@@ -15,7 +15,6 @@ fn fixture() -> Config {
     config.providers_mut().openai = None;
     config.providers_mut().anthropic = None;
     config.providers_mut().gemini = None;
-    config.providers_mut().copilot = None;
     config.providers_mut().bodhi = None;
     config.provider_instances.insert("work".into(), serde_json::from_value(json!({
         "provider_type":"openai", "label":"Demo provider", "api_key":FAKE_KEY,

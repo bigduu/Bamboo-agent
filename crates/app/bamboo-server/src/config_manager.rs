@@ -213,6 +213,26 @@ pub fn build_merged_config(
 
     let mut new_config: Config = serde_json::from_value(merged)
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
+    if new_config.providers().extra.contains_key("copilot")
+        && !current.providers().extra.contains_key("copilot")
+    {
+        return Err(AppError::BadRequest(
+            "GitHub Copilot provider is no longer supported".to_string(),
+        ));
+    }
+    for (id, instance) in &new_config.provider_instances {
+        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str())
+            && !current
+                .provider_instances
+                .get(id)
+                .is_some_and(|existing| existing.provider_type == instance.provider_type)
+        {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported provider type '{}' for new provider instance '{id}'",
+                instance.provider_type
+            )));
+        }
+    }
     // An explicit `api_key: ""` clear must drop the round-tripped ciphertext
     // BEFORE hydration — otherwise hydration refills the plaintext from it and
     // the subsequent sync/save re-encrypts, silently undoing the clear (#516).

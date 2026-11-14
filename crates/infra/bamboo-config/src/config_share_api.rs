@@ -31,9 +31,7 @@ pub enum ShareApiError {
     Conflict,
     #[error("Configuration sharing is unavailable until saved credentials are initialized")]
     Unavailable,
-    #[error(
-        "This import could initialize Copilot; configure an instance-only non-Copilot target first"
-    )]
+    #[error("Configuration import requires an explicit provider configuration without a runtime override")]
     RuntimeBoundary,
     #[error(transparent)]
     Share(#[from] ShareError),
@@ -202,12 +200,7 @@ pub fn preview_config_share(
     let snapshot = share_transaction::read_share_snapshot(data_dir).map_err(map_store)?;
     let current = target(&snapshot)?;
     let mut warnings = Vec::new();
-    if reject_network_initialization(&current).is_err()
-        || bundle
-            .providers
-            .iter()
-            .any(|provider| provider.provider_type.as_str() == "copilot")
-    {
+    if reject_network_initialization(&current).is_err() {
         warnings.push(ShareWarning::AutomaticProviderAuthenticationBlocked);
     }
     let credentials =
@@ -228,9 +221,8 @@ pub fn preview_config_share(
     })
 }
 
-/// Watcher registry construction attempts silent Copilot authentication. Keep
-/// that runtime boundary closed in this data-only import slice, including
-/// unchanged Copilot instances and the legacy registry's implicit Copilot.
+/// Keep the data-only import bound to a saved, instance-based provider route.
+/// Runtime environment overrides do not belong to that saved authority.
 fn reject_network_initialization(config: &Config) -> Result<(), ShareApiError> {
     // Runtime-only presence check, never a saved value, export value or log.
     // The existing scoped test override keeps synthetic tests off real env.
@@ -241,8 +233,7 @@ fn reject_network_initialization(config: &Config) -> Result<(), ShareApiError> {
             .provider_instances
             .values()
             .any(|instance| instance.enabled && instance.provider_type == "copilot")
-        || (config.effective_default_provider() == "copilot"
-            && !config.provider_instances.contains_key("copilot"))
+        || config.effective_default_provider().is_empty()
     {
         return Err(ShareApiError::RuntimeBoundary);
     }
@@ -341,6 +332,12 @@ fn prepare_import(
 ) -> Result<ShareTransactionCandidate, ShareApiError> {
     let mut current = target(snapshot)?;
     let plan = config_share::plan_import(bundle, &current, choices)?;
+    if plan.providers.iter().any(|provider| {
+        provider.provider_type.as_str() == "bodhi"
+            && !current.provider_instances.contains_key(&provider.id)
+    }) {
+        return Err(ShareApiError::Invalid);
+    }
     let mut providers: Stored<ProvidersSection> = decode_section(snapshot.providers.as_deref())?;
     let mut env: Stored<EnvSection> = decode_section(snapshot.env.as_deref())?;
     let mut credentials =

@@ -1166,8 +1166,7 @@ pub fn extract_provider_credentials(
     }
 
     // Legacy single-instance slots: providers.anthropic / openai / gemini /
-    // bodhi. `copilot` is intentionally omitted — it authenticates via device
-    // flow and has no `api_key` field to extract.
+    // the legacy Bodhi gateway.
     let mut push_legacy =
         |name: &str, api_key: &str, base_url: Option<String>, credential_ref: Option<String>| {
             let api_key = api_key.trim().to_string();

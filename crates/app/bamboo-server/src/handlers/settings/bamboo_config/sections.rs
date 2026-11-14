@@ -158,10 +158,6 @@ pub struct ProviderInstanceSettingsData {
     /// contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Copilot device-flow browser behavior retained from the legacy provider
-    /// contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headless_auth: Option<bool>,
 }
 
 fn provider_instance_enabled_default() -> bool {
@@ -211,9 +207,6 @@ impl ProviderInstanceSettingsData {
                 .then(|| instance.extra.get("max_tokens").and_then(Value::as_u64))
                 .flatten()
                 .and_then(|value| u32::try_from(value).ok()),
-            headless_auth: (instance.provider_type == "copilot")
-                .then(|| instance.extra.get("headless_auth").and_then(Value::as_bool))
-                .flatten(),
         }
     }
 
@@ -236,9 +229,6 @@ impl ProviderInstanceSettingsData {
         }
         if let Some(max_tokens) = self.max_tokens {
             extra.insert("max_tokens".to_string(), json!(max_tokens));
-        }
-        if let Some(headless_auth) = self.headless_auth {
-            extra.insert("headless_auth".to_string(), json!(headless_auth));
         }
         ProviderInstanceConfig {
             provider_type: self.provider_type,
@@ -439,6 +429,12 @@ pub async fn put_provider_settings_section(
 
             for (id, instance) in &provider_instances {
                 let Some(existing) = current.provider_instances.get(id) else {
+                    if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str()) {
+                        return Err(ConfigSectionMutationError::Invalid(format!(
+                            "provider type '{}' cannot be used for new provider instances",
+                            instance.provider_type
+                        )));
+                    }
                     continue;
                 };
                 if existing.provider_type != instance.provider_type {
@@ -783,9 +779,6 @@ fn sanitized_provider_metadata(providers: &ProviderConfigs) -> Result<Value, App
     sanitize!(openai);
     sanitize!(anthropic);
     sanitize!(gemini);
-    if let Some(provider) = providers.copilot.as_mut() {
-        provider.extra.clear();
-    }
     if let Some(provider) = providers.bodhi.as_mut() {
         provider.api_key.clear();
         provider.api_key_encrypted = None;
@@ -905,7 +898,6 @@ fn provider_exists(providers: &ProviderConfigs, name: &str) -> bool {
         "openai" => providers.openai.is_some(),
         "anthropic" => providers.anthropic.is_some(),
         "gemini" => providers.gemini.is_some(),
-        "copilot" => providers.copilot.is_some(),
         "bodhi" => providers.bodhi.is_some(),
         _ => false,
     }
@@ -969,12 +961,6 @@ fn retain_provider_settings_server_owned_fields(
         candidate.credential_ref = current.credential_ref.clone();
         candidate.extra = secret_free_provider_extra(&current.extra);
     }
-    if let (Some(current), Some(candidate)) = (
-        current.providers().copilot.as_ref(),
-        candidate.providers_mut().copilot.as_mut(),
-    ) {
-        candidate.extra = secret_free_provider_extra(&current.extra);
-    }
     for (id, instance) in &mut candidate.provider_instances {
         if let Some(current) = current.provider_instances.get(id) {
             instance.api_key = current.api_key.clone();
@@ -990,7 +976,6 @@ fn retain_provider_settings_server_owned_fields(
                         "target_provider"
                             | "thinking_replay_always"
                             | "max_tokens"
-                            | "headless_auth"
                             | bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
                     )
                 })
@@ -1141,7 +1126,7 @@ fn validate_provider_instance_shape(
         if id.trim().is_empty() {
             return Err("provider instance id must not be empty".to_string());
         }
-        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str()) {
+        if !bamboo_llm::is_configured_provider_type(&instance.provider_type) {
             return Err(format!(
                 "unknown provider type '{}' for provider instance '{id}'",
                 instance.provider_type
@@ -1170,11 +1155,6 @@ fn validate_provider_instance_shape(
         if instance.max_tokens.is_some() && instance.provider_type != "anthropic" {
             return Err(format!(
                 "max_tokens is only accepted for anthropic provider instance '{id}'"
-            ));
-        }
-        if instance.headless_auth.is_some() && instance.provider_type != "copilot" {
-            return Err(format!(
-                "headless_auth is only accepted for copilot provider instance '{id}'"
             ));
         }
         if instance.explicit_prompt_cache.is_some() && instance.provider_type != "openai" {
@@ -1362,13 +1342,6 @@ fn validate_provider_shape(candidate: &ProviderConfigs) -> Result<(), String> {
     validate!(openai);
     validate!(anthropic);
     validate!(gemini);
-    if let Some(provider) = &candidate.copilot {
-        if !provider.extra.is_empty() {
-            return Err(
-                "unknown provider fields are not accepted by the typed endpoint".to_string(),
-            );
-        }
-    }
     if let Some(provider) = &candidate.bodhi {
         if !provider.extra.is_empty() {
             return Err(
@@ -1514,20 +1487,6 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
                 "fast_model": provider.fast_model,
                 "vision_model": provider.vision_model,
                 "reasoning_effort": provider.reasoning_effort,
-            }),
-        );
-    }
-    if let Some(provider) = &providers.copilot {
-        result.insert(
-            "copilot".to_string(),
-            json!({
-                "enabled": provider.enabled,
-                "headless_auth": provider.headless_auth,
-                "model": provider.model,
-                "fast_model": provider.fast_model,
-                "vision_model": provider.vision_model,
-                "reasoning_effort": provider.reasoning_effort,
-                "responses_only_models": provider.responses_only_models,
             }),
         );
     }
@@ -2022,7 +1981,8 @@ mod tests {
             Err(ConfigSectionMutationError::Invalid(_))
         ));
 
-        config.providers_mut().copilot = Some(Default::default());
+        config.default_provider_instance = Some("openai".into());
+        config.providers_mut().openai = Some(Default::default());
         validate_provider_settings_default(&config)
             .expect("an actual legacy stanza keeps the hybrid alias valid");
 
@@ -2031,7 +1991,7 @@ mod tests {
         config.provider_instances.insert(
             "work".to_string(),
             serde_json::from_value(json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": true
             }))
             .unwrap(),
@@ -3371,8 +3331,8 @@ mod tests {
                         "features": {},
                         "provider_instances": {
                             "work": {
-                                "provider_type": "copilot",
-                                "enabled": true
+                                "provider_type": "gemini",
+                                "enabled": false
                             }
                         },
                         "default_provider_instance_id": "openai"
@@ -3601,6 +3561,26 @@ mod tests {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let facade = state.config_facade.as_ref().unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut saved = snapshot.data.as_ref().clone();
+        saved.provider_instances.insert(
+            "bodhi-proxy".into(),
+            serde_json::from_value(json!({
+                "provider_type": "bodhi",
+                "label": "Bodhi proxy",
+                "target_provider": "gemini",
+                "enabled": false
+            }))
+            .unwrap(),
+        );
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, saved)
+            .unwrap();
+        drop(state);
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let app = test::init_service(
             App::new().app_data(state.clone()).service(
                 web::resource("/provider-settings")
@@ -3632,12 +3612,6 @@ mod tests {
                     "max_tokens": 8192,
                     "enabled": false
                 },
-                "copilot-cli": {
-                    "provider_type": "copilot",
-                    "label": "Copilot CLI",
-                    "headless_auth": true,
-                    "enabled": false
-                },
                 "openai-proxy": {
                     "provider_type": "openai",
                     "label": "OpenAI-compatible proxy",
@@ -3653,7 +3627,7 @@ mod tests {
             test::TestRequest::put()
                 .uri("/provider-settings")
                 .set_json(json!({
-                    "expected_revision": 0,
+                    "expected_revision": 1,
                     "data": data,
                     "credential_changes": {
                         "providers": {
@@ -3688,10 +3662,6 @@ mod tests {
             8192
         );
         assert_eq!(
-            created["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
-            true
-        );
-        assert_eq!(
             created["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
             false
         );
@@ -3721,13 +3691,12 @@ mod tests {
         updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
         updated["provider_instances"]["glm-compat"]["thinking_replay_always"] = json!(false);
         updated["provider_instances"]["glm-compat"]["max_tokens"] = json!(4096);
-        updated["provider_instances"]["copilot-cli"]["headless_auth"] = json!(false);
         updated["provider_instances"]["openai-proxy"]["explicit_prompt_cache"] = json!(true);
         let updated = test::call_service(
             &app,
             test::TestRequest::put()
                 .uri("/provider-settings")
-                .set_json(json!({"expected_revision": 1, "data": updated}))
+                .set_json(json!({"expected_revision": 2, "data": updated}))
                 .to_request(),
         )
         .await;
@@ -3736,7 +3705,7 @@ mod tests {
         assert!(!updated_body.contains(hidden_value));
         assert!(!updated_body.contains(recovered_secret));
         let updated: Value = serde_json::from_str(&updated_body).unwrap();
-        assert_eq!(updated["revision"], 2);
+        assert_eq!(updated["revision"], 3);
         assert_eq!(
             updated["data"]["provider_instances"]["bodhi-proxy"]["target_provider"],
             "anthropic"
@@ -3748,10 +3717,6 @@ mod tests {
         assert_eq!(
             updated["data"]["provider_instances"]["glm-compat"]["max_tokens"],
             4096
-        );
-        assert_eq!(
-            updated["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
-            false
         );
         assert_eq!(
             updated["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
@@ -3779,10 +3744,6 @@ mod tests {
                 4096
             );
             assert_eq!(
-                config.provider_instances["copilot-cli"].extra["headless_auth"],
-                false
-            );
-            assert_eq!(
                 config.provider_instances["openai-proxy"].extra
                     [bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
                 true
@@ -3802,10 +3763,6 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("max_tokens");
-        removed["provider_instances"]["copilot-cli"]
-            .as_object_mut()
-            .unwrap()
-            .remove("headless_auth");
         removed["provider_instances"]["openai-proxy"]
             .as_object_mut()
             .unwrap()
@@ -3814,19 +3771,18 @@ mod tests {
             &app,
             test::TestRequest::put()
                 .uri("/provider-settings")
-                .set_json(json!({"expected_revision": 2, "data": removed}))
+                .set_json(json!({"expected_revision": 3, "data": removed}))
                 .to_request(),
         )
         .await;
         assert!(removed.status().is_success());
         let removed: Value = test::read_body_json(removed).await;
-        assert_eq!(removed["revision"], 3);
+        assert_eq!(removed["revision"], 4);
         assert!(removed["data"]["provider_instances"]["bodhi-proxy"]["target_provider"].is_null());
         assert!(
             removed["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"].is_null()
         );
         assert!(removed["data"]["provider_instances"]["glm-compat"]["max_tokens"].is_null());
-        assert!(removed["data"]["provider_instances"]["copilot-cli"]["headless_auth"].is_null());
         assert!(
             removed["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"]
                 .is_null()
@@ -3846,9 +3802,6 @@ mod tests {
             assert!(!config.provider_instances["glm-compat"]
                 .extra
                 .contains_key("max_tokens"));
-            assert!(!config.provider_instances["copilot-cli"]
-                .extra
-                .contains_key("headless_auth"));
             assert!(!config.provider_instances["openai-proxy"]
                 .extra
                 .contains_key(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY));
@@ -3869,7 +3822,7 @@ mod tests {
                 &app,
                 test::TestRequest::put()
                     .uri("/provider-settings")
-                    .set_json(json!({"expected_revision": 3, "data": invalid}))
+                    .set_json(json!({"expected_revision": 4, "data": invalid}))
                     .to_request(),
             )
             .await;

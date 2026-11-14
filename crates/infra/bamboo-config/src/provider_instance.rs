@@ -183,36 +183,6 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
         }
     }
 
-    if let Some(copilot) = &config.providers.copilot {
-        let id = "copilot".to_string();
-        if !config.provider_instances.contains_key(&id) {
-            // Copilot doesn't have a traditional api_key; it uses device auth.
-            let mut extra = copilot.extra.clone();
-            extra
-                .entry("headless_auth".to_string())
-                .or_insert(Value::Bool(copilot.headless_auth));
-            result.push((
-                id,
-                ProviderInstanceConfig {
-                    provider_type: "copilot".to_string(),
-                    label: Some("GitHub Copilot".to_string()),
-                    api_key: String::new(),
-                    api_key_encrypted: None,
-                    credential_ref: None,
-                    base_url: None,
-                    model: copilot.model.clone(),
-                    fast_model: copilot.fast_model.clone(),
-                    vision_model: copilot.vision_model.clone(),
-                    reasoning_effort: copilot.reasoning_effort,
-                    responses_only_models: copilot.responses_only_models.clone(),
-                    request_overrides: copilot.request_overrides.clone(),
-                    enabled: copilot.enabled || config.provider == "copilot",
-                    extra,
-                },
-            ));
-        }
-    }
-
     if let Some(bodhi) = &config.providers.bodhi {
         let id = "bodhi".to_string();
         if !config.provider_instances.contains_key(&id) {
@@ -247,6 +217,31 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
     result
 }
 
+/// Drop retired provider configuration while preserving unresolved model
+/// references for repair. Exact instance ids can belong to any provider type.
+pub(crate) fn retire_copilot(config: &mut Config) -> bool {
+    let selected = config
+        .default_provider_instance
+        .as_deref()
+        .unwrap_or(&config.provider);
+    let retired_default = match config.provider_instances.get(selected) {
+        Some(instance) => instance.provider_type == "copilot",
+        None => config.default_provider_instance.is_some() && selected == "copilot",
+    };
+    if retired_default {
+        config.default_provider_instance = None;
+        // Keep the compatibility route unavailable until explicitly selected.
+        config.provider = "copilot".to_owned();
+    }
+    let before = config.provider_instances.len();
+    config
+        .provider_instances
+        .retain(|_, instance| instance.provider_type != "copilot");
+    config.providers_mut().extra.remove("copilot").is_some()
+        || retired_default
+        || before != config.provider_instances.len()
+}
+
 /// Idempotently materialize legacy provider configuration.
 ///
 /// The provider type is retained as the instance id so existing routing keys,
@@ -263,22 +258,13 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
 /// aliases carry only the marker and never persist plaintext.
 pub fn materialize_legacy_provider_instances(config: &mut Config) -> bool {
     let selected = config.effective_default_provider().trim().to_string();
-    if selected.is_empty() {
+    let retired_default = selected.is_empty() && config.provider == "copilot";
+    if selected.is_empty() && !retired_default {
         return false;
     }
     let selected_is_explicit = config.provider_instances.contains_key(&selected);
 
     let mut candidates = synthesize_legacy_instances(config);
-
-    if !selected_is_explicit
-        && selected == "copilot"
-        && !candidates.iter().any(|(id, _)| id == &selected)
-    {
-        candidates.push((
-            selected.clone(),
-            default_copilot_instance(config.headless_auth),
-        ));
-    }
 
     // Preserve every standard legacy env-only provider, not just the selected
     // one. A custom explicit instance id must not absorb a type-wide legacy
@@ -319,29 +305,23 @@ pub fn materialize_legacy_provider_instances(config: &mut Config) -> bool {
         }
     }
 
-    if let Some((_, selected_instance)) = candidates
-        .iter_mut()
-        .find(|(id, _)| id == &selected && selected == "copilot")
-    {
-        selected_instance.enabled = true;
-    }
-
     let selected_is_usable = selected_is_explicit
         || candidates.iter().any(|(id, instance)| {
             id == &selected
                 && instance.enabled
-                && (instance.provider_type == "copilot"
-                    || instance.credential_ref.is_some()
+                && (instance.credential_ref.is_some()
                     || (provider_instance_api_key_from_env(instance)
                         && standard_provider_api_key_env_is_available(&instance.provider_type)))
         });
-    if !selected_is_usable {
+    // A retired default can leave other legacy credentials configured. Give
+    // Settings those instances without selecting a different default.
+    if !selected_is_usable && !retired_default {
         return false;
     }
 
     let mut changed = !candidates.is_empty();
     config.provider_instances.extend(candidates);
-    if config.default_provider_instance.as_deref() != Some(&selected) {
+    if selected_is_usable && config.default_provider_instance.as_deref() != Some(&selected) {
         config.default_provider_instance = Some(selected);
         changed = true;
     }
@@ -368,7 +348,6 @@ fn provider_display_label(provider_type: &str) -> &str {
         "openai" => "OpenAI",
         "anthropic" => "Anthropic",
         "gemini" => "Gemini",
-        "copilot" => "GitHub Copilot",
         "bodhi" => "Bodhi",
         other => other,
     }
@@ -393,20 +372,11 @@ fn empty_provider_instance(provider_type: &str) -> ProviderInstanceConfig {
     }
 }
 
-fn default_copilot_instance(headless_auth: bool) -> ProviderInstanceConfig {
-    let mut instance = empty_provider_instance("copilot");
-    instance.label = Some("GitHub Copilot".to_string());
-    instance
-        .extra
-        .insert("headless_auth".to_string(), Value::Bool(headless_auth));
-    instance
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        AnthropicConfig, BodhiConfig, CopilotConfig, GeminiConfig, OpenAIConfig, ProviderConfigs,
+        AnthropicConfig, BodhiConfig, GeminiConfig, OpenAIConfig, ProviderConfigs,
     };
 
     /// Build a test config with explicit empty providers/instances. (Since #38,
@@ -453,7 +423,6 @@ mod tests {
         // Clear any other legacy providers to isolate this test.
         config.providers.anthropic = None;
         config.providers.gemini = None;
-        config.providers.copilot = None;
         config.providers.bodhi = None;
 
         let instances = synthesize_legacy_instances(&config);
@@ -491,7 +460,6 @@ mod tests {
         // Clear other providers to isolate.
         config.providers.anthropic = None;
         config.providers.gemini = None;
-        config.providers.copilot = None;
         config.providers.bodhi = None;
 
         config.provider_instances.insert(
@@ -523,17 +491,6 @@ mod tests {
         let mut config = clean_test_config();
         config.providers.openai = None;
         config.providers.gemini = None;
-        config.providers.copilot = Some(CopilotConfig {
-            enabled: true,
-            headless_auth: true,
-            extra: [(
-                "copilot_extension".to_string(),
-                Value::String("kept".into()),
-            )]
-            .into_iter()
-            .collect(),
-            ..CopilotConfig::default()
-        });
         config.providers.bodhi = Some(BodhiConfig {
             api_key: String::new(),
             api_key_encrypted: None,
@@ -577,8 +534,6 @@ mod tests {
             anthropic.extra["anthropic_extension"],
             Value::String("kept".into())
         );
-        assert_eq!(instances["copilot"].extra["headless_auth"], true);
-        assert_eq!(instances["copilot"].extra["copilot_extension"], "kept");
         assert_eq!(instances["bodhi"].extra["target_provider"], "anthropic");
         assert_eq!(instances["bodhi"].extra["bodhi_extension"], true);
     }
@@ -589,7 +544,6 @@ mod tests {
         config.provider = "openai".to_string();
         config.providers.anthropic = None;
         config.providers.gemini = None;
-        config.providers.copilot = None;
         config.providers.bodhi = None;
         config.providers.openai = Some(OpenAIConfig {
             credential_ref: Some(crate::CredentialRef::parse("provider.openai.api_key").unwrap()),
@@ -706,7 +660,6 @@ mod tests {
         let mut config = clean_test_config();
         config.providers.anthropic = None;
         config.providers.gemini = None;
-        config.providers.copilot = None;
         config.providers.bodhi = None;
         config.providers.openai = Some(OpenAIConfig::default());
 
@@ -850,13 +803,31 @@ mod tests {
     }
 
     #[test]
-    fn selected_copilot_without_legacy_stanza_gets_a_default_instance() {
+    fn retired_legacy_default_exposes_keyed_provider_without_selecting_a_replacement() {
+        let _openai = crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini = crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let mut config = clean_test_config();
-        config.provider = "copilot".to_string();
-        *config.providers_mut() = ProviderConfigs::default();
+        config.provider = "copilot".into();
+        *config.providers_mut() = ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                credential_ref: Some(
+                    crate::CredentialRef::parse("provider.openai.api_key").unwrap(),
+                ),
+                model: Some("chat-model".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
         assert!(materialize_legacy_provider_instances(&mut config));
-        assert_eq!(config.default_provider_instance.as_deref(), Some("copilot"));
-        assert!(config.provider_instances["copilot"].enabled);
+        assert!(config.default_provider_instance.is_none());
+        assert!(!config.provider_instances.contains_key("copilot"));
+        assert_eq!(
+            config.provider_instances["openai"].model.as_deref(),
+            Some("chat-model")
+        );
+        assert!(!materialize_legacy_provider_instances(&mut config));
     }
 }

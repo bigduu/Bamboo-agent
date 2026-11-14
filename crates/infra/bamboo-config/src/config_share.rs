@@ -71,7 +71,6 @@ pub enum ShareProviderType {
     Openai,
     Anthropic,
     Gemini,
-    Copilot,
     Bodhi,
 }
 
@@ -81,7 +80,6 @@ impl ShareProviderType {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
-            Self::Copilot => "copilot",
             Self::Bodhi => "bodhi",
         }
     }

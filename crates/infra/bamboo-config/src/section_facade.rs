@@ -35,8 +35,6 @@ pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_FILE: &str = "config-sections.json";
 const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
-pub const COPILOT_GITHUB_ACCESS_CREDENTIAL_REF: &str = "copilot.oauth.github_access_token";
-pub const COPILOT_CHAT_CONFIG_CREDENTIAL_REF: &str = "copilot.oauth.chat_config";
 
 #[cfg(test)]
 mod observed_credential_hydration_tests {
@@ -945,6 +943,9 @@ where
     if instance_native_providers {
         remove_instance_native_legacy_provider_fields(&mut merged_data);
     }
+    if name == "providers.json" {
+        retire_copilot_from_provider_document(&mut merged_data);
+    }
     // A materialized default is still the revision-zero baseline. Preserve an
     // already-versioned sidecar when migration leaves its data byte-equivalent;
     // importing legacy data or normalizing a sparse envelope is a real revision
@@ -1046,6 +1047,42 @@ fn remove_instance_native_legacy_provider_fields(value: &mut Value) {
         "bodhi",
     ] {
         object.remove(key);
+    }
+}
+
+// Legacy provider data can be reintroduced by the raw overlays used to
+// preserve fields unknown to this version. Keep model references for repair.
+fn retire_copilot_from_provider_document(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("copilot");
+    let explicit_default = object
+        .get("default_provider_instance")
+        .and_then(Value::as_str);
+    let selected = explicit_default.or_else(|| object.get("provider").and_then(Value::as_str));
+    let retired_default = selected.is_some_and(|id| {
+        match object
+            .get("provider_instances")
+            .and_then(|instances| instances.get(id))
+        {
+            Some(instance) => {
+                instance.get("provider_type").and_then(Value::as_str) == Some("copilot")
+            }
+            None => explicit_default.is_some() && id == "copilot",
+        }
+    });
+    if let Some(instances) = object
+        .get_mut("provider_instances")
+        .and_then(Value::as_object_mut)
+    {
+        instances.retain(|_, instance| {
+            instance.get("provider_type").and_then(Value::as_str) != Some("copilot")
+        });
+    }
+    if retired_default {
+        object.remove("default_provider_instance");
+        object.insert("provider".into(), Value::String("copilot".into()));
     }
 }
 
@@ -3420,6 +3457,7 @@ fn preflight_legacy_root_sections(
     overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<()> {
     let mut sanitized_config = scrub_preflight_config_secrets(&input.config)?;
+    crate::provider_instance::retire_copilot(&mut sanitized_config);
     crate::materialize_legacy_provider_instances(&mut sanitized_config);
     let projection = SectionProjection::from_config(&sanitized_config, input.model_limits.clone())?;
     let mut sections =
@@ -3492,7 +3530,10 @@ fn preflight_legacy_root_sections(
                     }
                 }
             }
-            SectionId::Providers => scrub_preflight_provider_secrets(&mut data),
+            SectionId::Providers => {
+                retire_copilot_from_provider_document(&mut data);
+                scrub_preflight_provider_secrets(&mut data);
+            }
             SectionId::Mcp => scrub_preflight_mcp_secrets(&mut data),
             SectionId::Notifications => scrub_preflight_notification_secrets(&mut data),
             SectionId::Env => scrub_preflight_env_secrets(&mut data),
@@ -4147,6 +4188,7 @@ fn plan_config_facade_layout_with_broker(
             broker,
             authoritative_sidecars,
         } = input;
+        crate::provider_instance::retire_copilot(&mut config);
         crate::materialize_legacy_provider_instances(&mut config);
         let mut projection = SectionProjection::from_config(&config, model_limits)?;
         let mut broker_raw = None;
@@ -4184,6 +4226,7 @@ fn plan_config_facade_compound_layout(
         broker,
         authoritative_sidecars,
     } = load_strict_planning_input_with_overrides(data_dir, Some(overrides))?;
+    crate::provider_instance::retire_copilot(&mut config);
     crate::materialize_legacy_provider_instances(&mut config);
     let mut projection = SectionProjection::from_config(&config, model_limits)?;
     let mut broker_raw = None;
@@ -5585,10 +5628,6 @@ impl ConfigFacade {
         // `migrate_config_facade_layout` branches before reading any legacy
         // root input. Without the marker it performs the one-time split.
         migrate_config_facade_layout(data_dir)?;
-        // This migration can advance the credential section. Complete it
-        // before capturing the startup registry so the returned facade never
-        // owns a stale pre-migration credential snapshot.
-        migrate_copilot_oauth_cache(data_dir)?;
         let completed_marker = has_completed_section_layout_marker(data_dir)?;
         let completed = completed_layout_allows_legacy_root_reconciliation(data_dir)?;
         let mut startup = None::<LegacyRootReconciliationOutcome>;
@@ -5708,7 +5747,10 @@ impl ConfigFacade {
                         &self.data_dir,
                         SectionId::Providers,
                     )?;
-                if !crate::materialize_legacy_provider_instances(&mut durable_config) {
+                let retired = crate::provider_instance::retire_copilot(&mut durable_config);
+                let materialized =
+                    crate::materialize_legacy_provider_instances(&mut durable_config);
+                if !retired && !materialized {
                     // Another facade/process may have published the migration
                     // after this facade opened but before it acquired the
                     // shared lock. The durable no-op is authoritative; adopt
@@ -6028,129 +6070,6 @@ pub fn commit_core_metadata_from_durable_base(
             },
         ))
     })
-}
-
-/// Adopt the two historical plaintext Copilot OAuth caches into the encrypted
-/// credential authority. The credential is committed first and the legacy
-/// source is removed only if its bytes are still unchanged, making retries
-/// safe after a crash at either boundary.
-pub fn migrate_copilot_oauth_cache(data_dir: &Path) -> ConfigStoreResult<()> {
-    for (name, reference, kind) in [
-        (
-            ".token",
-            COPILOT_GITHUB_ACCESS_CREDENTIAL_REF,
-            CopilotCacheKind::AccessToken,
-        ),
-        (
-            ".copilot_token.json",
-            COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
-            CopilotCacheKind::ChatConfig,
-        ),
-        (
-            "copilot_token.json",
-            COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
-            CopilotCacheKind::ChatConfig,
-        ),
-    ] {
-        migrate_one_copilot_cache(data_dir, name, reference, kind)?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum CopilotCacheKind {
-    AccessToken,
-    ChatConfig,
-}
-
-fn migrate_one_copilot_cache(
-    data_dir: &Path,
-    name: &str,
-    reference: &str,
-    kind: CopilotCacheKind,
-) -> ConfigStoreResult<()> {
-    let path = data_dir.join(name);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(crate::ConfigStoreError::Validation(
-            "Copilot OAuth cache is not a regular file".to_string(),
-        ));
-    }
-    let original = std::fs::read(&path)?;
-    let text = std::str::from_utf8(&original).map_err(|_| {
-        crate::ConfigStoreError::Validation("Copilot OAuth cache is invalid".to_string())
-    })?;
-    let secret = match kind {
-        CopilotCacheKind::AccessToken => {
-            let token = text.trim();
-            if token.is_empty() {
-                return Err(crate::ConfigStoreError::Validation(
-                    "Copilot OAuth cache is empty".to_string(),
-                ));
-            }
-            token.to_string()
-        }
-        CopilotCacheKind::ChatConfig => {
-            let value: Value = serde_json::from_str(text)?;
-            let object = value.as_object().ok_or_else(|| {
-                crate::ConfigStoreError::Validation("Copilot OAuth cache is invalid".to_string())
-            })?;
-            if !object
-                .get("token")
-                .and_then(Value::as_str)
-                .is_some_and(|token| !token.trim().is_empty())
-                || !object.get("expires_at").is_some_and(Value::is_u64)
-            {
-                return Err(crate::ConfigStoreError::Validation(
-                    "Copilot OAuth cache is invalid".to_string(),
-                ));
-            }
-            serde_json::to_string(&value)?
-        }
-    };
-    let reference = CredentialRef::parse(reference.to_string()).map_err(|_| {
-        crate::ConfigStoreError::Validation("Copilot credential reference is invalid".to_string())
-    })?;
-    let store = CredentialStore::open(data_dir);
-    let mut installed = false;
-    for _ in 0..8 {
-        if let Some(existing) = store.resolve(&reference)? {
-            if existing.expose() != secret {
-                return Err(crate::ConfigStoreError::Validation(
-                    "Copilot OAuth cache conflicts with the credential store".to_string(),
-                ));
-            }
-            installed = true;
-            break;
-        }
-        let revision = store.revision()?;
-        match store.replace(
-            reference.clone(),
-            &secret,
-            CredentialSource::Migrated,
-            revision,
-        ) {
-            Ok(_) => {
-                installed = true;
-                break;
-            }
-            Err(crate::ConfigStoreError::Conflict { .. }) => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    if !installed {
-        return Err(crate::ConfigStoreError::Validation(
-            "Copilot credential store remained busy".to_string(),
-        ));
-    }
-    if std::fs::read(&path)? == original {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
 /// Opaque runtime projection for the one section changed by a compatibility
@@ -7195,7 +7114,7 @@ mod tests {
         providers.provider_instances.insert(
             "work".to_string(),
             serde_json::from_value(json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": true,
                 "model": "gpt-work"
             }))
@@ -7267,6 +7186,80 @@ mod tests {
         assert_eq!(
             store.resolve(&anthropic_ref).unwrap().unwrap().expose(),
             "hybrid-anthropic-secret"
+        );
+    }
+
+    #[test]
+    fn completed_facade_retires_copilot_at_one_revision_and_keeps_model_references() {
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut saved = snapshot.data.as_ref().clone();
+        saved.provider_instances.insert(
+            "oauth-work".into(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot", "model": "gpt-4o"
+            }))
+            .unwrap(),
+        );
+        // An instance id is not a provider type.
+        saved.provider_instances.insert(
+            "copilot".into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai", "enabled": false, "model": "relay"
+            }))
+            .unwrap(),
+        );
+        saved.default_provider_instance = Some("oauth-work".into());
+        saved.defaults = Some(
+            serde_json::from_value(json!({
+                "chat": {"provider": "oauth-work", "model": "gpt-4o"},
+                "fast": {"provider": "copilot", "model": "relay"}
+            }))
+            .unwrap(),
+        );
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, saved)
+            .unwrap();
+        let before = facade.registry().providers.snapshot().revision;
+        drop(facade);
+
+        // The retired OAuth cache does not participate in provider startup.
+        std::fs::write(dir.path().join(".copilot_token.json"), b"invalid old cache").unwrap();
+        let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = reopened.registry().providers.snapshot();
+        assert_eq!(envelope.revision, before + 1);
+        assert!(envelope.data.default_provider_instance.is_none());
+        assert!(!envelope.data.provider_instances.contains_key("oauth-work"));
+        assert_eq!(
+            envelope.data.provider_instances["copilot"].provider_type,
+            "openai"
+        );
+        assert_eq!(reopened.effective_config().effective_default_provider(), "");
+        assert_eq!(
+            envelope.data.defaults.as_ref().unwrap().chat.provider,
+            "oauth-work"
+        );
+        assert_eq!(
+            envelope
+                .data
+                .defaults
+                .as_ref()
+                .unwrap()
+                .fast
+                .as_ref()
+                .unwrap()
+                .provider,
+            "copilot"
+        );
+        drop(reopened);
+
+        let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            reopened.registry().providers.snapshot().revision,
+            before + 1
         );
     }
 
@@ -7972,39 +7965,6 @@ mod tests {
     }
 
     #[test]
-    fn facade_startup_migrates_copilot_oauth_caches_before_runtime_reads() {
-        let _key = crate::encryption::set_test_encryption_key([0x98; 32]);
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join(".token"), "github-oauth-secret\n").unwrap();
-        write_json(
-            &dir.path().join(".copilot_token.json"),
-            &json!({
-                "token": "copilot-chat-secret",
-                "expires_at": 4_000_000_000u64,
-                "refresh_in": 120
-            }),
-        );
-
-        ConfigFacade::open_or_migrate(dir.path()).unwrap();
-
-        assert!(!dir.path().join(".token").exists());
-        assert!(!dir.path().join(".copilot_token.json").exists());
-        let store = CredentialStore::open(dir.path());
-        let github =
-            CredentialRef::parse(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF.to_string()).unwrap();
-        let chat = CredentialRef::parse(COPILOT_CHAT_CONFIG_CREDENTIAL_REF.to_string()).unwrap();
-        assert_eq!(
-            store.resolve(&github).unwrap().unwrap().expose(),
-            "github-oauth-secret"
-        );
-        let chat = store.resolve(&chat).unwrap().unwrap();
-        assert!(chat.expose().contains("copilot-chat-secret"));
-        let durable = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
-        assert!(!durable.contains("github-oauth-secret"));
-        assert!(!durable.contains("copilot-chat-secret"));
-    }
-
-    #[test]
     fn providers_section_remains_readable_by_existing_exact_transaction_wire_type() {
         let section = ProvidersSection {
             provider: Some("openai".to_string()),
@@ -8030,7 +7990,10 @@ mod tests {
         config.providers_mut().openai = Some(crate::OpenAIConfig::default());
         config.providers_mut().anthropic = Some(crate::AnthropicConfig::default());
         config.providers_mut().gemini = Some(crate::GeminiConfig::default());
-        config.providers_mut().copilot = Some(crate::CopilotConfig::default());
+        config
+            .providers_mut()
+            .extra
+            .insert("copilot".into(), json!({"enabled": true}));
         config.providers_mut().bodhi = Some(serde_json::from_value(json!({})).unwrap());
         config
             .providers_mut()
@@ -10012,7 +9975,7 @@ mod tests {
                 "provider": "openai",
                 "provider_instances": {
                     "work": {
-                        "provider_type": "copilot",
+                        "provider_type": "gemini",
                         "enabled": true
                     }
                 },

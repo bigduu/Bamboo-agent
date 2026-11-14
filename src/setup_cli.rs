@@ -16,15 +16,11 @@ use anyhow::{bail, Context, Result};
 use bamboo_config::Config;
 
 /// Providers that `init` / `config set` can configure with a static API key.
-///
-/// Copilot uses an interactive OAuth device flow (not a static key), so it is
-/// intentionally excluded here — configure it via the web UI / `bamboo actor`.
 const KEYED_PROVIDERS: [&str; 3] = ["anthropic", "openai", "gemini"];
 
 /// All providers the config recognizes, for selecting the *default* provider.
-/// Broader than [`KEYED_PROVIDERS`]: `copilot` (OAuth) and `bodhi` (proxy) are
-/// valid default providers even though this CLI does not manage their keys.
-const KNOWN_PROVIDERS: [&str; 5] = ["anthropic", "openai", "gemini", "copilot", "bodhi"];
+/// This also recognizes the existing Bodhi gateway.
+const KNOWN_PROVIDERS: [&str; 4] = ["anthropic", "openai", "gemini", "bodhi"];
 
 /// A reasonable default chat model per provider, matching the ids referenced
 /// elsewhere in the repo (README / `docker/config.example.json`). Used only when
@@ -169,9 +165,6 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
         info(&format!("default provider = {provider}"));
         match provider_credential_status(&config, &provider) {
             CredentialStatus::Present => ok(&format!("provider '{provider}' has an API key")),
-            CredentialStatus::OauthProvider => ok(&format!(
-                "provider '{provider}' uses interactive login (no static key required)"
-            )),
             CredentialStatus::Missing => {
                 err(&format!(
                     "provider '{provider}' has no API key — run `bamboo init` or \
@@ -292,7 +285,7 @@ fn run_config_set_before_persist(
     // `None` = a dedicated arm mutated `config` in place.
     let outcome = match parts.as_slice() {
         // Selecting the default provider accepts any known provider (incl.
-        // copilot/bodhi), not just the keyed ones.
+        // the legacy Bodhi gateway), not just the keyed ones.
         ["provider"] => {
             config.provider = normalize_known_provider(value)?;
             None
@@ -540,7 +533,7 @@ fn normalize_provider(provider: &str) -> Result<String> {
 }
 
 /// Validate + canonicalize a provider name against the full known-provider set
-/// (for selecting the default provider, which may be copilot/bodhi).
+/// (for selecting the default provider, which may be the legacy Bodhi gateway).
 fn normalize_known_provider(provider: &str) -> Result<String> {
     let p = provider.trim().to_ascii_lowercase();
     if KNOWN_PROVIDERS.contains(&p.as_str()) {
@@ -634,7 +627,6 @@ fn set_provider_model(config: &mut Config, provider: &str, model: &str) -> Resul
 enum CredentialStatus {
     Present,
     Missing,
-    OauthProvider,
     Unknown,
 }
 
@@ -668,7 +660,6 @@ fn provider_credential_status(config: &Config, provider: &str) -> CredentialStat
                 .as_ref()
                 .map(|c| (c.api_key.as_str(), c.api_key_encrypted.as_deref())),
         ),
-        "copilot" => CredentialStatus::OauthProvider,
         _ => CredentialStatus::Unknown,
     }
 }
@@ -801,15 +792,13 @@ mod tests {
     fn normalize_provider_accepts_keyed_and_rejects_unknown() {
         assert_eq!(normalize_provider("Anthropic").unwrap(), "anthropic");
         assert_eq!(normalize_provider("  openai ").unwrap(), "openai");
-        // copilot has no static key → not a keyed provider.
         assert!(normalize_provider("copilot").is_err());
         assert!(normalize_provider("nope").is_err());
     }
 
     #[test]
-    fn normalize_known_provider_accepts_oauth_and_proxy_providers() {
-        // Selecting the default provider accepts copilot/bodhi too.
-        assert_eq!(normalize_known_provider("Copilot").unwrap(), "copilot");
+    fn normalize_known_provider_accepts_legacy_gateway_and_rejects_copilot() {
+        assert!(normalize_known_provider("Copilot").is_err());
         assert_eq!(normalize_known_provider("bodhi").unwrap(), "bodhi");
         assert_eq!(normalize_known_provider("anthropic").unwrap(), "anthropic");
         assert!(normalize_known_provider("nope").is_err());
@@ -845,7 +834,7 @@ mod tests {
         ));
         assert!(matches!(
             provider_credential_status(&config, "copilot"),
-            CredentialStatus::OauthProvider
+            CredentialStatus::Unknown
         ));
     }
 

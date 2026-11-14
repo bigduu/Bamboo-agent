@@ -150,7 +150,7 @@ pub struct AgentBuilder {
     /// Stable Project membership applied to newly-created or still-unassigned
     /// sessions. Existing membership is never overwritten by execution.
     project_id: Option<String>,
-    /// Provider to select (e.g. `anthropic`, `openai`, `gemini`, `copilot`,
+    /// Provider to select (e.g. `anthropic`, `openai`, `gemini`,
     /// `bodhi`) in `with_defaults_for_data_dir`, overriding `config.json`'s
     /// `provider`. `None` keeps the configured default.
     provider_name: Option<String>,
@@ -259,7 +259,7 @@ impl AgentBuilder {
     }
 
     /// Select the provider by instance id or built-in type (`anthropic`,
-    /// `openai`, `gemini`, `copilot`, `bodhi`) for
+    /// `openai`, `gemini`, or an existing `bodhi` gateway) for
     /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir). An exact
     /// instance id wins; a type deterministically selects the first enabled
     /// instance of that type, falling back to the legacy slot only when none
@@ -591,9 +591,8 @@ impl AgentBuilder {
     /// `api_key` (the same config `bamboo serve` reads). A fresh data dir with no
     /// `config.json` defaults to the `anthropic` provider with no key, so step 6
     /// (`create_provider_with_dir`) returns [`SdkError::ProviderInit`].
-    /// The `copilot` provider is the only one that can authenticate keyless (via
-    /// its cached OAuth token). Set the key via the config file, or pass it on the
-    /// builder with [`api_key`](Self::api_key) **before** calling this method.
+    /// Set the key in the config file or pass it to
+    /// [`api_key`](Self::api_key) before calling this method.
     ///
     /// If [`mcp_server`](Self::mcp_server)/[`mcp_servers`](Self::mcp_servers) were
     /// configured, each server is connected here (in call order) and its tools
@@ -1113,8 +1112,7 @@ impl Default for AgentBuilder {
 /// is **fabricated** from `{"api_key": …}` — every other field is serde-default
 /// (all `Option`/`Vec`/`flatten`), so `.api_key("sk-…")` alone is enough to make
 /// a fresh data dir usable. Only the keyed providers (`openai` / `anthropic` /
-/// `gemini`) are fabricated; other providers (e.g. `copilot`, which authenticates
-/// via cached OAuth rather than a plain key) return a typed error.
+/// `gemini`) accept an API key supplied through this SDK method.
 fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
     let provider_key = config.effective_default_provider().to_string();
     if let Some(instance) = config.provider_instances.get_mut(&provider_key) {
@@ -1251,7 +1249,7 @@ fn select_configured_chat_target(
         .any(|(id, _)| id == target.provider);
     let active_legacy = config.provider_instances.is_empty()
         && config.effective_default_provider() == target.provider
-        && bamboo_llm::AVAILABLE_PROVIDERS.contains(&target.provider.as_str());
+        && bamboo_llm::is_configured_provider_type(target.provider.as_str());
     if !exact_legacy && !active_legacy {
         return Err(SdkError::Config(format!(
             "Configured Chat provider '{}' is unavailable",
@@ -3043,9 +3041,13 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_config_model_is_captured_before_or_after_defaults_with_matching_client() {
-        let copilot_config = || {
+        let openai_config = || {
             let mut config = Config::default();
-            config.provider = "copilot".to_string();
+            config.provider = "openai".to_string();
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                model: Some("gpt-4o".into()),
+                ..Default::default()
+            });
             Arc::new(RwLock::new(config))
         };
 
@@ -3057,7 +3059,7 @@ mod tests {
         .unwrap();
         let before = AgentBuilder::new()
             .provider(Arc::new(NeverCalledProvider))
-            .config(copilot_config())
+            .config(openai_config())
             .with_defaults_for_data_dir(before_dir.path().to_path_buf())
             .await
             .unwrap()
@@ -3072,7 +3074,7 @@ mod tests {
             .await
             .unwrap()
             .provider(Arc::new(NeverCalledProvider))
-            .config(copilot_config())
+            .config(openai_config())
             .build()
             .unwrap();
         assert_eq!(after.new_session("after").unwrap().model, "gpt-4o");
@@ -3084,12 +3086,12 @@ mod tests {
             .with_defaults_for_data_dir(mismatch_dir.path().to_path_buf())
             .await
             .unwrap()
-            .config(copilot_config())
+            .config(openai_config())
             .build();
         assert!(
             matches!(mismatch, Err(super::SdkError::Config(message))
             if message.contains("SDK native provider configuration changed")),
-            "a native Anthropic client must not be retained for Copilot configuration"
+            "a native Anthropic client must not be retained for OpenAI configuration"
         );
 
         let explicit_dir = tempfile::tempdir().unwrap();
@@ -3100,7 +3102,7 @@ mod tests {
             .await
             .unwrap()
             .provider(Arc::new(NeverCalledProvider))
-            .config(copilot_config())
+            .config(openai_config())
             .build()
             .unwrap();
         assert_eq!(

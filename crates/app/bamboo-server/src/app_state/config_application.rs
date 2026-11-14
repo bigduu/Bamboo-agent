@@ -626,7 +626,6 @@ pub(super) fn boot_provider_is_complete(
         ("openai", providers.openai.is_some()),
         ("anthropic", providers.anthropic.is_some()),
         ("gemini", providers.gemini.is_some()),
-        ("copilot", providers.copilot.is_some()),
         ("bodhi", providers.bodhi.is_some()),
     ]
     .iter()

@@ -4683,10 +4683,6 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
         }
         candidate.extra = current.extra.clone();
     }
-    if let (Some(current), Some(candidate)) = (&current.copilot, &mut candidate.copilot) {
-        candidate.request_overrides = current.request_overrides.clone();
-        candidate.extra = current.extra.clone();
-    }
 }
 
 fn retain_mcp_credentials(

@@ -80,7 +80,6 @@ fn default_label_for_provider_type(provider_type: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "gemini" => "Gemini".to_string(),
-        "copilot" => "GitHub Copilot".to_string(),
         "bodhi" => "Bodhi".to_string(),
         other => other.to_string(),
     }
@@ -207,7 +206,9 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 }
 
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
-    validate_provider_type(&instance.provider_type)?;
+    if !bamboo_llm::is_configured_provider_type(&instance.provider_type) {
+        return validate_provider_type(&instance.provider_type);
+    }
     let mut config = bamboo_config::Config::default();
     config
         .provider_instances
@@ -248,14 +249,13 @@ fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), App
     }
 
     if instance.enabled
-        && instance.provider_type != "copilot"
         && instance.api_key.trim().is_empty()
         && instance.api_key_encrypted.is_none()
         && instance.credential_ref.is_none()
         && !bamboo_config::provider_instance_api_key_from_env(instance)
     {
         return Err(AppError::BadRequest(
-            "api_key is required for non-copilot providers".to_string(),
+            "api_key is required for enabled providers".to_string(),
         ));
     }
 
@@ -452,7 +452,6 @@ fn legacy_provider_alias_exists(config: &bamboo_config::Config, target_id: &str)
         "openai" => config.providers().openai.is_some(),
         "anthropic" => config.providers().anthropic.is_some(),
         "gemini" => config.providers().gemini.is_some(),
-        "copilot" => config.providers().copilot.is_some(),
         "bodhi" => config.providers().bodhi.is_some(),
         _ => false,
     }
@@ -766,6 +765,41 @@ mod tests {
 
     fn provider_and_credential_bytes(home: &std::path::Path) -> [Vec<u8>; 2] {
         ["providers.json", "credentials.json"].map(|name| std::fs::read(home.join(name)).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn retired_copilot_routes_and_provider_creation_are_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let before = provider_and_credential_bytes(home.path());
+        for provider_type in ["copilot", "bodhi"] {
+            let response = http_test::call_service(
+                &app,
+                http_test::TestRequest::post()
+                    .uri(INSTANCES_URL)
+                    .set_json(serde_json::json!({
+                        "type": provider_type, "config": {"api_key": "fixture-key"}
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = http_test::call_service(
+            &app,
+            http_test::TestRequest::post()
+                .uri("/api/v1/bamboo/copilot/auth/start")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(provider_and_credential_bytes(home.path()), before);
     }
 
     #[actix_web::test]
@@ -1847,7 +1881,7 @@ mod tests {
         let mut config = bamboo_config::Config::default();
         for (id, enabled) in [("z-last", true), ("a-first", true), ("disabled", false)] {
             let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": enabled
             }))
             .unwrap();

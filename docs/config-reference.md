@@ -102,6 +102,15 @@ not part of Bamboo Issue #597.
 
 ## Providers
 
+New provider instances use OpenAI (including compatible endpoints), Anthropic
+or Gemini. Existing Bodhi gateway configurations remain readable and editable.
+
+On upgrade, Bamboo removes GitHub Copilot instances and clears a default provider
+instance that selected one of them. References to those instances remain in
+saved model preferences and session history. Choose a supported provider and
+model in Settings to repair the affected preferences. Bamboo leaves old OAuth
+cache files and stored credentials on disk and no longer reads them for login.
+
 `provider_instances` is the durable and runtime authority. The legacy
 single-instance `provider` / `providers` shape remains accepted as a
 serde/migration compatibility input, most importantly so older installations
@@ -116,8 +125,8 @@ can be materialized into provider instances safely on cold start:
 }
 ```
 
-Each provider stanza (`OpenAIConfig` / `AnthropicConfig` / `GeminiConfig` /
-`CopilotConfig` / `BodhiConfig`, all in `config.rs`) shares this core shape —
+The general provider stanzas (`OpenAIConfig`, `AnthropicConfig` and
+`GeminiConfig` in `config.rs`) use fields such as
 `api_key` (write-only; persisted as `api_key_encrypted`, never re-emitted
 plaintext by `GET`), `base_url` (override the upstream endpoint — self-hosted
 proxies, Azure-style deployments, etc.), `model`, `fast_model`, `vision_model`,
@@ -126,10 +135,8 @@ onto the OpenAI Responses API path), `request_overrides` (provider-specific
 per-endpoint HTTP header/body tweaks), and an `extra` flatten for
 forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 `thinking_replay_always` (needed by some Anthropic-compatible upstreams, e.g.
-GLM's `/anthropic` endpoint). `BodhiConfig` adds `target_provider` (which of
-openai/anthropic/gemini the Bodhi proxy should present as). `CopilotConfig`
-has no `api_key` at all — it authenticates via a cached OAuth token
-(`headless_auth` for headless/CI login).
+GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
+`target_provider` to select `openai`, `anthropic` or `gemini`.
 
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
@@ -143,9 +150,9 @@ The server idempotently materializes a usable selected legacy provider into
 `provider_instances` when it opens the modular configuration. Built-in provider
 type names become stable instance ids (`openai`, `anthropic`, and so on), the
 selected id becomes `default_provider_instance`, and provider-specific fields
-such as Anthropic `max_tokens` / `thinking_replay_always`, Copilot
-`headless_auth`, and Bodhi `target_provider` are retained. Existing credential
-references are reused; plaintext is never copied into `providers.json`.
+such as Anthropic `max_tokens` and `thinking_replay_always` and the Bodhi gateway's
+`target_provider` are retained. Migration reuses existing credential references
+and keeps plaintext out of `providers.json`.
 Migration commits use the provider-section revision and the configuration
 facade's recoverable transaction protocol. Reopening an already migrated
 configuration is a byte/revision no-op. If the provider or credential authority
