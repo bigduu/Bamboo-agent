@@ -90,7 +90,7 @@ pub async fn validate_bamboo_config_patch(
     }
 
     if domains.provider {
-        if let Err(err) = bamboo_llm::validate_provider_config(&merged) {
+        if let Err(err) = config_manager::validate_provider_settings(&merged) {
             let (path, message) = provider_validation_issue(&merged, err.to_string());
             push_error("provider", path, message);
         }
@@ -477,8 +477,7 @@ pub(super) fn provider_validation_issue(
 ) -> (&'static str, String) {
     let effective = config.effective_default_provider();
     if let Some(instance) = config.provider_instances.get(effective) {
-        let configured = instance.provider_type == "copilot"
-            || !instance.api_key.trim().is_empty()
+        let configured = !instance.api_key.trim().is_empty()
             || instance.api_key_encrypted.is_some()
             || instance.credential_ref.is_some()
             || bamboo_config::provider_instance_environment_override_active(instance);

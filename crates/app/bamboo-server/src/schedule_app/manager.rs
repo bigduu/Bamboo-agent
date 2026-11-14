@@ -1407,7 +1407,6 @@ fn resolve_run_config_from_config(
                         && providers.openai.is_none()
                         && providers.anthropic.is_none()
                         && providers.gemini.is_none()
-                        && providers.copilot.is_none()
                         && providers.bodhi.is_none()
                         && providers.extra.is_empty();
                     if legacy_injected && !job.run_config.auto_execute {

@@ -213,6 +213,41 @@ pub fn build_merged_config(
 
     let mut new_config: Config = serde_json::from_value(merged)
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
+    if new_config.providers().extra.contains_key("copilot")
+        && !current.providers().extra.contains_key("copilot")
+    {
+        return Err(AppError::BadRequest(
+            "GitHub Copilot provider is no longer supported".to_string(),
+        ));
+    }
+    for (id, instance) in &new_config.provider_instances {
+        if current.is_retired_provider_alias(id) {
+            return Err(AppError::BadRequest(format!(
+                "Provider instance id '{id}' is reserved for a retired provider; use a new id"
+            )));
+        }
+        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str())
+            && !current
+                .provider_instances
+                .get(id)
+                .is_some_and(|existing| existing.provider_type == instance.provider_type)
+        {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported provider type '{}' for new provider instance '{id}'",
+                instance.provider_type
+            )));
+        }
+    }
+    new_config.preserve_provider_retirement(current);
+    let saved_default = new_config
+        .default_provider_instance
+        .as_deref()
+        .unwrap_or(&new_config.provider);
+    if new_config.is_retired_provider_alias(saved_default) {
+        return Err(AppError::BadRequest(
+            "The default provider instance was retired; select a configured provider".to_string(),
+        ));
+    }
     // An explicit `api_key: ""` clear must drop the round-tripped ciphertext
     // BEFORE hydration — otherwise hydration refills the plaintext from it and
     // the subsequent sync/save re-encrypts, silently undoing the clear (#516).
@@ -258,10 +293,41 @@ pub fn build_merged_config(
     Ok(new_config)
 }
 
+pub(crate) fn validate_provider_settings(config: &Config) -> Result<(), bamboo_llm::LLMError> {
+    if config.has_retired_provider_default() {
+        return Ok(());
+    }
+    bamboo_llm::validate_provider_config(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn compatibility_patch_preserves_retirement_and_rejects_reusing_an_alias() {
+        let mut current = Config::default();
+        current.provider = "copilot".into();
+        current.providers_mut().copilot_default_retired = true;
+        current
+            .providers_mut()
+            .retired_provider_aliases
+            .insert("openai".into());
+        let patch = serde_json::json!({
+            "providers": {"retired_provider_aliases": [], "copilot_default_retired": false}
+        });
+        let updated = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+        assert!(updated.has_retired_provider_default());
+        assert!(updated.is_retired_provider_alias("openai"));
+        let patch = serde_json::json!({
+            "provider_instances": {"openai": {"provider_type": "openai"}}
+        });
+        let error = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserved for a retired provider"));
+    }
 
     #[test]
     fn publisher_compatibility_patches_keep_revocations_and_explicit_empty_lists() {

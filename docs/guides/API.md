@@ -870,7 +870,7 @@ Bamboo follows a session-based architecture with unified server implementation:
 
 1. **Session**: Contains conversation history and state
 2. **Agent Loop**: Processes messages and executes tools
-3. **LLM Provider**: Communicates with AI model APIs (OpenAI, Anthropic, Gemini, Copilot)
+3. **LLM Provider**: Communicates with AI model APIs (OpenAI, Anthropic, Gemini)
 4. **Tool Executor**: Runs built-in tools (read, write, execute, etc.)
 5. **Event Broadcaster**: Streams real-time events via Server-Sent Events
 6. **Unified Server**: Single HTTP server with explicit routing (~120 routes)
@@ -882,7 +882,7 @@ Bamboo follows a session-based architecture with unified server implementation:
 - **Direct provider access**: No HTTP callbacks to self (eliminates proxy pattern)
 - **Handler organization** (`crates/bamboo-server/src/handlers/`):
   - Core agent handlers in `handlers/agent/` (chat, execute, events, stop, history, respond, etc.)
-  - Provider handlers in `handlers/` (openai/, anthropic/, gemini/, copilot_auth/, agent_api.rs)
+  - Provider handlers in `handlers/` (openai/, anthropic/, gemini/, agent_api.rs)
   - Feature handlers in `handlers/` (settings/, tools/, workspace/, skill/, command/)
 
 ---

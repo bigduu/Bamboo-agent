@@ -5,13 +5,11 @@
 pub mod anthropic;
 pub mod bodhi;
 pub mod common;
-pub mod copilot;
 pub mod gemini;
 pub mod openai;
 
 pub use anthropic::AnthropicProvider;
 pub use bodhi::BodhiProvider;
-pub use copilot::CopilotProvider;
 pub use gemini::GeminiProvider;
 pub use openai::OpenAIProvider;
 

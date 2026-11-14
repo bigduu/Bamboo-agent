@@ -1885,11 +1885,11 @@ pub struct ConfigValues {
     /// Stable credential-store reference for proxy authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_auth_credential_ref: Option<crate::CredentialRef>,
-    /// Deprecated: Use `providers.copilot.headless_auth` instead
+    /// Legacy setting retained for configuration round trips.
     #[serde(default)]
     pub headless_auth: bool,
 
-    /// Default LLM provider to use (e.g., "anthropic", "openai", "gemini", "copilot")
+    /// Default LLM provider to use (e.g., "anthropic", "openai", "gemini")
     #[serde(default = "default_provider")]
     pub provider: String,
 
@@ -2493,6 +2493,7 @@ define_counted_struct! {
         pub(crate) memory: crate::MemoryConfigModule,
         pub(crate) subagents: crate::SubagentsConfigModule,
         pub(crate) providers: crate::ProviderConfigsModule,
+        retired_provider_env_override: bool,
         recovery_status: Option<ConfigRecoveryStatus>,
     }
     count pub CONFIG_FIELD_COUNT;
@@ -2622,12 +2623,16 @@ pub struct ProviderConfigs {
     /// Google Gemini provider configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini: Option<GeminiConfig>,
-    /// GitHub Copilot provider configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub copilot: Option<CopilotConfig>,
     /// Bodhi proxy provider configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bodhi: Option<BodhiConfig>,
+
+    /// Routing aliases that were exact Copilot instance IDs before migration.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_provider_aliases: BTreeSet<String>,
+    /// The previous default was retired and requires explicit reconfiguration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub copilot_default_retired: bool,
 
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
@@ -2641,7 +2646,7 @@ impl ProviderConfigs {
         self.openai = None;
         self.anthropic = None;
         self.gemini = None;
-        self.copilot = None;
+        self.extra.remove("copilot");
         self.bodhi = None;
         self.extra.remove("provider");
     }
@@ -3356,59 +3361,6 @@ pub struct GeminiConfig {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// GitHub Copilot provider configuration
-///
-/// # Example
-///
-/// ```json
-/// "copilot": {
-///   "enabled": true,
-///   "headless_auth": false,
-///   "model": "gpt-4o"
-/// }
-/// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CopilotConfig {
-    /// Whether Copilot provider is enabled
-    #[serde(default)]
-    pub enabled: bool,
-    /// Print login URL to console instead of opening browser
-    #[serde(default)]
-    pub headless_auth: bool,
-    /// Default model to use for Copilot (used when clients request the "default" model)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Fast/cheap model for lightweight tasks (title generation, mermaid fix, summarization).
-    /// Falls back to `model` when not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fast_model: Option<String>,
-    /// Vision-capable model for image understanding tasks.
-    /// Falls back to `model` when not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_model: Option<String>,
-    /// Default reasoning effort for Copilot requests.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
-
-    /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
-    ///
-    /// This is useful for newer Copilot models that only support Responses-style requests.
-    ///
-    /// Example:
-    /// ```json
-    /// "responses_only_models": ["gpt-5.3-codex", "gpt-5*"]
-    /// ```
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub responses_only_models: Vec<String>,
-    /// Optional request overrides (headers/body patches/model rules).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_overrides: Option<RequestOverridesConfig>,
-
-    /// Preserve unknown keys under `providers.copilot`.
-    #[serde(default, flatten)]
-    pub extra: BTreeMap<String, Value>,
-}
-
 /// Bodhi proxy provider configuration.
 ///
 /// Routes LLM requests through a bodhi-server instance so that raw provider
@@ -3479,8 +3431,8 @@ fn default_provider() -> String {
 pub struct ProviderInstanceConfig {
     /// Which provider backend this instance targets.
     ///
-    /// Must be one of [`AVAILABLE_PROVIDERS`]: `"openai"`, `"anthropic"`,
-    /// `"gemini"`, `"copilot"`, `"bodhi"`.
+    /// New instances use `"openai"`, `"anthropic"` or `"gemini"`.
+    /// Existing gateway instances can use `"bodhi"`.
     pub provider_type: String,
 
     /// Human-readable label shown in the UI / catalog.
@@ -3699,6 +3651,7 @@ impl Config {
             memory: crate::MemoryConfigModule(memory),
             subagents: crate::SubagentsConfigModule(subagents),
             providers: crate::ProviderConfigsModule(providers),
+            retired_provider_env_override: false,
             recovery_status: None,
         }
     }
@@ -3865,6 +3818,7 @@ impl Config {
         config.normalize_skill_settings();
         config.normalize_plugin_trust_settings();
         config.extra.remove("data_dir");
+        crate::provider_instance::retire_copilot(&mut config);
         if apply_env {
             config.apply_env_overrides();
         }
@@ -4132,6 +4086,7 @@ impl Config {
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
         config.extra.remove("data_dir");
+        crate::provider_instance::retire_copilot(&mut config);
 
         // Apply environment variable overrides (highest priority). Skipped by
         // one-shot CLI writers (`bamboo init` / `config set`) so transient
@@ -4154,6 +4109,7 @@ impl Config {
     /// config. Factored out so one-shot writers can skip it (see
     /// [`Config::from_data_dir_without_env`]).
     fn apply_env_overrides(&mut self) {
+        crate::provider_instance::retire_copilot(self);
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
             if let Ok(port) = port.parse() {
                 self.server.port = port;
@@ -4168,9 +4124,14 @@ impl Config {
         // mode the override may name either an exact instance id or a provider
         // type. Type matches are ordered by instance id so the result is
         // deterministic even for a multi-account configuration.
+        self.retired_provider_env_override = false;
         if let Ok(provider) = crate::runtime_env_var("BAMBOO_PROVIDER") {
             let provider = provider.trim().to_string();
-            if !provider.is_empty() {
+            if self.is_retired_provider_alias(&provider)
+                || (provider == "copilot" && !self.provider_instances.contains_key(&provider))
+            {
+                self.retired_provider_env_override = true;
+            } else if !provider.is_empty() {
                 self.provider = provider.clone();
                 if !self.provider_instances.is_empty() {
                     let selected = self
@@ -4543,8 +4504,7 @@ impl Config {
     /// When `features.provider_model_ref` is enabled, reads from `defaults.chat`
     /// before falling back to legacy provider-specific config.
     ///
-    /// Note: for most providers this is a required config value (returns None when absent).
-    /// Copilot has a built-in fallback when no model is configured.
+    /// Returns None when no model is configured.
     pub fn get_model(&self) -> Option<String> {
         if self.features.provider_model_ref {
             if let Some(model_ref) = self.defaults.as_ref().map(|d| &d.chat) {
@@ -4553,10 +4513,7 @@ impl Config {
         }
         let provider = self.effective_default_provider();
         if let Some(instance) = self.provider_instances.get(provider) {
-            return instance
-                .model
-                .clone()
-                .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()));
+            return instance.model.clone();
         }
         match provider {
             "openai" => self.providers.openai.as_ref().and_then(|c| c.model.clone()),
@@ -4566,13 +4523,6 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.model.clone()),
             "gemini" => self.providers.gemini.as_ref().and_then(|c| c.model.clone()),
-            "copilot" => Some(
-                self.providers
-                    .copilot
-                    .as_ref()
-                    .and_then(|c| c.model.clone())
-                    .unwrap_or_else(|| "gpt-4o".to_string()),
-            ),
             _ => None,
         }
     }
@@ -4608,11 +4558,6 @@ impl Config {
                 "gemini" => self
                     .providers
                     .gemini
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                "copilot" => self
-                    .providers
-                    .copilot
                     .as_ref()
                     .and_then(|c| c.fast_model.clone()),
                 _ => None,
@@ -4753,11 +4698,6 @@ impl Config {
                     .gemini
                     .as_ref()
                     .and_then(|c| c.vision_model.clone()),
-                "copilot" => self
-                    .providers
-                    .copilot
-                    .as_ref()
-                    .and_then(|c| c.vision_model.clone()),
                 _ => None,
             }
         };
@@ -4780,7 +4720,7 @@ impl Config {
 
     /// Resolve the configured default reasoning effort for a provider routing key.
     ///
-    /// The key may be a multi-instance provider id (for example `"copilot-work"`)
+    /// The key may be a multi-instance provider id (for example `"openai-work"`)
     /// or a legacy provider type (for example `"openai"`). In multi-instance mode
     /// the per-instance `reasoning_effort` lives under `provider_instances[<id>]`,
     /// so we resolve instance ids there first; otherwise we fall back to the
@@ -4813,11 +4753,6 @@ impl Config {
             "gemini" => self
                 .providers
                 .gemini
-                .as_ref()
-                .and_then(|c| c.reasoning_effort),
-            "copilot" => self
-                .providers
-                .copilot
                 .as_ref()
                 .and_then(|c| c.reasoning_effort),
             "bodhi" => self
@@ -4899,9 +4834,41 @@ impl Config {
     /// Prefers `default_provider_instance` when set; falls back to the
     /// legacy `provider` string.
     pub fn effective_default_provider(&self) -> &str {
+        if self.has_retired_provider_default() {
+            return "";
+        }
         self.default_provider_instance
             .as_deref()
             .unwrap_or(&self.provider)
+    }
+
+    pub fn has_retired_provider_default(&self) -> bool {
+        self.retired_provider_env_override || self.has_saved_retired_provider_default()
+    }
+
+    pub fn has_saved_retired_provider_default(&self) -> bool {
+        self.default_provider_instance.is_none()
+            && self.provider == "copilot"
+            && self.providers().copilot_default_retired
+    }
+
+    /// An SDK caller's explicit provider selection outranks a runtime override.
+    pub fn clear_retired_provider_env_override(&mut self) {
+        self.retired_provider_env_override = false;
+    }
+
+    pub fn is_retired_provider_alias(&self, id: &str) -> bool {
+        self.providers().retired_provider_aliases.contains(id)
+            && !self.provider_instances.contains_key(id)
+    }
+
+    /// Keep the server-owned migration metadata and the runtime-only override
+    /// when a compatibility write or section publication reconstructs Config.
+    pub fn preserve_provider_retirement(&mut self, source: &Self) {
+        self.providers.0.retired_provider_aliases =
+            source.providers.0.retired_provider_aliases.clone();
+        self.providers.0.copilot_default_retired = source.providers.0.copilot_default_retired;
+        self.retired_provider_env_override = source.retired_provider_env_override;
     }
 
     /// Whether provider instances are configured (new multi-instance path).
@@ -9480,6 +9447,33 @@ mod tests {
         assert_eq!(config.server.port, 9999);
         assert_eq!(config.server.bind, "192.168.1.1");
         assert_eq!(config.provider, "openai");
+    }
+
+    #[test]
+    fn retired_provider_env_override_leaves_saved_default_unchanged() {
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("copilot"));
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "default_provider_instance": "work",
+            "provider_instances": {
+                "work": {"provider_type": "anthropic"}
+            }
+        }))
+        .unwrap();
+        config.apply_runtime_env_overrides();
+        assert_eq!(config.effective_default_provider(), "");
+        assert!(!config.has_saved_retired_provider_default());
+        let saved: Config =
+            serde_json::from_value(config.to_compatibility_value().unwrap()).unwrap();
+        assert_eq!(saved.effective_default_provider(), "work");
+
+        config.provider_instances.insert(
+            "copilot".into(),
+            serde_json::from_value(serde_json::json!({"provider_type": "openai"})).unwrap(),
+        );
+        config.apply_runtime_env_overrides();
+        assert_eq!(config.effective_default_provider(), "copilot");
     }
 
     #[test]
