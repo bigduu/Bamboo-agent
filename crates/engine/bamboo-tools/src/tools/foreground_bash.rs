@@ -397,6 +397,7 @@ struct OutputAccumulator {
     decoded_bytes: usize,
     completed_lines: usize,
     last_line_bytes: usize,
+    open_line_bytes: usize,
     spill: Option<Spill>,
 }
 
@@ -461,10 +462,17 @@ impl OutputAccumulator {
         self.completed_lines = self
             .completed_lines
             .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
-        self.last_line_bytes = match text.rsplit_once('\n') {
-            Some((_, line)) => line.len(),
-            None => self.last_line_bytes.saturating_add(text.len()),
-        };
+        if let Some((complete, tail)) = text.rsplit_once('\n') {
+            let length = complete.rsplit_once('\n').map_or_else(
+                || self.open_line_bytes.saturating_add(complete.len()),
+                |(_, line)| line.len(),
+            );
+            self.open_line_bytes = tail.len();
+            self.last_line_bytes = if tail.is_empty() { length } else { tail.len() };
+        } else {
+            self.open_line_bytes = self.open_line_bytes.saturating_add(text.len());
+            self.last_line_bytes = self.open_line_bytes;
+        }
         self.tail.push_str(text);
         if self.tail.len() > 2 * ROLLING_TAIL_BYTES {
             let start = self
@@ -477,7 +485,7 @@ impl OutputAccumulator {
 
     fn total_lines(&self) -> usize {
         self.completed_lines
-            .saturating_add(usize::from(self.last_line_bytes > 0))
+            .saturating_add(usize::from(self.open_line_bytes > 0))
     }
 
     fn truncated(&self) -> bool {
@@ -527,6 +535,7 @@ impl OutputAccumulator {
         let snapshot = if self.tail_starts_midline {
             self.tail
                 .split_once('\n')
+                .filter(|(_, rest)| !rest.is_empty())
                 .map_or(self.tail.as_str(), |(_, rest)| rest)
         } else {
             self.tail.as_str()
@@ -673,20 +682,27 @@ mod tests {
     #[tokio::test]
     async fn partial_last_line_stays_within_byte_limit_at_utf8_boundary() {
         let mut output = OutputAccumulator::default();
-        let complete = format!("first\n{}", "汉".repeat(MAX_BYTES));
-        for chunk in complete.as_bytes().chunks(8192) {
-            output.append(chunk).await.unwrap();
+        for ending in ["", "\n"] {
+            let complete = format!("first\n{}{ending}", "汉".repeat(MAX_BYTES * 2));
+            for chunk in complete.as_bytes().chunks(8192) {
+                output.append(chunk).await.unwrap();
+            }
+            output.finish().await.unwrap();
+            let result = std::mem::take(&mut output)
+                .into_text("(no output)")
+                .unwrap();
+            let path = extract_output_path(&result);
+            let saved = std::fs::read(path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let (visible, notice) = result.split_once("\n\n[Showing ").unwrap();
+            assert!(
+                notice.starts_with("last 50.0KB of line 2 (line is 300.0KB)."),
+                "{notice}"
+            );
+            assert!(visible.len() <= MAX_BYTES);
+            assert!(visible.chars().all(|c| c == '汉'));
+            assert_eq!(saved, complete.as_bytes());
         }
-        output.finish().await.unwrap();
-        let result = output.into_text("(no output)").unwrap();
-        let path = extract_output_path(&result);
-        let saved = std::fs::read(path).unwrap();
-        std::fs::remove_file(path).unwrap();
-        let (visible, notice) = result.split_once("\n\n[Showing ").unwrap();
-        assert!(notice.starts_with("last 50.0KB of line 2 (line is 150.0KB)."));
-        assert!(visible.len() <= MAX_BYTES);
-        assert!(visible.chars().all(|c| c == '汉'));
-        assert_eq!(saved, complete.as_bytes());
     }
 
     #[tokio::test]
