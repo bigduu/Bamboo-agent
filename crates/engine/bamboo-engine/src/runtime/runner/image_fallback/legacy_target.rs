@@ -56,18 +56,14 @@ fn selected_target(
         .map(str::to_string)
         .or_else(|| {
             configured_instance(config, active_provider).and_then(|instance| {
-                let copilot_default =
-                    (instance.provider_type == "copilot").then(|| "gpt-4o".to_string());
                 instance
                     .vision_model
                     .or(instance.fast_model)
                     .or(instance.model)
-                    .or(copilot_default)
             })
         })
         .or_else(|| {
-            // Copilot has a built-in default even with no explicit instance
-            // fields. Never borrow another account's default.
+            // Only consult the default model for the active provider.
             (config.defaults.is_none() && config.effective_default_provider() == active_provider)
                 .then(|| config.get_vision_model())
                 .flatten()

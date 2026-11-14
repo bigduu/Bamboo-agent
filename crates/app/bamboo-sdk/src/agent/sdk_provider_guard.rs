@@ -19,7 +19,6 @@ pub(super) enum SdkBinding {
     Native(Arc<SdkProviderBinding>),
     Instance,
     Legacy { alias_sensitive: bool },
-    ImplicitCopilot,
     Opaque { alias_sensitive: bool },
 }
 
@@ -30,7 +29,6 @@ fn has_legacy(config: &Config, provider: &str) -> bool {
         "anthropic" => providers.anthropic.is_some(),
         "gemini" => providers.gemini.is_some(),
         "bodhi" => providers.bodhi.is_some(),
-        "copilot" => providers.copilot.is_some(),
         _ => false,
     }
 }
@@ -50,16 +48,9 @@ pub(super) fn caller_binding(
     active_scope: Option<&str>,
 ) -> SdkBinding {
     let alias_sensitive =
-        bamboo_llm::AVAILABLE_PROVIDERS.contains(&provider) && active_scope != Some(provider);
+        bamboo_llm::is_configured_provider_type(provider) && active_scope != Some(provider);
     if config.provider_instances.contains_key(provider) {
         SdkBinding::Instance
-    } else if provider == "copilot"
-        && active_scope == Some(provider)
-        && !has_legacy(config, provider)
-    {
-        // The named, caller-owned Copilot client is fixed at assembly; a later
-        // change to the global default does not change its implicit source.
-        SdkBinding::ImplicitCopilot
     } else if has_legacy(config, provider) {
         SdkBinding::Legacy { alias_sensitive }
     } else {
@@ -74,15 +65,7 @@ pub(super) fn validate_binding(
     model: Option<&str>,
 ) -> Result<(), LLMError> {
     let instance = config.provider_instances.get(provider);
-    if instance.is_some_and(|instance| !instance.enabled)
-        || (instance.is_none()
-            && provider == "copilot"
-            && config
-                .providers()
-                .copilot
-                .as_ref()
-                .is_some_and(|copilot| !copilot.enabled && config.provider != "copilot"))
-    {
+    if instance.is_some_and(|instance| !instance.enabled) {
         return Err(LLMError::Api(
             "sdk_provider_binding: configured provider is disabled".into(),
         ));
@@ -93,9 +76,6 @@ pub(super) fn validate_binding(
             .provider_instances
             .get(provider)
             .is_some_and(|instance| instance.enabled),
-        SdkBinding::ImplicitCopilot => {
-            provider == "copilot" && instance.is_none() && config.providers().copilot.is_none()
-        }
         SdkBinding::Legacy { alias_sensitive } => {
             !config.provider_instances.contains_key(provider)
                 && has_legacy(config, provider)
@@ -317,10 +297,11 @@ mod tests {
 
     fn fixture(fail: bool) -> (Arc<BoundSdkProvider>, Arc<RwLock<Config>>, Arc<Probe>) {
         let mut config = Config::default();
-        config.provider = "copilot".into();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig::default());
         config.provider_instances.clear();
         config.default_provider_instance = None;
-        let binding = Arc::new(SdkProviderBinding::capture(&config, "copilot", false).unwrap());
+        let binding = Arc::new(SdkProviderBinding::capture(&config, "openai", false).unwrap());
         let config = Arc::new(RwLock::new(config));
         let probe = Arc::new(Probe {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -330,7 +311,7 @@ mod tests {
             delegate: probe.clone(),
             config: config.clone(),
             binding: SdkBinding::Native(binding),
-            provider: "copilot".into(),
+            provider: "openai".into(),
             single_use: false,
             refused: AtomicBool::new(false),
         });
@@ -450,8 +431,10 @@ mod tests {
         let root: Arc<dyn LLMProvider> = Arc::new(BoundSdkProvider {
             delegate: switching.clone(),
             config,
-            provider: "copilot".into(),
-            binding: SdkBinding::ImplicitCopilot,
+            provider: "openai".into(),
+            binding: SdkBinding::Legacy {
+                alias_sensitive: false,
+            },
             single_use: false,
             refused: AtomicBool::new(false),
         });
@@ -479,91 +462,5 @@ mod tests {
             .unwrap();
         assert_eq!(a.calls.load(Ordering::SeqCst), 1);
         assert_eq!(b.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn sdk_caller_copilot_disabled_refuses_model_catalog_without_dispatch() {
-        let mut config = Config::default();
-        config.provider = "anthropic".into();
-        config.provider_instances.clear();
-        for initially_configured in [false, true] {
-            let mut initial = config.clone();
-            initial.providers_mut().copilot = if initially_configured {
-                Some(serde_json::from_value(serde_json::json!({"enabled": true})).unwrap())
-            } else {
-                None
-            };
-            let binding = caller_binding(&initial, "copilot", Some("anthropic"));
-            let shared = Arc::new(RwLock::new(initial));
-            let probe = Arc::new(Probe {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                fail: false,
-            });
-            let provider = BoundSdkProvider {
-                delegate: probe.clone(),
-                config: shared.clone(),
-                binding,
-                provider: "copilot".into(),
-                single_use: false,
-                refused: AtomicBool::new(false),
-            };
-            shared.write().await.providers_mut().copilot =
-                Some(serde_json::from_value(serde_json::json!({"enabled": false})).unwrap());
-            assert!(provider.known_pre_dispatch_error().is_some());
-            assert!(provider.list_model_info().await.is_err());
-            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
-        }
-    }
-    #[tokio::test]
-    async fn sdk_caller_implicit_copilot_survives_unrelated_instance_but_rejects_rebinding() {
-        let mut config = Config::default();
-        config.provider = "copilot".into();
-        config.default_provider_instance = None;
-        config.provider_instances.clear();
-        config.providers_mut().copilot = None;
-        let binding = caller_binding(&config, "copilot", Some("copilot"));
-        let shared = Arc::new(RwLock::new(config));
-        let probe = Arc::new(Probe {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            fail: false,
-        });
-        let provider = BoundSdkProvider {
-            delegate: probe.clone(),
-            config: shared.clone(),
-            binding,
-            provider: "copilot".into(),
-            single_use: false,
-            refused: AtomicBool::new(false),
-        };
-        let _stream = provider
-            .chat_stream(&[], &[], None, "model-a")
-            .await
-            .unwrap();
-        shared.write().await.provider_instances.insert(
-            "unrelated".into(),
-            serde_json::from_value(serde_json::json!({
-                "provider_type":"openai", "enabled":true, "model":"unrelated"
-            }))
-            .unwrap(),
-        );
-        let _stream = provider
-            .chat_stream(&[], &[], None, "model-a")
-            .await
-            .unwrap();
-        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
-        for enabled in [true, false] {
-            shared.write().await.provider_instances.insert(
-                "copilot".into(),
-                serde_json::from_value(serde_json::json!({
-                    "provider_type":"copilot", "enabled":enabled
-                }))
-                .unwrap(),
-            );
-            assert!(provider
-                .chat_stream(&[], &[], None, "model-a")
-                .await
-                .is_err());
-            assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
-        }
     }
 }

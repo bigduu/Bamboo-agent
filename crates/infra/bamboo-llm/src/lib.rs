@@ -51,11 +51,11 @@ pub use provider::{
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
 };
 pub use provider_factory::{
-    create_provider, create_provider_by_name, create_provider_with_dir, validate_provider_config,
-    AVAILABLE_PROVIDERS,
+    create_provider, create_provider_by_name, create_provider_with_dir,
+    is_configured_provider_type, validate_provider_config, AVAILABLE_PROVIDERS,
 };
 pub use provider_registry::ProviderRegistry;
-pub use providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
+pub use providers::{AnthropicProvider, GeminiProvider, OpenAIProvider};
 pub use resolved_model::ResolvedModel;
 pub use router::ProviderModelRouter;
 pub use types::LLMChunk;

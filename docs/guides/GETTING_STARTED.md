@@ -18,8 +18,8 @@ Or build/run straight from the workspace without installing:
 bamboo init
 ```
 
-Interactive: picks a provider (`anthropic`/`openai`/`gemini`/`copilot`/
-`bodhi`) and prompts for an API key. Non-interactive form for scripts/CI:
+The interactive wizard prompts for a provider (`anthropic`, `openai`, or
+`gemini`) and its API key. Scripts can run it non-interactively.
 
 ```bash
 bamboo init --non-interactive --provider anthropic --api-key "sk-ant-..."

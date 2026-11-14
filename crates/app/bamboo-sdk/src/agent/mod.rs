@@ -686,13 +686,18 @@ impl Agent {
             }
             return Ok(requested.to_string());
         }
+        if config.is_some_and(|config| config.is_retired_provider_alias(requested)) {
+            return Err(Self::sdk_binding_error(format!(
+                "provider instance '{requested}' was retired"
+            )));
+        }
         if self.provider_scope.as_deref() == Some(requested) {
             return Ok(requested.to_string());
         }
         let config = config.ok_or_else(|| {
             Self::sdk_binding_error("provider alias cannot be verified for this client")
         })?;
-        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested) {
+        if !bamboo_llm::is_configured_provider_type(requested) {
             return Err(Self::sdk_binding_error(format!(
                 "unknown provider instance or type '{requested}'"
             )));
@@ -736,7 +741,7 @@ impl Agent {
         }
         let configured = config.is_some_and(|config| {
             config.provider_instances.contains_key(requested)
-                || (bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested)
+                || (bamboo_llm::is_configured_provider_type(requested)
                     && config
                         .provider_instances
                         .values()
@@ -1365,7 +1370,7 @@ impl Agent {
                 if target.provider == scope
                     && !config.provider_instances.contains_key(scope)
                     && config.effective_default_provider() != scope
-                    && bamboo_llm::AVAILABLE_PROVIDERS.contains(&scope)
+                    && bamboo_llm::is_configured_provider_type(scope)
                     && config
                         .provider_instances
                         .values()

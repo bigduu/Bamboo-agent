@@ -7,7 +7,13 @@ pub(super) fn configured_instances(config: &Config) -> BTreeMap<String, Provider
     let mut instances: BTreeMap<_, _> = crate::synthesize_legacy_instances(config)
         .into_iter()
         .collect();
-    instances.extend(config.provider_instances.clone());
+    instances.extend(
+        config
+            .provider_instances
+            .iter()
+            .filter(|(_, instance)| instance.provider_type != "copilot")
+            .map(|(id, instance)| (id.clone(), instance.clone())),
+    );
     instances
 }
 
@@ -62,7 +68,6 @@ pub fn select_bundle(config: &Config, selection: &ShareSelection) -> ShareResult
             "openai" => ShareProviderType::Openai,
             "anthropic" => ShareProviderType::Anthropic,
             "gemini" => ShareProviderType::Gemini,
-            "copilot" => ShareProviderType::Copilot,
             "bodhi" => ShareProviderType::Bodhi,
             _ => return Err(ShareError::Unsupported),
         };
