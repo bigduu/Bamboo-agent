@@ -429,6 +429,11 @@ pub async fn put_provider_settings_section(
 
             for (id, instance) in &provider_instances {
                 let Some(existing) = current.provider_instances.get(id) else {
+                    if current.is_retired_provider_alias(id) {
+                        return Err(ConfigSectionMutationError::Invalid(format!(
+                            "provider instance id '{id}' is reserved for a retired provider; use a new id"
+                        )));
+                    }
                     if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str()) {
                         return Err(ConfigSectionMutationError::Invalid(format!(
                             "provider type '{}' cannot be used for new provider instances",
@@ -482,9 +487,11 @@ pub async fn put_provider_settings_section(
                 &credential_changes.provider_instances,
             )?;
             validate_provider_settings_default(candidate)?;
-            bamboo_llm::validate_provider_config(candidate).map_err(|error| {
-                ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
-            })?;
+            if !candidate.has_retired_provider_default() {
+                bamboo_llm::validate_provider_config(candidate).map_err(|error| {
+                    ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
+                })?;
+            }
             Ok((provider_intents, provider_instance_intents))
         })
         .await
@@ -907,7 +914,8 @@ fn validate_provider_settings_default(
     candidate: &bamboo_config::Config,
 ) -> Result<(), ConfigSectionMutationError> {
     let Some(default_id) = candidate.default_provider_instance.as_deref() else {
-        if candidate.provider_instances.is_empty()
+        if candidate.has_retired_provider_default()
+            || candidate.provider_instances.is_empty()
             || provider_exists(candidate.providers(), &candidate.provider)
         {
             return Ok(());
@@ -934,7 +942,10 @@ fn retain_provider_settings_server_owned_fields(
     // Unknown forward-compatible metadata is intentionally not exposed by the
     // network DTO because its contents cannot be classified as non-secret.
     // Preserve it from the process-owned snapshot just like credential refs.
-    candidate.providers_mut().extra = secret_free_provider_extra(&current.providers().extra);
+    let providers = candidate.providers_mut();
+    providers.extra = secret_free_provider_extra(&current.providers().extra);
+    providers.retired_provider_aliases = current.providers().retired_provider_aliases.clone();
+    providers.copilot_default_retired = current.providers().copilot_default_retired;
     macro_rules! retain_env_provider {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (

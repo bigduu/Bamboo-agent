@@ -130,6 +130,11 @@ pub fn resolve_provider_routing_key(
         }
         return require_live(requested);
     }
+    if config.is_retired_provider_alias(requested) {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{requested}' was retired; select a configured provider instance"
+        )));
+    }
 
     // Legacy and hybrid aliases are registered under their exact type key.
     if provider_registry.get(requested).is_some() {
@@ -1412,6 +1417,18 @@ mod tests {
         config.provider_instances.remove("openai");
         assert_eq!(
             resolve_provider_routing_key(&config, "openai", &registry).unwrap(),
+            "a-openai"
+        );
+        config
+            .providers_mut()
+            .retired_provider_aliases
+            .insert("openai".into());
+        assert!(resolve_provider_routing_key(&config, "openai", &registry)
+            .unwrap_err()
+            .to_string()
+            .contains("was retired"));
+        assert_eq!(
+            resolve_provider_routing_key(&config, "a-openai", &registry).unwrap(),
             "a-openai"
         );
         assert!(resolve_provider_routing_key(&config, "typo", &registry).is_err());

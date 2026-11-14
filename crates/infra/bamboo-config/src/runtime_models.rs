@@ -61,6 +61,9 @@ fn instance_model_inputs(instance: &ProviderInstanceConfig) -> ModelInputs<'_> {
 // legacy fields relevant to admission are enabled, model selections, and the
 // runtime_models extra field.
 fn legacy_model_inputs<'a>(config: &'a Config, id: &str) -> Option<ModelInputs<'a>> {
+    if config.is_retired_provider_alias(id) {
+        return None;
+    }
     let providers = config.providers();
     match id {
         "openai" => providers.openai.as_ref().map(|entry| ModelInputs {
@@ -215,7 +218,8 @@ fn default_refs(
 /// as runtime routing. An explicit instance or legacy alias retains its identity.
 pub fn configured_provider_routing_key(config: &Config, provider: &str) -> String {
     let provider = provider.trim();
-    if config.provider_instances.contains_key(provider)
+    if config.is_retired_provider_alias(provider)
+        || config.provider_instances.contains_key(provider)
         || ((!config.has_provider_instances() || config.effective_default_provider() == provider)
             && legacy_model_inputs(config, provider).is_some())
     {

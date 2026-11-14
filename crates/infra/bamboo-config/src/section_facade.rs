@@ -1069,20 +1069,35 @@ fn retire_copilot_from_provider_document(value: &mut Value) {
             Some(instance) => {
                 instance.get("provider_type").and_then(Value::as_str) == Some("copilot")
             }
-            None => explicit_default.is_some() && id == "copilot",
+            None => id == "copilot",
         }
     });
+    let mut retired_aliases: BTreeSet<String> = object
+        .get("retired_provider_aliases")
+        .and_then(|aliases| serde_json::from_value(aliases.clone()).ok())
+        .unwrap_or_default();
     if let Some(instances) = object
         .get_mut("provider_instances")
         .and_then(Value::as_object_mut)
     {
-        instances.retain(|_, instance| {
-            instance.get("provider_type").and_then(Value::as_str) != Some("copilot")
+        instances.retain(|id, instance| {
+            let retired = instance.get("provider_type").and_then(Value::as_str) == Some("copilot");
+            if retired && crate::provider_instance::is_provider_alias(id) {
+                retired_aliases.insert(id.clone());
+            }
+            !retired
         });
+    }
+    if !retired_aliases.is_empty() {
+        object.insert(
+            "retired_provider_aliases".into(),
+            serde_json::json!(retired_aliases),
+        );
     }
     if retired_default {
         object.remove("default_provider_instance");
         object.insert("provider".into(), Value::String("copilot".into()));
+        object.insert("copilot_default_retired".into(), Value::Bool(true));
     }
 }
 
@@ -7261,6 +7276,44 @@ mod tests {
             reopened.registry().providers.snapshot().revision,
             before + 1
         );
+    }
+
+    #[test]
+    fn retirement_keeps_a_supported_exact_copilot_id_and_reserves_removed_aliases() {
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "copilot",
+                "provider_instances": {
+                    "copilot": {"provider_type": "openai", "model": "shared"},
+                    "openai": {"provider_type": "copilot", "model": "shared"}
+                },
+                "providers": {"openai": {"model": "shared"}},
+                "defaults": {"chat": {"provider": "openai", "model": "shared"}}
+            }),
+        );
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let config = facade.effective_config();
+        assert_eq!(config.effective_default_provider(), "copilot");
+        assert!(!config.has_retired_provider_default());
+        assert_eq!(config.provider_instances.len(), 1);
+        assert!(config.is_retired_provider_alias("openai"));
+        assert_eq!(
+            crate::configured_provider_routing_key(&config, "openai"),
+            "openai"
+        );
+        assert!(crate::provider_runtime_models(&config, "openai")
+            .unwrap()
+            .is_empty());
+        drop(facade);
+
+        let reopened = ConfigFacade::open_or_migrate(dir.path())
+            .unwrap()
+            .effective_config();
+        assert_eq!(reopened.effective_default_provider(), "copilot");
+        assert!(reopened.is_retired_provider_alias("openai"));
+        assert!(!reopened.provider_instances.contains_key("openai"));
     }
 
     #[test]

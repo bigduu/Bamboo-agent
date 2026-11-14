@@ -154,6 +154,10 @@ impl PortableToolExecution {
     pub(super) fn execution_name(&self) -> &str {
         &self.name
     }
+
+    pub(super) fn input(&self) -> &serde_json::Value {
+        &self.input
+    }
 }
 
 #[cfg(test)]
@@ -161,9 +165,13 @@ impl PortableToolExecution {
     /// Declare an already-selected executor identity for result-contract tests.
     /// Model catalog admission is covered separately by the promotion tests.
     pub(super) fn selected_identity_fixture(execution_name: &str) -> Self {
+        Self::with_input_fixture(execution_name, serde_json::json!({}))
+    }
+
+    pub(super) fn with_input_fixture(execution_name: &str, input: serde_json::Value) -> Self {
         Self {
             name: execution_name.to_owned(),
-            input: serde_json::json!({}),
+            input,
         }
     }
 }

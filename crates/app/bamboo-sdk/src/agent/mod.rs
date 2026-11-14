@@ -686,6 +686,11 @@ impl Agent {
             }
             return Ok(requested.to_string());
         }
+        if config.is_some_and(|config| config.is_retired_provider_alias(requested)) {
+            return Err(Self::sdk_binding_error(format!(
+                "provider instance '{requested}' was retired"
+            )));
+        }
         if self.provider_scope.as_deref() == Some(requested) {
             return Ok(requested.to_string());
         }

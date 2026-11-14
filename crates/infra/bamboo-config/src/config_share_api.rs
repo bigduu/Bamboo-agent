@@ -233,6 +233,8 @@ fn reject_network_initialization(config: &Config) -> Result<(), ShareApiError> {
             .provider_instances
             .values()
             .any(|instance| instance.enabled && instance.provider_type == "copilot")
+        || (config.effective_default_provider() == "copilot"
+            && !config.provider_instances.contains_key("copilot"))
         || config.effective_default_provider().is_empty()
     {
         return Err(ShareApiError::RuntimeBoundary);
@@ -332,12 +334,6 @@ fn prepare_import(
 ) -> Result<ShareTransactionCandidate, ShareApiError> {
     let mut current = target(snapshot)?;
     let plan = config_share::plan_import(bundle, &current, choices)?;
-    if plan.providers.iter().any(|provider| {
-        provider.provider_type.as_str() == "bodhi"
-            && !current.provider_instances.contains_key(&provider.id)
-    }) {
-        return Err(ShareApiError::Invalid);
-    }
     let mut providers: Stored<ProvidersSection> = decode_section(snapshot.providers.as_deref())?;
     let mut env: Stored<EnvSection> = decode_section(snapshot.env.as_deref())?;
     let mut credentials =

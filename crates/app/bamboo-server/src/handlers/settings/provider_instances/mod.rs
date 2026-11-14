@@ -25,6 +25,8 @@ use crate::error::AppError;
 #[derive(Serialize)]
 pub struct ListInstancesResponse {
     pub instances: Vec<ProviderInstanceResponse>,
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub retired_provider_aliases: std::collections::BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -508,6 +510,7 @@ pub async fn list_provider_instances(
 
     Ok(HttpResponse::Ok().json(ListInstancesResponse {
         instances,
+        retired_provider_aliases: config.providers().retired_provider_aliases.clone(),
         default_provider_instance_id: config.default_provider_instance.clone(),
         defaults: config.defaults.clone(),
         features: config.features.clone(),
@@ -800,6 +803,78 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(provider_and_credential_bytes(home.path()), before);
+    }
+
+    #[actix_web::test]
+    async fn retired_copilot_default_allows_repairing_a_surviving_provider() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            serde_json::json!({
+                "default_provider_instance": "openai",
+                "provider_instances": {
+                    "openai": {"provider_type": "copilot", "model": "shared-model"},
+                    "relay": {"provider_type": "openai", "enabled": false, "model": "shared-model"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+
+        let edited = http_test::call_service(
+            &app,
+            http_test::TestRequest::put()
+                .uri(&format!("{INSTANCES_URL}/relay"))
+                .set_json(serde_json::json!({
+                    "enabled": true,
+                    "config": {"api_key": "replacement-fixture-key", "base_url": "http://127.0.0.1:1/v1"}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(edited.status(), StatusCode::OK);
+        let relabeled = http_test::call_service(
+            &app,
+            http_test::TestRequest::put()
+                .uri(&format!("{INSTANCES_URL}/relay"))
+                .set_json(serde_json::json!({"label": "Repaired relay"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(relabeled.status(), StatusCode::OK);
+        assert!(state.provider_registry.get("relay").is_some());
+        assert!(state.provider_registry.get_default().is_none());
+
+        let list: Value = http_test::call_and_read_body_json(
+            &app,
+            http_test::TestRequest::get()
+                .uri(INSTANCES_URL)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            list["retired_provider_aliases"],
+            serde_json::json!(["openai"])
+        );
+        assert_eq!(list["instances"][0]["label"], "Repaired relay");
+        assert!(list.get("default_provider_instance_id").is_none());
+        let selected = http_test::call_service(
+            &app,
+            http_test::TestRequest::post()
+                .uri(&format!("{INSTANCES_URL}/default"))
+                .set_json(serde_json::json!({"default_provider_instance_id": "relay"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert_eq!(state.provider_registry.default_provider_name(), "relay");
     }
 
     #[actix_web::test]

@@ -612,7 +612,8 @@ impl AgentBuilder {
             None => config.clone(),
         };
         if let Some(provider) = self.provider_name.clone() {
-            select_provider_override(&mut provider_config, &provider);
+            provider_config.clear_retired_provider_env_override();
+            select_provider_override(&mut provider_config, &provider)?;
         }
         let chat_target = if self.provider_override.is_none()
             && self.provider_name.is_none()
@@ -627,6 +628,7 @@ impl AgentBuilder {
             None
         };
         if let Some(target) = chat_target.as_ref() {
+            provider_config.clear_retired_provider_env_override();
             select_configured_chat_target(&mut provider_config, target)?;
         }
         let provider_scope = provider_config.effective_default_provider().to_string();
@@ -1114,6 +1116,11 @@ impl Default for AgentBuilder {
 /// a fresh data dir usable. Only the keyed providers (`openai` / `anthropic` /
 /// `gemini`) accept an API key supplied through this SDK method.
 fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
+    if config.has_retired_provider_default() {
+        return Err(SdkError::UnsupportedApiKeyProvider {
+            provider: "copilot".into(),
+        });
+    }
     let provider_key = config.effective_default_provider().to_string();
     if let Some(instance) = config.provider_instances.get_mut(&provider_key) {
         let provider = instance.provider_type.clone();
@@ -1187,13 +1194,18 @@ fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
 /// rejects); a built-in type selects the lexicographically first enabled
 /// instance of that type. Only when no instance matches do we deliberately
 /// fall back to the legacy single-provider slot.
-fn select_provider_override(config: &mut Config, requested: &str) {
+fn select_provider_override(config: &mut Config, requested: &str) -> Result<(), SdkError> {
     if config.provider_instances.contains_key(requested) {
         config.default_provider_instance = Some(requested.to_string());
-        return;
+        return Ok(());
     }
 
     let requested_type = requested.to_ascii_lowercase();
+    if config.is_retired_provider_alias(&requested_type) {
+        return Err(SdkError::Config(format!(
+            "Provider instance '{requested_type}' was retired"
+        )));
+    }
     let mut matching = config
         .provider_instances
         .iter()
@@ -1203,11 +1215,12 @@ fn select_provider_override(config: &mut Config, requested: &str) {
     matching.sort();
     if let Some(instance_id) = matching.into_iter().next() {
         config.default_provider_instance = Some(instance_id);
-        return;
+        return Ok(());
     }
 
     config.default_provider_instance = None;
     config.provider = requested_type;
+    Ok(())
 }
 
 /// A configured Chat reference names an exact account, not a provider-type
@@ -1400,14 +1413,14 @@ mod tests {
             );
         }
 
-        select_provider_override(&mut config, "Work-Exact");
+        select_provider_override(&mut config, "Work-Exact").unwrap();
         assert_eq!(
             config.default_provider_instance.as_deref(),
             Some("Work-Exact"),
             "exact id wins even when disabled so factory validation stays fail-closed"
         );
 
-        select_provider_override(&mut config, "OPENAI");
+        select_provider_override(&mut config, "OPENAI").unwrap();
         assert_eq!(
             config.default_provider_instance.as_deref(),
             Some("a-enabled")
@@ -1453,7 +1466,7 @@ mod tests {
         config.default_provider_instance = Some("anthropic-work".to_string());
         config.providers_mut().gemini = None;
 
-        select_provider_override(&mut config, "GEMINI");
+        select_provider_override(&mut config, "GEMINI").unwrap();
         assert!(config.default_provider_instance.is_none());
         assert_eq!(config.provider, "gemini");
         apply_api_key(&mut config, "gemini-sdk-key").unwrap();

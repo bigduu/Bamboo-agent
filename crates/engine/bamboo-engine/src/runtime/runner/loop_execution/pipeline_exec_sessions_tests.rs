@@ -40,6 +40,8 @@ fn gated_command(gate: &Path) -> String {
     )
 }
 
+const OLD_QUIET_RECOVERY_STOP: usize = 6;
+
 struct IgnoredQuietReminder {
     command: String,
     calls: AtomicUsize,
@@ -103,11 +105,12 @@ impl LLMProvider for IgnoredQuietReminder {
                         Ok(LLMChunk::Done),
                     ])));
                 }
-                assert!(
-                    messages
-                        .iter()
-                        .any(|message| message.content.contains("[runtime_progress_feedback_v1]")),
-                    "the same model receives structured facts instead of a Human question"
+                assert_eq!(
+                    messages.iter().any(|message| {
+                        message.content.contains("[runtime_progress_feedback_v1]")
+                    }),
+                    matches!(round, 2 | OLD_QUIET_RECOVERY_STOP),
+                    "only a new group of quiet results produces an advisory"
                 );
                 if let Some(gate) = self.release_on_feedback.as_ref() {
                     assert_eq!(round, 2);
@@ -129,16 +132,18 @@ impl LLMProvider for IgnoredQuietReminder {
                         "write_stdin",
                         json!({"session_id":handle,"yield_time_ms":30_000}),
                     )]
-                } else {
-                    assert!(
-                        round < 6,
-                        "finite recovery ends before a seventh provider request"
-                    );
+                } else if round <= OLD_QUIET_RECOVERY_STOP {
                     vec![tool_call(
                         &format!("feedback-poll-{round}"),
                         "write_stdin",
                         json!({"session_id":handle,"yield_time_ms":250}),
                     )]
+                } else {
+                    assert_eq!(round, OLD_QUIET_RECOVERY_STOP + 1);
+                    return Ok(Box::pin(stream::iter([
+                        Ok(LLMChunk::Token("The command is still running.".into())),
+                        Ok(LLMChunk::Done),
+                    ])));
                 }
             }
         };
@@ -218,7 +223,7 @@ impl LLMProvider for ReadQuietCompletion {
 }
 
 #[tokio::test(start_paused = true)]
-async fn ignored_quiet_polling_ends_bounded_recovery_without_question_or_killing() {
+async fn ignored_quiet_polling_advice_does_not_end_the_turn_or_kill_the_command() {
     quiet_feedback_fixture(false).await;
 }
 
@@ -237,8 +242,7 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     } else {
         "ignored-quiet-polling"
     });
-    // Let the diagnostic recovery budget, rather than the generic round cap,
-    // determine this fixture's stop. Other fixtures keep their original cap.
+    // Let the fixture model decide when to finish.
     config.run_budget.max_rounds = None;
     let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
     let mut side_ctx = ToolCtx::none("side-start");
@@ -281,7 +285,11 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     .unwrap();
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
-        if finish_after_feedback { 4 } else { 6 }
+        if finish_after_feedback {
+            4
+        } else {
+            OLD_QUIET_RECOVERY_STOP + 2
+        }
     );
     assert!(session.pending_question.is_none());
     assert_ne!(
@@ -289,17 +297,13 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
         bamboo_domain::AgentStatusState::Suspended
     );
     assert!(!session.metadata.contains_key("runtime.suspend_reason"));
-    assert_eq!(
-        session
-            .metadata
-            .get("runtime.completion_reason")
-            .map(String::as_str),
-        if finish_after_feedback {
-            None
-        } else {
-            Some("observation_progress_exhausted")
-        }
-    );
+    assert!(!session.metadata.contains_key("runtime.completion_reason"));
+    if !finish_after_feedback {
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "The command is still running."
+        );
+    }
     let handle = provider.handle.lock().unwrap().clone().unwrap();
     let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle);
     if finish_after_feedback {
@@ -338,7 +342,7 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     }
     assert_eq!(questions, 0);
     if !finish_after_feedback {
-        for round in 2..6 {
+        for round in 2..=OLD_QUIET_RECOVERY_STOP {
             let actual = result_for(&session.messages, &format!("feedback-poll-{round}"));
             assert_eq!(actual["status"], "running");
             assert!(

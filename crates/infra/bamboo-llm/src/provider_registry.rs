@@ -322,6 +322,8 @@ impl ProviderRegistry {
         }
         let managed_direct_pristine = providers.is_empty()
             && config.provider != "copilot"
+            && !config.has_retired_provider_default()
+            && config.providers().retired_provider_aliases.is_empty()
             && config.defaults.is_none()
             && config.default_provider_instance.is_none()
             && !bamboo_config::has_any_runtime_model_inputs(config);
@@ -767,7 +769,7 @@ impl ProviderRegistry {
             .copied()
             .chain(["bodhi"])
         {
-            if !provider_is_configured(config, name) {
+            if config.is_retired_provider_alias(name) || !provider_is_configured(config, name) {
                 continue;
             }
 

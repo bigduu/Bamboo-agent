@@ -245,6 +245,16 @@ pub struct ShareProviderPreview {
     /// Same-ID Replace must retain the provider type. A different type can
     /// only be skipped or renamed to a fresh identity with no target settings.
     pub replace_allowed: bool,
+    /// False for legacy types that can only edit an existing instance.
+    #[serde(default = "default_rename_allowed")]
+    pub rename_allowed: bool,
+    /// The saved routing ID belongs to a retired instance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retired_id: bool,
+}
+
+fn default_rename_allowed() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

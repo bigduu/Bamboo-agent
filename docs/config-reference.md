@@ -173,12 +173,18 @@ For one or more provider accounts, the canonical shape is:
 ```
 
 `provider_instances` entries have the same field set as the legacy stanzas
-plus `provider_type` (which of the five kinds this is) and `enabled` (default
+plus `provider_type` (OpenAI, Anthropic, Gemini, or an existing Bodhi instance) and `enabled` (default
 `true`). An explicit instance id always wins over a same-named legacy alias,
 including when that instance is disabled or invalid; Bamboo never silently
 resurrects the stale alias. A temporary hybrid may keep a legacy default id
 only when a real stanza with that id still exists. Other instance-native paths
 do not re-project instances into global legacy slots.
+
+Upgrading removes Copilot instances from provider settings and leaves their
+saved model references available for repair. If Copilot was the default,
+select a configured provider explicitly. Former instance IDs that match
+built-in provider aliases stay reserved so saved references cannot route to a
+different account.
 
 `BAMBOO_PROVIDER` may select an exact instance id. A built-in type value selects
 the lexicographically first enabled instance of that type, making multi-account

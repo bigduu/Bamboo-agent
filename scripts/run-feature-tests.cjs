@@ -166,10 +166,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // server-app-state using Storage's existing test-utils dev dependency.
 // #1125 keeps provider deletion recovery in packages-4 and the HTTP cases in
 // server-settings. The existing additive contexts and cases are unchanged.
+// #2741 keeps the tool advisory and request regressions in the default Engine
+// owner. Stream lowering changes without adding a feature or test context.
 // Copilot retirement removes its default provider and OAuth cases. The
 // replacement checks run in the existing config, LLM, server-settings and
 // server-app-state owners. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "4e4425c2b6439c8ba4d259eabb61d256c6e560a903904f20459da9b0db013c6f";
+const FEATURE_SOURCE_SHA256 = "65824f8ad26f1879aaf437df0d84bf75a6b1f50ce1164be1de57ec74bce3d310";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

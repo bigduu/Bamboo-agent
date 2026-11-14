@@ -94,7 +94,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
 
     if let Some(openai) = &config.providers.openai {
         let id = "openai".to_string();
-        if !config.provider_instances.contains_key(&id) {
+        if !config.provider_instances.contains_key(&id) && !config.is_retired_provider_alias(&id) {
             let mut extra = openai.extra.clone();
             copy_runtime_env_marker(&mut extra, openai.api_key_from_env);
             result.push((
@@ -121,7 +121,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
 
     if let Some(anthropic) = &config.providers.anthropic {
         let id = "anthropic".to_string();
-        if !config.provider_instances.contains_key(&id) {
+        if !config.provider_instances.contains_key(&id) && !config.is_retired_provider_alias(&id) {
             let mut extra = anthropic.extra.clone();
             copy_runtime_env_marker(&mut extra, anthropic.api_key_from_env);
             insert_optional_extra(
@@ -158,7 +158,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
 
     if let Some(gemini) = &config.providers.gemini {
         let id = "gemini".to_string();
-        if !config.provider_instances.contains_key(&id) {
+        if !config.provider_instances.contains_key(&id) && !config.is_retired_provider_alias(&id) {
             let mut extra = gemini.extra.clone();
             copy_runtime_env_marker(&mut extra, gemini.api_key_from_env);
             result.push((
@@ -185,7 +185,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
 
     if let Some(bodhi) = &config.providers.bodhi {
         let id = "bodhi".to_string();
-        if !config.provider_instances.contains_key(&id) {
+        if !config.provider_instances.contains_key(&id) && !config.is_retired_provider_alias(&id) {
             let mut extra = bodhi.extra.clone();
             insert_optional_extra(
                 &mut extra,
@@ -226,20 +226,33 @@ pub(crate) fn retire_copilot(config: &mut Config) -> bool {
         .unwrap_or(&config.provider);
     let retired_default = match config.provider_instances.get(selected) {
         Some(instance) => instance.provider_type == "copilot",
-        None => config.default_provider_instance.is_some() && selected == "copilot",
+        None => selected == "copilot",
     };
-    if retired_default {
+    let changed_default = retired_default && !config.has_retired_provider_default();
+    if changed_default {
         config.default_provider_instance = None;
-        // Keep the compatibility route unavailable until explicitly selected.
         config.provider = "copilot".to_owned();
+        config.providers_mut().copilot_default_retired = true;
     }
+    let retired_aliases: Vec<_> = config
+        .provider_instances
+        .iter()
+        .filter(|(id, instance)| instance.provider_type == "copilot" && is_provider_alias(id))
+        .map(|(id, _)| id.clone())
+        .collect();
     let before = config.provider_instances.len();
     config
         .provider_instances
         .retain(|_, instance| instance.provider_type != "copilot");
-    config.providers_mut().extra.remove("copilot").is_some()
-        || retired_default
+    let providers = config.providers_mut();
+    providers.retired_provider_aliases.extend(retired_aliases);
+    providers.extra.remove("copilot").is_some()
+        || changed_default
         || before != config.provider_instances.len()
+}
+
+pub(crate) fn is_provider_alias(id: &str) -> bool {
+    matches!(id, "openai" | "anthropic" | "gemini" | "bodhi")
 }
 
 /// Idempotently materialize legacy provider configuration.
@@ -258,7 +271,7 @@ pub(crate) fn retire_copilot(config: &mut Config) -> bool {
 /// aliases carry only the marker and never persist plaintext.
 pub fn materialize_legacy_provider_instances(config: &mut Config) -> bool {
     let selected = config.effective_default_provider().trim().to_string();
-    let retired_default = selected.is_empty() && config.provider == "copilot";
+    let retired_default = config.has_retired_provider_default();
     if selected.is_empty() && !retired_default {
         return false;
     }
@@ -272,6 +285,7 @@ pub fn materialize_legacy_provider_instances(config: &mut Config) -> bool {
     for provider_type in ["openai", "anthropic", "gemini"] {
         if standard_provider_api_key_env_is_available(provider_type)
             && !config.provider_instances.contains_key(provider_type)
+            && !config.is_retired_provider_alias(provider_type)
             && !candidates.iter().any(|(id, _)| id == provider_type)
         {
             let mut instance = empty_provider_instance(provider_type);
@@ -821,6 +835,7 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(retire_copilot(&mut config));
         assert!(materialize_legacy_provider_instances(&mut config));
         assert!(config.default_provider_instance.is_none());
         assert!(!config.provider_instances.contains_key("copilot"));

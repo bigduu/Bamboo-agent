@@ -36,14 +36,10 @@ fn provider_hint_count(messages: &[Message]) -> usize {
     messages
         .iter()
         .filter(|message| message.role == Role::User)
-        .map(|message| {
-            message.content.matches(HINT_TEXT).count()
-                + message.content.matches(FEEDBACK_PREFIX).count()
-        })
+        .map(|message| message.content.matches(HINT_TEXT).count())
         .sum()
 }
 
-const FEEDBACK_PREFIX: &str = "[runtime_progress_feedback_v1]\n";
 const HINT_TEXT: &str = "The same successful file observations returned unchanged information for three consecutive rounds.";
 
 struct ObservationProvider {
@@ -91,12 +87,12 @@ impl LLMProvider for ObservationProvider {
         let wire_count = wire_blocks
             .iter()
             .filter_map(|block| block["text"].as_str())
-            .map(|text| text.matches(HINT_TEXT).count() + text.matches(FEEDBACK_PREFIX).count())
+            .map(|text| text.matches(HINT_TEXT).count())
             .sum::<usize>();
         for (index, block) in wire_blocks.iter().enumerate() {
             if block["text"]
                 .as_str()
-                .is_some_and(|text| text.contains(HINT_TEXT) || text.contains(FEEDBACK_PREFIX))
+                .is_some_and(|text| text.contains(HINT_TEXT))
             {
                 assert!(index >= 2);
                 for offset in [2, 1] {
@@ -168,9 +164,9 @@ impl LLMProvider for ObservationProvider {
                                 arguments: if self.tool_name == "write_stdin" {
                                     serde_json::json!({"session_id":"mock-polled-session", "chars":""}).to_string()
                                 } else if round.is_multiple_of(2) {
-                                    r#"{"path":"file","offset":1}"#.into()
+                                    format!(r#"{{"path":"file","offset":{offset}}}"#)
                                 } else {
-                                    r#"{"offset":1,"path":"file"}"#.into()
+                                    format!(r#"{{"offset":{offset},"path":"file"}}"#)
                                 },
                             },
                         })
@@ -339,7 +335,7 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
     let mut session = Session::new("observation-progress-retry", "model");
     assert_eq!(
         run_observation_loop_with_retry(&mut session, "Read", None, true).await,
-        [0, 0, 0, 1, 1, 1, 1, 1]
+        [0, 0, 0, 1, 1, 0, 0, 0]
     );
     assert!(session
         .messages
@@ -353,7 +349,7 @@ async fn observation_progress_real_loop_feedback_keeps_pairs_and_resets_on_user_
     let mut session = Session::new("observation-progress", "model");
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 1, 1, 1]
+        [0, 0, 0, 1, 0, 0, 0]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session
@@ -362,7 +358,7 @@ async fn observation_progress_real_loop_feedback_keeps_pairs_and_resets_on_user_
         .all(|message| !message.content.contains(HINT_TEXT)));
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 1, 1, 1]
+        [0, 0, 0, 1, 0, 0, 0]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session

@@ -18,11 +18,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::{
-    finish_exhausted_progress, quiet_poll_guard_active as progress_feedback_active,
-};
+pub(crate) use no_progress::quiet_poll_guard_active;
 pub(crate) use policy::ToolPolicyGuard;
-pub(crate) use progress_feedback::{is_required_progress_feedback, FeedbackDecision};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
@@ -240,6 +237,7 @@ async fn execute_and_apply_single_tool_call(
                 outcome,
             )
             .await?;
+            policy_guard.observe_repeated_call(None);
             return Ok(SingleToolExecutionControl {
                 should_break,
                 stop_round: false,
@@ -385,6 +383,7 @@ async fn execute_and_apply_single_tool_call(
     };
 
     // Compare raw output: changing evidence hidden by compression is still progress.
+    let completed_fingerprint = policy::completed_tool_fingerprint(tool_call, &outcome);
     policy_guard.observe_raw_observation(tool_call, &outcome.result);
     policy_guard.child_inspections.observe(
         tool_call,
@@ -449,6 +448,7 @@ async fn execute_and_apply_single_tool_call(
         outcome,
     )
     .await?;
+    policy_guard.observe_repeated_call(completed_fingerprint);
 
     Ok(SingleToolExecutionControl {
         should_break,
@@ -1032,11 +1032,12 @@ async fn execute_round_tool_calls_inner(
                         });
                     let task_hint = task_hint.clone();
                     async move {
+                        let fingerprint = policy::completed_tool_fingerprint(batch_call, &outcome);
                         let max_tool_tokens = outcome
                             .output_cap
                             .map(|cap| cap.unwrap_or(0))
                             .unwrap_or(max_tool_tokens);
-                        output_compressor::maybe_compress(
+                        let outcome = output_compressor::maybe_compress(
                             &tool_name,
                             &args,
                             &sid,
@@ -1045,12 +1046,13 @@ async fn execute_round_tool_calls_inner(
                             pressure,
                             task_hint.as_ref(),
                         )
-                        .await
+                        .await;
+                        (outcome, fingerprint)
                     }
                 }))
                 .await;
 
-            for (batch_call, outcome) in batch.iter().zip(compressed) {
+            for (batch_call, (outcome, fingerprint)) in batch.iter().zip(compressed) {
                 let admitted_execution_name = per_call::resolve_callable_for_session(
                     session.session_version,
                     effective_callable_set,
@@ -1078,6 +1080,7 @@ async fn execute_round_tool_calls_inner(
                     outcome,
                 )
                 .await?;
+                policy_guard.observe_repeated_call(fingerprint);
 
                 maybe_apply_mid_turn_context_compression_after_tool(
                     session,

@@ -2732,8 +2732,19 @@ async fn prepare_provider_candidate(
             .map_err(|_| ProviderCandidateError::runtime())?;
     let candidate_provider = candidate_registry
         .get_default()
+        .or_else(|| {
+            candidate_config
+                .has_retired_provider_default()
+                .then(unconfigured_provider)
+        })
         .ok_or_else(ProviderCandidateError::runtime)?;
     Ok((candidate_config, candidate_registry, candidate_provider))
+}
+
+fn unconfigured_provider() -> Arc<dyn LLMProvider> {
+    Arc::new(UnconfiguredProvider {
+        message: "No default provider is configured".to_string(),
+    })
 }
 
 struct ProviderCandidate {
@@ -4650,6 +4661,8 @@ fn provider_durable_document(
 
 fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut ProviderConfigs) {
     candidate.extra = current.extra.clone();
+    candidate.retired_provider_aliases = current.retired_provider_aliases.clone();
+    candidate.copilot_default_retired = current.copilot_default_retired;
     macro_rules! retain {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (&current.$field, &mut candidate.$field) {
@@ -5240,25 +5253,32 @@ impl AppState {
             "Reloading provider runtime from current config"
         );
 
-        let new_provider = candidate_registry.get_default().ok_or_else(|| {
-            record_application_failure(
-                &self.config_application,
-                ConfigConsumer::ProviderRuntime,
-                ConfigApplyError::ProviderInitializationFailed,
-            );
-            let message = if config.has_provider_instances() {
-                format!(
-                    "Default provider instance '{}' is not available or failed to initialize",
-                    default_provider_name
-                )
-            } else {
-                format!(
-                    "Provider '{}' is not available or failed to initialize",
-                    config.provider
-                )
-            };
-            bamboo_llm::LLMError::Auth(message)
-        })?;
+        let new_provider = candidate_registry
+            .get_default()
+            .or_else(|| {
+                config
+                    .has_retired_provider_default()
+                    .then(unconfigured_provider)
+            })
+            .ok_or_else(|| {
+                record_application_failure(
+                    &self.config_application,
+                    ConfigConsumer::ProviderRuntime,
+                    ConfigApplyError::ProviderInitializationFailed,
+                );
+                let message = if config.has_provider_instances() {
+                    format!(
+                        "Default provider instance '{}' is not available or failed to initialize",
+                        default_provider_name
+                    )
+                } else {
+                    format!(
+                        "Provider '{}' is not available or failed to initialize",
+                        config.provider
+                    )
+                };
+                bamboo_llm::LLMError::Auth(message)
+            })?;
 
         #[cfg(test)]
         run_generic_before_provider_publish_test_hook(&self.app_data_dir);
@@ -7244,10 +7264,8 @@ impl AppState {
                 let default_provider_name = candidate_registry.default_provider_name();
                 let candidate_provider = if let Some(provider) = candidate_registry.get_default() {
                     provider
-                } else if allow_unconfigured_provider {
-                    Arc::new(UnconfiguredProvider {
-                        message: "No default provider is configured".to_string(),
-                    })
+                } else if allow_unconfigured_provider || new_config.has_retired_provider_default() {
+                    unconfigured_provider()
                 } else {
                     let message = if new_config.has_provider_instances() {
                         format!(
@@ -9590,6 +9608,15 @@ for line in sys.stdin:
             })
             .expect("a Python interpreter is required for the MCP ordering fixture");
 
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "provider": "openai",
+                "providers": {"openai": {"api_key": "fixture-key", "model": "fixture-model"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
         let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
         stop_config_watcher(&mut state);
         let state = Arc::new(state);
@@ -9605,7 +9632,7 @@ for line in sys.stdin:
                 state
                     .update_config(
                         |config| {
-                            config.provider = "copilot".to_string();
+                            config.server.port += 1;
                             Ok(())
                         },
                         ConfigUpdateEffects {
@@ -9616,9 +9643,13 @@ for line in sys.stdin:
                     .await
             })
         };
-        tokio::task::spawn_blocking(move || provider_ready_rx.recv().unwrap())
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            provider_ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+        })
+        .await
+        .unwrap();
         assert!(
             state.config_io_lock.try_lock().is_err(),
             "the first writer must retain config_io_lock until its runtime effects finish"
