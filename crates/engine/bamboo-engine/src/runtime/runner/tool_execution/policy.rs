@@ -117,59 +117,62 @@ impl ObservationProgress {
 struct RepeatedToolCalls {
     fingerprint: Option<[u8; 32]>,
     count: usize,
-    advised: bool,
+    last_round: Option<usize>,
+    pending: BTreeSet<String>,
 }
 
 impl RepeatedToolCalls {
-    fn observe(&mut self, fingerprint: Option<[u8; 32]>) {
+    fn begin_round(&mut self, round: usize) {
+        if self
+            .last_round
+            .is_some_and(|last| last.checked_add(1) != Some(round))
+        {
+            *self = Self::default();
+        }
+        self.last_round = Some(round);
+    }
+
+    fn observe(&mut self, name: &str, fingerprint: Option<[u8; 32]>) {
         if fingerprint.is_some() && self.fingerprint == fingerprint {
             self.count = self.count.saturating_add(1);
         } else {
-            *self = Self {
-                fingerprint,
-                count: usize::from(fingerprint.is_some()),
-                advised: false,
-            };
+            self.fingerprint = fingerprint;
+            self.count = usize::from(fingerprint.is_some());
+        }
+        if self.count == REPEATED_TOOL_CALLS {
+            // Keep the notice even if further calls in the batch break this streak.
+            self.pending.insert(name.chars().take(128).collect());
         }
     }
 
     fn advisory(&mut self, file_hint: Option<&str>) -> Option<String> {
-        if self.advised {
-            return None;
+        if self.pending.is_empty() {
+            return file_hint
+                .filter(|_| self.count < REPEATED_TOOL_CALLS)
+                .map(|hint| format!("{REPEATED_TOOL_ADVISORY_PREFIX}{hint}"));
         }
-        if self.count < REPEATED_TOOL_CALLS {
-            return file_hint.map(|hint| format!("{REPEATED_TOOL_ADVISORY_PREFIX}{hint}"));
-        }
-        self.advised = true;
+        let tools = std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(format!(
-            "{REPEATED_TOOL_ADVISORY_PREFIX}The most recent tool was called {} times in a row with identical arguments and returned the same result. Consider using the evidence already collected or trying a different approach. If you are intentionally polling, wait for a useful change or use the appropriate status tool.",
-            self.count
+            "{REPEATED_TOOL_ADVISORY_PREFIX}The following tools each returned the same result at least {REPEATED_TOOL_CALLS} times in a row with identical arguments ({tools}). Consider using the evidence already collected or trying a different approach. If you are intentionally polling, wait for a useful change or use the appropriate status tool.",
         ))
     }
 }
 
-/// Compare actual dispatches before compression. Retain only a digest of the
-/// admitted identity, normalized arguments, and raw result.
-pub(super) fn completed_tool_fingerprint(
+/// Compare real results before compression, using the admitted identity and inputs.
+pub(super) fn dispatched_tool_fingerprint(
     call: &ToolCall,
     outcome: &super::per_call::ToolExecutionOutcome,
 ) -> Option<[u8; 32]> {
-    if outcome.output_cap.is_none() || !outcome.post_tool_hook_eligible {
+    outcome.output_cap?;
+    if outcome.needs_human.is_some() {
         return None;
     }
     let tool = outcome.portable_tool.as_ref()?;
-    let name = tool.execution_name();
-    // Shell processes and managed-loop controls have their own lifecycle.
-    if matches!(name, "exec_command" | "write_stdin" | "Bash" | "BashOutput")
-        || name == bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
-    {
-        return None;
-    }
-    let mut arguments = tool.input().clone();
-    arguments.sort_all_objects();
-    let mut fingerprint = Sha256::new();
-    hash_field(&mut fingerprint, name.as_bytes());
-    hash_field(&mut fingerprint, &serde_json::to_vec(&arguments).ok()?);
+    let mut fingerprint = start_tool_fingerprint("dispatch", tool.execution_name(), tool.input())?;
     match &outcome.result {
         Ok(result) => {
             if super::clarification::requires_suspension(call, result)
@@ -177,8 +180,16 @@ pub(super) fn completed_tool_fingerprint(
             {
                 return None;
             }
-            fingerprint.update([1, u8::from(result.success)]);
-            hash_field(&mut fingerprint, result.result.as_bytes());
+            fingerprint.update([
+                1,
+                u8::from(result.success),
+                u8::from(outcome.post_tool_hook_eligible),
+            ]);
+            let normalized = normalized_shell_poll(tool.execution_name(), result);
+            hash_field(
+                &mut fingerprint,
+                normalized.as_deref().unwrap_or(result.result.as_bytes()),
+            );
             for image in &result.images {
                 hash_field(&mut fingerprint, image.mime_type.as_bytes());
                 hash_field(&mut fingerprint, image.data.as_bytes());
@@ -186,10 +197,66 @@ pub(super) fn completed_tool_fingerprint(
         }
         Err(error) => {
             fingerprint.update([0]);
-            fingerprint.update(error.as_bytes());
+            hash_field(&mut fingerprint, error.as_bytes());
         }
     }
     Some(fingerprint.finalize().into())
+}
+
+pub(crate) fn discovery_tool_fingerprint(
+    name: &str,
+    arguments: &serde_json::Value,
+    success: bool,
+    result: &[u8],
+) -> Option<[u8; 32]> {
+    let mut fingerprint = start_tool_fingerprint("discovery", name, arguments)?;
+    fingerprint.update([u8::from(success)]);
+    hash_field(&mut fingerprint, result);
+    Some(fingerprint.finalize().into())
+}
+
+fn start_tool_fingerprint(
+    source: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<Sha256> {
+    let mut arguments = arguments.clone();
+    arguments.sort_all_objects();
+    let mut fingerprint = Sha256::new();
+    hash_field(&mut fingerprint, source.as_bytes());
+    hash_field(&mut fingerprint, name.as_bytes());
+    hash_field(&mut fingerprint, &serde_json::to_vec(&arguments).ok()?);
+    Some(fingerprint)
+}
+
+/// Shell clocks and advice change while an empty capture still observes the
+/// same process state. Preserve the handle, output and exit observations.
+fn normalized_shell_poll(name: &str, result: &ToolResult) -> Option<Vec<u8>> {
+    if !matches!(name, "exec_command" | "write_stdin") || !result.success {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&result.result).ok()?;
+    if value["status"] != "running"
+        || value["session_id"].as_str().is_none()
+        || value["output"] != ""
+        || value
+            .get("output_omitted_bytes")
+            .is_some_and(|v| v.as_u64() != Some(0))
+    {
+        return None;
+    }
+    let polling = value.get_mut("polling")?.as_object_mut()?;
+    for field in [
+        "elapsed_ms",
+        "output_idle_ms",
+        "consecutive_empty_readouts",
+        "state",
+        "advisory",
+    ] {
+        polling.remove(field);
+    }
+    value.sort_all_objects();
+    serde_json::to_vec(&value).ok()
 }
 
 fn hash_field(fingerprint: &mut Sha256, bytes: &[u8]) {
@@ -443,19 +510,17 @@ impl ToolPolicyGuard {
     }
 
     pub(super) fn begin_observation_round(&mut self, round: usize) {
-        if self
-            .observation_progress
-            .last_round
-            .is_some_and(|last| last.checked_add(1) != Some(round))
-        {
-            self.repeated_tool_calls = RepeatedToolCalls::default();
-        }
+        self.begin_repeated_tool_round(round);
         self.observation_progress.begin_round(round);
         self.child_inspections.begin_round(round);
     }
 
-    pub(super) fn observe_repeated_call(&mut self, fingerprint: Option<[u8; 32]>) {
-        self.repeated_tool_calls.observe(fingerprint);
+    pub(crate) fn begin_repeated_tool_round(&mut self, round: usize) {
+        self.repeated_tool_calls.begin_round(round);
+    }
+
+    pub(crate) fn observe_repeated_call(&mut self, name: &str, fingerprint: Option<[u8; 32]>) {
+        self.repeated_tool_calls.observe(name, fingerprint);
     }
 
     pub(crate) fn unchanged_child_inspection_targets(&mut self) -> Vec<String> {
@@ -662,26 +727,27 @@ mod tests {
         }
     }
 
+    fn fingerprint(name: &str, arguments: serde_json::Value, result: &str) -> Option<[u8; 32]> {
+        let call = tool_call(name, "{}");
+        let tool =
+            super::super::per_call::PortableToolExecution::with_input_fixture(name, arguments);
+        dispatched_tool_fingerprint(
+            &call,
+            &super::super::per_call::ToolExecutionOutcome {
+                output_cap: Some(None),
+                portable_tool: Some(tool),
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(true, result)),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                managed_running_violation: false,
+                tool_duration: std::time::Duration::ZERO,
+            },
+        )
+    }
+
     #[test]
     fn repeated_tool_advisory_rearms_when_tool_arguments_or_result_change() {
-        let fingerprint = |name: &str, arguments, result: &str| {
-            let call = tool_call(name, "{}");
-            let tool =
-                super::super::per_call::PortableToolExecution::with_input_fixture(name, arguments);
-            completed_tool_fingerprint(
-                &call,
-                &super::super::per_call::ToolExecutionOutcome {
-                    output_cap: Some(None),
-                    portable_tool: Some(tool),
-                    permission_replay_origin: None,
-                    result: Ok(ToolResult::text(true, result)),
-                    needs_human: None,
-                    post_tool_hook_eligible: true,
-                    managed_running_violation: false,
-                    tool_duration: std::time::Duration::ZERO,
-                },
-            )
-        };
         let first = fingerprint(
             "browser_eval",
             serde_json::json!({"code":"document.title","expected_epoch":17}),
@@ -715,19 +781,67 @@ mod tests {
             assert_ne!(first, changed);
             let mut repeats = RepeatedToolCalls::default();
             for observed in [first, same] {
-                repeats.observe(observed);
+                repeats.observe("browser_eval", observed);
                 assert!(repeats.advisory(None).is_none());
             }
-            repeats.observe(first);
+            repeats.observe("browser_eval", first);
             assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
-            repeats.observe(same);
+            repeats.observe("browser_eval", same);
             assert!(repeats.advisory(None).is_none());
             for observed in [changed, first, same] {
-                repeats.observe(observed);
+                repeats.observe("browser_eval", observed);
                 assert!(repeats.advisory(None).is_none());
             }
-            repeats.observe(first);
+            repeats.observe("browser_eval", first);
             assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
+        }
+    }
+
+    #[test]
+    fn shell_poll_comparison_keeps_process_and_output_changes() {
+        use serde_json::json;
+        let args = json!({"session_id":"process-a","chars":""});
+        let before = json!({
+            "session_id":"process-a",
+            "status":"running",
+            "output":"",
+            "polling":{
+                "terminal_result_ttl_ms":300000,
+                "state":"waiting",
+                "elapsed_ms":1000,
+                "output_idle_ms":500,
+                "consecutive_empty_readouts":2,
+                "exit_observed":false
+            }
+        });
+        let capture =
+            |tool, value: &serde_json::Value| fingerprint(tool, args.clone(), &value.to_string());
+        let initial = capture("write_stdin", &before);
+        assert!(initial.is_some());
+        let mut later = before.clone();
+        later["polling"]["elapsed_ms"] = json!(92000);
+        later["polling"]["output_idle_ms"] = json!(91500);
+        later["polling"]["state"] = json!("needs_diagnosis");
+        later["polling"]["consecutive_empty_readouts"] = json!(4);
+        later["polling"]["advisory"] = json!("wait for the command or inspect it");
+        assert_eq!(initial, capture("write_stdin", &later));
+        assert_ne!(
+            capture("mcp__terminal__write_stdin", &before),
+            capture("mcp__terminal__write_stdin", &later)
+        );
+        let mut exited = later.clone();
+        exited["polling"]["exit_observed"] = json!(true);
+        let mut other_process = later.clone();
+        other_process["session_id"] = json!("process-b");
+        let mut new_output = later;
+        new_output["output"] = json!("new bytes");
+        for changed in [
+            exited,
+            other_process,
+            new_output,
+            json!({"status":"completed","exit_code":0,"output":""}),
+        ] {
+            assert_ne!(initial, capture("write_stdin", &changed));
         }
     }
 

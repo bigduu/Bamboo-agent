@@ -26,6 +26,7 @@ struct ModelProgressProvider {
     advisory_rounds: Mutex<Vec<usize>>,
     tool_name: &'static str,
     finish_after: usize,
+    mixed_batch: bool,
 }
 
 #[async_trait]
@@ -48,43 +49,60 @@ impl LLMProvider for ModelProgressProvider {
             assert!(advice.content.contains("3 times in a row"));
             assert!(advice.content.contains("trying a different approach"));
             assert_eq!(messages[index - 1].role, Role::Tool);
+            let last_result = if self.mixed_batch {
+                "model-progress-other".to_owned()
+            } else {
+                format!("model-progress-{}", round - 1)
+            };
             assert_eq!(
                 messages[index - 1].tool_call_id.as_deref(),
-                Some(format!("model-progress-{}", round - 1).as_str())
+                Some(last_result.as_str())
             );
+            assert!(advice.content.contains(&format!("{:?}", self.tool_name)));
             assert_eq!(messages[index - 1].content, "unchanged raw evidence");
             self.advisory_rounds.lock().unwrap().push(round);
         }
         let chunks = if round == self.finish_after {
             vec![Ok(LLMChunk::Token(FINAL_ANSWER.into())), Ok(LLMChunk::Done)]
         } else {
-            vec![
-                Ok(LLMChunk::ToolCalls(vec![ToolCall {
-                    id: format!("model-progress-{round}"),
+            let arguments = if self.tool_name == "browser_eval" {
+                json!({
+                    "code":"document.title",
+                    "expected_epoch":17,
+                    "expected_url":"about:blank",
+                })
+            } else {
+                json!({"path":"same-file"})
+            };
+            let count = if self.mixed_batch { 3 } else { 1 };
+            let mut calls = (0..count)
+                .map(|index| ToolCall {
+                    id: format!("model-progress-{}", round + index),
                     tool_type: "function".into(),
                     function: FunctionCall {
                         name: self.tool_name.into(),
-                        arguments: if self.tool_name == "browser_eval" {
-                            json!({
-                                "code":"document.title",
-                                "expected_epoch":17,
-                                "expected_url":"about:blank",
-                            })
-                            .to_string()
-                        } else {
-                            json!({"path":"same-file"}).to_string()
-                        },
+                        arguments: arguments.to_string(),
                     },
-                }])),
-                Ok(LLMChunk::Done),
-            ]
+                })
+                .collect::<Vec<_>>();
+            if self.mixed_batch {
+                calls.push(ToolCall {
+                    id: "model-progress-other".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Glob".into(),
+                        arguments: json!({"pattern":"*.rs"}).to_string(),
+                    },
+                });
+            }
+            vec![Ok(LLMChunk::ToolCalls(calls)), Ok(LLMChunk::Done)]
         };
         Ok(Box::pin(stream::iter(chunks)))
     }
 }
 
 struct UnchangedToolExecutor {
-    name: &'static str,
+    names: Vec<&'static str>,
     calls: AtomicUsize,
 }
 
@@ -99,20 +117,24 @@ impl ToolExecutor for UnchangedToolExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        vec![ToolSchema {
-            schema_type: "function".into(),
-            function: FunctionSchema {
-                name: self.name.into(),
-                description: "Return the same observation".into(),
-                parameters: json!({"type":"object"}),
-            },
-        }]
+        self.names
+            .iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".into(),
+                function: FunctionSchema {
+                    name: (*name).into(),
+                    description: "Return the same observation".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            })
+            .collect()
     }
 }
 
 async fn run_model_feedback(
     tool_name: &'static str,
     finish_after: usize,
+    mixed_batch: bool,
 ) -> (Session, Arc<ModelProgressProvider>, usize, Vec<AgentEvent>) {
     let mut session = Session::new("model-progress-contract", "model");
     let provider = Arc::new(ModelProgressProvider {
@@ -120,9 +142,15 @@ async fn run_model_feedback(
         advisory_rounds: Mutex::new(Vec::new()),
         tool_name,
         finish_after,
+        mixed_batch,
     });
+    let names = if mixed_batch {
+        vec![tool_name, "Glob"]
+    } else {
+        vec![tool_name]
+    };
     let executor = Arc::new(UnchangedToolExecutor {
-        name: tool_name,
+        names,
         calls: AtomicUsize::new(0),
     });
     let config = AgentLoopConfig {
@@ -188,7 +216,7 @@ fn assert_no_new_progress_question(session: &Session, events: &[AgentEvent]) {
 
 #[tokio::test]
 async fn browser_repetition_advice_reaches_the_next_request_with_the_real_result() {
-    let (session, provider, tools, events) = run_model_feedback("browser_eval", 3).await;
+    let (session, provider, tools, events) = run_model_feedback("browser_eval", 3, false).await;
     assert_no_new_progress_question(&session, &events);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     assert_eq!(tools, 3);
@@ -201,7 +229,7 @@ async fn browser_repetition_advice_reaches_the_next_request_with_the_real_result
 
 #[tokio::test]
 async fn repeated_reads_can_continue_past_the_old_recovery_cutoff() {
-    let (session, provider, tools, events) = run_model_feedback("Read", 10).await;
+    let (session, provider, tools, events) = run_model_feedback("Read", 10, false).await;
     assert_no_new_progress_question(&session, &events);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 11);
     assert_eq!(tools, 10);
@@ -213,4 +241,23 @@ async fn repeated_reads_can_continue_past_the_old_recovery_cutoff() {
         0,
         "request-only advice must not reset the durable transcript epoch"
     );
+}
+
+#[tokio::test]
+async fn mcp_tool_repetition_reaches_the_next_request() {
+    let (session, provider, tools, events) =
+        run_model_feedback("mcp__inventory__list_records", 4, false).await;
+    assert_no_new_progress_question(&session, &events);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(tools, 4);
+    assert_eq!(*provider.advisory_rounds.lock().unwrap(), [3]);
+}
+
+#[tokio::test]
+async fn trailing_parallel_tool_result_does_not_erase_repeat_advice() {
+    let (session, provider, tools, events) = run_model_feedback("Read", 1, true).await;
+    assert_no_new_progress_question(&session, &events);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(tools, 4);
+    assert_eq!(*provider.advisory_rounds.lock().unwrap(), [1]);
 }

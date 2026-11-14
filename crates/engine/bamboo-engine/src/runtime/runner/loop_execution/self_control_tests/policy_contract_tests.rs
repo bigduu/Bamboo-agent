@@ -95,6 +95,22 @@ impl LLMProvider for PolicyContractProvider {
         assert!(messages
             .iter()
             .any(|message| message.content == ORIGINAL_FACT));
+        let advice = messages
+            .iter()
+            .find(|message| message.content.starts_with("[Runtime tool advisory]"));
+        assert_eq!(
+            advice.is_some(),
+            matches!((self.script, round), (PolicyContractScript::StatusBatch, 2))
+        );
+        if let Some(advice) = advice {
+            assert!(advice.content.contains("loop_control"));
+            let results = STATUS_IDS[..3]
+                .iter()
+                .map(|id| paired_result(messages, id))
+                .collect::<Vec<_>>();
+            assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(results[0]["activation_rounds_spent"], 1);
+        }
         let response = self.response(round, messages);
         let stream = futures::stream::iter([Ok(response), Ok(LLMChunk::Done)]).map(move |chunk| {
             let _keep_stream_admitted = &guard;

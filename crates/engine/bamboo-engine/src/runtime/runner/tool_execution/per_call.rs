@@ -1179,10 +1179,11 @@ where
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
     let control = ctx.config.loop_control.as_ref();
-    let apply = apply_tool_execution_outcome_inner(ctx, outcome);
+    let apply = apply_tool_execution_outcome_inner(ctx, outcome, raw_fingerprint);
     if let Some(control) = control {
         let (result, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(noninteractive, apply).await;
@@ -1208,6 +1209,7 @@ pub(super) async fn apply_tool_execution_outcome(
 async fn apply_tool_execution_outcome_inner(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
+    mut raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     // Normalize before post hooks, policy accounting or any question/wait write.
     // An already checkpointed loop receipt never has a waiting result shape.
@@ -1259,6 +1261,9 @@ async fn apply_tool_execution_outcome_inner(
         )
         .await?);
         loop_result_checkpointed = true;
+        // The dispatch acknowledgement only validated the command. The
+        // checkpoint's owner result is the first real outcome to compare.
+        raw_fingerprint = policy::dispatched_tool_fingerprint(ctx.tool_call, &outcome);
     }
     // Start can install its generation during owner apply above. Re-enter
     // the restriction now, before even its own native AfterTool hook runs.
@@ -1268,6 +1273,7 @@ async fn apply_tool_execution_outcome_inner(
         outcome,
         feedback_cap,
         loop_result_checkpointed,
+        raw_fingerprint,
     );
     if noninteractive {
         apply_without_suspension(apply).await
@@ -1281,6 +1287,7 @@ async fn apply_completed_tool_execution_outcome(
     mut outcome: ToolExecutionOutcome,
     feedback_cap: u32,
     loop_result_checkpointed: bool,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
@@ -1396,6 +1403,11 @@ async fn apply_completed_tool_execution_outcome(
         ctx.admitted_execution_name,
     );
 
+    let repeated_tool_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(PortableToolExecution::execution_name)
+        .unwrap_or(&ctx.tool_call.function.name);
     let running_violation = outcome.managed_running_violation;
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
@@ -1559,6 +1571,8 @@ async fn apply_completed_tool_execution_outcome(
             crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
         ));
     }
+    ctx.policy_guard
+        .observe_repeated_call(repeated_tool_name, raw_fingerprint);
     Ok(result)
 }
 
@@ -1668,6 +1682,7 @@ mod task_progress_tests {
                 state: &mut RoundExecutionState::default(),
             },
             outcome,
+            None,
         )
         .await
         .unwrap();
@@ -1917,6 +1932,7 @@ mod task_progress_tests {
                     state: &mut RoundExecutionState::default(),
                 },
                 outcome,
+                None,
             )
             .await
             .unwrap();
@@ -3669,6 +3685,7 @@ mod hook_tests {
                 state: &mut state,
             },
             outcome,
+            None,
         )
         .await
     }
