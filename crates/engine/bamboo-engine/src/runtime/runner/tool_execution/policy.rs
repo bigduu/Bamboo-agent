@@ -11,7 +11,7 @@ const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
 const REPEATED_TOOL_CALLS: usize = 3;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
 const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
-const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
+pub(super) const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ToolCircuitKey {
