@@ -23,6 +23,7 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
+use crate::runtime::runner::round_lifecycle::RoundOutputLimitPolicy;
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
@@ -31,8 +32,8 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
-    WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, RoundRuntimeState, SuspensionState,
+    WaitingForBashState, WaitingForChildrenState,
 };
 use bamboo_domain::{
     AgentHookPoint, CapabilityInvocationTarget, CapabilityLoadingClass, CapabilityLoadingMode,
@@ -1061,24 +1062,31 @@ impl RoundActivity {
     /// followed by validation or post-LLM failure must still affect the runtime
     /// budget just as it affects durable metrics.
     fn commit_to_runtime(&self, runtime_state: &mut AgentRuntimeState) {
+        self.apply_to_round(&mut runtime_state.round);
+    }
+
+    fn apply_to_round(&self, round: &mut RoundRuntimeState) {
         let mut accumulated = MetricsTokenUsage {
-            prompt_tokens: runtime_state.round.total_prompt_tokens,
-            completion_tokens: runtime_state.round.total_completion_tokens,
+            prompt_tokens: round.total_prompt_tokens,
+            completion_tokens: round.total_completion_tokens,
             total_tokens: 0,
         }
         .clamped_for_durable_metrics();
         accumulated.add_assign_durable(self.token_usage());
-        runtime_state.round.total_prompt_tokens = accumulated.prompt_tokens;
-        runtime_state.round.total_completion_tokens = accumulated.completion_tokens;
-        runtime_state.round.total_tool_calls = runtime_state
-            .round
-            .total_tool_calls
-            .saturating_add(self.tool_call_count);
-        runtime_state.round.total_subagents_spawned = runtime_state
-            .round
+        round.total_prompt_tokens = accumulated.prompt_tokens;
+        round.total_completion_tokens = accumulated.completion_tokens;
+        round.total_tool_calls = round.total_tool_calls.saturating_add(self.tool_call_count);
+        round.total_subagents_spawned = round
             .total_subagents_spawned
             .saturating_add(self.subagent_spawn_count);
     }
+}
+
+fn run_tokens_used(round: &RoundRuntimeState) -> u64 {
+    round
+        .total_prompt_tokens
+        .saturating_add(round.total_completion_tokens)
+        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT)
 }
 
 /// Checks the run's cumulative activity (already accumulated into `round` —
@@ -1088,13 +1096,10 @@ impl RoundActivity {
 /// same round. Mirrors the `max_rounds` exhaustion check in spirit: this is a
 /// graceful-stop trigger, not an error.
 fn check_run_budget_exceeded(
-    round: &bamboo_domain::session::runtime_state::RoundRuntimeState,
+    round: &RoundRuntimeState,
     budget: &bamboo_config::RunBudgetConfig,
 ) -> Option<RunBudgetExceeded> {
-    let total_tokens = round
-        .total_prompt_tokens
-        .saturating_add(round.total_completion_tokens)
-        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT);
+    let total_tokens = run_tokens_used(round);
     if let Some(limit) = budget.max_total_tokens {
         if total_tokens >= limit {
             return Some(RunBudgetExceeded {
@@ -3773,6 +3778,7 @@ async fn run_pipeline_inner(
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
         let mut output_limit_recovery = None;
+        let mut previous_prompt_tokens = 0;
         let mut turn_outcome: Option<TurnOutcome> = None;
         // Whether this round produced any tool call. Per-round, so it belongs
         // inside the loop; captured from the provider output rather than
@@ -3847,6 +3853,16 @@ async fn run_pipeline_inner(
             // transient record when context preparation/provider dispatch fails
             // before streaming starts.
             let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
+            let mut spent = state.runtime_state.round.clone();
+            round_activity.apply_to_round(&mut spent);
+            let output_limit_policy = RoundOutputLimitPolicy {
+                retry: output_limit_recovery,
+                remaining_run_tokens: config.run_budget.max_total_tokens
+                    .map(|limit| limit.saturating_sub(run_tokens_used(&spent))),
+                previous_prompt_tokens,
+                can_cutoff: attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    && check_run_budget_exceeded(&spent, &config.run_budget).is_none(),
+            };
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
                 config,
@@ -3863,7 +3879,7 @@ async fn run_pipeline_inner(
                         provenance: &prompt_memory_exposure,
                     },
                 ),
-                output_limit_recovery,
+                Some(output_limit_policy),
             )
             .await
             {
@@ -4112,15 +4128,18 @@ async fn run_pipeline_inner(
                     }
                 }
                 if matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. })
-                    && output_limit_recovery.is_none()
-                    && attempt < MAX_LLM_TURN_ATTEMPTS
+                    && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                 {
                     if let Some(recovery) = llm_output.output_limit_recovery {
-                        let mut budget_state = state.runtime_state.clone();
-                        round_activity.commit_to_runtime(&mut budget_state);
-                        if check_run_budget_exceeded(&budget_state.round, &config.run_budget).is_none() {
+                        let mut spent = state.runtime_state.round.clone();
+                        round_activity.apply_to_round(&mut spent);
+                        previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
+                        let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
+                        let budget_fits = config.run_budget.max_total_tokens
+                            .is_none_or(|limit| next_cost <= limit.saturating_sub(run_tokens_used(&spent)));
+                        if budget_fits && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
                             output_limit_recovery = Some(recovery);
-                            tracing::info!("Retrying an output-limited reasoning-only response with low effort");
+                            tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
                             continue;
                         }
                     }
@@ -4439,7 +4458,7 @@ async fn run_pipeline_inner(
                     break;
                 }
                 Err(error) => {
-                    if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                    if output_limit_recovery.is_none() && should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
                         if let Some(message_id) = crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
                             session,
                             attempt_tail_message_id.as_deref(),
@@ -10339,6 +10358,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_output_token_limit_recovers_reasoning_and_blocks_truncated_tools() {
         use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer};
@@ -10346,7 +10366,7 @@ mod tests {
         let reasoning_progress = "The reasoning reaches its limit.";
         let make_thinking = |usage| {
             mock_messages_completion(
-                json!({"type":"thinking","thinking":""}),
+                json!({"type":"thinking","thinking":"","signature":""}),
                 json!({"type":"thinking_delta","thinking":reasoning_progress}),
                 "max_tokens",
                 usage,
@@ -10395,7 +10415,7 @@ mod tests {
                     .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
                     .respond_with(retry.clone())
                     .with_priority(1)
-                    .expect(1)
+                    .expect(if scenario == "repeated-limit" { 2 } else { 1 })
                     .mount(&server)
                     .await;
             }
@@ -10446,7 +10466,7 @@ mod tests {
             let requests = server.received_requests().await.unwrap();
             assert_eq!(
                 requests.len(),
-                1 + usize::from(retry.is_some()),
+                1 + usize::from(retry.is_some()) + usize::from(scenario == "repeated-limit"),
                 "{scenario}"
             );
             let first: Value = requests[0].body_json().unwrap();
@@ -10459,6 +10479,10 @@ mod tests {
                 let mut expected = first.clone();
                 expected["output_config"]["effort"] = json!("low");
                 assert_eq!(second, expected);
+            }
+            if scenario == "repeated-limit" {
+                assert!(String::from_utf8_lossy(&requests[2].body)
+                    .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
             }
             assert_eq!(tools.0.load(Ordering::SeqCst), 0);
             let mut answer_tokens = String::new();
@@ -10498,14 +10522,13 @@ mod tests {
                 assert!(answer_tokens.is_empty());
             }
             let round = &state.runtime_state.round;
-            assert_eq!(
-                round.total_prompt_tokens,
-                if retry.is_some() { 62 } else { 31 }
-            );
+            assert_eq!(round.total_prompt_tokens, 31 * requests.len() as u64);
             assert_eq!(
                 round.total_completion_tokens,
                 if succeeds {
                     10
+                } else if scenario == "repeated-limit" {
+                    21
                 } else if retry.is_some() {
                     14
                 } else if scenario == "missing-output-usage" {
@@ -10518,10 +10541,353 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_output_token_limit_converges_and_cuts_off_compatible_messages() {
+        use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let exhausted = mock_messages_completion(
+            json!({"type":"thinking","thinking":"","signature":""}),
+            json!({"type":"thinking_delta","thinking":" reasoning".repeat(5200)}),
+            "max_tokens",
+            Some(16_384),
+        );
+        let mut long_stream_events = vec![
+            json!({"type":"message_start","message":{"usage":{
+                "input_tokens":31,"cache_creation_input_tokens":5,"cache_read_input_tokens":7
+            }}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"thinking","thinking":"","signature":""
+            }}),
+        ];
+        let mut calibrated_events = long_stream_events.clone();
+        calibrated_events.extend((0..8).map(|_| {
+            json!({
+                "type":"content_block_delta","index":0,"delta":{
+                    "type":"thinking_delta","thinking":" reasoning".repeat(650)
+                }
+            })
+        }));
+        calibrated_events
+            .push(json!({"type":"error","error":{"message":"past calibrated cutoff"}}));
+        let calibrated_stream = mock_completion_sse(&calibrated_events);
+        // Eight chunks of 2,000 locally counted tokens each. A cutoff at
+        // 14,336 drops the last chunk and never reads the provider's error.
+        long_stream_events.extend((0..8).map(|_| {
+            json!({
+                "type":"content_block_delta","index":0,"delta":{
+                    "type":"thinking_delta","thinking":" a".repeat(2000)
+                }
+            })
+        }));
+        long_stream_events.push(json!({"type":"error","error":{"message":"past cutoff"}}));
+        let long_stream = mock_completion_sse(&long_stream_events);
+        let answer = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"A small next step."}),
+            "end_turn",
+            Some(3),
+        );
+
+        for (scenario, low_stream, starts_low, pinned, run_limit) in [
+            ("reported-wire", &calibrated_stream, false, false, None),
+            ("local-cutoff", &long_stream, false, false, Some(75_000)),
+            ("configured-low", &exhausted, true, false, None),
+            ("patched-low", &long_stream, true, true, None),
+            ("final-cutoff", &exhausted, true, false, None),
+            ("run-budget", &exhausted, false, false, Some(40_000)),
+        ] {
+            let server = MockServer::start().await;
+            let request = || Mock::given(method("POST")).and(path("/messages"));
+            if !starts_low {
+                request()
+                    .and(body_partial_json(
+                        json!({"output_config":{"effort":"medium"}}),
+                    ))
+                    .respond_with(exhausted.clone())
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            request()
+                .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                .respond_with(low_stream.clone())
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let sends_final = scenario != "run-budget";
+            let final_hits_limit = scenario == "final-cutoff";
+            if sends_final {
+                request()
+                    .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                    .respond_with(if final_hits_limit {
+                        long_stream.clone()
+                    } else {
+                        answer.clone()
+                    })
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let mut patches = vec![json!({"op":"set","path":"/max_tokens","value":16_384})];
+            if pinned {
+                patches.push(json!({"op":"set","path":"/output_config/effort","value":"low"}));
+            }
+            let overrides =
+                serde_json::from_value(json!({"common":{"body_patch":patches}})).unwrap();
+            let llm = bamboo_llm::AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_thinking_replay_always(true)
+                .with_request_overrides(Some(overrides));
+            let tools = Arc::new(OutputLimitExecutor::default());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.reasoning_effort = Some(if starts_low && !pinned {
+                ReasoningEffort::Low
+            } else {
+                ReasoningEffort::Medium
+            });
+            config.token_budget = Some(bamboo_compression::TokenBudget::with_safety_margin(
+                65_536,
+                16_384,
+                Default::default(),
+                0,
+            ));
+            config.run_budget.max_total_tokens = run_limit;
+            let mut session = Session::new(scenario, "model");
+            session.add_message(Message::user("Answer the original request."));
+            session.add_message(
+                Message::assistant_with_reasoning(
+                    "",
+                    Some(vec![bamboo_domain::ToolCall {
+                        id: "call_prior".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_domain::FunctionCall {
+                            name: "fixture_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                    Some("Earlier accepted reasoning.".into()),
+                )
+                .with_reasoning_signature(Some("prior_signature".into())),
+            );
+            session.add_message(Message::tool_result("call_prior", "Confirmed result."));
+            let prior_messages = session.messages.len();
+            let mut state = e2e_loop_state(scenario);
+            let (tx, _rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0, "{scenario}");
+            let requests = server.received_requests().await.unwrap();
+            let failed_requests = if starts_low { 1 } else { 2 };
+            assert_eq!(
+                requests.len(),
+                failed_requests + usize::from(sends_final),
+                "{scenario}: {result:?}"
+            );
+            let bodies: Vec<Value> = requests
+                .iter()
+                .map(|request| request.body_json().unwrap())
+                .collect();
+            if !starts_low {
+                let mut expected = bodies[0].clone();
+                expected["output_config"]["effort"] = json!("low");
+                assert_eq!(bodies[1], expected, "{scenario}");
+            }
+            for body in &bodies {
+                assert_eq!(body["max_tokens"], 16_384);
+                assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+            }
+            if sends_final {
+                let last_body = bodies.last().unwrap();
+                assert_eq!(last_body["output_config"]["effort"], "low");
+                let messages = last_body["messages"].to_string();
+                assert!(messages.contains("Answer the original request."));
+                assert!(messages.contains("Earlier accepted reasoning."));
+                assert!(messages.contains("prior_signature"));
+                assert!(messages.contains("Confirmed result."));
+                assert!(messages.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                assert!(!messages.contains(&" a".repeat(100)));
+                assert!(!messages.contains(&" reasoning".repeat(100)));
+            }
+            if sends_final && !final_hits_limit {
+                assert!(result.unwrap(), "{scenario}");
+                assert_eq!(session.messages.len(), prior_messages + 1);
+                assert_eq!(
+                    session.messages[prior_messages].content,
+                    "A small next step."
+                );
+                assert!(session.messages[prior_messages].reasoning.is_none());
+            } else {
+                let expected_reason = if final_hits_limit {
+                    "reasoning_headroom"
+                } else {
+                    "max_tokens"
+                };
+                assert!(
+                    matches!(
+                        result,
+                        Err(AgentError::OutputTokenLimit {
+                            finish_reason,
+                            reasoning_only: true,
+                            ..
+                        }) if finish_reason == expected_reason
+                    ),
+                    "{scenario}: {result:?}"
+                );
+                assert_eq!(session.messages.len(), prior_messages);
+            }
+            let round = &state.runtime_state.round;
+            let saw_cutoff = matches!(
+                scenario,
+                "reported-wire" | "local-cutoff" | "patched-low" | "final-cutoff"
+            );
+            assert_eq!(
+                round.total_prompt_tokens,
+                31 * requests.len() as u64 + 12 * u64::from(saw_cutoff)
+            );
+            assert_eq!(
+                round.total_completion_tokens,
+                16_384 * (failed_requests as u64 + u64::from(final_hits_limit))
+                    + if sends_final && !final_hits_limit {
+                        3
+                    } else {
+                        0
+                    }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_output_token_limit_converges_for_chat_completions_and_gemini() {
+        use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer};
+
+        for protocol in ["openai", "gemini"] {
+            let server = MockServer::start().await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let (llm, route, prompt, effort, cap, low, limited, answer): (
+                Arc<dyn LLMProvider>,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = if protocol == "openai" {
+                (
+                    Arc::new(
+                        bamboo_llm::OpenAIProvider::new("test-key")
+                            .with_base_url(server.uri())
+                            .with_client(client),
+                    ),
+                    "/chat/completions",
+                    "messages",
+                    "/reasoning_effort",
+                    "/max_completion_tokens",
+                    "low",
+                    json!({"type":"chunk","choices":[{"delta":{"reasoning_content":"Failed reasoning"},"finish_reason":"length"}],
+                        "usage":{"prompt_tokens":10,"completion_tokens":8}}),
+                    json!({"type":"chunk","choices":[{"delta":{"content":"Recovered"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":12,"completion_tokens":3}}),
+                )
+            } else {
+                (
+                    Arc::new(
+                        bamboo_llm::GeminiProvider::new("test-key")
+                            .with_base_url(server.uri())
+                            .with_client(client),
+                    ),
+                    "/models/model:streamGenerateContent",
+                    "contents",
+                    "/generationConfig/thinkingConfig/thinkingLevel",
+                    "/generationConfig/maxOutputTokens",
+                    "LOW",
+                    json!({"type":"chunk","candidates":[{"content":{"parts":[{"text":"Failed reasoning","thought":true}]},"finishReason":"MAX_TOKENS"}],
+                        "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"thoughtsTokenCount":8}}),
+                    json!({"type":"chunk","candidates":[{"content":{"parts":[{"text":"Recovered"}]},"finishReason":"STOP"}],
+                        "usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}),
+                )
+            };
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(mock_completion_sse(&[limited]))
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(route))
+                .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                .respond_with(mock_completion_sse(&[answer]))
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.provider_type = Some(protocol.into());
+            config.reasoning_effort = Some(ReasoningEffort::Low);
+            let mut session = Session::new(protocol, "model");
+            session.add_message(Message::user("Answer the original request."));
+            let mut state = e2e_loop_state(protocol);
+            let (tx, _rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                llm,
+                Arc::new(OutputLimitExecutor::default()),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            assert!(result.unwrap(), "{protocol}");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            let before: Value = requests[0].body_json().unwrap();
+            let after: Value = requests[1].body_json().unwrap();
+            assert_eq!(before.pointer(effort).and_then(Value::as_str), Some(low));
+            assert_eq!(before.pointer(effort), after.pointer(effort));
+            assert!(before.pointer(cap).is_some());
+            assert_eq!(before.pointer(cap), after.pointer(cap));
+            let input = after[prompt].to_string();
+            assert!(input.contains("Answer the original request."));
+            assert!(input.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+            assert!(!input.contains("Failed reasoning"));
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(session.messages[1].content, "Recovered");
+            assert!(session.messages[1].reasoning.is_none());
+            assert_eq!(state.runtime_state.round.total_completion_tokens, 11);
+        }
+    }
+
+    #[tokio::test]
     async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
         use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
         use wiremock::{Mock, MockServer};
 
         let recovery = mock_completion_sse(&[json!({
@@ -10553,7 +10919,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/responses"))
                 .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
-                .respond_with(limited)
+                .respond_with(limited.clone())
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -10561,7 +10927,16 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/responses"))
                     .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
+                    .respond_with(limited.clone())
+                    .with_priority(2)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/responses"))
+                    .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
                     .respond_with(recovery.clone())
+                    .with_priority(1)
                     .expect(1)
                     .mount(&server)
                     .await;
@@ -10593,7 +10968,7 @@ mod tests {
             )
             .await;
             let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), if recover { 2 } else { 1 });
+            assert_eq!(requests.len(), if recover { 3 } else { 1 });
             assert_eq!(tools.0.load(Ordering::SeqCst), 0);
             let mut discarded = None;
             let mut visible = None;
@@ -10614,6 +10989,17 @@ mod tests {
                 let mut expected: Value = requests[0].body_json().unwrap();
                 expected["reasoning"]["effort"] = json!("low");
                 assert_eq!(requests[1].body_json::<Value>().unwrap(), expected);
+                let final_body: Value = requests[2].body_json().unwrap();
+                assert_eq!(final_body["reasoning"], expected["reasoning"]);
+                assert_eq!(
+                    final_body["max_output_tokens"],
+                    expected["max_output_tokens"]
+                );
+                assert!(final_body.get("previous_response_id").is_none());
+                assert!(!final_body["input"].to_string().contains("rs_limit"));
+                assert!(final_body["input"]
+                    .to_string()
+                    .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
                 let last = session.messages.last().unwrap();
                 assert_eq!(last.content, "Recovered");
                 assert!(last.reasoning.is_none());
@@ -10642,8 +11028,8 @@ mod tests {
                 assert_eq!(discarded, visible);
             }
             let round = &state.runtime_state.round;
-            assert_eq!(round.total_prompt_tokens, if recover { 58 } else { 29 });
-            assert_eq!(round.total_completion_tokens, if recover { 14 } else { 11 });
+            assert_eq!(round.total_prompt_tokens, if recover { 87 } else { 29 });
+            assert_eq!(round.total_completion_tokens, if recover { 25 } else { 11 });
         }
     }
 

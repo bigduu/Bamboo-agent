@@ -8,7 +8,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::provider::{current_completion_diagnostics, OutputLimitRecovery, Result};
+use crate::provider::{
+    current_completion_diagnostics, OutputLimitRecoveryControls, Result,
+    OUTPUT_LIMIT_CONVERGENCE_HINT,
+};
 use bamboo_config::{
     BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
     RequestScopeOverride, TemplateExpr, TemplateExprSpec,
@@ -110,8 +113,7 @@ pub fn apply_overrides_to_body(
 }
 
 /// Inspect the final wire controls after masking and operator body patches.
-/// An eligible retry lowers only the existing effort field, leaving request
-/// options used to render the prompt and protocol unchanged.
+/// Keep recovery bound to the observed protocol, effort and output cap.
 pub(crate) fn mask_and_prepare_agent_request(
     body: &mut Value,
     masking: &KeywordMaskingConfig,
@@ -146,7 +148,7 @@ pub(crate) fn mask_and_prepare_agent_request(
         .pointer(effort_path)
         .and_then(Value::as_str)
         .and_then(ReasoningEffort::parse)
-        .filter(|effort| !matches!(effort, ReasoningEffort::Disabled | ReasoningEffort::Low));
+        .filter(|effort| *effort != ReasoningEffort::Disabled);
     let native_control = match endpoint {
         ENDPOINT_MESSAGES => {
             body.pointer("/thinking/type").and_then(Value::as_str) == Some("adaptive")
@@ -160,22 +162,44 @@ pub(crate) fn mask_and_prepare_agent_request(
             .is_none(),
         _ => true,
     };
-    let candidate = effort.zip(limit).and_then(|(effort, output_limit)| {
-        (native_control
-            && !crate::retry::work_request_budget_active()
-            && masking.apply_masking(low) == low
-            && !overrides.is_some_and(|config| {
-                resolve_scope(config, endpoint, Some(model))
-                    .body_patch
-                    .iter()
-                    .any(|patch| patches_reasoning_control(endpoint, &patch.path))
-            }))
-        .then_some(OutputLimitRecovery {
-            endpoint,
-            effort,
-            output_limit,
-        })
-    });
+    let candidate = effort
+        .zip(limit)
+        .filter(|_| native_control && !crate::retry::work_request_budget_active())
+        .and_then(|(effort, output_limit)| {
+            let patches = overrides.map(|config| resolve_scope(config, endpoint, Some(model)));
+            let mut patches = patches.iter().flat_map(|scope| &scope.body_patch);
+            let effort_segments = parse_path(effort_path);
+            let control_is_pinned = patches.clone().any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(endpoint, &path)
+                    && !(effort == ReasoningEffort::Low && path == effort_segments)
+            });
+            if control_is_pinned
+                || (effort != ReasoningEffort::Low && masking.apply_masking(low) != low)
+            {
+                return None;
+            }
+            let (prompt_key, candidate_count) = match endpoint {
+                ENDPOINT_CHAT_COMPLETIONS => ("messages", body.get("n")),
+                ENDPOINT_MESSAGES => ("messages", None),
+                ENDPOINT_RESPONSES => ("input", None),
+                _ => ("contents", body.pointer("/generationConfig/candidateCount")),
+            };
+            if candidate_count.is_some_and(|count| count.as_u64() != Some(1)) {
+                return None;
+            }
+            let allows_convergence = !patches.any(|patch| match parse_path(&patch.path).first() {
+                Some(PathSegment::Key(key)) => key == prompt_key || key == "model",
+                _ => true,
+            }) && masking.apply_masking(OUTPUT_LIMIT_CONVERGENCE_HINT)
+                == OUTPUT_LIMIT_CONVERGENCE_HINT;
+            Some(OutputLimitRecoveryControls {
+                endpoint,
+                effort,
+                output_limit,
+                allows_convergence,
+            })
+        });
     if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
         *body
             .pointer_mut(effort_path)
@@ -184,8 +208,7 @@ pub(crate) fn mask_and_prepare_agent_request(
     Ok(())
 }
 
-fn patches_reasoning_control(endpoint: &str, path: &str) -> bool {
-    let path = parse_path(path);
+fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {
     if path.is_empty() {
         return true;
     }

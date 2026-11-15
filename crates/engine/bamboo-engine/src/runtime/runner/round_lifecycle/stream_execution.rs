@@ -33,7 +33,10 @@ use bamboo_domain::{
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
     ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
-use bamboo_llm::provider::{CompletionDiagnostics, OutputLimitRecovery, ResponsesRequestOptions};
+use bamboo_llm::provider::{
+    CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
+    REASONING_HEADROOM_FINISH_REASON,
+};
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegmentKind, Segment, SegmentRole,
@@ -41,7 +44,7 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
-use super::PromptMemoryExposureFrame;
+use super::{PromptMemoryExposureFrame, RoundOutputLimitPolicy};
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -54,7 +57,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub output_limit_recovery: Option<OutputLimitRecovery>,
+    pub output_limit_recovery: Option<RoundOutputLimitPolicy>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
     pub observation_progress_hint: Option<&'a str>,
@@ -824,14 +827,14 @@ fn build_request_envelope_reconciled(
     )
 }
 
-fn build_request_envelope_reconciled_for_loading_mode(
+fn build_request_envelope_reconciled_for_loading_mode<'a>(
     session: &mut Session,
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
-    observation_progress_hint: Option<&str>,
+    request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
     let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
     let requested_protocol = requested_family.map(|family| match family {
@@ -1162,9 +1165,7 @@ fn build_request_envelope_reconciled_for_loading_mode(
     let mut model_transcript = ledger.transcript;
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
-    if let Some(advisory) = observation_progress_hint {
-        model_transcript.push(Message::user(advisory));
-    }
+    model_transcript.extend(request_advisories.into_iter().map(Message::user));
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
@@ -1512,6 +1513,10 @@ pub(super) async fn execute_llm_stream(
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
+    let recovery = frame.output_limit_recovery.and_then(|policy| policy.retry);
+    let convergence_hint = recovery
+        .is_some_and(|retry| retry.is_convergence())
+        .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT);
     let (mut prepared_envelope, previous_response_id, final_usage, loading_mode) = loop {
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
@@ -1531,7 +1536,9 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
-            observation_progress_hint,
+            observation_progress_hint
+                .into_iter()
+                .chain(convergence_hint),
         );
         // `prepare_round_context` reserves the already-durable ledger history. The
         // reconciliation above can append a new host-state snapshot, so verify the
@@ -1559,16 +1566,34 @@ pub(super) async fn execute_llm_stream(
             }
         };
         let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-        let mut request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        let output_reserve =
+            recovery.map_or(u64::from(max_output_tokens), |retry| retry.output_limit());
+        let mut request_input_limit = u64::from(max_context_tokens).saturating_sub(output_reserve);
         if bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?
             .is_some()
         {
             request_input_limit =
-                request_input_limit.min(prepared_context.token_usage.budget_limit);
+                request_input_limit.min(u64::from(prepared_context.token_usage.budget_limit));
         }
-        if final_usage.input_tokens > request_input_limit
+        let retry_exceeds_run_budget = frame
+            .output_limit_recovery
+            .and_then(|policy| {
+                Some((
+                    policy.retry?,
+                    policy.remaining_run_tokens?,
+                    policy.previous_prompt_tokens,
+                ))
+            })
+            .is_some_and(|(retry, remaining, previous_input)| {
+                u64::from(final_usage.input_tokens)
+                    .max(previous_input)
+                    .saturating_add(retry.output_limit())
+                    > remaining
+            });
+        if u64::from(final_usage.input_tokens) > request_input_limit
             || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+            || retry_exceeds_run_budget
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
@@ -1576,6 +1601,11 @@ pub(super) async fn execute_llm_stream(
             // the available context.
             if observation_progress_hint.take().is_some() {
                 continue;
+            }
+            if retry_exceeds_run_budget {
+                return Err(AgentError::Budget(
+                    "output-limit retry would exceed the remaining run token budget".into(),
+                ));
             }
             return Err(AgentError::Budget(format!(
                 "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
@@ -1810,7 +1840,25 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
-    let completion = CompletionDiagnostics::for_agent_round(frame.output_limit_recovery);
+    let mut completion = CompletionDiagnostics::for_agent_round(recovery);
+    if let Some(policy) = frame
+        .output_limit_recovery
+        .filter(|policy| policy.can_cutoff)
+    {
+        // Reserve the wire cap for both calls. A disconnected provider can
+        // still bill up to that cap, and the follow-up adds one more advisory.
+        let hint = u64::from(
+            TiktokenTokenCounter::default()
+                .count_message(&Message::user(OUTPUT_LIMIT_CONVERGENCE_HINT)),
+        );
+        let input = u64::from(final_usage.input_tokens);
+        let context_headroom = u64::from(max_context_tokens).saturating_sub(input + hint);
+        let run_headroom = policy.remaining_run_tokens.map_or(u64::MAX, |remaining| {
+            let prompt = input.max(policy.previous_prompt_tokens);
+            remaining.saturating_sub(prompt.saturating_mul(2).saturating_add(hint)) / 2
+        });
+        completion = completion.with_reasoning_cutoff_budget(run_headroom.min(context_headroom));
+    }
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -2057,13 +2105,22 @@ pub(super) async fn execute_llm_stream(
     if let Some(usage) = stream_output.provider_usage {
         observation.model_usage(&token_usage(usage));
     }
-    usage_guard.finish(
-        bamboo_domain::ModelCallStatus::Success,
-        stream_output.provider_usage,
-    );
-    observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
+    let finish_reason = completion.finish_reason();
+    let (status, outcome) = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
+        (
+            bamboo_domain::ModelCallStatus::Error,
+            bamboo_infrastructure::telemetry::Outcome::ProviderError,
+        )
+    } else {
+        (
+            bamboo_domain::ModelCallStatus::Success,
+            bamboo_infrastructure::telemetry::Outcome::Success,
+        )
+    };
+    usage_guard.finish(status, stream_output.provider_usage);
+    observation.finish(outcome);
 
-    let output_limited = super::rejected_output_limit(&stream_output, completion.finish_reason());
+    let output_limited = super::rejected_output_limit(&stream_output, finish_reason);
     if config.features_final_evidence_check
         && !activation_pending
         && !output_limited

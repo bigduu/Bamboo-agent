@@ -12,7 +12,7 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::ProviderTranscriptItemKind;
-use bamboo_llm::provider::OutputLimitRecovery;
+use bamboo_llm::provider::{OutputLimitRecovery, REASONING_HEADROOM_FINISH_REASON};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -47,18 +47,20 @@ pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
 fn rejected_output_limit(output: &StreamHandlingOutput, finish_reason: &str) -> bool {
     // Responses explicitly marks this terminal frame incomplete, even if it
     // produced some text. Other protocols already allow text-only truncation.
-    finish_reason == "max_output_tokens"
-        || (matches!(finish_reason, "max_tokens" | "length" | "MAX_TOKENS")
-            && (output.content.trim().is_empty()
-                || !output.tool_calls.is_empty()
-                || output.provider_transcript_items.iter().any(|item| {
-                    item.kind().is_discovery()
-                        || matches!(
-                            item.kind(),
-                            ProviderTranscriptItemKind::OpenAiFunctionCall
-                                | ProviderTranscriptItemKind::AnthropicToolUse
-                        )
-                })))
+    matches!(
+        finish_reason,
+        "max_output_tokens" | REASONING_HEADROOM_FINISH_REASON
+    ) || (matches!(finish_reason, "max_tokens" | "length" | "MAX_TOKENS")
+        && (output.content.trim().is_empty()
+            || !output.tool_calls.is_empty()
+            || output.provider_transcript_items.iter().any(|item| {
+                item.kind().is_discovery()
+                    || matches!(
+                        item.kind(),
+                        ProviderTranscriptItemKind::OpenAiFunctionCall
+                            | ProviderTranscriptItemKind::AnthropicToolUse
+                    )
+            })))
 }
 
 fn request_tool_schemas_for_loading_mode<'a>(
@@ -200,6 +202,14 @@ pub(crate) struct RoundLlmExecutionOutput {
     pub(crate) host_gold_attempt: Option<Arc<crate::runtime::host_gold::HostGoldAttempt>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RoundOutputLimitPolicy {
+    pub retry: Option<OutputLimitRecovery>,
+    pub remaining_run_tokens: Option<u64>,
+    pub previous_prompt_tokens: u64,
+    pub can_cutoff: bool,
+}
+
 /// Trusted execution-local prompt-memory snapshot paired with the stable
 /// execution-scoped round identity used for durable metrics deduplication.
 ///
@@ -270,7 +280,7 @@ pub(crate) async fn execute_llm_round(
     tool_schemas: &[ToolSchema],
     observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
-    output_limit_recovery: Option<OutputLimitRecovery>,
+    output_limit_recovery: Option<RoundOutputLimitPolicy>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
@@ -343,8 +353,10 @@ pub(crate) async fn execute_llm_round(
             finish_reason,
             response_id: stream_output.response_id.clone(),
             reasoning_only: empty_answer
-                && (!stream_output.reasoning_content.trim().is_empty()
-                    || stream_output.thinking_tokens > 0)
+                && (finish_reason == REASONING_HEADROOM_FINISH_REASON
+                    || !stream_output.reasoning_content.trim().is_empty()
+                    || stream_output.thinking_tokens > 0
+                    || !stream_output.provider_transcript_items.is_empty())
                 && stream_output.provider_transcript_items.iter().all(|item| {
                     matches!(
                         item.kind(),
@@ -373,7 +385,46 @@ pub(crate) async fn execute_llm_round(
     } else {
         completion_tokens
     };
-    let attempt_usage = canonical_attempt_usage(&stream_output, prompt_tokens, estimated_output);
+    let attempt_usage = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
+        // The stream was closed before terminal usage. The opening snapshot
+        // can report an exact prompt total. If any component was omitted,
+        // keep at least the known prompt usage and the full output reserve.
+        let known_input = stream_output
+            .input_tokens
+            .saturating_add(stream_output.cache_creation_input_tokens)
+            .saturating_add(stream_output.cache_read_input_tokens);
+        canonical_token_usage(
+            stream_output.provider_usage,
+            0,
+            0,
+            prompt_tokens.max(known_input),
+            estimated_output,
+        )
+    } else {
+        canonical_attempt_usage(&stream_output, prompt_tokens, estimated_output)
+    };
+    let mut output_limit_recovery = completion.output_limit_recovery();
+    if matches!(
+        terminal_validation_error,
+        Some(AgentError::OutputTokenLimit {
+            finish_reason: "max_tokens",
+            reasoning_only: true,
+            ..
+        })
+    ) && stream_output.reasoning_signature.is_none()
+        && stream_output.reasoning_content.len() >= 4096
+    {
+        if let Some(retry) = output_limit_recovery.filter(|retry| !retry.is_convergence()) {
+            if stream_output
+                .provider_usage
+                .and_then(|usage| usage.output_tokens)
+                == Some(retry.output_limit())
+            {
+                output_limit_recovery =
+                    Some(retry.with_capped_reasoning_bytes(stream_output.reasoning_content.len()));
+            }
+        }
+    }
 
     tracing::debug!(
         "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, estimated_tokens={}, canonical_tokens={}",
@@ -396,7 +447,7 @@ pub(crate) async fn execute_llm_round(
         completion_tokens,
         attempt_usage,
         terminal_validation_error,
-        output_limit_recovery: completion.output_limit_recovery(),
+        output_limit_recovery,
         host_gold_attempt,
     })
 }
