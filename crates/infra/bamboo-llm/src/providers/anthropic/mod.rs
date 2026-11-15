@@ -100,9 +100,26 @@ fn is_deepseek_v4_model(model: &str) -> bool {
         .next()
         .unwrap_or(model)
         .to_ascii_lowercase();
-    // Compatible providers can prefix the model ID with a vendor name.
-    model.split('.').any(|part| {
-        part == "deepseek-flash" || part == "deepseek-v4" || part.starts_with("deepseek-v4-")
+    let model_id = model
+        .rsplit_once(".deepseek-")
+        .map_or(model.as_str(), |(namespace, _)| {
+            &model[namespace.len() + 1..]
+        });
+    [
+        "deepseek-flash",
+        "deepseek-v4",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4.1-flash",
+    ]
+    .iter()
+    .any(|known| {
+        model_id.strip_prefix(known).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('-').is_some_and(|revision| {
+                    matches!(revision.len(), 4 | 8) && revision.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
     })
 }
 
@@ -7664,6 +7681,14 @@ mod anthropic_provider_tests {
             ),
             (false, model, None, None, None, None),
             (true, "other-compatible-model", None, None, None, None),
+            (
+                true,
+                "router.deepseek-v4-pro.claude-sonnet-4-6",
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         let server = MockServer::start().await;
         Mock::given(method("POST"))
