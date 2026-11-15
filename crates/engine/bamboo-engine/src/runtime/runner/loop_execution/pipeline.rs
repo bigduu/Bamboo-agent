@@ -4188,6 +4188,9 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
+            if let Some(split) = split_recovery.as_mut() {
+                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
+            }
             let validation_error = llm_output.terminal_validation_error.or_else(|| {
                 output_limit_recovery.and_then(|_| {
                     let mut spent = state.runtime_state.round.clone();
@@ -4208,7 +4211,7 @@ async fn run_pipeline_inner(
                     }
                 }
                 if matches!(split_request.as_ref(), Some((SplitStage::Plan, _)))
-                    && matches!(error, AgentError::OutputTokenLimit { .. })
+                    && llm_output.can_resume_truncated_messages
                 {
                     // The model has already spent its single planning request.
                     // Try one bounded action using the existing checkpoint.
@@ -4290,7 +4293,6 @@ async fn run_pipeline_inner(
                 break;
             }
             if let (Some((stage, _)), Some(split)) = (split_request.as_ref(), split_recovery.as_mut()) {
-                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
                 let max_tools = usize::from(*stage == SplitStage::Work);
                 let invalid_tool = stream_output.tool_calls.len() > max_tools
                     || stream_output.tool_calls.iter().any(|call| {

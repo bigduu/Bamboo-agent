@@ -257,7 +257,6 @@ pub const REASONING_HEADROOM_FINISH_REASON: &str = "reasoning_headroom";
 pub struct OutputLimitRecovery {
     controls: OutputLimitRecoveryControls,
     step: OutputLimitStep,
-    prefer_split: bool,
     capped_reasoning_bytes: Option<usize>,
 }
 
@@ -274,6 +273,7 @@ pub(crate) struct OutputLimitRecoveryControls {
     pub(crate) lowerable_effort: Option<ReasoningEffort>,
     pub(crate) output_limit: u64,
     pub(crate) allows_convergence: bool,
+    pub(crate) compatible_messages: bool,
 }
 
 impl OutputLimitRecovery {
@@ -290,18 +290,13 @@ impl OutputLimitRecovery {
     }
 
     pub fn prefers_task_split(self) -> bool {
-        self.prefer_split && self.allows_task_split()
-    }
-
-    pub fn allows_truncated_messages_split(self) -> bool {
-        self.controls.endpoint == crate::providers::common::request_overrides::ENDPOINT_MESSAGES
-            && self.prefers_task_split()
+        self.controls.compatible_messages && self.allows_task_split()
     }
 
     pub fn for_task_split(self) -> Self {
         Self {
             step: OutputLimitStep::Split {
-                lower_effort: self.is_convergence() && !self.prefer_split,
+                lower_effort: self.is_convergence() && !self.controls.compatible_messages,
             },
             ..self
         }
@@ -330,6 +325,7 @@ struct CompletionDiagnosticState {
     finish_reason: Option<&'static str>,
     messages_stopped: bool,
     provider_tool_seen: bool,
+    compatible_messages: bool,
     endpoint: Option<&'static str>,
     changed_protocol: bool,
     output_limit: Option<u64>,
@@ -399,16 +395,18 @@ impl CompletionDiagnostics {
         ))
     }
 
-    pub(crate) fn prefer_task_split(&self) {
-        if let Some(candidate) = self
-            .state
+    pub(crate) fn mark_compatible_messages(&self) {
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .recovery
-            .as_mut()
-        {
-            candidate.prefer_split = true;
-        }
+            .compatible_messages = true;
+    }
+
+    pub fn is_compatible_messages(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .compatible_messages
     }
 
     pub(crate) fn record_reasoning_cutoff(&self) {
@@ -527,7 +525,6 @@ impl CompletionDiagnostics {
                     OutputLimitRecovery {
                         controls,
                         step,
-                        prefer_split: controls.lowerable_effort.is_none(),
                         capped_reasoning_bytes: None,
                     },
                 )

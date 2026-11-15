@@ -204,6 +204,7 @@ pub(crate) struct RoundLlmExecutionOutput {
     /// a billed response is not turned into a zero-usage terminal round.
     pub terminal_validation_error: Option<AgentError>,
     pub output_limit_recovery: Option<OutputLimitRecovery>,
+    pub can_resume_truncated_messages: bool,
     pub(crate) host_gold_attempt: Option<Arc<crate::runtime::host_gold::HostGoldAttempt>>,
 }
 
@@ -449,31 +450,25 @@ pub(crate) async fn execute_llm_round(
     } else {
         canonical_attempt_usage(&stream_output, prompt_tokens, estimated_output)
     };
-    let mut output_limit_recovery = completion.output_limit_recovery().filter(|retry| {
-        if matches!(
-            terminal_validation_error,
-            Some(AgentError::OutputTokenLimit {
-                reasoning_only: true,
-                ..
-            })
-        ) {
-            return true;
-        }
-        // A compatible Messages gateway can hide its thinking or leave a
-        // provisional client tool call at the cap. The entire attempted turn
-        // is discarded. Start a new bounded phase only without provider work.
-        output_limited
-            && finish_reason == "max_tokens"
-            && retry.allows_truncated_messages_split()
-            && !completion.saw_provider_tool()
-            && stream_output.provider_transcript_items.iter().all(|item| {
-                matches!(
-                    item.kind(),
-                    ProviderTranscriptItemKind::AnthropicThinking
-                        | ProviderTranscriptItemKind::AnthropicRedactedThinking
-                        | ProviderTranscriptItemKind::AnthropicToolUse
-                )
-            })
+    // A compatible Messages gateway can hide its thinking or leave a
+    // provisional client tool call at the cap. Discarding this turn is safe
+    // only when it contains no provider-side work.
+    let can_resume_truncated_messages = output_limited
+        && completion.is_compatible_messages()
+        && !completion.saw_provider_tool()
+        && stream_output
+            .provider_transcript_items
+            .iter()
+            .all(|item| !item.kind().is_discovery());
+    let mut output_limit_recovery = completion.output_limit_recovery().filter(|_| {
+        can_resume_truncated_messages
+            || matches!(
+                terminal_validation_error,
+                Some(AgentError::OutputTokenLimit {
+                    reasoning_only: true,
+                    ..
+                })
+            )
     });
     if matches!(
         terminal_validation_error,
@@ -521,6 +516,7 @@ pub(crate) async fn execute_llm_round(
         attempt_usage,
         terminal_validation_error,
         output_limit_recovery,
+        can_resume_truncated_messages,
         host_gold_attempt,
     })
 }

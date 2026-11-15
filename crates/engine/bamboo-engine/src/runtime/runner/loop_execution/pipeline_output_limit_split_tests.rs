@@ -161,7 +161,7 @@ async fn mount_replies(server: &MockServer, route: &str, replies: Vec<ResponseTe
 
 async fn run(
     protocol: Protocol,
-    effort: ReasoningEffort,
+    effort: Option<ReasoningEffort>,
     replies: Vec<ResponseTemplate>,
     budget: bamboo_config::RunBudgetConfig,
 ) -> Run {
@@ -172,7 +172,7 @@ async fn run(
     let mut config = canonical_usage_pipeline_config();
     let dir = tempfile::tempdir().unwrap();
     config.app_data_dir = Some(dir.path().into());
-    config.reasoning_effort = Some(effort);
+    config.reasoning_effort = effort;
     config.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
     config.run_budget = budget;
     let mut session = Session::new("task-split", "model");
@@ -239,7 +239,7 @@ async fn run_compatible(
 ) -> Run {
     run(
         Protocol::Messages { compatible: true },
-        ReasoningEffort::Medium,
+        Some(ReasoningEffort::Medium),
         replies,
         budget,
     )
@@ -265,7 +265,7 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
         ];
         let run = run(
             Protocol::Messages { compatible },
-            effort,
+            Some(effort),
             replies,
             Default::default(),
         )
@@ -333,7 +333,7 @@ async fn pipeline_closes_unsigned_messages_before_the_limit_without_thinking_con
     frames.push(json!({"type":"error","error":{"message":"stream was read past the cutoff"}}));
     let run = run(
         Protocol::Messages { compatible: false },
-        ReasoningEffort::Disabled,
+        None,
         vec![
             mock_completion_sse(&frames),
             text("[]"),
@@ -367,7 +367,7 @@ async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_
     for reply in [opaque, provisional] {
         let run = run(
             Protocol::Messages { compatible: false },
-            ReasoningEffort::Disabled,
+            None,
             vec![
                 reply,
                 text(r#"["Check the fixture once"]"#),
@@ -488,6 +488,52 @@ async fn pipeline_uses_one_confirmed_action_after_a_capped_recovery_plan() {
 }
 
 #[tokio::test]
+async fn pipeline_stops_if_a_capped_plan_contains_provider_work_or_leaves_too_little_budget() {
+    let unexpected_provider_work = mock_completion_sse(&[
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"server_tool_use","id":"srv_plan","name":"web_search","input":{}
+        }}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let capped_plan = mock_completion_sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10_000,
+            "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    for (plan, max_total_tokens, expected_error) in [
+        (unexpected_provider_work, None, "output token limit"),
+        (capped_plan, Some(26_000), "budget"),
+    ] {
+        let run = run_compatible(
+            vec![limit(), plan],
+            bamboo_config::RunBudgetConfig {
+                max_total_tokens,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(run
+            .result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains(expected_error));
+        assert_eq!(run.tool_count, 0);
+        assert_eq!(
+            run.session.messages.last().unwrap().content,
+            "Verified prerequisite."
+        );
+        if max_total_tokens.is_some() {
+            assert_eq!(run.usage.total_prompt_tokens, 10_031);
+            assert_eq!(run.usage.total_completion_tokens, CAP * 2);
+        }
+    }
+}
+
+#[tokio::test]
 async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_send() {
     for (effort, response, status) in [
         (ReasoningEffort::Medium, ResponseTemplate::new(429), "429"),
@@ -499,7 +545,7 @@ async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_
     ] {
         let run = run(
             Protocol::Messages { compatible: false },
-            effort,
+            Some(effort),
             vec![limit(), response],
             Default::default(),
         )
@@ -601,7 +647,7 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
 async fn pipeline_output_limit_split_counts_separate_gemini_proxy_reasoning() {
     let run = run(
         Protocol::BodhiGemini,
-        ReasoningEffort::Low,
+        Some(ReasoningEffort::Low),
         vec![mock_completion_sse(&[json!({
             "type":"chunk","candidates":[{"content":{"parts":[{"text":"Thinking","thought":true}]},"finishReason":"MAX_TOKENS"}],
             "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":8000}
@@ -660,7 +706,7 @@ async fn pipeline_output_limit_split_reserves_missing_gemini_candidate_count() {
     })]);
     let run = run(
         Protocol::Gemini,
-        ReasoningEffort::Low,
+        Some(ReasoningEffort::Low),
         vec![reasoning, answer],
         Default::default(),
     )
@@ -923,11 +969,11 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
         ]);
         let run = run(
             protocol,
-            if responses {
+            Some(if responses {
                 ReasoningEffort::Max
             } else {
                 ReasoningEffort::Low
-            },
+            }),
             replies,
             Default::default(),
         )

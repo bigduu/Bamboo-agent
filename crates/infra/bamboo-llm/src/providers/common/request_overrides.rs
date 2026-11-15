@@ -172,6 +172,7 @@ pub(crate) fn mask_and_prepare_agent_request(
             .is_none(),
         _ => true,
     };
+    let compatible_messages = endpoint == ENDPOINT_MESSAGES && diagnostics.is_compatible_messages();
     let candidate = limit
         .filter(|_| {
             client_tools_only(endpoint, body) && !crate::retry::work_request_budget_active()
@@ -193,6 +194,9 @@ pub(crate) fn mask_and_prepare_agent_request(
                     && !control_is_pinned
                     && (*effort == ReasoningEffort::Low || masking.apply_masking(low) == low)
             });
+            if !compatible_messages && lowerable_effort.is_none() {
+                return None;
+            }
             let (prompt_key, candidate_count) = match endpoint {
                 ENDPOINT_CHAT_COMPLETIONS => ("messages", body.get("n")),
                 ENDPOINT_MESSAGES => ("messages", None),
@@ -212,6 +216,7 @@ pub(crate) fn mask_and_prepare_agent_request(
                 lowerable_effort,
                 output_limit,
                 allows_convergence,
+                compatible_messages,
             })
         });
     if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
@@ -683,18 +688,47 @@ mod tests {
             };
             let diagnostics =
                 CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            diagnostics.mark_compatible_messages();
             assert_eq!(dispatch(diagnostics.clone(), body.clone()).await, expected);
             let split = diagnostics.output_limit_recovery().unwrap();
             assert!(split.prefers_task_split(), "{path}");
             assert_eq!(diagnostics.reasoning_cutoff_budget(), Some((4096, None)));
-            assert_eq!(
-                dispatch(
-                    CompletionDiagnostics::for_agent_round(Some(split.for_task_split())),
-                    body
+            let continuation = CompletionDiagnostics::for_agent_round(Some(split.for_task_split()));
+            continuation.mark_compatible_messages();
+            assert_eq!(dispatch(continuation, body).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_effort_only_allows_new_recovery_on_compatible_messages() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (ENDPOINT_MESSAGES, json!({"max_tokens":4096})),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"max_completion_tokens":4096}),
+            ),
+            (ENDPOINT_RESPONSES, json!({"max_output_tokens":4096})),
+            (
+                ENDPOINT_STREAM_GENERATE_CONTENT,
+                json!({"generationConfig":{"maxOutputTokens":4096}}),
+            ),
+        ] {
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "fixture",
                 )
-                .await,
-                expected,
-            );
+                .unwrap();
+            })
+            .await;
+            assert!(diagnostics.output_limit_recovery().is_none(), "{endpoint}");
         }
     }
 

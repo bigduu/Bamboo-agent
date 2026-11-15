@@ -488,6 +488,16 @@ impl AnthropicProvider {
             Some(model),
         );
         apply_required_tool_choice(&mut body, required_tool);
+        // A compatible gateway can enforce reasoning without advertising it
+        // on the request. Its cutoff must not depend on replaying old thinking.
+        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        if let Some(diagnostics) = completion_diagnostics
+            .as_ref()
+            .filter(|_| compatible_gateway)
+        {
+            diagnostics.mark_compatible_messages();
+        }
         // Last-moment scan: mask every text value in the fully-assembled body.
         request_overrides::mask_and_prepare_agent_request(
             &mut body,
@@ -589,15 +599,6 @@ impl AnthropicProvider {
             )));
         }
 
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
-        // A compatible gateway can enforce reasoning without advertising it
-        // on the request. Its cutoff must not depend on replaying old thinking.
-        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
-        if compatible_gateway {
-            if let Some(diagnostics) = completion_diagnostics.as_ref() {
-                diagnostics.prefer_task_split();
-            }
-        }
         let reasoning_cutoff = completion_diagnostics
             .as_ref()
             .filter(|_| compatible_gateway)
