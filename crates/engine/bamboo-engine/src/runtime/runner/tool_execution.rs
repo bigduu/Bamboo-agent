@@ -123,6 +123,8 @@ pub(crate) fn legacy_effective_callable_set(
 }
 
 pub(crate) struct RoundToolExecutionResult {
+    /// Exact contract of the sole tool when its dispatch completed successfully.
+    pub completed_single_tool_contract: Option<String>,
     pub quiet_exec_handle: Option<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,

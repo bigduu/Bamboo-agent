@@ -20,6 +20,12 @@ use super::tests::{
 #[derive(Default)]
 struct SplitExecutor(AtomicUsize);
 
+impl SplitExecutor {
+    fn call_count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolExecutor for SplitExecutor {
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -70,12 +76,12 @@ fn tool(id: &str, tokens: u64) -> ResponseTemplate {
     )
 }
 
-struct Run {
+struct Run<T = SplitExecutor> {
     result: Result<bool, AgentError>,
     requests: Vec<Value>,
     session: Session,
     usage: RoundRuntimeState,
-    tool_count: usize,
+    tools: Arc<T>,
     events: Vec<AgentEvent>,
 }
 
@@ -165,6 +171,23 @@ async fn run(
     replies: Vec<ResponseTemplate>,
     budget: bamboo_config::RunBudgetConfig,
 ) -> Run {
+    run_with_executor(
+        protocol,
+        effort,
+        replies,
+        budget,
+        Arc::new(SplitExecutor::default()),
+    )
+    .await
+}
+
+async fn run_with_executor<T: ToolExecutor + 'static>(
+    protocol: Protocol,
+    effort: Option<ReasoningEffort>,
+    replies: Vec<ResponseTemplate>,
+    budget: bamboo_config::RunBudgetConfig,
+    tools: Arc<T>,
+) -> Run<T> {
     let count = replies.len();
     let server = MockServer::start().await;
     let (route, provider) = protocol.provider(&server);
@@ -197,7 +220,6 @@ async fn run(
     ));
     session.add_message(Message::tool_result("call_prior", "Verified prerequisite."));
     let mut state = e2e_loop_state("task-split");
-    let tools = Arc::new(SplitExecutor::default());
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let cancel = CancellationToken::new();
     let result = tokio::time::timeout(
@@ -228,7 +250,7 @@ async fn run(
         requests,
         session,
         usage: state.runtime_state.round,
-        tool_count: tools.0.load(Ordering::SeqCst),
+        tools,
         events,
     }
 }
@@ -244,6 +266,68 @@ async fn run_compatible(
         budget,
     )
     .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pipeline_output_limit_split_uses_foreground_bash_contract() {
+    use bamboo_tools::{
+        tools::foreground_bash::ForegroundBashTool, BuiltinToolExecutor, ToolRegistry,
+    };
+
+    for (command, success) in [
+        ("printf 'foreground evidence'", true),
+        ("printf 'foreground evidence'; exit 7", false),
+    ] {
+        let registry = ToolRegistry::new();
+        registry.register(ForegroundBashTool).unwrap();
+        let mut replies = vec![
+            limit(),
+            text(r#"["Run the shell command","Use its output"]"#),
+            mock_messages_completion(
+                json!({"type":"tool_use","id":"call_bash","name":"bash","input":{}}),
+                json!({"type":"input_json_delta","partial_json":json!({"command":command}).to_string()}),
+                "tool_use",
+                Some(9),
+            ),
+        ];
+        if success {
+            replies.extend([
+                text("CHECKPOINT: Foreground output was received."),
+                text("Final foreground report."),
+            ]);
+        }
+        let run = run_with_executor(
+            Protocol::Messages { compatible: true },
+            Some(ReasoningEffort::Medium),
+            replies,
+            Default::default(),
+            Arc::new(BuiltinToolExecutor::with_registry(registry)),
+        )
+        .await;
+        let result = run
+            .session
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == Role::Tool && message.tool_call_id.as_deref() == Some("call_bash")
+            })
+            .expect("the foreground executor must return a result for the call");
+        assert_eq!(result.tool_success, Some(success));
+        assert!(result.content.contains("foreground evidence"));
+        if success {
+            assert_eq!(result.content, "foreground evidence");
+            assert!(run.result.unwrap());
+            assert_eq!(
+                run.session.messages.last().unwrap().content,
+                "Final foreground report."
+            );
+        } else {
+            assert!(result.content.contains("Command exited with code 7"));
+            assert!(matches!(run.result, Err(AgentError::Tool(ref error))
+                if error.contains("unconfirmed step")));
+        }
+    }
 }
 
 #[tokio::test]
@@ -271,7 +355,7 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
         )
         .await;
         assert!(run.result.unwrap());
-        assert_eq!(run.tool_count, 2);
+        assert_eq!(run.tools.call_count(), 2);
         let stages = &run.requests[1..];
         for (i, body) in stages.iter().enumerate() {
             assert_eq!(body["max_tokens"], CAP);
@@ -379,7 +463,7 @@ async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_
         )
         .await;
         assert!(run.result.unwrap());
-        assert_eq!(run.tool_count, 1);
+        assert_eq!(run.tools.call_count(), 1);
         let report = run.requests[3]["messages"].to_string();
         assert!(report.contains("Verified prerequisite."));
         assert!(report.contains("confirmed result for complete"));
@@ -417,7 +501,7 @@ async fn pipeline_output_limit_split_stops_at_token_and_round_limits() {
             "{:?}",
             run.result
         );
-        assert_eq!(run.tool_count, 1);
+        assert_eq!(run.tools.call_count(), 1);
         assert_eq!(run.usage.total_completion_tokens, CAP * 2 + 7);
         assert!(run.session.messages.iter().any(|message| {
             message.role == Role::Tool && message.content.contains("confirmed result for step_a")
@@ -440,7 +524,7 @@ async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
             run.result.unwrap_err().to_string().contains(reason),
             "{reason}"
         );
-        assert_eq!(run.tool_count, 0);
+        assert_eq!(run.tools.call_count(), 0);
         assert_eq!(run.session.messages.len(), 3);
     }
 }
@@ -467,7 +551,7 @@ async fn pipeline_uses_one_confirmed_action_after_a_capped_recovery_plan() {
         assert!(!work_request.contains("Discard this partial plan"));
         if step_completes {
             assert!(run.result.unwrap());
-            assert_eq!(run.tool_count, 1);
+            assert_eq!(run.tools.call_count(), 1);
             assert!(run.requests[3]["messages"]
                 .to_string()
                 .contains("confirmed result for step_retained"));
@@ -477,7 +561,7 @@ async fn pipeline_uses_one_confirmed_action_after_a_capped_recovery_plan() {
                 run.result,
                 Err(AgentError::OutputTokenLimit { .. })
             ));
-            assert_eq!(run.tool_count, 0);
+            assert_eq!(run.tools.call_count(), 0);
             assert_eq!(run.usage.total_completion_tokens, 3 * CAP);
             assert!(run
                 .session
@@ -522,7 +606,7 @@ async fn pipeline_stops_if_a_capped_plan_contains_provider_work_or_leaves_too_li
             .to_string()
             .to_lowercase()
             .contains(expected_error));
-        assert_eq!(run.tool_count, 0);
+        assert_eq!(run.tools.call_count(), 0);
         assert_eq!(
             run.session.messages.last().unwrap().content,
             "Verified prerequisite."
@@ -552,7 +636,7 @@ async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_
         )
         .await;
         assert!(run.result.unwrap_err().to_string().contains(status));
-        assert_eq!(run.tool_count, 0);
+        assert_eq!(run.tools.call_count(), 0);
         assert_eq!(run.requests[1]["output_config"]["effort"], effort.as_str());
     }
 }
@@ -577,7 +661,7 @@ async fn pipeline_output_limit_split_rejects_a_tool_before_messages_stop() {
         .unwrap_err()
         .to_string()
         .contains("without a successful provider completion"));
-    assert_eq!(run.tool_count, 0);
+    assert_eq!(run.tools.call_count(), 0);
     assert_eq!(run.session.messages.len(), 3);
 }
 
@@ -618,6 +702,7 @@ async fn pipeline_output_limit_split_reserves_confirmed_cache_and_refuses_provid
 #[test]
 fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_results() {
     use super::super::output_limit_split::{confirms_tool_result, forbidden_tool};
+    use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
     for name in ["default::SubAgent", "default::spawnSession", "deploy_agent"] {
         assert!(forbidden_tool(name), "{name}");
     }
@@ -633,15 +718,22 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
     ] {
         let message = Message::tool_result("command", result.to_string());
         assert_eq!(
-            confirms_tool_result("default::exec_command", "command", &message),
+            confirms_tool_result("default::exec_command", "command", None, &message),
             success
         );
     }
     assert!(confirms_tool_result(
         "Bash",
         "command",
+        None,
         &Message::tool_result("command", r#"{"exit_code":0}"#),
     ));
+
+    let output = Message::tool_result("command", "plain foreground output");
+    let contract = Some(FOREGROUND_BASH_EXECUTION_CONTRACT);
+    assert!(!confirms_tool_result("bash", "command", None, &output));
+    assert!(!confirms_tool_result("bash", "other", contract, &output));
+    assert!(confirms_tool_result("bash", "command", contract, &output));
 }
 
 #[tokio::test]
@@ -684,7 +776,7 @@ async fn pipeline_output_limit_split_stops_on_blocked_or_truncated_work() {
         )
         .await;
         assert!(run.result.unwrap_err().to_string().contains(reason));
-        assert_eq!(run.tool_count, 0);
+        assert_eq!(run.tools.call_count(), 0);
         assert_eq!(
             run.session
                 .messages
@@ -845,7 +937,7 @@ async fn pipeline_output_limit_split_rejects_tool_batches_before_dispatch() {
     .await;
     let error = run.result.unwrap_err().to_string();
     assert!(error.contains("tool outside the current step"), "{error}");
-    assert_eq!(run.tool_count, 0);
+    assert_eq!(run.tools.call_count(), 0);
     assert_eq!(run.session.messages.len(), 3);
 }
 
@@ -864,7 +956,7 @@ async fn pipeline_output_limit_split_reserves_full_output_when_usage_is_missing(
     .await;
     assert!(matches!(run.result, Err(AgentError::Budget(_))));
     assert_eq!(run.usage.total_completion_tokens, 2 * CAP);
-    assert_eq!(run.tool_count, 0);
+    assert_eq!(run.tools.call_count(), 0);
 }
 
 #[tokio::test]
@@ -883,7 +975,7 @@ async fn pipeline_output_limit_split_rejects_tools_when_reported_usage_exceeds_b
     .await;
     assert!(matches!(run.result, Err(AgentError::Budget(_))));
     assert_eq!(run.usage.total_completion_tokens, 5 * CAP + 7);
-    assert_eq!(run.tool_count, 0);
+    assert_eq!(run.tools.call_count(), 0);
 }
 
 #[tokio::test]
