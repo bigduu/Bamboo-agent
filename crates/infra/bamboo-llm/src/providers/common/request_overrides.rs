@@ -164,7 +164,11 @@ pub(crate) fn mask_and_prepare_agent_request(
     };
     let candidate = effort
         .zip(limit)
-        .filter(|_| native_control && !crate::retry::work_request_budget_active())
+        .filter(|_| {
+            native_control
+                && client_tools_only(endpoint, body)
+                && !crate::retry::work_request_budget_active()
+        })
         .and_then(|(effort, output_limit)| {
             let patches = overrides.map(|config| resolve_scope(config, endpoint, Some(model)));
             let mut patches = patches.iter().flat_map(|scope| &scope.body_patch);
@@ -198,7 +202,6 @@ pub(crate) fn mask_and_prepare_agent_request(
                 effort,
                 output_limit,
                 allows_convergence,
-                client_tools_only: client_tools_only(endpoint, body),
             })
         });
     if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
@@ -622,6 +625,41 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[tokio::test]
+    async fn provider_tools_disable_all_output_limit_recovery() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        for (field, tools) in [
+            (
+                "tools",
+                serde_json::json!([{"type":"web_search_20250305","name":"web_search"}]),
+            ),
+            (
+                "mcp_servers",
+                serde_json::json!([{"type":"url","name":"remote"}]),
+            ),
+        ] {
+            let diagnostics =
+                CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            let mut body = serde_json::json!({
+                "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}
+            });
+            body[field] = tools;
+            scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    ENDPOINT_MESSAGES,
+                    "fixture",
+                )
+                .unwrap();
+            })
+            .await;
+            assert!(diagnostics.output_limit_recovery().is_none(), "{field}");
+            assert!(diagnostics.reasoning_cutoff_budget().is_none(), "{field}");
+        }
+    }
 
     #[tokio::test]
     async fn work_budget_rejects_resolved_body_patch_and_keeps_legacy_behavior() {

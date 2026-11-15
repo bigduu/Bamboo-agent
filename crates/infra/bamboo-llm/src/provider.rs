@@ -274,7 +274,6 @@ pub(crate) struct OutputLimitRecoveryControls {
     pub(crate) effort: ReasoningEffort,
     pub(crate) output_limit: u64,
     pub(crate) allows_convergence: bool,
-    pub(crate) client_tools_only: bool,
 }
 
 impl OutputLimitRecovery {
@@ -287,7 +286,7 @@ impl OutputLimitRecovery {
     }
 
     pub fn allows_task_split(self) -> bool {
-        self.controls.allows_convergence && self.controls.client_tools_only
+        self.controls.allows_convergence
     }
 
     pub fn prefers_task_split(self) -> bool {
@@ -322,6 +321,8 @@ impl OutputLimitRecovery {
 #[derive(Debug, Default)]
 struct CompletionDiagnosticState {
     finish_reason: Option<&'static str>,
+    messages_stopped: bool,
+    provider_tool_seen: bool,
     endpoint: Option<&'static str>,
     changed_protocol: bool,
     output_limit: Option<u64>,
@@ -403,6 +404,49 @@ impl CompletionDiagnostics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .finish_reason = Some(REASONING_HEADROOM_FINISH_REASON);
+    }
+
+    pub(crate) fn record_messages_stop(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages_stopped = true;
+    }
+
+    pub(crate) fn record_provider_tool(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_tool_seen = true;
+    }
+
+    pub fn saw_provider_tool(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_tool_seen
+    }
+
+    /// A recovery step needs a confirmed successful protocol boundary.
+    pub fn has_recovery_completion(&self) -> bool {
+        use crate::providers::common::request_overrides::{
+            ENDPOINT_CHAT_COMPLETIONS, ENDPOINT_MESSAGES, ENDPOINT_RESPONSES,
+            ENDPOINT_STREAM_GENERATE_CONTENT,
+        };
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !state.provider_tool_seen
+            && match (state.endpoint, state.finish_reason) {
+                (Some(ENDPOINT_MESSAGES), Some("end_turn" | "tool_use" | "stop_sequence")) => {
+                    state.messages_stopped
+                }
+                (
+                    Some(ENDPOINT_CHAT_COMPLETIONS),
+                    Some("stop" | "tool_calls" | "function_call"),
+                )
+                | (Some(ENDPOINT_RESPONSES), Some("completed"))
+                | (Some(ENDPOINT_STREAM_GENERATE_CONTENT), Some("STOP")) => true,
+                _ => false,
+            }
     }
 
     pub fn output_limit(&self) -> Option<u64> {

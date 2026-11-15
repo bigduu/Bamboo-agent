@@ -179,9 +179,12 @@ pub(crate) fn work_request_budget_active() -> bool {
 }
 
 fn single_attempt_required() -> bool {
-    work_request_budget_active()
-        || crate::provider::current_completion_diagnostics()
-            .is_some_and(|diagnostics| diagnostics.is_output_limit_recovery())
+    work_request_budget_active() || output_limit_recovery_active()
+}
+
+pub(crate) fn output_limit_recovery_active() -> bool {
+    crate::provider::current_completion_diagnostics()
+        .is_some_and(|diagnostics| diagnostics.is_output_limit_recovery())
 }
 
 pub(crate) fn claim_work_physical_request() -> Result<(), LLMError> {

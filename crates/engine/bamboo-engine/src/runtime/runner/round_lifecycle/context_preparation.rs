@@ -3039,8 +3039,8 @@ pub(crate) async fn force_overflow_context_recovery(
 }
 
 /// Preserve the current active transcript and let the final wire preflight
-/// enforce the window. A split request must not start an unreserved compaction.
-pub(super) async fn prepare_task_split_context(
+/// enforce the window. A recovery request must not start an unreserved compaction.
+pub(super) async fn prepare_output_limit_recovery_context(
     session: &mut Session,
     config: &AgentLoopConfig,
     model_name: &str,

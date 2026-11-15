@@ -3027,7 +3027,7 @@ async fn handle_tool_calls_path(
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
-    allow_mid_turn_compression: bool,
+    output_limit_recovery: bool,
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -3107,7 +3107,7 @@ async fn handle_tool_calls_path(
                 runtime_state,
                 policy_guard,
                 task_context,
-                compression_model_name: allow_mid_turn_compression.then_some(model_name),
+                compression_model_name: (!output_limit_recovery).then_some(model_name),
                 compression_model_provider: auxiliary_models
                     .summarization_model_provider
                     .as_ref()
@@ -3216,7 +3216,7 @@ async fn handle_tool_calls_path(
     // The poll has already returned and its tool result is paired. A sole
     // follow-up quiet read can now wait within this run, outside tool deadlines
     // and without spending another provider turn.
-    if round_status == MetricsRoundStatus::Success {
+    if !output_limit_recovery && round_status == MetricsRoundStatus::Success {
         if let Some(handle) = tool_execution.quiet_exec_handle {
             if let Some(job) =
                 bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
@@ -3922,10 +3922,17 @@ async fn run_pipeline_inner(
                     private_plan: *stage == SplitStage::Plan,
                 }),
             };
-            let request_tools = if matches!(split_request.as_ref(), Some((SplitStage::Plan | SplitStage::Report, _))) {
-                &[]
-            } else {
-                tool_schemas.as_slice()
+            let split_tools;
+            let request_tools = match split_request.as_ref() {
+                Some((SplitStage::Plan | SplitStage::Report, _)) => &[],
+                Some((SplitStage::Work, _)) => {
+                    split_tools = tool_schemas.iter()
+                        .filter(|schema| !super::output_limit_split::forbidden_tool(&schema.function.name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    split_tools.as_slice()
+                }
+                None => tool_schemas.as_slice(),
             };
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
@@ -4181,8 +4188,17 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
-            if let Some(error) = llm_output.terminal_validation_error {
-                if matches!(error, AgentError::OutputTokenLimit { .. }) {
+            let validation_error = llm_output.terminal_validation_error.or_else(|| {
+                output_limit_recovery.and_then(|_| {
+                    let mut spent = state.runtime_state.round.clone();
+                    round_activity.apply_to_round(&mut spent);
+                    (run_tokens_used(&spent) > recovery_token_limit).then(|| AgentError::Budget(
+                        "output-limit recovery exceeded its token budget on reported usage".into(),
+                    ))
+                })
+            });
+            if let Some(error) = validation_error {
+                if output_limit_recovery.is_some() || matches!(error, AgentError::OutputTokenLimit { .. }) {
                     if let Some(visible) = stream_output.visible_message {
                         let _ = event_tx
                             .send(AgentEvent::VisibleMessageDiscard {
@@ -4247,8 +4263,7 @@ async fn run_pipeline_inner(
                 let max_tools = usize::from(*stage == SplitStage::Work);
                 let invalid_tool = stream_output.tool_calls.len() > max_tools
                     || stream_output.tool_calls.iter().any(|call| {
-                        is_child_spawn_call(call)
-                            || call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+                        super::output_limit_split::forbidden_tool(&call.function.name)
                     })
                     || stream_output.provider_transcript_items.iter().any(|item| {
                         item.kind().is_discovery()
@@ -4256,24 +4271,15 @@ async fn run_pipeline_inner(
                                 ProviderTranscriptItemKind::AnthropicToolUse
                                     | ProviderTranscriptItemKind::OpenAiFunctionCall))
                     });
-                let mut spent = state.runtime_state.round.clone();
-                round_activity.apply_to_round(&mut spent);
-                let rejection = if run_tokens_used(&spent) > recovery_token_limit {
-                    Some(AgentError::Budget(
-                        "output-limit task recovery exceeded its token budget on reported usage".into(),
-                    ))
-                } else {
-                    invalid_tool.then(|| AgentError::LLMNonRetryable(
-                        "output-limit task recovery rejected a tool outside the current step".into(),
-                    ))
-                };
-                if let Some(error) = rejection {
+                if invalid_tool {
                     if let Some(visible) = stream_output.visible_message {
                         let _ = event_tx.send(AgentEvent::VisibleMessageDiscard {
                             message_id: visible.message_id,
                         }).await;
                     }
-                    terminal_error = Some(error);
+                    terminal_error = Some(AgentError::LLMNonRetryable(
+                        "output-limit task recovery rejected a tool outside the current step".into(),
+                    ));
                     break;
                 }
 
@@ -4592,9 +4598,9 @@ async fn run_pipeline_inner(
             let injected_handler_error = take_test_post_llm_retry_failure(session);
             #[cfg(not(test))]
             let injected_handler_error: Option<AgentError> = None;
-            let split_tool_id = split_request.as_ref()
+            let split_tool = split_request.as_ref()
                 .and_then(|_| stream_output.tool_calls.first())
-                .map(|call| call.id.clone());
+                .map(|call| (call.function.name.clone(), call.id.clone()));
             let before_tool = session.messages.len();
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
@@ -4611,7 +4617,7 @@ async fn run_pipeline_inner(
                         &state.model_name,
                         &mut state.task_context,
                         cancel_token,
-                        split_request.is_none(),
+                        output_limit_recovery.is_some(),
                     )
                     .await
                 }
@@ -4629,11 +4635,10 @@ async fn run_pipeline_inner(
                             }
                         }
                     }
-                    if let (Some(split), Some(call_id)) = (split_recovery.as_mut(), split_tool_id) {
+                    if let (Some(split), Some((name, id))) = (split_recovery.as_mut(), split_tool) {
                         if !outcome.should_break {
                             let confirmed = session.messages.iter().skip(before_tool).any(|message| {
-                                message.role == Role::Tool && message.tool_call_id.as_deref() == Some(call_id.as_str())
-                                    && message.tool_success == Some(true)
+                                super::output_limit_split::confirms_tool_result(&name, &id, message)
                             });
                             split.finish_step(confirmed);
                         }
@@ -10966,263 +10971,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_output_token_limit_converges_for_chat_completions_and_gemini() {
-        use bamboo_domain::ReasoningEffort;
-        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
-        use serde_json::{json, Value};
-        use wiremock::matchers::{body_string_contains, method, path};
-        use wiremock::{Mock, MockServer};
-
-        for protocol in ["openai", "gemini"] {
-            let server = MockServer::start().await;
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let (llm, route, prompt, effort, cap, low, limited, answer): (
-                Arc<dyn LLMProvider>,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-            ) = if protocol == "openai" {
-                (
-                    Arc::new(
-                        bamboo_llm::OpenAIProvider::new("test-key")
-                            .with_base_url(server.uri())
-                            .with_client(client),
-                    ),
-                    "/chat/completions",
-                    "messages",
-                    "/reasoning_effort",
-                    "/max_completion_tokens",
-                    "low",
-                    json!({"type":"chunk","choices":[{"delta":{"reasoning_content":"Failed reasoning"},"finish_reason":"length"}],
-                        "usage":{"prompt_tokens":10,"completion_tokens":8}}),
-                    json!({"type":"chunk","choices":[{"delta":{"content":"Recovered"},"finish_reason":"stop"}],
-                        "usage":{"prompt_tokens":12,"completion_tokens":3}}),
-                )
-            } else {
-                (
-                    Arc::new(
-                        bamboo_llm::GeminiProvider::new("test-key")
-                            .with_base_url(server.uri())
-                            .with_client(client),
-                    ),
-                    "/models/model:streamGenerateContent",
-                    "contents",
-                    "/generationConfig/thinkingConfig/thinkingLevel",
-                    "/generationConfig/maxOutputTokens",
-                    "LOW",
-                    json!({"type":"chunk","candidates":[{"content":{"parts":[{"text":"Failed reasoning","thought":true}]},"finishReason":"MAX_TOKENS"}],
-                        "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0,"thoughtsTokenCount":8}}),
-                    json!({"type":"chunk","candidates":[{"content":{"parts":[{"text":"Recovered"}]},"finishReason":"STOP"}],
-                        "usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}),
-                )
-            };
-            Mock::given(method("POST"))
-                .and(path(route))
-                .respond_with(mock_completion_sse(&[limited]))
-                .with_priority(2)
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path(route))
-                .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
-                .respond_with(mock_completion_sse(&[answer]))
-                .with_priority(1)
-                .expect(1)
-                .mount(&server)
-                .await;
-            let dir = tempfile::tempdir().unwrap();
-            let mut config = canonical_usage_pipeline_config();
-            config.app_data_dir = Some(dir.path().into());
-            config.provider_type = Some(protocol.into());
-            config.reasoning_effort = Some(ReasoningEffort::Low);
-            let mut session = Session::new(protocol, "model");
-            session.add_message(Message::user("Answer the original request."));
-            let mut state = e2e_loop_state(protocol);
-            let (tx, _rx) = tokio::sync::mpsc::channel(128);
-            let result = super::run_pipeline(
-                &mut session,
-                &tx,
-                llm,
-                Arc::new(OutputLimitExecutor::default()),
-                &CancellationToken::new(),
-                &config,
-                &mut state,
-            )
-            .await;
-            assert!(result.unwrap(), "{protocol}");
-            let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), 2);
-            let before: Value = requests[0].body_json().unwrap();
-            let after: Value = requests[1].body_json().unwrap();
-            assert_eq!(before.pointer(effort).and_then(Value::as_str), Some(low));
-            assert_eq!(before.pointer(effort), after.pointer(effort));
-            assert!(before.pointer(cap).is_some());
-            assert_eq!(before.pointer(cap), after.pointer(cap));
-            let input = after[prompt].to_string();
-            assert!(input.contains("Answer the original request."));
-            assert!(input.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
-            assert!(!input.contains("Failed reasoning"));
-            assert_eq!(session.messages.len(), 2);
-            assert_eq!(session.messages[1].content, "Recovered");
-            assert!(session.messages[1].reasoning.is_none());
-            assert_eq!(state.runtime_state.round.total_completion_tokens, 11);
-        }
-    }
-
-    #[tokio::test]
     async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
         use bamboo_domain::ReasoningEffort;
-        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
-        use serde_json::{json, Value};
-        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer};
 
-        let recovery = mock_completion_sse(&[json!({
-            "type":"response.completed",
-            "response":{"id":"resp_answer","status":"completed","usage":{"input_tokens":29,"output_tokens":3},
-                "output":[{"id":"msg_answer","type":"message","content":[{"type":"output_text","text":"Recovered"}]}]}
-        })]);
-        for (scenario, recover) in [("responses-recovery", true), ("responses-truncated", false)] {
-            let server = MockServer::start().await;
-            let prefix = if recover {
-                json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_limit","delta":"Reasoning progress"})
-            } else {
-                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"})
-            };
-            let output = if recover {
-                json!([{"id":"rs_limit","type":"reasoning","summary":[]}])
-            } else {
-                json!([{"id":"fc_partial","type":"function_call","call_id":"call_partial",
-                        "name":"fixture_tool","arguments":"{"}])
-            };
-            let limited = mock_completion_sse(&[
-                prefix,
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+            .respond_with(mock_completion_sse(&[
+                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"}),
                 json!({"type":"response.incomplete",
                     "response":{"id":"resp_limited","status":"incomplete",
-                        "incomplete_details":{"reason":"max_output_tokens"},"output":output,
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "output":[{"id":"fc_partial","type":"function_call","call_id":"call_partial",
+                            "name":"fixture_tool","arguments":"{"}],
                         "usage":{"input_tokens":29,"output_tokens":11,
                                  "output_tokens_details":{"reasoning_tokens":10}}}}),
-            ]);
-            Mock::given(method("POST"))
-                .and(path("/responses"))
-                .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
-                .respond_with(limited.clone())
-                .expect(1)
-                .mount(&server)
-                .await;
-            if recover {
-                Mock::given(method("POST"))
-                    .and(path("/responses"))
-                    .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
-                    .respond_with(limited.clone())
-                    .with_priority(2)
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                Mock::given(method("POST"))
-                    .and(path("/responses"))
-                    .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
-                    .respond_with(recovery.clone())
-                    .with_priority(1)
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-            }
-            let llm = bamboo_llm::OpenAIProvider::new("test-key")
-                .with_base_url(server.uri())
-                .with_responses_only_models(vec!["model".into()])
-                .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
-            let tools = Arc::new(OutputLimitExecutor::default());
-            let dir = tempfile::tempdir().unwrap();
-            let mut config = canonical_usage_pipeline_config();
-            config.app_data_dir = Some(dir.path().into());
-            config.reasoning_effort = Some(ReasoningEffort::Max);
-            let mut session = Session::new(scenario, "model");
-            session.add_message(Message::user("Answer the original request."));
-            session
-                .metadata
-                .insert("responses.previous_response_id".into(), "resp_prior".into());
-            let mut state = e2e_loop_state(scenario);
-            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-            let result = super::run_pipeline(
-                &mut session,
-                &tx,
-                Arc::new(llm),
-                tools.clone(),
-                &CancellationToken::new(),
-                &config,
-                &mut state,
-            )
+            ]))
+            .expect(1)
+            .mount(&server)
             .await;
-            let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), if recover { 3 } else { 1 });
-            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
-            let mut discarded = None;
-            let mut visible = None;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    AgentEvent::VisibleMessageStart { message_id, .. } => {
-                        visible = Some(message_id)
-                    }
-                    AgentEvent::VisibleMessageDiscard { message_id } => {
-                        discarded = Some(message_id)
-                    }
-                    AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
-                    _ => {}
-                }
+        let llm = bamboo_llm::OpenAIProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_responses_only_models(vec!["model".into()])
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        let tools = Arc::new(OutputLimitExecutor::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = canonical_usage_pipeline_config();
+        config.app_data_dir = Some(dir.path().into());
+        config.reasoning_effort = Some(ReasoningEffort::Max);
+        let mut session = Session::new("responses-truncated", "model");
+        session.add_message(Message::user("Answer the original request."));
+        session
+            .metadata
+            .insert("responses.previous_response_id".into(), "resp_prior".into());
+        let mut state = e2e_loop_state(&session.id);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(llm),
+            tools.clone(),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::OutputTokenLimit {
+                    finish_reason: "max_output_tokens",
+                    response_id: Some(ref id),
+                    reasoning_only: false,
+                }) if id == "resp_limited"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "Answer the original request."
+        );
+        assert_eq!(
+            session.metadata["responses.previous_response_id"],
+            "resp_prior"
+        );
+        let (mut visible, mut discarded) = (None, None);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::VisibleMessageStart { message_id, .. } => visible = Some(message_id),
+                AgentEvent::VisibleMessageDiscard { message_id } => discarded = Some(message_id),
+                AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
+                _ => {}
             }
-            if recover {
-                assert!(result.unwrap());
-                let mut expected: Value = requests[0].body_json().unwrap();
-                expected["reasoning"]["effort"] = json!("low");
-                assert_eq!(requests[1].body_json::<Value>().unwrap(), expected);
-                let final_body: Value = requests[2].body_json().unwrap();
-                assert_eq!(final_body["reasoning"], expected["reasoning"]);
-                assert_eq!(
-                    final_body["max_output_tokens"],
-                    expected["max_output_tokens"]
-                );
-                assert!(final_body.get("previous_response_id").is_none());
-                assert!(!final_body["input"].to_string().contains("rs_limit"));
-                assert!(final_body["input"]
-                    .to_string()
-                    .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
-                let last = session.messages.last().unwrap();
-                assert_eq!(last.content, "Recovered");
-                assert!(last.reasoning.is_none());
-                assert!(discarded.is_none());
-            } else {
-                assert!(
-                    matches!(
-                        result,
-                        Err(AgentError::OutputTokenLimit {
-                            finish_reason: "max_output_tokens",
-                            response_id: Some(ref id),
-                            reasoning_only: false,
-                        }) if id == "resp_limited"
-                    ),
-                    "{result:?}"
-                );
-                assert_eq!(
-                    session.messages.last().unwrap().content,
-                    "Answer the original request."
-                );
-                assert_eq!(
-                    session.metadata["responses.previous_response_id"],
-                    "resp_prior"
-                );
-                assert!(visible.is_some());
-                assert_eq!(discarded, visible);
-            }
-            let round = &state.runtime_state.round;
-            assert_eq!(round.total_prompt_tokens, if recover { 87 } else { 29 });
-            assert_eq!(round.total_completion_tokens, if recover { 25 } else { 11 });
         }
+        assert!(visible.is_some());
+        assert_eq!(discarded, visible);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 29);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 11);
     }
 
     #[tokio::test]
@@ -14191,7 +14022,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
-                true,
+                false,
             ),
         )
         .await;
@@ -14498,7 +14329,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
-                true,
+                false,
             ),
         )
         .await

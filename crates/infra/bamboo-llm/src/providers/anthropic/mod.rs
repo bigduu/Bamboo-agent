@@ -597,16 +597,9 @@ impl AnthropicProvider {
                 diagnostics.prefer_task_split();
             }
         }
-        let server_tools = body["tools"].as_array().is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind != "custom")
-            })
-        });
         let reasoning_cutoff = completion_diagnostics
             .as_ref()
-            .filter(|_| compatibility_reasoning && !server_tools)
+            .filter(|_| compatibility_reasoning)
             .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
             .filter(|(limit, _)| *limit >= 4096)
             .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));
@@ -2586,7 +2579,11 @@ pub fn parse_anthropic_sse_event(
                 );
             }
 
-            if !state.tool_uses_by_index.is_empty() {
+            if state.tool_uses_by_index.is_empty() {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_messages_stop();
+                }
+            } else {
                 tracing::warn!(
                     open_tool_count = state.tool_uses_by_index.len(),
                     "Anthropic message_stop received with open tool_use blocks (possible incomplete tool arguments)"
@@ -2628,6 +2625,11 @@ pub fn parse_anthropic_sse_event(
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
+            if block_type == "server_tool_use" || block_type.ends_with("_tool_result") {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_provider_tool();
+                }
+            }
 
             if block_type != "thinking"
                 || index != 0

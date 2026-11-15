@@ -166,6 +166,11 @@ async fn run(
     config.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
     config.run_budget = budget;
     let mut session = Session::new("task-split", "model");
+    if matches!(protocol, Protocol::Responses) {
+        session
+            .metadata
+            .insert("responses.previous_response_id".into(), "resp_prior".into());
+    }
     session.add_message(Message::user(
         "Inspect the fixture and verify the reported behavior.",
     ));
@@ -365,17 +370,102 @@ async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
 
 #[tokio::test]
 async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_send() {
-    for effort in [ReasoningEffort::Medium, ReasoningEffort::Low] {
+    for (effort, response, status) in [
+        (ReasoningEffort::Medium, ResponseTemplate::new(429), "429"),
+        (
+            ReasoningEffort::Low,
+            ResponseTemplate::new(307).insert_header("location", "/messages"),
+            "307",
+        ),
+    ] {
         let run = run(
             Protocol::Messages { compatible: false },
             effort,
-            vec![limit(), ResponseTemplate::new(429)],
+            vec![limit(), response],
             Default::default(),
         )
         .await;
-        assert!(run.result.unwrap_err().to_string().contains("429"));
+        assert!(run.result.unwrap_err().to_string().contains(status));
         assert_eq!(run.tool_count, 0);
         assert_eq!(run.requests[1]["output_config"]["effort"], "low");
+    }
+}
+
+#[tokio::test]
+async fn pipeline_output_limit_split_rejects_a_tool_before_messages_stop() {
+    let incomplete = mock_completion_sse(&[
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"partial_tool","name":"fixture_tool","input":{}
+        }}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}),
+    ]);
+    let run = run_compatible(
+        vec![limit(), text(r#"["Check the fixture"]"#), incomplete],
+        Default::default(),
+    )
+    .await;
+    assert!(run
+        .result
+        .unwrap_err()
+        .to_string()
+        .contains("without a successful provider completion"));
+    assert_eq!(run.tool_count, 0);
+    assert_eq!(run.session.messages.len(), 3);
+}
+
+#[tokio::test]
+async fn pipeline_output_limit_split_reserves_confirmed_cache_and_refuses_provider_work() {
+    for server_tool in [false, true] {
+        let mut frames = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":31,"cache_read_input_tokens":9_000}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Still reasoning"}}),
+            json!({"type":"content_block_stop","index":0}),
+        ];
+        if server_tool {
+            frames.extend([
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}),
+                json!({"type":"content_block_stop","index":1}),
+            ]);
+        }
+        frames.extend([
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let run = run_compatible(
+            vec![mock_completion_sse(&frames)],
+            bamboo_config::RunBudgetConfig {
+                max_total_tokens: (!server_tool).then_some(20_000),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(AgentError::OutputTokenLimit { reasoning_only, .. }) if reasoning_only != server_tool)
+        );
+        assert!(run.usage.total_prompt_tokens >= 9_031);
+    }
+}
+
+#[test]
+fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_results() {
+    use super::super::output_limit_split::{confirms_tool_result, forbidden_tool};
+    for name in ["default::SubAgent", "default::spawnSession", "deploy_agent"] {
+        assert!(forbidden_tool(name), "{name}");
+    }
+    assert!(!forbidden_tool("fixture_tool"));
+    for (result, success) in [
+        (json!({"status":"running","exit_code":null}), false),
+        (json!({"status":"exited","exit_code":1}), false),
+        (json!({"status":"exited","exit_code":0}), true),
+    ] {
+        let message = Message::tool_result("command", result.to_string());
+        assert_eq!(
+            confirms_tool_result("default::exec_command", "command", &message),
+            success
+        );
     }
 }
 
@@ -645,19 +735,29 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
             };
             mock_completion_sse(&[event])
         };
+        let responses = matches!(protocol, Protocol::Responses);
+        let mut replies = vec![reply("initial", None)];
+        if responses {
+            replies.push(reply("lower", None));
+        }
+        let convergence = replies.len();
+        replies.extend([
+            reply("convergence", None),
+            reply("plan", Some(r#"["Check the verified prerequisite"]"#)),
+            reply(
+                "work",
+                Some("CHECKPOINT: The prior tool result verified the prerequisite."),
+            ),
+            reply("report", Some("The prerequisite is verified.")),
+        ]);
         let run = run(
             protocol,
-            ReasoningEffort::Low,
-            vec![
-                reply("initial", None),
-                reply("convergence", None),
-                reply("plan", Some(r#"["Check the verified prerequisite"]"#)),
-                reply(
-                    "work",
-                    Some("CHECKPOINT: The prior tool result verified the prerequisite."),
-                ),
-                reply("report", Some("The prerequisite is verified.")),
-            ],
+            if responses {
+                ReasoningEffort::Max
+            } else {
+                ReasoningEffort::Low
+            },
+            replies,
             Default::default(),
         )
         .await;
@@ -666,14 +766,31 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
             run.session.messages.last().unwrap().content,
             "The prerequisite is verified."
         );
+        assert_eq!(
+            run.usage.total_prompt_tokens,
+            31 * run.requests.len() as u64
+        );
+        assert_eq!(
+            run.usage.total_completion_tokens,
+            7 * run.requests.len() as u64
+        );
+        if responses {
+            let mut before = run.requests[0].clone();
+            before["reasoning"]["effort"] = json!("low");
+            assert_eq!(run.requests[1], before);
+        }
+        assert!(run.requests[convergence][prompt]
+            .to_string()
+            .contains(bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT));
         let original_cap = run.requests[0].pointer(cap).unwrap();
-        for body in &run.requests[2..] {
+        for body in &run.requests[convergence..] {
             assert_eq!(body.pointer(cap), Some(original_cap));
             assert_eq!(body.pointer(effort_path), Some(&json!(wire_effort)));
             assert!(body.get("previous_response_id").is_none());
             let input = body[prompt].to_string();
             assert!(input.contains("Verified prerequisite."));
             assert!(!input.contains("Unfinished reasoning"));
+            assert!(!input.contains("rs_initial") && !input.contains("rs_lower"));
         }
     }
 }

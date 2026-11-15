@@ -302,8 +302,9 @@ pub(crate) async fn execute_llm_round(
     let request_tool_schemas =
         context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
-    let prepared = if output_limit_recovery.is_some_and(|policy| policy.task_split.is_some()) {
-        context_preparation::prepare_task_split_context(
+    let is_recovery = output_limit_recovery.is_some_and(|policy| policy.retry.is_some());
+    let prepared = if is_recovery {
+        context_preparation::prepare_output_limit_recovery_context(
             session, config, model_name, session_id, llm,
         )
         .await?
@@ -373,6 +374,7 @@ pub(crate) async fn execute_llm_round(
             finish_reason,
             response_id: stream_output.response_id.clone(),
             reasoning_only: empty_answer
+                && !completion.saw_provider_tool()
                 && (finish_reason == REASONING_HEADROOM_FINISH_REASON
                     || !stream_output.reasoning_content.trim().is_empty()
                     || stream_output.thinking_tokens > 0
@@ -386,6 +388,10 @@ pub(crate) async fn execute_llm_round(
                     )
                 }),
         })
+    } else if is_recovery && !completion.has_recovery_completion() {
+        Some(AgentError::LLMNonRetryable(
+            "output-limit recovery ended without a successful provider completion".into(),
+        ))
     } else {
         empty_answer.then(|| AgentError::EmptyAssistantResponse {
             response_id: stream_output.response_id.clone(),
@@ -396,7 +402,7 @@ pub(crate) async fn execute_llm_round(
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
     // Missing usage on these paths can hide reasoning spend. Keep reported
     // usage authoritative and reserve the entire wire cap as the fallback.
-    let estimated_output = if output_limited || task_split {
+    let estimated_output = if output_limited || is_recovery {
         let reasoning_estimate = estimate_completion_tokens(&stream_output.reasoning_content, &[]);
         completion_tokens
             .saturating_add(reasoning_estimate.max(stream_output.thinking_tokens))
@@ -404,10 +410,10 @@ pub(crate) async fn execute_llm_round(
     } else {
         completion_tokens
     };
-    let attempt_usage = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
-        // The stream was closed before terminal usage. The opening snapshot
-        // can report an exact prompt total. If any component was omitted,
-        // keep at least the known prompt usage and the full output reserve.
+    let attempt_usage = if output_limited || is_recovery {
+        // A partial usage snapshot can omit its full prompt total even when
+        // the known cached input is large. Reserve at least that known sum
+        // and the projected wire input when the total is missing.
         let known_input = stream_output
             .input_tokens
             .saturating_add(stream_output.cache_creation_input_tokens)

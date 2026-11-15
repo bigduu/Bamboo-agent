@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
-use bamboo_agent_core::AgentError;
+use bamboo_agent_core::{AgentError, Message, Role};
+use bamboo_domain::capability_loading::resolve_tool_reference_name;
 use bamboo_llm::provider::OutputLimitRecovery;
 
 const MAX_STEPS: usize = 3;
@@ -9,6 +10,40 @@ const MAX_STEP_BYTES: usize = 320;
 /// Used when this run has no configured token ceiling. Earlier usage counts
 /// against it along with the planning, work and reporting requests.
 pub(super) const DEFAULT_TOKEN_LIMIT: u64 = 256_000;
+
+pub(super) fn forbidden_tool(reference: &str) -> bool {
+    resolve_tool_reference_name(reference, |name| {
+        matches!(
+            name,
+            "SubAgent"
+                | "sub_task"
+                | "spawn_session"
+                | "session_control"
+                | "session_message"
+                | "ask_agent"
+                | "deploy_agent"
+                | "cluster"
+        ) || name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+    })
+    .is_some()
+}
+
+pub(super) fn confirms_tool_result(reference: &str, id: &str, message: &Message) -> bool {
+    if message.role != Role::Tool
+        || message.tool_call_id.as_deref() != Some(id)
+        || message.tool_success != Some(true)
+    {
+        return false;
+    }
+    // The shell API reports transport success for running commands and
+    // nonzero exits. Those receipts do not complete a recovery dependency.
+    resolve_tool_reference_name(reference, |name| {
+        matches!(name, "Bash" | "bash" | "exec_command" | "write_stdin")
+    })
+    .is_none()
+        || serde_json::from_str::<serde_json::Value>(&message.content)
+            .is_ok_and(|body| body["status"] != "running" && body["exit_code"].as_i64() == Some(0))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stage {

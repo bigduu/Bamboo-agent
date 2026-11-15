@@ -104,8 +104,7 @@ pub(super) async fn apply_message_transforms_with_vision_budget(
             if !allow_paid_vision {
                 if prepared_context.messages.iter().any(has_image_parts) {
                     return Err(AgentError::Budget(
-                        "output-limit task recovery cannot reserve an auxiliary vision request"
-                            .into(),
+                        "output-limit recovery cannot reserve an auxiliary vision request".into(),
                     ));
                 }
                 return Ok(());

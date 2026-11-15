@@ -1664,7 +1664,7 @@ pub(super) async fn execute_llm_stream(
                 // nondeterministic Legacy Vision description inside it must not be
                 // requested again for the same source.
                 if provider_relevant_source_digest(session) != provider_source_digest {
-                    if task_split.is_some() {
+                    if recovery.is_some() {
                         return Err(AgentError::LLMNonRetryable(
                             "task recovery context changed before dispatch".into(),
                         ));
@@ -1673,10 +1673,12 @@ pub(super) async fn execute_llm_stream(
                 }
                 required_tool = required_tool_for_session(session);
                 effective_schemas = effective_tool_schemas(session, base_tool_schemas);
-                let reprepared = if task_split.is_some() {
-                    Box::pin(super::context_preparation::prepare_task_split_context(
-                        session, config, model, session_id, llm,
-                    ))
+                let reprepared = if recovery.is_some() {
+                    Box::pin(
+                        super::context_preparation::prepare_output_limit_recovery_context(
+                            session, config, model, session_id, llm,
+                        ),
+                    )
                     .await?
                 } else {
                     Box::pin(super::context_preparation::prepare_round_context(
@@ -1719,7 +1721,7 @@ pub(super) async fn execute_llm_stream(
         config.persistence.as_ref(),
         config.session_inbox.as_ref(),
     ) {
-        (Some(host), Some(persistence), Some(inbox)) if task_split.is_none() => persistence
+        (Some(host), Some(persistence), Some(inbox)) if recovery.is_none() => persistence
             .root_actor_writer()
             .filter(|owner| {
                 owner.fence.actor_id == session.id
@@ -2129,17 +2131,19 @@ pub(super) async fn execute_llm_stream(
         observation.model_usage(&token_usage(usage));
     }
     let finish_reason = completion.finish_reason();
-    let (status, outcome) = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
-        (
-            bamboo_domain::ModelCallStatus::Error,
-            bamboo_infrastructure::telemetry::Outcome::ProviderError,
-        )
-    } else {
-        (
-            bamboo_domain::ModelCallStatus::Success,
-            bamboo_infrastructure::telemetry::Outcome::Success,
-        )
-    };
+    let incomplete_recovery = recovery.is_some() && !completion.has_recovery_completion();
+    let (status, outcome) =
+        if finish_reason == REASONING_HEADROOM_FINISH_REASON || incomplete_recovery {
+            (
+                bamboo_domain::ModelCallStatus::Error,
+                bamboo_infrastructure::telemetry::Outcome::ProviderError,
+            )
+        } else {
+            (
+                bamboo_domain::ModelCallStatus::Success,
+                bamboo_infrastructure::telemetry::Outcome::Success,
+            )
+        };
     usage_guard.finish(status, stream_output.provider_usage);
     observation.finish(outcome);
 
@@ -2272,7 +2276,7 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if !output_limited && !private_plan {
+    if !output_limited && !incomplete_recovery && !private_plan {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {
@@ -2290,7 +2294,7 @@ pub(super) async fn execute_llm_stream(
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
-    let prompt_tokens = if task_split.is_some() {
+    let prompt_tokens = if output_limited || recovery.is_some() {
         u64::from(final_usage.input_tokens)
     } else {
         super::token_estimation::estimate_prompt_tokens(&prepared_context.messages)
