@@ -43,7 +43,7 @@ use crate::providers::common::request_overrides;
 use crate::providers::common::tool_schema::sanitize_anthropic_tool_input_schema;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::ReasoningEffort;
+use bamboo_domain::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 
 fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
     let guidance = if status == reqwest::StatusCode::FORBIDDEN {
@@ -91,6 +91,19 @@ fn is_official_anthropic_base_url(base_url: &str) -> bool {
     let normalized = base_url.trim_end_matches('/');
     normalized.eq_ignore_ascii_case("https://api.anthropic.com")
         || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
+}
+
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    // Compatible providers can prefix the model ID with a vendor name.
+    model.split('.').any(|part| {
+        part == "deepseek-flash" || part == "deepseek-v4" || part.starts_with("deepseek-v4-")
+    })
 }
 
 fn supports_anthropic_tool_search(model: &str) -> bool {
@@ -437,17 +450,34 @@ impl AnthropicProvider {
             });
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
-        let reasoning_effort = options
-            .and_then(|o| o.reasoning_effort)
-            .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let cache_plan = options.and_then(|o| o.cache.as_ref());
-        let reasoning_source = if request_reasoning_effort.is_some() {
-            "request"
-        } else if self.default_reasoning_effort.is_some() {
-            "provider_default"
+        let (reasoning_effort, reasoning_source) = if let Some(effort) = request_reasoning_effort {
+            (Some(effort), "request")
+        } else if let Some(effort) = self.default_reasoning_effort {
+            (Some(effort), "provider_default")
+        } else if compatible_gateway
+            && is_deepseek_v4_model(model)
+            && completion_diagnostics
+                .as_ref()
+                .is_some_and(|d| d.is_agent_round())
+            && required_tool.is_none()
+            && !crate::retry::work_request_budget_active()
+            && !request_overrides::messages_controls_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            )
+            && self.masking_config.apply_masking("adaptive") == "adaptive"
+            && self
+                .masking_config
+                .apply_masking(DEFAULT_REASONING_EFFORT.as_str())
+                == DEFAULT_REASONING_EFFORT.as_str()
+        {
+            (Some(DEFAULT_REASONING_EFFORT), "agent_default")
         } else {
-            "none"
+            (None, "none")
         };
 
         let request_purpose = options
@@ -490,8 +520,6 @@ impl AnthropicProvider {
         apply_required_tool_choice(&mut body, required_tool);
         // A compatible gateway can enforce reasoning without advertising it
         // on the request. Its cutoff must not depend on replaying old thinking.
-        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         if let Some(diagnostics) = completion_diagnostics
             .as_ref()
             .filter(|_| compatible_gateway)
@@ -7601,6 +7629,131 @@ mod anthropic_provider_tests {
             ),
             Message::tool_result("call_1", r#"{"ok":true}"#),
         ]
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_agent_requests_send_explicit_reasoning() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let model = "dashscope.deepseek-v4.1-flash-1017";
+        let cases = [
+            (true, model, None, None, Some("adaptive"), Some("medium")),
+            (
+                true,
+                model,
+                None,
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("high"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("low"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::High),
+                Some("disabled"),
+                None,
+            ),
+            (false, model, None, None, None, None),
+            (true, "other-compatible-model", None, None, None, None),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(cases.len() as u64)
+            .mount(&server)
+            .await;
+        for (agent_round, model, request_effort, provider_effort, mode, effort) in cases {
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_reasoning_effort(provider_effort);
+            let diagnostics = if agent_round {
+                CompletionDiagnostics::for_agent_round(None)
+            } else {
+                CompletionDiagnostics::default()
+            };
+            let options = LLMRequestOptions {
+                reasoning_effort: request_effort,
+                ..Default::default()
+            };
+            drop(
+                scope_completion_diagnostics(
+                    diagnostics,
+                    provider.chat_stream_with_options(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        model,
+                        Some(&options),
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
+            assert_eq!(body["max_tokens"], 4096);
+        }
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_default_respects_an_effort_body_patch() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let overrides = serde_json::from_value(json!({"common":{"body_patch":[
+            {"op":"set","path":"/output_config/effort","value":"none"}
+        ]}}))
+        .unwrap();
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_request_overrides(Some(overrides));
+        drop(
+            scope_completion_diagnostics(
+                CompletionDiagnostics::for_agent_round(None),
+                provider.chat_stream(
+                    &[Message::user("Inspect the fixture.")],
+                    &[],
+                    Some(4096),
+                    "deepseek-flash",
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = requests[0].body_json().unwrap();
+        assert_eq!(body["output_config"]["effort"], "none");
+        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]

@@ -270,6 +270,22 @@ fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {
     }
 }
 
+pub(crate) fn messages_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_MESSAGES, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_MESSAGES, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if key == "model" || key == "tool_choice")
+            })
+    })
+}
+
 /// A configured Work budget cannot accept arbitrary wire body patches (which
 /// may replace/remove token limits, model, prompts or candidate counts). Reject
 /// the resolved patch before any model request; header-only overrides remain.

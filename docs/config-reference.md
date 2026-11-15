@@ -144,6 +144,11 @@ near its output limit and resume from completed tool results. The
 Recovery keeps pinned reasoning settings and requires a known output cap,
 remaining run budget and a request that uses only client-managed tools.
 
+On compatible Messages routes, automatic agent requests for DeepSeek V4 and
+`deepseek-flash` send adaptive thinking with Bamboo's default `medium` effort
+when the request and provider leave effort unset. Explicit effort and reasoning
+body patches keep priority.
+
 DeepSeek treats `thinking.budget_tokens` as an ignored compatibility field.
 [DeepSeek Messages API](https://api-docs.deepseek.com/zh-cn/api/create-message/)
 
