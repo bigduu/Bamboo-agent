@@ -180,3 +180,12 @@ readback, resume the original publisher's failed crate job and its finalizer usi
 the attempt-1 native outputs. Keep the recovery run's real `GITHUB_*` identity;
 never impersonate the original run. See the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261019-crate-recovery).
 Reviewed source alone does not establish a successful recovery or publication.
+
+The fixed `v2026.11.22` recovery in #2762 uses
+`recover-crate-2026-11-22.yml` on the exact reviewed protected Dev controller.
+It authenticates the failed attempt of publisher 43712198357, draft 446034086,
+the eight retained crate originals and the five native transports. The
+22 proven-unstarted crates use the signed write-ahead protocol. After
+authenticated readback of `recovery20261122.completed=true`, the original
+publisher owns finalization. Follow the
+[fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261122-crate-recovery).

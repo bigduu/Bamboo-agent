@@ -117,6 +117,32 @@ retry the original publisher's failed crate job and its dependent finalizer;
 they reuse the three successful native attempt-1 outputs. Do not rerun all jobs
 or treat a local/policy check as completed production recovery.
 
+### Fixed v2026.11.22 crate recovery
+
+Issue #2762 binds draft 446034086 and source
+`13336567999504a8c7deb89fba94f7907b04c3ee` to [publisher 43712198357](https://github.com/bigduu/Bamboo-agent/actions/runs/43712198357).
+Attempt 1 received HTTP 503 during the readback of the eighth crate,
+`bamboo-infrastructure`, after retaining its original archive and checksum.
+The fixed controller verifies the failed job log, eight published checksums,
+the sealed frontend and all five native transports from attempt 1. It
+applies bounded backoff to transient registry reads. The signed checkpoint
+tracks first verification and archive retention for the remaining 22 crates.
+
+Dispatch this controller after its reviewed PR merges into protected Dev:
+
+```bash
+gh workflow run recover-crate-2026-11-22.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+The recovery succeeds when authenticated readback shows
+`recovery20261122.completed=true`, no pending compilation, `receipt.completed=false`,
+the original draft and `publisherRunId=43712198357`. Retry only the failed jobs
+of that publisher after the recovery completes. Its finalizer uses the
+attempt-1 native outputs and publishes the v3 manifest for the same tag and
+source. The procedure requires the original retained transports and their
+unexpired identities.
+
 ## Main and consumers
 
 The frozen source selects the native executable contract. The five-target v3
