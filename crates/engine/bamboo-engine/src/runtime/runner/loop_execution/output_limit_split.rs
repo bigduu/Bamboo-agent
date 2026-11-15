@@ -3,6 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use bamboo_agent_core::{AgentError, Message, Role};
 use bamboo_domain::capability_loading::resolve_tool_reference_name;
 use bamboo_llm::provider::OutputLimitRecovery;
+use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
 
 const MAX_STEPS: usize = 3;
 const MAX_REQUESTS: usize = MAX_STEPS + 2;
@@ -28,12 +29,21 @@ pub(super) fn forbidden_tool(reference: &str) -> bool {
     .is_some()
 }
 
-pub(super) fn confirms_tool_result(reference: &str, id: &str, message: &Message) -> bool {
+pub(super) fn confirms_tool_result(
+    reference: &str,
+    id: &str,
+    completed_tool_contract: Option<&str>,
+    message: &Message,
+) -> bool {
     if message.role != Role::Tool
         || message.tool_call_id.as_deref() != Some(id)
         || message.tool_success != Some(true)
     {
         return false;
+    }
+    // Foreground Bash reports terminal command success directly and returns plain output.
+    if completed_tool_contract == Some(FOREGROUND_BASH_EXECUTION_CONTRACT) {
+        return true;
     }
     // The shell API reports transport success for running commands and
     // nonzero exits. Those receipts do not complete a recovery dependency.

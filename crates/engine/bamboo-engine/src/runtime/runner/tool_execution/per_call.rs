@@ -148,6 +148,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 pub(super) struct PortableToolExecution {
     name: String,
     input: serde_json::Value,
+    execution_contract: Option<String>,
 }
 
 impl PortableToolExecution {
@@ -172,6 +173,7 @@ impl PortableToolExecution {
         Self {
             name: execution_name.to_owned(),
             input,
+            execution_contract: None,
         }
     }
 }
@@ -201,6 +203,7 @@ pub(super) fn portable_tool_for_admitted_call(
         PortableToolExecution {
             name,
             input: parse_tool_args_best_effort(&call.function.arguments).0,
+            execution_contract: None,
         }
     })
 }
@@ -888,6 +891,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
+            execution_contract: execution.execution_contract().map(str::to_owned),
         }),
         tool_duration,
     })
@@ -1418,6 +1422,12 @@ async fn apply_completed_tool_execution_outcome(
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
     let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
+    if ctx.state.single_tool_call && outcome.post_tool_hook_eligible && is_success {
+        ctx.state.completed_single_tool_contract = outcome
+            .portable_tool
+            .as_ref()
+            .and_then(|tool| tool.execution_contract.clone());
+    }
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1645,6 +1655,7 @@ mod task_progress_tests {
             portable_tool: Some(PortableToolExecution {
                 name: execution_name.into(),
                 input: serde_json::json!({}),
+                execution_contract: None,
             }),
             permission_replay_origin: None,
             result: Ok(result),
@@ -2479,6 +2490,7 @@ mod hook_tests {
                         portable_tool: Some(PortableToolExecution {
                             name: execution_name.into(),
                             input: serde_json::json!({}),
+                            execution_contract: None,
                         }),
                         permission_replay_origin: None,
                         result: Ok(ToolResult::text(true, payload.to_string())),
