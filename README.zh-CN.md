@@ -26,6 +26,10 @@ Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness �
 本文描述 **开发源码检出**：最初产品审查基线为 `025641317c5703226052a4b94a52d1844615c352`，本次文档更新基于 `dev` 提交 `10ca51ccdf1f253ff6ec1e78f21b4c74835e1582`，不表示每个命令和能力都已进入最新 crates.io 发布版。比较版本时请查看已安装程序的 `bamboo --help` 和[版本/源码审查](./docs/readme-audit.md)。源码 manifest 有意使用 `0.0.0` 占位，发布流程另行写入发布版本。下方录屏保留其独立的较早源码来源说明。
 
 
+## Terminal-Bench 评测
+
+Bamboo `7efc6bbd0` 使用 DS Flash high 和 Auto 模式，在本地 Terminal-Bench 2.1 的 78 道题子集上通过 **60 道（76.92%）**。按相同 78 道题重算，参考排名为 **第 2 / 11**。Bamboo 每题一次有效尝试，公开榜数据每题三次。[逐题结果、运行配置和复跑命令](./docs/benchmarks/terminal-bench-2.1-2026-11-15/README.md)
+
 ## 看界面准备项目上下文
 
 ![Lotus Next 在真实 Bamboo 后端创建演示项目，并为新任务选择工作区。](docs/demos/project-workspace.gif)
