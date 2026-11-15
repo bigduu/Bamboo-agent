@@ -10586,7 +10586,7 @@ mod tests {
         use bamboo_domain::ReasoningEffort;
         use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
         use wiremock::{Mock, MockServer};
 
         let reasoning_progress = "The reasoning reaches its limit.";
@@ -10620,9 +10620,10 @@ mod tests {
             ("truncated-tool", &truncated_tool, None, false),
             ("run-budget", &thinking, None, false),
             ("missing-output-usage", &unreported_thinking, None, false),
-            ("unset-effort", &thinking, None, false),
-            ("pinned-effort", &thinking, None, false),
+            ("unset-effort", &thinking, Some(&answer), true),
+            ("pinned-effort", &thinking, Some(&answer), true),
         ] {
+            let preserve_effort = matches!(scenario, "unset-effort" | "pinned-effort");
             let server = MockServer::start().await;
             let mut first_request = Mock::given(method("POST")).and(path("/messages"));
             if scenario != "unset-effort" {
@@ -10636,9 +10637,13 @@ mod tests {
                 .mount(&server)
                 .await;
             if let Some(retry) = retry {
-                Mock::given(method("POST"))
-                    .and(path("/messages"))
-                    .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                let request = Mock::given(method("POST")).and(path("/messages"));
+                let request = if preserve_effort {
+                    request.and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                } else {
+                    request.and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                };
+                request
                     .respond_with(retry.clone())
                     .with_priority(1)
                     .expect(if scenario == "repeated-limit" { 2 } else { 1 })
@@ -10674,9 +10679,8 @@ mod tests {
             if matches!(scenario, "run-budget" | "missing-output-usage") {
                 config.run_budget.max_total_tokens = Some(38);
             }
-            if scenario == "repeated-limit" {
-                config.run_budget.max_rounds = Some(1);
-            }
+            // Keep this fixture on the bounded single-round retry path.
+            config.run_budget.max_rounds = Some(1);
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
             let mut state = e2e_loop_state(scenario);
@@ -10705,9 +10709,17 @@ mod tests {
             }
             if retry.is_some() {
                 let second: Value = requests[1].body_json().unwrap();
-                let mut expected = first.clone();
-                expected["output_config"]["effort"] = json!("low");
-                assert_eq!(second, expected);
+                if preserve_effort {
+                    assert!(second["messages"]
+                        .to_string()
+                        .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                    assert_eq!(second.get("thinking"), first.get("thinking"));
+                    assert_eq!(second.get("output_config"), first.get("output_config"));
+                } else {
+                    let mut expected = first.clone();
+                    expected["output_config"]["effort"] = json!("low");
+                    assert_eq!(second, expected);
+                }
             }
             if scenario == "repeated-limit" {
                 assert!(String::from_utf8_lossy(&requests[2].body)

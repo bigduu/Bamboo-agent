@@ -144,6 +144,9 @@ near its output limit and resume from completed tool results. The
 Recovery keeps pinned reasoning settings and requires a known output cap,
 remaining run budget and a request that uses only client-managed tools.
 
+DeepSeek treats `thinking.budget_tokens` as an ignored compatibility field.
+[DeepSeek Messages API](https://api-docs.deepseek.com/zh-cn/api/create-message/)
+
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
 The raw session identifier is never serialized into the provider request, and
