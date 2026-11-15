@@ -540,6 +540,30 @@ async fn pipeline_output_limit_split_stops_on_blocked_or_truncated_work() {
 }
 
 #[tokio::test]
+async fn pipeline_output_limit_split_reserves_missing_gemini_candidate_count() {
+    let reasoning = mock_completion_sse(&[json!({
+        "type":"chunk","candidates":[{"content":{"parts":[{"text":"Thinking","thought":true}]},"finishReason":"MAX_TOKENS"}],
+        "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":0,"thoughtsTokenCount":7}
+    })]);
+    let answer = mock_completion_sse(&[json!({
+        "type":"chunk","candidates":[{"content":{"parts":[{"text":"Recovered"}]},"finishReason":"STOP"}],
+        "usageMetadata":{"promptTokenCount":31,"thoughtsTokenCount":7}
+    })]);
+    let run = run(
+        Protocol::Gemini,
+        ReasoningEffort::Low,
+        vec![reasoning, answer],
+        Default::default(),
+    )
+    .await;
+    assert!(run.result.unwrap());
+    let wire_cap = run.requests[1]["generationConfig"]["maxOutputTokens"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(run.usage.total_completion_tokens, wire_cap + 7);
+}
+
+#[tokio::test]
 async fn output_limit_step_failure_ends_execution_and_next_turn_uses_saved_results() {
     use crate::runtime::{tests::build_direct_execute_agent, ExecuteRequestBuilder};
     use bamboo_domain::AgentStatusState;
