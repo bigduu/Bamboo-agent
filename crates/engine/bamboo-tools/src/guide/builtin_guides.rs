@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
+    "bash",
     "exec_command",
     "write_stdin",
     "Edit",
@@ -51,7 +52,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "Read",
             ToolCategory::FileReading,
             "Use for reading file contents, especially before Edit/Write on existing files.",
-            "Do not use for writing or cross-project search; do not substitute exec_command cat/head/tail for this.",
+            "Use this for file contents, and use Edit or Write to change files.",
             &["Edit", "Write", "Grep"],
             vec![example(
                 "Read a config file",
@@ -119,6 +120,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "First identify candidate files, then use Read or scoped content mode.",
             )],
         )),
+        "bash" => Some(guide(
+            "bash",
+            ToolCategory::CommandExecution,
+            "Run terminal commands in this session's working directory. The result includes combined output when the command exits. Set timeout in seconds when a command needs a time limit.",
+            "Use dedicated file tools for reading, editing, and searching when available.",
+            &[],
+            vec![example(
+                "Run tests",
+                json!({"command":"cargo test","timeout":120}),
+                "The command reports a nonzero exit as a failure.",
+            )],
+        )),
         "exec_command" => Some(guide(
             "exec_command",
             ToolCategory::CommandExecution,
@@ -134,14 +147,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait. Ordinary polls clamp yield_time_ms to 250–30000 ms and default to 10000 ms. A single unattended Root poll can wait longer within the tool deadline for a quiet command with no open stdin. Running results retain session_id. Final results omit it and include exit_code when available. Polling reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. A true exit_observed still requires terminal output capture. The quiet polling advisory suggests a longer wait when you need the exit result. Investigate a concrete failure when one is visible. In a Human-controlled Root, repeated quiet polling can transfer the command to durable background monitoring and deliver its terminal result automatically. Otherwise finite diagnostic recovery can report incomplete progress while retaining the handle. Unread terminal results expire five minutes after completion. Output is bounded by max_output_tokens (default 2000, maximum 8192). output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to stdin. Include your own newline and use eof=true to close the pipe. A lone Ctrl-C (\\u0003) stops the process.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait. Ordinary polls clamp yield_time_ms to 250–30000 ms and default to 10000 ms. A single unattended Root poll can explicitly request a longer wait within the tool deadline. After three empty polls, use the advisory to reassess. A sole subsequent empty poll of the same command with closed stdin can hand off waiting to the runtime for up to 180 seconds. Running results retain session_id. Final results omit it and include exit_code when available. Polling reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. A true exit_observed still requires terminal output capture. Investigate a concrete failure when one is visible. In a Human-controlled Root, repeated quiet polling can transfer the command to durable background monitoring and deliver its terminal result automatically. Otherwise finite diagnostic recovery can report incomplete progress while retaining the handle. Unread terminal results expire five minutes after completion. Output is bounded by max_output_tokens (default 2000, maximum 8192). output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to stdin. Include your own newline and use eof=true to close the pipe. A lone Ctrl-C (\\u0003) stops the process.",
             "Do not use a conversation ID or legacy Bash ID as session_id. Do not infer completion from silence or an existing report, stop a command only because it is quiet, or poll after receiving a terminal result. Expect automatic results only after an explicit background handoff. Input requires an interactive stdin pipe.",
             &["exec_command"],
             vec![
                 example(
                     "Pull a command's next output and exit status",
                     json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
-                    "While status=running, keep the handle and request a longer wait if you need the exit result. Inspect a nonzero exit_code.",
+                    "While status=running, keep the handle and use the advisory to decide whether to diagnose, do other work, or let the runner wait for completion. Inspect a nonzero exit_code.",
                 ),
                 example(
                     "Answer an interactive prompt and close input",
@@ -261,7 +274,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Retrieve the session's current workspace directory. (Alias for Workspace with no path argument.)",
             "Do not use when absolute paths are already known.",
-            &["Workspace", "exec_command", "Read"],
+            &["Workspace", "Read"],
             vec![example(
                 "Inspect working directory",
                 json!({}),
@@ -382,7 +395,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Change the current session workspace. (Alias for Workspace with path argument.)",
             "Do not use with non-directory or missing paths.",
-            &["Workspace", "exec_command", "Read"],
+            &["Workspace", "Read"],
             vec![example(
                 "Switch session workspace",
                 json!({"path":"/workspace/project"}),
@@ -395,7 +408,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Get or set the current session workspace directory. Call without 'path' to read the current workspace; call with 'path' to change it.",
             "Do not set workspace to a non-directory or missing path.",
-            &["exec_command", "Read"],
+            &["Read"],
             vec![
                 example(
                     "Get current workspace",
@@ -414,7 +427,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::UserInteraction,
             "Request one or more remembered permission scopes through independent typed decisions. Batch entries are reviewed one at a time.",
             "Do not use this for a one-shot operation: invoke the target tool directly so Allow once is bound to that exact tool-call occurrence.",
-            &["Write", "Edit", "exec_command", "WebFetch"],
+            &["Write", "Edit", "WebFetch"],
             vec![example(
                 "Request remembered file-write permission",
                 json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),
@@ -426,7 +439,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Pause briefly when waiting for an external state change before polling again.",
             "Do not use for normal reasoning pauses or long waits when another tool can fetch status directly.",
-            &["write_stdin", "WebFetch"],
+            &["WebFetch"],
             vec![example(
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),
@@ -729,10 +742,12 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("Final results omit it"));
         assert!(poll.when_to_use.contains("your own newline"));
-        assert!(poll.when_to_use.contains("polling advisory"));
         assert!(poll
             .when_to_use
-            .contains("A single unattended Root poll can wait longer"));
+            .contains("Running results retain session_id"));
+        assert!(poll
+            .when_to_use
+            .contains("can explicitly request a longer wait within the tool deadline"));
         assert!(poll
             .when_to_use
             .contains("A true exit_observed still requires terminal output capture"));

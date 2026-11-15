@@ -556,6 +556,7 @@ impl Fixture {
             "GetFileInfo",
             "ViewImage",
             "Bash",
+            "bash",
             "exec_command",
             "write_stdin",
             "Write",

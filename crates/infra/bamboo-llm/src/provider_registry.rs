@@ -87,18 +87,6 @@ impl ManagedProviderOrigin {
         }
         let original = self.original_binding.as_ref().ok_or_else(stale_binding)?;
         let current = configured_binding(config, provider_id, &self.key)?;
-        // An implicit Copilot client remains the same source when unrelated
-        // provider instances are added. Source tags still distinguish an
-        // explicit instance or stanza from this implicit form.
-        let current = if current.is_none()
-            && provider_id == "copilot"
-            && !config.provider_instances.contains_key(provider_id)
-            && config.providers().copilot.is_none()
-        {
-            configured_binding_with_mode(config, provider_id, &self.key, true, false)?
-        } else {
-            current
-        };
         let current = current.ok_or_else(stale_binding)?;
         if !bool::from(original.as_slice().ct_eq(current.0.as_slice())) {
             return Err(stale_binding());
@@ -132,9 +120,8 @@ impl ManagedProviderOrigin {
         if Arc::ptr_eq(&current, expected) {
             return Ok(());
         }
-        // A newly built handle needs a stronger proof. In particular, an
-        // unchanged template or Copilot configuration does not establish an
-        // unchanged credential at request time.
+        // A newly built handle needs a stronger proof. An unchanged
+        // template does not establish an unchanged credential at request time.
         if !gold_factory_identity_is_static(config, &self.provider_id) {
             return Err(LLMError::Api(
                 "Gold provider identity cannot be proven stable across reload".into(),
@@ -333,7 +320,10 @@ impl ProviderRegistry {
             })?;
             bindings.insert(provider.clone(), binding);
         }
-        let managed_direct_pristine = providers.keys().all(|provider| provider == "copilot")
+        let managed_direct_pristine = providers.is_empty()
+            && config.provider != "copilot"
+            && !config.has_retired_provider_default()
+            && config.providers().retired_provider_aliases.is_empty()
             && config.defaults.is_none()
             && config.default_provider_instance.is_none()
             && !bamboo_config::has_any_runtime_model_inputs(config);
@@ -774,8 +764,12 @@ impl ProviderRegistry {
         let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
         let mut metadata: HashMap<String, ProviderMetadata> = HashMap::new();
 
-        for name in crate::provider_factory::AVAILABLE_PROVIDERS {
-            if !provider_is_configured(config, name) {
+        for name in crate::provider_factory::AVAILABLE_PROVIDERS
+            .iter()
+            .copied()
+            .chain(["bodhi"])
+        {
+            if config.is_retired_provider_alias(name) || !provider_is_configured(config, name) {
                 continue;
             }
 
@@ -802,7 +796,11 @@ impl ProviderRegistry {
             }
         }
 
-        Ok((providers, metadata, config.provider.clone()))
+        Ok((
+            providers,
+            metadata,
+            config.effective_default_provider().to_owned(),
+        ))
     }
 
     /// Instance-keyed registry construction.
@@ -1149,7 +1147,7 @@ fn hash_factory_inputs<T: Serialize>(
 // Keep the fields below aligned with create_provider_from_instance and
 // synthesize_legacy_instances. Source tags make an explicit instance and a
 // legacy alias distinct even when they happen to share an ID and credentials.
-// Ambient system-proxy state and Copilot's dynamic authentication are not
+// Ambient system-proxy state is not
 // represented by Config and are intentionally outside this binding.
 /// Opaque in-memory identity of the factory inputs used by an SDK client.
 /// It stores only a keyed tag, never serialized credentials or an endpoint.
@@ -1183,7 +1181,7 @@ impl SdkProviderBinding {
     }
 
     /// Check the exact configured source and factory inputs without exposing
-    /// credentials. Dynamic environment and Copilot auth remain owned by the
+    /// credentials. Dynamic environment inputs remain owned by the
     /// provider and are not represented by this Config proof.
     pub fn validate(&self, config: &Config) -> Result<(), LLMError> {
         let current =
@@ -1317,7 +1315,6 @@ fn configured_binding_with_mode(
                 &instance.responses_only_models,
                 &instance.request_overrides,
                 FactoryExtra(&instance.extra, api_key_overridden),
-                (instance.provider_type == "copilot").then_some(config.headless_auth),
             ),
         )
         .map(Some);
@@ -1468,30 +1465,6 @@ fn configured_binding_with_mode(
             .map(Some),
             None => Ok(None),
         },
-        "copilot" => match providers.copilot.as_ref() {
-            Some(entry) if sdk_mode || !hybrid || entry.enabled || config.provider == "copilot" => {
-                hash_factory_inputs(
-                    key,
-                    config,
-                    id,
-                    "legacy-copilot",
-                    &(
-                        entry.headless_auth,
-                        config.headless_auth,
-                        &entry.reasoning_effort,
-                        &entry.responses_only_models,
-                        &entry.request_overrides,
-                        FactoryExtra(&entry.extra, api_key_overridden),
-                    ),
-                )
-                .map(Some)
-            }
-            None if sdk_mode || !hybrid => {
-                hash_factory_inputs(key, config, id, "implicit-copilot", &config.headless_auth)
-                    .map(Some)
-            }
-            _ => Ok(None),
-        },
         _ => Ok(None),
     }
 }
@@ -1501,7 +1474,6 @@ fn display_name_for_provider_type(id: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "gemini" => "Gemini".to_string(),
-        "copilot" => "GitHub Copilot".to_string(),
         "bodhi" => "Bodhi".to_string(),
         other => other.to_string(),
     }
@@ -1510,7 +1482,6 @@ fn display_name_for_provider_type(id: &str) -> String {
 /// Check whether a provider has enough configuration to attempt initialization.
 fn provider_is_configured(config: &Config, name: &str) -> bool {
     match name {
-        "copilot" => true, // Copilot can be attempted without explicit config
         "openai" => config
             .providers()
             .openai
@@ -1729,23 +1700,6 @@ mod tests {
         assert!(!registry
             .validate_legacy_direct_provider(&config, &target, &direct, false)
             .unwrap());
-        let mut copilot_config = Config::default();
-        copilot_config.provider = "copilot".into();
-        let copilot = ProviderRegistry::from_config(&copilot_config, dir.path().into())
-            .await
-            .unwrap();
-        let copilot_target = bamboo_domain::ProviderModelRef::new("copilot", "memory");
-        assert!(copilot
-            .validate_legacy_direct_provider(&copilot_config, &copilot_target, &direct, true)
-            .unwrap());
-        let mut explicitly_denied = copilot_config.clone();
-        explicitly_denied.providers_mut().copilot = Some(
-            serde_json::from_value(serde_json::json!({"enabled": true, "runtime_models": []}))
-                .unwrap(),
-        );
-        assert!(copilot
-            .validate_legacy_direct_provider(&explicitly_denied, &copilot_target, &direct, true)
-            .is_err());
         registry.set_runtime_models(HashMap::new());
         assert!(registry
             .validate_legacy_direct_provider(&config, &target, &direct, true)
@@ -2241,38 +2195,6 @@ mod tests {
         assert!(
             LegacyVisionProviderSource::capture(&config, "relay", client.clone(), missing).is_err()
         );
-
-        // A managed implicit Copilot source is still the same source when an
-        // unrelated instance is added. No Copilot client or network is used.
-        let mut copilot = Config::default();
-        copilot.provider = "copilot".into();
-        copilot.default_provider_instance = None;
-        copilot.provider_instances.clear();
-        let key =
-            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
-                .unwrap();
-        let tag = configured_binding(&copilot, "copilot", &key)
-            .unwrap()
-            .unwrap()
-            .0;
-        let origin = Arc::new(ManagedProviderOrigin {
-            registry: registry.clone(),
-            provider_id: "copilot".into(),
-            key,
-            original_binding: Some(tag),
-            selected: client.clone(),
-        });
-        let implicit =
-            LegacyVisionProviderSource::capture(&copilot, "copilot", client.clone(), Some(origin))
-                .unwrap();
-        copilot.provider_instances.insert(
-            "other".into(),
-            serde_json::from_value(serde_json::json!({
-                "provider_type":"openai", "enabled":true, "api_key":"synthetic"
-            }))
-            .unwrap(),
-        );
-        assert!(implicit.validate(&copilot, "copilot", &client).is_ok());
     }
 
     async fn assert_changed_static_inputs_are_rejected(original: &Config, changed: &Config) {
@@ -2473,16 +2395,10 @@ mod tests {
             }
         }
 
-        for scenario in [
-            "copilot_auth",
-            "env_header",
-            "env_key_marker",
-            "unknown_env_marker",
-        ] {
+        for scenario in ["env_header", "env_key_marker", "unknown_env_marker"] {
             let mut config = managed_config();
             let instance = config.provider_instances.get_mut("relay").unwrap();
             match scenario {
-                "copilot_auth" => instance.provider_type = "copilot".into(),
                 "env_header" => {
                     instance.request_overrides = Some(serde_json::from_value(serde_json::json!({
                         "common": {"headers": {"Authorization": {"type":"env_ref", "name":"SYNTHETIC_KEY"}}}
@@ -2654,7 +2570,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut original = managed_config();
         // Retain instance mode even after deleting the selected relay; this
-        // avoids constructing the unrelated implicit Copilot fallback.
         original.provider_instances.insert(
             "unused-disabled".into(),
             serde_json::from_value(serde_json::json!({"provider_type":"openai", "enabled":false}))
@@ -3166,7 +3081,7 @@ mod tests {
             ..bamboo_config::ProviderConfigs::default()
         };
 
-        assert!(provider_is_configured(&config, "copilot"));
+        assert!(!provider_is_configured(&config, "copilot"));
         assert!(provider_is_configured(&config, "openai"));
         assert!(!provider_is_configured(&config, "anthropic"));
         assert!(!provider_is_configured(&config, "gemini"));

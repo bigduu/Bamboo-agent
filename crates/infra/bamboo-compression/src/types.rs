@@ -51,6 +51,15 @@ pub enum BudgetError {
     #[error("Context summarization failed: {0}")]
     SummaryGenerationError(String),
 
+    #[error(
+        "The model returned an empty summary during {stage} stage {stage_index}/{stage_count}"
+    )]
+    EmptySummaryResponse {
+        stage: String,
+        stage_index: usize,
+        stage_count: usize,
+    },
+
     #[error("Failed to segment messages: {0}")]
     SegmentationError(String),
 }

@@ -18,11 +18,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::{
-    finish_exhausted_progress, quiet_poll_guard_active as progress_feedback_active,
-};
-pub(crate) use policy::ToolPolicyGuard;
-pub(crate) use progress_feedback::{is_required_progress_feedback, FeedbackDecision};
+pub(crate) use no_progress::quiet_poll_guard_active;
+pub(crate) use policy::{discovery_tool_fingerprint, ToolPolicyGuard};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
@@ -126,6 +123,9 @@ pub(crate) fn legacy_effective_callable_set(
 }
 
 pub(crate) struct RoundToolExecutionResult {
+    /// Exact contract of the sole tool when its dispatch completed successfully.
+    pub completed_single_tool_contract: Option<String>,
+    pub quiet_exec_handle: Option<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,
@@ -238,6 +238,7 @@ async fn execute_and_apply_single_tool_call(
                     state,
                 },
                 outcome,
+                None,
             )
             .await?;
             return Ok(SingleToolExecutionControl {
@@ -385,6 +386,7 @@ async fn execute_and_apply_single_tool_call(
     };
 
     // Compare raw output: changing evidence hidden by compression is still progress.
+    let raw_fingerprint = policy::dispatched_tool_fingerprint(tool_call, &outcome);
     policy_guard.observe_raw_observation(tool_call, &outcome.result);
     policy_guard.child_inspections.observe(
         tool_call,
@@ -404,6 +406,15 @@ async fn execute_and_apply_single_tool_call(
         // handles must not permanently occupy the bounded policy capacity.
         policy_guard.quiet_polls.retain_owned_handles(
             &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    } else if state.single_tool_call
+        && runtime_state.no_human_approver
+        && no_progress::quiet_exec_wait_scope(session, config)
+    {
+        state.quiet_exec_handle = quiet_poll::empty_running_poll_handle(
+            tool_call,
+            &outcome,
+            admitted_execution_name.as_deref(),
         );
     }
     // Use exactly the scalar observed by this dispatch, including unknown/zero.
@@ -447,6 +458,7 @@ async fn execute_and_apply_single_tool_call(
             state,
         },
         outcome,
+        raw_fingerprint,
     )
     .await?;
 
@@ -1032,11 +1044,12 @@ async fn execute_round_tool_calls_inner(
                         });
                     let task_hint = task_hint.clone();
                     async move {
+                        let fingerprint = policy::dispatched_tool_fingerprint(batch_call, &outcome);
                         let max_tool_tokens = outcome
                             .output_cap
                             .map(|cap| cap.unwrap_or(0))
                             .unwrap_or(max_tool_tokens);
-                        output_compressor::maybe_compress(
+                        let outcome = output_compressor::maybe_compress(
                             &tool_name,
                             &args,
                             &sid,
@@ -1045,12 +1058,13 @@ async fn execute_round_tool_calls_inner(
                             pressure,
                             task_hint.as_ref(),
                         )
-                        .await
+                        .await;
+                        (outcome, fingerprint)
                     }
                 }))
                 .await;
 
-            for (batch_call, outcome) in batch.iter().zip(compressed) {
+            for (batch_call, (outcome, fingerprint)) in batch.iter().zip(compressed) {
                 let admitted_execution_name = per_call::resolve_callable_for_session(
                     session.session_version,
                     effective_callable_set,
@@ -1076,6 +1090,7 @@ async fn execute_round_tool_calls_inner(
                         state: &mut state,
                     },
                     outcome,
+                    fingerprint,
                 )
                 .await?;
 

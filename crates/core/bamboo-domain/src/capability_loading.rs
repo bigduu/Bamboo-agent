@@ -44,10 +44,12 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 14] = [
+pub const CORE_TOOL_NAMES: [&str; 16] = [
+    "bash",
     "exec_command",
     "write_stdin",
     "Read",
+    "ViewImage",
     "Grep",
     "Edit",
     "Write",
@@ -73,10 +75,9 @@ pub const HOST_ONLY_TOOL_NAMES: [&str; 6] = [
 ];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
     "Glob",
     "GetFileInfo",
-    "ViewImage",
     "load_skill",
     "workflow_run",
     "update_goal",
@@ -163,22 +164,16 @@ pub const DISCOVERY_CONTROL_GATEWAY: DiscoveryControlGateway =
 /// This function is intentionally reference-oriented: callers that classify a
 /// registered schema, build a logical catalog, or make admission decisions must
 /// use [`ClassifiedToolIdentity`] / [`ClassifiedToolSchema`] instead. Their
-/// exact-first registration semantics prevent a custom exact `bash` or
+/// exact-first registration semantics prevent a custom exact `read_file` or
 /// `apply_patch` registration from inheriting Core policy from a builtin alias.
 /// Unknown references deliberately remain Deferred so a new builtin, server
 /// overlay, plugin, desktop, MCP, or custom tool cannot silently expand the
 /// always-resident surface.
 pub fn capability_loading_class_for_reference(name: &str) -> CapabilityLoadingClass {
     let canonical = canonical_tool_name(name);
-    if CORE_TOOL_NAMES
-        .iter()
-        .any(|core| core.eq_ignore_ascii_case(&canonical))
-    {
+    if CORE_TOOL_NAMES.contains(&canonical.as_str()) {
         CapabilityLoadingClass::Core
-    } else if HOST_ONLY_TOOL_NAMES
-        .iter()
-        .any(|host_only| host_only.eq_ignore_ascii_case(&canonical))
-    {
+    } else if HOST_ONLY_TOOL_NAMES.contains(&canonical.as_str()) {
         CapabilityLoadingClass::HostOnly
     } else {
         CapabilityLoadingClass::Deferred
@@ -285,7 +280,10 @@ pub fn resolve_tool_reference_name(
     }
 
     let fallback = canonical_tool_name(exact);
-    (!fallback.is_empty() && contains_registered_name(&fallback)).then_some(fallback)
+    if !fallback.is_empty() && contains_registered_name(&fallback) {
+        return Some(fallback);
+    }
+    (fallback == "bash" && contains_registered_name("Bash")).then(|| "Bash".into())
 }
 
 /// A logical catalog entry carrying provider-neutral loading policy alongside
@@ -467,9 +465,11 @@ mod tests {
         assert_eq!(
             CORE_TOOL_NAMES,
             [
+                "bash",
                 "exec_command",
                 "write_stdin",
                 "Read",
+                "ViewImage",
                 "Grep",
                 "Edit",
                 "Write",
@@ -694,7 +694,6 @@ mod tests {
             "BashOutput",
             "KillShell",
             "execute_command",
-            "bash",
             "default::Bash",
         ] {
             let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
@@ -707,7 +706,7 @@ mod tests {
                 .unwrap()
                 .is_model_visible());
         }
-        for name in ["exec_command", "write_stdin"] {
+        for name in ["bash", "exec_command", "write_stdin"] {
             let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
             assert_eq!(identity.execution_name(), name);
             assert_eq!(identity.loading_class(), CapabilityLoadingClass::Core);

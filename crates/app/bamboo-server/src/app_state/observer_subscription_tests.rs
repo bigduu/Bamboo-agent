@@ -2123,6 +2123,8 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
 
 pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     final_decision: PermissionDecisionKind,
+    restart_after_commit: bool,
+    revoke_before_claim: bool,
 ) {
     use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
     use bamboo_orchestration::managed_session::approval_handoff::DELAY;
@@ -2361,24 +2363,244 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     config.set_ask_rules(Vec::new());
     assert!(decision(PermissionDecisionKind::AllowGlobal).await.is_err());
 
+    if final_decision == PermissionDecisionKind::DenyOnce {
+        state
+            .session_store
+            .interrupt_full_save_at_main_for_test(ROOT_A, false);
+        let error = decision(PermissionDecisionKind::AllowOnce)
+            .await
+            .expect_err("the delegated response did not reach Main");
+        assert!(error
+            .to_string()
+            .contains("injected full save interruption"));
+        assert_eq!(
+            bamboo_domain::pending_permission_occurrence(&load(state, ROOT_A).await),
+            Some(handoff.pending.occurrence.clone())
+        );
+        let control = state
+            .storage
+            .load_runtime_control_plane(ROOT_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.pending_question, target.pending_question);
+        assert!(control.messages.is_empty());
+        let (supervisor_context, _) = state
+            .storage
+            .load_supervisor_context_target(&f.reference, ROOT_A)
+            .await
+            .unwrap();
+        assert_eq!(supervisor_context.pending_question, target.pending_question);
+        assert!(supervisor_context.messages.is_empty());
+        assert!(config
+            .decision_receipt(ROOT_A, call, &current_request.request_generation)
+            .is_none());
+        assert!(!config.temporary_grants().iter().any(|grant| {
+            grant.session_id.as_deref() == Some(ROOT_A) && grant.request_id.as_deref() == Some(call)
+        }));
+        assert!(!std::path::Path::new(&file).exists());
+    } else {
+        state
+            .session_store
+            .interrupt_full_save_at_main_for_test(ROOT_A, true);
+    }
+
     state
         .approval_runtime
         .set(Arc::downgrade(&state.clone().into_inner()))
         .expect("bind the native decision port");
-    let result = invoke_managed_control(
-        state,
-        &f.reference,
-        "timed-decision",
-        json!({"action":"decide_approval", "target_session_id":ROOT_A,
+    if revoke_before_claim {
+        let (reached, release) = state
+            .session_store
+            .pause_full_save_before_filesystem_commit_for_test(ROOT_A);
+        let revoke = async {
+            reached.wait().await;
+            let guard = state.permission_io_lock.lock();
+            tokio::pin!(guard);
+            assert!(futures::poll!(&mut guard).is_pending());
+            release.wait().await;
+            let _guard = guard.await;
+            config.set_ask_rules(["session_control".into()]);
+        };
+        let (result, ()) = tokio::time::timeout(WAIT, async {
+            tokio::join!(decision(final_decision), revoke)
+        })
+        .await
+        .expect("permission setting and first delegated response both finish");
+        let error = result.expect_err("revoked delegation cannot claim the committed response");
+        assert!(
+            error
+                .to_string()
+                .contains("Permission response was saved but execution could not be confirmed"),
+            "{error}"
+        );
+        assert!(!std::path::Path::new(&file).exists());
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .is_none());
+        let committed = load(state, ROOT_A).await;
+        assert!(committed.pending_question.is_none());
+        assert!(committed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        let replay = decision(final_decision)
+            .await
+            .expect_err("same choice still requires current delegation");
+        assert!(matches!(replay, crate::error::AppError::Forbidden(_)));
+        config.set_ask_rules(Vec::new());
+        let retried = decision(final_decision).await.unwrap();
+        assert_eq!(retried["replayed"], true);
+        assert_eq!(
+            retried["receipt"]["decision"]["request_generation"],
+            current_request.request_generation
+        );
+        settled(state, ROOT_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+        state.shutdown().await;
+        return;
+    }
+    let result = if restart_after_commit {
+        state
+            .session_store
+            .interrupt_response_publication_for_test(ROOT_A);
+        let error = decision(final_decision).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Permission response was saved but execution could not be confirmed"),
+            "{error}"
+        );
+        assert!(!std::path::Path::new(&file).exists());
+        let committed = load(state, ROOT_A).await;
+        assert!(committed.pending_question.is_none());
+        assert!(committed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        state.shutdown().await;
+        let restarted = host(f.home.path(), f.probe.clone()).await;
+        let queued =
+            bamboo_domain::SessionMessageEnvelope::user_input(ROOT_A, "queued after approval");
+        let queued_receipt = restarted.session_inbox.deliver(&queued).await.unwrap();
+        restarted
+            .session_inbox
+            .mark_message_activation_eligible(
+                ROOT_A,
+                &queued_receipt,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        use bamboo_domain::SessionActivationPort;
+        restarted
+            .session_activation_router
+            .request_activation(ROOT_A, queued_receipt.generation)
+            .await
+            .unwrap();
+        assert!(
+            !restarted
+                .session_activation_router
+                .has_activation_owner_or_reservation(ROOT_A)
+                .await
+        );
+        let execute = crate::handlers::agent::execute::handle_execute(
+            restarted.clone(),
+            ROOT_A.into(),
+            web::Json(serde_json::from_value(json!({})).unwrap()),
+        )
+        .await;
+        assert_eq!(execute.status(), actix_web::http::StatusCode::CONFLICT);
+        assert!(!load(&restarted, ROOT_A)
+            .await
+            .messages
+            .iter()
+            .any(|message| { message.id == queued.id.as_str() }));
+        let retry = |caller: SessionCallerReference, kind| {
+            let state = restarted.clone();
+            let reference = handoff.reference.clone();
+            async move {
+                decide_delegated_approval(
+                    state.clone(),
+                    &state.observer_subscriptions.inbox,
+                    &caller,
+                    ROOT_A.into(),
+                    &reference,
+                    kind,
+                )
+                .await
+            }
+        };
+        let mut stale = caller.clone();
+        stale.root_tool_authority_revision += 1;
+        assert!(retry(stale, final_decision).await.is_err());
+        assert!(retry(caller.clone(), PermissionDecisionKind::DenyOnce)
+            .await
+            .is_err());
+        restarted
+            .session_store
+            .interrupt_once_handoff_claim_for_test(ROOT_A);
+        let interrupted = retry(caller.clone(), final_decision).await.unwrap_err();
+        assert!(interrupted
+            .to_string()
+            .contains("injected Once handoff interruption"));
+        assert!(restarted
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .is_none());
+        assert!(!std::path::Path::new(&file).exists());
+        let interrupted = load(&restarted, ROOT_A).await;
+        assert!(interrupted
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        assert_eq!(
+            interrupted
+                .metadata
+                .get(bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some(call),
+        );
+        let response = retry(caller.clone(), final_decision).await.unwrap();
+        assert_eq!(response["replayed"], true);
+        assert_eq!(response["auto_resume_status"], "started");
+        let claimed = load(&restarted, ROOT_A).await;
+        assert!(!claimed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        assert!(!claimed
+            .metadata
+            .contains_key(bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY));
+        settled(&restarted, ROOT_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+        assert!(retry(caller, final_decision).await.is_err());
+        restarted.shutdown().await;
+        return;
+    } else {
+        invoke_managed_control(
+            state,
+            &f.reference,
+            "timed-decision",
+            json!({"action":"decide_approval", "target_session_id":ROOT_A,
             "approval_reference":handoff.reference, "decision":final_decision}),
-    )
-    .await;
+        )
+        .await
+    };
     assert_eq!(
         result["receipt"]["decision"]["decision"],
         json!(final_decision)
     );
+    assert_eq!(
+        result["receipt"]["decision"]["request_generation"],
+        json!(current_request.request_generation)
+    );
     assert!(load(state, ROOT_A).await.pending_question.is_none());
-    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    if final_decision == PermissionDecisionKind::DenyOnce {
+        assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    }
     if final_decision == PermissionDecisionKind::AllowOnce {
         assert_eq!(result["auto_resume_status"], "started", "{result}");
         let completed = settled(state, ROOT_A).await;
@@ -2394,6 +2616,7 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
             tool_result.content
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
     } else {
         assert!(!std::path::Path::new(&file).exists());
     }

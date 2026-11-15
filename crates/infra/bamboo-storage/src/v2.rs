@@ -676,6 +676,19 @@ struct SessionControlPlane {
     session: Session,
 }
 
+fn decode_main_control_plane(raw: &str, side: Option<&Session>) -> serde_json::Result<Session> {
+    let main = serde_json::from_str::<SessionControlPlane>(raw)?.session;
+    if side.is_some_and(|side| {
+        crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+    }) {
+        // Only an ambiguous response pair needs its actual pending result ID.
+        // The caller still projects away all transcript fields.
+        serde_json::from_str(raw)
+    } else {
+        Ok(main)
+    }
+}
+
 impl<'de> Deserialize<'de> for SessionControlPlane {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ControlVisitor;
@@ -745,6 +758,11 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
 pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    // The handoff's acknowledgement shares the response's Main boundary.
+    // Runtime-only writes cannot publish or consume it.
+    snapshot
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
     // Native transcript groups are committed atomically with the ordinary
     // message that anchors them. Never let runtime.json expose a load/search
     // item without the corresponding session.json history boundary.
@@ -772,6 +790,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
             side.observe_main_session_version(main.session_version);
+            crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1797,6 +1816,12 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
+    #[cfg(feature = "test-utils")]
+    full_save_fault: std::sync::Mutex<Option<(String, bool)>>,
+    #[cfg(feature = "test-utils")]
+    full_response_publication_fault: std::sync::Mutex<Option<String>>,
+    #[cfg(feature = "test-utils")]
+    once_handoff_claim_fault: std::sync::Mutex<Option<String>>,
     #[cfg(test)]
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
     #[cfg(test)]
@@ -1828,6 +1853,7 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
     "runtime.host_run_id",
     "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
@@ -2144,6 +2170,12 @@ impl SessionStoreV2 {
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_save_fault: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_response_publication_fault: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            once_handoff_claim_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2483,7 +2515,7 @@ impl SessionStoreV2 {
     }
 
     /// Same canonical pair, revocation and proof validation as the full reader.
-    /// The control view never deserializes private messages/provider history.
+    /// The control view discards private messages and provider history.
     async fn load_session_from_dir_strict_view(
         &self,
         abs_dir: &Path,
@@ -2572,7 +2604,18 @@ impl SessionStoreV2 {
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
         self.validate_root_tool_authority_overlay(id, &main, sidecar.as_ref())
             .await?;
+        if control_only
+            && sidecar.as_ref().is_some_and(|side| {
+                crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+            })
+        {
+            let transcript: Session = serde_json::from_str(&raw)?;
+            main.messages = transcript.messages;
+        }
         let mut session = overlay_runtime_sidecar(main, sidecar);
+        if control_only {
+            session.messages.clear();
+        }
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
@@ -2994,6 +3037,50 @@ impl SessionStoreV2 {
             pause.reached.wait().await;
             pause.release.wait().await;
         }
+    }
+
+    /// Interrupt the next full save for a test-owned Session at the Main boundary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_full_save_at_main_for_test(&self, session_id: &str, after_main: bool) {
+        *self.full_save_fault.lock().unwrap() = Some((session_id.into(), after_main));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_response_publication_for_test(&self, session_id: &str) {
+        *self.full_response_publication_fault.lock().unwrap() = Some(session_id.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_once_handoff_claim_for_test(&self, session_id: &str) {
+        *self.once_handoff_claim_fault.lock().unwrap() = Some(session_id.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_response_publication_fault(&self, session_id: &str) -> io::Result<()> {
+        let mut fault = self.full_response_publication_fault.lock().unwrap();
+        if fault.as_deref() == Some(session_id) {
+            fault.take();
+            return Err(io::Error::other(
+                "injected response publication interruption",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_full_save_fault(&self, session_id: &str, after_main: bool) -> io::Result<()> {
+        let mut fault = self.full_save_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(id, after)| id == session_id && *after == after_main)
+        {
+            *fault = None;
+            return Err(io::Error::other("injected full save interruption at Main"));
+        }
+        Ok(())
     }
 
     pub fn bamboo_home_dir(&self) -> &Path {
@@ -3866,9 +3953,18 @@ impl SessionStoreV2 {
             // An Ordinary Child may already own this ID in another tree.
             // Only canonical Root absence permits its normal control-plane read.
         }
-        if let Some(side) = self.read_runtime_sidecar_boxed(session_id).await? {
+        if let Some(mut side) = self.read_runtime_sidecar_boxed(session_id).await? {
             self.validate_root_tool_authority_against_proof(session_id, &side)
                 .await?;
+            if crate::session_merge::has_uncommitted_response_marker(&side) {
+                if let Some(path) = self.session_json_path(session_id).await? {
+                    let raw = fs::read_to_string(path).await?;
+                    compact_main::validate_full_main(raw.as_bytes())?;
+                    let main = decode_main_control_plane(&raw, Some(&side))?;
+                    supervisor::validate_overlay(&main, Some(&side))?;
+                    crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+                }
+            }
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
@@ -6382,6 +6478,14 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "pending permission response must resume before clearing history",
+            ));
+        }
         if session.conversation_reset.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
                 "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
@@ -7420,6 +7524,17 @@ impl SessionStoreV2 {
         {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
+            crate::session_merge::reject_stale_permission_response(&durable, session, true)?;
+            let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+            let marker = durable.metadata.get(marker_key);
+            if (marker.is_some() || session.metadata.contains_key(marker_key))
+                && (marker != session.metadata.get(marker_key)
+                    || !crate::session_merge::same_permission_response_control(&durable, session))
+            {
+                return Err(root_actor_runtime::conflict(
+                    "pending permission response control changed",
+                ));
+            }
         }
         let previous = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
@@ -7708,6 +7823,42 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
 
+        if let Some(previous) = previous_main.as_ref() {
+            let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+            let prior = previous.metadata.get(marker_key);
+            let proposed = session.metadata.get(marker_key);
+            if prior.is_none() && proposed.is_none() {
+                crate::session_merge::reject_stale_permission_response(previous, session, false)?;
+            }
+            if prior.is_some() && guards.once_response_handoff.is_none() {
+                if proposed != prior
+                    || !crate::session_merge::same_permission_response_control(previous, session)
+                    || serde_json::to_value(&previous.messages)?
+                        != serde_json::to_value(&session.messages)?
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "pending permission response must resume before changing its transcript or control",
+                    ));
+                }
+            } else if let Some(marker) = proposed {
+                let response: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
+                if bamboo_domain::consumed_pending_permission(previous, session).as_ref()
+                    != Some(&response)
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "permission response occurrence changed",
+                    ));
+                }
+            }
+        } else if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "permission response requires a canonical pending occurrence",
+            ));
+        }
+
         // An incoming Session field is never authority to create or roll back
         // Main-owned facts. The bound Root writer adopts the current Main and,
         // only for its exact retained Inbox lease, derives the input transition.
@@ -7753,6 +7904,20 @@ impl SessionStoreV2 {
                         )
                         .map_err(io::Error::other)?;
                 }
+            }
+            if let (Some(outcomes), Some(response)) =
+                (outcomes.as_mut(), guards.once_response_handoff.as_ref())
+            {
+                let reset = durable
+                    .conversation_reset_sha256()
+                    .map_err(io::Error::other)?;
+                outcomes
+                    .recover_permission_resume(
+                        &root_actor.owner().fence,
+                        reset.as_deref(),
+                        response,
+                    )
+                    .map_err(io::Error::other)?;
             }
             let current = if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
                 let mut current = session.clone();
@@ -7960,8 +8125,22 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
         }
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, false)?;
+        #[cfg(feature = "test-utils")]
+        if guards.once_response_handoff.is_some() {
+            let mut fault = self.once_handoff_claim_fault.lock().unwrap();
+            if fault.as_deref() == Some(&session.id) {
+                fault.take();
+                return Err(io::Error::other(
+                    "injected Once handoff interruption before Main",
+                ));
+            }
+        }
         self.write_default_bytes(&path, session_bytes, guards)
             .await?;
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, true)?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Main)?;
         }
@@ -8301,7 +8480,46 @@ impl Storage for SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, publish)
+        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, None, publish)
+            .await
+    }
+
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        approval: &bamboo_domain::storage::SupervisorApprovalCommit,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_bound_startup_impl(
+            owner,
+            session,
+            expected,
+            inherited,
+            Some(approval),
+            publish,
+        )
+        .await
+    }
+
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        approval: Option<&bamboo_domain::storage::SupervisorApprovalCommit>,
+    ) -> io::Result<Session> {
+        self.confirm_root_response_checkpoint_impl(owner, approval)
+            .await
+    }
+
+    async fn claim_once_response_handoff(
+        &self,
+        session: &Session,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+        approval: Option<&bamboo_domain::storage::SupervisorApprovalCommit>,
+    ) -> io::Result<()> {
+        self.claim_once_response_handoff_impl(session, owner, approval)
             .await
     }
 
@@ -8796,7 +9014,16 @@ impl Storage for SessionStoreV2 {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let _session = self.acquire_session_maintenance_lock(session_id).await?;
-        self.load_execution_admission_unchecked(session_id).await
+        let current = self.load_execution_admission_unchecked(session_id).await?;
+        if let Some(session) = current.as_ref().filter(|session| {
+            session
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        }) {
+            let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
+            root_actor_runtime::sync_response_checkpoint(&directory)?;
+        }
+        Ok(current)
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {

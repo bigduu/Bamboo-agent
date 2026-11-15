@@ -23,6 +23,7 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
+use crate::runtime::runner::round_lifecycle::{RoundOutputLimitPolicy, TaskSplitPrompt};
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
@@ -31,8 +32,8 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
-    WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, RoundRuntimeState, SuspensionState,
+    WaitingForBashState, WaitingForChildrenState,
 };
 use bamboo_domain::{
     AgentHookPoint, CapabilityInvocationTarget, CapabilityLoadingClass, CapabilityLoadingMode,
@@ -53,7 +54,9 @@ use super::gold::{
     select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
+use super::output_limit_split::{SplitRecovery, Stage as SplitStage, DEFAULT_TOKEN_LIMIT};
 use crate::runtime::runner::state_bridge;
+use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
@@ -659,7 +662,7 @@ async fn commit_sticky_fallback_discovery_round(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     browser_only: bool,
-) -> Result<(), AgentError> {
+) -> Result<Option<[u8; 32]>, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -697,6 +700,7 @@ async fn commit_sticky_fallback_discovery_round(
 
     let discovery_is_alone = tool_calls.len() == 1
         && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+    let mut fingerprint = None;
     if !discovery_is_alone {
         const ERROR: &str = "discovery must be called alone";
         for call in &tool_calls {
@@ -712,7 +716,7 @@ async fn commit_sticky_fallback_discovery_round(
         let discovery_result =
             serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
                 .map_err(|error| format!("invalid discovery arguments: {error}"));
-        let definitions = match discovery_result {
+        let definitions = match &discovery_result {
             Ok(request) => {
                 let include_commands = request.kinds.as_ref().is_some_and(|kinds| {
                     kinds
@@ -727,7 +731,7 @@ async fn commit_sticky_fallback_discovery_round(
                     include_commands,
                 )
                 .await
-                .and_then(|discovery| discovery.discover_complete_schemas(&request))
+                .and_then(|discovery| discovery.discover_complete_schemas(request))
                 {
                     Ok(mut schemas) => {
                         if browser_only {
@@ -740,9 +744,9 @@ async fn commit_sticky_fallback_discovery_round(
                     Err(error) => Err(error.to_string()),
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.clone()),
         };
-        match definitions {
+        let (content, success, new_names) = match definitions {
             Ok(definitions) => {
                 let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
                     .into_iter()
@@ -763,24 +767,34 @@ async fn commit_sticky_fallback_discovery_round(
                         "sticky discovery result could not be serialized: {error}"
                     ))
                 })?;
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
+                (
                     format!(
                         "{STICKY_DISCOVERY_RESULT_START}{payload}{STICKY_DISCOVERY_RESULT_END}"
                     ),
                     true,
-                    &canonical_new_names,
-                ));
+                    canonical_new_names,
+                )
             }
-            Err(error) => {
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
-                    format!("capability discovery failed: {error}"),
-                    false,
-                    &[],
-                ));
-            }
-        }
+            Err(error) => (
+                format!("capability discovery failed: {error}"),
+                false,
+                Vec::new(),
+            ),
+        };
+        fingerprint = discovery_result
+            .ok()
+            .and_then(|request| serde_json::to_value(request).ok())
+            .and_then(|arguments| {
+                discovery_tool_fingerprint(
+                    bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                    &arguments,
+                    success,
+                    content.as_bytes(),
+                )
+            });
+        session.add_message(sticky_fallback_tool_result(
+            &call.id, content, success, &new_names,
+        ));
     }
 
     if let Some(persistence) = config.persistence.as_ref() {
@@ -793,7 +807,15 @@ async fn commit_sticky_fallback_discovery_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(fingerprint)
+}
+
+const OPENAI_CLIENT_SEARCH_TOOL_NAME: &str = "tool_search";
+
+#[derive(Debug)]
+struct ClientToolSearchOutput {
+    item: ProviderTranscriptItem,
+    fingerprint: Option<[u8; 32]>,
 }
 
 async fn build_openai_client_tool_search_outputs(
@@ -801,7 +823,7 @@ async fn build_openai_client_tool_search_outputs(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     provider_items: &[ProviderTranscriptItem],
-) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+) -> Result<Vec<ClientToolSearchOutput>, AgentError> {
     let requests = openai_client_tool_search_requests(provider_items)?;
     let discovery =
         CompleteCapabilityDiscovery::new(session, config, tool_schemas, false, false).await?;
@@ -839,7 +861,17 @@ async fn build_openai_client_tool_search_outputs(
                 "OpenAI client tool-search output could not be constructed: {error}"
             ))
         })?;
-        outputs.push(item);
+        // Provider call IDs pair the transcript items but never describe
+        // progress. Compare the actual returned definitions and search input.
+        let fingerprint = serde_json::to_value(request).ok().and_then(|arguments| {
+            discovery_tool_fingerprint(
+                OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                &arguments,
+                true,
+                item.payload()["tools"].to_string().as_bytes(),
+            )
+        });
+        outputs.push(ClientToolSearchOutput { item, fingerprint });
     }
     Ok(outputs)
 }
@@ -849,7 +881,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<Message, AgentError> {
+) -> Result<(Message, Vec<Option<[u8; 32]>>), AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -871,14 +903,16 @@ async fn commit_openai_client_tool_search_round(
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
     commit_assistant_message(session, message.clone(), &mut provider_items)?;
-    for output in host_outputs {
+    let mut fingerprints = Vec::with_capacity(host_outputs.len());
+    for ClientToolSearchOutput { item, fingerprint } in host_outputs {
         session
-            .append_provider_transcript_group(&anchor, None, vec![output])
+            .append_provider_transcript_group(&anchor, None, vec![item])
             .map_err(|error| {
                 AgentError::LLM(format!(
                     "OpenAI client tool-search result could not be committed: {error}"
                 ))
             })?;
+        fingerprints.push(fingerprint);
     }
     if let Some(persistence) = config.persistence.as_ref() {
         persistence
@@ -890,7 +924,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(message)
+    Ok((message, fingerprints))
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -1029,24 +1063,57 @@ impl RoundActivity {
     /// followed by validation or post-LLM failure must still affect the runtime
     /// budget just as it affects durable metrics.
     fn commit_to_runtime(&self, runtime_state: &mut AgentRuntimeState) {
+        self.apply_to_round(&mut runtime_state.round);
+    }
+
+    fn apply_to_round(&self, round: &mut RoundRuntimeState) {
         let mut accumulated = MetricsTokenUsage {
-            prompt_tokens: runtime_state.round.total_prompt_tokens,
-            completion_tokens: runtime_state.round.total_completion_tokens,
+            prompt_tokens: round.total_prompt_tokens,
+            completion_tokens: round.total_completion_tokens,
             total_tokens: 0,
         }
         .clamped_for_durable_metrics();
         accumulated.add_assign_durable(self.token_usage());
-        runtime_state.round.total_prompt_tokens = accumulated.prompt_tokens;
-        runtime_state.round.total_completion_tokens = accumulated.completion_tokens;
-        runtime_state.round.total_tool_calls = runtime_state
-            .round
-            .total_tool_calls
-            .saturating_add(self.tool_call_count);
-        runtime_state.round.total_subagents_spawned = runtime_state
-            .round
+        round.total_prompt_tokens = accumulated.prompt_tokens;
+        round.total_completion_tokens = accumulated.completion_tokens;
+        round.total_tool_calls = round.total_tool_calls.saturating_add(self.tool_call_count);
+        round.total_subagents_spawned = round
             .total_subagents_spawned
             .saturating_add(self.subagent_spawn_count);
     }
+}
+
+fn run_tokens_used(round: &RoundRuntimeState) -> u64 {
+    round
+        .total_prompt_tokens
+        .saturating_add(round.total_completion_tokens)
+        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT)
+}
+
+fn can_split_tasks(
+    session: &Session,
+    config: &AgentLoopConfig,
+    runtime: &AgentRuntimeState,
+    round: u32,
+) -> bool {
+    // The split owns the remaining rounds. Managed runs already have their
+    // own completion and recovery gates.
+    session.kind == bamboo_domain::SessionKind::Root
+        && session.authority_identity.is_ordinary()
+        && config.effective_counted_loop().is_none()
+        && config.loop_control.is_none()
+        && !config.goal_loop_active()
+        && !config.guardian_active()
+        && !config.features_final_evidence_check
+        && config.host_gold_run.is_none()
+        && crate::runtime::runner::round_lifecycle::required_tool_for_session(session).is_none()
+        && runtime.suspension.is_none()
+        && runtime.waiting_for_children.is_none()
+        && runtime.waiting_for_bash.is_none()
+        && config
+            .run_budget
+            .max_rounds
+            .is_none_or(|max| round.saturating_add(2) < max)
 }
 
 /// Checks the run's cumulative activity (already accumulated into `round` —
@@ -1056,13 +1123,10 @@ impl RoundActivity {
 /// same round. Mirrors the `max_rounds` exhaustion check in spirit: this is a
 /// graceful-stop trigger, not an error.
 fn check_run_budget_exceeded(
-    round: &bamboo_domain::session::runtime_state::RoundRuntimeState,
+    round: &RoundRuntimeState,
     budget: &bamboo_config::RunBudgetConfig,
 ) -> Option<RunBudgetExceeded> {
-    let total_tokens = round
-        .total_prompt_tokens
-        .saturating_add(round.total_completion_tokens)
-        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT);
+    let total_tokens = run_tokens_used(round);
     if let Some(limit) = budget.max_total_tokens {
         if total_tokens >= limit {
             return Some(RunBudgetExceeded {
@@ -1513,7 +1577,7 @@ async fn maybe_background_quiet_exec(
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
 ) -> Result<bool, AgentError> {
-    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config) {
+    if !crate::runtime::runner::tool_execution::quiet_poll_guard_active(session, runtime, config) {
         return Ok(false);
     }
     if let Some(wait) = runtime.waiting_for_bash.as_ref() {
@@ -2930,6 +2994,27 @@ async fn handle_no_tool_calls(
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
 
+const QUIET_EXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+async fn wait_for_quiet_exec(
+    job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+    cancel_token: &CancellationToken,
+) -> Result<Message, AgentError> {
+    use crate::session_app::child_completion_coordinator::{
+        exec_completion_message, exec_wait_resume_message,
+    };
+
+    let result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+        result = tokio::time::timeout(QUIET_EXEC_WAIT_TIMEOUT, job.completion()) => result,
+    };
+    Ok(match result {
+        Ok(info) => exec_completion_message(&info),
+        Err(_) => exec_wait_resume_message(&[job.id().to_owned()], true),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tool_calls_path(
     frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
@@ -2942,7 +3027,8 @@ async fn handle_tool_calls_path(
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
-) -> Result<TurnOutcome, AgentError> {
+    output_limit_recovery: bool,
+) -> Result<(TurnOutcome, Option<String>), AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
     // The signature only ever covers the reasoning text, so it rides along only
@@ -2981,14 +3067,6 @@ async fn handle_tool_calls_path(
             })?;
     }
 
-    let compression_model = Some(model_name.to_string())
-        .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
-    if compression_model.is_none() {
-        tracing::warn!(
-            "[{}] Skipping mid-turn context compression after tool execution: missing model name",
-            frame.session_id
-        );
-    }
     let eligible_tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
     let required_tool = crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
@@ -3029,9 +3107,7 @@ async fn handle_tool_calls_path(
                 runtime_state,
                 policy_guard,
                 task_context,
-                compression_model_name: compression_model
-                    .as_deref()
-                    .or(auxiliary_models.background_model_name.as_deref()),
+                compression_model_name: (!output_limit_recovery).then_some(model_name),
                 compression_model_provider: auxiliary_models
                     .summarization_model_provider
                     .as_ref()
@@ -3120,10 +3196,14 @@ async fn handle_tool_calls_path(
                     .await;
             }
         }
-        return Ok(TurnOutcome {
-            should_break: true,
-            sent_complete: ticket_question_yield && !super::defers_terminal_complete(frame.config),
-        });
+        return Ok((
+            TurnOutcome {
+                should_break: true,
+                sent_complete: ticket_question_yield
+                    && !super::defers_terminal_complete(frame.config),
+            },
+            None,
+        ));
     }
 
     if frame.debug_enabled {
@@ -3135,6 +3215,25 @@ async fn handle_tool_calls_path(
                 "message_count": session.messages.len(),
             })
         );
+    }
+
+    // The poll has already returned and its tool result is paired. A sole
+    // follow-up quiet read can now wait within this run, outside tool deadlines
+    // and without spending another provider turn.
+    if !output_limit_recovery && round_status == MetricsRoundStatus::Success {
+        if let Some(handle) = tool_execution.quiet_exec_handle {
+            if let Some(job) =
+                bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
+                    .await
+            {
+                let message = wait_for_quiet_exec(job, cancel_token).await?;
+                session.add_message(message.clone());
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::message_appended(&session.id, &message))
+                    .await;
+            }
+        }
     }
 
     // ---- Dynamic model routing: classify task complexity ----
@@ -3199,10 +3298,13 @@ async fn handle_tool_calls_path(
         round_error,
     );
 
-    Ok(TurnOutcome {
-        should_break: false,
-        sent_complete: false,
-    })
+    Ok((
+        TurnOutcome {
+            should_break: false,
+            sent_complete: false,
+        },
+        tool_execution.completed_single_tool_contract,
+    ))
 }
 
 // ---- Core pipeline ----
@@ -3462,9 +3564,16 @@ async fn run_pipeline_inner(
     // across rounds, so resetting it per iteration would make the guard unable
     // to ever fire (#2425).
     let mut no_tool_call_continuation_streak: u32 = 0;
+    let mut split_recovery: Option<SplitRecovery> = None;
+    let recovery_token_limit = config
+        .run_budget
+        .max_total_tokens
+        .unwrap_or(DEFAULT_TOKEN_LIMIT);
 
     loop {
-        if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+        if (split_recovery.is_some() || config.effective_counted_loop().is_some())
+            && cancel_token.is_cancelled()
+        {
             return Err(AgentError::Cancelled);
         }
         // Startup has already admitted this run's input. A runtime-only wakeup
@@ -3485,6 +3594,23 @@ async fn run_pipeline_inner(
         {
             break;
         }
+        if split_recovery.is_some()
+            && (run_tokens_used(&state.runtime_state.round) >= recovery_token_limit
+                || check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget)
+                    .is_some()
+                || config
+                    .run_budget
+                    .max_rounds
+                    .is_some_and(|max| turn_counter >= max))
+        {
+            return Err(AgentError::Budget(
+                "output-limit task recovery reached the run budget; confirmed progress is in the session".into(),
+            ));
+        }
+        let split_request = split_recovery
+            .as_mut()
+            .map(SplitRecovery::next_request)
+            .transpose()?;
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -3505,31 +3631,33 @@ async fn run_pipeline_inner(
             abort_in_flight_evaluations(state, event_tx, "delegation_failure_limit").await;
             return Err(error);
         }
-        refresh_auxiliary_models_for_round(state, config);
-        poll_completed_task_evaluation(state).await;
-        apply_completed_task_evaluation(session, event_tx, config, state).await;
-        start_queued_task_evaluation_if_idle(
-            state,
-            event_tx,
-            llm.clone(),
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
-        poll_completed_gold_evaluation(state).await;
-        apply_completed_gold_evaluation(session, config, state).await;
-        let gold_provider = select_gold_evaluation_provider(
-            config,
-            &llm,
-            state.auxiliary_models.fast_model_provider.as_ref(),
-        );
-        start_queued_gold_evaluation_if_idle(
-            state,
-            event_tx,
-            gold_provider,
-            config,
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
+        if split_request.is_none() {
+            refresh_auxiliary_models_for_round(state, config);
+            poll_completed_task_evaluation(state).await;
+            apply_completed_task_evaluation(session, event_tx, config, state).await;
+            start_queued_task_evaluation_if_idle(
+                state,
+                event_tx,
+                llm.clone(),
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+            poll_completed_gold_evaluation(state).await;
+            apply_completed_gold_evaluation(session, config, state).await;
+            let gold_provider = select_gold_evaluation_provider(
+                config,
+                &llm,
+                state.auxiliary_models.fast_model_provider.as_ref(),
+            );
+            start_queued_gold_evaluation_if_idle(
+                state,
+                event_tx,
+                gold_provider,
+                config,
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+        }
 
         state.runtime_state.round.current_round = turn_counter;
 
@@ -3592,7 +3720,7 @@ async fn run_pipeline_inner(
                 Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
-                Some(&runtime_context),
+                split_request.is_none().then_some(&runtime_context),
                 &state.execution_id,
             )
             .await?;
@@ -3605,6 +3733,11 @@ async fn run_pipeline_inner(
                     || input.wrapper.as_deref() == Some("root_chat_turn_v1")
             })
         });
+        if split_request.is_some() && fresh_human_input {
+            return Err(AgentError::LLMNonRetryable(
+                "output-limit task recovery stopped after new user input; confirmed progress is in the session".into(),
+            ));
+        }
         observation.update_current(
             &mut state.current_inputs,
             &state.session_id,
@@ -3638,15 +3771,14 @@ async fn run_pipeline_inner(
                 }
             }
         }
-        // Consume only after the complete real tool batch and newly admitted
-        // Human input. The same-model facts are mandatory for each bounded
-        // recovery request; they create neither a pending question nor a grant.
-        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+        // Evaluate feedback after the real tool batch and any newly admitted
+        // Human input. Quiet command recovery retains its existing handoff.
+        let quiet_poll_active = crate::runtime::runner::tool_execution::quiet_poll_guard_active(
             session,
             &state.runtime_state,
             config,
         );
-        if feedback_active {
+        if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
                 if maybe_background_quiet_exec(
                     session,
@@ -3662,24 +3794,7 @@ async fn run_pipeline_inner(
             }
         }
         let observation_progress_hint =
-            match tool_policy_guard.feedback_for_next_round(feedback_active) {
-                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
-                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
-                    feedback,
-                    summary,
-                } => {
-                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
-                        session,
-                        &state.runtime_state,
-                        event_tx,
-                        config,
-                        &feedback,
-                        &summary,
-                    )
-                    .await?;
-                    break;
-                }
-            };
+            tool_policy_guard.feedback_for_next_round(quiet_poll_active);
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3718,7 +3833,10 @@ async fn run_pipeline_inner(
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
-        let mut output_limit_recovery = None;
+        let mut output_limit_recovery = split_recovery.as_ref().map(|split| split.retry);
+        let mut previous_prompt_tokens = split_recovery
+            .as_ref()
+            .map_or(0, |split| split.prompt_floor);
         let mut turn_outcome: Option<TurnOutcome> = None;
         // Whether this round produced any tool call. Per-round, so it belongs
         // inside the loop; captured from the provider output rather than
@@ -3772,7 +3890,12 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
+        let attempt_limit = if split_request.is_some() {
+            1
+        } else {
+            MAX_LLM_TURN_ATTEMPTS + extra_attempts
+        };
+        for attempt in 1..=attempt_limit {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
                     session,
@@ -3793,6 +3916,31 @@ async fn run_pipeline_inner(
             // transient record when context preparation/provider dispatch fails
             // before streaming starts.
             let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
+            let mut spent = state.runtime_state.round.clone();
+            round_activity.apply_to_round(&mut spent);
+            let output_limit_policy = RoundOutputLimitPolicy {
+                retry: output_limit_recovery,
+                remaining_run_tokens: Some(recovery_token_limit.saturating_sub(run_tokens_used(&spent))),
+                previous_prompt_tokens,
+                can_cutoff: attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    && check_run_budget_exceeded(&spent, &config.run_budget).is_none(),
+                task_split: split_request.as_ref().map(|(stage, advisory)| TaskSplitPrompt {
+                    advisory,
+                    private_plan: *stage == SplitStage::Plan,
+                }),
+            };
+            let split_tools;
+            let request_tools = match split_request.as_ref() {
+                Some((SplitStage::Plan | SplitStage::Report, _)) => &[],
+                Some((SplitStage::Work, _)) => {
+                    split_tools = tool_schemas.iter()
+                        .filter(|schema| !super::output_limit_split::forbidden_tool(&schema.function.name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    split_tools.as_slice()
+                }
+                None => tool_schemas.as_slice(),
+            };
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
                 config,
@@ -3801,7 +3949,7 @@ async fn run_pipeline_inner(
                 cancel_token,
                 &state.session_id,
                 &state.model_name,
-                &tool_schemas,
+                request_tools,
                 observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
@@ -3809,7 +3957,7 @@ async fn run_pipeline_inner(
                         provenance: &prompt_memory_exposure,
                     },
                 ),
-                output_limit_recovery,
+                Some(output_limit_policy),
             )
             .await
             {
@@ -4047,8 +4195,17 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
-            if let Some(error) = llm_output.terminal_validation_error {
-                if matches!(error, AgentError::OutputTokenLimit { .. }) {
+            let validation_error = llm_output.terminal_validation_error.or_else(|| {
+                output_limit_recovery.and_then(|_| {
+                    let mut spent = state.runtime_state.round.clone();
+                    round_activity.apply_to_round(&mut spent);
+                    (run_tokens_used(&spent) > recovery_token_limit).then(|| AgentError::Budget(
+                        "output-limit recovery exceeded its token budget on reported usage".into(),
+                    ))
+                })
+            });
+            if let Some(error) = validation_error {
+                if output_limit_recovery.is_some() || matches!(error, AgentError::OutputTokenLimit { .. }) {
                     if let Some(visible) = stream_output.visible_message {
                         let _ = event_tx
                             .send(AgentEvent::VisibleMessageDiscard {
@@ -4058,21 +4215,120 @@ async fn run_pipeline_inner(
                     }
                 }
                 if matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. })
-                    && output_limit_recovery.is_none()
-                    && attempt < MAX_LLM_TURN_ATTEMPTS
+                    && split_request.is_none()
                 {
-                    if let Some(recovery) = llm_output.output_limit_recovery {
-                        let mut budget_state = state.runtime_state.clone();
-                        round_activity.commit_to_runtime(&mut budget_state);
-                        if check_run_budget_exceeded(&budget_state.round, &config.run_budget).is_none() {
+                    let mut spent = state.runtime_state.round.clone();
+                    round_activity.apply_to_round(&mut spent);
+                    previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
+                    let next = llm_output.output_limit_recovery;
+                    let remaining_tokens = recovery_token_limit.saturating_sub(run_tokens_used(&spent));
+                    let split_candidate = next.filter(|candidate| candidate.prefers_task_split())
+                        .or_else(|| output_limit_recovery.filter(|attempt| attempt.is_convergence()))
+                        .filter(|candidate| candidate.allows_task_split());
+                    if let Some(candidate) = split_candidate {
+                        let cost = previous_prompt_tokens.saturating_add(candidate.output_limit());
+                        if cost.saturating_mul(2) <= remaining_tokens
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                            && can_split_tasks(session, config, &state.runtime_state, turn_counter)
+                        {
+                            split_recovery = Some(SplitRecovery::new(
+                                candidate.for_task_split(), previous_prompt_tokens,
+                            ));
+                            crate::runtime::runner::metrics_lifecycle::record_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session.messages.len() as u32,
+                                MetricsRoundStatus::Error,
+                                round_activity.token_usage(),
+                                0,
+                                0,
+                                Some(error.to_string()),
+                            );
+                            abort_in_flight_evaluations(state, event_tx, "output_limit_task_split").await;
+                            tracing::info!(session_id = %state.session_id, "Splitting unfinished work after reasoning output exhaustion");
+                            turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                            break;
+                        }
+                    }
+                    if let Some(recovery) = next.filter(|_| {
+                        attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    }) {
+                        let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
+                        if next_cost <= remaining_tokens && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
                             output_limit_recovery = Some(recovery);
-                            tracing::info!("Retrying an output-limited reasoning-only response with low effort");
+                            tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
                             continue;
                         }
                     }
                 }
                 terminal_error = Some(error);
                 break;
+            }
+            if let (Some((stage, _)), Some(split)) = (split_request.as_ref(), split_recovery.as_mut()) {
+                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
+                let max_tools = usize::from(*stage == SplitStage::Work);
+                let invalid_tool = stream_output.tool_calls.len() > max_tools
+                    || stream_output.tool_calls.iter().any(|call| {
+                        super::output_limit_split::forbidden_tool(&call.function.name)
+                    })
+                    || stream_output.provider_transcript_items.iter().any(|item| {
+                        item.kind().is_discovery()
+                            || (max_tools == 0 && matches!(item.kind(),
+                                ProviderTranscriptItemKind::AnthropicToolUse
+                                    | ProviderTranscriptItemKind::OpenAiFunctionCall))
+                    });
+                if invalid_tool {
+                    if let Some(visible) = stream_output.visible_message {
+                        let _ = event_tx.send(AgentEvent::VisibleMessageDiscard {
+                            message_id: visible.message_id,
+                        }).await;
+                    }
+                    terminal_error = Some(AgentError::LLMNonRetryable(
+                        "output-limit task recovery rejected a tool outside the current step".into(),
+                    ));
+                    break;
+                }
+
+                if *stage == SplitStage::Plan {
+                    if let Err(error) = split.accept_plan(&stream_output.content) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
+
+                if *stage == SplitStage::Work && stream_output.tool_calls.is_empty() {
+                    let confirmed_checkpoint = stream_output.content.trim()
+                        .strip_prefix("CHECKPOINT:")
+                        .is_some_and(|evidence| !evidence.trim().is_empty());
+                    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                        .then_some(stream_output.reasoning_content);
+                    let mut checkpoint = assistant_with_visible_identity(
+                        Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+                            .with_reasoning_signature(stream_output.reasoning_signature),
+                        stream_output.visible_message,
+                    );
+                    checkpoint.phase = Some(bamboo_domain::MessagePhase::Commentary);
+                    if let Err(error) = commit_assistant_message(
+                        session, checkpoint, &mut Some(stream_output.provider_transcript_items),
+                    ) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    split.finish_step(confirmed_checkpoint);
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
             }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
@@ -4100,7 +4356,14 @@ async fn run_pipeline_inner(
                     )
                     .await
                     {
-                        Ok(message) => {
+                        Ok((message, fingerprints)) => {
+                            tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                            for fingerprint in fingerprints {
+                                tool_policy_guard.observe_repeated_call(
+                                    OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                                    fingerprint,
+                                );
+                            }
                             if config.features_final_evidence_check {
                                 publish_buffered_message(event_tx, &message).await;
                             }
@@ -4302,7 +4565,12 @@ async fn run_pipeline_inner(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(fingerprint) => {
+                        tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                        tool_policy_guard.observe_repeated_call(
+                            bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                            fingerprint,
+                        );
                         record_no_tool_calls_round_completed(
                             state.metrics_collector.as_ref(),
                             &round_id,
@@ -4337,6 +4605,10 @@ async fn run_pipeline_inner(
             let injected_handler_error = take_test_post_llm_retry_failure(session);
             #[cfg(not(test))]
             let injected_handler_error: Option<AgentError> = None;
+            let split_tool = split_request.as_ref()
+                .and_then(|_| stream_output.tool_calls.first())
+                .map(|call| (call.function.name.clone(), call.id.clone()));
+            let before_tool = session.messages.len();
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
                 None => {
@@ -4352,13 +4624,14 @@ async fn run_pipeline_inner(
                         &state.model_name,
                         &mut state.task_context,
                         cancel_token,
+                        output_limit_recovery.is_some(),
                     )
                     .await
                 }
             };
 
             match handler_result {
-                Ok(outcome) => {
+                Ok((outcome, completed_tool_contract)) => {
                     if let Some(attempt) = activation_attempt.as_ref() {
                         if !outcome.should_break {
                             if let Err(error) =
@@ -4369,11 +4642,21 @@ async fn run_pipeline_inner(
                             }
                         }
                     }
+                    if let (Some(split), Some((name, id))) = (split_recovery.as_mut(), split_tool) {
+                        if !outcome.should_break {
+                            let confirmed = session.messages.iter().skip(before_tool).any(|message| {
+                                super::output_limit_split::confirms_tool_result(
+                                    &name, &id, completed_tool_contract.as_deref(), message,
+                                )
+                            });
+                            split.finish_step(confirmed);
+                        }
+                    }
                     turn_outcome = Some(outcome);
                     break;
                 }
                 Err(error) => {
-                    if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                    if output_limit_recovery.is_none() && should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
                         if let Some(message_id) = crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
                             session,
                             attempt_tail_message_id.as_deref(),
@@ -4672,6 +4955,10 @@ async fn run_pipeline_inner(
         sent_complete = sent_complete || outcome.sent_complete;
         if outcome.should_break {
             break;
+        }
+        if split_recovery.is_some() {
+            turn_counter = turn_counter.saturating_add(1);
+            continue;
         }
 
         // Bounded progress guard (#2425). When a round produced no tool calls,
@@ -5651,7 +5938,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([{
                 "type":"function",
                 "name":"ReadArchive",
@@ -5930,7 +6217,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5954,7 +6241,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            refreshed[0].payload()["tools"],
+            refreshed[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5972,7 +6259,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(missing[0].payload()["tools"], serde_json::json!([]));
+        assert_eq!(missing[0].item.payload()["tools"], serde_json::json!([]));
         let invalid_kind = native_client_search_item_with_arguments(
             "search_skill",
             serde_json::json!({
@@ -6552,19 +6839,37 @@ mod tests {
                 .any(|tool| tool.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let advice = messages
+                .iter()
+                .find(|message| message.content.starts_with("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 4);
             let chunks = match count {
-                0 => vec![
+                0..=3 => vec![
                     Ok(LLMChunk::ToolCalls(vec![activation_call(
-                        "codex-search",
+                        &format!("codex-search-{count}"),
                         bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
                         r#"{"query":"timezone!","limit":1}"#,
                     )])),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
+                4 => {
+                    assert!(advice.unwrap().content.contains("discover_capabilities"));
+                    let deltas = (0..4)
+                        .map(|index| {
+                            let call_id = format!("codex-search-{index}");
+                            let result = messages
+                                .iter()
+                                .find(|message| {
+                                    message.tool_call_id.as_deref() == Some(call_id.as_str())
+                                })
+                                .unwrap();
+                            sticky_result_definition_values(result).unwrap().len()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(deltas, [1, 0, 0, 0]);
                     let result = messages
                         .iter()
-                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search"))
+                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search-0"))
                         .unwrap();
                     let definitions = sticky_result_definition_values(result).unwrap();
                     assert_eq!(definitions.len(), 1);
@@ -6582,7 +6887,7 @@ mod tests {
                         Ok(LLMChunk::Done),
                     ]
                 }
-                2 => {
+                5 => {
                     assert!(messages
                         .iter()
                         .any(
@@ -6656,8 +6961,12 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| { !message.content.starts_with("[Runtime tool advisory]") }));
         let mut resumed: Session =
             serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
         let current =
@@ -6736,14 +7045,33 @@ mod tests {
                 .iter()
                 .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let input = body["input"].as_array().unwrap();
+            let advice = input
+                .iter()
+                .position(|item| item.to_string().contains("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 3);
             let chunks = match count {
-                0 => vec![
+                0..=2 => vec![
                     Ok(LLMChunk::ProviderTranscriptItem(
-                        native_client_search_item_for("codex-native-search", "timezone!"),
+                        native_client_search_item_for(
+                            &format!("codex-native-search-{count}"),
+                            "timezone!",
+                        ),
                     )),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
+                3 => {
+                    let advisory_index = advice.unwrap();
+                    assert!(input[advisory_index].to_string().contains("tool_search"));
+                    for index in 0..3 {
+                        let call_id = format!("codex-native-search-{index}");
+                        assert!(
+                            input[..advisory_index].iter().any(|item| {
+                                item["type"] == "tool_search_output" && item["call_id"] == call_id
+                            }),
+                            "each actual search result must precede the request-only advice"
+                        );
+                    }
                     let output = ir
                         .provider_transcript_groups
                         .iter()
@@ -6761,7 +7089,7 @@ mod tests {
                     // only for discovery; ordinary calls use normalized chunks.
                     vec![Ok(LLMChunk::ToolCalls(vec![call])), Ok(LLMChunk::Done)]
                 }
-                2 => {
+                4 => {
                     assert!(body["input"]
                         .as_array()
                         .unwrap()
@@ -6808,7 +7136,7 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -7297,11 +7625,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].payload()["type"], "tool_search_output");
-        assert_eq!(outputs[0].payload()["execution"], "client");
-        assert_eq!(outputs[0].payload()["call_id"], "search_1");
-        assert_eq!(outputs[0].payload()["status"], "completed");
-        let discovered = outputs[0].payload()["tools"].as_array().unwrap();
+        assert_eq!(outputs[0].item.payload()["type"], "tool_search_output");
+        assert_eq!(outputs[0].item.payload()["execution"], "client");
+        assert_eq!(outputs[0].item.payload()["call_id"], "search_1");
+        assert_eq!(outputs[0].item.payload()["status"], "completed");
+        let discovered = outputs[0].item.payload()["tools"].as_array().unwrap();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0]["name"], "search_orders");
         assert_eq!(discovered[0]["strict"], false);
@@ -7317,9 +7645,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(empty_outputs.len(), 1);
-        assert_eq!(empty_outputs[0].payload()["call_id"], "search_empty");
+        assert_eq!(empty_outputs[0].item.payload()["call_id"], "search_empty");
         assert_eq!(
-            empty_outputs[0].payload()["tools"],
+            empty_outputs[0].item.payload()["tools"],
             serde_json::json!([]),
             "an empty discovery result remains an explicit completed tools array"
         );
@@ -8543,7 +8871,7 @@ mod tests {
         }
     }
 
-    fn e2e_loop_state(
+    pub(super) fn e2e_loop_state(
         session_id: &str,
     ) -> crate::runtime::runner::loop_execution::startup::LoopRunState {
         use crate::runtime::runner::loop_execution::startup::{
@@ -9806,7 +10134,7 @@ mod tests {
         );
     }
 
-    fn canonical_usage_pipeline_config() -> AgentLoopConfig {
+    pub(super) fn canonical_usage_pipeline_config() -> AgentLoopConfig {
         use crate::runtime::config::PromptMemoryFlags;
 
         AgentLoopConfig {
@@ -10163,7 +10491,7 @@ mod tests {
         assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
     }
 
-    fn mock_messages_completion(
+    pub(super) fn mock_messages_completion(
         block: serde_json::Value,
         delta: serde_json::Value,
         finish_reason: &str,
@@ -10186,7 +10514,7 @@ mod tests {
         ])
     }
 
-    fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
+    pub(super) fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
         let sse = events
             .iter()
             .map(|event| {
@@ -10202,7 +10530,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct OutputLimitExecutor(AtomicUsize);
+    pub(super) struct OutputLimitExecutor(AtomicUsize);
 
     #[async_trait::async_trait]
     impl bamboo_agent_core::tools::ToolExecutor for OutputLimitExecutor {
@@ -10232,6 +10560,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_output_token_limit_recovers_reasoning_and_blocks_truncated_tools() {
         use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer};
@@ -10239,7 +10568,7 @@ mod tests {
         let reasoning_progress = "The reasoning reaches its limit.";
         let make_thinking = |usage| {
             mock_messages_completion(
-                json!({"type":"thinking","thinking":""}),
+                json!({"type":"thinking","thinking":"","signature":""}),
                 json!({"type":"thinking_delta","thinking":reasoning_progress}),
                 "max_tokens",
                 usage,
@@ -10288,7 +10617,7 @@ mod tests {
                     .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
                     .respond_with(retry.clone())
                     .with_priority(1)
-                    .expect(1)
+                    .expect(if scenario == "repeated-limit" { 2 } else { 1 })
                     .mount(&server)
                     .await;
             }
@@ -10321,6 +10650,9 @@ mod tests {
             if matches!(scenario, "run-budget" | "missing-output-usage") {
                 config.run_budget.max_total_tokens = Some(38);
             }
+            if scenario == "repeated-limit" {
+                config.run_budget.max_rounds = Some(1);
+            }
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
             let mut state = e2e_loop_state(scenario);
@@ -10339,7 +10671,7 @@ mod tests {
             let requests = server.received_requests().await.unwrap();
             assert_eq!(
                 requests.len(),
-                1 + usize::from(retry.is_some()),
+                1 + usize::from(retry.is_some()) + usize::from(scenario == "repeated-limit"),
                 "{scenario}"
             );
             let first: Value = requests[0].body_json().unwrap();
@@ -10352,6 +10684,10 @@ mod tests {
                 let mut expected = first.clone();
                 expected["output_config"]["effort"] = json!("low");
                 assert_eq!(second, expected);
+            }
+            if scenario == "repeated-limit" {
+                assert!(String::from_utf8_lossy(&requests[2].body)
+                    .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
             }
             assert_eq!(tools.0.load(Ordering::SeqCst), 0);
             let mut answer_tokens = String::new();
@@ -10391,14 +10727,13 @@ mod tests {
                 assert!(answer_tokens.is_empty());
             }
             let round = &state.runtime_state.round;
-            assert_eq!(
-                round.total_prompt_tokens,
-                if retry.is_some() { 62 } else { 31 }
-            );
+            assert_eq!(round.total_prompt_tokens, 31 * requests.len() as u64);
             assert_eq!(
                 round.total_completion_tokens,
                 if succeeds {
                     10
+                } else if scenario == "repeated-limit" {
+                    21
                 } else if retry.is_some() {
                     14
                 } else if scenario == "missing-output-usage" {
@@ -10411,70 +10746,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
+    async fn pipeline_output_token_limit_converges_and_cuts_off_compatible_messages() {
         use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
         use wiremock::{Mock, MockServer};
 
-        let recovery = mock_completion_sse(&[json!({
-            "type":"response.completed",
-            "response":{"id":"resp_answer","status":"completed","usage":{"input_tokens":29,"output_tokens":3},
-                "output":[{"id":"msg_answer","type":"message","content":[{"type":"output_text","text":"Recovered"}]}]}
-        })]);
-        for (scenario, recover) in [("responses-recovery", true), ("responses-truncated", false)] {
+        let exhausted = mock_messages_completion(
+            json!({"type":"thinking","thinking":"","signature":""}),
+            json!({"type":"thinking_delta","thinking":" reasoning".repeat(5200)}),
+            "max_tokens",
+            Some(16_384),
+        );
+        let mut long_stream_events = vec![
+            json!({"type":"message_start","message":{"usage":{
+                "input_tokens":31,"cache_creation_input_tokens":5,"cache_read_input_tokens":7
+            }}}),
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"thinking","thinking":"","signature":""
+            }}),
+        ];
+        let mut calibrated_events = long_stream_events.clone();
+        calibrated_events.extend((0..8).map(|_| {
+            json!({
+                "type":"content_block_delta","index":0,"delta":{
+                    "type":"thinking_delta","thinking":" reasoning".repeat(650)
+                }
+            })
+        }));
+        calibrated_events
+            .push(json!({"type":"error","error":{"message":"past calibrated cutoff"}}));
+        let calibrated_stream = mock_completion_sse(&calibrated_events);
+        // Eight chunks of 2,000 locally counted tokens each. A cutoff at
+        // 14,336 drops the last chunk and never reads the provider's error.
+        long_stream_events.extend((0..8).map(|_| {
+            json!({
+                "type":"content_block_delta","index":0,"delta":{
+                    "type":"thinking_delta","thinking":" a".repeat(2000)
+                }
+            })
+        }));
+        long_stream_events.push(json!({"type":"error","error":{"message":"past cutoff"}}));
+        let long_stream = mock_completion_sse(&long_stream_events);
+        let answer = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"A small next step."}),
+            "end_turn",
+            Some(3),
+        );
+
+        for (scenario, low_stream, starts_low, pinned, run_limit) in [
+            ("reported-wire", &calibrated_stream, false, false, None),
+            ("local-cutoff", &long_stream, false, false, Some(75_000)),
+            ("configured-low", &exhausted, true, false, None),
+            ("patched-low", &long_stream, true, true, None),
+            ("final-cutoff", &exhausted, true, false, None),
+            ("run-budget", &exhausted, false, false, Some(40_000)),
+        ] {
             let server = MockServer::start().await;
-            let prefix = if recover {
-                json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_limit","delta":"Reasoning progress"})
-            } else {
-                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"})
-            };
-            let output = if recover {
-                json!([{"id":"rs_limit","type":"reasoning","summary":[]}])
-            } else {
-                json!([{"id":"fc_partial","type":"function_call","call_id":"call_partial",
-                        "name":"fixture_tool","arguments":"{"}])
-            };
-            let limited = mock_completion_sse(&[
-                prefix,
-                json!({"type":"response.incomplete",
-                    "response":{"id":"resp_limited","status":"incomplete",
-                        "incomplete_details":{"reason":"max_output_tokens"},"output":output,
-                        "usage":{"input_tokens":29,"output_tokens":11,
-                                 "output_tokens_details":{"reasoning_tokens":10}}}}),
-            ]);
-            Mock::given(method("POST"))
-                .and(path("/responses"))
-                .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
-                .respond_with(limited)
-                .expect(1)
-                .mount(&server)
-                .await;
-            if recover {
-                Mock::given(method("POST"))
-                    .and(path("/responses"))
-                    .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
-                    .respond_with(recovery.clone())
+            let request = || Mock::given(method("POST")).and(path("/messages"));
+            if !starts_low {
+                request()
+                    .and(body_partial_json(
+                        json!({"output_config":{"effort":"medium"}}),
+                    ))
+                    .respond_with(exhausted.clone())
                     .expect(1)
                     .mount(&server)
                     .await;
             }
-            let llm = bamboo_llm::OpenAIProvider::new("test-key")
+            request()
+                .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                .respond_with(low_stream.clone())
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let sends_final = scenario != "run-budget";
+            let final_hits_limit = scenario == "final-cutoff";
+            if sends_final {
+                request()
+                    .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                    .respond_with(if final_hits_limit {
+                        long_stream.clone()
+                    } else {
+                        answer.clone()
+                    })
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let mut patches = vec![json!({"op":"set","path":"/max_tokens","value":16_384})];
+            if pinned {
+                patches.push(json!({"op":"set","path":"/output_config/effort","value":"low"}));
+            }
+            let overrides =
+                serde_json::from_value(json!({"common":{"body_patch":patches}})).unwrap();
+            let llm = bamboo_llm::AnthropicProvider::new("test-key")
                 .with_base_url(server.uri())
-                .with_responses_only_models(vec!["model".into()])
-                .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_thinking_replay_always(true)
+                .with_request_overrides(Some(overrides));
             let tools = Arc::new(OutputLimitExecutor::default());
             let dir = tempfile::tempdir().unwrap();
             let mut config = canonical_usage_pipeline_config();
             config.app_data_dir = Some(dir.path().into());
-            config.reasoning_effort = Some(ReasoningEffort::Max);
+            config.reasoning_effort = Some(if starts_low && !pinned {
+                ReasoningEffort::Low
+            } else {
+                ReasoningEffort::Medium
+            });
+            config.token_budget = Some(bamboo_compression::TokenBudget::with_safety_margin(
+                65_536,
+                16_384,
+                Default::default(),
+                0,
+            ));
+            config.run_budget.max_total_tokens = run_limit;
+            config.run_budget.max_rounds = Some(1);
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
-            session
-                .metadata
-                .insert("responses.previous_response_id".into(), "resp_prior".into());
+            session.add_message(
+                Message::assistant_with_reasoning(
+                    "",
+                    Some(vec![bamboo_domain::ToolCall {
+                        id: "call_prior".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_domain::FunctionCall {
+                            name: "fixture_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                    Some("Earlier accepted reasoning.".into()),
+                )
+                .with_reasoning_signature(Some("prior_signature".into())),
+            );
+            session.add_message(Message::tool_result("call_prior", "Confirmed result."));
+            let prior_messages = session.messages.len();
             let mut state = e2e_loop_state(scenario);
-            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let (tx, _rx) = tokio::sync::mpsc::channel(128);
             let result = super::run_pipeline(
                 &mut session,
                 &tx,
@@ -10485,59 +10898,171 @@ mod tests {
                 &mut state,
             )
             .await;
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0, "{scenario}");
             let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), if recover { 2 } else { 1 });
-            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
-            let mut discarded = None;
-            let mut visible = None;
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    AgentEvent::VisibleMessageStart { message_id, .. } => {
-                        visible = Some(message_id)
-                    }
-                    AgentEvent::VisibleMessageDiscard { message_id } => {
-                        discarded = Some(message_id)
-                    }
-                    AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
-                    _ => {}
-                }
+            let failed_requests = if starts_low { 1 } else { 2 };
+            assert_eq!(
+                requests.len(),
+                failed_requests + usize::from(sends_final),
+                "{scenario}: {result:?}"
+            );
+            let bodies: Vec<Value> = requests
+                .iter()
+                .map(|request| request.body_json().unwrap())
+                .collect();
+            if !starts_low {
+                let mut expected = bodies[0].clone();
+                expected["output_config"]["effort"] = json!("low");
+                assert_eq!(bodies[1], expected, "{scenario}");
             }
-            if recover {
-                assert!(result.unwrap());
-                let mut expected: Value = requests[0].body_json().unwrap();
-                expected["reasoning"]["effort"] = json!("low");
-                assert_eq!(requests[1].body_json::<Value>().unwrap(), expected);
-                let last = session.messages.last().unwrap();
-                assert_eq!(last.content, "Recovered");
-                assert!(last.reasoning.is_none());
-                assert!(discarded.is_none());
+            for body in &bodies {
+                assert_eq!(body["max_tokens"], 16_384);
+                assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+            }
+            if sends_final {
+                let last_body = bodies.last().unwrap();
+                assert_eq!(last_body["output_config"]["effort"], "low");
+                let messages = last_body["messages"].to_string();
+                assert!(messages.contains("Answer the original request."));
+                assert!(messages.contains("Earlier accepted reasoning."));
+                assert!(messages.contains("prior_signature"));
+                assert!(messages.contains("Confirmed result."));
+                assert!(messages.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                assert!(!messages.contains(&" a".repeat(100)));
+                assert!(!messages.contains(&" reasoning".repeat(100)));
+            }
+            if sends_final && !final_hits_limit {
+                assert!(result.unwrap(), "{scenario}");
+                assert_eq!(session.messages.len(), prior_messages + 1);
+                assert_eq!(
+                    session.messages[prior_messages].content,
+                    "A small next step."
+                );
+                assert!(session.messages[prior_messages].reasoning.is_none());
             } else {
+                let expected_reason = if final_hits_limit {
+                    "reasoning_headroom"
+                } else {
+                    "max_tokens"
+                };
                 assert!(
                     matches!(
                         result,
                         Err(AgentError::OutputTokenLimit {
-                            finish_reason: "max_output_tokens",
-                            response_id: Some(ref id),
-                            reasoning_only: false,
-                        }) if id == "resp_limited"
+                            finish_reason,
+                            reasoning_only: true,
+                            ..
+                        }) if finish_reason == expected_reason
                     ),
-                    "{result:?}"
+                    "{scenario}: {result:?}"
                 );
-                assert_eq!(
-                    session.messages.last().unwrap().content,
-                    "Answer the original request."
-                );
-                assert_eq!(
-                    session.metadata["responses.previous_response_id"],
-                    "resp_prior"
-                );
-                assert!(visible.is_some());
-                assert_eq!(discarded, visible);
+                assert_eq!(session.messages.len(), prior_messages);
             }
             let round = &state.runtime_state.round;
-            assert_eq!(round.total_prompt_tokens, if recover { 58 } else { 29 });
-            assert_eq!(round.total_completion_tokens, if recover { 14 } else { 11 });
+            let saw_cutoff = matches!(
+                scenario,
+                "reported-wire" | "local-cutoff" | "patched-low" | "final-cutoff"
+            );
+            assert_eq!(
+                round.total_prompt_tokens,
+                31 * requests.len() as u64 + 12 * u64::from(saw_cutoff)
+            );
+            assert_eq!(
+                round.total_completion_tokens,
+                16_384 * (failed_requests as u64 + u64::from(final_hits_limit))
+                    + if sends_final && !final_hits_limit {
+                        3
+                    } else {
+                        0
+                    }
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
+        use bamboo_domain::ReasoningEffort;
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+            .respond_with(mock_completion_sse(&[
+                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"}),
+                json!({"type":"response.incomplete",
+                    "response":{"id":"resp_limited","status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "output":[{"id":"fc_partial","type":"function_call","call_id":"call_partial",
+                            "name":"fixture_tool","arguments":"{"}],
+                        "usage":{"input_tokens":29,"output_tokens":11,
+                                 "output_tokens_details":{"reasoning_tokens":10}}}}),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let llm = bamboo_llm::OpenAIProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_responses_only_models(vec!["model".into()])
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        let tools = Arc::new(OutputLimitExecutor::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = canonical_usage_pipeline_config();
+        config.app_data_dir = Some(dir.path().into());
+        config.reasoning_effort = Some(ReasoningEffort::Max);
+        let mut session = Session::new("responses-truncated", "model");
+        session.add_message(Message::user("Answer the original request."));
+        session
+            .metadata
+            .insert("responses.previous_response_id".into(), "resp_prior".into());
+        let mut state = e2e_loop_state(&session.id);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(llm),
+            tools.clone(),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::OutputTokenLimit {
+                    finish_reason: "max_output_tokens",
+                    response_id: Some(ref id),
+                    reasoning_only: false,
+                }) if id == "resp_limited"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "Answer the original request."
+        );
+        assert_eq!(
+            session.metadata["responses.previous_response_id"],
+            "resp_prior"
+        );
+        let (mut visible, mut discarded) = (None, None);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::VisibleMessageStart { message_id, .. } => visible = Some(message_id),
+                AgentEvent::VisibleMessageDiscard { message_id } => discarded = Some(message_id),
+                AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
+                _ => {}
+            }
+        }
+        assert!(visible.is_some());
+        assert_eq!(discarded, visible);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 29);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 11);
     }
 
     #[tokio::test]
@@ -13506,6 +14031,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                false,
             ),
         )
         .await;
@@ -13812,6 +14338,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                false,
             ),
         )
         .await
@@ -16782,6 +17309,10 @@ mod final_evidence_tests;
 #[cfg(test)]
 #[path = "pipeline_model_routing_tests.rs"]
 mod model_routing_tests;
+
+#[cfg(test)]
+#[path = "pipeline_output_limit_split_tests.rs"]
+mod output_limit_split_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

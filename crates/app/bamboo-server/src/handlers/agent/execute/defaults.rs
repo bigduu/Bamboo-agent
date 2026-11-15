@@ -49,7 +49,7 @@ pub struct ExecuteDefaultsResponse {
     pub model: Option<String>,
     /// Provider routing key for the primary model.
     pub provider: Option<String>,
-    /// Underlying provider type (e.g. `openai`, `anthropic`, `copilot`).
+    /// Underlying provider type (e.g. `openai`, `anthropic`, `gemini`).
     pub provider_type: Option<String>,
     /// Present when a saved explicit primary target fails admission.
     #[serde(skip_serializing_if = "Option::is_none")]

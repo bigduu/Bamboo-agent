@@ -25,7 +25,7 @@ use crate::providers::common::openai_compat::{
 };
 use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
-use bamboo_config::KeywordMaskingConfig;
+use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
 const DEFAULT_MAX_TOKENS: u32 = 16384;
@@ -36,17 +36,19 @@ pub struct BodhiProvider {
     base_url: String,
     target_provider: String,
     default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
 }
 
 impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             api_key: api_key.into(),
             base_url: "http://localhost:8080".to_string(),
             target_provider: "openai".to_string(),
             default_reasoning_effort: None,
+            request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
         }
     }
@@ -78,16 +80,43 @@ impl BodhiProvider {
         self
     }
 
-    fn build_headers(&self) -> Result<HeaderMap> {
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if self.target_provider == "anthropic" {
+            headers.insert(
+                "anthropic-version",
+                HeaderValue::from_static(super::anthropic::ANTHROPIC_API_VERSION),
+            );
+        }
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
+        // This hop authenticates to Bodhi. The gateway selects the upstream credential.
+        for name in [
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-litellm-api-key",
+            "proxy-authorization",
+        ] {
+            headers.remove(name);
+        }
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", self.api_key))
                 .map_err(|e| LLMError::Auth(format!("Invalid bodhi API key: {}", e)))?,
-        );
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
         );
         Ok(headers)
     }
@@ -199,6 +228,7 @@ impl LLMProvider for BodhiProvider {
                     model,
                     reasoning_effort,
                     required_tool,
+                    options.and_then(|options| options.cache.as_ref()),
                 )
                 .await
             }
@@ -222,7 +252,7 @@ impl LLMProvider for BodhiProvider {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         let url = self.proxy_url("v1/models");
-        let headers = self.build_headers()?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
 
         // Try to fetch models through the bodhi proxy.
         // If the bodhi server doesn't support this endpoint, return empty gracefully.
@@ -274,7 +304,8 @@ impl BodhiProvider {
             model,
         )?;
 
-        let headers = self.build_headers()?;
+        let headers =
+            self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
         let url = self.proxy_url("v1/chat/completions");
 
         let response = match send_chat_completions(
@@ -316,15 +347,16 @@ impl BodhiProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
+        cache_plan: Option<&crate::cache::PromptCachePlan>,
     ) -> Result<LLMStream> {
         use crate::providers::anthropic::{
-            apply_required_tool_choice, build_anthropic_request, parse_anthropic_sse_event,
-            AnthropicStreamState,
+            apply_cache_ttl_header, apply_required_tool_choice, build_anthropic_request_with_cache,
+            parse_anthropic_sse_event, AnthropicStreamState,
         };
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let mut body = build_anthropic_request(
+        let mut body = build_anthropic_request_with_cache(
             messages,
             tools,
             model,
@@ -332,6 +364,7 @@ impl BodhiProvider {
             true,
             reasoning_effort,
             None,
+            cache_plan,
         );
         apply_required_tool_choice(&mut body, required_tool);
         request_overrides::mask_and_prepare_agent_request(
@@ -342,7 +375,8 @@ impl BodhiProvider {
             model,
         )?;
 
-        let headers = self.build_headers()?;
+        let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        apply_cache_ttl_header(&mut headers, cache_plan);
         let url = self.proxy_url("v1/messages");
 
         // Retry the initial request on transient failures (issue #18); the
@@ -409,7 +443,10 @@ impl BodhiProvider {
             model,
         )?;
 
-        let headers = self.build_headers()?;
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            Some(model),
+        )?;
         let url = self.proxy_url(&format!(
             "v1beta/models/{}:streamGenerateContent?alt=sse",
             model

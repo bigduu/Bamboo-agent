@@ -88,8 +88,8 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// Re-read and prepare an activation target under the same per-session
 /// persistence lock that commits the generic suspension clear.
 ///
-/// The boolean is false for an unanswered human question or a respected
-/// child/Bash wait in the latest durable snapshot; leave activation unreserved.
+/// The boolean is false while a human response is pending or has its own
+/// successor, or while a child/Bash wait is respected.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -102,7 +102,11 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if latest.has_pending_question() {
+            if latest.has_pending_question()
+                || latest
+                    .metadata
+                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            {
                 return;
             }
             let mut runtime_state = read_runtime_state(latest);
@@ -3174,9 +3178,9 @@ where
         .await
 }
 
-fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
+pub(crate) fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
     let mut message = Message::user(format!(
-        "Runtime notification: background command monitoring for {} {}. Completion is not confirmed by this notice. Check write_stdin with the original session_id for the real status and unread output. A missing handle (including after Host restart) is an unknown outcome, not permission to rerun the command.",
+        "Runtime notification: background command monitoring for {} {}. Completion is not confirmed by this notice. Reassess the approach or continue independent work. Use write_stdin with the original session_id when you need the current status or unread output. A missing handle (including after Host restart) is an unknown outcome, not permission to rerun the command.",
         ids.join(", "),
         if timed_out { "reached its wait ceiling" } else { "ended or lost its live handle" },
     ));
@@ -3184,6 +3188,12 @@ fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
         RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
         RUNTIME_RESUME_MESSAGE_KIND_KEY: BASH_COMPLETION_RESUME_KIND,
     }));
+    message
+}
+
+pub(crate) fn exec_completion_message(info: &BashCompletionInfo) -> Message {
+    let mut message = bash_resume_message_from_info(info);
+    message.content = exec_completion_injection_body(info);
     message
 }
 
@@ -3228,9 +3238,11 @@ fn shell_completion_envelope(
     info: &BashCompletionInfo,
     kind: ShellCompletionKind,
 ) -> bamboo_domain::SessionMessageEnvelope {
-    let mut provider_message = bash_resume_message_from_info(info);
+    let provider_message = match kind {
+        ShellCompletionKind::Exec => exec_completion_message(info),
+        ShellCompletionKind::Bash => bash_resume_message_from_info(info),
+    };
     let (identity_kind, instruction, content, data) = if kind == ShellCompletionKind::Exec {
-        provider_message.content = exec_completion_injection_body(info);
         (
             "background_exec",
             "background_exec_completed",

@@ -14,7 +14,7 @@ use reqwest::{Client, RequestBuilder, Response};
 use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::{
-    provider::{scope_completion_diagnostics, CompletionDiagnostics},
+    provider::{scope_completion_diagnostics, CompletionDiagnostics, LLMError},
     retry::WorkPhysicalRequest,
     work_usage::{ObservedWorkUsage, WorkUsage, POST_DONE_USAGE_TIMEOUT},
     LLMChunk, LLMProvider, LLMRequestOptions,
@@ -44,7 +44,7 @@ pub(crate) fn active() -> bool {
 }
 
 pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Response> {
-    match WORK_TEXT.try_with(Clone::clone) {
+    let response = match WORK_TEXT.try_with(Clone::clone) {
         Ok(dispatch) => {
             let request = request.build()?;
             if let Err(error) = (dispatch.admit)().await {
@@ -54,10 +54,34 @@ pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Res
             dispatch
                 .physical_send_started
                 .store(true, Ordering::Release);
-            Ok(dispatch.client.execute(request).await?)
+            dispatch.client.execute(request).await?
         }
-        Err(_) => Ok(request.send().await?),
-    }
+        Err(_) if crate::retry::output_limit_recovery_active() => {
+            let (client, request) = request.build_split();
+            let mut request = request?;
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .ok_or_else(|| {
+                    LLMError::RequestFailed(
+                        "output-limit recovery requires a buffered request body".into(),
+                    )
+                })?
+                .to_vec();
+            // Prevent a custom client from replaying the inference POST on a
+            // transport retry or a redirect that preserves the request body.
+            request
+                .headers_mut()
+                .insert(reqwest::header::CONTENT_LENGTH, body.len().into());
+            *request.body_mut() = Some(reqwest::Body::wrap_stream(futures::stream::once(async {
+                Ok::<_, std::io::Error>(body)
+            })));
+            client.execute(request).await?
+        }
+        Err(_) => request.send().await?,
+    };
+    crate::http_client::observe_provider_response(&response);
+    Ok(response)
 }
 
 /// A separate HTTP pool for reserved text calls. The configured provider

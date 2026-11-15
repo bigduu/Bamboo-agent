@@ -15,7 +15,7 @@ const BROWSER_FILE_INPUT_WIRE_LIMIT: usize = 1_405_000;
 pub fn tool_input_limit(execution_name: &str) -> usize {
     match execution_name {
         "Write" | "Edit" | "NotebookEdit" => WRITE_LIMIT,
-        "Bash" | "exec_command" | "Read" | "Grep" | "Glob" => QUERY_LIMIT,
+        "Bash" | "bash" | "exec_command" | "Read" | "Grep" | "Glob" => QUERY_LIMIT,
         _ => DEFAULT_LIMIT,
     }
 }
@@ -63,7 +63,7 @@ fn check_size(execution_name: &str, size: usize, limit: usize) -> Result<(), Too
     }
     let advice = match execution_name {
         "Write" | "Edit" | "NotebookEdit" => "Split the content into smaller writes or patches.",
-        "Bash" | "exec_command" | "js_repl" => {
+        "Bash" | "bash" | "exec_command" | "js_repl" => {
             "Move large inline content into a file and shorten the command."
         }
         _ => "Split the request or pass a file reference instead of inline content.",

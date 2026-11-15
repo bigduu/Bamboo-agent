@@ -29,7 +29,7 @@ pub(super) fn build_plan_mode_instructions(plan_mode: &PlanModeState) -> String 
 
 The user has indicated they want you to PLAN before implementing. You MUST NOT:
 - Make any file edits (Write, Edit, NotebookEdit)
-- Execute or continue any shell commands (exec_command, write_stdin, legacy Bash tools)
+- Execute or continue any shell commands
 - Make HTTP requests that modify state
 - Spawn child sessions for implementation (only read-only exploration)
 
@@ -101,8 +101,7 @@ mod tests {
         assert!(instructions.contains("PLAN MODE ACTIVE"));
         assert!(instructions.contains("MUST NOT"));
         assert!(instructions.contains("Write, Edit, NotebookEdit"));
-        assert!(instructions.contains("Bash"));
-        assert!(instructions.contains("exec_command, write_stdin"));
+        assert!(instructions.contains("Execute or continue any shell commands"));
         assert!(instructions.contains("EXPLORE"));
     }
 

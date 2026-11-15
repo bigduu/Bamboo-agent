@@ -662,7 +662,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     }
 
     // Bamboo internal routes (commands/settings/skills/tools/workspace/
-    // copilot/provider-catalog/provider-instances/cluster-fabric) — nested
+    // provider-catalog/provider-instances/cluster-fabric) — nested
     // into this SAME `/api/v1` scope (not a second competing
     // `Scope("/api/v1")`) so they become reachable at the canonical prefix
     // while a separate `/v1` scope (`routes::bamboo_v1::bamboo_v1_routes`)

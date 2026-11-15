@@ -102,7 +102,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     probe.requests.lock().unwrap().push(body.clone());
     let (delta, finish) = if body["model"] == "wait-child" {
         if !has_tool_result(&body, "verifier-command") {
-            // Hold an actual foreground command, not only a provider response.
+            // Hold an actual shell command while the parent is quiescent.
             // The test releases its file after proving the parent is quiescent.
             let index = usize::from(has(&body, "second non-overlapping acceptance"));
             let command = format!("touch verifier-started-{index}; while [ ! -f verifier-release ]; do sleep 0.05; done; printf 'verified\\n'");

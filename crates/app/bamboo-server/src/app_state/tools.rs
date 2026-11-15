@@ -255,10 +255,11 @@ impl HostNativeToolCeiling {
         };
         let mut names = vec![name.clone()];
         if name == "Bash" {
-            names.extend(["exec_command".into(), "write_stdin".into()]);
-        } else if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
-            names.push(replacement.into());
+            names.push("write_stdin".into());
+        } else if name == "bash" && self.native_owner("bash") {
+            names.extend(["Bash".into(), "exec_command".into(), "write_stdin".into()]);
         }
+        names.extend(bamboo_domain::legacy_shell_replacements(&name).map(str::to_owned));
         names
     }
 }
@@ -560,6 +561,7 @@ mod native_ceiling_tests {
                 "Glob",
                 "Read",
                 "Write",
+                "bash",
                 "exec_command",
                 "write_stdin"
             ]
@@ -705,7 +707,7 @@ mod native_ceiling_tests {
             .unwrap();
         let mut foreign = source.projects.create("foreign fixture", None).unwrap();
         session.set_project_id_meta(project.id.as_str());
-        assert_eq!(source.observe(&session).await.unwrap().len(), 7);
+        assert_eq!(source.observe(&session).await.unwrap().len(), 8);
         session
             .metadata
             .insert("project_id".into(), "another-project".into());

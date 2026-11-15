@@ -145,6 +145,7 @@ impl LLMProvider for PullFromContextProvider {
         )
         .unwrap();
         assert_eq!(ids.len(), 1);
+        assert!(!snapshot.content.contains("Continue polling while"));
         assert!(!snapshot.content.contains("PRIVATE_SHELL_OUTPUT"));
         assert!(!snapshot.content.contains("PRIVATE_POST_TOOL_FEEDBACK"));
         self.requests.lock().unwrap().push(messages.to_vec());

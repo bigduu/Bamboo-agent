@@ -11,9 +11,15 @@ pub(crate) struct LegacyShellProjection {
     pub restriction_only: bool,
 }
 
-/// A resolved combined continuation needs every operation policy checked before
-/// an Ask can be approved. Keep ordinary/legacy, pure-poll and post-tool control
-/// semantics unchanged, and derive the boundary from the existing projections.
+pub(crate) fn foreground_bash_hook(payload: &HookPayload) -> bool {
+    matches!(
+        payload,
+        HookPayload::ToolExecution { tool_name, .. } | HookPayload::ToolResult { tool_name, .. }
+            if tool_name == "bash"
+    )
+}
+
+/// Check all relevant shell policies before an Ask can suspend dispatch.
 pub fn requires_complete_shell_policy_checks(
     point: bamboo_domain::AgentHookPoint,
     payload: &HookPayload,
@@ -21,13 +27,14 @@ pub fn requires_complete_shell_policy_checks(
     original_input: Option<&Value>,
 ) -> bool {
     point == bamboo_domain::AgentHookPoint::BeforeToolExecution
-        && legacy_shell_projections(payload, session, original_input)
-            .iter()
-            .any(|projected| projected.restriction_only)
+        && (foreground_bash_hook(payload)
+            || legacy_shell_projections(payload, session, original_input)
+                .iter()
+                .any(|projected| projected.restriction_only))
 }
 
-/// A continuation always reads output, in addition to its optional input/kill
-/// operation. Keep that secondary policy surface from granting write authority.
+/// Foreground commands carry forward both prior start-command policies.
+/// A continuation also checks any separate restriction on reading output.
 pub(crate) fn legacy_shell_projections(
     payload: &HookPayload,
     session: &Session,
@@ -36,6 +43,23 @@ pub(crate) fn legacy_shell_projections(
     let Some(primary) = legacy_shell_projection(payload, session, original_input) else {
         return Vec::new();
     };
+    if foreground_bash_hook(payload) {
+        let mut args = primary
+            .input
+            .as_object()
+            .expect("shell projection is an object")
+            .clone();
+        if let Some(command) = args.remove("command") {
+            args.insert("cmd".into(), command);
+        }
+        args.remove("timeout");
+        // An Ask in one compatibility policy must not hide a separate
+        // restriction that matched the previous model entry point.
+        return vec![
+            project_shell_hook(payload, "exec_command", Value::Object(args), false),
+            primary,
+        ];
+    }
     let secondary_payload = match &primary.payload {
         HookPayload::ToolExecution {
             tool_name,
@@ -88,15 +112,11 @@ pub(crate) fn legacy_shell_projection(
     };
     // The engine supplies resolved builtin identities. Never guess a builtin
     // from an unresolved namespace: exact custom names may share this suffix.
-    if !matches!(tool_name.as_str(), "exec_command" | "write_stdin") {
+    if !matches!(tool_name.as_str(), "bash" | "exec_command" | "write_stdin") {
         return None;
     }
-    let (tool_call_id, input) = match payload {
-        HookPayload::ToolExecution {
-            tool_call_id,
-            parsed_args,
-            ..
-        } => (tool_call_id, Some(parsed_args.clone())),
+    let input = match payload {
+        HookPayload::ToolExecution { parsed_args, .. } => Some(parsed_args.clone()),
         HookPayload::ToolResult { tool_call_id, .. } => {
             let input = original_input.cloned().or_else(|| {
                 session
@@ -108,19 +128,27 @@ pub(crate) fn legacy_shell_projection(
                     .find(|call| call.id == *tool_call_id)
                     .and_then(|call| serde_json::from_str(&call.function.arguments).ok())
             });
-            (tool_call_id, input)
+            input
         }
         _ => return None,
     };
     let mut input = match input {
         Some(input) => input,
-        None if tool_name == "exec_command" => serde_json::json!({}),
+        None if matches!(tool_name.as_str(), "bash" | "exec_command") => serde_json::json!({}),
         None => return None,
     };
     let args = input.as_object_mut()?;
     args.remove("yield_time_ms");
     args.remove("max_output_tokens");
     let legacy_name = match tool_name.as_str() {
+        "bash" => {
+            if let Some(seconds) = args.remove("timeout").and_then(|value| value.as_f64()) {
+                if let Some(milliseconds) = serde_json::Number::from_f64(seconds * 1000.0) {
+                    args.insert("timeout".into(), milliseconds.into());
+                }
+            }
+            "Bash"
+        }
         "exec_command" => {
             if let Some(command) = args.remove("cmd") {
                 args.insert("command".into(), command);
@@ -153,30 +181,68 @@ pub(crate) fn legacy_shell_projection(
         }
         _ => return None,
     };
+    Some(project_shell_hook(payload, legacy_name, input, false))
+}
+
+fn project_shell_hook(
+    payload: &HookPayload,
+    legacy_name: &str,
+    input: Value,
+    restriction_only: bool,
+) -> LegacyShellProjection {
     let payload = match payload {
-        HookPayload::ToolExecution { .. } => HookPayload::ToolExecution {
+        HookPayload::ToolExecution { tool_call_id, .. } => HookPayload::ToolExecution {
             tool_name: legacy_name.into(),
             tool_call_id: tool_call_id.clone(),
             parsed_args: input.clone(),
         },
-        HookPayload::ToolResult { outcome, .. } => HookPayload::ToolResult {
+        HookPayload::ToolResult {
+            tool_call_id,
+            outcome,
+            ..
+        } => HookPayload::ToolResult {
             tool_name: legacy_name.into(),
             tool_call_id: tool_call_id.clone(),
             outcome: outcome.clone(),
         },
         _ => unreachable!("only tool hook payloads are projected"),
     };
-    Some(LegacyShellProjection {
+    LegacyShellProjection {
         payload,
         input,
-        restriction_only: false,
-    })
+        restriction_only,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn foreground_projects_both_previous_command_policies() {
+        let session = Session::new("foreground-hook", "model");
+        let payload = HookPayload::ToolExecution {
+            tool_name: "bash".into(),
+            tool_call_id: "bash-call".into(),
+            parsed_args: json!({"command":"printf ok", "timeout":2.5}),
+        };
+        let aliases = legacy_shell_projections(&payload, &session, None);
+        assert_eq!(aliases.len(), 2);
+        assert!(
+            matches!(&aliases[0].payload, HookPayload::ToolExecution { tool_name, .. }
+            if tool_name == "exec_command")
+        );
+        assert_eq!(aliases[0].input, json!({"cmd":"printf ok"}));
+        assert!(
+            matches!(&aliases[1].payload, HookPayload::ToolExecution { tool_name, .. }
+            if tool_name == "Bash")
+        );
+        assert_eq!(
+            aliases[1].input,
+            json!({"command":"printf ok", "timeout":2500.0})
+        );
+    }
 
     #[test]
     fn stdin_compatibility_selects_legacy_operation_and_preserves_input_bytes() {

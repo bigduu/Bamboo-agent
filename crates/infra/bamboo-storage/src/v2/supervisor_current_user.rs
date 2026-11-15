@@ -53,8 +53,8 @@ impl SessionStoreV2 {
         .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
     }
 
-    /// Run an approval effect after re-reading both canonical Main sessions
-    /// under the original Supervisor, target and finite-scope fences.
+    /// Read both canonical Main sessions under the original Supervisor,
+    /// target and finite-scope fences. The callback must not reenter storage.
     pub async fn with_unscoped_supervisor_root_state<T, F>(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -66,6 +66,24 @@ impl SessionStoreV2 {
         T: Send + 'static,
         F: FnOnce(&Session, &Session) -> io::Result<T> + Send + 'static,
     {
+        let (authority, source, current) = self
+            .lock_supervisor_approval(caller, supervisor, target)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let result = effect(&source, &current);
+            drop(authority);
+            result
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Root approval job failed: {error}")))?
+    }
+
+    pub(crate) async fn lock_supervisor_approval(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+    ) -> io::Result<(CurrentUserTargetGuard, Session, Session)> {
         let authority = self
             .lock_unscoped_supervisor_root(caller, supervisor, target)
             .await?;
@@ -78,13 +96,7 @@ impl SessionStoreV2 {
         if !caller.matches_session(&source) || !target.matches(&current) {
             return Err(denied("Managed approval authority changed"));
         }
-        tokio::task::spawn_blocking(move || {
-            let result = effect(&source, &current);
-            drop(authority);
-            result
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("Root approval job failed: {error}")))?
+        Ok((authority, source, current))
     }
 
     pub(crate) async fn lock_unscoped_supervisor_root(

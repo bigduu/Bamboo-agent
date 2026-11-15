@@ -42,9 +42,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 toml = "1.1"
 dirs = "7"
 colored = "2"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }

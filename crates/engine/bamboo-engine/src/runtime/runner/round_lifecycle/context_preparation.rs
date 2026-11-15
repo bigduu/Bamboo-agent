@@ -19,7 +19,7 @@ use bamboo_compression::{
     build_retrieval_window_full_archive_plan_with_token_accounting,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
-    prepare_hybrid_context_with_fixed_tokens, CompressionPlan, CompressionPlanError,
+    prepare_hybrid_context_with_fixed_tokens, BudgetError, CompressionPlan, CompressionPlanError,
     PreparedContext, RetrievalWindowPlanError, RetrievalWindowPolicy,
     RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
@@ -2475,9 +2475,18 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 error = %error,
                 "Bounded context compression failed before commit"
             );
-            let status = format!("failed:{error}");
+            let (status, error) = match error {
+                BudgetError::EmptySummaryResponse { .. } => (
+                    "failed_empty_summary".to_string(),
+                    AgentError::EmptyContextSummary,
+                ),
+                error => {
+                    let detail = error.to_string();
+                    (format!("failed:{detail}"), AgentError::Budget(detail))
+                }
+            };
             emit_context_compression_status(event_tx, phase_label, &status).await;
-            return Err(AgentError::Budget(error.to_string()));
+            return Err(error);
         }
     };
 
@@ -3027,6 +3036,50 @@ pub(crate) async fn force_overflow_context_recovery(
         None,
     )
     .await
+}
+
+/// Preserve the current active transcript and let the final wire preflight
+/// enforce the window. A recovery request must not start an unreserved compaction.
+pub(super) async fn prepare_output_limit_recovery_context(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+) -> Result<PreparedRoundContext, AgentError> {
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        return prepare_round_context(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            None,
+        )
+        .await;
+    }
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    let counter = TiktokenTokenCounter::default();
+    let mut prepared_context = all_active_prepared_context(session, &budget, &counter);
+    transforms::apply_message_transforms_with_vision_budget(
+        config,
+        &mut prepared_context,
+        llm,
+        session_id,
+        model_name,
+        false,
+    )
+    .await?;
+    Ok(PreparedRoundContext {
+        prepared_context,
+        budget,
+    })
 }
 
 pub(super) async fn prepare_round_context(

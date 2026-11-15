@@ -157,6 +157,34 @@ pub struct ChildActorRuntimeSave<'a> {
 /// treats the result as unknown; it cannot use its candidate as committed data.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
+/// Original Supervisor and target observations for a delegated permission
+/// response. The final writer rechecks these and the approval contract while
+/// retaining its canonical authority locks.
+pub struct SupervisorApprovalCommit {
+    pub caller: crate::SessionCallerReference,
+    pub supervisor: SupervisorReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
+    /// Validate the retained source and target snapshots without reentering storage.
+    pub validate: SupervisorApprovalValidator,
+}
+
+pub type SupervisorApprovalValidator =
+    Box<dyn Fn(&Session, &Session) -> std::io::Result<()> + Send + Sync>;
+
+/// Main message metadata written only by the fenced delegated response commit.
+pub const SUPERVISOR_APPROVAL_RESPONSE_KEY: &str = "supervisor_approval_response.v1";
+
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SupervisorApprovalResponseOrigin {
+    pub caller: crate::SessionCallerReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
+    pub occurrence: crate::ResponseOccurrence,
+}
+
 /// The final sink receives a fresh owner check while the physical authority
 /// guards remain owned by the publication job. Check immediately before each
 /// final effect, including after any journal scan performed by the sink.
@@ -464,6 +492,53 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             crate::SessionAuthorityConflict("conditional Root bound startup is unsupported".into()),
+        ))
+    }
+
+    /// Commit a delegated permission answer while the original Supervisor's
+    /// authority and the reserved Root writer are both current.
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        approval: &SupervisorApprovalCommit,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, expected, inherited, approval, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded Supervisor approval response is unsupported",
+        ))
+    }
+
+    /// Reload a committed response under the successor's Root fence and confirm
+    /// Main and runtime are durable before a retry can dispatch its handoff.
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        approval: Option<&SupervisorApprovalCommit>,
+    ) -> std::io::Result<Session> {
+        let _ = (owner, approval);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Root response checkpoint recovery is unsupported",
+        ))
+    }
+
+    /// The exact pending Once handoff is consumed at Main before the first
+    /// tool or provider side effect. A stale or already claimed handoff fails.
+    async fn claim_once_response_handoff(
+        &self,
+        session: &Session,
+        owner: Option<&RootActorRuntimeWrite>,
+        approval: Option<&SupervisorApprovalCommit>,
+    ) -> std::io::Result<()> {
+        let _ = (session, owner, approval);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Once response handoff claim is unsupported",
         ))
     }
 

@@ -457,7 +457,6 @@ fn extra_key_paths(config: &Config) -> BTreeSet<String> {
     provider_extra!(openai);
     provider_extra!(anthropic);
     provider_extra!(gemini);
-    provider_extra!(copilot);
     provider_extra!(bodhi);
 
     for (id, instance) in &config.provider_instances {

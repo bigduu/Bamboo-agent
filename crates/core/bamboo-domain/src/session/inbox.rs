@@ -1582,6 +1582,8 @@ pub enum SessionInboxError {
     BacklogFull { current: usize, limit: usize },
     #[error("session inbox claim is invalid: {0}")]
     InvalidClaim(String),
+    #[error("session inbox lease expired before the claim could begin")]
+    ClaimLeaseExpired,
     #[error("session inbox storage failure: {0}")]
     Storage(String),
 }

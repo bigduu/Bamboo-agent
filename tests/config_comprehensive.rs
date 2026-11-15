@@ -253,7 +253,7 @@ mod comprehensive_config_tests {
         assert_eq!(config.provider, "openai");
         assert!(config.providers().openai.is_some());
         assert!(config.providers().anthropic.is_some());
-        assert!(config.providers().copilot.is_some());
+        assert!(!config.providers().extra.contains_key("copilot"));
         assert_eq!(config.server.port, 9999);
         assert_eq!(config.server.bind, "0.0.0.0");
         assert_eq!(config.server.workers, 16);
@@ -410,31 +410,4 @@ mod comprehensive_config_tests {
     }
 
     // === 7) Provider Configuration ===
-
-    #[test]
-    fn copilot_headless_auth_from_provider_config() {
-        let _lock = env_lock_acquire();
-        let temp = TempDir::new();
-
-        temp.write_config(
-            r#"{
-            "provider": "copilot",
-            "headless_auth": false,
-            "providers": {
-                "copilot": {
-                    "enabled": true,
-                    "headless_auth": true
-                }
-            }
-        }"#,
-        );
-
-        let _env = EnvVarGuard::set("BAMBOO_DATA_DIR", temp.path.to_str().unwrap());
-        let config = Config::new();
-
-        // Provider config should be available
-        assert!(config.providers().copilot.is_some());
-        let copilot = config.providers().copilot.as_ref().unwrap();
-        assert!(copilot.headless_auth);
-    }
 }

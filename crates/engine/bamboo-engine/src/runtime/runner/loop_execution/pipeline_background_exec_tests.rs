@@ -115,7 +115,7 @@ async fn background_exec_handoff_releases_the_conversation_and_keeps_the_command
     config.run_budget.max_rounds = None;
     let hook = Arc::new(BackgroundHook::default());
     config.bash_resume_hook = Some(hook.clone());
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let (tx, mut rx) = mpsc::channel(256);
     let complete = run_pipeline(
         &mut session,
@@ -219,6 +219,70 @@ async fn background_exec_handoff_releases_the_conversation_and_keeps_the_command
     let result: Value = serde_json::from_str(&result.result).unwrap();
     assert_eq!(result["exit_code"], 7);
     assert_eq!(result["output"], "background-finished");
+}
+
+#[tokio::test(start_paused = true)]
+async fn quiet_exec_wait_ceiling_preserves_the_handle_without_rearming_the_wait() {
+    use bamboo_tools::tools::{
+        bash_runtime::get_shell,
+        exec_command::{reserve_background_job, reserve_quiet_exec_job},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let quoted = gate.to_string_lossy().replace('\'', "'\\''");
+    let command = format!("while [ ! -f '{quoted}' ]; do sleep 0.01; done; exit 7");
+    let executor = yielding_executor();
+    let start = executor.registry().get("exec_command").unwrap();
+    let poll = executor.registry().get("write_stdin").unwrap();
+    let owner = "bounded-quiet-exec-wait";
+    let context = |id: &str| {
+        let mut ctx = ToolCtx::none(id);
+        ctx.session_id = Some(Arc::from(owner));
+        ctx
+    };
+    let ToolOutcome::Completed(started) = start
+        .invoke(
+            json!({"cmd": command, "yield_time_ms": 250}),
+            context("start"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected running result");
+    };
+    let result: Value = serde_json::from_str(&started.result).unwrap();
+    let handle = result["session_id"].as_str().unwrap();
+    let poll_args = json!({"session_id": handle, "yield_time_ms": 250});
+    for n in 0..4 {
+        poll.invoke(poll_args.clone(), context(&format!("quiet-{n}")))
+            .await
+            .unwrap();
+    }
+
+    let job = reserve_quiet_exec_job(owner, handle).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let message = wait_for_quiet_exec(job, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= QUIET_EXEC_WAIT_TIMEOUT);
+    assert!(message.content.contains("reached its wait ceiling"));
+    assert!(message.content.contains("Completion is not confirmed"));
+    assert!(message.content.contains(handle));
+    assert_eq!(get_shell(handle).unwrap().status(), "running");
+    poll.invoke(poll_args, context("poll-after-ceiling"))
+        .await
+        .unwrap();
+    assert!(reserve_quiet_exec_job(owner, handle).await.is_none());
+
+    let job = reserve_background_job(owner, handle).unwrap();
+    tokio::time::resume();
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), job.completion())
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, Some(7));
 }
 
 struct PollMonitoredExec {
@@ -374,7 +438,7 @@ async fn quiet_followup(completes_at_boundary: bool) {
     config.run_budget.max_rounds = None;
     let hook = Arc::new(BackgroundHook::default());
     config.bash_resume_hook = Some(hook.clone());
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let (tx, _rx) = mpsc::channel(256);
     run_pipeline(
         &mut session,

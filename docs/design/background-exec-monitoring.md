@@ -1,4 +1,7 @@
-# Quiet exec commands and background monitoring
+# Background monitoring for the yielding shell API
+
+The standard model catalog uses `exec_command` and `write_stdin` for the
+yielding shell protocol. Explicit SDK catalogs can select foreground `bash`.
 
 An ordinary `exec_command` remains pull based: it yields an owner-scoped handle,
 and `write_stdin` retrieves incremental output and the real terminal result.
@@ -13,12 +16,15 @@ no pending question, second job store, process, permission grant, or command ret
 If durable persistence or a capable completion hook is unavailable, the current
 finite diagnostic policy still applies.
 
-A Root with `no_human_approver` can wait in its active runner. When its only
-tool call is an empty `write_stdin` for a command with closed stdin, an explicit
-longer wait can continue past the first empty read. Repeated quiet reads can
-also use the remaining tool deadline to await the terminal capture. The
-same tool response carries the exit status and output when ready, or the running
-status when the deadline expires. Run cancellation also interrupts this wait.
+A Root with `no_human_approver` can wait in its active runner. An explicit longer
+empty `write_stdin` wait for a command with closed stdin can continue within
+the tool deadline. Short polls keep their requested wait. After three empty
+results and the advisory, a sole follow-up empty poll of the same handle can
+hand off waiting to the runner. The tool result is paired first. The active run
+waits up to 180 seconds for the terminal capture and sends its bounded result
+before the next model request. On expiry, it reports the unconfirmed outcome
+and keeps the live command and handle available. An unchanged quiet period
+starts at most one automatic wait. Run cancellation interrupts the wait.
 
 A Human follow-up that repeatedly polls the same quiet handle yields back to
 the existing wait. It keeps the original monitor and waits for the actual

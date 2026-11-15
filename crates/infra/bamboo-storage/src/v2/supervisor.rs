@@ -197,6 +197,51 @@ struct MainIdentity {
 }
 
 impl SessionStoreV2 {
+    /// Apply a Host profile edit to the current Supervisor under the physical
+    /// writer lock. The callback validates and edits the requested config
+    /// fields. It must not reenter storage. The observed lifetime and
+    /// conversation generation fence the edit to its original target.
+    pub async fn update_supervisor_execution_profile<T, E>(
+        &self,
+        observed: &Session,
+        edit: impl FnOnce(&mut Session) -> Result<T, E>,
+    ) -> io::Result<Result<(Session, T), E>> {
+        let started = Instant::now();
+        let id = &observed.id;
+        let incarnation = observed.supervisor_incarnation_id().ok_or_else(|| {
+            writer_conflict(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "profile update requires a canonical Supervisor observation",
+            ))
+        })?;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_lock = self.acquire_session_write_lock(id, SaveKind::Full).await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, task, session_lock);
+        let mut current = self
+            .load_execution_admission_unchecked(id)
+            .await?
+            .filter(|session| {
+                session.created_at == observed.created_at
+                    && session.supervisor_incarnation_id() == Some(incarnation)
+            })
+            .ok_or_else(|| {
+                writer_conflict(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Supervisor lifetime changed before profile update",
+                ))
+            })?;
+        reject_conversation_generation_change(observed, &current)?;
+        reject_session_version_change(observed, &current)?;
+        let result = match edit(&mut current) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        self.save_session_after_lock(&current, started, &guards, None)
+            .await?;
+        Ok(Ok((current, result)))
+    }
+
     /// Caller holds lifecycle/task/session read guards. Admission needs the
     /// strict canonical Root proof and full history; never repair its index.
     pub(crate) async fn load_execution_admission_unchecked(
@@ -340,6 +385,14 @@ impl SessionStoreV2 {
                 .is_some_and(|cutoff| side.created_at <= cutoff)
         {
             return Ok(None);
+        }
+        if crate::session_merge::has_uncommitted_response_marker(&side) {
+            let raw = String::from_utf8(read_regular(&directory.join("session.json")).await?)
+                .map_err(|_| invalid("invalid canonical session.json"))?;
+            compact_main::validate_full_main(raw.as_bytes())?;
+            let main = super::decode_main_control_plane(&raw, Some(&side))?;
+            validate_overlay(&main, Some(&side))?;
+            crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
         }
         side.root_session_id = id.to_string();
         side.messages.clear();

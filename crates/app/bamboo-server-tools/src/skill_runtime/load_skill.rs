@@ -10,8 +10,9 @@ use tokio::sync::RwLock;
 use bamboo_llm::Config;
 use bamboo_skills::access_control;
 use bamboo_skills::runtime_metadata::{
-    LAST_LOADED_SKILL_ID_METADATA_KEY, LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
-    LOADED_SKILL_IDS_METADATA_KEY,
+    validate_pinned_activation_metadata, LAST_LOADED_SKILL_ID_METADATA_KEY,
+    LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LOADED_SKILL_IDS_METADATA_KEY,
+    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_skills::SkillManager;
 
@@ -20,10 +21,7 @@ use bamboo_agent_core::tools::{
     ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult,
 };
 
-use super::{
-    skill_access_error_to_tool_error, validate_runtime_activation,
-    validate_runtime_activation_descriptor, SkillToolAccess,
-};
+use super::{skill_access_error_to_tool_error, validate_runtime_activation, SkillToolAccess};
 
 pub(super) fn plan_allows_dynamic_provider(plan_read_only: bool, tool_name: &str) -> bool {
     !plan_read_only || bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name)
@@ -974,13 +972,6 @@ impl Tool for LoadSkillTool {
             .map_err(|err| {
                 ToolError::Execution(format!("Failed to load skill '{skill_id}': {err}"))
             })?;
-        validate_runtime_activation_descriptor(
-            &self.access,
-            &payload_descriptor,
-            session_id,
-            skill_id,
-        )
-        .await?;
         let catalog_entry = store
             .pinned_activation_catalog_entries(session_id)
             .await
@@ -999,6 +990,36 @@ impl Tool for LoadSkillTool {
             .session_for_context(Some(session_id))
             .await
             .ok_or_else(|| ToolError::Execution(format!("Session '{session_id}' not found")))?;
+        let validated_current_pin = validate_pinned_activation_metadata(
+            &session.metadata,
+            Some(&payload_descriptor),
+            Some(skill_id),
+        )
+        .map_err(ToolError::Execution)?;
+        if reused_published_activation && !validated_current_pin {
+            return Err(ToolError::Execution(
+                "Pinned workflow activation changed before loading".into(),
+            ));
+        }
+        let automatic_selection = validated_current_pin
+            && session
+                .metadata
+                .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                .is_some_and(|source| source == "auto");
+        if automatic_selection
+            && session
+                .metadata
+                .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+                .is_some_and(|active| {
+                    active.status == bamboo_skills::WorkflowActivationStatus::Active
+                        && active.id != skill_id
+                })
+        {
+            return Err(ToolError::InvalidArguments(
+                "An automatic Skill is already active for this execution".into(),
+            ));
+        }
         // Direct SDK/tool integrations may pin through the guarded fallback
         // above without running the agent's setup publisher. Materialize the
         // same immutable catalog/snapshot metadata from that pin; never rebuild
@@ -1021,17 +1042,22 @@ impl Tool for LoadSkillTool {
                 })?,
             );
         }
-        if !reused_published_activation
+        if automatic_selection
+            || !reused_published_activation
             || !session
                 .metadata
                 .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
         {
-            let snapshot = store
-                .export_activation_snapshot(session_id)
-                .await
-                .ok_or_else(|| {
-                    ToolError::Execution("pinned workflow snapshot is unavailable".to_string())
-                })?;
+            let snapshot = if automatic_selection {
+                store
+                    .export_selected_skill_snapshot(session_id, skill_id)
+                    .await
+            } else {
+                store.export_activation_snapshot(session_id).await
+            }
+            .ok_or_else(|| {
+                ToolError::Execution("pinned workflow snapshot is unavailable".to_string())
+            })?;
             session.metadata.insert(
                 bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(),
                 serde_json::to_string(&snapshot).map_err(|_| {
@@ -1058,6 +1084,11 @@ impl Tool for LoadSkillTool {
             bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY.to_string(),
             serde_json::to_string(&dynamic_context).unwrap_or_else(|_| "[]".to_string()),
         );
+        if automatic_selection {
+            session
+                .metadata
+                .remove(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
+        }
         let activation_stopped = dynamic_context.iter().any(|block| {
             block.status == bamboo_skills::WorkflowActivationStatus::Degraded
                 && block.stop_on_failure

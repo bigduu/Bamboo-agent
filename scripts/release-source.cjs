@@ -171,17 +171,22 @@ function authorizeFrozen(env, read, log, event, workflow) {
 }
 // Fixed recovery request, derived here rather than forging publisher environment
 // or accepting caller-selected source/CI/workflow identities.
-function recoveryEvent(env) {
+const RECOVERY_2371 = Object.freeze({
+  source: '4786b7db862cabbebce49e288da62b284ccf5b72', featurePr: 2369, featureRunId: 40588035791,
+  workflow: 'recover-frozen-crate-release.yml',
+})
+function recoveryEvent(env, admission) {
   const event = sourceEvent(env)
   assert.deepEqual(Object.keys(event.inputs).sort(), ['expected_controller_sha'])
   assert.equal(event.inputs.expected_controller_sha, env.EXPECTED_CONTROLLER_SHA)
-  return { inputs: { expected_source_sha: '4786b7db862cabbebce49e288da62b284ccf5b72', feature_pr: '2369', accepted_ci_run: '40588035791' } }
+  return { inputs: { expected_source_sha: admission.source, feature_pr: String(admission.featurePr),
+    accepted_ci_run: String(admission.featureRunId) } }
 }
-function authorizeFrozenRecovery(env = process.env, read = githubRead, log = featureLog) {
-  return authorizeFrozen(env, read, log, recoveryEvent(env), 'recover-frozen-crate-release.yml')
+function authorizeFrozenRecovery(env = process.env, read = githubRead, log = featureLog, admission = RECOVERY_2371) {
+  return authorizeFrozen(env, read, log, recoveryEvent(env, admission), admission.workflow)
 }
-function frozenRecoveryGuard(validation, env = process.env, read = githubRead) {
-  return guard(validation, env, read, recoveryEvent(env), 'recover-frozen-crate-release.yml')
+function frozenRecoveryGuard(validation, env = process.env, read = githubRead, admission = RECOVERY_2371) {
+  return guard(validation, env, read, recoveryEvent(env, admission), admission.workflow)
 }
 // The immutable product source must contain the completed cutover too: promoting
 // an older tested Dev cut would restore Main builds or the old tag Docker build.

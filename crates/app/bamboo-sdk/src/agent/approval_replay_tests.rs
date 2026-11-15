@@ -1271,7 +1271,8 @@ async fn invalid_typed_replay_is_rejected_before_executor_or_provider() {
             "missing-config" => {}
             _ => unreachable!(),
         }
-        fixture.repo.save(&mut session).await.unwrap();
+        // Feed the corrupted caller snapshot directly to SDK resume. The
+        // canonical writer now protects an accepted receipt from replacement.
         let before = replay_state(&session);
         let config = (case != "missing-config").then(|| Arc::new(PermissionConfig::new()));
         let agent = fixture.agent(config, true, false, None);

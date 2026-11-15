@@ -922,13 +922,13 @@ async fn schedule_run_uses_config_get_fast_then_default_fallback() {
         .await
         .unwrap();
 
-    // Copilot has no dedicated fast model configured here, so schedules should
-    // fall back from fast to the default chat model.
     let mut cfg = clean_config(dir.path());
-    cfg.provider = "copilot".to_string();
-    let expected_model = cfg
-        .get_fast_model()
-        .expect("copilot should have a schedule model fallback");
+    cfg.provider = "openai".to_string();
+    cfg.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        model: Some("schedule-chat".into()),
+        ..Default::default()
+    });
+    let expected_model = "schedule-chat";
 
     let (_agent, manager) = build_manager(
         dir.path(),

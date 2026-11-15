@@ -248,14 +248,15 @@ test('preparation output freezes one signed reservation and accepts later attemp
   }
 })
 
-test('crate fan-out resumes the same version using fresh signed progress and sealed frontend bytes', async () => {
+for (const contractVersion of [2, 3]) test('crate fan-out v' + contractVersion + ' resumes the same version using fresh signed progress and sealed frontend bytes', async () => {
   const initial = makeReceipt()
-  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, 2)
+  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, contractVersion)
   const progress = makeReceipt({ completed: true, packageChecksums: Object.fromEntries(crates.map(name => [name, checksum])) })
   const entry = release(progress, { draft: false })
   const { context, calls } = fixture({ releases: async () => [entry], registry: async () => ({ checksum }),
     ensureFrontend: async (_release, _receipt, options) => { assert.deepEqual(options, { sealed: true }); calls.push('sealed-frontend') } })
-  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2 }, 2)
+  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2 }, contractVersion)
+  await assert.rejects(resumePrepared(context, prepared, preparationIdentity, contractVersion === 2 ? 3 : 2))
   assert.equal(resumed.release.id, entry.id)
   assert.deepEqual(resumed.receipt, progress)
   assert.deepEqual(calls, ['tag', 'sealed-frontend'])
@@ -1863,30 +1864,102 @@ function reservation2371(receipt) {
         .map(([name, checksum], index) => ({ id: 200 + index, name, state: 'uploaded', size: 1, digest: 'sha256:' + checksum })),
     ] }
 }
-function evidence2371() {
-  const { TARGET: target, JOBS, ARTIFACTS } = recovery2371
+function frozenRecoveryEvidence(target, attempts, originalArtifacts, expiresAt) {
   const routes = {
-    ['actions/runs/' + target.runId]: { id: target.runId, run_attempt: 1, workflow_id: target.workflowId,
+    ['actions/runs/' + target.runId]: { id: target.runId, run_attempt: attempts.length, workflow_id: target.workflowId,
       check_suite_id: target.suiteId, name: 'Publish Crate', path: '.github/workflows/publish-crate.yml',
       event: 'workflow_dispatch', head_branch: 'dev', head_sha: target.source, status: 'completed', conclusion: 'failure',
       html_url: 'https://github.com/' + target.repository + '/actions/runs/' + target.runId,
       repository: { full_name: target.repository }, head_repository: { full_name: target.repository } },
     ['check-suites/' + target.suiteId]: { app: { id: 15368 }, head_sha: target.source, status: 'completed', conclusion: 'failure' },
     'actions/workflows/publish-crate.yml': { id: target.workflowId },
-    ['actions/runs/' + target.runId + '/attempts/1/jobs?per_page=100']: { total_count: 6,
-      jobs: JOBS.map(([jobId, name, conclusion]) => ({ id: jobId, name, conclusion, status: 'completed',
-        run_id: target.runId, run_attempt: 1, head_sha: target.source, steps: jobId === target.jobId
-          ? Array.from({ length: 11 }, (_, index) => ({ number: index + 1, status: 'completed',
-            name: index === 10 ? 'Publish verified crates and complete the GitHub Release' : 'Original step ' + index,
-            conclusion: index === 10 ? 'failure' : 'success' })) : [] })) },
-    ['actions/runs/' + target.runId + '/artifacts?per_page=100']: { total_count: 4,
-      artifacts: ARTIFACTS.map(([artifactId, name, size, checksum]) => ({ id: artifactId, name, size_in_bytes: size,
-        digest: 'sha256:' + checksum, expired: false, expires_at: '2026-10-31T01:00:00Z',
+    ['actions/runs/' + target.runId + '/artifacts?per_page=100']: { total_count: originalArtifacts.length,
+      artifacts: originalArtifacts.map(([artifactId, name, size, checksum]) => ({ id: artifactId, name, size_in_bytes: size,
+        digest: 'sha256:' + checksum, expired: false, expires_at: expiresAt,
         workflow_run: { id: target.runId, repository_id: 1164779771, head_repository_id: 1164779771,
           head_branch: 'dev', head_sha: target.source } })) },
   }
+  for (const [index, {jobs, log}] of attempts.entries()) {
+    const attempt = index + 1
+    routes['actions/runs/' + target.runId + '/attempts/' + attempt + '/jobs?per_page=100'] = {
+      total_count: jobs.length,
+      jobs: jobs.map(([jobId, name, conclusion]) => ({ id: jobId, name, conclusion, status: 'completed',
+        run_id: target.runId, run_attempt: attempt, head_sha: target.source, steps: jobId === log.jobId
+          ? Array.from({ length: 11 }, (_, mockStep) => ({ number: mockStep + 1, status: 'completed',
+            name: mockStep === 10 ? 'Publish verified crates and complete the GitHub Release' : 'Original step ' + mockStep,
+            conclusion: mockStep === 10 ? 'failure' : 'success' })) : [] })),
+    }
+  }
   return { routes, read: route => { assert.ok(routes[route], route); return clone(routes[route]) } }
 }
+
+function evidence2371() {
+  const { TARGET, JOBS, ARTIFACTS } = recovery2371
+  return frozenRecoveryEvidence(TARGET, [{ jobs: JOBS, log: { jobId: TARGET.jobId } }], ARTIFACTS,
+    '2026-10-31T01:00:00Z')
+}
+
+test('frozen recovery retries transient registry GET responses with a bounded delay', async () => {
+  const { retryRegistryRead } = require('./frozen-crate-recovery-controller.cjs')
+  for (const [statuses, expectedStatus, expectedWaits] of [
+    [[503, 502, 504, 200], 200, [2000, 4000, 8000]],
+    [[404], 404, []],
+    [[403], 403, []],
+    [[503, 503, 503, 503, 503], 503, [2000, 4000, 8000, 16000]],
+  ]) {
+    let requests = 0, closed = 0
+    const waits = []
+    const observed = await retryRegistryRead(async () => {
+      assert.ok(requests < statuses.length)
+      return {status: statuses[requests++], body: { cancel: async () => { closed++ } }}
+    }, async delay => { waits.push(delay) })
+    assert.equal(observed.status, expectedStatus)
+    assert.equal(requests, statuses.length)
+    assert.equal(closed, expectedWaits.length)
+    assert.deepEqual(waits, expectedWaits)
+  }
+})
+
+const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')
+test('2762 binds the failed attempt and all five original native transports', () => {
+  const { TARGET, ATTEMPTS, ARTIFACTS } = recovery2762
+  const now = Date.parse('2026-11-15T12:00:00Z')
+  const originalRun = 'actions/runs/' + TARGET.runId
+  const latestJobs = originalRun + '/attempts/1/jobs?per_page=100'
+  const makeEvidence = () => frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-18T11:00:00Z')
+  assert.equal(recovery2762.originalEvidence(makeEvidence().read, now).run_attempt, 1)
+  for (const alter of [
+    routes => { routes[originalRun].run_attempt = 2 },
+    routes => { delete routes[latestJobs] },
+    routes => { routes[latestJobs].jobs[1].id++ },
+    routes => { routes[latestJobs].jobs[1].steps[10].conclusion = 'success' },
+    routes => { routes[originalRun + '/artifacts?per_page=100'].artifacts.pop() },
+  ]) {
+    const evidence = makeEvidence()
+    alter(evidence.routes)
+    assert.throws(() => recovery2762.originalEvidence(evidence.read, now))
+  }
+})
+
+test('2762 separates the recovery controller from the historical workflow and original publisher', () => {
+  const { TARGET, WORKFLOW, TAIL } = recovery2762
+  const sha = 'a'.repeat(40)
+  const env = { GITHUB_REPOSITORY: TARGET.repository, GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/dev',
+    GITHUB_REF_TYPE: 'branch', GITHUB_REF_PROTECTED: 'true', EXPECTED_CONTROLLER_SHA: sha, GITHUB_SHA: sha,
+    GITHUB_WORKFLOW_SHA: sha, GITHUB_WORKFLOW_REF: TARGET.repository + '/.github/workflows/' + WORKFLOW + '@refs/heads/dev',
+    GITHUB_RUN_ID: '79999999999', GITHUB_RUN_ATTEMPT: '1' }
+  assert.equal(recovery2762.request(env).controllerRevision, sha)
+  assert.throws(() => recovery2371.request(env))
+  assert.throws(() => recovery2762.request({ ...env, GITHUB_RUN_ID: String(TARGET.runId) }))
+  assert.throws(() => recovery2762.request({ ...env, GITHUB_REF_PROTECTED: 'false' }))
+  assert.equal(TAIL.length, 22)
+  assert.equal(TAIL[0], 'bamboo-llm')
+  const prefix = { crates: ['bamboo-a2a', 'bamboo-domain', 'bamboo-agent-core', 'bamboo-subagent', 'bamboo-broker',
+    'bamboo-config', 'bamboo-compression', 'bamboo-infrastructure', ...TAIL], packageChecksums: {} }
+  assert.throws(() => recovery2762.verifyRegistryMetadata(prefix, 'bamboo-infrastructure', TARGET.version, null), /prefix disappeared/)
+  assert.equal(recovery2762.verifyRegistryMetadata(prefix, TAIL[0], TARGET.version, null), null)
+  assert.throws(() => recovery2762.verifyRegistryMetadata(prefix, TAIL[0], TARGET.version, { yanked: false }), /no reserved package checksum/)
+})
 
 test('2371 binds final official original attempt, jobs and retained native artifacts', () => {
   const now = Date.parse('2026-10-28T03:00:00Z')
@@ -2000,17 +2073,24 @@ test('2371 restore with a release token has no GitHub write path and altered ori
       return JSON.stringify(x.read(route))
     },
   }
-  const module = { exports: {} }, realFs = require('node:fs')
-  require('node:vm').runInNewContext(fs.readFileSync('scripts/crate-release-frozen-recovery.cjs', 'utf8'), {
-    module, Buffer, JSON, console, process, require: name => name === './crate-release.cjs' ? proxy
-      : name === './release-source.cjs' ? require('./release-source.cjs') : name === 'node:fs'
-        ? { ...realFs, writeFileSync: (...args) => { writes.push(args); throw Error('Unexpected local write') } } : require(name),
+  const vm = require('node:vm'), realFs = require('node:fs')
+  const load = (file, resolve) => {
+    const module = { exports: {} }
+    vm.runInNewContext(fs.readFileSync(file, 'utf8'), { module, Buffer, JSON, console, process, require: resolve })
+    return module.exports
+  }
+  const controller = load('scripts/frozen-crate-recovery-controller.cjs', name => {
+    if (name === './crate-release.cjs') return proxy
+    if (name === 'node:fs') return { ...realFs, writeFileSync: (...args) => { writes.push(args); throw Error('Unexpected local write') } }
+    return require(name)
   })
+  const historical = load('scripts/crate-release-frozen-recovery.cjs',
+    name => name === './frozen-crate-recovery-controller.cjs' ? controller : require(name))
   const env = { ...x.env, GH_TOKEN: 'dummy-release-write-token', BAMBOO_RELEASE_SIGNING_KEY: signingKey,
     BAMBOO_RELEASE_SIGNING_KEY_SHA256: signingKeyDigest }
   // restore is intentionally reached through its CLI-independent function only
   // in this test; production still authenticates the real official log bytes.
-  assert.throws(() => module.exports.restore(env), /Original frontend artifact bytes changed/)
+  assert.throws(() => historical.restore(env), /Original frontend artifact bytes changed/)
   assert.equal(writes.length, 0)
   assert.ok(calls.some(args => args.some(arg => arg.endsWith('/releases/426156779'))))
   assert.equal(calls.some(args => args.includes('cargo')), false)
@@ -2162,33 +2242,35 @@ test('2371 frontend verification and upload classification never substitute byte
   assert.equal(child.status, 0); assert.equal(child.stdout.includes(secret), false)
 })
 
-test('2371 workflow controller guard admits only the exact protected Dev dispatch', () => {
-  const workflow = fs.readFileSync('.github/workflows/recover-frozen-crate-release.yml', 'utf8')
-  const marker = '      - name: Require the exact protected Dev controller before checkout\n'
-  assert.equal(workflow.split(marker).length, 2, 'Require one controller guard')
-  const block = workflow.split(marker)[1].split('\n      - name:')[0]
-  assert.equal(block.split('        run: |\n').length, 2, 'Require one guard script')
-  const script = block.split('        run: |\n')[1].replace(/^          /gm, '')
-  const sha = 'a'.repeat(40)
-  const env = { PATH: process.env.PATH, EXPECTED_CONTROLLER_SHA: sha,
-    GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
-    GITHUB_REF: 'refs/heads/dev', GITHUB_REF_TYPE: 'branch', GITHUB_REF_PROTECTED: 'true',
-    GITHUB_SHA: sha, GITHUB_WORKFLOW_SHA: sha,
-    GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/recover-frozen-crate-release.yml@refs/heads/dev' }
-  for (const [name, change, accepted] of [
-    ['exact Dev', {}, true],
-    ['foreign repository', { GITHUB_REPOSITORY: 'other/Bamboo-agent' }, false],
-    ['Main', { GITHUB_REF: 'refs/heads/main' }, false],
-    ['unprotected', { GITHUB_REF_PROTECTED: 'false' }, false],
-    ['automatic event', { GITHUB_EVENT_NAME: 'push' }, false],
-    ['moving controller', { GITHUB_SHA: 'b'.repeat(40) }, false],
-    ['workflow drift', { GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, false],
-    ['wrong workflow', { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev' }, false],
-    ['malformed SHA', { EXPECTED_CONTROLLER_SHA: '$(exit 0)' }, false],
-    ['uppercase', { EXPECTED_CONTROLLER_SHA: 'A'.repeat(40) }, false],
-    ['newline', { EXPECTED_CONTROLLER_SHA: sha + '\n' }, false],
-  ]) {
-    const result = spawnSync('bash', ['-c', script], { env: { ...env, ...change }, encoding: 'utf8' })
-    assert.equal(result.status === 0, accepted, name)
-  }
-})
+for (const filename of ['recover-frozen-crate-release.yml', recovery2762.WORKFLOW]) {
+  test(filename + ' admits only the exact protected Dev dispatch', () => {
+    const workflow = fs.readFileSync('.github/workflows/' + filename, 'utf8')
+    const marker = '      - name: Require the exact protected Dev controller before checkout\n'
+    assert.equal(workflow.split(marker).length, 2, 'Require one controller guard')
+    const block = workflow.split(marker)[1].split('\n      - name:')[0]
+    assert.equal(block.split('        run: |\n').length, 2, 'Require one guard script')
+    const script = block.split('        run: |\n')[1].replace(/^          /gm, '')
+    const sha = 'a'.repeat(40)
+    const env = { PATH: process.env.PATH, EXPECTED_CONTROLLER_SHA: sha,
+      GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+      GITHUB_REF: 'refs/heads/dev', GITHUB_REF_TYPE: 'branch', GITHUB_REF_PROTECTED: 'true',
+      GITHUB_SHA: sha, GITHUB_WORKFLOW_SHA: sha,
+      GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/' + filename + '@refs/heads/dev' }
+    for (const [name, change, accepted] of [
+      ['exact Dev', {}, true],
+      ['foreign repository', { GITHUB_REPOSITORY: 'other/Bamboo-agent' }, false],
+      ['Main', { GITHUB_REF: 'refs/heads/main' }, false],
+      ['unprotected', { GITHUB_REF_PROTECTED: 'false' }, false],
+      ['automatic event', { GITHUB_EVENT_NAME: 'push' }, false],
+      ['moving controller', { GITHUB_SHA: 'b'.repeat(40) }, false],
+      ['workflow drift', { GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, false],
+      ['wrong workflow', { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev' }, false],
+      ['malformed SHA', { EXPECTED_CONTROLLER_SHA: '$(exit 0)' }, false],
+      ['uppercase', { EXPECTED_CONTROLLER_SHA: 'A'.repeat(40) }, false],
+      ['newline', { EXPECTED_CONTROLLER_SHA: sha + '\n' }, false],
+    ]) {
+      const result = spawnSync('bash', ['-c', script], { env: { ...env, ...change }, encoding: 'utf8' })
+      assert.equal(result.status === 0, accepted, name)
+    }
+  })
+}

@@ -108,13 +108,17 @@ pub(crate) async fn prepare_context(
         }
     };
     session.metadata.remove(SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    let explicit_activation_loaded = skill_result.restored_active_context
-        || skill_context::selection_matches_loaded_activation(session, &skill_result);
-    let skill_context = if explicit_activation_loaded {
+    let active_skill_id = skill_result
+        .restored_active_skill_id
+        .as_deref()
+        .or_else(|| {
+            skill_context::selection_matches_loaded_activation(session, &skill_result)
+                .then(|| skill_result.selected_skill_ids[0].as_str())
+        });
+    let skill_context = if let Some(skill_id) = active_skill_id {
         format!(
             "\n\n## Explicit Workflow Already Activated\n\
 The `{skill_id}` workflow was loaded successfully earlier in this session. Continue following the existing `load_skill` result and its workflow instructions. Do not call `load_skill` again solely because execution resumed.\n",
-            skill_id = skill_result.selected_skill_ids[0],
         )
     } else if skill_result.selection_source.as_deref() == Some("explicit")
         && skill_result.selected_skill_ids.len() == 1
@@ -231,7 +235,7 @@ The user explicitly selected `{skill_id}`. Your first response step MUST be exac
                 .remove(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY);
         }
 
-        if !skill_result.restored_active_context {
+        if skill_result.restored_active_skill_id.is_none() {
             skill_context::reset_activation_state_for_new_selection(session, &skill_result);
         }
 
@@ -515,8 +519,8 @@ pub(crate) fn retain_terminal_activation_tools(
     // result, stop advertising load_skill so the model-issued attempt occurs
     // exactly once. A typed degraded result is terminal too: the main session
     // continues without workflow instructions instead of retrying forever.
-    // Automatic catalogs keep the tool available until the model chooses a
-    // candidate.
+    // Once the model has chosen an automatic candidate, it can read that
+    // Skill's resources through the separate resource tool.
     let loaded_skill_ids = session
         .metadata
         .get(LOADED_SKILL_IDS_METADATA_KEY)
@@ -527,10 +531,11 @@ pub(crate) fn retain_terminal_activation_tools(
         .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
         .unwrap_or_default();
-    let explicit_selection = session
+    let selection_source = session
         .metadata
         .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
-        .is_some_and(|source| source == "explicit");
+        .map(String::as_str);
+    let explicit_selection = selection_source == Some("explicit");
     let explicit_activation_is_current = explicit_selection
         && !loaded_skill_ids.is_empty()
         && loaded_skill_ids == selected_skill_ids;
@@ -538,7 +543,19 @@ pub(crate) fn retain_terminal_activation_tools(
         && session
             .metadata
             .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    if explicit_activation_is_current || explicit_activation_degraded {
+    let automatic_activation_is_current = selection_source == Some("auto")
+        && session
+            .metadata
+            .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+            .is_some_and(|active| {
+                active.status == bamboo_skills::WorkflowActivationStatus::Active
+                    && selected_skill_ids.contains(&active.id)
+            });
+    if explicit_activation_is_current
+        || explicit_activation_degraded
+        || automatic_activation_is_current
+    {
         tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
 }

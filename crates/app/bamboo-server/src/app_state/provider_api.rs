@@ -179,16 +179,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_flag_on_copilot_returns_provider() {
+    async fn endpoint_flag_on_rejects_retired_copilot() {
         let (_temp, state) = make_state().await;
         {
             let mut config = state.config.write().await;
             config.features.provider_model_ref = true;
         }
 
-        // Copilot is always available (no API key required)
         let result = state.get_provider_for_endpoint("copilot").await;
-        assert!(result.is_ok(), "Flag ON with copilot should succeed");
+        assert!(result.is_err());
     }
 
     // ---- get_provider_for_model_ref ----
@@ -202,22 +201,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_ref_copilot_returns_provider() {
+    async fn boot_retires_copilot_and_keeps_other_provider_and_model_preferences() {
         let temp = tempfile::tempdir().unwrap();
-        let mut config = bamboo_config::Config::default();
-        config.default_provider_instance = Some("copilot".into());
-        config.provider_instances.insert(
-            "copilot".into(),
-            serde_json::from_value(serde_json::json!({
-                "provider_type":"copilot", "model":"gpt-4o", "runtime_models":["gpt-4o"]
-            }))
-            .unwrap(),
-        );
-        config.save_to_dir(temp.path().to_path_buf()).unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let target = bamboo_domain::ProviderModelRef::new("copilot", "gpt-4o");
-        let result = state.get_provider_for_model_ref(&target);
-        assert!(result.is_ok(), "copilot provider should be routable");
+        let legacy = serde_json::json!({
+            "default_provider_instance": "copilot",
+            "provider_instances": {
+                "copilot": {
+                    "provider_type": "copilot", "model": "gpt-4o", "runtime_models": ["gpt-4o"]
+                },
+                "relay": {
+                    "provider_type": "openai", "model": "relay-chat", "api_key": "fixture-relay"
+                }
+            },
+            "defaults": {
+                "chat": target,
+                "fast": {"provider": "relay", "model": "relay-chat"}
+            }
+        });
+        std::fs::write(temp.path().join("config.json"), legacy.to_string()).unwrap();
+
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        assert!(state.get_provider_for_model_ref(&target).is_err());
+        let relay = bamboo_domain::ProviderModelRef::new("relay", "relay-chat");
+        assert!(state.get_provider_for_model_ref(&relay).is_ok());
+        let config = state.config.read().await;
+        assert!(!config.provider_instances.contains_key("copilot"));
+        assert_eq!(config.default_provider_instance, None);
+        let defaults = config.defaults.as_ref().unwrap();
+        assert_eq!(defaults.chat, target);
+        assert_eq!(defaults.fast.as_ref(), Some(&relay));
     }
 
     // ---- tools_for ----

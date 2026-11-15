@@ -49,6 +49,16 @@ pub async fn restore_session_state(
             "session_id": session_id
         })));
     };
+    if session
+        .metadata
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+    {
+        return Ok(HttpResponse::Conflict().json(serde_json::json!({
+            "error": crate::error::error_value(
+                "Retry the committed permission decision before restoring history"
+            ),
+        })));
+    }
 
     let Some(target_index) = find_target_message_index(&session.messages, &target_message_id)
     else {

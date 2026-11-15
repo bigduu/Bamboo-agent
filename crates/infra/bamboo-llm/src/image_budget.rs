@@ -1,7 +1,7 @@
 //! Bound cumulative tool-image URL bytes before native request cloning/serialization.
 use bamboo_domain::{Message, MessagePart, Role, ToolResultImage};
 
-pub(crate) const MAX_TOOL_IMAGE_URL_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_TOOL_IMAGE_URL_BYTES: usize = 32 * 1024 * 1024;
 
 /// Check a borrowed request's cumulative tool-image transport size before
 /// cloning, rewriting to an auxiliary request, or provider serialization.

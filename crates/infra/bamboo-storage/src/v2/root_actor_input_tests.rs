@@ -495,6 +495,39 @@ async fn root_owned_full_checkpoint_commits_typed_input_cursor_and_ack_before_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_claim_lease_expiring_behind_write_lock_leaves_input_available() {
+    let f = Fixture::new(LeaseDuration::seconds(30)).await;
+    let write_lock =
+        f.a.acquire_session_write_lock(ROOT, SaveKind::Full)
+            .await
+            .unwrap();
+    let request = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now: Utc::now(),
+        duration: LeaseDuration::milliseconds(250),
+    };
+    let deadline = request.expires_at().unwrap();
+    let inbox = f.bound.clone();
+    let mut claim =
+        tokio::spawn(async move { inbox.claim_owned(ROOT, 1, Some("run-a"), &request).await });
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut claim)
+        .await
+        .is_err());
+    expire(deadline).await;
+    drop(write_lock);
+    let result = tokio::time::timeout(WAIT, claim).await.unwrap().unwrap();
+    assert!(matches!(
+        result,
+        Err(bamboo_domain::SessionInboxError::ClaimLeaseExpired)
+    ));
+    f.assert_unadmitted().await;
+
+    let claim = f.claim(LeaseDuration::seconds(5)).await;
+    f.checkpoint(&claim).await.unwrap();
+    assert!(f.raw.was_admitted(ROOT, &f.input.id).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_owned_ack_cleans_up_committed_claim_after_only_inbox_lease_expires() {
     for root_expires in [false, true] {
         let f = Fixture::new(if root_expires {

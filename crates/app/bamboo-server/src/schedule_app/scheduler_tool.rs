@@ -805,8 +805,8 @@ mod tests {
             id: "interactive-forced-ask".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "Bash".to_string(),
-                arguments: serde_json::json!({"command": interactive_command}).to_string(),
+                name: "exec_command".to_string(),
+                arguments: serde_json::json!({"cmd": interactive_command}).to_string(),
             },
         };
         let (interactive_event_tx, mut interactive_event_rx) = tokio::sync::mpsc::channel(8);

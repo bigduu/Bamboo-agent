@@ -2,7 +2,7 @@
 use super::*;
 use bamboo_domain::{
     ActorActivationStatus, RootActorRuntimeWrite, RootInboxAdmission, SessionInboxConsumerId,
-    SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
+    SessionInboxError, SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
 };
 use std::io;
 
@@ -124,19 +124,31 @@ impl SessionRepository {
         consumer: &SessionInboxConsumerId,
         expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<InputAdmission> {
-        let request = lease_request(directory, owner, consumer).await?;
-        let claim = match self.root_inbox_receipt.as_ref() {
-            Some(receipt) => inbox
-                .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), &request)
-                .await
-                .map_err(io::Error::other)?,
+        let claim_once = async |request: &SessionInboxLeaseRequest| match self
+            .root_inbox_receipt
+            .as_ref()
+        {
+            Some(receipt) => {
+                inbox
+                    .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), request)
+                    .await
+            }
             None => inbox
-                .claim_owned(&session.id, 1, active_run_id, &request)
+                .claim_owned(&session.id, 1, active_run_id, request)
                 .await
-                .map_err(io::Error::other)?
-                .into_iter()
-                .next(),
+                .map(|claims| claims.into_iter().next()),
         };
+        let request = lease_request(directory, owner, consumer).await?;
+        let claim = match claim_once(&request).await {
+            // This error comes from before the queue was touched. Refresh the
+            // request once, including a fresh check of the Root's authority.
+            Err(SessionInboxError::ClaimLeaseExpired) => {
+                let request = lease_request(directory, owner, consumer).await?;
+                claim_once(&request).await
+            }
+            result => result,
+        }
+        .map_err(io::Error::other)?;
         let Some(claim) = claim else {
             return Ok(InputAdmission::Empty);
         };

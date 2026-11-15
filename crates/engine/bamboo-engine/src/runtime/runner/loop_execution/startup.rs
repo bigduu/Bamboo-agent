@@ -1034,16 +1034,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrapped_copilot_queue_keeps_same_provider_without_network() {
+    fn rewrapped_openai_queue_keeps_same_provider_without_network() {
         use bamboo_domain::{ProviderModelRef, ReasoningEffort};
         use bamboo_llm::{LLMProvider, ResolvedModel};
         use std::sync::Arc;
 
-        let provider: Arc<dyn LLMProvider> = Arc::new(
-            bamboo_llm::providers::copilot::CopilotProvider::with_token("synthetic-only"),
-        );
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(bamboo_llm::OpenAIProvider::new("synthetic-only"));
         let reference =
-            ProviderModelRef::new("copilot", "model-a").with_reasoning_effort(ReasoningEffort::Low);
+            ProviderModelRef::new("openai", "model-a").with_reasoning_effort(ReasoningEffort::Low);
         let first = ResolvedModel::from_ref(provider.clone(), &reference).provider;
         let second = ResolvedModel::from_ref(provider, &reference).provider;
         assert!(
@@ -1051,7 +1050,7 @@ mod tests {
             "each resolution constructs a new role wrapper"
         );
         let queued = super::QueuedEvaluation::new((), first, "model-a".into())
-            .expect("normal Copilot can be queued");
+            .expect("OpenAI can be queued");
         assert!(queued.current_provider(second, "model-a").is_some());
     }
 }

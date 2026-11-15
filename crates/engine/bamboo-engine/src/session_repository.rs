@@ -329,6 +329,22 @@ impl SessionRepository {
         &self,
         owner: bamboo_domain::RootActorRuntimeWrite,
     ) -> std::io::Result<Self> {
+        self.bind_root_response_writer_inner(owner, None)
+    }
+
+    pub fn bind_supervisor_approval_response_writer(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        approval: Arc<bamboo_domain::storage::SupervisorApprovalCommit>,
+    ) -> std::io::Result<Self> {
+        self.bind_root_response_writer_inner(owner, Some(approval))
+    }
+
+    fn bind_root_response_writer_inner(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
+    ) -> std::io::Result<Self> {
         let directory = self.root_actor_directory.clone().ok_or_else(|| {
             root_actor_binding_error("Root response requires its Host Actor directory")
         })?;
@@ -339,9 +355,12 @@ impl SessionRepository {
                 Arc::new(crate::SessionSnapshot::new(saved.clone())),
             );
         });
-        let bound_store = self
+        let mut bound_store = self
             .persistence
             .bind_root_actor_writer(owner.clone(), publisher)?;
+        if let Some(approval) = approval {
+            bound_store = bound_store.bind_supervisor_approval(approval);
+        }
         // Deferred repository callbacks can only update this execution-private
         // cache. The shared Host cache is published inside V2's physical guard.
         let mut bound = Self::new(

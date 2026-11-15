@@ -10,7 +10,6 @@ mod chat;
 mod commands;
 mod common;
 mod config_flow;
-mod copilot_auth;
 mod delete;
 mod events;
 mod execute;

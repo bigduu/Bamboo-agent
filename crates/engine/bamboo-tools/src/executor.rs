@@ -12,6 +12,7 @@ use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
+use crate::tools::foreground_bash::ForegroundBashTool;
 use crate::tools::{
     BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
     GetFileInfoTool, GlobTool, GrepTool, KillShellTool, LoopControlTool, ReadTool,
@@ -356,6 +357,9 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
             framework_tools.insert(name, tool);
         }
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ForegroundBashTool) {
+            framework_tools.insert(name, tool);
+        }
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
             framework_tools.insert(name, tool);
         }
@@ -416,13 +420,14 @@ impl BuiltinToolExecutor {
 
     // Kept in sync with the startup wire's NativeToolCeiling::NAMES. This crate
     // intentionally does not depend on the sub-agent transport crate.
-    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
+    const NATIVE_TOOL_NAMES: [&'static str; 9] = [
         "Bash",
         "Edit",
         "Glob",
         "Read",
         "Task",
         "Write",
+        "bash",
         "exec_command",
         "write_stdin",
     ];
@@ -573,8 +578,10 @@ impl BuiltinToolExecutor {
         // safely merely by dropping its future. Custom/plugin tools stay inline:
         // their private task-local capability scopes must not be lost.
         let owned_resources = crate::LocalTaskResources::current().filter(|_| {
-            matches!(execution_name, "Write" | "Edit" | "Bash" | "exec_command")
-                && self.is_framework_builtin_instance(execution_name, &tool)
+            matches!(
+                execution_name,
+                "Write" | "Edit" | "Bash" | "bash" | "exec_command"
+            ) && self.is_framework_builtin_instance(execution_name, &tool)
         });
         let outcome = if let Some(resources) = owned_resources {
             let tool_ctx = ctx.to_tool_ctx();
@@ -1374,16 +1381,17 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific command tool by name
     pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "Bash" || name == "exec_command" {
-            let (name, tool) = if name == "Bash" {
-                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?
-            } else {
-                BuiltinToolExecutor::register_tracked_builtin(
-                    &self.registry,
-                    ExecCommandTool::new(),
-                )?
-            };
-            self.framework_builtin_tools.insert(name, tool);
+        let framework_tool: Option<Arc<dyn Tool>> = match name {
+            "Bash" => Some(Arc::new(BashTool::new())),
+            "bash" => Some(Arc::new(ForegroundBashTool)),
+            "exec_command" => Some(Arc::new(ExecCommandTool::new())),
+            _ => None,
+        };
+        if let Some(tool) = framework_tool {
+            self.registry
+                .register_shared(tool.clone())
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            self.framework_builtin_tools.insert(name.to_owned(), tool);
             return Ok(self);
         }
         match name {

@@ -171,7 +171,7 @@ fn display_name_for_provider(id: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "gemini" => "Gemini".to_string(),
-        "copilot" => "GitHub Copilot".to_string(),
+        "bodhi" => "Bodhi".to_string(),
         other => other.to_string(),
     }
 }
@@ -270,11 +270,6 @@ mod tests {
     }
 
     #[test]
-    fn display_name_copilot() {
-        assert_eq!(display_name_for_provider("copilot"), "GitHub Copilot");
-    }
-
-    #[test]
     fn display_name_unknown_passthrough() {
         assert_eq!(display_name_for_provider("custom-llm"), "custom-llm");
     }
@@ -339,14 +334,14 @@ mod tests {
     async fn catalog_preserves_dynamic_model_token_limits() {
         let registry = make_registry(
             vec![(
-                "copilot",
+                "openai",
                 vec![ProviderModelInfo {
                     id: "dynamic-model".to_string(),
                     max_context_tokens: Some(264_000),
                     max_output_tokens: Some(64_000),
                 }],
             )],
-            "copilot",
+            "openai",
         );
         let service = ModelCatalogService::new(registry);
         let models = service.get_catalog().await.models;

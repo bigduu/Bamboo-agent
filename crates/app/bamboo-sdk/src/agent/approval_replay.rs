@@ -124,6 +124,14 @@ impl Agent {
     ) -> Result<ReplayDisposition, AgentError> {
         if session
             .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(invalid(
+                "retry the committed permission decision through its server endpoint",
+            ));
+        }
+        if session
+            .metadata
             .contains_key(REPLAY_SAVE_RECOVERY_REQUIRED_KEY)
         {
             return Err(invalid(

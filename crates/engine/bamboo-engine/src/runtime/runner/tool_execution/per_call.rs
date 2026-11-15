@@ -148,11 +148,16 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 pub(super) struct PortableToolExecution {
     name: String,
     input: serde_json::Value,
+    execution_contract: Option<String>,
 }
 
 impl PortableToolExecution {
     pub(super) fn execution_name(&self) -> &str {
         &self.name
+    }
+
+    pub(super) fn input(&self) -> &serde_json::Value {
+        &self.input
     }
 }
 
@@ -161,9 +166,14 @@ impl PortableToolExecution {
     /// Declare an already-selected executor identity for result-contract tests.
     /// Model catalog admission is covered separately by the promotion tests.
     pub(super) fn selected_identity_fixture(execution_name: &str) -> Self {
+        Self::with_input_fixture(execution_name, serde_json::json!({}))
+    }
+
+    pub(super) fn with_input_fixture(execution_name: &str, input: serde_json::Value) -> Self {
         Self {
             name: execution_name.to_owned(),
-            input: serde_json::json!({}),
+            input,
+            execution_contract: None,
         }
     }
 }
@@ -193,6 +203,7 @@ pub(super) fn portable_tool_for_admitted_call(
         PortableToolExecution {
             name,
             input: parse_tool_args_best_effort(&call.function.arguments).0,
+            execution_contract: None,
         }
     })
 }
@@ -246,13 +257,14 @@ pub(super) fn shell_accounting_outcome(
     outcome: &ToolExecutionOutcome,
     admitted_execution_name: Option<&str>,
 ) -> ShellAccountingOutcome {
+    let execution_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(|tool| tool.execution_name())
+        .or(admitted_execution_name);
     if !matches!(
-        outcome
-            .portable_tool
-            .as_ref()
-            .map(|tool| tool.execution_name())
-            .or(admitted_execution_name),
-        Some("exec_command" | "write_stdin")
+        execution_name,
+        Some("bash" | "exec_command" | "write_stdin")
     ) {
         return ShellAccountingOutcome::Ordinary;
     }
@@ -268,6 +280,9 @@ pub(super) fn shell_accounting_outcome(
     // the JSON body; use the same success/marker contract as clarification.
     if result.success && result.display_preference.as_deref() == Some("request_permissions") {
         return ShellAccountingOutcome::Pending;
+    }
+    if execution_name == Some("bash") {
+        return ShellAccountingOutcome::Terminal(result.success);
     }
     let envelope = serde_json::from_str::<serde_json::Value>(&result.result).ok();
     let status = envelope.as_ref().and_then(|value| value["status"].as_str());
@@ -764,32 +779,34 @@ async fn execute_tool_call_only_with_execution_name_inner(
         ctx.session_id,
         ctx.round_id,
     );
-    let observed_dispatch = observation
-        .scope(bamboo_tools::with_hook_permission_override(
-            permission_override,
-            &ctx.tool_call.id,
-            dispatch,
-        ))
-        .await
-        .map(ToolOutcome::enforce_suspension_restriction);
+    let dispatch = observation.scope(bamboo_tools::with_hook_permission_override(
+        permission_override,
+        &ctx.tool_call.id,
+        dispatch,
+    ));
+    let await_quiet_exec = ctx.await_quiet_exec && execution_name == "write_stdin";
+    let observed_dispatch = if await_quiet_exec {
+        bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await
+    } else {
+        dispatch.await
+    }
+    .map(ToolOutcome::enforce_suspension_restriction);
     // Await the same admitted command before completing the tool lifecycle.
     // The outer runner's cancellation still covers this tool future.
     let observed_dispatch = match observed_dispatch {
-        Ok(ToolOutcome::Completed(previous))
-            if ctx.await_quiet_exec && execution_name == "write_stdin" =>
-        {
+        Ok(ToolOutcome::Completed(previous)) if await_quiet_exec => {
             let elapsed = tool_timer.elapsed();
             let remaining = std::time::Duration::from_secs(ctx.config.per_tool_timeout_secs)
                 .saturating_sub(elapsed);
             let result = bamboo_tools::tools::write_stdin::continue_empty_poll(
                 ctx.session_id,
+                &ctx.tool_call.id,
                 &args,
-                &previous,
+                previous,
                 elapsed,
                 remaining,
             )
-            .await
-            .unwrap_or(ToolOutcome::Completed(previous));
+            .await;
             Ok(result)
         }
         outcome => outcome,
@@ -874,6 +891,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
+            execution_contract: execution.execution_contract().map(str::to_owned),
         }),
         tool_duration,
     })
@@ -1169,10 +1187,11 @@ where
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
     let control = ctx.config.loop_control.as_ref();
-    let apply = apply_tool_execution_outcome_inner(ctx, outcome);
+    let apply = apply_tool_execution_outcome_inner(ctx, outcome, raw_fingerprint);
     if let Some(control) = control {
         let (result, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(noninteractive, apply).await;
@@ -1198,6 +1217,7 @@ pub(super) async fn apply_tool_execution_outcome(
 async fn apply_tool_execution_outcome_inner(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
+    mut raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     // Normalize before post hooks, policy accounting or any question/wait write.
     // An already checkpointed loop receipt never has a waiting result shape.
@@ -1249,6 +1269,9 @@ async fn apply_tool_execution_outcome_inner(
         )
         .await?);
         loop_result_checkpointed = true;
+        // The dispatch acknowledgement only validated the command. The
+        // checkpoint's owner result is the first real outcome to compare.
+        raw_fingerprint = policy::dispatched_tool_fingerprint(ctx.tool_call, &outcome);
     }
     // Start can install its generation during owner apply above. Re-enter
     // the restriction now, before even its own native AfterTool hook runs.
@@ -1258,6 +1281,7 @@ async fn apply_tool_execution_outcome_inner(
         outcome,
         feedback_cap,
         loop_result_checkpointed,
+        raw_fingerprint,
     );
     if noninteractive {
         apply_without_suspension(apply).await
@@ -1271,6 +1295,7 @@ async fn apply_completed_tool_execution_outcome(
     mut outcome: ToolExecutionOutcome,
     feedback_cap: u32,
     loop_result_checkpointed: bool,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
@@ -1386,12 +1411,23 @@ async fn apply_completed_tool_execution_outcome(
         ctx.admitted_execution_name,
     );
 
+    let repeated_tool_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(PortableToolExecution::execution_name)
+        .unwrap_or(&ctx.tool_call.function.name);
     let running_violation = outcome.managed_running_violation;
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
     let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
+    if ctx.state.single_tool_call && outcome.post_tool_hook_eligible && is_success {
+        ctx.state.completed_single_tool_contract = outcome
+            .portable_tool
+            .as_ref()
+            .and_then(|tool| tool.execution_contract.clone());
+    }
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1549,6 +1585,8 @@ async fn apply_completed_tool_execution_outcome(
             crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
         ));
     }
+    ctx.policy_guard
+        .observe_repeated_call(repeated_tool_name, raw_fingerprint);
     Ok(result)
 }
 
@@ -1617,6 +1655,7 @@ mod task_progress_tests {
             portable_tool: Some(PortableToolExecution {
                 name: execution_name.into(),
                 input: serde_json::json!({}),
+                execution_contract: None,
             }),
             permission_replay_origin: None,
             result: Ok(result),
@@ -1658,6 +1697,7 @@ mod task_progress_tests {
                 state: &mut RoundExecutionState::default(),
             },
             outcome,
+            None,
         )
         .await
         .unwrap();
@@ -1737,6 +1777,7 @@ mod task_progress_tests {
 
     async fn real_shell_permission_ack_is_neutral(cap: u32) {
         for (requested, execution_name) in [
+            ("bash", "bash"),
             ("exec_command", "exec_command"),
             ("default::exec_command", "exec_command"),
             ("write_stdin", "write_stdin"),
@@ -1753,11 +1794,14 @@ mod task_progress_tests {
                 bamboo_tools::BuiltinToolExecutor::new_with_permissions(checker),
             );
             let schemas = tools.list_tools();
-            let args = if execution_name == "exec_command" {
-                serde_json::json!({"cmd":format!("printf forbidden > '{}'", sentinel.display())})
-            } else {
+            let command = format!("printf forbidden > '{}'", sentinel.display());
+            let args = match execution_name {
+                "bash" => serde_json::json!({"command":command}),
+                "exec_command" => serde_json::json!({"cmd":command}),
                 // The gate must pause before the actual tool rejects this unknown handle.
-                serde_json::json!({"session_id":"00000000-0000-0000-0000-000000000000", "chars":""})
+                _ => {
+                    serde_json::json!({"session_id":"00000000-0000-0000-0000-000000000000", "chars":""})
+                }
             };
             let call = ToolCall {
                 id: format!("real-pending-{cap}-{requested}"),
@@ -1907,6 +1951,7 @@ mod task_progress_tests {
                     state: &mut RoundExecutionState::default(),
                 },
                 outcome,
+                None,
             )
             .await
             .unwrap();
@@ -2445,6 +2490,7 @@ mod hook_tests {
                         portable_tool: Some(PortableToolExecution {
                             name: execution_name.into(),
                             input: serde_json::json!({}),
+                            execution_contract: None,
                         }),
                         permission_replay_origin: None,
                         result: Ok(ToolResult::text(true, payload.to_string())),
@@ -3659,6 +3705,7 @@ mod hook_tests {
                 state: &mut state,
             },
             outcome,
+            None,
         )
         .await
     }

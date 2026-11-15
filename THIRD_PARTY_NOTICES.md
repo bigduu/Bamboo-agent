@@ -1,5 +1,12 @@
 # Third-party source notices
 
+## Pi foreground bash
+
+[`foreground_bash.rs`](crates/engine/bamboo-tools/src/tools/foreground_bash.rs)
+adapts the model-facing shell tool and output handling from
+[Pi v1.2.0](https://github.com/earendil-works/pi/tree/v1.2.0/packages/coding-agent/src/core/tools).
+The source file includes the MIT license and the copyright notice for Mario Zechner.
+
 ## OpenAI Codex tool search
 
 `crates/engine/bamboo-tools/src/tool_search.rs` adapts metadata text construction

@@ -39,11 +39,11 @@ mod child_actor;
 use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
-use bamboo_domain::storage::Storage;
+use bamboo_domain::storage::{Storage, SupervisorApprovalCommit};
 use bamboo_domain::{
-    latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
-    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY,
-    CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    latest_response_occurrence, permission_request_generation, PermissionAuditSeed,
+    PermissionAuditSnapshot, ResponseOccurrence, RetrievalWindowCheckpointOutcome,
+    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -61,20 +61,24 @@ const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "project_resources_rendered",
     "runtime_prompt_snapshot",
 ];
+const PERMISSION_RESPONSE_RESUME_KEYS: &[&str] = &[
+    "clarification_resume_pending",
+    "conclusion_with_options_resume_pending",
+    "execute.startup_handoff_at",
+];
+pub(crate) const PERMISSION_REPLAY_KEYS: &[&str] = &[
+    "permission.reexecute_tool_call_id",
+    "permission.reexecute_request_generation",
+];
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
     CONSUMED_RESPONSE_OCCURRENCES_KEY,
     "runtime.suspend_reason",
-    "clarification_resume_pending",
-    "conclusion_with_options_resume_pending",
-    "execute.startup_handoff_at",
-    "permission.reexecute_tool_call_id",
-    "permission.reexecute_request_generation",
     "retry_resume_pending",
     "retry_resume_reason",
-    "provider_name",
-    "runtime.child_completion_source_v1",
 ];
+const RESPONSE_RELATED_METADATA_KEYS: &[&str] =
+    &["provider_name", "runtime.child_completion_source_v1"];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
 const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
@@ -83,6 +87,175 @@ const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_r
 const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
 const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_handoff";
+
+/// A full response save replaces runtime.json before session.json. A typed
+/// consumption in the sidecar cannot clear the question until Main replaces
+/// the tool result with the decision receipt from that same response.
+pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Session) {
+    let handoff_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+    match main.metadata.get(handoff_key) {
+        Some(marker) => {
+            side.metadata.insert(handoff_key.into(), marker.clone());
+            copy_permission_response_control(main, side);
+            return;
+        }
+        None => {
+            side.metadata.remove(handoff_key);
+        }
+    }
+    if !main_may_have_uncommitted_response_control(main, side)
+        || main.id != side.id
+        || main.created_at != side.created_at
+        || main.check_conversation_generation(side).is_err()
+    {
+        return;
+    }
+    // The sidecar intentionally has no messages. Match its consumed ledger
+    // against the current Main occurrence, not just the provider's call ID.
+    let Some(occurrence) = bamboo_domain::pending_permission_occurrence(main) else {
+        return;
+    };
+    let consumed = |session: &Session| {
+        session
+            .metadata
+            .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            .and_then(|encoded| serde_json::from_str::<Vec<ResponseOccurrence>>(encoded).ok())
+            .is_some_and(|entries| entries.contains(&occurrence))
+    };
+    if !consumed(side) || consumed(main) {
+        return;
+    }
+    copy_permission_response_control(main, side);
+}
+
+fn copy_permission_response_control(main: &Session, side: &mut Session) {
+    side.pending_question.clone_from(&main.pending_question);
+    for &key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+    {
+        match main.metadata.get(key) {
+            Some(value) => {
+                side.metadata.insert(key.into(), value.clone());
+            }
+            None => {
+                side.metadata.remove(key);
+            }
+        }
+    }
+}
+
+/// Pending and consumed response controls are immutable while Main owns an
+/// unclaimed handoff. Only the dedicated claim may advance this checkpoint.
+pub(crate) fn same_permission_response_control(current: &Session, proposed: &Session) -> bool {
+    current.pending_question == proposed.pending_question
+        && RESPONSE_CONTROL_METADATA_KEYS
+            .iter()
+            .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+            .chain(PERMISSION_REPLAY_KEYS)
+            .all(|key| current.metadata.get(*key) == proposed.metadata.get(*key))
+}
+
+pub(crate) fn reject_stale_permission_response(
+    current: &Session,
+    proposed: &Session,
+    runtime_only: bool,
+) -> std::io::Result<()> {
+    let Some(raw) = current.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY) else {
+        return Ok(());
+    };
+    let consumed: Vec<ResponseOccurrence> = serde_json::from_str(raw)?;
+    let history = if runtime_only { current } else { proposed };
+    let occurrence = proposed
+        .pending_question
+        .as_ref()
+        .and_then(|question| latest_response_occurrence(history, &question.tool_call_id));
+    let replay_call_key = PERMISSION_REPLAY_KEYS[0];
+    let replay_generation_key = PERMISSION_REPLAY_KEYS[1];
+    let replay_call = proposed.metadata.get(replay_call_key);
+    let replay_generation = proposed.metadata.get(replay_generation_key);
+    let replay_controls_changed = current.metadata.get(replay_call_key) != replay_call
+        || current.metadata.get(replay_generation_key) != replay_generation;
+    let stale = consumed
+        .iter()
+        .filter(|entry| entry.permission_generation.is_some())
+        .any(|entry| {
+            let reopens = match &occurrence {
+                Some(pending) => entry == pending,
+                // Runtime-only control projections have no transcript. Only
+                // canonical history can attest a new generation in that case.
+                None => proposed.pending_question.as_ref().is_some_and(|question| {
+                    current.pending_question.as_ref() != Some(question)
+                        && entry.tool_call_id == question.tool_call_id
+                }),
+            };
+            let reintroduces_replay = replay_controls_changed
+                && replay_call == Some(&entry.tool_call_id)
+                && replay_generation.is_none_or(|generation| {
+                    Some(generation) == entry.permission_generation.as_ref()
+                });
+            reopens
+                || reintroduces_replay
+                || (!runtime_only && changes_permission_receipt(current, proposed, entry))
+        });
+    if stale {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "permission response was already consumed".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn changes_permission_receipt(
+    current: &Session,
+    proposed: &Session,
+    entry: &ResponseOccurrence,
+) -> bool {
+    fn result<'a>(
+        session: &'a Session,
+        entry: &ResponseOccurrence,
+    ) -> Option<&'a bamboo_domain::Message> {
+        session.messages.iter().rev().find(|message| {
+            message.id == entry.tool_result_message_id
+                && permission_request_generation(message) == entry.permission_generation
+        })
+    }
+    let Some(saved) = result(current, entry) else {
+        return false;
+    };
+    let Some(candidate) = result(proposed, entry) else {
+        // A repark has a new generation. History edits may also remove the
+        // entire occurrence after its handoff has been claimed.
+        return false;
+    };
+    let key = "permission_decision_receipt";
+    let saved = saved.metadata.as_ref().and_then(|value| value.get(key));
+    let candidate = candidate.metadata.as_ref().and_then(|value| value.get(key));
+    saved.is_some() && saved != candidate
+}
+
+/// Sidecar-only reads need Main only when the response's sidecar could be ahead.
+pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
+    side.pending_question.is_none()
+        && side
+            .metadata
+            .contains_key(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && PERMISSION_RESPONSE_RESUME_KEYS
+            .iter()
+            .chain(PERMISSION_REPLAY_KEYS)
+            .any(|key| side.metadata.contains_key(*key))
+}
+
+pub(crate) fn main_may_have_uncommitted_response_control(main: &Session, side: &Session) -> bool {
+    main.pending_question.is_some()
+        && main.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            != side.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && has_uncommitted_response_marker(side)
+}
 
 /// A worker clarification was already checkpointed by the Host while this
 /// runner still held an older in-memory Child snapshot. The Host checkpoint,
@@ -154,10 +327,17 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS.iter().copied().chain([
-        bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
-        bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
-    ]) {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .copied()
+        .chain([
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+            bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+        ])
+    {
         match durable.metadata.get(key) {
             Some(value) => {
                 session.metadata.insert(key.to_string(), value.clone());
@@ -899,7 +1079,13 @@ fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .chain([&bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY])
+    {
         if let Some(value) = durable.metadata.get(*key) {
             session.metadata.insert((*key).to_string(), value.clone());
         } else {
@@ -1009,6 +1195,7 @@ pub struct LockedSessionStore {
         bamboo_domain::RootActorRuntimeWrite,
         bamboo_domain::RootActorRuntimePublisher,
     )>,
+    supervisor_approval: Option<Arc<SupervisorApprovalCommit>>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Serializes recoverable child/root Task transactions. Per-session locks
     /// still provide the data isolation; this gate ensures a retained recovery
@@ -1062,6 +1249,7 @@ impl LockedSessionStore {
             storage,
             inherited_child_wait: None,
             root_actor_writer: None,
+            supervisor_approval: None,
             child_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
@@ -1085,10 +1273,18 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: Some((owner, publish)),
+            supervisor_approval: None,
             child_actor_writer: None,
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         })
+    }
+
+    /// Restrict this private response writer to the original delegated
+    /// approval. Its storage CAS must retain the approval's authority.
+    pub fn bind_supervisor_approval(mut self, approval: Arc<SupervisorApprovalCommit>) -> Self {
+        self.supervisor_approval = Some(approval);
+        self
     }
 
     /// Keep the exact captured birth/wait in a private execution view, sharing
@@ -1098,6 +1294,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: Some(inherited),
             root_actor_writer: self.root_actor_writer.clone(),
+            supervisor_approval: self.supervisor_approval.clone(),
             child_actor_writer: self.child_actor_writer.clone(),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
@@ -1270,16 +1467,29 @@ impl LockedSessionStore {
                 let carried_wait = self.inherited_for_session(session).cloned();
                 let (publish, slot) = capture_root_publication(publish.clone());
                 let mut candidate = session.clone();
-                self.storage
-                    .save_root_actor_bound_startup(
-                        owner,
-                        &mut candidate,
-                        expected,
-                        carried_wait.as_ref(),
-                        publish,
-                    )
-                    .await
-                    .and_then(|()| adopt_root_publication(session, &slot))
+                let saved = if let Some(approval) = self.supervisor_approval.as_ref() {
+                    self.storage
+                        .save_supervisor_approval_response(
+                            owner,
+                            &mut candidate,
+                            expected,
+                            carried_wait.as_ref(),
+                            approval,
+                            publish,
+                        )
+                        .await
+                } else {
+                    self.storage
+                        .save_root_actor_bound_startup(
+                            owner,
+                            &mut candidate,
+                            expected,
+                            carried_wait.as_ref(),
+                            publish,
+                        )
+                        .await
+                };
+                saved.and_then(|()| adopt_root_publication(session, &slot))
             } else if self.child_actor_writer.is_some() {
                 self.save_child_snapshot(session, false, input.cloned(), inherited)
                     .await
@@ -2836,8 +3046,9 @@ impl LockedSessionStore {
         // overwriting a cross-instance profile or pending-question change.
         // Older backends retain their original fenced response save; Connect
         // verifies this capability before consuming a non-terminal answer.
-        let expected = (self.root_actor_writer.is_some()
-            && self.storage.supports_root_actor_bound_startup())
+        let expected = (self.supervisor_approval.is_some()
+            || (self.root_actor_writer.is_some()
+                && self.storage.supports_root_actor_bound_startup()))
         .then(|| session.clone());
         if let Err(error) = mutate(&mut session) {
             return Ok(Err(error));

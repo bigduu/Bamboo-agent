@@ -21,7 +21,7 @@ tokens, and gateways that queue one request behind another, routinely take tens
 of seconds to return headers and can take minutes. A short deadline turns those
 requests into repeated resends of the same large body and then a terminal
 failure that a manual retry would have completed.
-Other built-in providers using the shared HTTP driver apply finite headers and per-send time limits. Copilot model POSTs use the same policy while model discovery retains its existing transport contract. Successful streams retain their independent stream watchdog.
+Other built-in providers using the shared HTTP driver apply finite headers and per-send time limits. Successful streams retain their independent stream watchdog.
 
 Operator environment settings seed the policy at first use. The persisted
 configuration below is authoritative once published, so the environment only

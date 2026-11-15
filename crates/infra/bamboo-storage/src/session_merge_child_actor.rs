@@ -45,6 +45,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: None,
+            supervisor_approval: None,
             child_actor_writer: Some((owner, directory, publish)),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),

@@ -129,7 +129,7 @@ async fn ordinary_child_uses_actual_host_ports_and_fresh_root_aliases_for_every_
         .invocations()
         .iter()
         .all(|name| name == "spawn_session"));
-    assert_eq!(bamboo_subagent::proto::NativeToolCeiling::NAMES.len(), 8);
+    assert_eq!(bamboo_subagent::proto::NativeToolCeiling::NAMES.len(), 9);
 }
 
 #[tokio::test]

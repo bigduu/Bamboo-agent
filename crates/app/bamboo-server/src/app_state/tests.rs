@@ -319,11 +319,13 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
     assert_eq!(
         core_names,
         std::collections::BTreeSet::from([
+            "bash".to_string(),
             "exec_command".to_string(),
             "write_stdin".to_string(),
             "Edit".to_string(),
             "Grep".to_string(),
             "Read".to_string(),
+            "ViewImage".to_string(),
             "Write".to_string(),
             "session_history_current".to_string(),
             "work_overview".to_string(),

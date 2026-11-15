@@ -23,7 +23,12 @@ struct Cli {
     /// Run a full headless agent on this prompt and print the result. Boots
     /// the complete server runtime (root tool surface incl. SubAgent, so it
     /// CAN spawn actor children), finishes when the whole tree finishes.
-    #[arg(short = 'p', long = "prompt", global = false)]
+    #[arg(
+        short = 'p',
+        long = "prompt",
+        global = false,
+        allow_hyphen_values = true
+    )]
     prompt: Option<String>,
 
     /// With -p: continue this existing session instead of creating a new one.
@@ -2278,6 +2283,24 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headless_prompt_accepts_hyphen_prefixed_task_text() {
+        use clap::Parser;
+
+        let prompt = "- First requirement\n- Second requirement";
+        for flag in ["-p", "--prompt"] {
+            let parsed =
+                super::Cli::try_parse_from(["bamboo", flag, prompt, "--permission-mode", "auto"])
+                    .unwrap();
+            assert_eq!(parsed.prompt.as_deref(), Some(prompt));
+            assert_eq!(parsed.permission_mode.as_deref(), Some("auto"));
+        }
+
+        let stdin = super::Cli::try_parse_from(["bamboo", "-p", "-"]).unwrap();
+        assert_eq!(stdin.prompt.as_deref(), Some("-"));
+        assert!(super::Cli::try_parse_from(["bamboo", "--prompt"]).is_err());
+    }
+
     #[test]
     fn native_supervisor_confirmation_is_explicit_serve_only_opt_in() {
         use clap::Parser;

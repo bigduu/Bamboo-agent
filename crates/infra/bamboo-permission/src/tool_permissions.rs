@@ -613,7 +613,7 @@ pub fn check_permissions(
                 format!("Notebook edit: {}", path),
             )]))
         }
-        "Bash" | "exec_command" => {
+        "Bash" | "bash" | "exec_command" => {
             let command = shell_command(tool_name, args)
                 .ok_or_else(|| {
                     PermissionError::CheckFailed(
@@ -3468,6 +3468,31 @@ mod tests {
                 check_tool_rules("exec_command", &exec_args, &allowed, &denied),
                 Some(false)
             );
+        }
+    }
+
+    #[test]
+    fn foreground_bash_preserves_shell_restrictions_without_widening_grants() {
+        let command = "printf '%s' evidence";
+        let foreground = json!({"command": command, "timeout": 2.5});
+        let yielding = json!({"cmd": command, "interactive": true});
+        assert_eq!(
+            check_permissions("bash", &foreground).unwrap().unwrap()[0].resource,
+            command
+        );
+        for rule in ["Bash(printf *)", "exec_command(printf *)"] {
+            let rules = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("bash", &foreground, &[], &rules),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("bash", &foreground, &rules, &[]),
+                Some(true)
+            );
+        }
+        for (name, args) in [("Bash", &foreground), ("exec_command", &yielding)] {
+            assert_eq!(check_tool_rules(name, args, &["bash".into()], &[]), None);
         }
     }
 

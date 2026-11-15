@@ -123,11 +123,27 @@ impl ApprovalHandoff {
         target_session_id: &str,
         decision: PermissionDecisionKind,
     ) -> bool {
+        Self::allows_control_reference(
+            config,
+            supervisor,
+            target_session_id,
+            &self.reference,
+            decision,
+        )
+    }
+
+    pub fn allows_control_reference(
+        config: &PermissionConfig,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        reference: &str,
+        decision: PermissionDecisionKind,
+    ) -> bool {
         let tool_name = "session_control";
         let tool_args = json!({
             "action": "decide_approval",
             "target_session_id": target_session_id,
-            "approval_reference": self.reference,
+            "approval_reference": reference,
             "decision": decision,
         });
         if !is_once(decision) || config.requires_forced_confirmation(tool_name, &tool_args) {
@@ -135,7 +151,7 @@ impl ApprovalHandoff {
         }
         matches!(
             config.evaluate(PermissionEvaluation {
-                request_id: self.reference.clone(),
+                request_id: reference.to_owned(),
                 session_id: supervisor.session_id.clone(),
                 workspace_path: config.session_workspace(&supervisor.session_id),
                 tool_name: tool_name.into(),
