@@ -171,11 +171,14 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Copilot retirement removes its default provider and OAuth cases. The
 // replacement checks run in the existing config, LLM, server-settings and
 // server-app-state owners. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "5912eee61c5bd865f11542ca60e5ff0f0cf42be5ae42c86679a37f9f604bea78";
+// #2742 keeps output-limit coverage with the existing default Engine and LLM
+// owners. The request changes move the fingerprint without changing ownership.
+const FEATURE_SOURCE_SHA256 = "5b7862ff21a44851386b6971b920ea2c06c6ffc2a4046b2c4677e4011dfbd8b8";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
 // contexts and 20 additive cases; its nested tests add no producer.
+// Reasoning output recovery and task splitting use the existing Engine and LLM owners.
 
 
 const FEATURE_CONTEXTS = [

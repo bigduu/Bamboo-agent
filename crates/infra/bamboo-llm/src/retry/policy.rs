@@ -25,7 +25,7 @@ pub async fn with_upstream_retry<F: Future>(policy: UpstreamRetry, future: F) ->
 }
 
 pub(crate) fn continuous_request_retries() -> bool {
-    !super::work_request_budget_active()
+    !super::single_attempt_required()
         && UPSTREAM_RETRY
             .try_with(|p| *p == UpstreamRetry::UntilCancelled)
             .unwrap_or(false)

@@ -74,6 +74,13 @@ fn provider_client_builder() -> ClientBuilder {
     Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .user_agent(BAMBOO_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if crate::retry::output_limit_recovery_active() {
+                attempt.stop()
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        }))
 }
 
 fn correlation_value<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {

@@ -3038,6 +3038,50 @@ pub(crate) async fn force_overflow_context_recovery(
     .await
 }
 
+/// Preserve the current active transcript and let the final wire preflight
+/// enforce the window. A recovery request must not start an unreserved compaction.
+pub(super) async fn prepare_output_limit_recovery_context(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+) -> Result<PreparedRoundContext, AgentError> {
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        return prepare_round_context(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            None,
+        )
+        .await;
+    }
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    let counter = TiktokenTokenCounter::default();
+    let mut prepared_context = all_active_prepared_context(session, &budget, &counter);
+    transforms::apply_message_transforms_with_vision_budget(
+        config,
+        &mut prepared_context,
+        llm,
+        session_id,
+        model_name,
+        false,
+    )
+    .await?;
+    Ok(PreparedRoundContext {
+        prepared_context,
+        budget,
+    })
+}
+
 pub(super) async fn prepare_round_context(
     session: &mut Session,
     config: &AgentLoopConfig,

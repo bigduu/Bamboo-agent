@@ -589,11 +589,26 @@ impl AnthropicProvider {
             )));
         }
 
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let compatibility_reasoning =
+            self.thinking_replay_always && !is_official_anthropic_base_url(&self.base_url);
+        if compatibility_reasoning {
+            if let Some(diagnostics) = completion_diagnostics.as_ref() {
+                diagnostics.prefer_task_split();
+            }
+        }
+        let reasoning_cutoff = completion_diagnostics
+            .as_ref()
+            .filter(|_| compatibility_reasoning)
+            .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
+            .filter(|(limit, _)| *limit >= 4096)
+            .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));
         let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
-            completion_diagnostics: crate::provider::current_completion_diagnostics(),
+            completion_diagnostics,
+            reasoning_cutoff,
             ..Default::default()
         }));
         Ok(anthropic_stream_with_usage_on_error(
@@ -1695,6 +1710,7 @@ fn validated_anthropic_reference_definitions_in_order<'a>(
 #[derive(Default)]
 pub struct AnthropicStreamState {
     pub(crate) completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
+    reasoning_cutoff: Option<ReasoningCutoff>,
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
@@ -1725,6 +1741,46 @@ pub struct AnthropicStreamState {
     native_capture_bytes: usize,
     native_capture_invalid: bool,
     usage_snapshot: AnthropicUsageSnapshot,
+}
+
+/// These compatible gateways stream raw thinking but report token counts only
+/// at the end. Estimate in batches to keep the work linear in the stream size.
+/// This is a local cutoff threshold, never a provider usage measurement.
+struct ReasoningCutoff {
+    token_threshold: u64,
+    estimated_tokens: u64,
+    byte_threshold: Option<usize>,
+    bytes: usize,
+    pending_text: String,
+}
+
+impl ReasoningCutoff {
+    fn new(output_limit: u64, capped_reasoning_bytes: Option<usize>) -> Self {
+        Self {
+            token_threshold: output_limit - output_limit.div_ceil(8),
+            estimated_tokens: 0,
+            // An unsigned full-cap sample from this request can reveal a
+            // tokenizer mismatch that a generic token estimate would miss.
+            byte_threshold: capped_reasoning_bytes.map(|bytes| bytes - bytes.div_ceil(8)),
+            bytes: 0,
+            pending_text: String::new(),
+        }
+    }
+
+    fn observe(&mut self, text: &str) -> bool {
+        self.bytes = self.bytes.saturating_add(text.len());
+        if self.byte_threshold.is_some_and(|limit| self.bytes >= limit) {
+            return true;
+        }
+        self.pending_text.push_str(text);
+        if self.pending_text.len() < 1024 {
+            return false;
+        }
+        let tokens = tiktoken_rs::o200k_base_singleton().count_ordinary(&self.pending_text) as u64;
+        self.estimated_tokens = self.estimated_tokens.saturating_add(tokens);
+        self.pending_text.clear();
+        self.estimated_tokens >= self.token_threshold
+    }
 }
 
 /// Anthropic reports uncached input, cache read and cache creation as disjoint
@@ -1826,26 +1882,54 @@ fn anthropic_stream_with_usage_on_error(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             parse_anthropic_sse_event_multi(&mut state, event, data)
         });
-    usage_before_anthropic_stream_error(stream, state)
+    finish_anthropic_stream(stream, state)
 }
 
-// Preserve the latest presence-aware snapshot before propagating an actual
-// stream error. Success remains terminal-only, so a later malformed field can
-// invalidate an earlier value without changing the shared chunk contract.
-fn usage_before_anthropic_stream_error(
+// Preserve known usage when the body errors or we stop reading it early. In
+// particular, message_start can already contain all three prompt components.
+// Success remains terminal-only so later fields can still invalidate a value.
+fn finish_anthropic_stream(
     upstream: LLMStream,
     state: Arc<Mutex<AnthropicStreamState>>,
 ) -> LLMStream {
     use futures::StreamExt;
 
+    let cutoff_enabled = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reasoning_cutoff
+        .is_some();
     Box::pin(futures::stream::unfold(
-        (upstream, state, None),
-        |(mut upstream, state, pending_error)| async move {
+        (Some(upstream), state, None),
+        move |(upstream, state, pending_error)| async move {
             if let Some(error) = pending_error {
                 return Some((Err(error), (upstream, state, None)));
             }
-            match upstream.next().await {
-                Some(Err(error)) => {
+            let mut upstream = upstream?;
+            let item = upstream.next().await?;
+            let cutoff_snapshot = match &item {
+                Ok(LLMChunk::ReasoningToken(text)) if cutoff_enabled => {
+                    let mut parser = state.lock().unwrap_or_else(|e| e.into_inner());
+                    parser
+                        .reasoning_cutoff
+                        .as_mut()
+                        .is_some_and(|cutoff| cutoff.observe(text))
+                        .then(|| {
+                            if let Some(diagnostics) = &parser.completion_diagnostics {
+                                diagnostics.record_reasoning_cutoff();
+                            }
+                            parser.usage_snapshot.take_terminal()
+                        })
+                }
+                _ => None,
+            };
+            if let Some(snapshot) = cutoff_snapshot {
+                tracing::info!("Closing a compatible Messages stream at the reasoning threshold");
+                drop(upstream);
+                return snapshot.map(|usage| (Ok(usage), (None, state, None)));
+            }
+            match item {
+                Err(error) => {
                     let snapshot = {
                         let mut state = state
                             .lock()
@@ -1853,13 +1937,12 @@ fn usage_before_anthropic_stream_error(
                         state.usage_snapshot.take_terminal()
                     };
                     if let Some(snapshot) = snapshot {
-                        Some((Ok(snapshot), (upstream, state, Some(error))))
+                        Some((Ok(snapshot), (Some(upstream), state, Some(error))))
                     } else {
-                        Some((Err(error), (upstream, state, None)))
+                        Some((Err(error), (Some(upstream), state, None)))
                     }
                 }
-                Some(item) => Some((item, (upstream, state, None))),
-                None => None,
+                Ok(chunk) => Some((Ok(chunk), (Some(upstream), state, None))),
             }
         },
     ))
@@ -2388,6 +2471,7 @@ pub fn parse_anthropic_sse_event(
             Ok(None)
         }
         "message_delta" => {
+            state.reasoning_cutoff = None;
             if !data.is_empty() {
                 if let Some(diagnostics) = &state.completion_diagnostics {
                     diagnostics.observe_sse(event_type, data);
@@ -2495,7 +2579,11 @@ pub fn parse_anthropic_sse_event(
                 );
             }
 
-            if !state.tool_uses_by_index.is_empty() {
+            if state.tool_uses_by_index.is_empty() {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_messages_stop();
+                }
+            } else {
                 tracing::warn!(
                     open_tool_count = state.tool_uses_by_index.len(),
                     "Anthropic message_stop received with open tool_use blocks (possible incomplete tool arguments)"
@@ -2537,6 +2625,21 @@ pub fn parse_anthropic_sse_event(
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
+            if block_type == "server_tool_use" || block_type.ends_with("_tool_result") {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_provider_tool();
+                }
+            }
+
+            if block_type != "thinking"
+                || index != 0
+                || state.thinking_blocks_started != 0
+                || content_block["signature"]
+                    .as_str()
+                    .is_some_and(|signature| !signature.is_empty())
+            {
+                state.reasoning_cutoff = None;
+            }
 
             if block_type == "thinking" || block_type == "redacted_thinking" {
                 let index = index as usize;
@@ -2728,6 +2831,7 @@ pub fn parse_anthropic_sse_event(
                     Ok(None)
                 }
                 "signature_delta" => {
+                    state.reasoning_cutoff = None;
                     // Provider-minted signature over the thinking block's exact
                     // text — required to replay the block to real Anthropic
                     // (#520). Accumulate defensively (the real API delivers it
@@ -6158,7 +6262,7 @@ mod anthropic_stream_parse {
             let upstream: super::LLMStream = Box::pin(futures::stream::iter(vec![Err(
                 super::LLMError::Stream("synthetic interruption".into()),
             )]));
-            let mut stream = super::usage_before_anthropic_stream_error(upstream, state);
+            let mut stream = super::finish_anthropic_stream(upstream, state);
             assert!(matches!(
                 stream.next().await.unwrap().unwrap(),
                 LLMChunk::ProviderUsage {

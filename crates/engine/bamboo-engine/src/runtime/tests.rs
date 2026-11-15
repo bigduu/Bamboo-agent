@@ -784,7 +784,7 @@ impl RuntimeSessionPersistence for FailingCompletedCheckpointPersistence {
     }
 }
 
-async fn build_direct_execute_agent(
+pub(super) async fn build_direct_execute_agent(
     provider: Arc<dyn LLMProvider>,
     persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
     tools_override: Option<Arc<dyn ToolExecutor>>,
