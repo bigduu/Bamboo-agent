@@ -605,8 +605,9 @@ async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verif
   await upload()
 }
 
-async function registryFetch(url, allowMissing = false) {
-  const response = await fetch(url, { headers: { 'User-Agent': 'bamboo-publish-crate/2.0 (+https://github.com/bigduu/Bamboo-agent)' } })
+async function registryFetch(url, allowMissing = false, retryRead = read => read()) {
+  const read = () => fetch(url, { headers: { 'User-Agent': 'bamboo-publish-crate/2.0 (+https://github.com/bigduu/Bamboo-agent)' } })
+  const response = await retryRead(read)
   if (allowMissing && response.status === 404) return null
   assert.ok(response.ok, `Registry request failed (${response.status}): ${url}`)
   return response
@@ -693,8 +694,8 @@ function makeRecoveryContext(env = process.env) {
   return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
 }
 
-function makeFrozenRecoveryContext(env = process.env) {
-  const recovery = require('./crate-release-frozen-recovery.cjs').makeAuthority(env)
+function makeFrozenRecoveryContext(env = process.env, makeAuthority = require('./crate-release-frozen-recovery.cjs').makeAuthority) {
+  const recovery = makeAuthority(env)
   assert.equal(command(['git', 'rev-parse', 'HEAD']).trim(), recovery.receipt.identity.sourceRevision)
   const context = makeVerifiedContext(env, env.GITHUB_REPOSITORY, recovery.receipt.identity.sourceRevision,
     recovery.receipt.validation.ciRun, true, true, recovery)
@@ -731,12 +732,13 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   const receiptFile = path.join(directory, RECEIPT_NAME)
   const verifiedSources = new Map()
   const paginated = (route) => jsonCommand(['gh', 'api', '--paginate', '--slurp', `repos/${repository}/${route}`]).flat()
+  const readRegistry = (url, allowMissing) => registryFetch(url, allowMissing, recovery?.retryRegistryRead)
   const registryVersions = async (name) => {
-    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}`, true)
+    const response = await readRegistry(`https://crates.io/api/v1/crates/${name}`, true)
     return response ? (await response.json()).versions.map((version) => version.num) : []
   }
   const downloadArchive = async (name, version) => {
-    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}/download`)
+    const response = await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}/download`)
     const bytes = Buffer.from(await response.arrayBuffer())
     const archive = path.join(directory, `${name}-${version}.crate`)
     fs.writeFileSync(archive, bytes)
@@ -826,7 +828,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       })
     },
     registry: async (name, version) => {
-      const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}`, true)
+      const response = await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}`, true)
       return response ? (await response.json()).version : null
     },
     package: async (name, version, expected, release) => {
