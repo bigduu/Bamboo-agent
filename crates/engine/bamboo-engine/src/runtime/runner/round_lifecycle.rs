@@ -305,7 +305,12 @@ pub(crate) async fn execute_llm_round(
     let is_recovery = output_limit_recovery.is_some_and(|policy| policy.retry.is_some());
     let prepared = if is_recovery {
         context_preparation::prepare_output_limit_recovery_context(
-            session, config, model_name, session_id, llm,
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
         )
         .await?
     } else {
@@ -418,10 +423,15 @@ pub(crate) async fn execute_llm_round(
             .input_tokens
             .saturating_add(stream_output.cache_creation_input_tokens)
             .saturating_add(stream_output.cache_read_input_tokens);
+        let known_output = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
+            0
+        } else {
+            stream_output.output_tokens
+        };
         canonical_token_usage(
             stream_output.provider_usage,
             0,
-            0,
+            known_output,
             prompt_tokens.max(known_input),
             estimated_output,
         )

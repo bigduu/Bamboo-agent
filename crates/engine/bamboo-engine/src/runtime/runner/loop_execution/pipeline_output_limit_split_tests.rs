@@ -459,6 +459,10 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
     for (result, success) in [
         (json!({"status":"running","exit_code":null}), false),
         (json!({"status":"exited","exit_code":1}), false),
+        (
+            json!({"status":"error","exit_code":0,"error":"read failed"}),
+            false,
+        ),
         (json!({"status":"exited","exit_code":0}), true),
     ] {
         let message = Message::tool_result("command", result.to_string());
@@ -467,6 +471,11 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
             success
         );
     }
+    assert!(confirms_tool_result(
+        "Bash",
+        "command",
+        &Message::tool_result("command", r#"{"exit_code":0}"#),
+    ));
 }
 
 #[tokio::test]

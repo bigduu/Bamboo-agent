@@ -364,6 +364,11 @@ impl CompletionDiagnostics {
         self.recovery.is_some()
     }
 
+    pub(crate) fn is_task_split(&self) -> bool {
+        self.recovery
+            .is_some_and(|retry| matches!(retry.step, OutputLimitStep::Split { .. }))
+    }
+
     /// The runner leaves room for both an in-flight cutoff and its follow-up.
     pub fn with_reasoning_cutoff_budget(mut self, max_output: u64) -> Self {
         self.cutoff_max_output = Some(max_output);

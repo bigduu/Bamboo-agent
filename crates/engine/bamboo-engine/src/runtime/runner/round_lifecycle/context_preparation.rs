@@ -3045,8 +3045,24 @@ pub(super) async fn prepare_output_limit_recovery_context(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
 ) -> Result<PreparedRoundContext, AgentError> {
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        return prepare_round_context(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            None,
+        )
+        .await;
+    }
     let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
     let counter = TiktokenTokenCounter::default();

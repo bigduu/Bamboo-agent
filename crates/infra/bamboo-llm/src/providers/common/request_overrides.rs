@@ -125,6 +125,16 @@ pub(crate) fn mask_and_prepare_agent_request(
     let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
         return Ok(());
     };
+    if diagnostics.is_task_split() {
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    != Some(bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+            });
+        }
+    }
     let (effort_path, limit_path, low) = match endpoint {
         ENDPOINT_CHAT_COMPLETIONS => ("/reasoning_effort", "/max_completion_tokens", "low"),
         ENDPOINT_RESPONSES => ("/reasoning/effort", "/max_output_tokens", "low"),

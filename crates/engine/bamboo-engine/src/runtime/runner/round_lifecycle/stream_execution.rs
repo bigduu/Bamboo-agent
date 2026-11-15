@@ -1666,7 +1666,7 @@ pub(super) async fn execute_llm_stream(
                 if provider_relevant_source_digest(session) != provider_source_digest {
                     if recovery.is_some() {
                         return Err(AgentError::LLMNonRetryable(
-                            "task recovery context changed before dispatch".into(),
+                            "output-limit recovery context changed before dispatch".into(),
                         ));
                     }
                     config.vision_description_reuse.clear();
@@ -1676,7 +1676,12 @@ pub(super) async fn execute_llm_stream(
                 let reprepared = if recovery.is_some() {
                     Box::pin(
                         super::context_preparation::prepare_output_limit_recovery_context(
-                            session, config, model, session_id, llm,
+                            session,
+                            config,
+                            model,
+                            session_id,
+                            effective_schemas.as_ref(),
+                            llm,
                         ),
                     )
                     .await?

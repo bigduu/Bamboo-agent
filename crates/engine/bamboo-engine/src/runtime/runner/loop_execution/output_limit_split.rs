@@ -37,12 +37,19 @@ pub(super) fn confirms_tool_result(reference: &str, id: &str, message: &Message)
     }
     // The shell API reports transport success for running commands and
     // nonzero exits. Those receipts do not complete a recovery dependency.
-    resolve_tool_reference_name(reference, |name| {
-        matches!(name, "Bash" | "bash" | "exec_command" | "write_stdin")
+    let Some(shell) = resolve_tool_reference_name(reference, |name| {
+        matches!(
+            name,
+            "Bash" | "bash" | "BashOutput" | "bash_output" | "exec_command" | "write_stdin"
+        )
+    }) else {
+        return true;
+    };
+    serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|body| {
+        let terminal = matches!(body["status"].as_str(), Some("completed" | "exited"))
+            || (matches!(shell.as_str(), "Bash" | "bash") && body.get("status").is_none());
+        terminal && body["error"].is_null() && body["exit_code"].as_i64() == Some(0)
     })
-    .is_none()
-        || serde_json::from_str::<serde_json::Value>(&message.content)
-            .is_ok_and(|body| body["status"] != "running" && body["exit_code"].as_i64() == Some(0))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

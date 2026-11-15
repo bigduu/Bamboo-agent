@@ -173,7 +173,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // server-app-state owners. The four additive contexts and 20 cases stay intact.
 // #2742 keeps output-limit coverage with the existing default Engine and LLM
 // owners. The request changes move the fingerprint without changing ownership.
-const FEATURE_SOURCE_SHA256 = "29b14917ce6c68d700e6c4673840a608661b0a0107cf4a7a758117b8d2608869";
+const FEATURE_SOURCE_SHA256 = "5b7862ff21a44851386b6971b920ea2c06c6ffc2a4046b2c4677e4011dfbd8b8";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
