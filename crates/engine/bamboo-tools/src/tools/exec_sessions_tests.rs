@@ -970,6 +970,58 @@ mod process_tests {
     }
 
     #[tokio::test]
+    async fn short_poll_keeps_its_deadline_after_diagnosis() {
+        use crate::tools::write_stdin::{continue_empty_poll, defer_empty_poll_advisory};
+
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("short-quiet-poll-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "while [ ! -f release ]; do sleep 0.01; done; printf tail".into(),
+            &owner,
+            false,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let args = json!({"session_id": id, "yield_time_ms": 250});
+        let ctx = context(&owner);
+        let ToolOutcome::Completed(mut initial) =
+            defer_empty_poll_advisory(WriteStdinTool::new().invoke(args.clone(), ctx.clone()))
+                .await
+                .unwrap()
+        else {
+            panic!("expected an ordinary empty poll");
+        };
+        let mut signal: Value = serde_json::from_str(&initial.result).unwrap();
+        signal["polling"]["state"] = json!("needs_diagnosis");
+        initial.result = signal.to_string();
+
+        let completed = timeout(
+            Duration::from_secs(2),
+            continue_empty_poll(
+                &owner,
+                &ctx.tool_call_id,
+                &args,
+                initial,
+                Duration::from_millis(250),
+                Duration::from_secs(90),
+            ),
+        )
+        .await
+        .expect("the requested short wait has already elapsed");
+        let result = payload(completed);
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["session_id"], id);
+        assert_eq!(result["output"], "");
+    }
+
+    #[tokio::test]
     async fn requested_long_poll_waits_for_exit_on_the_first_empty_read() {
         let _environment = environment();
         let directory = tempfile::tempdir().unwrap();

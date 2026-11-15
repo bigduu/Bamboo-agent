@@ -123,6 +123,7 @@ pub(crate) fn legacy_effective_callable_set(
 }
 
 pub(crate) struct RoundToolExecutionResult {
+    pub quiet_exec_handle: Option<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,
@@ -403,6 +404,15 @@ async fn execute_and_apply_single_tool_call(
         // handles must not permanently occupy the bounded policy capacity.
         policy_guard.quiet_polls.retain_owned_handles(
             &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    } else if state.single_tool_call
+        && runtime_state.no_human_approver
+        && no_progress::quiet_exec_wait_scope(session, config)
+    {
+        state.quiet_exec_handle = quiet_poll::empty_running_poll_handle(
+            tool_call,
+            &outcome,
+            admitted_execution_name.as_deref(),
         );
     }
     // Use exactly the scalar observed by this dispatch, including unknown/zero.

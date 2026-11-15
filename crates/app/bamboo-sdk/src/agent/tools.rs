@@ -8,9 +8,9 @@
 //! [`BuiltinTool::tool`]. Custom tools (your own `impl Tool`) can be passed the
 //! same way.
 //!
-//! For model shell access, select [`BuiltinTool::ForegroundBash`]. An explicit
-//! SDK catalog may select [`BuiltinTool::ExecCommand`] with
-//! [`BuiltinTool::WriteStdin`] for the yielding shell protocol.
+//! For model shell access, select [`BuiltinTool::ExecCommand`] with
+//! [`BuiltinTool::WriteStdin`]. An explicit SDK catalog can select
+//! [`BuiltinTool::ForegroundBash`] for foreground-only execution.
 //!
 //! The canonical source of truth for built-in tool *names* is
 //! [`bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`]; [`BuiltinTool`] is kept in

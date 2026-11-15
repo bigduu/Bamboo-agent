@@ -507,7 +507,14 @@ async fn fixture(case: Case) {
             } else if case == Case::BuiltinImplementer {
                 assert_eq!(
                     names,
-                    std::collections::BTreeSet::from(["bash", "Edit", "Glob", "Read", "Write",])
+                    std::collections::BTreeSet::from([
+                        "exec_command",
+                        "write_stdin",
+                        "Edit",
+                        "Glob",
+                        "Read",
+                        "Write",
+                    ])
                 );
             } else {
                 assert!(

@@ -2962,6 +2962,27 @@ async fn handle_no_tool_calls(
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
 
+const QUIET_EXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+async fn wait_for_quiet_exec(
+    job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+    cancel_token: &CancellationToken,
+) -> Result<Message, AgentError> {
+    use crate::session_app::child_completion_coordinator::{
+        exec_completion_message, exec_wait_resume_message,
+    };
+
+    let result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+        result = tokio::time::timeout(QUIET_EXEC_WAIT_TIMEOUT, job.completion()) => result,
+    };
+    Ok(match result {
+        Ok(info) => exec_completion_message(&info),
+        Err(_) => exec_wait_resume_message(&[job.id().to_owned()], true),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tool_calls_path(
     frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
@@ -3167,6 +3188,25 @@ async fn handle_tool_calls_path(
                 "message_count": session.messages.len(),
             })
         );
+    }
+
+    // The poll has already returned and its tool result is paired. A sole
+    // follow-up quiet read can now wait within this run, outside tool deadlines
+    // and without spending another provider turn.
+    if round_status == MetricsRoundStatus::Success {
+        if let Some(handle) = tool_execution.quiet_exec_handle {
+            if let Some(job) =
+                bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
+                    .await
+            {
+                let message = wait_for_quiet_exec(job, cancel_token).await?;
+                session.add_message(message.clone());
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::message_appended(&session.id, &message))
+                    .await;
+            }
+        }
     }
 
     // ---- Dynamic model routing: classify task complexity ----
