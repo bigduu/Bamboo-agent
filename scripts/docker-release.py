@@ -281,8 +281,7 @@ def original(assets, entry, name):
     return {'id': executable['id'], 'size': executable['size'], 'sha256': entry['sha256']}
 
 
-def verify_release():
-    event_run, version, source = release_inputs()
+def verify_release_assets(event_run, version, source):
     release = api('releases/tags/v' + version)
     assert release['tag_name'] == 'v' + version and release['target_commitish'] == source
     assert not release['draft'] and not release['prerelease'] and release['published_at']
@@ -315,23 +314,33 @@ def verify_release():
     binary_names = {item['name'] for item in assets if
                     re.fullmatch(r'bamboo-(aarch64|x86_64)-(apple-darwin|pc-windows-msvc\.exe|unknown-linux-gnu)', item['name'])}
     assert binary_names == {entry['assetName'] for entry in entries}, 'Unexpected release binaries'
-    linux_assets = {}
+    executables = {}
     for entry in entries:
         target = entry['target']
         suffix = '.exe' if target.endswith('-windows-msvc') else ''
         assert entry['format'] == 'raw' and entry['buildMode'] == 'embedded' and entry['embeddedFrontend'] is True
         assert 65536 <= entry['sizeBytes'] <= 1024 ** 3
-        identity = original(assets, entry, f'bamboo-{target}{suffix}')
-        if target == 'x86_64-unknown-linux-gnu':
-            linux_assets['amd64'] = identity
-        if target == 'aarch64-unknown-linux-gnu':
-            linux_assets['arm64'] = identity
-    original(assets, manifest['browserHost'], 'bamboo-browser-host-v1.tar.gz')
+        executables[target] = original(assets, entry, f'bamboo-{target}{suffix}')
+    browser_host = original(assets, manifest['browserHost'], 'bamboo-browser-host-v1.tar.gz')
     if contract == 3:
         verify_v3_publication(event_run, version, source, manifest_sha)
-    else:
-        linux_assets['arm64'] = {'id': '', 'size': '', 'sha256': ''}
-    return {'source': source, 'version': version, 'contract': contract,
+    return {
+        'contract': contract,
+        'manifest': raw,
+        'executables': executables,
+        'browser_host': browser_host,
+    }
+
+
+def verify_release():
+    event_run, version, source = release_inputs()
+    verified = verify_release_assets(event_run, version, source)
+    executables = verified['executables']
+    linux_assets = {
+        'amd64': executables['x86_64-unknown-linux-gnu'],
+        'arm64': executables.get('aarch64-unknown-linux-gnu', {'id': '', 'size': '', 'sha256': ''}),
+    }
+    return {'source': source, 'version': version, 'contract': verified['contract'],
             'linux_assets': json.dumps(linux_assets, separators=(',', ':'))}
 
 

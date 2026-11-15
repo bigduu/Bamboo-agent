@@ -172,6 +172,57 @@ supply the original Linux x64 executable and keep their frozen ARM64 image
 build path. Run `node --test scripts/docker-publish.test.cjs` for the focused
 release-selection and Docker packaging contracts.
 
+## npm CLI package
+
+[Publish Bamboo CLI to npm](../../.github/workflows/publish-npm.yml) runs by manual
+dispatch on protected Dev. Supply a completed v3 release version and frozen
+source, plus the original successful Publish Crate run and attempt.
+The preparation job checks the publisher's authenticated manifest and the
+asset digests for all five executables. It packages the launcher, the exact
+manifest, and the verified Browser Host. On first invocation the launcher
+downloads and verifies the executable selected for the client's platform.
+
+The `verify` operation exercises the live Release proof and package file
+selection. The `stage` and `publish` operations retain one npm tarball from
+the preparation job. Both upload jobs verify its SHA-256 before sending it to
+npm. The publish job checks that the exact public version reports the
+prepared archive's integrity. If a registry request fails with an uncertain
+outcome, inspect the public version or the npm staging area before retrying
+only the failed job with the retained archive.
+
+### Authorize the first npm version
+
+1. In [npm Access Tokens](https://www.npmjs.com/settings/~/tokens), sign in as
+   an account with publish access to `@bigduu`. Generate a granular access
+   token limited to that package scope with **Read and write (stage only)**.
+   [npm token instructions](https://docs.npmjs.com/creating-and-viewing-access-tokens/)
+2. Add the token as the `BAMBOO_NPM_STAGE_TOKEN` secret in Bamboo-agent's
+   [`bamboo-release` environment](https://github.com/bigduu/Bamboo-agent/settings/environments).
+3. Run the workflow with `operation=stage`. npm creates a public
+   `0.0.0-stage` placeholder for a new package while the real version is staged.
+   In the npm website's **Staged Packages** tab, review
+   `@bigduu/bamboo-agent` at the exact version and approve it with 2FA.
+   [npm staged publishing](https://docs.npmjs.com/staged-publishing/)
+
+Run the following command to stage Bamboo v2026.11.22.
+
+~~~bash
+gh workflow run publish-npm.yml -R bigduu/Bamboo-agent --ref dev \
+  -f operation=stage -f version=2026.11.22 \
+  -f source=13336567999504a8c7deb89fba94f7907b04c3ee \
+  -f publisher_run_id=43712198357 -f publisher_attempt=2
+~~~
+
+### Authorize subsequent npm versions
+
+On npmjs.com, open `@bigduu/bamboo-agent` → **Settings** → **Trusted Publishing**
+and choose **GitHub Actions**. Enter owner `bigduu`, repository `Bamboo-agent`,
+workflow filename `publish-npm.yml`, and environment `bamboo-release`. Enable
+**Allow npm publish**. Dispatch `operation=publish` against each subsequent
+completed v3 release. npm supplies the workflow with short-lived OIDC
+credentials and a provenance attestation.
+[npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+
 ## Rollout and historical releases
 
 Land the feature and release workflow changes through the normal reviewed PR
