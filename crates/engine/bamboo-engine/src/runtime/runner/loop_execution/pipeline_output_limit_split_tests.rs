@@ -354,12 +354,13 @@ async fn pipeline_closes_unsigned_messages_before_the_limit_without_thinking_con
 
 #[tokio::test]
 async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_tool() {
+    const CAPPED_TOOL_ID: &str = "capped_tool_must_not_replay_2757";
     let opaque = mock_completion_sse(&[
         json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
         json!({"type":"message_stop"}),
     ]);
     let provisional = mock_messages_completion(
-        json!({"type":"tool_use","id":"provisional","name":"fixture_tool","input":{}}),
+        json!({"type":"tool_use","id":CAPPED_TOOL_ID,"name":"fixture_tool","input":{}}),
         json!({"type":"input_json_delta","partial_json":"{}"}),
         "max_tokens",
         Some(CAP),
@@ -382,7 +383,7 @@ async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_
         let report = run.requests[3]["messages"].to_string();
         assert!(report.contains("Verified prerequisite."));
         assert!(report.contains("confirmed result for complete"));
-        assert!(!report.contains("provisional"));
+        assert!(!report.contains(CAPPED_TOOL_ID));
     }
 }
 
