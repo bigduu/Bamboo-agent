@@ -198,6 +198,7 @@ pub(crate) fn mask_and_prepare_agent_request(
                 effort,
                 output_limit,
                 allows_convergence,
+                client_tools_only: client_tools_only(endpoint, body),
             })
         });
     if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
@@ -206,6 +207,26 @@ pub(crate) fn mask_and_prepare_agent_request(
             .expect("validated wire effort field") = Value::String(low.into());
     }
     Ok(())
+}
+
+fn client_tools_only(endpoint: &str, body: &Value) -> bool {
+    if body.get("mcp_servers").is_some() || body.get("mcpServers").is_some() {
+        return false;
+    }
+    body.get("tools").is_none_or(|tools| {
+        tools.as_array().is_some_and(|tools| {
+            tools.iter().all(|tool| match endpoint {
+                ENDPOINT_MESSAGES => {
+                    tool.get("input_schema").is_some()
+                        && tool.get("type").is_none_or(|kind| kind == "custom")
+                }
+                ENDPOINT_STREAM_GENERATE_CONTENT => tool.as_object().is_some_and(|tool| {
+                    tool.len() == 1 && tool.contains_key("functionDeclarations")
+                }),
+                _ => tool["type"] == "function",
+            })
+        })
+    })
 }
 
 fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {

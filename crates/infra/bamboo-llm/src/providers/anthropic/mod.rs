@@ -590,6 +590,13 @@ impl AnthropicProvider {
         }
 
         let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let compatibility_reasoning =
+            self.thinking_replay_always && !is_official_anthropic_base_url(&self.base_url);
+        if compatibility_reasoning {
+            if let Some(diagnostics) = completion_diagnostics.as_ref() {
+                diagnostics.prefer_task_split();
+            }
+        }
         let server_tools = body["tools"].as_array().is_some_and(|tools| {
             tools.iter().any(|tool| {
                 tool.get("type")
@@ -599,11 +606,7 @@ impl AnthropicProvider {
         });
         let reasoning_cutoff = completion_diagnostics
             .as_ref()
-            .filter(|_| {
-                self.thinking_replay_always
-                    && !is_official_anthropic_base_url(&self.base_url)
-                    && !server_tools
-            })
+            .filter(|_| compatibility_reasoning && !server_tools)
             .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
             .filter(|(limit, _)| *limit >= 4096)
             .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));

@@ -178,6 +178,12 @@ pub(crate) fn work_request_budget_active() -> bool {
     WORK_PHYSICAL_REQUEST.try_with(|_| ()).is_ok()
 }
 
+fn single_attempt_required() -> bool {
+    work_request_budget_active()
+        || crate::provider::current_completion_diagnostics()
+            .is_some_and(|diagnostics| diagnostics.is_output_limit_recovery())
+}
+
 pub(crate) fn claim_work_physical_request() -> Result<(), LLMError> {
     WORK_PHYSICAL_REQUEST.try_with(|spent| {
         spent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -271,7 +277,7 @@ async fn send_managed_request(
         |_, _| {},
     )
     .await;
-    let remaining_attempt = (!work_request_budget_active()
+    let remaining_attempt = (!single_attempt_required()
         && (continuous || attempts < config.max_attempts.max(1)))
     .then_some(RemainingInitialRequestAttempt {
         deadline,
@@ -719,12 +725,12 @@ where
     Fut: Future<Output = RetryAttempt<T>>,
     D: Fn(&mut RetryAttempt<T>, RetryDecision),
 {
-    let max_attempts = if work_request_budget_active() {
+    let max_attempts = if single_attempt_required() {
         1
     } else {
         config.max_attempts.max(1)
     };
-    let continuous = allow_continuous && !work_request_budget_active();
+    let continuous = allow_continuous && !single_attempt_required();
     let mut index: u32 = initial_index;
     loop {
         let mut outcome = attempt().await;
@@ -815,7 +821,7 @@ impl InitialRequestBudget {
         let limits = initial_request_limits();
         Self {
             attempts: AtomicU32::new(0),
-            max_attempts: if work_request_budget_active() {
+            max_attempts: if single_attempt_required() {
                 1
             } else {
                 config.max_attempts.max(1)
@@ -845,7 +851,7 @@ impl InitialRequestBudget {
     }
 
     fn record_live_candidate(&self, retry_after: Option<Duration>) {
-        if self.is_continuous() || work_request_budget_active() {
+        if self.is_continuous() || single_attempt_required() {
             return;
         }
         let Some(not_before) = Instant::now().checked_add(retry_after.unwrap_or_default()) else {
@@ -858,7 +864,7 @@ impl InitialRequestBudget {
 
     fn can_defer_terminal(&self, stop: RequestStopReason) -> bool {
         if self.is_continuous()
-            || work_request_budget_active()
+            || single_attempt_required()
             || !matches!(
                 stop,
                 RequestStopReason::AttemptsExhausted

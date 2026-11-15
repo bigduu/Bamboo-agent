@@ -59,6 +59,25 @@ pub(super) async fn apply_message_transforms(
     session_id: &str,
     model_name: &str,
 ) -> Result<(), AgentError> {
+    apply_message_transforms_with_vision_budget(
+        config,
+        prepared_context,
+        llm,
+        session_id,
+        model_name,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn apply_message_transforms_with_vision_budget(
+    config: &AgentLoopConfig,
+    prepared_context: &mut PreparedContext,
+    llm: &Arc<dyn LLMProvider>,
+    session_id: &str,
+    model_name: &str,
+    allow_paid_vision: bool,
+) -> Result<(), AgentError> {
     normalize_tool_chains(&mut prepared_context.messages, session_id);
     match image_projection(config, llm.as_ref(), model_name).await {
         ImageProjection::Nonvision => {
@@ -82,6 +101,15 @@ pub(super) async fn apply_message_transforms(
                 config.attachment_reader.as_deref(),
             )
             .await?;
+            if !allow_paid_vision {
+                if prepared_context.messages.iter().any(has_image_parts) {
+                    return Err(AgentError::Budget(
+                        "output-limit task recovery cannot reserve an auxiliary vision request"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            }
             return apply_image_fallback(config, prepared_context, llm).await;
         }
         ImageProjection::LegacyFallback(_) => {

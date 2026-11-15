@@ -57,7 +57,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub output_limit_recovery: Option<RoundOutputLimitPolicy>,
+    pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
     pub observation_progress_hint: Option<&'a str>,
@@ -1503,6 +1503,9 @@ pub(super) async fn execute_llm_stream(
     let mut prepared_context = prepared_context.clone();
     let mut required_tool = required_tool_for_session(session);
     let mut effective_schemas = effective_tool_schemas(session, base_tool_schemas);
+    let task_split = frame
+        .output_limit_recovery
+        .and_then(|policy| policy.task_split);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1510,13 +1513,17 @@ pub(super) async fn execute_llm_stream(
     let continuation_enabled = bamboo_domain::ChildContextBinding::from_session(session)
         .map_err(|error| AgentError::Budget(error.to_string()))?
         .is_none()
+        && task_split.is_none()
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
     let recovery = frame.output_limit_recovery.and_then(|policy| policy.retry);
-    let convergence_hint = recovery
-        .is_some_and(|retry| retry.is_convergence())
-        .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT);
+    let convergence_hint = task_split.map(|split| split.advisory).or_else(|| {
+        recovery
+            .is_some_and(|retry| retry.is_convergence())
+            .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT)
+    });
+    let private_plan = task_split.is_some_and(|split| split.private_plan);
     let (mut prepared_envelope, previous_response_id, final_usage, loading_mode) = loop {
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
@@ -1657,20 +1664,32 @@ pub(super) async fn execute_llm_stream(
                 // nondeterministic Legacy Vision description inside it must not be
                 // requested again for the same source.
                 if provider_relevant_source_digest(session) != provider_source_digest {
+                    if task_split.is_some() {
+                        return Err(AgentError::LLMNonRetryable(
+                            "task recovery context changed before dispatch".into(),
+                        ));
+                    }
                     config.vision_description_reuse.clear();
                 }
                 required_tool = required_tool_for_session(session);
                 effective_schemas = effective_tool_schemas(session, base_tool_schemas);
-                let reprepared = Box::pin(super::context_preparation::prepare_round_context(
-                    session,
-                    config,
-                    model,
-                    session_id,
-                    effective_schemas.as_ref(),
-                    llm,
-                    Some(event_tx),
-                ))
-                .await?;
+                let reprepared = if task_split.is_some() {
+                    Box::pin(super::context_preparation::prepare_task_split_context(
+                        session, config, model, session_id, llm,
+                    ))
+                    .await?
+                } else {
+                    Box::pin(super::context_preparation::prepare_round_context(
+                        session,
+                        config,
+                        model,
+                        session_id,
+                        effective_schemas.as_ref(),
+                        llm,
+                        Some(event_tx),
+                    ))
+                    .await?
+                };
                 max_context_tokens = reprepared.budget.max_context_tokens;
                 max_output_tokens = reprepared.budget.max_output_tokens;
                 prepared_context = reprepared.prepared_context;
@@ -1700,7 +1719,7 @@ pub(super) async fn execute_llm_stream(
         config.persistence.as_ref(),
         config.session_inbox.as_ref(),
     ) {
-        (Some(host), Some(persistence), Some(inbox)) => persistence
+        (Some(host), Some(persistence), Some(inbox)) if task_split.is_none() => persistence
             .root_actor_writer()
             .filter(|owner| {
                 owner.fence.actor_id == session.id
@@ -1750,7 +1769,7 @@ pub(super) async fn execute_llm_stream(
     // Single home for turning the canonical envelope into a concrete provider
     // request (request POLICY + observability). The ledger keeps every previously
     // emitted item byte-stable while appending real turns and context events.
-    let planned = plan_llm_request(
+    let mut planned = plan_llm_request(
         &prepared_envelope,
         session_id,
         reasoning_effort,
@@ -1758,6 +1777,9 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         final_usage,
     );
+    if task_split.is_some() {
+        planned.request_options.parallel_tool_calls = Some(false);
+    }
     if !continuation_enabled {
         tracing::debug!(
             "[{}] Responses API previous_response_id disabled (store={:?}, provider={})",
@@ -2044,7 +2066,7 @@ pub(super) async fn execute_llm_stream(
     // Buffer this response until tool calls tell us whether it is a candidate.
     let stream_output_result = observation
         .scope(async {
-            if activation_pending || config.features_final_evidence_check {
+            if activation_pending || config.features_final_evidence_check || private_plan {
                 crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                     stream,
                     cancel_token,
@@ -2087,11 +2109,12 @@ pub(super) async fn execute_llm_stream(
             observation.finish(crate::runtime::runner::telemetry_error_outcome(
                 &failure.error,
             ));
-            let appended = append_interrupted_assistant_output(
-                session,
-                *failure.partial_output,
-                &failure.error,
-            );
+            let appended = !private_plan
+                && append_interrupted_assistant_output(
+                    session,
+                    *failure.partial_output,
+                    &failure.error,
+                );
             if appended {
                 tracing::warn!(
                     "[{}] Preserved interrupted partial assistant output in the live transcript",
@@ -2120,7 +2143,8 @@ pub(super) async fn execute_llm_stream(
     usage_guard.finish(status, stream_output.provider_usage);
     observation.finish(outcome);
 
-    let output_limited = super::rejected_output_limit(&stream_output, finish_reason);
+    let output_limited =
+        super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
     if config.features_final_evidence_check
         && !activation_pending
         && !output_limited
@@ -2248,7 +2272,7 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if !output_limited {
+    if !output_limited && !private_plan {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {
@@ -2266,7 +2290,11 @@ pub(super) async fn execute_llm_stream(
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
-    let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
+    let prompt_tokens = if task_split.is_some() {
+        u64::from(final_usage.input_tokens)
+    } else {
+        super::token_estimation::estimate_prompt_tokens(&prepared_context.messages)
+    };
 
     Ok((stream_output, llm_duration, prompt_tokens, completion))
 }

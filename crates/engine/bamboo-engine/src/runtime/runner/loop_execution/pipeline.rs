@@ -23,7 +23,7 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
-use crate::runtime::runner::round_lifecycle::RoundOutputLimitPolicy;
+use crate::runtime::runner::round_lifecycle::{RoundOutputLimitPolicy, TaskSplitPrompt};
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
@@ -54,6 +54,7 @@ use super::gold::{
     select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
+use super::output_limit_split::{SplitRecovery, Stage as SplitStage, DEFAULT_TOKEN_LIMIT};
 use crate::runtime::runner::state_bridge;
 use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
@@ -1087,6 +1088,32 @@ fn run_tokens_used(round: &RoundRuntimeState) -> u64 {
         .total_prompt_tokens
         .saturating_add(round.total_completion_tokens)
         .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT)
+}
+
+fn can_split_tasks(
+    session: &Session,
+    config: &AgentLoopConfig,
+    runtime: &AgentRuntimeState,
+    round: u32,
+) -> bool {
+    // The split owns the remaining rounds. Managed runs already have their
+    // own completion and recovery gates.
+    session.kind == bamboo_domain::SessionKind::Root
+        && session.authority_identity.is_ordinary()
+        && config.effective_counted_loop().is_none()
+        && config.loop_control.is_none()
+        && !config.goal_loop_active()
+        && !config.guardian_active()
+        && !config.features_final_evidence_check
+        && config.host_gold_run.is_none()
+        && crate::runtime::runner::round_lifecycle::required_tool_for_session(session).is_none()
+        && runtime.suspension.is_none()
+        && runtime.waiting_for_children.is_none()
+        && runtime.waiting_for_bash.is_none()
+        && config
+            .run_budget
+            .max_rounds
+            .is_none_or(|max| round.saturating_add(2) < max)
 }
 
 /// Checks the run's cumulative activity (already accumulated into `round` —
@@ -3000,6 +3027,7 @@ async fn handle_tool_calls_path(
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
+    allow_mid_turn_compression: bool,
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -3039,14 +3067,6 @@ async fn handle_tool_calls_path(
             })?;
     }
 
-    let compression_model = Some(model_name.to_string())
-        .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
-    if compression_model.is_none() {
-        tracing::warn!(
-            "[{}] Skipping mid-turn context compression after tool execution: missing model name",
-            frame.session_id
-        );
-    }
     let eligible_tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
     let required_tool = crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
@@ -3087,9 +3107,7 @@ async fn handle_tool_calls_path(
                 runtime_state,
                 policy_guard,
                 task_context,
-                compression_model_name: compression_model
-                    .as_deref()
-                    .or(auxiliary_models.background_model_name.as_deref()),
+                compression_model_name: allow_mid_turn_compression.then_some(model_name),
                 compression_model_provider: auxiliary_models
                     .summarization_model_provider
                     .as_ref()
@@ -3539,9 +3557,16 @@ async fn run_pipeline_inner(
     // across rounds, so resetting it per iteration would make the guard unable
     // to ever fire (#2425).
     let mut no_tool_call_continuation_streak: u32 = 0;
+    let mut split_recovery: Option<SplitRecovery> = None;
+    let recovery_token_limit = config
+        .run_budget
+        .max_total_tokens
+        .unwrap_or(DEFAULT_TOKEN_LIMIT);
 
     loop {
-        if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+        if (split_recovery.is_some() || config.effective_counted_loop().is_some())
+            && cancel_token.is_cancelled()
+        {
             return Err(AgentError::Cancelled);
         }
         // Startup has already admitted this run's input. A runtime-only wakeup
@@ -3562,6 +3587,23 @@ async fn run_pipeline_inner(
         {
             break;
         }
+        if split_recovery.is_some()
+            && (run_tokens_used(&state.runtime_state.round) >= recovery_token_limit
+                || check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget)
+                    .is_some()
+                || config
+                    .run_budget
+                    .max_rounds
+                    .is_some_and(|max| turn_counter >= max))
+        {
+            return Err(AgentError::Budget(
+                "output-limit task recovery reached the run budget; confirmed progress is in the session".into(),
+            ));
+        }
+        let split_request = split_recovery
+            .as_mut()
+            .map(SplitRecovery::next_request)
+            .transpose()?;
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -3582,31 +3624,33 @@ async fn run_pipeline_inner(
             abort_in_flight_evaluations(state, event_tx, "delegation_failure_limit").await;
             return Err(error);
         }
-        refresh_auxiliary_models_for_round(state, config);
-        poll_completed_task_evaluation(state).await;
-        apply_completed_task_evaluation(session, event_tx, config, state).await;
-        start_queued_task_evaluation_if_idle(
-            state,
-            event_tx,
-            llm.clone(),
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
-        poll_completed_gold_evaluation(state).await;
-        apply_completed_gold_evaluation(session, config, state).await;
-        let gold_provider = select_gold_evaluation_provider(
-            config,
-            &llm,
-            state.auxiliary_models.fast_model_provider.as_ref(),
-        );
-        start_queued_gold_evaluation_if_idle(
-            state,
-            event_tx,
-            gold_provider,
-            config,
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
+        if split_request.is_none() {
+            refresh_auxiliary_models_for_round(state, config);
+            poll_completed_task_evaluation(state).await;
+            apply_completed_task_evaluation(session, event_tx, config, state).await;
+            start_queued_task_evaluation_if_idle(
+                state,
+                event_tx,
+                llm.clone(),
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+            poll_completed_gold_evaluation(state).await;
+            apply_completed_gold_evaluation(session, config, state).await;
+            let gold_provider = select_gold_evaluation_provider(
+                config,
+                &llm,
+                state.auxiliary_models.fast_model_provider.as_ref(),
+            );
+            start_queued_gold_evaluation_if_idle(
+                state,
+                event_tx,
+                gold_provider,
+                config,
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+        }
 
         state.runtime_state.round.current_round = turn_counter;
 
@@ -3669,7 +3713,7 @@ async fn run_pipeline_inner(
                 Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
-                Some(&runtime_context),
+                split_request.is_none().then_some(&runtime_context),
                 &state.execution_id,
             )
             .await?;
@@ -3682,6 +3726,11 @@ async fn run_pipeline_inner(
                     || input.wrapper.as_deref() == Some("root_chat_turn_v1")
             })
         });
+        if split_request.is_some() && fresh_human_input {
+            return Err(AgentError::LLMNonRetryable(
+                "output-limit task recovery stopped after new user input; confirmed progress is in the session".into(),
+            ));
+        }
         observation.update_current(
             &mut state.current_inputs,
             &state.session_id,
@@ -3777,8 +3826,10 @@ async fn run_pipeline_inner(
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
-        let mut output_limit_recovery = None;
-        let mut previous_prompt_tokens = 0;
+        let mut output_limit_recovery = split_recovery.as_ref().map(|split| split.retry);
+        let mut previous_prompt_tokens = split_recovery
+            .as_ref()
+            .map_or(0, |split| split.prompt_floor);
         let mut turn_outcome: Option<TurnOutcome> = None;
         // Whether this round produced any tool call. Per-round, so it belongs
         // inside the loop; captured from the provider output rather than
@@ -3832,7 +3883,12 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
+        let attempt_limit = if split_request.is_some() {
+            1
+        } else {
+            MAX_LLM_TURN_ATTEMPTS + extra_attempts
+        };
+        for attempt in 1..=attempt_limit {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
                     session,
@@ -3857,11 +3913,19 @@ async fn run_pipeline_inner(
             round_activity.apply_to_round(&mut spent);
             let output_limit_policy = RoundOutputLimitPolicy {
                 retry: output_limit_recovery,
-                remaining_run_tokens: config.run_budget.max_total_tokens
-                    .map(|limit| limit.saturating_sub(run_tokens_used(&spent))),
+                remaining_run_tokens: Some(recovery_token_limit.saturating_sub(run_tokens_used(&spent))),
                 previous_prompt_tokens,
                 can_cutoff: attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                     && check_run_budget_exceeded(&spent, &config.run_budget).is_none(),
+                task_split: split_request.as_ref().map(|(stage, advisory)| TaskSplitPrompt {
+                    advisory,
+                    private_plan: *stage == SplitStage::Plan,
+                }),
+            };
+            let request_tools = if matches!(split_request.as_ref(), Some((SplitStage::Plan | SplitStage::Report, _))) {
+                &[]
+            } else {
+                tool_schemas.as_slice()
             };
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
@@ -3871,7 +3935,7 @@ async fn run_pipeline_inner(
                 cancel_token,
                 &state.session_id,
                 &state.model_name,
-                &tool_schemas,
+                request_tools,
                 observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
@@ -4128,16 +4192,47 @@ async fn run_pipeline_inner(
                     }
                 }
                 if matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. })
-                    && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    && split_request.is_none()
                 {
-                    if let Some(recovery) = llm_output.output_limit_recovery {
-                        let mut spent = state.runtime_state.round.clone();
-                        round_activity.apply_to_round(&mut spent);
-                        previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
+                    let mut spent = state.runtime_state.round.clone();
+                    round_activity.apply_to_round(&mut spent);
+                    previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
+                    let next = llm_output.output_limit_recovery;
+                    let remaining_tokens = recovery_token_limit.saturating_sub(run_tokens_used(&spent));
+                    let split_candidate = next.filter(|candidate| candidate.prefers_task_split())
+                        .or_else(|| output_limit_recovery.filter(|attempt| attempt.is_convergence()))
+                        .filter(|candidate| candidate.allows_task_split());
+                    if let Some(candidate) = split_candidate {
+                        let cost = previous_prompt_tokens.saturating_add(candidate.output_limit());
+                        if cost.saturating_mul(2) <= remaining_tokens
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                            && can_split_tasks(session, config, &state.runtime_state, turn_counter)
+                        {
+                            split_recovery = Some(SplitRecovery::new(
+                                candidate.for_task_split(), previous_prompt_tokens,
+                            ));
+                            crate::runtime::runner::metrics_lifecycle::record_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session.messages.len() as u32,
+                                MetricsRoundStatus::Error,
+                                round_activity.token_usage(),
+                                0,
+                                0,
+                                Some(error.to_string()),
+                            );
+                            abort_in_flight_evaluations(state, event_tx, "output_limit_task_split").await;
+                            tracing::info!(session_id = %state.session_id, "Splitting unfinished work after reasoning output exhaustion");
+                            turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                            break;
+                        }
+                    }
+                    if let Some(recovery) = next.filter(|_| {
+                        attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    }) {
                         let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
-                        let budget_fits = config.run_budget.max_total_tokens
-                            .is_none_or(|limit| next_cost <= limit.saturating_sub(run_tokens_used(&spent)));
-                        if budget_fits && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
+                        if next_cost <= remaining_tokens && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
                             output_limit_recovery = Some(recovery);
                             tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
                             continue;
@@ -4146,6 +4241,81 @@ async fn run_pipeline_inner(
                 }
                 terminal_error = Some(error);
                 break;
+            }
+            if let (Some((stage, _)), Some(split)) = (split_request.as_ref(), split_recovery.as_mut()) {
+                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
+                let max_tools = usize::from(*stage == SplitStage::Work);
+                let invalid_tool = stream_output.tool_calls.len() > max_tools
+                    || stream_output.tool_calls.iter().any(|call| {
+                        is_child_spawn_call(call)
+                            || call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+                    })
+                    || stream_output.provider_transcript_items.iter().any(|item| {
+                        item.kind().is_discovery()
+                            || (max_tools == 0 && matches!(item.kind(),
+                                ProviderTranscriptItemKind::AnthropicToolUse
+                                    | ProviderTranscriptItemKind::OpenAiFunctionCall))
+                    });
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                let rejection = if run_tokens_used(&spent) > recovery_token_limit {
+                    Some(AgentError::Budget(
+                        "output-limit task recovery exceeded its token budget on reported usage".into(),
+                    ))
+                } else {
+                    invalid_tool.then(|| AgentError::LLMNonRetryable(
+                        "output-limit task recovery rejected a tool outside the current step".into(),
+                    ))
+                };
+                if let Some(error) = rejection {
+                    if let Some(visible) = stream_output.visible_message {
+                        let _ = event_tx.send(AgentEvent::VisibleMessageDiscard {
+                            message_id: visible.message_id,
+                        }).await;
+                    }
+                    terminal_error = Some(error);
+                    break;
+                }
+
+                if *stage == SplitStage::Plan {
+                    if let Err(error) = split.accept_plan(&stream_output.content) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
+
+                if *stage == SplitStage::Work && stream_output.tool_calls.is_empty() {
+                    let confirmed_checkpoint = stream_output.content.trim()
+                        .strip_prefix("CHECKPOINT:")
+                        .is_some_and(|evidence| !evidence.trim().is_empty());
+                    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                        .then_some(stream_output.reasoning_content);
+                    let mut checkpoint = assistant_with_visible_identity(
+                        Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+                            .with_reasoning_signature(stream_output.reasoning_signature),
+                        stream_output.visible_message,
+                    );
+                    checkpoint.phase = Some(bamboo_domain::MessagePhase::Commentary);
+                    if let Err(error) = commit_assistant_message(
+                        session, checkpoint, &mut Some(stream_output.provider_transcript_items),
+                    ) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    split.finish_step(confirmed_checkpoint);
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
             }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
@@ -4422,6 +4592,10 @@ async fn run_pipeline_inner(
             let injected_handler_error = take_test_post_llm_retry_failure(session);
             #[cfg(not(test))]
             let injected_handler_error: Option<AgentError> = None;
+            let split_tool_id = split_request.as_ref()
+                .and_then(|_| stream_output.tool_calls.first())
+                .map(|call| call.id.clone());
+            let before_tool = session.messages.len();
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
                 None => {
@@ -4437,6 +4611,7 @@ async fn run_pipeline_inner(
                         &state.model_name,
                         &mut state.task_context,
                         cancel_token,
+                        split_request.is_none(),
                     )
                     .await
                 }
@@ -4452,6 +4627,15 @@ async fn run_pipeline_inner(
                                 terminal_error = Some(error);
                                 break;
                             }
+                        }
+                    }
+                    if let (Some(split), Some(call_id)) = (split_recovery.as_mut(), split_tool_id) {
+                        if !outcome.should_break {
+                            let confirmed = session.messages.iter().skip(before_tool).any(|message| {
+                                message.role == Role::Tool && message.tool_call_id.as_deref() == Some(call_id.as_str())
+                                    && message.tool_success == Some(true)
+                            });
+                            split.finish_step(confirmed);
                         }
                     }
                     turn_outcome = Some(outcome);
@@ -4757,6 +4941,10 @@ async fn run_pipeline_inner(
         sent_complete = sent_complete || outcome.sent_complete;
         if outcome.should_break {
             break;
+        }
+        if split_recovery.is_some() {
+            turn_counter = turn_counter.saturating_add(1);
+            continue;
         }
 
         // Bounded progress guard (#2425). When a round produced no tool calls,
@@ -8669,7 +8857,7 @@ mod tests {
         }
     }
 
-    fn e2e_loop_state(
+    pub(super) fn e2e_loop_state(
         session_id: &str,
     ) -> crate::runtime::runner::loop_execution::startup::LoopRunState {
         use crate::runtime::runner::loop_execution::startup::{
@@ -9932,7 +10120,7 @@ mod tests {
         );
     }
 
-    fn canonical_usage_pipeline_config() -> AgentLoopConfig {
+    pub(super) fn canonical_usage_pipeline_config() -> AgentLoopConfig {
         use crate::runtime::config::PromptMemoryFlags;
 
         AgentLoopConfig {
@@ -10289,7 +10477,7 @@ mod tests {
         assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
     }
 
-    fn mock_messages_completion(
+    pub(super) fn mock_messages_completion(
         block: serde_json::Value,
         delta: serde_json::Value,
         finish_reason: &str,
@@ -10312,7 +10500,7 @@ mod tests {
         ])
     }
 
-    fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
+    pub(super) fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
         let sse = events
             .iter()
             .map(|event| {
@@ -10328,7 +10516,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct OutputLimitExecutor(AtomicUsize);
+    pub(super) struct OutputLimitExecutor(AtomicUsize);
 
     #[async_trait::async_trait]
     impl bamboo_agent_core::tools::ToolExecutor for OutputLimitExecutor {
@@ -10447,6 +10635,9 @@ mod tests {
             ));
             if matches!(scenario, "run-budget" | "missing-output-usage") {
                 config.run_budget.max_total_tokens = Some(38);
+            }
+            if scenario == "repeated-limit" {
+                config.run_budget.max_rounds = Some(1);
             }
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
@@ -10661,6 +10852,7 @@ mod tests {
                 0,
             ));
             config.run_budget.max_total_tokens = run_limit;
+            config.run_budget.max_rounds = Some(1);
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
             session.add_message(
@@ -13999,6 +14191,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                true,
             ),
         )
         .await;
@@ -14305,6 +14498,7 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                true,
             ),
         )
         .await
@@ -17275,6 +17469,10 @@ mod final_evidence_tests;
 #[cfg(test)]
 #[path = "pipeline_model_routing_tests.rs"]
 mod model_routing_tests;
+
+#[cfg(test)]
+#[path = "pipeline_output_limit_split_tests.rs"]
+mod output_limit_split_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

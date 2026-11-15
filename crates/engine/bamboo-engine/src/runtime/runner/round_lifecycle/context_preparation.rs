@@ -3038,6 +3038,34 @@ pub(crate) async fn force_overflow_context_recovery(
     .await
 }
 
+/// Preserve the current active transcript and let the final wire preflight
+/// enforce the window. A split request must not start an unreserved compaction.
+pub(super) async fn prepare_task_split_context(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    llm: &Arc<dyn LLMProvider>,
+) -> Result<PreparedRoundContext, AgentError> {
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    let counter = TiktokenTokenCounter::default();
+    let mut prepared_context = all_active_prepared_context(session, &budget, &counter);
+    transforms::apply_message_transforms_with_vision_budget(
+        config,
+        &mut prepared_context,
+        llm,
+        session_id,
+        model_name,
+        false,
+    )
+    .await?;
+    Ok(PreparedRoundContext {
+        prepared_context,
+        budget,
+    })
+}
+
 pub(super) async fn prepare_round_context(
     session: &mut Session,
     config: &AgentLoopConfig,

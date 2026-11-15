@@ -256,8 +256,16 @@ pub const REASONING_HEADROOM_FINISH_REASON: &str = "reasoning_headroom";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLimitRecovery {
     controls: OutputLimitRecoveryControls,
-    converge: bool,
+    step: OutputLimitStep,
+    prefer_split: bool,
     capped_reasoning_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputLimitStep {
+    LowerEffort,
+    Converge,
+    Split { lower_effort: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,15 +274,43 @@ pub(crate) struct OutputLimitRecoveryControls {
     pub(crate) effort: ReasoningEffort,
     pub(crate) output_limit: u64,
     pub(crate) allows_convergence: bool,
+    pub(crate) client_tools_only: bool,
 }
 
 impl OutputLimitRecovery {
     pub fn is_convergence(self) -> bool {
-        self.converge
+        self.step == OutputLimitStep::Converge
     }
 
     pub fn output_limit(self) -> u64 {
         self.controls.output_limit
+    }
+
+    pub fn allows_task_split(self) -> bool {
+        self.controls.allows_convergence && self.controls.client_tools_only
+    }
+
+    pub fn prefers_task_split(self) -> bool {
+        self.prefer_split && self.allows_task_split()
+    }
+
+    pub fn for_task_split(self) -> Self {
+        Self {
+            step: OutputLimitStep::Split {
+                lower_effort: self.is_convergence() && !self.prefer_split,
+            },
+            ..self
+        }
+    }
+
+    fn lowers_effort(self) -> bool {
+        self.controls.effort != ReasoningEffort::Low
+            && !matches!(
+                self.step,
+                OutputLimitStep::Split {
+                    lower_effort: false
+                }
+            )
     }
 
     pub fn with_capped_reasoning_bytes(mut self, bytes: usize) -> Self {
@@ -323,6 +359,10 @@ impl CompletionDiagnostics {
         self.agent_round
     }
 
+    pub(crate) fn is_output_limit_recovery(&self) -> bool {
+        self.recovery.is_some()
+    }
+
     /// The runner leaves room for both an in-flight cutoff and its follow-up.
     pub fn with_reasoning_cutoff_budget(mut self, max_output: u64) -> Self {
         self.cutoff_max_output = Some(max_output);
@@ -331,14 +371,31 @@ impl CompletionDiagnostics {
 
     pub(crate) fn reasoning_cutoff_budget(&self) -> Option<(u64, Option<usize>)> {
         // The final request has already passed its own budget admission.
-        if let Some(retry) = self.recovery.filter(|retry| retry.converge) {
+        if let Some(retry) = self
+            .recovery
+            .filter(|retry| retry.step != OutputLimitStep::LowerEffort)
+        {
             return Some((retry.output_limit(), retry.capped_reasoning_bytes));
         }
-        let next = self.output_limit_recovery().filter(|next| next.converge)?;
+        let next = self
+            .output_limit_recovery()
+            .filter(|next| next.is_convergence() || next.prefers_task_split())?;
         (next.output_limit() <= self.cutoff_max_output?).then_some((
             next.output_limit(),
             self.recovery.and_then(|retry| retry.capped_reasoning_bytes),
         ))
+    }
+
+    pub(crate) fn prefer_task_split(&self) {
+        if let Some(candidate) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recovery
+            .as_mut()
+        {
+            candidate.prefer_split = true;
+        }
     }
 
     pub(crate) fn record_reasoning_cutoff(&self) {
@@ -369,6 +426,11 @@ impl CompletionDiagnostics {
         candidate: Option<OutputLimitRecoveryControls>,
     ) -> Result<bool> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_output_limit_recovery() && state.endpoint.is_some() {
+            return Err(LLMError::RequestFailed(
+                "output-limit recovery permits one provider send per request".into(),
+            ));
+        }
         state.output_limit = output_limit;
         state.changed_protocol |= state.endpoint.is_some_and(|previous| previous != endpoint);
         state.endpoint = Some(endpoint);
@@ -378,21 +440,29 @@ impl CompletionDiagnostics {
                     "Output-limit recovery no longer matches the original request controls".into(),
                 ));
             }
-            state.recovery = (!expected.converge && expected.controls.allows_convergence)
+            state.recovery = (expected.step == OutputLimitStep::LowerEffort
+                && expected.controls.allows_convergence)
                 .then_some(OutputLimitRecovery {
-                    converge: true,
+                    step: OutputLimitStep::Converge,
                     ..expected
                 });
-            return Ok(expected.controls.effort != ReasoningEffort::Low);
+            return Ok(expected.lowers_effort());
         }
         if !state.changed_protocol {
             state.recovery = candidate.and_then(|controls| {
-                let converge = controls.effort == ReasoningEffort::Low;
-                (!converge || controls.allows_convergence).then_some(OutputLimitRecovery {
-                    controls,
-                    converge,
-                    capped_reasoning_bytes: None,
-                })
+                let step = if controls.effort == ReasoningEffort::Low {
+                    OutputLimitStep::Converge
+                } else {
+                    OutputLimitStep::LowerEffort
+                };
+                (step != OutputLimitStep::Converge || controls.allows_convergence).then_some(
+                    OutputLimitRecovery {
+                        controls,
+                        step,
+                        prefer_split: false,
+                        capped_reasoning_bytes: None,
+                    },
+                )
             });
         } else {
             state.recovery = None;

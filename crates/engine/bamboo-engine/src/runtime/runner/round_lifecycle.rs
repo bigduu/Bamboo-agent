@@ -44,14 +44,19 @@ pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
     })
 }
 
-fn rejected_output_limit(output: &StreamHandlingOutput, finish_reason: &str) -> bool {
-    // Responses explicitly marks this terminal frame incomplete, even if it
-    // produced some text. Other protocols already allow text-only truncation.
+fn rejected_output_limit(
+    output: &StreamHandlingOutput,
+    finish_reason: &str,
+    task_split: bool,
+) -> bool {
+    // Responses explicitly marks this frame incomplete. A task split also
+    // requires a complete plan, checkpoint or report on the other protocols.
     matches!(
         finish_reason,
         "max_output_tokens" | REASONING_HEADROOM_FINISH_REASON
     ) || (matches!(finish_reason, "max_tokens" | "length" | "MAX_TOKENS")
-        && (output.content.trim().is_empty()
+        && (task_split
+            || output.content.trim().is_empty()
             || !output.tool_calls.is_empty()
             || output.provider_transcript_items.iter().any(|item| {
                 item.kind().is_discovery()
@@ -203,11 +208,18 @@ pub(crate) struct RoundLlmExecutionOutput {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RoundOutputLimitPolicy {
+pub(crate) struct TaskSplitPrompt<'a> {
+    pub advisory: &'a str,
+    pub private_plan: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoundOutputLimitPolicy<'a> {
     pub retry: Option<OutputLimitRecovery>,
     pub remaining_run_tokens: Option<u64>,
     pub previous_prompt_tokens: u64,
     pub can_cutoff: bool,
+    pub task_split: Option<TaskSplitPrompt<'a>>,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable
@@ -280,7 +292,7 @@ pub(crate) async fn execute_llm_round(
     tool_schemas: &[ToolSchema],
     observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
-    output_limit_recovery: Option<RoundOutputLimitPolicy>,
+    output_limit_recovery: Option<RoundOutputLimitPolicy<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
@@ -290,16 +302,23 @@ pub(crate) async fn execute_llm_round(
     let request_tool_schemas =
         context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
-    let prepared = context_preparation::prepare_round_context(
-        session,
-        config,
-        model_name,
-        session_id,
-        tool_schemas,
-        llm,
-        Some(event_tx),
-    )
-    .await?;
+    let prepared = if output_limit_recovery.is_some_and(|policy| policy.task_split.is_some()) {
+        context_preparation::prepare_task_split_context(
+            session, config, model_name, session_id, llm,
+        )
+        .await?
+    } else {
+        context_preparation::prepare_round_context(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            Some(event_tx),
+        )
+        .await?
+    };
 
     // Use model from config (provided by execute request), not from session.
     let model = config
@@ -347,7 +366,8 @@ pub(crate) async fn execute_llm_round(
         && stream_output.content.trim().is_empty()
         && !openai_client_search_boundary;
     let finish_reason = completion.finish_reason();
-    let output_limited = rejected_output_limit(&stream_output, finish_reason);
+    let task_split = output_limit_recovery.is_some_and(|policy| policy.task_split.is_some());
+    let output_limited = rejected_output_limit(&stream_output, finish_reason, task_split);
     let terminal_validation_error = if output_limited {
         Some(AgentError::OutputTokenLimit {
             finish_reason,
@@ -374,10 +394,9 @@ pub(crate) async fn execute_llm_round(
 
     let completion_tokens =
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
-    // A cap hit with missing usage can spend the whole output allocation on
-    // reasoning. Keep reported usage authoritative and use the observed wire
-    // cap for the estimate that gates any additional request.
-    let estimated_output = if output_limited {
+    // Missing usage on these paths can hide reasoning spend. Keep reported
+    // usage authoritative and reserve the entire wire cap as the fallback.
+    let estimated_output = if output_limited || task_split {
         let reasoning_estimate = estimate_completion_tokens(&stream_output.reasoning_content, &[]);
         completion_tokens
             .saturating_add(reasoning_estimate.max(stream_output.thinking_tokens))
@@ -414,7 +433,9 @@ pub(crate) async fn execute_llm_round(
     ) && stream_output.reasoning_signature.is_none()
         && stream_output.reasoning_content.len() >= 4096
     {
-        if let Some(retry) = output_limit_recovery.filter(|retry| !retry.is_convergence()) {
+        if let Some(retry) = output_limit_recovery
+            .filter(|retry| !retry.is_convergence() || retry.prefers_task_split())
+        {
             if stream_output
                 .provider_usage
                 .and_then(|usage| usage.output_tokens)
