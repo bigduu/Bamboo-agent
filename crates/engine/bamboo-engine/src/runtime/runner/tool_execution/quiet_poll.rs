@@ -54,6 +54,47 @@ fn poll_args(call: &ToolCall) -> Option<(String, bool)> {
     Some((id.to_owned(), chars.is_empty() && !eof))
 }
 
+fn observe_poll(
+    call: &ToolCall,
+    outcome: &ToolExecutionOutcome,
+    admitted: Option<&str>,
+) -> Option<(String, Option<serde_json::Value>)> {
+    let identity = outcome
+        .portable_tool
+        .as_ref()
+        .map(|tool| tool.execution_name())
+        .or(admitted);
+    if identity != Some("write_stdin") || !outcome.post_tool_hook_eligible {
+        return None;
+    }
+    let (id, empty_poll) = poll_args(call)?;
+    let quiet_result = outcome
+        .result
+        .as_ref()
+        .ok()
+        .filter(|result| empty_poll && result.success && result.images.is_empty())
+        .and_then(|result| serde_json::from_str::<serde_json::Value>(&result.result).ok())
+        .filter(|value| {
+            value["session_id"].as_str() == Some(id.as_str())
+                && value["status"] == "running"
+                && value["polling"]["exit_observed"] == false
+                && value["output"] == ""
+                && value
+                    .get("output_omitted_bytes")
+                    .is_none_or(|v| v.as_u64() == Some(0))
+        });
+    Some((id, quiet_result))
+}
+
+pub(super) fn empty_running_poll_handle(
+    call: &ToolCall,
+    outcome: &ToolExecutionOutcome,
+    admitted: Option<&str>,
+) -> Option<String> {
+    let (handle, result) = observe_poll(call, outcome, admitted)?;
+    result.map(|_| handle)
+}
+
 impl QuietPollGuard {
     pub(super) fn observe(
         &mut self,
@@ -61,40 +102,18 @@ impl QuietPollGuard {
         outcome: &ToolExecutionOutcome,
         admitted: Option<&str>,
     ) {
-        let identity = outcome
-            .portable_tool
-            .as_ref()
-            .map(|tool| tool.execution_name())
-            .or(admitted);
-        if identity != Some("write_stdin") || !outcome.post_tool_hook_eligible {
-            return;
-        }
-        let Some((id, empty_poll)) = poll_args(call) else {
+        let Some((id, raw)) = observe_poll(call, outcome, admitted) else {
             return;
         };
-        let raw = outcome
-            .result
-            .as_ref()
-            .ok()
-            .filter(|result| result.success && result.images.is_empty())
-            .and_then(|result| serde_json::from_str::<serde_json::Value>(&result.result).ok());
-        let quiet = empty_poll
-            && raw.as_ref().is_some_and(|value| {
-                value["session_id"].as_str() == Some(id.as_str())
-                    && value["status"] == "running"
-                    && value["polling"]["exit_observed"] == false
-                    && value["polling"]["elapsed_ms"].as_u64().is_some()
-                    && value["output"] == ""
-                    && value
-                        .get("output_omitted_bytes")
-                        .is_none_or(|v| v.as_u64() == Some(0))
-                    && value["polling"]["output_idle_ms"]
-                        .as_u64()
-                        .is_some_and(|ms| ms >= SILENCE_MS)
-                    && value["polling"]["consecutive_empty_readouts"]
-                        .as_u64()
-                        .is_some_and(|n| n >= 3)
-            });
+        let quiet = raw.as_ref().is_some_and(|value| {
+            value["polling"]["elapsed_ms"].as_u64().is_some()
+                && value["polling"]["output_idle_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= SILENCE_MS)
+                && value["polling"]["consecutive_empty_readouts"]
+                    .as_u64()
+                    .is_some_and(|n| n >= 3)
+        });
         if !quiet {
             self.forget_handle(&id);
             return;

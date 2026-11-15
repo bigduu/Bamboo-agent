@@ -1485,10 +1485,10 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
 }
 
 #[test]
-fn default_models_use_foreground_bash_and_resident_view_image() {
+fn default_models_use_yielding_shell_and_resident_view_image() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = bamboo_tools::BuiltinToolExecutor::new();
-    let session = Session::new("foreground-bash-catalog", "model");
+    let session = Session::new("yielding-shell-catalog", "model");
     let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
     let discovery =
         crate::capability_discovery::project_classified_tool_capability_metadata(&catalog);
@@ -1502,14 +1502,10 @@ fn default_models_use_foreground_bash_and_resident_view_image() {
             mode,
             ["exec_command", "write_stdin", "default::write_stdin"],
         );
-        assert!(callable.contains_execution_name("bash"));
+        assert!(callable.contains_execution_name("exec_command"));
+        assert!(callable.contains_execution_name("write_stdin"));
         assert!(callable.contains_execution_name("ViewImage"));
-        for retired in [
-            "Bash",
-            "exec_command",
-            "write_stdin",
-            "default::write_stdin",
-        ] {
+        for retired in ["Bash", "bash"] {
             assert!(
                 callable.resolve_callable_reference(retired).is_none(),
                 "{retired}"
@@ -1530,8 +1526,8 @@ fn default_models_use_foreground_bash_and_resident_view_image() {
         .iter()
         .find(|section| section.name == "tool_guide")
         .unwrap();
-    assert!(!guide.content.contains("write_stdin"));
-    assert!(!guide.content.contains("exec_command"));
+    assert!(guide.content.contains("write_stdin"));
+    assert!(guide.content.contains("exec_command"));
 
     for disabled in ["bash", "Bash", "exec_command"] {
         let config = crate::runtime::config::AgentLoopConfig {
@@ -1546,6 +1542,18 @@ fn default_models_use_foreground_bash_and_resident_view_image() {
             )),
             "{disabled}"
         );
+    }
+    for disabled in ["write_stdin", "BashOutput"] {
+        let config = crate::runtime::config::AgentLoopConfig {
+            disabled_tools: [disabled.into()].into(),
+            ..Default::default()
+        };
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+        assert!(schemas.iter().any(|schema| schema.function.name == "bash"));
+        assert!(!schemas.iter().any(|schema| matches!(
+            schema.function.name.as_str(),
+            "exec_command" | "write_stdin"
+        )));
     }
 }
 

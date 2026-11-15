@@ -313,8 +313,17 @@ fn resolve_catalog_with_activation(
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     if tools.execution_contract_for_exact("bash") == Some(FOREGROUND_BASH_EXECUTION_CONTRACT) {
-        by_execution_name.remove("exec_command");
-        by_execution_name.remove("write_stdin");
+        let yielding_shell = ["exec_command", "write_stdin"].into_iter().all(|name| {
+            by_execution_name.contains_key(name) && session.allows_model_tool_execution(name)
+        });
+        // A yielded handle needs both tools. Preserve existing shell denials
+        // when switching the default surface from foreground to yielding.
+        if yielding_shell && !disabled_execution_names.contains("bash") {
+            by_execution_name.remove("bash");
+        } else {
+            by_execution_name.remove("exec_command");
+            by_execution_name.remove("write_stdin");
+        }
     }
     retain_legacy_plan_exit(session, &mut by_execution_name);
     // Root and Child models delegate through the logical SubAgent facade. Keep the

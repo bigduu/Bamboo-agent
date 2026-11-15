@@ -77,7 +77,6 @@ pub async fn continue_empty_poll(
         .filter(|requested| *requested > yield_duration(Some(*requested)))
     {
         Some(requested) => remaining.min(Duration::from_millis(requested).saturating_sub(elapsed)),
-        None if result["polling"]["state"] == "needs_diagnosis" => remaining,
         None => Duration::ZERO,
     };
     let deadline = if wait.is_zero() {
@@ -131,7 +130,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Wait on the session_id returned by exec_command. Empty chars reads output and the actual exit status. If the command is still running and its result is needed, continue with the same session_id and request a longer yield_time_ms. Nonempty chars writes exact bytes to an interactive stdin pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the command. A terminal result carries status and any exit code."
+        "Wait on the session_id returned by exec_command. Empty chars reads output and the actual exit status. After three empty polls, assess whether to diagnose the command or continue other work. An unattended Root can wait for the terminal result when its next action is only another empty poll of the same command with closed stdin. Nonempty chars writes exact bytes to an interactive stdin pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the command. A terminal result carries status and any exit code."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

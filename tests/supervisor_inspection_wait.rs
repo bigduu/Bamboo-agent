@@ -102,14 +102,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     probe.requests.lock().unwrap().push(body.clone());
     let (delta, finish) = if body["model"] == "wait-child" {
         if !has_tool_result(&body, "verifier-command") {
-            // Hold an actual foreground command, not only a provider response.
+            // Hold an actual shell command while the parent is quiescent.
             // The test releases its file after proving the parent is quiescent.
             let index = usize::from(has(&body, "second non-overlapping acceptance"));
             let command = format!("touch verifier-started-{index}; while [ ! -f verifier-release ]; do sleep 0.05; done; printf 'verified\\n'");
             call(
                 "verifier-command",
-                "bash",
-                json!({"command":command,"timeout":30}),
+                "exec_command",
+                json!({"cmd":command,"workdir":probe.workspace,"yield_time_ms":30000,"max_output_tokens":256}),
             )
         } else if matches!(probe.case, Case::Failed) {
             return HttpResponse::BadRequest().json(json!({"error":{"type":"invalid_request_error","message":"controlled verifier provider failure"}}));
@@ -587,7 +587,7 @@ async fn fixture(case: Case, ultra: bool) {
         assert!(child.messages.iter().any(|m| m
             .tool_calls
             .as_ref()
-            .is_some_and(|calls| calls.iter().any(|c| c.function.name == "bash"))));
+            .is_some_and(|calls| calls.iter().any(|c| c.function.name == "exec_command"))));
     }
     post(
         &client,

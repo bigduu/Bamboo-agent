@@ -309,13 +309,13 @@ impl Fixture {
             tool_type: "function".into(),
             function: FunctionCall {
                 name: if permission {
-                    "bash"
+                    "exec_command"
                 } else {
                     "fixture_clarification"
                 }
                 .into(),
                 arguments: if permission {
-                    json!({"command":"echo followup-permission-probe"})
+                    json!({"cmd":"echo followup-permission-probe"})
                 } else {
                     json!({"question":"Which original option?", "options":["A","B"]})
                 }
