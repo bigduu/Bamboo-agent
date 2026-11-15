@@ -248,20 +248,21 @@ async fn run_compatible(
 
 #[tokio::test]
 async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded() {
-    for (compatible, effort, plan_index, wire_effort) in [
-        (true, ReasoningEffort::Medium, 1, "medium"),
-        (true, ReasoningEffort::Low, 1, "low"),
-        (false, ReasoningEffort::Medium, 3, "low"),
+    for (compatible, effort, wire_effort) in [
+        (true, ReasoningEffort::Medium, Some("medium")),
+        (true, ReasoningEffort::Low, Some("low")),
+        (false, ReasoningEffort::Medium, Some("medium")),
+        (false, ReasoningEffort::Disabled, None),
     ] {
-        let mut replies = vec![limit(); plan_index];
         let plan = r#"["Inspect one fixture","Verify one observation","Record the evidence"]"#;
-        replies.extend([
+        let replies = vec![
+            limit(),
             text(plan),
             tool("step_a", 8),
             tool("step_b", 9),
             text("CHECKPOINT: The tool results confirm the fixture and observation."),
             text("Final verified report."),
-        ]);
+        ];
         let run = run(
             Protocol::Messages { compatible },
             effort,
@@ -271,10 +272,14 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
         .await;
         assert!(run.result.unwrap());
         assert_eq!(run.tool_count, 2);
-        let stages = &run.requests[plan_index..];
+        let stages = &run.requests[1..];
         for (i, body) in stages.iter().enumerate() {
             assert_eq!(body["max_tokens"], CAP);
-            assert_eq!(body["output_config"]["effort"], wire_effort);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                wire_effort
+            );
             let messages = body["messages"].to_string();
             assert!(messages.contains("Verified prerequisite."));
             assert!(!messages.contains("Incomplete reasoning only."));
@@ -308,10 +313,76 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
             run.usage.total_prompt_tokens,
             31 * run.requests.len() as u64
         );
-        assert_eq!(
-            run.usage.total_completion_tokens,
-            CAP * plan_index as u64 + 38
-        );
+        assert_eq!(run.usage.total_completion_tokens, CAP + 38);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_closes_unsigned_messages_before_the_limit_without_thinking_controls() {
+    let mut frames = vec![
+        json!({"type":"message_start","message":{"usage":{"input_tokens":31,
+            "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+    ];
+    frames.extend((0..4).map(|_| {
+        json!({
+            "type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":" a".repeat(1_000)}
+        })
+    }));
+    frames.push(json!({"type":"error","error":{"message":"stream was read past the cutoff"}}));
+    let run = run(
+        Protocol::Messages { compatible: false },
+        ReasoningEffort::Disabled,
+        vec![
+            mock_completion_sse(&frames),
+            text("[]"),
+            text("Completed from the earlier result."),
+        ],
+        Default::default(),
+    )
+    .await;
+    assert!(run.result.unwrap());
+    assert_eq!(run.usage.total_completion_tokens, CAP + 14);
+    for body in &run.requests {
+        assert!(body.get("thinking").is_none());
+        let messages = body["messages"].to_string();
+        assert!(messages.contains("Verified prerequisite."));
+        assert!(!messages.contains(&" a".repeat(100)));
+    }
+}
+
+#[tokio::test]
+async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_tool() {
+    let opaque = mock_completion_sse(&[
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let provisional = mock_messages_completion(
+        json!({"type":"tool_use","id":"provisional","name":"fixture_tool","input":{}}),
+        json!({"type":"input_json_delta","partial_json":"{}"}),
+        "max_tokens",
+        Some(CAP),
+    );
+    for reply in [opaque, provisional] {
+        let run = run(
+            Protocol::Messages { compatible: false },
+            ReasoningEffort::Disabled,
+            vec![
+                reply,
+                text(r#"["Check the fixture once"]"#),
+                tool("complete", 8),
+                text("Completed from the confirmed results."),
+            ],
+            Default::default(),
+        )
+        .await;
+        assert!(run.result.unwrap());
+        assert_eq!(run.tool_count, 1);
+        let report = run.requests[3]["messages"].to_string();
+        assert!(report.contains("Verified prerequisite."));
+        assert!(report.contains("confirmed result for complete"));
+        assert!(!report.contains("provisional"));
     }
 }
 
@@ -356,11 +427,6 @@ async fn pipeline_output_limit_split_stops_at_token_and_round_limits() {
 #[tokio::test]
 async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
     for (reply, reason) in [
-        (limit(), "output token limit"),
-        (
-            message_text("[]", "max_tokens", Some(CAP)),
-            "output token limit",
-        ),
         (text(r#"["one","two","three","four"]"#), "plan was invalid"),
         (
             tool("plan_must_not_execute", 8),
@@ -375,6 +441,49 @@ async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
         );
         assert_eq!(run.tool_count, 0);
         assert_eq!(run.session.messages.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_uses_one_confirmed_action_after_a_capped_recovery_plan() {
+    for step_completes in [true, false] {
+        let mut replies = vec![
+            limit(),
+            message_text(r#"["Discard this partial plan"#, "max_tokens", Some(CAP)),
+        ];
+        if step_completes {
+            replies.extend([
+                tool("step_retained", 8),
+                text("Completed from the confirmed tools."),
+            ]);
+        } else {
+            replies.push(limit());
+        }
+        let run = run_compatible(replies, Default::default()).await;
+        let work_request = run.requests[2]["messages"].to_string();
+        assert!(work_request.contains("next useful unfinished action"));
+        assert!(work_request.contains("Verified prerequisite."));
+        assert!(!work_request.contains("Discard this partial plan"));
+        if step_completes {
+            assert!(run.result.unwrap());
+            assert_eq!(run.tool_count, 1);
+            assert!(run.requests[3]["messages"]
+                .to_string()
+                .contains("confirmed result for step_retained"));
+            assert_eq!(run.usage.total_completion_tokens, 2 * CAP + 15);
+        } else {
+            assert!(matches!(
+                run.result,
+                Err(AgentError::OutputTokenLimit { .. })
+            ));
+            assert_eq!(run.tool_count, 0);
+            assert_eq!(run.usage.total_completion_tokens, 3 * CAP);
+            assert!(run
+                .session
+                .messages
+                .iter()
+                .any(|message| message.content == "Verified prerequisite."));
+        }
     }
 }
 
@@ -397,7 +506,7 @@ async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_
         .await;
         assert!(run.result.unwrap_err().to_string().contains(status));
         assert_eq!(run.tool_count, 0);
-        assert_eq!(run.requests[1]["output_config"]["effort"], "low");
+        assert_eq!(run.requests[1]["output_config"]["effort"], effort.as_str());
     }
 }
 

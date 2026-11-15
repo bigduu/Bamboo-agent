@@ -138,6 +138,12 @@ forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 `target_provider` to select `openai`, `anthropic` or `gemini`.
 
+An Anthropic-compatible Messages route can close an unsigned reasoning stream
+near its output limit and resume from completed tool results. The
+`thinking_replay_always` option controls history replay independently.
+Recovery keeps pinned reasoning settings and requires a known output cap,
+remaining run budget and a request that uses only client-managed tools.
+
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
 The raw session identifier is never serialized into the provider request, and

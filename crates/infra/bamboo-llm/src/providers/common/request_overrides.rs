@@ -172,27 +172,27 @@ pub(crate) fn mask_and_prepare_agent_request(
             .is_none(),
         _ => true,
     };
-    let candidate = effort
-        .zip(limit)
+    let candidate = limit
         .filter(|_| {
-            native_control
-                && client_tools_only(endpoint, body)
-                && !crate::retry::work_request_budget_active()
+            client_tools_only(endpoint, body) && !crate::retry::work_request_budget_active()
         })
-        .and_then(|(effort, output_limit)| {
+        .and_then(|output_limit| {
             let patches = overrides.map(|config| resolve_scope(config, endpoint, Some(model)));
             let mut patches = patches.iter().flat_map(|scope| &scope.body_patch);
             let effort_segments = parse_path(effort_path);
             let control_is_pinned = patches.clone().any(|patch| {
                 let path = parse_path(&patch.path);
                 patches_reasoning_control(endpoint, &path)
-                    && !(effort == ReasoningEffort::Low && path == effort_segments)
+                    && !(effort == Some(ReasoningEffort::Low) && path == effort_segments)
             });
-            if control_is_pinned
-                || (effort != ReasoningEffort::Low && masking.apply_masking(low) != low)
-            {
-                return None;
-            }
+            // Altering effort and resuming unfinished work have separate
+            // prerequisites. A custom gateway can keep reasoning even when the
+            // operator removes, pins or replaces its reasoning controls.
+            let lowerable_effort = effort.filter(|effort| {
+                native_control
+                    && !control_is_pinned
+                    && (*effort == ReasoningEffort::Low || masking.apply_masking(low) == low)
+            });
             let (prompt_key, candidate_count) = match endpoint {
                 ENDPOINT_CHAT_COMPLETIONS => ("messages", body.get("n")),
                 ENDPOINT_MESSAGES => ("messages", None),
@@ -209,7 +209,7 @@ pub(crate) fn mask_and_prepare_agent_request(
                 == OUTPUT_LIMIT_CONVERGENCE_HINT;
             Some(OutputLimitRecoveryControls {
                 endpoint,
-                effort,
+                lowerable_effort,
                 output_limit,
                 allows_convergence,
             })
@@ -635,6 +635,68 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[tokio::test]
+    async fn messages_reasoning_overrides_are_preserved_on_task_split() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (path, op, value) in [
+            ("thinking", "remove", Value::Null),
+            (
+                "thinking",
+                "set",
+                json!({"type":"enabled","budget_tokens":1024}),
+            ),
+            ("output_config.effort", "set", json!("medium")),
+        ] {
+            let overrides = serde_json::from_value::<RequestOverridesConfig>(json!({
+                "common":{"body_patch":[{"path":path,"op":op,"value":value}]}
+            }))
+            .unwrap();
+            let mut body = json!({
+                "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}
+            });
+            apply_overrides_to_body(
+                &mut body,
+                Some(&overrides),
+                ENDPOINT_MESSAGES,
+                Some("fixture"),
+            );
+            let expected = body.clone();
+            let dispatch = |diagnostics, mut body| {
+                let overrides = &overrides;
+                async move {
+                    scope_completion_diagnostics(diagnostics, async {
+                        mask_and_prepare_agent_request(
+                            &mut body,
+                            &Default::default(),
+                            Some(overrides),
+                            ENDPOINT_MESSAGES,
+                            "fixture",
+                        )
+                        .unwrap();
+                        body
+                    })
+                    .await
+                }
+            };
+            let diagnostics =
+                CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            assert_eq!(dispatch(diagnostics.clone(), body.clone()).await, expected);
+            let split = diagnostics.output_limit_recovery().unwrap();
+            assert!(split.prefers_task_split(), "{path}");
+            assert_eq!(diagnostics.reasoning_cutoff_budget(), Some((4096, None)));
+            assert_eq!(
+                dispatch(
+                    CompletionDiagnostics::for_agent_round(Some(split.for_task_split())),
+                    body
+                )
+                .await,
+                expected,
+            );
+        }
+    }
 
     #[tokio::test]
     async fn provider_tools_disable_all_output_limit_recovery() {

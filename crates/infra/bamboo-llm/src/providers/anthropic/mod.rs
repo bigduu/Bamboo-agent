@@ -590,16 +590,17 @@ impl AnthropicProvider {
         }
 
         let completion_diagnostics = crate::provider::current_completion_diagnostics();
-        let compatibility_reasoning =
-            self.thinking_replay_always && !is_official_anthropic_base_url(&self.base_url);
-        if compatibility_reasoning {
+        // A compatible gateway can enforce reasoning without advertising it
+        // on the request. Its cutoff must not depend on replaying old thinking.
+        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
+        if compatible_gateway {
             if let Some(diagnostics) = completion_diagnostics.as_ref() {
                 diagnostics.prefer_task_split();
             }
         }
         let reasoning_cutoff = completion_diagnostics
             .as_ref()
-            .filter(|_| compatibility_reasoning)
+            .filter(|_| compatible_gateway)
             .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
             .filter(|(limit, _)| *limit >= 4096)
             .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));

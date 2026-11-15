@@ -449,7 +449,32 @@ pub(crate) async fn execute_llm_round(
     } else {
         canonical_attempt_usage(&stream_output, prompt_tokens, estimated_output)
     };
-    let mut output_limit_recovery = completion.output_limit_recovery();
+    let mut output_limit_recovery = completion.output_limit_recovery().filter(|retry| {
+        if matches!(
+            terminal_validation_error,
+            Some(AgentError::OutputTokenLimit {
+                reasoning_only: true,
+                ..
+            })
+        ) {
+            return true;
+        }
+        // A compatible Messages gateway can hide its thinking or leave a
+        // provisional client tool call at the cap. The entire attempted turn
+        // is discarded. Start a new bounded phase only without provider work.
+        output_limited
+            && finish_reason == "max_tokens"
+            && retry.allows_truncated_messages_split()
+            && !completion.saw_provider_tool()
+            && stream_output.provider_transcript_items.iter().all(|item| {
+                matches!(
+                    item.kind(),
+                    ProviderTranscriptItemKind::AnthropicThinking
+                        | ProviderTranscriptItemKind::AnthropicRedactedThinking
+                        | ProviderTranscriptItemKind::AnthropicToolUse
+                )
+            })
+    });
     if matches!(
         terminal_validation_error,
         Some(AgentError::OutputTokenLimit {

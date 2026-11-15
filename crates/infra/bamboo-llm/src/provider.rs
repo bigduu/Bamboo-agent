@@ -271,7 +271,7 @@ enum OutputLimitStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputLimitRecoveryControls {
     pub(crate) endpoint: &'static str,
-    pub(crate) effort: ReasoningEffort,
+    pub(crate) lowerable_effort: Option<ReasoningEffort>,
     pub(crate) output_limit: u64,
     pub(crate) allows_convergence: bool,
 }
@@ -293,6 +293,11 @@ impl OutputLimitRecovery {
         self.prefer_split && self.allows_task_split()
     }
 
+    pub fn allows_truncated_messages_split(self) -> bool {
+        self.controls.endpoint == crate::providers::common::request_overrides::ENDPOINT_MESSAGES
+            && self.prefers_task_split()
+    }
+
     pub fn for_task_split(self) -> Self {
         Self {
             step: OutputLimitStep::Split {
@@ -303,7 +308,9 @@ impl OutputLimitRecovery {
     }
 
     fn lowers_effort(self) -> bool {
-        self.controls.effort != ReasoningEffort::Low
+        self.controls
+            .lowerable_effort
+            .is_some_and(|effort| effort != ReasoningEffort::Low)
             && !matches!(
                 self.step,
                 OutputLimitStep::Split {
@@ -508,7 +515,10 @@ impl CompletionDiagnostics {
         }
         if !state.changed_protocol {
             state.recovery = candidate.and_then(|controls| {
-                let step = if controls.effort == ReasoningEffort::Low {
+                let step = if controls
+                    .lowerable_effort
+                    .is_none_or(|effort| effort == ReasoningEffort::Low)
+                {
                     OutputLimitStep::Converge
                 } else {
                     OutputLimitStep::LowerEffort
@@ -517,7 +527,7 @@ impl CompletionDiagnostics {
                     OutputLimitRecovery {
                         controls,
                         step,
-                        prefer_split: false,
+                        prefer_split: controls.lowerable_effort.is_none(),
                         capped_reasoning_bytes: None,
                     },
                 )

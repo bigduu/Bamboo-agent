@@ -162,6 +162,14 @@ impl SplitRecovery {
         Ok(())
     }
 
+    pub fn continue_after_truncated_plan(&mut self) {
+        debug_assert!(matches!(self.phase, Phase::Plan));
+        self.phase = Phase::Work(VecDeque::from([
+            "Complete the next useful unfinished action. If all work is done, confirm it from the evidence."
+                .into(),
+        ]));
+    }
+
     pub fn finish_step(&mut self, successful: bool) {
         let Phase::Work(steps) = &mut self.phase else {
             return;
