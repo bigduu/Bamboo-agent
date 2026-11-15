@@ -1,0 +1,192 @@
+name: Publish Bamboo CLI to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Verify package, stage the first version, or publish through npm OIDC
+        type: choice
+        options:
+          - verify
+          - stage
+          - publish
+        default: verify
+        required: true
+      version:
+        description: Published Bamboo version without v
+        required: true
+        type: string
+      source:
+        description: Exact frozen Bamboo source SHA
+        required: true
+        type: string
+      publisher_run_id:
+        description: Original successful Publish Crate run ID
+        required: true
+        type: string
+      publisher_attempt:
+        description: Successful publisher attempt
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bamboo-npm-publication
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify release and prepare npm package
+    if: github.repository == 'bigduu/Bamboo-agent' && github.ref == 'refs/heads/dev' && github.ref_protected
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      artifact: ${{ steps.pack.outputs.artifact }}
+      version: ${{ steps.pack.outputs.version }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      integrity: ${{ steps.pack.outputs.integrity }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - &npm-toolchain
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - &npm-cli
+        name: Select npm CLI
+        run: npm install --global npm@11.20.0 --ignore-scripts --no-audit --no-fund
+      - name: Read the completed release and assemble its npm package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
+          INPUT_PUBLISHER_ATTEMPT: ${{ inputs.publisher_attempt }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/npm-release.py "$RUNNER_TEMP/bamboo-npm-package"
+      - name: Verify package contents and retain the npm archive for upload
+        id: pack
+        env:
+          OPERATION: ${{ inputs.operation }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/bamboo-npm-package"
+          archive="$RUNNER_TEMP/bamboo-npm-archive"
+          metadata="$RUNNER_TEMP/bamboo-npm-pack.json"
+          if [[ "$OPERATION" == verify ]]; then
+            npm pack "$package" --dry-run --json --ignore-scripts > "$metadata"
+          else
+            mkdir "$archive"
+            npm pack "$package" --pack-destination "$archive" --json --ignore-scripts > "$metadata"
+          fi
+          filename="bigduu-bamboo-agent-$VERSION.tgz"
+          jq -e --arg version "$VERSION" --arg filename "$filename" '
+            length == 1 and .[0].name == "@bigduu/bamboo-agent" and .[0].version == $version and
+            .[0].filename == $filename and
+            ([.[0].files[].path] | sort) == [
+              "LICENSE", "README.md", "bamboo-sidecars-v3.json", "bin/bamboo.cjs",
+              "browser-runtime/host.cjs", "browser-runtime/package-lock.json", "browser-runtime/package.json",
+              "package.json"
+            ]
+          ' "$metadata" > /dev/null
+          if [[ "$OPERATION" != verify ]]; then
+            sha="$(sha256sum "$archive/$filename" | cut -d' ' -f1)"
+            integrity="$(jq -er '.[0].integrity | select(test("^sha512-[A-Za-z0-9+/]{86}==$"))' "$metadata")"
+            {
+              printf 'artifact=bamboo-npm-%s-attempt-%s\n' "$VERSION" "$GITHUB_RUN_ATTEMPT"
+              printf 'version=%s\nsha256=%s\nintegrity=%s\n' "$VERSION" "$sha" "$integrity"
+            } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Retain the original npm archive
+        if: inputs.operation != 'verify'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ steps.pack.outputs.artifact }}
+          path: ${{ runner.temp }}/bamboo-npm-archive/*.tgz
+          if-no-files-found: error
+
+  stage:
+    name: Stage the first npm version
+    if: inputs.operation == 'stage'
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    steps:
+      - *npm-toolchain
+      - *npm-cli
+      - &download-archive
+        name: Restore the prepared npm archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact }}
+          path: ${{ runner.temp }}/bamboo-npm-archive
+      - &verify-archive
+        name: Check the prepared archive SHA-256
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.prepare.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          tarball="$RUNNER_TEMP/bamboo-npm-archive/bigduu-bamboo-agent-$VERSION.tgz"
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$tarball" | sha256sum --check --strict
+          printf 'NPM_TARBALL=%s\n' "$tarball" >> "$GITHUB_ENV"
+      - name: Stage on npm for maintainer approval
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.BAMBOO_NPM_STAGE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
+            echo "::error::Configure BAMBOO_NPM_STAGE_TOKEN in the bamboo-release environment"
+            exit 1
+          fi
+          npm stage publish "$NPM_TARBALL" --access public --tag latest --ignore-scripts --json
+
+  publish:
+    name: Publish with npm Trusted Publishing
+    if: inputs.operation == 'publish'
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - *npm-toolchain
+      - *npm-cli
+      - *download-archive
+      - *verify-archive
+      - name: Publish and verify the exact npm version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          INTEGRITY: ${{ needs.prepare.outputs.integrity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! npm publish "$NPM_TARBALL" --access public --tag latest --provenance --ignore-scripts; then
+            echo "Checking the exact registry version after the publish error"
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "@bigduu/bamboo-agent@$VERSION" dist.integrity --json --fetch-retries=0 2>/dev/null |
+              jq -e --arg integrity "$INTEGRITY" '. == $integrity' > /dev/null; then
+              echo "Verified @bigduu/bamboo-agent@$VERSION on npm"
+              exit 0
+            fi
+            if [[ "$attempt" != 6 ]]; then sleep 5; fi
+          done
+          echo "::error::npm did not confirm the prepared archive integrity"
+          exit 1
