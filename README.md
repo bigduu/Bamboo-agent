@@ -39,6 +39,19 @@ agent task completion. It is not a recording of the published desktop package.
 
 ### Install
 
+#### Bodhi desktop app
+
+Bodhi includes the Bamboo runtime. The terminal installer supports Apple Silicon
+Macs running macOS 13.5 or later and Linux x64 distributions that use APT.
+
+```sh
+curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://bigduu.github.io/Pavilion/install.sh | sh
+```
+
+[Bodhi installation requirements and downloads](https://bigduu.github.io/Pavilion/download?lang=en#terminal-install)
+
+#### Standalone Bamboo
+
 For a published package:
 
 ```bash

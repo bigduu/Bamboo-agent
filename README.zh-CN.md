@@ -39,6 +39,18 @@ Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness �
 
 ### 安装
 
+#### Bodhi 桌面版
+
+Bodhi 内置 Bamboo 运行时。终端安装脚本支持运行 macOS 13.5 或更高版本的 Apple Silicon Mac，以及使用 APT 的 Linux x64 发行版。
+
+```sh
+curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://bigduu.github.io/Pavilion/install.sh | sh
+```
+
+[Bodhi 安装要求与下载](https://bigduu.github.io/Pavilion/download?lang=zh#terminal-install)
+
+#### 独立安装 Bamboo
+
 安装已发布包：
 
 ```bash
