@@ -1,0 +1,29 @@
+{
+  "name": "@bigduu/bamboo-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bamboo agent harness CLI from the official Bamboo release",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigduu/Bamboo-agent.git"
+  },
+  "homepage": "https://github.com/bigduu/Bamboo-agent",
+  "bugs": {
+    "url": "https://github.com/bigduu/Bamboo-agent/issues"
+  },
+  "bin": {
+    "bamboo": "bin/bamboo.cjs"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["arm64", "x64"],
+  "files": ["bin/bamboo.cjs", "bamboo-sidecars-v3.json", "browser-runtime", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org",
+    "tag": "latest"
+  }
+}
