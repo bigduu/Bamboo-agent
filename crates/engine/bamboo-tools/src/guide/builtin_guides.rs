@@ -747,7 +747,7 @@ mod tests {
             .contains("Running results retain session_id"));
         assert!(poll
             .when_to_use
-            .contains("A single unattended Root poll can wait longer"));
+            .contains("can explicitly request a longer wait within the tool deadline"));
         assert!(poll
             .when_to_use
             .contains("A true exit_observed still requires terminal output capture"));
