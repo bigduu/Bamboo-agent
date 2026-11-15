@@ -132,16 +132,9 @@ impl Protocol {
     }
 }
 
-async fn run(
-    protocol: Protocol,
-    effort: ReasoningEffort,
-    replies: Vec<ResponseTemplate>,
-    budget: bamboo_config::RunBudgetConfig,
-) -> Run {
+async fn mount_replies(server: &MockServer, route: &str, replies: Vec<ResponseTemplate>) {
     let count = replies.len();
     let index = AtomicUsize::new(0);
-    let server = MockServer::start().await;
-    let (route, provider) = protocol.provider(&server);
     Mock::given(method("POST"))
         .and(path(route))
         .respond_with(move |_: &Request| {
@@ -152,8 +145,20 @@ async fn run(
                 .unwrap_or_else(|| ResponseTemplate::new(400))
         })
         .expect(count as u64)
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+async fn run(
+    protocol: Protocol,
+    effort: ReasoningEffort,
+    replies: Vec<ResponseTemplate>,
+    budget: bamboo_config::RunBudgetConfig,
+) -> Run {
+    let count = replies.len();
+    let server = MockServer::start().await;
+    let (route, provider) = protocol.provider(&server);
+    mount_replies(&server, route, replies).await;
     let mut config = canonical_usage_pipeline_config();
     let dir = tempfile::tempdir().unwrap();
     config.app_data_dir = Some(dir.path().into());
@@ -405,6 +410,104 @@ async fn pipeline_output_limit_split_stops_on_blocked_or_truncated_work() {
             retained
         );
     }
+}
+
+#[tokio::test]
+async fn output_limit_step_failure_ends_execution_and_next_turn_uses_saved_results() {
+    use crate::runtime::{tests::build_direct_execute_agent, ExecuteRequestBuilder};
+    use bamboo_domain::AgentStatusState;
+
+    let server = MockServer::start().await;
+    let (route, provider) = Protocol::Messages { compatible: true }.provider(&server);
+    mount_replies(
+        &server,
+        route,
+        vec![
+            limit(),
+            text(r#"["Read the fixture","Check the result"]"#),
+            tool("step_retained", 8),
+            limit(),
+            text("Finished using the saved result."),
+        ],
+    )
+    .await;
+    let tools = Arc::new(SplitExecutor::default());
+    let (dir, agent, storage) =
+        build_direct_execute_agent(provider, None, Some(tools.clone())).await;
+    let mut session = Session::new("output-limit-reentry", "model");
+    storage.save_session(&session).await.unwrap();
+    let run_budget = bamboo_config::RunBudgetConfig {
+        max_rounds: Some(4),
+        max_total_tokens: Some(20_000),
+        ..Default::default()
+    };
+    let request = |message, tx| {
+        ExecuteRequestBuilder::new(message, tx, CancellationToken::new())
+            .model("model")
+            .provider_type("anthropic")
+            .reasoning_effort(ReasoningEffort::Medium)
+            .app_data_dir(dir.path().to_path_buf())
+            .run_budget(run_budget)
+            .build()
+    };
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+    let first = tokio::time::timeout(
+        Duration::from_secs(10),
+        agent.execute(&mut session, request("Inspect the fixture.", event_tx)),
+    )
+    .await
+    .expect("the exhausted run must release its execution");
+    assert!(
+        matches!(
+            first,
+            Err(AgentError::OutputTokenLimit {
+                reasoning_only: true,
+                ..
+            })
+        ),
+        "{first:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = event_rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Complete { .. }));
+        }
+    })
+    .await
+    .expect("failed run event stream must close");
+
+    let mut saved = storage.load_session(&session.id).await.unwrap().unwrap();
+    let failed_run = saved.agent_runtime_state.as_ref().unwrap();
+    assert_eq!(failed_run.status, AgentStatusState::Failed);
+    assert!(saved.messages.iter().any(|message| {
+        message.tool_success == Some(true)
+            && message.content == "confirmed result for step_retained"
+    }));
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        agent.execute(
+            &mut saved,
+            request("Continue from the saved result.", event_tx),
+        ),
+    )
+    .await
+    .expect("a new turn must be admitted")
+    .unwrap();
+    let completed = storage.load_session(&session.id).await.unwrap().unwrap();
+    let completed_run = completed.agent_runtime_state.as_ref().unwrap();
+    assert_eq!(completed_run.status, AgentStatusState::Completed);
+    assert_eq!(completed_run.round.total_completion_tokens, 7);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    let body: Value = requests[4].body_json().unwrap();
+    assert!(body["messages"]
+        .to_string()
+        .contains("confirmed result for step_retained"));
+    assert_eq!(tools.0.load(Ordering::SeqCst), 1);
+    assert!(std::iter::from_fn(|| event_rx.try_recv().ok())
+        .any(|event| matches!(event, AgentEvent::Complete { .. })));
 }
 
 #[tokio::test]
