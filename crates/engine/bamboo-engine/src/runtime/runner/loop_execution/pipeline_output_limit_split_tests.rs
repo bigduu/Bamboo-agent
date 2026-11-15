@@ -85,6 +85,7 @@ enum Protocol {
     Chat,
     Responses,
     Gemini,
+    BodhiGemini,
 }
 
 impl Protocol {
@@ -125,6 +126,15 @@ impl Protocol {
                 Arc::new(
                     bamboo_llm::GeminiProvider::new("test-key")
                         .with_base_url(server.uri())
+                        .with_client(client),
+                ),
+            ),
+            Protocol::BodhiGemini => (
+                "/proxy/gemini/v1beta/models/model:streamGenerateContent",
+                Arc::new(
+                    bamboo_llm::providers::BodhiProvider::new("test-key")
+                        .with_base_url(server.uri())
+                        .with_target_provider("gemini")
                         .with_client(client),
                 ),
             ),
@@ -479,6 +489,24 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
 }
 
 #[tokio::test]
+async fn pipeline_output_limit_split_counts_separate_gemini_proxy_reasoning() {
+    let run = run(
+        Protocol::BodhiGemini,
+        ReasoningEffort::Low,
+        vec![mock_completion_sse(&[json!({
+            "type":"chunk","candidates":[{"content":{"parts":[{"text":"Thinking","thought":true}]},"finishReason":"MAX_TOKENS"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":8000}
+        })])],
+        bamboo_config::RunBudgetConfig { max_total_tokens: Some(8000), ..Default::default() },
+    ).await;
+    assert!(matches!(
+        run.result,
+        Err(AgentError::OutputTokenLimit { .. })
+    ));
+    assert_eq!(run.usage.total_completion_tokens, 8007);
+}
+
+#[tokio::test]
 async fn pipeline_output_limit_split_stops_on_blocked_or_truncated_work() {
     let blocked = "BLOCKED: The second fixture is missing.";
     let clipped = "CHECKPOINT: The fixture might";
@@ -729,7 +757,7 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
                             "output":[{"id":format!("rs_{id}"),"type":"reasoning","summary":[]}]}})
                     }
                 }
-                Protocol::Gemini => {
+                Protocol::Gemini | Protocol::BodhiGemini => {
                     let (part, reason) = content.map_or(
                         (
                             json!({"text":"Unfinished reasoning","thought":true}),
@@ -738,7 +766,8 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
                         |text| (json!({"text":text}), "STOP"),
                     );
                     json!({"type":"chunk","candidates":[{"content":{"parts":[part]},"finishReason":reason}],
-                        "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7}})
+                        "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":if content.is_some() {7} else {0},
+                            "thoughtsTokenCount":if content.is_some() {0} else {7}}})
                 }
                 Protocol::Messages { .. } => unreachable!(),
             };

@@ -425,6 +425,16 @@ pub(crate) async fn execute_llm_round(
             .saturating_add(stream_output.cache_read_input_tokens);
         let known_output = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
             0
+        } else if completion.legacy_counts_reasoning_separately() {
+            if stream_output.thinking_tokens == 0
+                && !stream_output.reasoning_content.trim().is_empty()
+            {
+                0 // The aggregate is unknown. Use the conservative reserve.
+            } else {
+                stream_output
+                    .output_tokens
+                    .saturating_add(stream_output.thinking_tokens)
+            }
         } else {
             stream_output.output_tokens
         };

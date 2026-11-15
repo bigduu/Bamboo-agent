@@ -432,6 +432,15 @@ impl CompletionDiagnostics {
             .provider_tool_seen
     }
 
+    /// Gemini's legacy usage chunks report candidates and thoughts separately.
+    pub fn legacy_counts_reasoning_separately(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .endpoint
+            == Some(crate::providers::common::request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT)
+    }
+
     /// A recovery step needs a confirmed successful protocol boundary.
     pub fn has_recovery_completion(&self) -> bool {
         use crate::providers::common::request_overrides::{
