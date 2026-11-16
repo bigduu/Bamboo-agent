@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -45,6 +45,21 @@ pub struct InitArgs {
     pub non_interactive: bool,
 }
 
+fn load_init_config(data_dir: &Path) -> Result<(Config, Option<u64>)> {
+    if !bamboo_config::modular_authority_boundary_present(data_dir)? {
+        let legacy = Config::from_data_dir_without_env(Some(data_dir.to_path_buf()));
+        if !legacy.has_provider_instances() {
+            return Ok((legacy, None));
+        }
+        // A hybrid root can still hold credentials for legacy built-in
+        // providers. Use the facade's migration before selecting a new
+        // instance, which commits the canonical provider representation.
+    }
+    let facade = bamboo_config::ConfigFacade::open_or_migrate(data_dir)?;
+    let revision = facade.registry().providers.snapshot().revision;
+    Ok((facade.effective_config(), Some(revision)))
+}
+
 /// `bamboo init` — scaffold/populate `config.json` with a provider + API key.
 ///
 /// Interactive by default (prompts for anything not passed as a flag); with
@@ -58,17 +73,7 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
 
     // A setup write starts from the saved settings and their revision.
-    let (mut config, providers_revision) =
-        if bamboo_config::modular_authority_boundary_present(&data_dir)? {
-            let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir)?;
-            let revision = facade.registry().providers.snapshot().revision;
-            (facade.effective_config(), Some(revision))
-        } else {
-            (
-                Config::from_data_dir_without_env(Some(data_dir.clone())),
-                None,
-            )
-        };
+    let (mut config, providers_revision) = load_init_config(&data_dir)?;
 
     // 1. Provider.
     let provider = match args.provider {
