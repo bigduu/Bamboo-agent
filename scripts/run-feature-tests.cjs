@@ -178,7 +178,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The four additive contexts own their 20 explicitly selected cases.
 // #2772 model metadata and request window regressions use the default LLM
 // packages-2 and Engine packages-3 owners.
-const FEATURE_SOURCE_SHA256 = "6213eb528970b5e8d2d663b7f6076b9ef16576639f4bcf224e6b95d685e23ed1";
+const FEATURE_SOURCE_SHA256 = "8976c6c0e05def2474b17aa464e95cbd92abba6f83d83053b6352e69ae6f9914";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

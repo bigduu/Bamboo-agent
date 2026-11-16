@@ -2727,6 +2727,7 @@ async fn prepare_provider_candidate(
     candidate_config
         .hydrate_provider_credentials_from_store(data_dir)
         .map_err(|_| ProviderCandidateError::invalid("provider credential is unavailable"))?;
+    candidate_config.apply_runtime_provider_metadata_overrides();
     let candidate_registry =
         bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.to_path_buf())
             .await
@@ -3366,7 +3367,8 @@ impl AppState {
         let _io = self.config_io_lock.lock().await;
         ensure_provider_mcp_migration_ready(&self.app_data_dir)
             .map_err(ConfigSectionMutationError::Store)?;
-        let current = self.config.read().await.clone();
+        let mut current = self.config.read().await.clone();
+        current.restore_saved_provider_metadata();
         retain_provider_credentials(current.providers(), &mut providers);
         let mut candidate = current;
         *candidate.providers_mut() = providers.clone();
@@ -3491,7 +3493,8 @@ impl AppState {
                     "provider settings require the modular configuration facade".to_string(),
                 )
             })?;
-            let current = config.read().await.clone();
+            let mut current = config.read().await.clone();
+            current.restore_saved_provider_metadata();
             let mut candidate = current.clone();
             let (provider_intents, provider_instance_intents) = update(&current, &mut candidate)?;
 

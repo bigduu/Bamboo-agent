@@ -104,6 +104,19 @@ bamboo history <session-id>
 bamboo -p "接下来应该读哪些文件？" -s <session-id>
 ```
 
+接入自定义网关时，按网关的 API 协议选 provider，再提供网关上的模型 ID。下面的命令使用 OpenAI 兼容协议，可从空数据目录运行。
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "回复 OK。" --provider openai
+```
+
+Anthropic 和 Gemini 使用同样的变量名规则。长期使用可运行 `bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id` 保存设置。[各 provider 的配置方式与优先级](./docs/config-reference.md#choosing-a-provider-and-model)。
+
+普通模式把推理进度写到 stderr。使用 `--stream-json` 时，stdout 输出 NDJSON 事件流。
+
 Headless 运行使用完整 agent 运行时和已配置的 provider。交互式 `bamboo -p` 因工具权限请求或提问暂停时，请在同一个终端回答提示。浏览器回应和 `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` 面向独立运行的 `bamboo serve` 所拥有的任务，不能解除进程内 headless 任务的等待。不要仅为了跑通示例而关闭权限检查。
 
 还没有密钥？`bamboo -p "ping" --echo` **仅用于传输链路冒烟**：它使用 echo executor 而非 LLM，不证明模型推理或工具任务成功。

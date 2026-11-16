@@ -11,11 +11,10 @@ keys are encrypted automatically — see [Secrets](#secrets-and-masking) below),
 and `bamboo config [--show-secrets]` prints the resolved config. This document
 is for when you need to know exactly what a key does or edit the file by hand.
 
-**Precedence:** `config.json` < environment variables < CLI flags (`bamboo
-serve --port ...` wins over everything). Provider selection specifically is
-`providers.<name>` / `provider_instances.<id>` (file) → `BAMBOO_PROVIDER` /
-`BAMBOO_<PROVIDER>_API_KEY` (env, in-memory only, never persisted) →
-`--provider` (CLI).
+For a field with a runtime override, Bamboo starts with the built-in default,
+loads the saved setting, and applies the documented environment and command
+options. Provider selection, model admission, and path precedence are covered
+below. [Choosing a provider and model](#choosing-a-provider-and-model).
 
 Source of truth for every struct below: `crates/infra/bamboo-config/src/config.rs`
 (`pub struct Config`, around line 1069) unless noted otherwise. Struct field
@@ -104,6 +103,48 @@ not part of Bamboo Issue #597.
 
 New provider instances use OpenAI (including compatible endpoints), Anthropic
 or Gemini. Existing Bodhi gateway configurations remain readable and editable.
+
+### Choosing a provider and model
+
+| Protocol served by the endpoint | `--provider` for the built-in account | Process environment | Built-in base URL | Suggested model from `bamboo init` with the built-in endpoint |
+|---|---|---|---|---|
+| OpenAI-compatible | `openai` | `BAMBOO_OPENAI_API_KEY`, `BAMBOO_OPENAI_BASE_URL`, `BAMBOO_OPENAI_MODEL` | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| Anthropic Messages | `anthropic` | `BAMBOO_ANTHROPIC_API_KEY`, `BAMBOO_ANTHROPIC_BASE_URL`, `BAMBOO_ANTHROPIC_MODEL` | `https://api.anthropic.com/v1` | `claude-sonnet-4-6` |
+| Gemini | `gemini` | `BAMBOO_GEMINI_API_KEY`, `BAMBOO_GEMINI_BASE_URL`, `BAMBOO_GEMINI_MODEL` | `https://generativelanguage.googleapis.com/v1beta` | `gemini-2.0-flash-exp` |
+| Existing Bodhi proxy | Configured instance ID | Configure the existing account in provider settings | `http://localhost:8080` | Configured model, with `target_provider` selecting the upstream protocol |
+
+The protocol follows the API that the gateway serves. For example, a gateway
+serving a Gemini model via OpenAI Chat Completions uses the `openai` row.
+For the native protocols, use the API base path through its version segment,
+such as `/v1` or `/v1beta`. For Bodhi, use the proxy server's root URL and
+set `target_provider` on the instance. Use the model ID accepted by the gateway.
+The base URL must be an absolute HTTP(S) URL without user info, query
+parameters, or fragments. Supply the credential through the API key setting.
+
+| Setting | Saved configuration | Environment | Command line |
+|---|---|---|---|
+| Data directory | Holds Bamboo settings and sessions. The default is `~/.bamboo`. | `BAMBOO_DATA_DIR` | `--data-dir` wins. `--config PATH` supplies a containing directory when the environment variable is unset. |
+| Default provider | `default_provider_instance` (legacy `provider`, which defaults to `anthropic`) | `BAMBOO_PROVIDER` selects the runtime default account. | `bamboo -p ... --provider ID`, or `-m ID:MODEL` for that run. `bamboo init --provider TYPE` saves a built-in provider. |
+| API endpoint | `provider_instances.<id>.base_url` | The matching `*_BASE_URL` overrides the built-in account. | `bamboo init --base-url URL` saves the address. A one-shot run reads it from the account or runtime environment. |
+| Default model | `provider_instances.<id>.model`. With model references enabled, `defaults.chat` sets the chat role. | The matching `*_MODEL` supplies the built-in account's default model. | `bamboo -p ... --provider ID` uses that account's model. `-m ID:MODEL` pins an admitted model. `bamboo init --model MODEL` saves the model. |
+| API key | Encrypted credential store with a reference in provider settings. | The matching `*_API_KEY` supplies a runtime credential. | `bamboo init` prompts for a key. The existing `--api-key` argument also saves it. |
+| Model limits | Set model-specific context and output limits in `model_limits.json`. See [Model limits](#model-limits-model_limitsjson) for the fallback and precedence. | | |
+
+A new custom endpoint needs a model ID. `bamboo init` reuses a saved model when
+updating an account. Headless runs without a model selection use the saved
+session target on resume, or the configured chat/provider default for a new
+session. Keep a custom model in the account's `runtime_models` if that account
+uses an explicit list.
+
+Use the process environment for a one-shot or container launch. API keys,
+base URLs, and model IDs supplied this way are runtime overrides. A fresh data
+directory accepts all three variables without a prewritten configuration. In
+an existing instance layout, `*_BASE_URL` and `*_MODEL` apply to the exact
+built-in ID that has `api_key_from_env: true`. Named accounts keep their saved
+endpoints and models. Use one explicit instance ID per account when storing
+multiple gateways. Update a saved model with
+`bamboo config set provider_instances.work.model your-model-id`.
+[Copyable setup commands](./guides/GETTING_STARTED.md#use-a-custom-gateway).
 
 On upgrade, Bamboo removes GitHub Copilot instances and clears a default provider
 instance that selected one of them. References to those instances remain in
@@ -810,11 +851,9 @@ optional; file config plus built-in defaults cover a fresh install.
 | `BAMBOO_HEADLESS` | Enable headless auth mode. |
 | `BAMBOO_WORKERS` | Actix worker-count override (CLI-level). |
 
-**Provider API keys** (in-memory only — never persisted to `config.json`,
-even after `bamboo config set`; the point is a plaintext-key-free config file
-for Docker/CI/secret-manager deploys):
-
-`BAMBOO_OPENAI_API_KEY`, `BAMBOO_ANTHROPIC_API_KEY`, `BAMBOO_GEMINI_API_KEY`.
+**Provider runtime overrides** use the `BAMBOO_OPENAI`, `BAMBOO_ANTHROPIC`,
+and `BAMBOO_GEMINI` prefixes with the `_API_KEY`, `_BASE_URL`, and `_MODEL`
+suffixes. [Provider variables and account scope](#choosing-a-provider-and-model).
 
 **Memory toggles** (override the matching `memory.*` config field):
 `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`, `BAMBOO_MEMORY_RELEVANT_RECALL`,

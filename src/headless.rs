@@ -602,6 +602,7 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
     // pending question.
     let mut exit: Result<(), String> = Ok(());
     let mut streamed_tokens = false;
+    let mut reasoning_progress = ReasoningProgress::default();
     // `--timeout`: measured from before the FIRST execute, so it covers the
     // whole run wall-clock including any permission-gate round trips across
     // resumed segments below (not reset per segment).
@@ -630,7 +631,7 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                                 if args.stream_json {
                                     println!("{value}");
                                 } else {
-                                    print_server_event(&value, &mut streamed_tokens);
+                                    print_server_event(&value, &mut streamed_tokens, &mut reasoning_progress);
                                 }
                                 match value["type"].as_str().unwrap_or("") {
                                     // `need_clarification` also ends this segment: the
@@ -916,9 +917,36 @@ fn resolve_model_selection(
     })
 }
 
+#[derive(Default)]
+struct ReasoningProgress {
+    chars: usize,
+    last_update: Option<Instant>,
+}
+
+impl ReasoningProgress {
+    fn observe(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        self.chars += content.chars().count();
+        let now = Instant::now();
+        if self
+            .last_update
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        {
+            eprintln!("[thinking: {} chars]", self.chars);
+            self.last_update = Some(now);
+        }
+    }
+}
+
 /// Pretty-print one server event (typed `AgentEvent`, serialized form).
 /// Child (sub-agent) streams are shown indented under a `│` gutter.
-fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
+fn print_server_event(
+    value: &serde_json::Value,
+    streamed_tokens: &mut bool,
+    reasoning_progress: &mut ReasoningProgress,
+) {
     use std::io::Write;
     match value["type"].as_str().unwrap_or("") {
         "token" => {
@@ -926,6 +954,7 @@ fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
             print!("{}", value["content"].as_str().unwrap_or(""));
             let _ = std::io::stdout().flush();
         }
+        "reasoning_token" => reasoning_progress.observe(value["content"].as_str().unwrap_or("")),
         "tool_start" => eprintln!("\n⚙ {}", value["tool_name"].as_str().unwrap_or("tool")),
         "tool_complete" => eprintln!("✔ tool done"),
         "tool_error" => eprintln!("✘ tool error: {}", value["error"].as_str().unwrap_or("")),

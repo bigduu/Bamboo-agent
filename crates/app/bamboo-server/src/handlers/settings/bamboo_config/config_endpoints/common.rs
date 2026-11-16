@@ -199,6 +199,7 @@ pub(super) async fn redacted_config_json(
     app_data_dir: &Path,
 ) -> Result<Value, AppError> {
     let mut config_for_response = config.clone();
+    config_for_response.restore_saved_provider_metadata();
     config_for_response.refresh_proxy_auth_encrypted()?;
     config_for_response.refresh_provider_api_keys_encrypted()?;
     // A secret set earlier in THIS request only exists as plaintext on
