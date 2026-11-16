@@ -2752,6 +2752,8 @@ mod tests {
         TokenBudget {
             max_context_tokens,
             max_output_tokens: max_context_tokens / 4,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,

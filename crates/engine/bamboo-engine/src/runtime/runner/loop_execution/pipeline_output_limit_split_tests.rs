@@ -209,6 +209,11 @@ async fn run_with_executor<T: ToolExecutor + 'static>(
     config.reasoning_effort = effort;
     config.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
     config.run_budget = budget;
+    if matches!(protocol, Protocol::Messages { compatible: true }) {
+        config.legacy_model_limits = Some(json!([{
+            "model_pattern":"model","max_context_tokens":1_000_000,"max_output_tokens":64_000
+        }]));
+    }
     let mut session = Session::new("task-split", "model");
     if matches!(protocol, Protocol::Responses) {
         session

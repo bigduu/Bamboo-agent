@@ -2335,8 +2335,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
         let payload = HookPayload::Compression {
             estimated_tokens: active_tokens,
             usage_percent,
-            max_context_tokens: budget.max_context_tokens,
-            trigger_context_tokens,
+            max_context_tokens: compression_window,
+            trigger_context_tokens: range.trigger_tokens,
             trigger: trigger.to_string(),
             phase: phase_label.to_string(),
         };

@@ -6,7 +6,7 @@ fn all_strategies_use_the_same_output_aware_range() {
         (1_000_000, 32_000, 10_000, None, 800_000, 250_000),
         (200_000, 32_000, 2_000, None, 134_000, 50_000),
         (32_000, 8_000, 1_000, None, 18_400, 8_000),
-        (1_000_000, 64_000, 1_000, Some(8_000), 5_600, 2_000),
+        (1_000_000, 64_000, 1_000, Some(8_000), 6_000, 2_000),
     ] {
         for strategy in [
             ContextManagementStrategy::Summary,
