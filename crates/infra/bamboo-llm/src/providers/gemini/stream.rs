@@ -182,6 +182,10 @@ impl GeminiProviderUsage {
 }
 
 impl GeminiStreamState {
+    pub(crate) fn pending_provider_usage(&self) -> Option<ProviderUsageReplacement> {
+        self.pending_replacement
+    }
+
     /// Generate a unique tool call ID.
     fn generate_tool_id(&mut self) -> String {
         let id = format!("gemini_{}", self.next_tool_id);

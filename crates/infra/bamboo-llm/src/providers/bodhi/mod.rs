@@ -483,7 +483,15 @@ impl BodhiProvider {
                 if let Some(diagnostics) = &completion_diagnostics {
                     diagnostics.observe_sse(event, data);
                 }
-                parse_gemini_sse_event(&mut state, event, data)
+                let chunks = parse_gemini_sse_event(&mut state, event, data)?;
+                if let (Some(diagnostics), Some(usage)) =
+                    (&completion_diagnostics, state.pending_provider_usage())
+                {
+                    // The legacy proxy emits usage at completion. Retain
+                    // observed counts if the agent cuts the stream earlier.
+                    diagnostics.record_pending_usage(usage);
+                }
+                Ok(chunks)
             },
         );
 

@@ -520,6 +520,10 @@ async fn pipeline_detects_reasoning_repetition_on_each_normalized_stream() {
 async fn pipeline_retains_usage_from_the_frame_where_reasoning_is_stopped() {
     const KNOWN_INPUT: u64 = 9321;
     let reasoning = REPEATED_REASONING.repeat(96);
+    let gemini_frame = json!({"type":"chunk","candidates":[{"content":{"parts":[
+        {"thought":true,"text":reasoning} ]}}],
+        "usageMetadata":{"promptTokenCount":KNOWN_INPUT,"candidatesTokenCount":0,
+        "thoughtsTokenCount":9}});
     for (protocol, frame) in [
         (
             Protocol::Chat,
@@ -527,13 +531,8 @@ async fn pipeline_retains_usage_from_the_frame_where_reasoning_is_stopped() {
             {"index":0,"delta":{"reasoning_content":reasoning},"finish_reason":null}],
             "usage":{"prompt_tokens":KNOWN_INPUT,"completion_tokens":9}}),
         ),
-        (
-            Protocol::Gemini,
-            json!({"type":"chunk","candidates":[{"content":{"parts":[
-            {"thought":true,"text":reasoning} ]}}],
-            "usageMetadata":{"promptTokenCount":KNOWN_INPUT,"candidatesTokenCount":0,
-            "thoughtsTokenCount":9}}),
-        ),
+        (Protocol::Gemini, gemini_frame.clone()),
+        (Protocol::BodhiGemini, gemini_frame),
     ] {
         let run = run(
             protocol,
