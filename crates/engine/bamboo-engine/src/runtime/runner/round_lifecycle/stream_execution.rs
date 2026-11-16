@@ -20,6 +20,7 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
+use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
@@ -35,7 +36,7 @@ use bamboo_domain::{
 };
 use bamboo_llm::provider::{
     CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
-    REASONING_HEADROOM_FINISH_REASON,
+    REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -190,6 +191,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
         AgentError::OutputTokenLimit { .. } => "output_token_limit",
+        AgentError::ReasoningRepetition { .. } => REASONING_REPETITION_FINISH_REASON,
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
         AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
@@ -1869,25 +1871,7 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
-    let mut completion = CompletionDiagnostics::for_agent_round(recovery);
-    if let Some(policy) = frame
-        .output_limit_recovery
-        .filter(|policy| policy.can_cutoff)
-    {
-        // Reserve the wire cap for both calls. A disconnected provider can
-        // still bill up to that cap, and the follow-up adds one more advisory.
-        let hint = u64::from(
-            TiktokenTokenCounter::default()
-                .count_message(&Message::user(OUTPUT_LIMIT_CONVERGENCE_HINT)),
-        );
-        let input = u64::from(final_usage.input_tokens);
-        let context_headroom = u64::from(max_context_tokens).saturating_sub(input + hint);
-        let run_headroom = policy.remaining_run_tokens.map_or(u64::MAX, |remaining| {
-            let prompt = input.max(policy.previous_prompt_tokens);
-            remaining.saturating_sub(prompt.saturating_mul(2).saturating_add(hint)) / 2
-        });
-        completion = completion.with_reasoning_cutoff_budget(run_headroom.min(context_headroom));
-    }
+    let completion = CompletionDiagnostics::for_agent_round(recovery);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -1985,7 +1969,7 @@ pub(super) async fn execute_llm_stream(
         })
     });
     let stream = match stream {
-        Ok(stream) => stream,
+        Ok(stream) => stop_repeated_reasoning(stream, completion.clone()),
         Err(error) => {
             usage_guard.finish(usage_status(&error), None);
             observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
@@ -2138,7 +2122,7 @@ pub(super) async fn execute_llm_stream(
     let finish_reason = completion.finish_reason();
     let incomplete_recovery = recovery.is_some() && !completion.has_recovery_completion();
     let (status, outcome) =
-        if finish_reason == REASONING_HEADROOM_FINISH_REASON || incomplete_recovery {
+        if finish_reason == REASONING_REPETITION_FINISH_REASON || incomplete_recovery {
             (
                 bamboo_domain::ModelCallStatus::Error,
                 bamboo_infrastructure::telemetry::Outcome::ProviderError,
@@ -2152,11 +2136,11 @@ pub(super) async fn execute_llm_stream(
     usage_guard.finish(status, stream_output.provider_usage);
     observation.finish(outcome);
 
-    let output_limited =
-        super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
+    let response_rejected = finish_reason == REASONING_REPETITION_FINISH_REASON
+        || super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
     if config.features_final_evidence_check
         && !activation_pending
-        && !output_limited
+        && !response_rejected
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
@@ -2281,7 +2265,7 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if !output_limited && !incomplete_recovery && !private_plan {
+    if !response_rejected && !incomplete_recovery && !private_plan {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {
@@ -2299,7 +2283,7 @@ pub(super) async fn execute_llm_stream(
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
-    let prompt_tokens = if output_limited || recovery.is_some() {
+    let prompt_tokens = if response_rejected || recovery.is_some() {
         u64::from(final_usage.input_tokens)
     } else {
         super::token_estimation::estimate_prompt_tokens(&prepared_context.messages)

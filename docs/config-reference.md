@@ -138,6 +138,22 @@ forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 `target_provider` to select `openai`, `anthropic` or `gemini`.
 
+The agent can close a reasoning-only stream when its text repeats in a sustained
+cycle. This uses the normalized reasoning stream across providers.
+`max_output_tokens` and the provider's wire cap still bound the request. An
+interrupted attempt can resume from confirmed tool results when the request
+allows recovery. The recovery request count is bounded, and an explicit
+`run_budget.max_total_tokens` applies to recovery. The
+`thinking_replay_always` option controls history replay independently.
+
+On compatible Messages routes, automatic agent requests for DeepSeek V4 and
+`deepseek-flash` send adaptive thinking with Bamboo's default `medium` effort
+when the request and provider leave effort unset. Explicit effort and reasoning
+body patches keep priority.
+
+DeepSeek treats `thinking.budget_tokens` as an ignored compatibility field.
+[DeepSeek Messages API](https://api-docs.deepseek.com/zh-cn/api/create-message/)
+
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
 The raw session identifier is never serialized into the provider request, and

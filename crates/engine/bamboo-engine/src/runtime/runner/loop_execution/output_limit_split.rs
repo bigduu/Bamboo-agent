@@ -8,9 +8,6 @@ use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
 const MAX_STEPS: usize = 3;
 const MAX_REQUESTS: usize = MAX_STEPS + 2;
 const MAX_STEP_BYTES: usize = 320;
-/// Used when this run has no configured token ceiling. Earlier usage counts
-/// against it along with the planning, work and reporting requests.
-pub(super) const DEFAULT_TOKEN_LIMIT: u64 = 256_000;
 
 pub(super) fn forbidden_tool(reference: &str) -> bool {
     resolve_tool_reference_name(reference, |name| {
@@ -170,6 +167,14 @@ impl SplitRecovery {
             )
         };
         Ok(())
+    }
+
+    pub fn continue_after_truncated_plan(&mut self) {
+        debug_assert!(matches!(self.phase, Phase::Plan));
+        self.phase = Phase::Work(VecDeque::from([
+            "Complete the next useful unfinished action. If all work is done, confirm it from the evidence."
+                .into(),
+        ]));
     }
 
     pub fn finish_step(&mut self, successful: bool) {

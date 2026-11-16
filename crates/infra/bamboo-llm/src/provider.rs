@@ -4,7 +4,7 @@
 //! enabling support for multiple LLM backends through a common trait.
 
 use crate::prompt_ir::PromptIR;
-use crate::types::LLMChunk;
+use crate::types::{LLMChunk, ProviderUsageReplacement};
 use async_trait::async_trait;
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
@@ -243,22 +243,19 @@ pub struct CompletionDiagnostics {
     state: Arc<Mutex<CompletionDiagnosticState>>,
     agent_round: bool,
     recovery: Option<OutputLimitRecovery>,
-    cutoff_max_output: Option<u64>,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
     "Bamboo runtime recovery: use the work already completed. Keep this step small. \
      If you can answer now, give the concise answer. If more work is needed, make only the \
      single next useful tool call. Otherwise, report confirmed progress and what remains.";
-pub const REASONING_HEADROOM_FINISH_REASON: &str = "reasoning_headroom";
+pub const REASONING_REPETITION_FINISH_REASON: &str = "reasoning_repetition";
 
 /// An attempt authorized by a completed request's wire controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLimitRecovery {
     controls: OutputLimitRecoveryControls,
     step: OutputLimitStep,
-    prefer_split: bool,
-    capped_reasoning_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,9 +268,10 @@ enum OutputLimitStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputLimitRecoveryControls {
     pub(crate) endpoint: &'static str,
-    pub(crate) effort: ReasoningEffort,
+    pub(crate) lowerable_effort: Option<ReasoningEffort>,
     pub(crate) output_limit: u64,
     pub(crate) allows_convergence: bool,
+    pub(crate) compatible_messages: bool,
 }
 
 impl OutputLimitRecovery {
@@ -290,31 +288,28 @@ impl OutputLimitRecovery {
     }
 
     pub fn prefers_task_split(self) -> bool {
-        self.prefer_split && self.allows_task_split()
+        self.controls.compatible_messages && self.allows_task_split()
     }
 
     pub fn for_task_split(self) -> Self {
         Self {
             step: OutputLimitStep::Split {
-                lower_effort: self.is_convergence() && !self.prefer_split,
+                lower_effort: self.is_convergence() && !self.controls.compatible_messages,
             },
             ..self
         }
     }
 
     fn lowers_effort(self) -> bool {
-        self.controls.effort != ReasoningEffort::Low
+        self.controls
+            .lowerable_effort
+            .is_some_and(|effort| effort != ReasoningEffort::Low)
             && !matches!(
                 self.step,
                 OutputLimitStep::Split {
                     lower_effort: false
                 }
             )
-    }
-
-    pub fn with_capped_reasoning_bytes(mut self, bytes: usize) -> Self {
-        self.capped_reasoning_bytes = Some(bytes);
-        self
     }
 }
 
@@ -323,6 +318,9 @@ struct CompletionDiagnosticState {
     finish_reason: Option<&'static str>,
     messages_stopped: bool,
     provider_tool_seen: bool,
+    response_progress_seen: bool,
+    pending_usage: Option<ProviderUsageReplacement>,
+    compatible_messages: bool,
     endpoint: Option<&'static str>,
     changed_protocol: bool,
     output_limit: Option<u64>,
@@ -334,8 +332,8 @@ tokio::task_local! {
 }
 
 /// Scope diagnostics to the inline construction of one provider stream.
-/// Built-in adapters capture this handle in their stream parser; no payload or
-/// mutable global state is shared between concurrent requests.
+/// Built-in adapters capture this handle in their stream parser. Diagnostics
+/// and usage counters belong to this request alone.
 pub async fn scope_completion_diagnostics<F: Future>(
     diagnostics: CompletionDiagnostics,
     future: F,
@@ -369,46 +367,54 @@ impl CompletionDiagnostics {
             .is_some_and(|retry| matches!(retry.step, OutputLimitStep::Split { .. }))
     }
 
-    /// The runner leaves room for both an in-flight cutoff and its follow-up.
-    pub fn with_reasoning_cutoff_budget(mut self, max_output: u64) -> Self {
-        self.cutoff_max_output = Some(max_output);
-        self
-    }
-
-    pub(crate) fn reasoning_cutoff_budget(&self) -> Option<(u64, Option<usize>)> {
-        // The final request has already passed its own budget admission.
-        if let Some(retry) = self
-            .recovery
-            .filter(|retry| retry.step != OutputLimitStep::LowerEffort)
-        {
-            return Some((retry.output_limit(), retry.capped_reasoning_bytes));
-        }
-        let next = self
-            .output_limit_recovery()
-            .filter(|next| next.is_convergence() || next.prefers_task_split())?;
-        (next.output_limit() <= self.cutoff_max_output?).then_some((
-            next.output_limit(),
-            self.recovery.and_then(|retry| retry.capped_reasoning_bytes),
-        ))
-    }
-
-    pub(crate) fn prefer_task_split(&self) {
-        if let Some(candidate) = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .recovery
-            .as_mut()
-        {
-            candidate.prefer_split = true;
-        }
-    }
-
-    pub(crate) fn record_reasoning_cutoff(&self) {
+    pub(crate) fn mark_compatible_messages(&self) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .finish_reason = Some(REASONING_HEADROOM_FINISH_REASON);
+            .compatible_messages = true;
+    }
+
+    pub fn is_compatible_messages(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .compatible_messages
+    }
+
+    pub fn try_stop_for_reasoning_repetition(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finish_reason.is_some()
+            || state.messages_stopped
+            || state.response_progress_seen
+            || state.provider_tool_seen
+        {
+            return false;
+        }
+        state.finish_reason = Some(REASONING_REPETITION_FINISH_REASON);
+        true
+    }
+
+    pub(crate) fn record_response_progress(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .response_progress_seen = true;
+    }
+
+    pub(crate) fn record_pending_usage(&self, usage: ProviderUsageReplacement) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage = Some(usage);
+    }
+
+    pub fn take_pending_usage(&self) -> Option<LLMChunk> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage
+            .take()
+            .and_then(ProviderUsageReplacement::legacy_chunk)
     }
 
     pub(crate) fn record_messages_stop(&self) {
@@ -508,19 +514,16 @@ impl CompletionDiagnostics {
         }
         if !state.changed_protocol {
             state.recovery = candidate.and_then(|controls| {
-                let step = if controls.effort == ReasoningEffort::Low {
+                let step = if controls
+                    .lowerable_effort
+                    .is_none_or(|effort| effort == ReasoningEffort::Low)
+                {
                     OutputLimitStep::Converge
                 } else {
                     OutputLimitStep::LowerEffort
                 };
-                (step != OutputLimitStep::Converge || controls.allows_convergence).then_some(
-                    OutputLimitRecovery {
-                        controls,
-                        step,
-                        prefer_split: false,
-                        capped_reasoning_bytes: None,
-                    },
-                )
+                (step != OutputLimitStep::Converge || controls.allows_convergence)
+                    .then_some(OutputLimitRecovery { controls, step })
             });
         } else {
             state.recovery = None;
@@ -528,7 +531,7 @@ impl CompletionDiagnostics {
         Ok(false)
     }
 
-    /// The sanitized provider reason, or `unavailable` if none was reported.
+    /// The normalized completion reason, or `unavailable` if none was observed.
     pub fn finish_reason(&self) -> &'static str {
         self.state
             .lock()
@@ -543,6 +546,29 @@ impl CompletionDiagnostics {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(event);
+        // Responses can announce a tool before producing a normalized call
+        // or transcript item. Its pending work takes priority over a cutoff
+        // even if the next frame contains only reasoning.
+        if matches!(
+            event,
+            "response.output_item.added" | "response.output_item.done"
+        ) {
+            if let Some(kind) = value
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| kind.ends_with("_call"))
+            {
+                self.record_response_progress();
+                if kind != "function_call"
+                    && value
+                        .pointer("/item/execution")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("client")
+                {
+                    self.record_provider_tool();
+                }
+            }
+        }
         let reason = [
             "/choices/0/finish_reason",
             "/delta/stop_reason",

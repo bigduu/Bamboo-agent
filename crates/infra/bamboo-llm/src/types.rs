@@ -166,6 +166,26 @@ pub enum LLMChunk {
 }
 
 impl LLMChunk {
+    /// Output already received from the provider that must settle before a
+    /// reasoning-only attempt can be discarded.
+    pub fn blocks_reasoning_cutoff(&self) -> bool {
+        use bamboo_domain::ProviderTranscriptItemKind;
+
+        match self {
+            Self::Token(text) => !text.trim().is_empty(),
+            Self::ToolCalls(calls) => !calls.is_empty(),
+            Self::ToolCallsIndexed(calls) => !calls.is_empty(),
+            Self::ProviderTranscriptItem(item) => !matches!(
+                item.kind(),
+                ProviderTranscriptItemKind::OpenAiReasoning
+                    | ProviderTranscriptItemKind::AnthropicThinking
+                    | ProviderTranscriptItemKind::AnthropicRedactedThinking
+            ),
+            Self::Done => true,
+            _ => false,
+        }
+    }
+
     /// Whether this chunk advances model-authored content or tool state.
     /// Protocol metadata, usage, completion, and transport-only markers are
     /// deliberately excluded from semantic-progress deadlines.

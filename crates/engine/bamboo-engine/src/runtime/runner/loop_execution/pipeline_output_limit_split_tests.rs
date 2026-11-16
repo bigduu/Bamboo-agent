@@ -44,6 +44,7 @@ impl ToolExecutor for SplitExecutor {
 }
 
 const CAP: u64 = 4096;
+const REPEATED_REASONING: &str = "Rechecking the same assumption. ";
 
 fn limit() -> ResponseTemplate {
     mock_messages_completion(
@@ -91,6 +92,7 @@ enum Protocol {
     Chat,
     Responses,
     Gemini,
+    BodhiMessages,
     BodhiGemini,
 }
 
@@ -135,6 +137,15 @@ impl Protocol {
                         .with_client(client),
                 ),
             ),
+            Protocol::BodhiMessages => (
+                "/proxy/anthropic/v1/messages",
+                Arc::new(
+                    bamboo_llm::providers::BodhiProvider::new("test-key")
+                        .with_base_url(server.uri())
+                        .with_target_provider("anthropic")
+                        .with_client(client),
+                ),
+            ),
             Protocol::BodhiGemini => (
                 "/proxy/gemini/v1beta/models/model:streamGenerateContent",
                 Arc::new(
@@ -167,7 +178,7 @@ async fn mount_replies(server: &MockServer, route: &str, replies: Vec<ResponseTe
 
 async fn run(
     protocol: Protocol,
-    effort: ReasoningEffort,
+    effort: Option<ReasoningEffort>,
     replies: Vec<ResponseTemplate>,
     budget: bamboo_config::RunBudgetConfig,
 ) -> Run {
@@ -183,7 +194,7 @@ async fn run(
 
 async fn run_with_executor<T: ToolExecutor + 'static>(
     protocol: Protocol,
-    effort: ReasoningEffort,
+    effort: Option<ReasoningEffort>,
     replies: Vec<ResponseTemplate>,
     budget: bamboo_config::RunBudgetConfig,
     tools: Arc<T>,
@@ -195,7 +206,7 @@ async fn run_with_executor<T: ToolExecutor + 'static>(
     let mut config = canonical_usage_pipeline_config();
     let dir = tempfile::tempdir().unwrap();
     config.app_data_dir = Some(dir.path().into());
-    config.reasoning_effort = Some(effort);
+    config.reasoning_effort = effort;
     config.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
     config.run_budget = budget;
     let mut session = Session::new("task-split", "model");
@@ -261,7 +272,7 @@ async fn run_compatible(
 ) -> Run {
     run(
         Protocol::Messages { compatible: true },
-        ReasoningEffort::Medium,
+        Some(ReasoningEffort::Medium),
         replies,
         budget,
     )
@@ -299,7 +310,7 @@ async fn pipeline_output_limit_split_uses_foreground_bash_contract() {
         }
         let run = run_with_executor(
             Protocol::Messages { compatible: true },
-            ReasoningEffort::Medium,
+            Some(ReasoningEffort::Medium),
             replies,
             Default::default(),
             Arc::new(BuiltinToolExecutor::with_registry(registry)),
@@ -332,33 +343,38 @@ async fn pipeline_output_limit_split_uses_foreground_bash_contract() {
 
 #[tokio::test]
 async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded() {
-    for (compatible, effort, plan_index, wire_effort) in [
-        (true, ReasoningEffort::Medium, 1, "medium"),
-        (true, ReasoningEffort::Low, 1, "low"),
-        (false, ReasoningEffort::Medium, 3, "low"),
+    for (compatible, effort, wire_effort) in [
+        (true, ReasoningEffort::Medium, Some("medium")),
+        (true, ReasoningEffort::Low, Some("low")),
+        (false, ReasoningEffort::Medium, Some("medium")),
+        (false, ReasoningEffort::Disabled, None),
     ] {
-        let mut replies = vec![limit(); plan_index];
         let plan = r#"["Inspect one fixture","Verify one observation","Record the evidence"]"#;
-        replies.extend([
+        let replies = vec![
+            limit(),
             text(plan),
             tool("step_a", 8),
             tool("step_b", 9),
             text("CHECKPOINT: The tool results confirm the fixture and observation."),
             text("Final verified report."),
-        ]);
+        ];
         let run = run(
             Protocol::Messages { compatible },
-            effort,
+            Some(effort),
             replies,
             Default::default(),
         )
         .await;
         assert!(run.result.unwrap());
         assert_eq!(run.tools.call_count(), 2);
-        let stages = &run.requests[plan_index..];
+        let stages = &run.requests[1..];
         for (i, body) in stages.iter().enumerate() {
             assert_eq!(body["max_tokens"], CAP);
-            assert_eq!(body["output_config"]["effort"], wire_effort);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                wire_effort
+            );
             let messages = body["messages"].to_string();
             assert!(messages.contains("Verified prerequisite."));
             assert!(!messages.contains("Incomplete reasoning only."));
@@ -392,11 +408,388 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
             run.usage.total_prompt_tokens,
             31 * run.requests.len() as u64
         );
-        assert_eq!(
-            run.usage.total_completion_tokens,
-            CAP * plan_index as u64 + 38
-        );
+        assert_eq!(run.usage.total_completion_tokens, CAP + 38);
     }
+}
+
+fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
+    let mut frames = Vec::new();
+    if matches!(
+        protocol,
+        Protocol::Messages { .. } | Protocol::BodhiMessages
+    ) {
+        frames.push(
+            json!({"type":"message_start","message":{"usage":{"input_tokens":31,
+            "cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":0}}}),
+        );
+        frames.push(json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":""}}));
+    }
+    let reasoning = REPEATED_REASONING.repeat(96);
+    for chunk in reasoning.as_bytes().chunks(137) {
+        let chunk = std::str::from_utf8(chunk).unwrap();
+        frames.push(match protocol {
+            Protocol::Messages { .. } | Protocol::BodhiMessages => {
+                json!({"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":chunk}})
+            }
+            Protocol::Chat => json!({"type":"chunk","id":"response","choices":[
+                {"index":0,"delta":{"reasoning_content":chunk},"finish_reason":null}]}),
+            Protocol::Responses => json!({"type":"response.reasoning_summary_text.delta",
+                "item_id":"reasoning","delta":chunk}),
+            Protocol::Gemini | Protocol::BodhiGemini => json!({"type":"chunk","candidates":[
+                {"content":{"parts":[{"thought":true,"text":chunk}]}}]}),
+        });
+    }
+    frames.push(json!({"type":"error","error":{"message":"stream was read past the cutoff"}}));
+    mock_completion_sse(&frames)
+}
+
+#[tokio::test]
+async fn pipeline_closes_repeated_reasoning_without_explicit_thinking_controls() {
+    let protocol = Protocol::Messages { compatible: false };
+    let run = run(
+        protocol,
+        None,
+        vec![
+            repeated_reasoning(protocol),
+            text("[]"),
+            text("Completed from the earlier result."),
+        ],
+        Default::default(),
+    )
+    .await;
+    assert!(run.result.unwrap());
+    assert_eq!(run.usage.total_prompt_tokens, 43 + 31 * 2);
+    assert_eq!(run.usage.total_completion_tokens, CAP + 14);
+    for body in &run.requests {
+        assert!(body.get("thinking").is_none());
+        let messages = body["messages"].to_string();
+        assert!(messages.contains("Verified prerequisite."));
+        assert!(!messages.contains(REPEATED_REASONING));
+    }
+}
+
+#[tokio::test]
+async fn pipeline_detects_reasoning_repetition_on_each_normalized_stream() {
+    for protocol in [
+        Protocol::Messages { compatible: false },
+        Protocol::Chat,
+        Protocol::Responses,
+        Protocol::Gemini,
+        Protocol::BodhiMessages,
+    ] {
+        let run = run(
+            protocol,
+            Some(ReasoningEffort::Medium),
+            vec![repeated_reasoning(protocol)],
+            bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(AgentError::ReasoningRepetition { .. })),
+            "{:?}",
+            run.result
+        );
+        let request = &run.requests[0];
+        let cap = [
+            "/max_tokens",
+            "/max_completion_tokens",
+            "/max_output_tokens",
+            "/generationConfig/maxOutputTokens",
+        ]
+        .into_iter()
+        .find_map(|path| request.pointer(path).and_then(Value::as_u64))
+        .expect("the dispatched request has a wire cap");
+        assert_eq!(run.usage.total_completion_tokens, cap);
+        if matches!(
+            protocol,
+            Protocol::Messages { .. } | Protocol::BodhiMessages
+        ) {
+            assert_eq!(run.usage.total_prompt_tokens, 43);
+        }
+        assert_eq!(run.tools.call_count(), 0);
+        assert_eq!(run.session.messages.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_retains_usage_from_the_frame_where_reasoning_is_stopped() {
+    const KNOWN_INPUT: u64 = 9321;
+    let reasoning = REPEATED_REASONING.repeat(96);
+    let gemini_frame = json!({"type":"chunk","candidates":[{"content":{"parts":[
+        {"thought":true,"text":reasoning} ]}}],
+        "usageMetadata":{"promptTokenCount":KNOWN_INPUT,"candidatesTokenCount":0,
+        "thoughtsTokenCount":9}});
+    for (protocol, frame) in [
+        (
+            Protocol::Chat,
+            json!({"type":"chunk","id":"response","choices":[
+            {"index":0,"delta":{"reasoning_content":reasoning},"finish_reason":null}],
+            "usage":{"prompt_tokens":KNOWN_INPUT,"completion_tokens":9}}),
+        ),
+        (Protocol::Gemini, gemini_frame.clone()),
+        (Protocol::BodhiGemini, gemini_frame),
+    ] {
+        let run = run(
+            protocol,
+            None,
+            vec![mock_completion_sse(&[frame])],
+            bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            run.result,
+            Err(AgentError::ReasoningRepetition { .. })
+        ));
+        assert_eq!(run.usage.total_prompt_tokens, KNOWN_INPUT);
+        assert!(run.usage.total_completion_tokens > 9);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_keeps_visible_or_tool_output_in_the_same_frame_as_repeated_reasoning() {
+    let completed = |content| {
+        mock_completion_sse(&[json!({"type":"chunk","candidates":[
+            {"content":{"parts":[{"text":content}]},"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":0}
+        })])
+    };
+    for (output, expected_tool_calls) in [
+        (json!({"text":"Visible progress."}), 0),
+        (json!({"functionCall":{"name":"fixture_tool","args":{}}}), 1),
+    ] {
+        let mixed = json!({"type":"chunk","candidates":[{"content":{"parts":[
+            {"thought":true,"text":REPEATED_REASONING.repeat(96)}, output
+        ]}}]});
+        // The mixed frame has no finish reason. Its whole contents must
+        // be considered before a reasoning delta can stop the stream.
+        let finish = json!({"type":"chunk","candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":90}
+        });
+        let mut replies = vec![mock_completion_sse(&[mixed, finish])];
+        if expected_tool_calls == 1 {
+            replies.push(completed("Using the confirmed tool result."));
+        }
+        let run = run(Protocol::Gemini, None, replies, Default::default()).await;
+        assert!(run.result.unwrap());
+        assert_eq!(run.tools.call_count(), expected_tool_calls);
+        let last = run.session.messages.last().unwrap();
+        if expected_tool_calls == 0 {
+            assert_eq!(last.content, "Visible progress.");
+            assert_eq!(run.usage.total_completion_tokens, 97);
+        } else {
+            assert_eq!(last.content, "Using the confirmed tool result.");
+            assert!(run.requests[1].to_string().contains("confirmed result for"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipeline_keeps_signed_visible_text_outside_reasoning_detection() {
+    let answer = REPEATED_REASONING.trim_end().repeat(96);
+    let reply = mock_completion_sse(&[
+        json!({"type":"chunk","candidates":[{"content":{"parts":[
+            {"text":answer,"thoughtSignature":"signature"}
+        ]}}]}),
+        json!({"type":"chunk","candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":97,"thoughtsTokenCount":0}
+        }),
+    ]);
+    let run = run(Protocol::Gemini, None, vec![reply], Default::default()).await;
+    assert!(run.result.unwrap());
+    let message = run.session.messages.last().unwrap();
+    assert_eq!(message.content, answer);
+    assert!(message.reasoning.is_none());
+}
+
+#[tokio::test]
+async fn pipeline_keeps_a_provider_tool_stream_open_until_it_settles() {
+    let reply = mock_completion_sse(&[
+        json!({"type":"response.output_item.added",
+            "item":{"type":"tool_search_call","execution":"server","id":"search","status":"in_progress"}}),
+        json!({"type":"response.reasoning_summary_text.delta",
+            "item_id":"reasoning","delta":REPEATED_REASONING.repeat(96)}),
+        json!({"type":"response.output_text.delta","item_id":"answer","delta":"Provider work settled."}),
+        json!({"type":"response.completed","response":{"id":"response","status":"completed",
+            "output":[],"usage":{"input_tokens":31,"output_tokens":97}}}),
+    ]);
+    let run = run(Protocol::Responses, None, vec![reply], Default::default()).await;
+    assert!(run.result.unwrap());
+    assert_eq!(
+        run.session.messages.last().unwrap().content,
+        "Provider work settled."
+    );
+    assert_eq!(run.tools.call_count(), 0);
+    assert_eq!(run.usage.total_completion_tokens, 97);
+}
+
+#[tokio::test]
+async fn pipeline_accepts_long_distinct_reasoning_before_a_normal_answer() {
+    use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+    let reasoning: String = (0..1100)
+        .map(|index| format!("Checking distinct observation {index}. "))
+        .collect();
+    assert!(u64::from(TiktokenTokenCounter::default().count_text(&reasoning)) > CAP * 7 / 8);
+    let reply = mock_completion_sse(&[
+        json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":""}}),
+        json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":reasoning}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Verified."}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":CAP - 1}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let run = run_compatible(vec![reply], Default::default()).await;
+    assert!(run.result.unwrap());
+    assert_eq!(run.session.messages.last().unwrap().content, "Verified.");
+    assert_eq!(run.usage.total_completion_tokens, CAP - 1);
+}
+
+#[tokio::test]
+async fn pipeline_stops_when_a_recovery_step_repeats_its_reasoning() {
+    let protocol = Protocol::Messages { compatible: true };
+    let run = run_compatible(
+        vec![
+            repeated_reasoning(protocol),
+            text(r#"["Read the fixture","Verify the result"]"#),
+            tool("confirmed_step", 8),
+            repeated_reasoning(protocol),
+        ],
+        Default::default(),
+    )
+    .await;
+    assert!(matches!(
+        run.result,
+        Err(AgentError::ReasoningRepetition { .. })
+    ));
+    assert_eq!(run.usage.total_completion_tokens, CAP * 2 + 15);
+    assert_eq!(run.tools.call_count(), 1);
+    let last_request = run.requests.last().unwrap()["messages"].to_string();
+    assert!(last_request.contains("Verified prerequisite."));
+    assert!(last_request.contains("confirmed result for confirmed_step"));
+    assert!(!last_request.contains(REPEATED_REASONING));
+    assert_eq!(
+        run.session.messages.last().unwrap().content,
+        "confirmed result for confirmed_step"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_stops_repetition_even_when_recovery_cannot_fit_the_budget() {
+    let protocol = Protocol::Messages { compatible: true };
+    let run = run_compatible(
+        vec![repeated_reasoning(protocol)],
+        bamboo_config::RunBudgetConfig {
+            max_total_tokens: Some(2 * CAP),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        run.result,
+        Err(AgentError::ReasoningRepetition { .. })
+    ));
+    assert_eq!(run.usage.total_completion_tokens, CAP);
+    assert_eq!(run.tools.call_count(), 0);
+}
+
+#[tokio::test]
+async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_tool() {
+    const CAPPED_TOOL_ID: &str = "capped_tool_must_not_replay_2757";
+    let opaque = mock_completion_sse(&[
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let provisional = mock_messages_completion(
+        json!({"type":"tool_use","id":CAPPED_TOOL_ID,"name":"fixture_tool","input":{}}),
+        json!({"type":"input_json_delta","partial_json":"{}"}),
+        "max_tokens",
+        Some(CAP),
+    );
+    for reply in [opaque, provisional] {
+        let run = run(
+            Protocol::Messages { compatible: false },
+            None,
+            vec![
+                reply,
+                text(r#"["Check the fixture once"]"#),
+                tool("complete", 8),
+                text("Completed from the confirmed results."),
+            ],
+            Default::default(),
+        )
+        .await;
+        assert!(run.result.unwrap());
+        assert_eq!(run.tools.call_count(), 1);
+        let report = run.requests[3]["messages"].to_string();
+        assert!(report.contains("Verified prerequisite."));
+        assert!(report.contains("confirmed result for complete"));
+        assert!(!report.contains(CAPPED_TOOL_ID));
+    }
+}
+
+#[tokio::test]
+async fn pipeline_output_limit_split_uses_only_an_explicit_total_token_budget() {
+    let first_tool = mock_completion_sse(&[
+        json!({"type":"message_start","message":{"usage":{
+            "input_tokens":31,"cache_creation_input_tokens":0,"cache_read_input_tokens":250_000
+        }}}),
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"prior_work","name":"fixture_tool","input":{}
+        }}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let mut replies = vec![first_tool, limit()];
+    let explicit_limit = 256_000;
+    let bounded = run_compatible(
+        replies.clone(),
+        bamboo_config::RunBudgetConfig {
+            max_total_tokens: Some(explicit_limit),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        bounded.result,
+        Err(AgentError::OutputTokenLimit { .. })
+    ));
+    assert_eq!(bounded.usage.total_prompt_tokens, 250_062);
+    assert_eq!(bounded.tools.call_count(), 1);
+    assert_eq!(
+        bounded.session.messages.last().unwrap().content,
+        "confirmed result for prior_work"
+    );
+
+    replies.extend([
+        text(r#"["Verify one observation"]"#),
+        tool("verification", 3000),
+        text("Completed verification."),
+    ]);
+    let run = run_compatible(replies, Default::default()).await;
+    assert!(run.result.unwrap());
+    assert_eq!(run.tools.call_count(), 2);
+    assert!(run.usage.total_prompt_tokens + run.usage.total_completion_tokens > explicit_limit);
+    let report_history = run.requests[4]["messages"].to_string();
+    assert!(report_history.contains("confirmed result for prior_work"));
+    assert!(report_history.contains("confirmed result for verification"));
+    assert_eq!(
+        run.session.messages.last().unwrap().content,
+        "Completed verification."
+    );
 }
 
 #[tokio::test]
@@ -440,11 +833,6 @@ async fn pipeline_output_limit_split_stops_at_token_and_round_limits() {
 #[tokio::test]
 async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
     for (reply, reason) in [
-        (limit(), "output token limit"),
-        (
-            message_text("[]", "max_tokens", Some(CAP)),
-            "output token limit",
-        ),
         (text(r#"["one","two","three","four"]"#), "plan was invalid"),
         (
             tool("plan_must_not_execute", 8),
@@ -463,6 +851,95 @@ async fn pipeline_output_limit_split_rejects_unbounded_or_failed_plans() {
 }
 
 #[tokio::test]
+async fn pipeline_uses_one_confirmed_action_after_a_capped_recovery_plan() {
+    for step_completes in [true, false] {
+        let mut replies = vec![
+            limit(),
+            message_text(r#"["Discard this partial plan"#, "max_tokens", Some(CAP)),
+        ];
+        if step_completes {
+            replies.extend([
+                tool("step_retained", 8),
+                text("Completed from the confirmed tools."),
+            ]);
+        } else {
+            replies.push(limit());
+        }
+        let run = run_compatible(replies, Default::default()).await;
+        let work_request = run.requests[2]["messages"].to_string();
+        assert!(work_request.contains("next useful unfinished action"));
+        assert!(work_request.contains("Verified prerequisite."));
+        assert!(!work_request.contains("Discard this partial plan"));
+        if step_completes {
+            assert!(run.result.unwrap());
+            assert_eq!(run.tools.call_count(), 1);
+            assert!(run.requests[3]["messages"]
+                .to_string()
+                .contains("confirmed result for step_retained"));
+            assert_eq!(run.usage.total_completion_tokens, 2 * CAP + 15);
+        } else {
+            assert!(matches!(
+                run.result,
+                Err(AgentError::OutputTokenLimit { .. })
+            ));
+            assert_eq!(run.tools.call_count(), 0);
+            assert_eq!(run.usage.total_completion_tokens, 3 * CAP);
+            assert!(run
+                .session
+                .messages
+                .iter()
+                .any(|message| message.content == "Verified prerequisite."));
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipeline_stops_if_a_capped_plan_contains_provider_work_or_leaves_too_little_budget() {
+    let unexpected_provider_work = mock_completion_sse(&[
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"server_tool_use","id":"srv_plan","name":"web_search","input":{}
+        }}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let capped_plan = mock_completion_sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10_000,
+            "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":CAP}}),
+        json!({"type":"message_stop"}),
+    ]);
+    for (plan, max_total_tokens, expected_error) in [
+        (unexpected_provider_work, None, "output token limit"),
+        (capped_plan, Some(26_000), "budget"),
+    ] {
+        let run = run_compatible(
+            vec![limit(), plan],
+            bamboo_config::RunBudgetConfig {
+                max_total_tokens,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(run
+            .result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains(expected_error));
+        assert_eq!(run.tools.call_count(), 0);
+        assert_eq!(
+            run.session.messages.last().unwrap().content,
+            "Verified prerequisite."
+        );
+        if max_total_tokens.is_some() {
+            assert_eq!(run.usage.total_prompt_tokens, 10_031);
+            assert_eq!(run.usage.total_completion_tokens, CAP * 2);
+        }
+    }
+}
+
+#[tokio::test]
 async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_send() {
     for (effort, response, status) in [
         (ReasoningEffort::Medium, ResponseTemplate::new(429), "429"),
@@ -474,14 +951,14 @@ async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_
     ] {
         let run = run(
             Protocol::Messages { compatible: false },
-            effort,
+            Some(effort),
             vec![limit(), response],
             Default::default(),
         )
         .await;
         assert!(run.result.unwrap_err().to_string().contains(status));
         assert_eq!(run.tools.call_count(), 0);
-        assert_eq!(run.requests[1]["output_config"]["effort"], "low");
+        assert_eq!(run.requests[1]["output_config"]["effort"], effort.as_str());
     }
 }
 
@@ -584,7 +1061,7 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
 async fn pipeline_output_limit_split_counts_separate_gemini_proxy_reasoning() {
     let run = run(
         Protocol::BodhiGemini,
-        ReasoningEffort::Low,
+        Some(ReasoningEffort::Low),
         vec![mock_completion_sse(&[json!({
             "type":"chunk","candidates":[{"content":{"parts":[{"text":"Thinking","thought":true}]},"finishReason":"MAX_TOKENS"}],
             "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":8000}
@@ -643,7 +1120,7 @@ async fn pipeline_output_limit_split_reserves_missing_gemini_candidate_count() {
     })]);
     let run = run(
         Protocol::Gemini,
-        ReasoningEffort::Low,
+        Some(ReasoningEffort::Low),
         vec![reasoning, answer],
         Default::default(),
     )
@@ -885,7 +1362,7 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
                         "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":if content.is_some() {7} else {0},
                             "thoughtsTokenCount":if content.is_some() {0} else {7}}})
                 }
-                Protocol::Messages { .. } => unreachable!(),
+                Protocol::Messages { .. } | Protocol::BodhiMessages => unreachable!(),
             };
             mock_completion_sse(&[event])
         };
@@ -906,11 +1383,11 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
         ]);
         let run = run(
             protocol,
-            if responses {
+            Some(if responses {
                 ReasoningEffort::Max
             } else {
                 ReasoningEffort::Low
-            },
+            }),
             replies,
             Default::default(),
         )

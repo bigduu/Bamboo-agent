@@ -43,7 +43,7 @@ use crate::providers::common::request_overrides;
 use crate::providers::common::tool_schema::sanitize_anthropic_tool_input_schema;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::ReasoningEffort;
+use bamboo_domain::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 
 fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
     let guidance = if status == reqwest::StatusCode::FORBIDDEN {
@@ -91,6 +91,36 @@ fn is_official_anthropic_base_url(base_url: &str) -> bool {
     let normalized = base_url.trim_end_matches('/');
     normalized.eq_ignore_ascii_case("https://api.anthropic.com")
         || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
+}
+
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let model_id = model
+        .rsplit_once(".deepseek-")
+        .map_or(model.as_str(), |(namespace, _)| {
+            &model[namespace.len() + 1..]
+        });
+    [
+        "deepseek-flash",
+        "deepseek-v4",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4.1-flash",
+    ]
+    .iter()
+    .any(|known| {
+        model_id.strip_prefix(known).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('-').is_some_and(|revision| {
+                    matches!(revision.len(), 4 | 8) && revision.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+    })
 }
 
 fn supports_anthropic_tool_search(model: &str) -> bool {
@@ -437,17 +467,34 @@ impl AnthropicProvider {
             });
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
-        let reasoning_effort = options
-            .and_then(|o| o.reasoning_effort)
-            .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let cache_plan = options.and_then(|o| o.cache.as_ref());
-        let reasoning_source = if request_reasoning_effort.is_some() {
-            "request"
-        } else if self.default_reasoning_effort.is_some() {
-            "provider_default"
+        let (reasoning_effort, reasoning_source) = if let Some(effort) = request_reasoning_effort {
+            (Some(effort), "request")
+        } else if let Some(effort) = self.default_reasoning_effort {
+            (Some(effort), "provider_default")
+        } else if compatible_gateway
+            && is_deepseek_v4_model(model)
+            && completion_diagnostics
+                .as_ref()
+                .is_some_and(|d| d.is_agent_round())
+            && required_tool.is_none()
+            && !crate::retry::work_request_budget_active()
+            && !request_overrides::messages_controls_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            )
+            && self.masking_config.apply_masking("adaptive") == "adaptive"
+            && self
+                .masking_config
+                .apply_masking(DEFAULT_REASONING_EFFORT.as_str())
+                == DEFAULT_REASONING_EFFORT.as_str()
+        {
+            (Some(DEFAULT_REASONING_EFFORT), "agent_default")
         } else {
-            "none"
+            (None, "none")
         };
 
         let request_purpose = options
@@ -488,6 +535,14 @@ impl AnthropicProvider {
             Some(model),
         );
         apply_required_tool_choice(&mut body, required_tool);
+        // A compatible gateway can enforce reasoning without advertising it
+        // on the request. This identifies the wire controls for recovery.
+        if let Some(diagnostics) = completion_diagnostics
+            .as_ref()
+            .filter(|_| compatible_gateway)
+        {
+            diagnostics.mark_compatible_messages();
+        }
         // Last-moment scan: mask every text value in the fully-assembled body.
         request_overrides::mask_and_prepare_agent_request(
             &mut body,
@@ -589,26 +644,11 @@ impl AnthropicProvider {
             )));
         }
 
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
-        let compatibility_reasoning =
-            self.thinking_replay_always && !is_official_anthropic_base_url(&self.base_url);
-        if compatibility_reasoning {
-            if let Some(diagnostics) = completion_diagnostics.as_ref() {
-                diagnostics.prefer_task_split();
-            }
-        }
-        let reasoning_cutoff = completion_diagnostics
-            .as_ref()
-            .filter(|_| compatibility_reasoning)
-            .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
-            .filter(|(limit, _)| *limit >= 4096)
-            .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));
         let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
             completion_diagnostics,
-            reasoning_cutoff,
             ..Default::default()
         }));
         Ok(anthropic_stream_with_usage_on_error(
@@ -1710,7 +1750,6 @@ fn validated_anthropic_reference_definitions_in_order<'a>(
 #[derive(Default)]
 pub struct AnthropicStreamState {
     pub(crate) completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
-    reasoning_cutoff: Option<ReasoningCutoff>,
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
@@ -1741,46 +1780,6 @@ pub struct AnthropicStreamState {
     native_capture_bytes: usize,
     native_capture_invalid: bool,
     usage_snapshot: AnthropicUsageSnapshot,
-}
-
-/// These compatible gateways stream raw thinking but report token counts only
-/// at the end. Estimate in batches to keep the work linear in the stream size.
-/// This is a local cutoff threshold, never a provider usage measurement.
-struct ReasoningCutoff {
-    token_threshold: u64,
-    estimated_tokens: u64,
-    byte_threshold: Option<usize>,
-    bytes: usize,
-    pending_text: String,
-}
-
-impl ReasoningCutoff {
-    fn new(output_limit: u64, capped_reasoning_bytes: Option<usize>) -> Self {
-        Self {
-            token_threshold: output_limit - output_limit.div_ceil(8),
-            estimated_tokens: 0,
-            // An unsigned full-cap sample from this request can reveal a
-            // tokenizer mismatch that a generic token estimate would miss.
-            byte_threshold: capped_reasoning_bytes.map(|bytes| bytes - bytes.div_ceil(8)),
-            bytes: 0,
-            pending_text: String::new(),
-        }
-    }
-
-    fn observe(&mut self, text: &str) -> bool {
-        self.bytes = self.bytes.saturating_add(text.len());
-        if self.byte_threshold.is_some_and(|limit| self.bytes >= limit) {
-            return true;
-        }
-        self.pending_text.push_str(text);
-        if self.pending_text.len() < 1024 {
-            return false;
-        }
-        let tokens = tiktoken_rs::o200k_base_singleton().count_ordinary(&self.pending_text) as u64;
-        self.estimated_tokens = self.estimated_tokens.saturating_add(tokens);
-        self.pending_text.clear();
-        self.estimated_tokens >= self.token_threshold
-    }
 }
 
 /// Anthropic reports uncached input, cache read and cache creation as disjoint
@@ -1845,28 +1844,23 @@ impl AnthropicUsageSnapshot {
         if std::mem::replace(&mut self.emitted, true) {
             return None;
         }
+        self.usage().legacy_chunk()
+    }
+
+    fn usage(&self) -> crate::types::ProviderUsageReplacement {
         let input_tokens = self.fresh_input.and_then(|fresh| {
             fresh
                 .checked_add(self.cache_creation?)?
                 .checked_add(self.cache_read?)
         });
-        if input_tokens.is_none()
-            && self.output.is_none()
-            && self.reasoning.is_none()
-            && self.cache_creation.is_none()
-            && self.cache_read.is_none()
-        {
-            return None;
-        }
-        Some(LLMChunk::ProviderUsage {
+        crate::types::ProviderUsageReplacement {
             input_tokens,
             output_tokens: self.output,
-            total_tokens: None,
             reasoning_tokens: self.reasoning,
             cache_creation_input_tokens: self.cache_creation,
             cache_read_input_tokens: self.cache_read,
-            cache_write_input_tokens: None,
-        })
+            ..Default::default()
+        }
     }
 }
 
@@ -1885,8 +1879,8 @@ fn anthropic_stream_with_usage_on_error(
     finish_anthropic_stream(stream, state)
 }
 
-// Preserve known usage when the body errors or we stop reading it early. In
-// particular, message_start can already contain all three prompt components.
+// Preserve known usage when the body errors. The message_start event can
+// already contain all three prompt components.
 // Success remains terminal-only so later fields can still invalidate a value.
 fn finish_anthropic_stream(
     upstream: LLMStream,
@@ -1894,40 +1888,13 @@ fn finish_anthropic_stream(
 ) -> LLMStream {
     use futures::StreamExt;
 
-    let cutoff_enabled = state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .reasoning_cutoff
-        .is_some();
     Box::pin(futures::stream::unfold(
-        (Some(upstream), state, None),
-        move |(upstream, state, pending_error)| async move {
+        (upstream, state, None),
+        |(mut upstream, state, pending_error)| async move {
             if let Some(error) = pending_error {
                 return Some((Err(error), (upstream, state, None)));
             }
-            let mut upstream = upstream?;
             let item = upstream.next().await?;
-            let cutoff_snapshot = match &item {
-                Ok(LLMChunk::ReasoningToken(text)) if cutoff_enabled => {
-                    let mut parser = state.lock().unwrap_or_else(|e| e.into_inner());
-                    parser
-                        .reasoning_cutoff
-                        .as_mut()
-                        .is_some_and(|cutoff| cutoff.observe(text))
-                        .then(|| {
-                            if let Some(diagnostics) = &parser.completion_diagnostics {
-                                diagnostics.record_reasoning_cutoff();
-                            }
-                            parser.usage_snapshot.take_terminal()
-                        })
-                }
-                _ => None,
-            };
-            if let Some(snapshot) = cutoff_snapshot {
-                tracing::info!("Closing a compatible Messages stream at the reasoning threshold");
-                drop(upstream);
-                return snapshot.map(|usage| (Ok(usage), (None, state, None)));
-            }
             match item {
                 Err(error) => {
                     let snapshot = {
@@ -1937,12 +1904,12 @@ fn finish_anthropic_stream(
                         state.usage_snapshot.take_terminal()
                     };
                     if let Some(snapshot) = snapshot {
-                        Some((Ok(snapshot), (Some(upstream), state, Some(error))))
+                        Some((Ok(snapshot), (upstream, state, Some(error))))
                     } else {
-                        Some((Err(error), (Some(upstream), state, None)))
+                        Some((Err(error), (upstream, state, None)))
                     }
                 }
-                Ok(chunk) => Some((Ok(chunk), (Some(upstream), state, None))),
+                Ok(chunk) => Some((Ok(chunk), (upstream, state, None))),
             }
         },
     ))
@@ -2402,7 +2369,6 @@ fn parse_anthropic_sse_event_multi(
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
     capture_anthropic_native_event(state, event_type, data);
-    state.usage_snapshot.observe(event_type, data);
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {
         take_anthropic_provider_transcript_items(state)
@@ -2427,6 +2393,12 @@ pub fn parse_anthropic_sse_event(
     event_type: &str,
     data: &str,
 ) -> Result<Option<LLMChunk>> {
+    state.usage_snapshot.observe(event_type, data);
+    if matches!(event_type, "message_start" | "message_delta") {
+        if let Some(diagnostics) = &state.completion_diagnostics {
+            diagnostics.record_pending_usage(state.usage_snapshot.usage());
+        }
+    }
     match event_type {
         "ping" => Ok(None),
         "message_start" => {
@@ -2471,7 +2443,6 @@ pub fn parse_anthropic_sse_event(
             Ok(None)
         }
         "message_delta" => {
-            state.reasoning_cutoff = None;
             if !data.is_empty() {
                 if let Some(diagnostics) = &state.completion_diagnostics {
                     diagnostics.observe_sse(event_type, data);
@@ -2629,16 +2600,6 @@ pub fn parse_anthropic_sse_event(
                 if let Some(diagnostics) = &state.completion_diagnostics {
                     diagnostics.record_provider_tool();
                 }
-            }
-
-            if block_type != "thinking"
-                || index != 0
-                || state.thinking_blocks_started != 0
-                || content_block["signature"]
-                    .as_str()
-                    .is_some_and(|signature| !signature.is_empty())
-            {
-                state.reasoning_cutoff = None;
             }
 
             if block_type == "thinking" || block_type == "redacted_thinking" {
@@ -2831,7 +2792,6 @@ pub fn parse_anthropic_sse_event(
                     Ok(None)
                 }
                 "signature_delta" => {
-                    state.reasoning_cutoff = None;
                     // Provider-minted signature over the thinking block's exact
                     // text — required to replay the block to real Anthropic
                     // (#520). Accumulate defensively (the real API delivers it
@@ -7599,6 +7559,139 @@ mod anthropic_provider_tests {
             ),
             Message::tool_result("call_1", r#"{"ok":true}"#),
         ]
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_agent_requests_send_explicit_reasoning() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let model = "dashscope.deepseek-v4.1-flash-1017";
+        let cases = [
+            (true, model, None, None, Some("adaptive"), Some("medium")),
+            (
+                true,
+                model,
+                None,
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("high"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("low"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::High),
+                Some("disabled"),
+                None,
+            ),
+            (false, model, None, None, None, None),
+            (true, "other-compatible-model", None, None, None, None),
+            (
+                true,
+                "router.deepseek-v4-pro.claude-sonnet-4-6",
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(cases.len() as u64)
+            .mount(&server)
+            .await;
+        for (agent_round, model, request_effort, provider_effort, mode, effort) in cases {
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_reasoning_effort(provider_effort);
+            let diagnostics = if agent_round {
+                CompletionDiagnostics::for_agent_round(None)
+            } else {
+                CompletionDiagnostics::default()
+            };
+            let options = LLMRequestOptions {
+                reasoning_effort: request_effort,
+                ..Default::default()
+            };
+            drop(
+                scope_completion_diagnostics(
+                    diagnostics,
+                    provider.chat_stream_with_options(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        model,
+                        Some(&options),
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
+            assert_eq!(body["max_tokens"], 4096);
+        }
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_default_respects_an_effort_body_patch() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let overrides = serde_json::from_value(json!({"common":{"body_patch":[
+            {"op":"set","path":"/output_config/effort","value":"none"}
+        ]}}))
+        .unwrap();
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_request_overrides(Some(overrides));
+        drop(
+            scope_completion_diagnostics(
+                CompletionDiagnostics::for_agent_round(None),
+                provider.chat_stream(
+                    &[Message::user("Inspect the fixture.")],
+                    &[],
+                    Some(4096),
+                    "deepseek-flash",
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = requests[0].body_json().unwrap();
+        assert_eq!(body["output_config"]["effort"], "none");
+        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]

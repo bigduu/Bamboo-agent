@@ -232,6 +232,10 @@ pub enum AgentError {
         reasoning_only: bool,
     },
 
+    /// The local stream reader stopped a reasoning-only attempt after sustained repetition.
+    #[error("LLM repeated its reasoning (response_id={response_id:?})")]
+    ReasoningRepetition { response_id: Option<String> },
+
     /// LLM request exceeded provider context/input limits and requires
     /// host-side overflow recovery before retry.
     #[error("LLM overflow: {0}")]
