@@ -959,6 +959,9 @@ pub trait LLMProvider: Send + Sync {
     /// Look up limits for a model selected for an actual request. Routing
     /// guards must check the selected model before delegating the lookup.
     async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        if let Some(error) = self.known_pre_dispatch_error() {
+            return Err(error);
+        }
         Ok(self
             .list_model_info()
             .await?

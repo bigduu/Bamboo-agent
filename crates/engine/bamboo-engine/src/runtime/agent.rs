@@ -343,7 +343,7 @@ impl bamboo_llm::LLMProvider for ChildGoldPolicyProvider {
         &self,
         model: &str,
     ) -> Result<Option<bamboo_llm::provider::ProviderModelInfo>, bamboo_llm::LLMError> {
-        self.select(model)?.model_info_for_request(model).await
+        self.dispatch(model)?.model_info_for_request(model).await
     }
 }
 
