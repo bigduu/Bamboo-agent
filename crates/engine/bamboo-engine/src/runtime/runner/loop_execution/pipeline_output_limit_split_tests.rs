@@ -740,6 +740,59 @@ async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_
 }
 
 #[tokio::test]
+async fn pipeline_output_limit_split_uses_only_an_explicit_total_token_budget() {
+    let first_tool = mock_completion_sse(&[
+        json!({"type":"message_start","message":{"usage":{
+            "input_tokens":31,"cache_creation_input_tokens":0,"cache_read_input_tokens":250_000
+        }}}),
+        json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"prior_work","name":"fixture_tool","input":{}
+        }}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}),
+        json!({"type":"message_stop"}),
+    ]);
+    let mut replies = vec![first_tool, limit()];
+    let explicit_limit = 256_000;
+    let bounded = run_compatible(
+        replies.clone(),
+        bamboo_config::RunBudgetConfig {
+            max_total_tokens: Some(explicit_limit),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        bounded.result,
+        Err(AgentError::OutputTokenLimit { .. })
+    ));
+    assert_eq!(bounded.usage.total_prompt_tokens, 250_062);
+    assert_eq!(bounded.tools.call_count(), 1);
+    assert_eq!(
+        bounded.session.messages.last().unwrap().content,
+        "confirmed result for prior_work"
+    );
+
+    replies.extend([
+        text(r#"["Verify one observation"]"#),
+        tool("verification", 3000),
+        text("Completed verification."),
+    ]);
+    let run = run_compatible(replies, Default::default()).await;
+    assert!(run.result.unwrap());
+    assert_eq!(run.tools.call_count(), 2);
+    assert!(run.usage.total_prompt_tokens + run.usage.total_completion_tokens > explicit_limit);
+    let report_history = run.requests[4]["messages"].to_string();
+    assert!(report_history.contains("confirmed result for prior_work"));
+    assert!(report_history.contains("confirmed result for verification"));
+    assert_eq!(
+        run.session.messages.last().unwrap().content,
+        "Completed verification."
+    );
+}
+
+#[tokio::test]
 async fn pipeline_output_limit_split_stops_at_token_and_round_limits() {
     for budget in [
         bamboo_config::RunBudgetConfig {

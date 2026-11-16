@@ -142,7 +142,8 @@ The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
 `max_output_tokens` and the provider's wire cap still bound the request. An
 interrupted attempt can resume from confirmed tool results when the request
-allows recovery and the remaining run budget can fund it. The
+allows recovery. The recovery request count is bounded, and an explicit
+`run_budget.max_total_tokens` applies to recovery. The
 `thinking_replay_always` option controls history replay independently.
 
 On compatible Messages routes, automatic agent requests for DeepSeek V4 and

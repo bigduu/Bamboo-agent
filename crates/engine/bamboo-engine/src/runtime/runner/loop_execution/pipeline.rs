@@ -54,7 +54,7 @@ use super::gold::{
     select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
-use super::output_limit_split::{SplitRecovery, Stage as SplitStage, DEFAULT_TOKEN_LIMIT};
+use super::output_limit_split::{SplitRecovery, Stage as SplitStage};
 use crate::runtime::runner::state_bridge;
 use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
@@ -3565,10 +3565,7 @@ async fn run_pipeline_inner(
     // to ever fire (#2425).
     let mut no_tool_call_continuation_streak: u32 = 0;
     let mut split_recovery: Option<SplitRecovery> = None;
-    let recovery_token_limit = config
-        .run_budget
-        .max_total_tokens
-        .unwrap_or(DEFAULT_TOKEN_LIMIT);
+    let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
@@ -3595,9 +3592,7 @@ async fn run_pipeline_inner(
             break;
         }
         if split_recovery.is_some()
-            && (run_tokens_used(&state.runtime_state.round) >= recovery_token_limit
-                || check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget)
-                    .is_some()
+            && (check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
                 || config
                     .run_budget
                     .max_rounds
@@ -3916,11 +3911,14 @@ async fn run_pipeline_inner(
             // transient record when context preparation/provider dispatch fails
             // before streaming starts.
             let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
-            let mut spent = state.runtime_state.round.clone();
-            round_activity.apply_to_round(&mut spent);
+            let remaining_run_tokens = recovery_token_limit.map(|limit| {
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                limit.saturating_sub(run_tokens_used(&spent))
+            });
             let output_limit_policy = RoundOutputLimitPolicy {
                 retry: output_limit_recovery,
-                remaining_run_tokens: Some(recovery_token_limit.saturating_sub(run_tokens_used(&spent))),
+                remaining_run_tokens,
                 previous_prompt_tokens,
                 task_split: split_request.as_ref().map(|(stage, advisory)| TaskSplitPrompt {
                     advisory,
@@ -4197,13 +4195,13 @@ async fn run_pipeline_inner(
                 split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
             }
             let validation_error = llm_output.terminal_validation_error.or_else(|| {
-                output_limit_recovery.and_then(|_| {
-                    let mut spent = state.runtime_state.round.clone();
-                    round_activity.apply_to_round(&mut spent);
-                    (run_tokens_used(&spent) > recovery_token_limit).then(|| AgentError::Budget(
-                        "output-limit recovery exceeded its token budget on reported usage".into(),
-                    ))
-                })
+                output_limit_recovery?;
+                let limit = recovery_token_limit?;
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                (run_tokens_used(&spent) > limit).then(|| AgentError::Budget(
+                    "output-limit recovery exceeded its token budget on reported usage".into(),
+                ))
             });
             if let Some(error) = validation_error {
                 let reasoning_repeated = matches!(error, AgentError::ReasoningRepetition { .. });
@@ -4249,13 +4247,13 @@ async fn run_pipeline_inner(
                     round_activity.apply_to_round(&mut spent);
                     previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
                     let next = llm_output.output_limit_recovery;
-                    let remaining_tokens = recovery_token_limit.saturating_sub(run_tokens_used(&spent));
+                    let remaining_tokens = recovery_token_limit.map(|limit| limit.saturating_sub(run_tokens_used(&spent)));
                     let split_candidate = next.filter(|candidate| reasoning_repeated || candidate.prefers_task_split())
                         .or_else(|| output_limit_recovery.filter(|attempt| reasoning_only && attempt.is_convergence()))
                         .filter(|candidate| candidate.allows_task_split());
                     if let Some(candidate) = split_candidate {
                         let cost = previous_prompt_tokens.saturating_add(candidate.output_limit());
-                        if cost.saturating_mul(2) <= remaining_tokens
+                        if remaining_tokens.is_none_or(|remaining| cost.saturating_mul(2) <= remaining)
                             && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
                             && can_split_tasks(session, config, &state.runtime_state, turn_counter)
                         {
@@ -4284,7 +4282,9 @@ async fn run_pipeline_inner(
                             && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                     }) {
                         let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
-                        if next_cost <= remaining_tokens && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
+                        if remaining_tokens.is_none_or(|remaining| next_cost <= remaining)
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                        {
                             output_limit_recovery = Some(recovery);
                             tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
                             continue;
@@ -4292,7 +4292,7 @@ async fn run_pipeline_inner(
                     }
                     tracing::warn!(
                         session_id = %state.session_id,
-                        remaining_tokens,
+                        ?remaining_tokens,
                         recovery_available = next.is_some() || split_candidate.is_some(),
                         "Recovery could not start under the current request and run limits"
                     );
