@@ -823,71 +823,12 @@ impl LLMProvider for OpenAIProvider {
             }
         };
 
-        let model_for_log = model.to_string();
-        let requested_reasoning = reasoning_effort;
-        let mut observed_reasoning_signal = false;
-        let mut reasoning_chars = 0usize;
-        let mut logged_summary = false;
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
-        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
-            if data.trim().is_empty() {
-                return Ok(Vec::new());
-            }
-            if let Some(diagnostics) = &completion_diagnostics {
-                diagnostics.observe_sse(event, data);
-            }
-
-            let mut reasoning_chunk_to_emit: Option<String> = None;
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(delta) = v
-                    .get("choices")
-                    .and_then(|choices| choices.get(0))
-                    .and_then(|choice| choice.get("delta"))
-                {
-                    let has_answer_content = delta
-                        .get("content")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|value| !value.is_empty());
-                    let reasoning_chunk = delta
-                        .get("reasoning_content")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| delta.get("reasoning").and_then(|value| value.as_str()));
-
-                    if let Some(reasoning_chunk) = reasoning_chunk {
-                        observed_reasoning_signal = true;
-                        reasoning_chars = reasoning_chars.saturating_add(reasoning_chunk.len());
-                        if !reasoning_chunk.is_empty() && !has_answer_content {
-                            reasoning_chunk_to_emit = Some(reasoning_chunk.to_string());
-                        }
-                    }
-                }
-            }
-
-            let mut chunks = parse_openai_compat_sse_data_strict_multi(data)?;
-            if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
-                chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
-                chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
-            }
-
-            if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
-                && !logged_summary
-                && (requested_reasoning.is_some() || observed_reasoning_signal)
-            {
-                tracing::info!(
-                    "OpenAI chat_completions reasoning summary: model_hash={} requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                    log_identity(&model_for_log),
-                    requested_reasoning
-                        .map(ReasoningEffort::as_str)
-                        .unwrap_or("none"),
-                    observed_reasoning_signal,
-                    reasoning_chars
-                );
-                logged_summary = true;
-            }
-            Ok(chunks)
-        });
-
-        Ok(stream)
+        Ok(chat_completions_stream(
+            response,
+            model.to_string(),
+            reasoning_effort,
+            crate::provider::current_completion_diagnostics(),
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
@@ -924,6 +865,74 @@ impl LLMProvider for OpenAIProvider {
             },
         ))
     }
+}
+
+pub(crate) fn chat_completions_stream(
+    response: reqwest::Response,
+    model_for_log: String,
+    requested_reasoning: Option<ReasoningEffort>,
+    completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
+) -> LLMStream {
+    let mut observed_reasoning_signal = false;
+    let mut reasoning_chars = 0usize;
+    let mut logged_summary = false;
+    openai_compat_chat_stream_from_sse(response, move |event, data| {
+        if data.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(diagnostics) = &completion_diagnostics {
+            diagnostics.observe_sse(event, data);
+        }
+
+        let mut reasoning_chunk_to_emit: Option<String> = None;
+        if let Ok(v) = serde_json::from_str::<Value>(data) {
+            if let Some(delta) = v
+                .get("choices")
+                .and_then(|choices| choices.get(0))
+                .and_then(|choice| choice.get("delta"))
+            {
+                let has_answer_content = delta
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| !value.is_empty());
+                let reasoning_chunk = delta
+                    .get("reasoning_content")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| delta.get("reasoning").and_then(|value| value.as_str()));
+
+                if let Some(reasoning_chunk) = reasoning_chunk {
+                    observed_reasoning_signal = true;
+                    reasoning_chars = reasoning_chars.saturating_add(reasoning_chunk.len());
+                    if !reasoning_chunk.is_empty() && !has_answer_content {
+                        reasoning_chunk_to_emit = Some(reasoning_chunk.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut chunks = parse_openai_compat_sse_data_strict_multi(data)?;
+        if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
+            chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+            chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
+        }
+
+        if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
+            && !logged_summary
+            && (requested_reasoning.is_some() || observed_reasoning_signal)
+        {
+            tracing::info!(
+                "OpenAI chat_completions reasoning summary: model_hash={} requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                log_identity(&model_for_log),
+                requested_reasoning
+                    .map(ReasoningEffort::as_str)
+                    .unwrap_or("none"),
+                observed_reasoning_signal,
+                reasoning_chars
+            );
+            logged_summary = true;
+        }
+        Ok(chunks)
+    })
 }
 
 #[cfg(test)]

@@ -361,6 +361,29 @@ pub(crate) fn chat_completions_controls_overridden(
     })
 }
 
+/// A protocol fallback can carry wire controls that have a Chat equivalent.
+/// Content, tool and provider-specific patches must stay on their original route.
+pub(crate) fn messages_fallback_patches_supported(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_none_or(|config| {
+        resolve_scope(config, ENDPOINT_MESSAGES, Some(model))
+            .body_patch
+            .iter()
+            .all(|patch| match parse_path(&patch.path).as_slice() {
+                [PathSegment::Key(key)] => matches!(
+                    key.as_str(),
+                    "max_tokens" | "temperature" | "top_p" | "stop_sequences"
+                ),
+                [PathSegment::Key(parent), PathSegment::Key(child)] => {
+                    parent == "output_config" && child == "effort"
+                }
+                _ => false,
+            })
+    })
+}
+
 /// A configured Work budget cannot accept arbitrary wire body patches (which
 /// may replace/remove token limits, model, prompts or candidate counts). Reject
 /// the resolved patch before any model request; header-only overrides remain.

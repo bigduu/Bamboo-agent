@@ -1,6 +1,7 @@
 //! Anthropic provider and request-building helpers.
 
 pub mod api_types;
+mod chat_fallback;
 pub mod conversion;
 pub mod stream;
 
@@ -653,6 +654,25 @@ impl AnthropicProvider {
             })
             .await?;
 
+        let fallback = if compatible_gateway
+            && (response.status().is_success()
+                || response.status() == reqwest::StatusCode::BAD_REQUEST)
+        {
+            request_budget.remaining_attempt().and_then(|attempt| {
+                chat_fallback::ChatFallback::prepare(
+                    self,
+                    messages,
+                    tools,
+                    model,
+                    &body,
+                    &headers,
+                    attempt,
+                    completion_diagnostics.clone(),
+                )
+            })
+        } else {
+            None
+        };
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.map_err(LLMError::Http)?;
@@ -660,10 +680,13 @@ impl AnthropicProvider {
             if status == 401 || status == 403 {
                 return Err(anthropic_auth_error(status, text));
             }
-            return Err(LLMError::Api(format!(
-                "Anthropic API error: HTTP {}: {}",
-                status, text
-            )));
+            let error = LLMError::Api(format!("Anthropic API error: HTTP {status}: {text}"));
+            if let Some(fallback) =
+                fallback.filter(|_| chat_fallback::rejects_thinking_budget(&text))
+            {
+                return fallback.retry(error).await;
+            }
+            return Err(error);
         }
 
         let state = Arc::new(Mutex::new(AnthropicStreamState {
@@ -673,10 +696,12 @@ impl AnthropicProvider {
             completion_diagnostics,
             ..Default::default()
         }));
-        Ok(anthropic_stream_with_usage_on_error(
-            response.into_response(),
-            state,
-        ))
+        let stream =
+            anthropic_stream_with_usage_on_error(response.into_response(), Arc::clone(&state));
+        Ok(match fallback {
+            Some(fallback) => fallback.recover_stream(stream, state),
+            None => stream,
+        })
     }
 }
 
@@ -1791,6 +1816,8 @@ pub struct AnthropicStreamState {
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
     request_thinking_budget_tokens: Option<u64>,
+    model_output_started: bool,
+    thinking_budget_rejected: bool,
     native_blocks_by_index: HashMap<usize, Value>,
     native_input_json_by_index: HashMap<usize, String>,
     /// Thinking blocks that have received a signature delta. This ordering
@@ -2390,6 +2417,17 @@ fn parse_anthropic_sse_event_multi(
     event_type: &str,
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
+    match event_type {
+        "content_block_start"
+        | "content_block_delta"
+        | "content_block_stop"
+        | "message_delta"
+        | "message_stop" => state.model_output_started = true,
+        "error" if !state.model_output_started => {
+            state.thinking_budget_rejected = chat_fallback::rejects_thinking_budget(data);
+        }
+        _ => {}
+    }
     capture_anthropic_native_event(state, event_type, data);
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {

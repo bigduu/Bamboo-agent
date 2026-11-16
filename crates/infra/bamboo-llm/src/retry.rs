@@ -843,6 +843,16 @@ impl InitialRequestBudget {
         }
     }
 
+    pub(crate) fn remaining_attempt(self) -> Option<RemainingInitialRequestAttempt> {
+        let continuous = self.is_continuous();
+        (!single_attempt_required()
+            && (continuous || self.attempts.load(Ordering::Relaxed) < self.max_attempts))
+            .then_some(RemainingInitialRequestAttempt {
+                deadline: (!continuous).then_some(self.deadline),
+                attempt_timeout: self.attempt_timeout,
+            })
+    }
+
     fn is_continuous(&self) -> bool {
         self.continuous || self.live_continuous.load(Ordering::Acquire)
     }
