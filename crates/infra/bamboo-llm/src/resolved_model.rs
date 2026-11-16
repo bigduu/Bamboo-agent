@@ -186,6 +186,10 @@ impl LLMProvider for RoleReasoningProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
     }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]

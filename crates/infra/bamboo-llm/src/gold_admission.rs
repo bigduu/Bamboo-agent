@@ -236,6 +236,10 @@ impl LLMProvider for GuardedGoldProvider {
         self.validate()?;
         self.delegate.list_model_info().await
     }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.dispatch(model)?.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]

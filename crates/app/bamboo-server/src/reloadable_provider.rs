@@ -158,6 +158,10 @@ impl LLMProvider for ReloadableProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.current().await.list_model_info().await
     }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.current().await.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]

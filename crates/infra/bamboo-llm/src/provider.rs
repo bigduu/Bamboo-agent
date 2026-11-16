@@ -955,6 +955,16 @@ pub trait LLMProvider: Send + Sync {
             .map(ProviderModelInfo::from_id)
             .collect())
     }
+
+    /// Look up limits for a model selected for an actual request. Routing
+    /// guards must check the selected model before delegating the lookup.
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        Ok(self
+            .list_model_info()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == model))
+    }
 }
 
 /// Produce a stable, process-local identity for a known wrapper's inner Arc.
@@ -1141,6 +1151,9 @@ impl LLMProvider for QueuedBudgetProvider {
     }
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
+    }
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
     }
 }
 

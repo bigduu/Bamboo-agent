@@ -46,11 +46,10 @@ pub(crate) async fn resolve_known_token_ceilings(
         .is_none_or(|limit| limit.max_output_tokens.is_none())
     {
         provider
-            .list_model_info()
+            .model_info_for_request(model)
             .await
             .ok()?
-            .into_iter()
-            .find(|info| info.id == model)
+            .filter(|info| info.id == model)
     } else {
         None
     };
@@ -342,8 +341,8 @@ async fn reported_model_limits(
     llm: &dyn LLMProvider,
     model_name: &str,
 ) -> Option<ProviderModelInfo> {
-    match tokio::time::timeout(MODEL_INFO_TIMEOUT, llm.list_model_info()).await {
-        Ok(Ok(models)) => models.into_iter().find(|entry| {
+    match tokio::time::timeout(MODEL_INFO_TIMEOUT, llm.model_info_for_request(model_name)).await {
+        Ok(Ok(entry)) => entry.filter(|entry| {
             entry.id == model_name
                 && (entry.max_context_tokens.is_some()
                     || entry.max_input_tokens.is_some()
@@ -866,14 +865,12 @@ mod tests {
         assert_eq!(fallback.max_context_tokens, 1_000_000);
         assert_eq!(fallback.max_output_tokens, 64_000);
 
-        tokio::fs::write(
-            model_limits_path(&config),
-            r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#,
-        )
-        .await
-        .unwrap();
+        let path = model_limits_path(&config);
+        let stored = r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#;
+        tokio::fs::write(&path, stored).await.unwrap();
         let saved = resolve_token_budget(&mut session, &config, model, &provider).await;
         assert_eq!(saved.max_output_tokens, 32_000);
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), stored);
     }
 
     struct MutableMetadataProvider {
