@@ -702,13 +702,11 @@ mod tests {
                     .await
                 }
             };
-            let diagnostics =
-                CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
             diagnostics.mark_compatible_messages();
             assert_eq!(dispatch(diagnostics.clone(), body.clone()).await, expected);
             let split = diagnostics.output_limit_recovery().unwrap();
             assert!(split.prefers_task_split(), "{path}");
-            assert_eq!(diagnostics.reasoning_cutoff_budget(), Some((4096, None)));
             let continuation = CompletionDiagnostics::for_agent_round(Some(split.for_task_split()));
             continuation.mark_compatible_messages();
             assert_eq!(dispatch(continuation, body).await, expected);
@@ -761,8 +759,7 @@ mod tests {
                 serde_json::json!([{"type":"url","name":"remote"}]),
             ),
         ] {
-            let diagnostics =
-                CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
             let mut body = serde_json::json!({
                 "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}
             });
@@ -779,7 +776,6 @@ mod tests {
             })
             .await;
             assert!(diagnostics.output_limit_recovery().is_none(), "{field}");
-            assert!(diagnostics.reasoning_cutoff_budget().is_none(), "{field}");
         }
     }
 

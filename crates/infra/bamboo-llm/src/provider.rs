@@ -243,21 +243,19 @@ pub struct CompletionDiagnostics {
     state: Arc<Mutex<CompletionDiagnosticState>>,
     agent_round: bool,
     recovery: Option<OutputLimitRecovery>,
-    cutoff_max_output: Option<u64>,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
     "Bamboo runtime recovery: use the work already completed. Keep this step small. \
      If you can answer now, give the concise answer. If more work is needed, make only the \
      single next useful tool call. Otherwise, report confirmed progress and what remains.";
-pub const REASONING_HEADROOM_FINISH_REASON: &str = "reasoning_headroom";
+pub const REASONING_REPETITION_FINISH_REASON: &str = "reasoning_repetition";
 
 /// An attempt authorized by a completed request's wire controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLimitRecovery {
     controls: OutputLimitRecoveryControls,
     step: OutputLimitStep,
-    capped_reasoning_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,11 +311,6 @@ impl OutputLimitRecovery {
                 }
             )
     }
-
-    pub fn with_capped_reasoning_bytes(mut self, bytes: usize) -> Self {
-        self.capped_reasoning_bytes = Some(bytes);
-        self
-    }
 }
 
 #[derive(Debug, Default)]
@@ -372,29 +365,6 @@ impl CompletionDiagnostics {
             .is_some_and(|retry| matches!(retry.step, OutputLimitStep::Split { .. }))
     }
 
-    /// The runner leaves room for both an in-flight cutoff and its follow-up.
-    pub fn with_reasoning_cutoff_budget(mut self, max_output: u64) -> Self {
-        self.cutoff_max_output = Some(max_output);
-        self
-    }
-
-    pub(crate) fn reasoning_cutoff_budget(&self) -> Option<(u64, Option<usize>)> {
-        // The final request has already passed its own budget admission.
-        if let Some(retry) = self
-            .recovery
-            .filter(|retry| retry.step != OutputLimitStep::LowerEffort)
-        {
-            return Some((retry.output_limit(), retry.capped_reasoning_bytes));
-        }
-        let next = self
-            .output_limit_recovery()
-            .filter(|next| next.is_convergence() || next.prefers_task_split())?;
-        (next.output_limit() <= self.cutoff_max_output?).then_some((
-            next.output_limit(),
-            self.recovery.and_then(|retry| retry.capped_reasoning_bytes),
-        ))
-    }
-
     pub(crate) fn mark_compatible_messages(&self) {
         self.state
             .lock()
@@ -409,11 +379,11 @@ impl CompletionDiagnostics {
             .compatible_messages
     }
 
-    pub(crate) fn record_reasoning_cutoff(&self) {
+    pub fn record_reasoning_repetition(&self) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .finish_reason = Some(REASONING_HEADROOM_FINISH_REASON);
+            .finish_reason = Some(REASONING_REPETITION_FINISH_REASON);
     }
 
     pub(crate) fn record_messages_stop(&self) {
@@ -521,13 +491,8 @@ impl CompletionDiagnostics {
                 } else {
                     OutputLimitStep::LowerEffort
                 };
-                (step != OutputLimitStep::Converge || controls.allows_convergence).then_some(
-                    OutputLimitRecovery {
-                        controls,
-                        step,
-                        capped_reasoning_bytes: None,
-                    },
-                )
+                (step != OutputLimitStep::Converge || controls.allows_convergence)
+                    .then_some(OutputLimitRecovery { controls, step })
             });
         } else {
             state.recovery = None;
@@ -535,7 +500,7 @@ impl CompletionDiagnostics {
         Ok(false)
     }
 
-    /// The sanitized provider reason, or `unavailable` if none was reported.
+    /// The normalized completion reason, or `unavailable` if none was observed.
     pub fn finish_reason(&self) -> &'static str {
         self.state
             .lock()

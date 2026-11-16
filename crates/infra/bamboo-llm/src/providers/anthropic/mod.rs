@@ -536,7 +536,7 @@ impl AnthropicProvider {
         );
         apply_required_tool_choice(&mut body, required_tool);
         // A compatible gateway can enforce reasoning without advertising it
-        // on the request. Its cutoff must not depend on replaying old thinking.
+        // on the request. This identifies the wire controls for recovery.
         if let Some(diagnostics) = completion_diagnostics
             .as_ref()
             .filter(|_| compatible_gateway)
@@ -644,18 +644,11 @@ impl AnthropicProvider {
             )));
         }
 
-        let reasoning_cutoff = completion_diagnostics
-            .as_ref()
-            .filter(|_| compatible_gateway)
-            .and_then(|diagnostics| diagnostics.reasoning_cutoff_budget())
-            .filter(|(limit, _)| *limit >= 4096)
-            .map(|(limit, sample)| ReasoningCutoff::new(limit, sample));
         let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
             completion_diagnostics,
-            reasoning_cutoff,
             ..Default::default()
         }));
         Ok(anthropic_stream_with_usage_on_error(
@@ -1757,7 +1750,6 @@ fn validated_anthropic_reference_definitions_in_order<'a>(
 #[derive(Default)]
 pub struct AnthropicStreamState {
     pub(crate) completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
-    reasoning_cutoff: Option<ReasoningCutoff>,
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
@@ -1788,46 +1780,6 @@ pub struct AnthropicStreamState {
     native_capture_bytes: usize,
     native_capture_invalid: bool,
     usage_snapshot: AnthropicUsageSnapshot,
-}
-
-/// These compatible gateways stream raw thinking but report token counts only
-/// at the end. Estimate in batches to keep the work linear in the stream size.
-/// This is a local cutoff threshold, never a provider usage measurement.
-struct ReasoningCutoff {
-    token_threshold: u64,
-    estimated_tokens: u64,
-    byte_threshold: Option<usize>,
-    bytes: usize,
-    pending_text: String,
-}
-
-impl ReasoningCutoff {
-    fn new(output_limit: u64, capped_reasoning_bytes: Option<usize>) -> Self {
-        Self {
-            token_threshold: output_limit - output_limit.div_ceil(8),
-            estimated_tokens: 0,
-            // An unsigned full-cap sample from this request can reveal a
-            // tokenizer mismatch that a generic token estimate would miss.
-            byte_threshold: capped_reasoning_bytes.map(|bytes| bytes - bytes.div_ceil(8)),
-            bytes: 0,
-            pending_text: String::new(),
-        }
-    }
-
-    fn observe(&mut self, text: &str) -> bool {
-        self.bytes = self.bytes.saturating_add(text.len());
-        if self.byte_threshold.is_some_and(|limit| self.bytes >= limit) {
-            return true;
-        }
-        self.pending_text.push_str(text);
-        if self.pending_text.len() < 1024 {
-            return false;
-        }
-        let tokens = tiktoken_rs::o200k_base_singleton().count_ordinary(&self.pending_text) as u64;
-        self.estimated_tokens = self.estimated_tokens.saturating_add(tokens);
-        self.pending_text.clear();
-        self.estimated_tokens >= self.token_threshold
-    }
 }
 
 /// Anthropic reports uncached input, cache read and cache creation as disjoint
@@ -1932,8 +1884,8 @@ fn anthropic_stream_with_usage_on_error(
     finish_anthropic_stream(stream, state)
 }
 
-// Preserve known usage when the body errors or we stop reading it early. In
-// particular, message_start can already contain all three prompt components.
+// Preserve known usage when the body errors. The message_start event can
+// already contain all three prompt components.
 // Success remains terminal-only so later fields can still invalidate a value.
 fn finish_anthropic_stream(
     upstream: LLMStream,
@@ -1941,40 +1893,13 @@ fn finish_anthropic_stream(
 ) -> LLMStream {
     use futures::StreamExt;
 
-    let cutoff_enabled = state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .reasoning_cutoff
-        .is_some();
     Box::pin(futures::stream::unfold(
-        (Some(upstream), state, None),
-        move |(upstream, state, pending_error)| async move {
+        (upstream, state, None),
+        |(mut upstream, state, pending_error)| async move {
             if let Some(error) = pending_error {
                 return Some((Err(error), (upstream, state, None)));
             }
-            let mut upstream = upstream?;
             let item = upstream.next().await?;
-            let cutoff_snapshot = match &item {
-                Ok(LLMChunk::ReasoningToken(text)) if cutoff_enabled => {
-                    let mut parser = state.lock().unwrap_or_else(|e| e.into_inner());
-                    parser
-                        .reasoning_cutoff
-                        .as_mut()
-                        .is_some_and(|cutoff| cutoff.observe(text))
-                        .then(|| {
-                            if let Some(diagnostics) = &parser.completion_diagnostics {
-                                diagnostics.record_reasoning_cutoff();
-                            }
-                            parser.usage_snapshot.take_terminal()
-                        })
-                }
-                _ => None,
-            };
-            if let Some(snapshot) = cutoff_snapshot {
-                tracing::info!("Closing a compatible Messages stream at the reasoning threshold");
-                drop(upstream);
-                return snapshot.map(|usage| (Ok(usage), (None, state, None)));
-            }
             match item {
                 Err(error) => {
                     let snapshot = {
@@ -1984,12 +1909,12 @@ fn finish_anthropic_stream(
                         state.usage_snapshot.take_terminal()
                     };
                     if let Some(snapshot) = snapshot {
-                        Some((Ok(snapshot), (Some(upstream), state, Some(error))))
+                        Some((Ok(snapshot), (upstream, state, Some(error))))
                     } else {
-                        Some((Err(error), (Some(upstream), state, None)))
+                        Some((Err(error), (upstream, state, None)))
                     }
                 }
-                Ok(chunk) => Some((Ok(chunk), (Some(upstream), state, None))),
+                Ok(chunk) => Some((Ok(chunk), (upstream, state, None))),
             }
         },
     ))
@@ -2518,7 +2443,6 @@ pub fn parse_anthropic_sse_event(
             Ok(None)
         }
         "message_delta" => {
-            state.reasoning_cutoff = None;
             if !data.is_empty() {
                 if let Some(diagnostics) = &state.completion_diagnostics {
                     diagnostics.observe_sse(event_type, data);
@@ -2676,16 +2600,6 @@ pub fn parse_anthropic_sse_event(
                 if let Some(diagnostics) = &state.completion_diagnostics {
                     diagnostics.record_provider_tool();
                 }
-            }
-
-            if block_type != "thinking"
-                || index != 0
-                || state.thinking_blocks_started != 0
-                || content_block["signature"]
-                    .as_str()
-                    .is_some_and(|signature| !signature.is_empty())
-            {
-                state.reasoning_cutoff = None;
             }
 
             if block_type == "thinking" || block_type == "redacted_thinking" {
@@ -2878,7 +2792,6 @@ pub fn parse_anthropic_sse_event(
                     Ok(None)
                 }
                 "signature_delta" => {
-                    state.reasoning_cutoff = None;
                     // Provider-minted signature over the thinking block's exact
                     // text — required to replay the block to real Anthropic
                     // (#520). Accumulate defensively (the real API delivers it
