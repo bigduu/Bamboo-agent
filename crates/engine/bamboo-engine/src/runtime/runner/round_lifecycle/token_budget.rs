@@ -393,9 +393,10 @@ fn resolve_window(
     let context = joint_window
         .or_else(|| input_limit.map(|input| input.saturating_add(output)))
         .unwrap_or(fallback.max_context_tokens);
+    let compression_window = context.min(input_limit.unwrap_or(u32::MAX));
     let safety_margin = configured
         .and_then(|limit| limit.safety_margin)
-        .unwrap_or_else(|| ModelLimit::new("", context).get_safety_margin());
+        .unwrap_or_else(|| ModelLimit::new("", compression_window).get_safety_margin());
     let mut budget = TokenBudget::with_safety_margin(
         context,
         output,

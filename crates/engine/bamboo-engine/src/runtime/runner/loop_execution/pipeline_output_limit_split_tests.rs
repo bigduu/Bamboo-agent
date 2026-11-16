@@ -500,6 +500,62 @@ async fn dynamic_model_window_shrinks_the_wire_output_when_the_prompt_grows() {
     }
 }
 
+#[tokio::test]
+async fn messages_honors_large_output_and_a_much_smaller_independent_input_cap() {
+    use crate::runtime::runner::round_lifecycle::execute_llm_round;
+
+    let server = MockServer::start().await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        bamboo_llm::AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"model",
+            "max_context_tokens":1_000_000,"max_input_tokens":8_000,"max_tokens":64_000}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_replies(&server, "/messages", vec![text("Verified.")]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = canonical_usage_pipeline_config();
+    config.provider_name = Some("configured-route".into());
+    config.app_data_dir = Some(dir.path().into());
+    let mut session = Session::new("independent-input-window", "model");
+    session.add_message(Message::user("Check the result."));
+    let (events, _receiver) = tokio::sync::mpsc::channel(128);
+    let output = execute_llm_round(
+        &mut session,
+        &config,
+        &provider,
+        &events,
+        &CancellationToken::new(),
+        "independent-input-window",
+        "model",
+        &[],
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.stream_output.content, "Verified.");
+    let budget = &session.resolved_token_budget.as_ref().unwrap().1;
+    assert_eq!(budget.safety_margin, 1_000);
+    assert_eq!(budget.max_request_input_tokens(), 7_000);
+    assert_eq!(budget.compression_target_context_tokens(), 2_000);
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|request| request.url.path() == "/messages")
+        .unwrap();
+    let body: Value = request.body_json().unwrap();
+    assert_eq!(body["max_tokens"], 64_000);
+}
+
 fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
     let mut frames = Vec::new();
     if matches!(

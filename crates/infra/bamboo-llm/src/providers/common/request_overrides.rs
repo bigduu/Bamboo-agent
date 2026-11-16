@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::provider::{
-    current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, Result,
-    OUTPUT_LIMIT_CONVERGENCE_HINT,
+    current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, ProviderModelInfo,
+    Result, OUTPUT_LIMIT_CONVERGENCE_HINT,
 };
 use bamboo_config::{
     BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
@@ -112,6 +112,36 @@ pub fn apply_overrides_to_body(
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
 }
 
+/// Gateways can route the same model ID differently under request-specific
+/// headers. Keep catalog IDs but withhold capacities when these scopes differ.
+pub(crate) fn bind_catalog_limits(
+    mut models: Vec<ProviderModelInfo>,
+    overrides: Option<&RequestOverridesConfig>,
+    generation_endpoints: impl Fn(&str) -> &'static [&'static str],
+) -> Vec<ProviderModelInfo> {
+    let Some(overrides) = overrides.filter(|overrides| {
+        overrides
+            .endpoints
+            .values()
+            .any(|scope| !scope.headers.is_empty())
+            || overrides
+                .rules
+                .iter()
+                .any(|rule| !rule.scope.headers.is_empty())
+    }) else {
+        return models;
+    };
+    let catalog_headers = resolve_scope(overrides, ENDPOINT_MODELS, None).headers;
+    for model in &mut models {
+        if generation_endpoints(&model.id).iter().any(|endpoint| {
+            resolve_scope(overrides, endpoint, Some(&model.id)).headers != catalog_headers
+        }) {
+            *model = ProviderModelInfo::from_id(std::mem::take(&mut model.id));
+        }
+    }
+    models
+}
+
 /// Inspect the final wire controls after masking and operator body patches.
 /// Keep recovery bound to the observed protocol, effort and output cap.
 pub(crate) fn mask_and_prepare_agent_request(
@@ -148,20 +178,34 @@ pub(crate) fn mask_and_prepare_agent_request(
     };
     let legacy_limit_path = (endpoint == ENDPOINT_CHAT_COMPLETIONS).then_some("/max_tokens");
     if let Some(window_limit) = diagnostics.model_window_limit() {
+        // Gemini addresses the model in the URL. The other adapters must
+        // still address the model whose capacity the runtime resolved.
+        if endpoint != ENDPOINT_STREAM_GENERATE_CONTENT
+            && body.get("model").and_then(Value::as_str) != Some(model)
+        {
+            return Err(LLMError::RequestFailed(
+                "Set the routed model in provider settings when using model windows".into(),
+            ));
+        }
+        let limit_paths = std::iter::once(limit_path).chain(legacy_limit_path);
+        let mut wire_limit = u64::from(window_limit);
         let mut has_output_control = false;
-        for path in std::iter::once(limit_path).chain(legacy_limit_path) {
-            if let Some(field) = body.pointer_mut(path) {
-                let configured = field.as_u64().ok_or_else(|| {
-                    LLMError::RequestFailed("Model output limit must be an integer".into())
-                })?;
-                *field = Value::from(configured.min(u64::from(window_limit)));
-                has_output_control = true;
-            }
+        for field in limit_paths.clone().filter_map(|path| body.pointer(path)) {
+            let configured = field.as_u64().filter(|limit| *limit > 0).ok_or_else(|| {
+                LLMError::RequestFailed("Model output limit must be a positive integer".into())
+            })?;
+            wire_limit = wire_limit.min(configured);
+            has_output_control = true;
         }
         if !has_output_control {
             return Err(LLMError::RequestFailed(
                 "Model window requires an output limit on the final request".into(),
             ));
+        }
+        for path in limit_paths {
+            if let Some(field) = body.pointer_mut(path) {
+                *field = Value::from(wire_limit);
+            }
         }
     }
     let limit = body
@@ -766,7 +810,7 @@ mod tests {
         use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
         use serde_json::json;
 
-        let mut body = json!({"max_tokens":4096});
+        let mut body = json!({"model":"fixture","max_tokens":4096});
         let initial =
             CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
         initial.mark_compatible_messages();
@@ -800,6 +844,67 @@ mod tests {
         assert_eq!(body["max_tokens"], 3900);
         assert_eq!(follow_up.output_limit(), Some(3900));
         assert!(follow_up.output_limit_recovery().is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_window_rejects_a_changed_wire_model_before_observing_the_request() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (
+                ENDPOINT_MESSAGES,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_RESPONSES,
+                json!({"model":"small","max_output_tokens":4096}),
+            ),
+        ] {
+            let diagnostics =
+                CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+            let error = scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "large",
+                )
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, LLMError::RequestFailed(_)), "{endpoint}");
+            assert_eq!(diagnostics.output_limit(), None, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_chat_window_uses_one_limit_for_both_output_fields() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"model":"fixture","max_tokens":4096,"max_completion_tokens":5000});
+        let diagnostics =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4500));
+        scope_completion_diagnostics(diagnostics.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_CHAT_COMPLETIONS,
+                "fixture",
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert_eq!(diagnostics.output_limit(), Some(4096));
     }
 
     #[tokio::test]

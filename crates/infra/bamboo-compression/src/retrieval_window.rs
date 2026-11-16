@@ -70,7 +70,7 @@ pub struct RetrievalWindowCandidatePlan {
     pub active_tokens_before: u32,
     /// Projected active tokens after the candidate messages are removed.
     pub projected_active_tokens_after: u32,
-    /// Provider context-window size used for the plan.
+    /// Compression window, including any tighter independent input ceiling.
     pub context_window_tokens: u32,
     /// Effective provider request-input limit after output and safety reserves.
     pub request_input_limit_tokens: u32,
@@ -493,7 +493,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         token_accounting_sha256: token_accounting_sha256(accounting),
         active_tokens_before,
         projected_active_tokens_after,
-        context_window_tokens: budget.max_context_tokens,
+        context_window_tokens: budget.compression_window_tokens(),
         request_input_limit_tokens: budget.max_request_input_tokens(),
         target_tokens,
         target_usage_percent: policy.target_usage_percent,
@@ -977,7 +977,7 @@ fn validate_current_token_budget(
     plan: &RetrievalWindowCandidatePlan,
     current_budget: &TokenBudget,
 ) -> Result<(), RetrievalWindowApplyError> {
-    if current_budget.max_context_tokens != plan.context_window_tokens
+    if current_budget.compression_window_tokens() != plan.context_window_tokens
         || current_budget.max_request_input_tokens() != plan.request_input_limit_tokens
     {
         return Err(RetrievalWindowApplyError::StalePlan {
@@ -1445,7 +1445,7 @@ pub fn effective_retrieval_window_target_tokens(
     target_usage_percent: u8,
 ) -> u32 {
     effective_target_tokens(
-        budget.max_context_tokens,
+        budget.compression_window_tokens(),
         budget.max_request_input_tokens(),
         target_usage_percent,
     )

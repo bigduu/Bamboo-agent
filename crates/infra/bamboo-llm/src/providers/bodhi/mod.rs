@@ -274,17 +274,31 @@ impl LLMProvider for BodhiProvider {
         use model_fetcher::ModelListFormat;
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = self.proxy_url("v1/models");
-        let format = match self.target_provider.as_str() {
-            "anthropic" => ModelListFormat::Messages,
-            "gemini" => ModelListFormat::Gemini,
-            _ => ModelListFormat::Compatible,
+        let (format, generation_endpoints): (_, &'static [_]) = match self.target_provider.as_str()
+        {
+            "anthropic" => (
+                ModelListFormat::Messages,
+                &[request_overrides::ENDPOINT_MESSAGES],
+            ),
+            "gemini" => (
+                ModelListFormat::Gemini,
+                &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+            ),
+            _ => (
+                ModelListFormat::Compatible,
+                &[request_overrides::ENDPOINT_CHAT_COMPLETIONS],
+            ),
         };
         match self
             .model_info_cache
             .get(&self.client, &url, headers, "Bodhi", format)
             .await
         {
-            Ok(models) => Ok(models),
+            Ok(models) => Ok(request_overrides::bind_catalog_limits(
+                models,
+                self.request_overrides.as_ref(),
+                |_| generation_endpoints,
+            )),
             Err(error) => {
                 tracing::debug!(
                     error_kind = llm_error_kind(&error),

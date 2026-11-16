@@ -21,22 +21,22 @@ pub struct TokenBudget {
     /// Safety margin for tokenizer estimation errors
     #[serde(default = "default_safety_margin")]
     pub safety_margin: u32,
-    /// Proactive compression trigger threshold as a percentage of context window tokens.
+    /// Proactive compression trigger as a percentage of the compression window.
     ///
     /// Combined with the request input ceiling and dynamically reserved working space.
     #[serde(default = "default_compression_trigger_percent")]
     pub compression_trigger_percent: u8,
-    /// Compression target threshold as a percentage of context window tokens.
+    /// Compression target as a percentage of the compression window.
     #[serde(default = "default_compression_target_percent")]
     pub compression_target_percent: u8,
-    /// Optional legacy reserve measured from the total context window.
+    /// Optional legacy reserve measured from the compression window.
     ///
     /// A non-zero value can tighten the dynamically calculated trigger, but
     /// never postpone a configured percentage or consume reserved output space.
     #[serde(default = "default_working_reserve_tokens")]
     pub working_reserve_tokens: u32,
     /// Fallback percentage trigger when the context window is too small for the fixed
-    /// reserve (i.e. `max_context_tokens < working_reserve_tokens * 2`).
+    /// reserve (i.e. `compression_window_tokens() < working_reserve_tokens * 2`).
     #[serde(default = "default_fallback_trigger_percent")]
     pub fallback_trigger_percent: u8,
     /// Minimum tool output character length required before prompt-side cache compaction.
@@ -101,9 +101,9 @@ fn default_prompt_cache_recent_tool_chains() -> u8 {
 
 /// Effective compression range for one resolved model budget.
 ///
-/// This is derived runtime data, not a second persisted policy. Targets retain
-/// a whole context-window percentage so retrieval receipts keep their existing
-/// exact arithmetic. A zero trigger/target means no positive range is feasible.
+/// Targets retain a whole compression-window percentage so retrieval receipts
+/// reproduce the exact token arithmetic. A zero trigger/target means no
+/// positive range is feasible.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompressionThresholds {
     pub input_limit: u32,
@@ -185,6 +185,12 @@ impl TokenBudget {
             .map_or(u32::MAX, |limit| limit.saturating_sub(self.safety_margin))
     }
 
+    /// Capacity used for input pressure and compression percentages.
+    pub fn compression_window_tokens(&self) -> u32 {
+        self.max_context_tokens
+            .min(self.max_input_tokens.unwrap_or(u32::MAX))
+    }
+
     /// Maximum output that fits the measured request and this model's window.
     pub fn output_limit_for_input(&self, input_tokens: u32) -> u32 {
         if input_tokens > self.input_ceiling() {
@@ -203,7 +209,7 @@ impl TokenBudget {
     /// checks. The reserve scales with the actual output/safety allowances;
     /// fixed legacy settings may only move the trigger earlier.
     pub fn compression_thresholds(&self) -> CompressionThresholds {
-        let window = self.max_context_tokens;
+        let window = self.compression_window_tokens();
         let input_limit = self.max_request_input_tokens();
         let headroom = self
             .output_reserve()

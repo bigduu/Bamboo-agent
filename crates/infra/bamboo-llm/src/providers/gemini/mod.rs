@@ -370,7 +370,8 @@ impl LLMProvider for GeminiProvider {
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = self.list_models_url();
-        self.model_info_cache
+        let models = self
+            .model_info_cache
             .get(
                 &self.client,
                 &url,
@@ -378,7 +379,12 @@ impl LLMProvider for GeminiProvider {
                 "Gemini",
                 model_fetcher::ModelListFormat::Gemini,
             )
-            .await
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+        ))
     }
 }
 

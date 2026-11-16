@@ -441,7 +441,8 @@ impl LLMProvider for AnthropicProvider {
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        self.model_info_cache
+        let models = self
+            .model_info_cache
             .get(
                 &self.client,
                 &url,
@@ -449,7 +450,12 @@ impl LLMProvider for AnthropicProvider {
                 "Anthropic",
                 model_fetcher::ModelListFormat::Messages,
             )
-            .await
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_MESSAGES],
+        ))
     }
 }
 

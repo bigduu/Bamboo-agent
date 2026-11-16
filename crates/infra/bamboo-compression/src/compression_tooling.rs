@@ -436,7 +436,7 @@ pub fn build_forced_compression_candidate_plan_with_input_costs(
         });
     }
 
-    let context_window = budget.max_context_tokens;
+    let context_window = budget.compression_window_tokens();
     let target_limit = budget.compression_target_context_tokens();
     let system_tokens = counter.count_messages(&system_messages);
     let protected_ids = protected_compression_message_ids(&non_system);
@@ -776,7 +776,7 @@ pub fn build_message_summary_candidate_plan_with_input_costs(
         active_usage_before_percent: exposure.active_usage_percent,
         projected_usage_after_percent: context_window_usage_percent(
             projected_tokens,
-            budget.max_context_tokens,
+            budget.compression_window_tokens(),
         ),
         trigger_percent: effective_trigger_percent(budget),
         target_percent: budget.compression_thresholds().target_usage_percent,
@@ -784,7 +784,7 @@ pub fn build_message_summary_candidate_plan_with_input_costs(
         trigger_type,
         additional_fixed_tokens,
         retained_input_tokens,
-        context_window: budget.max_context_tokens,
+        context_window: budget.compression_window_tokens(),
         target_limit,
         message_summary_snapshot: Some(message_summary_snapshot(session)?),
         summary_budget_clamped: target_summary_tokens < desired_summary_tokens,
@@ -893,11 +893,12 @@ pub fn finalize_compression_candidate_plan(
 }
 
 fn effective_trigger_percent(budget: &TokenBudget) -> u8 {
-    if budget.max_context_tokens == 0 {
+    let context_window = budget.compression_window_tokens();
+    if context_window == 0 {
         return 0;
     }
-    ((u64::from(budget.compression_trigger_context_tokens()) * 100)
-        / u64::from(budget.max_context_tokens)) as u8
+    ((u64::from(budget.compression_trigger_context_tokens()) * 100) / u64::from(context_window))
+        as u8
 }
 
 pub fn context_window_usage_percent(total_tokens: u32, context_window_tokens: u32) -> f64 {
@@ -963,9 +964,7 @@ pub fn estimate_context_compression_exposure_with_fixed_tokens(
     let active_tokens = active_message_tokens
         .saturating_add(summary_tokens)
         .saturating_add(additional_fixed_tokens);
-    // Use context window as the denominator for a single, provider-aligned
-    // pressure scale across backend and frontend.
-    let context_window = budget.max_context_tokens;
+    let context_window = budget.compression_window_tokens();
     let estimated_usage = context_window_usage_percent(active_tokens, context_window);
     let usage = session
         .token_usage
@@ -979,6 +978,7 @@ pub fn estimate_context_compression_exposure_with_fixed_tokens(
             } else {
                 context_window
             };
+            let denominator = denominator.min(budget.max_input_tokens.unwrap_or(u32::MAX));
             (denominator > 0).then_some(context_window_usage_percent(
                 token_usage.total_tokens,
                 denominator,
@@ -989,11 +989,7 @@ pub fn estimate_context_compression_exposure_with_fixed_tokens(
 
     let rounded = usage.clamp(0.0, 100.0).round() as u8;
     let trigger_tokens = budget.compression_trigger_context_tokens();
-    let trigger_percent = if budget.max_context_tokens > 0 {
-        (trigger_tokens as f64 / budget.max_context_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
+    let trigger_percent = context_window_usage_percent(trigger_tokens, context_window);
     let threshold_reached = usage >= trigger_percent;
 
     // Check non-system message count to stay consistent with the plan
@@ -1077,7 +1073,7 @@ fn build_compression_plan_with_summary_internal(
     let summary_message = compression_summary_message(&summary_content);
     let summary_tokens = counter.count_messages(&[summary_message]);
 
-    let context_window = budget.max_context_tokens;
+    let context_window = budget.compression_window_tokens();
     let target_limit = budget.compression_target_context_tokens();
 
     let mut active_messages = active_messages_for_budget(session);

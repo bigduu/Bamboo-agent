@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(gemini[0].max_context_tokens, None);
 
         let compatible = parse_models(
-            &json!({"data":[{"id":"alias","max_input_tokens":null,"max_output_tokens":4294967296,
+            &json!({"data":[{"id":"alias","max_input_tokens":null,"max_output_tokens":4294967296_u64,
                 "max_context_tokens":0}]}),
             ModelListFormat::Compatible,
         );

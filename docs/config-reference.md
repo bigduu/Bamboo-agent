@@ -752,10 +752,12 @@ is unknown.
 For ordinary Agent turns with model limits, Bamboo reserves working space
 during context preparation and recomputes the output allowance after projecting
 the final input and tools. A joint window bounds output by the space left after
-the measured input and `safety_margin`. An independent input ceiling is also
-checked. The counting margin is optional and defaults to the model window's
-derived margin. Numeric body overrides can lower the wire cap. Body patches that
-rewrite prompt content can change the provider's actual token count.
+the measured input and `safety_margin`. When an independent input ceiling is
+smaller, the compression trigger, target and default counting margin use that
+smaller window. Numeric body overrides can lower the wire cap. Set the routed
+model through provider settings so Bamboo resolves its limits before sizing the
+request. Dynamic sizing rejects a body patch that changes that model. Body
+patches that rewrite prompt content can change the provider's actual token count.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
@@ -771,7 +773,9 @@ server is running.
 
 With no matching user or provider limit, Bamboo uses compatibility limits of
 1M total context and 32K output for planning. Provider limits come from the
-selected route's catalog and are cached briefly.
+selected route's catalog and are cached briefly. If configured catalog and
+generation headers differ for a model, Bamboo keeps the catalog ID and omits
+its capacities. Configure limits explicitly for that generation route.
 
 ## Schedules (`schedules.json`)
 
