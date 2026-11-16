@@ -146,6 +146,12 @@ multiple gateways. Update a saved model with
 `bamboo config set provider_instances.work.model your-model-id`.
 [Copyable setup commands](./guides/GETTING_STARTED.md#use-a-custom-gateway).
 
+Built-in compression on a custom OpenAI Chat Completions gateway uses
+`max_tokens` for its summary allowance and leaves reasoning to the gateway when
+the effort and request controls are unset. This lets a gateway return summary
+text even when it always generates reasoning. Explicit Task Summary or Fast
+effort and request body controls still apply to the selected route.
+
 On upgrade, Bamboo removes GitHub Copilot instances and clears a default provider
 instance that selected one of them. References to those instances remain in
 saved model preferences and session history. Choose a supported provider and

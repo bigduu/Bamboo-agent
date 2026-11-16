@@ -19,7 +19,6 @@ use bamboo_compression::{
     HeuristicSummarizer, MessageSegmenter, Summarizer, TiktokenTokenCounter, TokenBudget,
     TokenCounter,
 };
-use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
     SessionMessageKind, SessionMessageSource,
@@ -1446,10 +1445,9 @@ impl LlmSummarizer {
         messages: &[Message],
         max_output_tokens: u32,
     ) -> Result<String, LLMError> {
-        // Compression calls reserve most of their output allowance for summary text.
         let options = LLMRequestOptions {
             session_id: None,
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: self.llm.default_compression_reasoning_effort(&self.model),
             parallel_tool_calls: None,
             required_tool: None,
             responses: None,
@@ -2356,6 +2354,54 @@ mod tests {
             safety_margin_tokens,
         );
         SummaryRequestBudget::from_token_budget(&token_budget, 80, target_summary_tokens, 0.20)
+    }
+
+    #[tokio::test]
+    async fn compression_uses_legacy_output_limit_on_openai_gateway() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let gateway = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let sse = if body["max_tokens"]
+                    .as_u64()
+                    .is_some_and(|limit| (1..=50).contains(&limit))
+                    && body.get("max_completion_tokens").is_none()
+                    && body.get("reasoning_effort").is_none()
+                {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"still thinking\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Saved progress.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                } else {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"used the whole budget\"},\"finish_reason\":\"length\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse)
+            })
+            .mount(&gateway)
+            .await;
+        let provider = bamboo_llm::OpenAIProvider::new("fixture")
+            .with_base_url(gateway.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        let summarizer = LlmSummarizer::new(Arc::new(provider), "custom-model".into(), None, None)
+            .with_request_budget(bounded_budget(10_000, 2_000, 100, 50));
+
+        let report = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .expect("both gateway stages produce a visible summary");
+        assert_eq!(report.content, "Saved progress.");
+        assert_eq!((report.map_calls, report.reduce_calls), (1, 1));
+        assert_eq!(gateway.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

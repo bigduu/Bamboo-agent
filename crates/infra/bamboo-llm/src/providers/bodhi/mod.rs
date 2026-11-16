@@ -21,7 +21,7 @@ use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
-    ChatCompletionsResponse,
+    ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
@@ -350,7 +350,11 @@ impl BodhiProvider {
             "Bodhi",
             |body| self.client.post(&url).headers(headers.clone()).json(body),
             body,
-            allow_disable_correction,
+            if allow_disable_correction {
+                ChatCompletionsCorrection::ReasoningDisable
+            } else {
+                ChatCompletionsCorrection::None
+            },
         )
         .await?
         {

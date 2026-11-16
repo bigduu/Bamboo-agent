@@ -2,7 +2,7 @@
 use crate::provider::{ProviderModelInfo, Result};
 use crate::{LLMProvider, LLMRequestOptions, LLMStream, PromptIR, ProviderVisibleToolFootprint};
 use async_trait::async_trait;
-use bamboo_domain::{CapabilityLoadingMode, Message, ToolSchema};
+use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 use std::{collections::BTreeMap, sync::Arc};
 
 pub(crate) struct ModelVisionProvider {
@@ -12,6 +12,10 @@ pub(crate) struct ModelVisionProvider {
 
 #[async_trait]
 impl LLMProvider for ModelVisionProvider {
+    fn default_compression_reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        self.inner.default_compression_reasoning_effort(model)
+    }
+
     fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
         Some(self.inner.clone())
     }

@@ -192,14 +192,20 @@ pub(crate) enum ChatCompletionsResponse {
     },
 }
 
-/// Correct a rejected disable spelling once, on the same Chat Completions
-/// route. A metered Work reservation owns exactly one physical send.
+pub(crate) enum ChatCompletionsCorrection {
+    None,
+    ReasoningDisable,
+    CompressionTokenLimit { reasoning_effort: String },
+}
+
+/// Correct an explicit wire rejection once on the same Chat Completions route.
+/// A metered Work reservation owns exactly one physical send.
 pub(crate) async fn send_chat_completions(
     retry: &RetryConfig,
     provider: &str,
     request: impl Fn(&Value) -> RequestBuilder,
     mut body: Value,
-    allow_disable_correction: bool,
+    correction: ChatCompletionsCorrection,
 ) -> Result<ChatCompletionsResponse> {
     let (response, remaining_attempt) =
         send_provider_request_with_remaining_attempt(retry, provider, || request(&body)).await?;
@@ -209,16 +215,21 @@ pub(crate) async fn send_chat_completions(
     }
     let rejection = response.text().await?;
     if let Some(attempt) = remaining_attempt.filter(|_| {
-        allow_disable_correction
-            && status == StatusCode::BAD_REQUEST
+        status == StatusCode::BAD_REQUEST
             && !looks_like_responses_only_error(status, &rejection)
-            && correct_rejected_chat_disable(&mut body, &rejection)
+            && match &correction {
+                ChatCompletionsCorrection::None => false,
+                ChatCompletionsCorrection::ReasoningDisable => {
+                    correct_rejected_chat_disable(&mut body, &rejection)
+                }
+                ChatCompletionsCorrection::CompressionTokenLimit { reasoning_effort } => {
+                    correct_rejected_compression_limit(&mut body, &rejection, reasoning_effort)
+                }
+            }
     }) {
         if let Some(response) = attempt
             .send(|| {
-                tracing::info!(
-                    "Retrying a rejected Chat Completions reasoning disable with enable_thinking=false"
-                );
+                tracing::info!("Retrying an explicitly rejected Chat Completions control");
                 request(&body)
             })
             .await?
@@ -230,7 +241,10 @@ pub(crate) async fn send_chat_completions(
             return Ok(ChatCompletionsResponse::Rejected {
                 status,
                 body: response.text().await?,
-                corrected_disable: true,
+                corrected_disable: matches!(
+                    correction,
+                    ChatCompletionsCorrection::ReasoningDisable
+                ),
             });
         }
     }
@@ -239,6 +253,43 @@ pub(crate) async fn send_chat_completions(
         body: rejection,
         corrected_disable: false,
     })
+}
+
+fn correct_rejected_compression_limit(
+    body: &mut Value,
+    rejection: &str,
+    reasoning_effort: &str,
+) -> bool {
+    let Ok(rejection) = serde_json::from_str::<Value>(rejection) else {
+        return false;
+    };
+    let error = rejection.get("error").unwrap_or(&rejection);
+    let param = error.get("param").and_then(Value::as_str);
+    let code = error.get("code").and_then(Value::as_str);
+    if !matches!(
+        (param, code),
+        (
+            Some("max_tokens"),
+            Some("unsupported_parameter" | "unknown_parameter")
+        ) | (
+            Some("max_completion_tokens"),
+            Some("missing_required_parameter")
+        )
+    ) {
+        return false;
+    }
+    let Some(fields) = body.as_object_mut() else {
+        return false;
+    };
+    if fields.contains_key("max_completion_tokens") || fields.contains_key("reasoning_effort") {
+        return false;
+    }
+    let Some(limit) = fields.remove("max_tokens") else {
+        return false;
+    };
+    fields.insert("max_completion_tokens".into(), limit);
+    fields.insert("reasoning_effort".into(), json!(reasoning_effort));
+    true
 }
 
 pub(crate) fn looks_like_responses_only_error(status: StatusCode, body: &str) -> bool {
@@ -693,7 +744,7 @@ mod tests {
                 "test",
                 |body| client.post(server.uri()).json(body),
                 json!({"reasoning_effort": "none", "max_completion_tokens": 128}),
-                true,
+                super::ChatCompletionsCorrection::ReasoningDisable,
             )
             .await
             .unwrap();
