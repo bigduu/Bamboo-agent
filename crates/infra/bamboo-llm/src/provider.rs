@@ -695,6 +695,8 @@ pub(crate) fn required_tool_from_options<'a>(
     }
 }
 
+pub(crate) const DEFAULT_COMPRESSION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -724,6 +726,14 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Built-in effort for a compression request before any role override.
+    /// A provider can leave the setting to the upstream when its transport
+    /// cannot reserve a small output budget separately from reasoning.
+    #[doc(hidden)]
+    fn default_compression_reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
+        Some(DEFAULT_COMPRESSION_REASONING_EFFORT)
+    }
+
     /// An immutable downstream handle through which this wrapper sends every
     /// chat request. This is separate from queue and allocation identity.
     ///

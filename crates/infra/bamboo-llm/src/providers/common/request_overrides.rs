@@ -345,6 +345,22 @@ pub(crate) fn messages_controls_overridden(
     })
 }
 
+pub(crate) fn chat_completions_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_CHAT_COMPLETIONS, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_CHAT_COMPLETIONS, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if matches!(key.as_str(), "model" | "max_tokens" | "max_completion_tokens"))
+            })
+    })
+}
+
 /// A configured Work budget cannot accept arbitrary wire body patches (which
 /// may replace/remove token limits, model, prompts or candidate counts). Reject
 /// the resolved patch before any model request; header-only overrides remain.
