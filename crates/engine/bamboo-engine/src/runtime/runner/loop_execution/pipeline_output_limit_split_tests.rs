@@ -407,7 +407,7 @@ fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
     if matches!(protocol, Protocol::Messages { .. }) {
         frames.push(
             json!({"type":"message_start","message":{"usage":{"input_tokens":31,
-            "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+            "cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":0}}}),
         );
         frames.push(json!({"type":"content_block_start","index":0,
             "content_block":{"type":"thinking","thinking":""}}));
@@ -445,6 +445,7 @@ async fn pipeline_closes_repeated_reasoning_without_explicit_thinking_controls()
     )
     .await;
     assert!(run.result.unwrap());
+    assert_eq!(run.usage.total_prompt_tokens, 43 + 31 * 2);
     assert_eq!(run.usage.total_completion_tokens, CAP + 14);
     for body in &run.requests {
         assert!(body.get("thinking").is_none());
@@ -491,6 +492,65 @@ async fn pipeline_detects_reasoning_repetition_on_each_normalized_stream() {
         assert_eq!(run.tools.call_count(), 0);
         assert_eq!(run.session.messages.len(), 3);
     }
+}
+
+#[tokio::test]
+async fn pipeline_keeps_visible_or_tool_output_in_the_same_frame_as_repeated_reasoning() {
+    let completed = |content| {
+        mock_completion_sse(&[json!({"type":"chunk","candidates":[
+            {"content":{"parts":[{"text":content}]},"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":0}
+        })])
+    };
+    for (output, expected_tool_calls) in [
+        (json!({"text":"Visible progress."}), 0),
+        (json!({"functionCall":{"name":"fixture_tool","args":{}}}), 1),
+    ] {
+        let mixed = json!({"type":"chunk","candidates":[{"content":{"parts":[
+            {"thought":true,"text":REPEATED_REASONING.repeat(96)}, output
+        ]}}]});
+        // The mixed frame has no finish reason. Its whole contents must
+        // be considered before a reasoning delta can stop the stream.
+        let finish = json!({"type":"chunk","candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7,"thoughtsTokenCount":90}
+        });
+        let mut replies = vec![mock_completion_sse(&[mixed, finish])];
+        if expected_tool_calls == 1 {
+            replies.push(completed("Using the confirmed tool result."));
+        }
+        let run = run(Protocol::Gemini, None, replies, Default::default()).await;
+        assert!(run.result.unwrap());
+        assert_eq!(run.tools.call_count(), expected_tool_calls);
+        let last = run.session.messages.last().unwrap();
+        if expected_tool_calls == 0 {
+            assert_eq!(last.content, "Visible progress.");
+            assert_eq!(run.usage.total_completion_tokens, 97);
+        } else {
+            assert_eq!(last.content, "Using the confirmed tool result.");
+            assert!(run.requests[1].to_string().contains("confirmed result for"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipeline_keeps_a_provider_tool_stream_open_until_it_settles() {
+    let reply = mock_completion_sse(&[
+        json!({"type":"response.output_item.added",
+            "item":{"type":"tool_search_call","execution":"server","id":"search","status":"in_progress"}}),
+        json!({"type":"response.reasoning_summary_text.delta",
+            "item_id":"reasoning","delta":REPEATED_REASONING.repeat(96)}),
+        json!({"type":"response.output_text.delta","item_id":"answer","delta":"Provider work settled."}),
+        json!({"type":"response.completed","response":{"id":"response","status":"completed",
+            "output":[],"usage":{"input_tokens":31,"output_tokens":97}}}),
+    ]);
+    let run = run(Protocol::Responses, None, vec![reply], Default::default()).await;
+    assert!(run.result.unwrap());
+    assert_eq!(
+        run.session.messages.last().unwrap().content,
+        "Provider work settled."
+    );
+    assert_eq!(run.tools.call_count(), 0);
+    assert_eq!(run.usage.total_completion_tokens, 97);
 }
 
 #[tokio::test]

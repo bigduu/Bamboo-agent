@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use bamboo_domain::ProviderTranscriptItemKind;
 use bamboo_llm::provider::CompletionDiagnostics;
 use bamboo_llm::{LLMChunk, LLMStream};
 use futures::StreamExt;
@@ -68,43 +67,37 @@ pub(crate) fn stop_repeated_reasoning(
     completion: CompletionDiagnostics,
 ) -> LLMStream {
     Box::pin(futures::stream::unfold(
-        (stream, completion, Some(ReasoningRepetition::default())),
-        |(mut stream, completion, mut detector)| async move {
+        (
+            Some(stream),
+            completion,
+            Some(ReasoningRepetition::default()),
+        ),
+        |(stream, completion, mut detector)| async move {
+            let mut stream = stream?;
             let item = stream.next().await?;
             if let Some(repetition) = detector.as_mut() {
                 match &item {
                     Ok(LLMChunk::ReasoningToken(text)) if repetition.observe(text.as_bytes()) => {
-                        if !completion.saw_provider_tool() {
-                            completion.record_reasoning_repetition();
+                        if completion.try_stop_for_reasoning_repetition() {
                             tracing::info!("Stopping a stream after repeated reasoning");
-                            return None;
+                            drop(stream);
+                            return completion
+                                .take_pending_usage()
+                                .map(|usage| (Ok(usage), (None, completion, None)));
                         }
                         detector = None;
                     }
                     // The current recovery path can discard a reasoning-only
                     // attempt. Once there is visible output or tool activity,
                     // keep reading so the ordinary response path can settle it.
-                    Ok(LLMChunk::Token(text)) if !text.trim().is_empty() => detector = None,
-                    Ok(LLMChunk::ToolCalls(calls)) if !calls.is_empty() => detector = None,
-                    Ok(LLMChunk::ToolCallsIndexed(calls)) if !calls.is_empty() => detector = None,
-                    Ok(LLMChunk::ProviderTranscriptItem(item))
-                        if !matches!(
-                            item.kind(),
-                            ProviderTranscriptItemKind::OpenAiReasoning
-                                | ProviderTranscriptItemKind::AnthropicThinking
-                                | ProviderTranscriptItemKind::AnthropicRedactedThinking
-                        ) =>
-                    {
-                        detector = None;
-                    }
+                    Ok(chunk) if chunk.blocks_reasoning_cutoff() => detector = None,
                     Ok(LLMChunk::ReasoningSignature(_) | LLMChunk::ProviderTranscriptItem(_)) => {
                         *repetition = ReasoningRepetition::default();
                     }
-                    Ok(LLMChunk::Done) => detector = None,
                     _ => {}
                 }
             }
-            Some((item, (stream, completion, detector)))
+            Some((item, (Some(stream), completion, detector)))
         },
     ))
 }

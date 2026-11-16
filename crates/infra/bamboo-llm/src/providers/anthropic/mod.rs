@@ -1844,28 +1844,23 @@ impl AnthropicUsageSnapshot {
         if std::mem::replace(&mut self.emitted, true) {
             return None;
         }
+        self.usage().legacy_chunk()
+    }
+
+    fn usage(&self) -> crate::types::ProviderUsageReplacement {
         let input_tokens = self.fresh_input.and_then(|fresh| {
             fresh
                 .checked_add(self.cache_creation?)?
                 .checked_add(self.cache_read?)
         });
-        if input_tokens.is_none()
-            && self.output.is_none()
-            && self.reasoning.is_none()
-            && self.cache_creation.is_none()
-            && self.cache_read.is_none()
-        {
-            return None;
-        }
-        Some(LLMChunk::ProviderUsage {
+        crate::types::ProviderUsageReplacement {
             input_tokens,
             output_tokens: self.output,
-            total_tokens: None,
             reasoning_tokens: self.reasoning,
             cache_creation_input_tokens: self.cache_creation,
             cache_read_input_tokens: self.cache_read,
-            cache_write_input_tokens: None,
-        })
+            ..Default::default()
+        }
     }
 }
 
@@ -2375,6 +2370,11 @@ fn parse_anthropic_sse_event_multi(
 ) -> Result<Vec<LLMChunk>> {
     capture_anthropic_native_event(state, event_type, data);
     state.usage_snapshot.observe(event_type, data);
+    if matches!(event_type, "message_start" | "message_delta") {
+        if let Some(diagnostics) = &state.completion_diagnostics {
+            diagnostics.record_pending_usage(state.usage_snapshot.usage());
+        }
+    }
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {
         take_anthropic_provider_transcript_items(state)

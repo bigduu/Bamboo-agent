@@ -4,7 +4,7 @@
 //! enabling support for multiple LLM backends through a common trait.
 
 use crate::prompt_ir::PromptIR;
-use crate::types::LLMChunk;
+use crate::types::{LLMChunk, ProviderUsageReplacement};
 use async_trait::async_trait;
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
@@ -318,6 +318,8 @@ struct CompletionDiagnosticState {
     finish_reason: Option<&'static str>,
     messages_stopped: bool,
     provider_tool_seen: bool,
+    response_progress_seen: bool,
+    pending_usage: Option<ProviderUsageReplacement>,
     compatible_messages: bool,
     endpoint: Option<&'static str>,
     changed_protocol: bool,
@@ -330,8 +332,8 @@ tokio::task_local! {
 }
 
 /// Scope diagnostics to the inline construction of one provider stream.
-/// Built-in adapters capture this handle in their stream parser; no payload or
-/// mutable global state is shared between concurrent requests.
+/// Built-in adapters capture this handle in their stream parser. Diagnostics
+/// and usage counters belong to this request alone.
 pub async fn scope_completion_diagnostics<F: Future>(
     diagnostics: CompletionDiagnostics,
     future: F,
@@ -379,11 +381,40 @@ impl CompletionDiagnostics {
             .compatible_messages
     }
 
-    pub fn record_reasoning_repetition(&self) {
+    pub fn try_stop_for_reasoning_repetition(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finish_reason.is_some()
+            || state.messages_stopped
+            || state.response_progress_seen
+            || state.provider_tool_seen
+        {
+            return false;
+        }
+        state.finish_reason = Some(REASONING_REPETITION_FINISH_REASON);
+        true
+    }
+
+    pub(crate) fn record_response_progress(&self) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .finish_reason = Some(REASONING_REPETITION_FINISH_REASON);
+            .response_progress_seen = true;
+    }
+
+    pub(crate) fn record_pending_usage(&self, usage: ProviderUsageReplacement) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage = Some(usage);
+    }
+
+    pub fn take_pending_usage(&self) -> Option<LLMChunk> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage
+            .take()
+            .and_then(ProviderUsageReplacement::legacy_chunk)
     }
 
     pub(crate) fn record_messages_stop(&self) {
@@ -515,6 +546,29 @@ impl CompletionDiagnostics {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(event);
+        // Responses can announce a tool before producing a normalized call
+        // or transcript item. Its pending work takes priority over a cutoff
+        // even if the next frame contains only reasoning.
+        if matches!(
+            event,
+            "response.output_item.added" | "response.output_item.done"
+        ) {
+            if let Some(kind) = value
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| kind.ends_with("_call"))
+            {
+                self.record_response_progress();
+                if kind != "function_call"
+                    && value
+                        .pointer("/item/execution")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("client")
+                {
+                    self.record_provider_tool();
+                }
+            }
+        }
         let reason = [
             "/choices/0/finish_reason",
             "/delta/stop_reason",

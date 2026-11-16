@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use reqwest::Response;
 use serde_json::Value;
 
-use crate::provider::{LLMError, LLMStream, Result};
+use crate::provider::{current_completion_diagnostics, LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
 
 /// True if a top-level SSE `"error"` field represents a REAL error.
@@ -81,6 +81,7 @@ pub fn llm_stream_from_sse_multi<H>(response: Response, mut handler: H) -> LLMSt
 where
     H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
 {
+    let completion = current_completion_diagnostics();
     // `eventsource-stream` intentionally discards SSE comments and buffers
     // incomplete event fragments. Observe the raw body first so those bytes
     // can still refresh the independent transport watchdog (#787). A boolean
@@ -107,7 +108,16 @@ where
             .eventsource()
             .map(move |event| {
                 let event = event.map_err(|e| LLMError::Stream(e.to_string()))?;
-                handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)
+                let chunks =
+                    handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)?;
+                if let Some(completion) = &completion {
+                    // Record every chunk of this frame before exposing its
+                    // first reasoning delta to the agent's stream guard.
+                    if chunks.iter().any(LLMChunk::blocks_reasoning_cutoff) {
+                        completion.record_response_progress();
+                    }
+                }
+                Ok(chunks)
             })
             .flat_map(|result| {
                 stream::iter(match result {
