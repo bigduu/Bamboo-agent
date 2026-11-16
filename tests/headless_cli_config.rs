@@ -43,10 +43,7 @@ fn bamboo(directory: &Path) -> Command {
 }
 
 async fn run(command: &mut Command) -> Output {
-    let output = tokio::time::timeout(Duration::from_secs(35), command.output())
-        .await
-        .expect("Bamboo must exit")
-        .expect("launch the Bamboo binary");
+    let output = run_to_exit(command).await;
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -54,6 +51,13 @@ async fn run(command: &mut Command) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+async fn run_to_exit(command: &mut Command) -> Output {
+    tokio::time::timeout(Duration::from_secs(35), command.output())
+        .await
+        .expect("Bamboo must exit")
+        .expect("launch the Bamboo binary")
 }
 
 fn stream(body: String) -> ResponseTemplate {
@@ -201,6 +205,55 @@ async fn doctor_accepts_runtime_credentials_and_model_without_a_config_file() {
 }
 
 #[tokio::test]
+async fn invalid_env_endpoint_is_redacted_and_prevents_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(openai_stream())
+        .expect(0)
+        .mount(&server)
+        .await;
+    let data = dir.path().join("bamboo");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        data.join("config.json"),
+        json!({
+            "default_provider_instance": "openai",
+            "provider_instances": {"openai": {
+                "provider_type": "openai", "api_key_from_env": true,
+                "base_url": server.uri(), "model": MODEL,
+            }},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let secret = "fixture-url-secret";
+    let endpoint = format!("http://gateway-user:{secret}@127.0.0.1:1/v1");
+    let mut inspect = bamboo(dir.path());
+    gateway_environment(&mut inspect, "openai", &endpoint);
+    let output = run(inspect.arg("config")).await;
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+
+    let mut command = bamboo(dir.path());
+    gateway_environment(&mut command, "openai", &endpoint);
+    let output = run_to_exit(command.env("RUST_LOG", "warn").args([
+        "-p",
+        "Give a concise answer.",
+        "--provider",
+        "openai",
+        "--timeout",
+        "15",
+    ]))
+    .await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("BAMBOO_OPENAI_BASE_URL"));
+    assert!(!stderr.contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+}
+
+#[tokio::test]
 async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
@@ -232,6 +285,15 @@ async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
     let output =
         run(bamboo(dir.path()).args(["-p", "Give a concise answer.", "--timeout", "15"])).await;
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), ANSWER);
+    let data_dir = dir.path().join("bamboo");
+    let prior = bamboo_config::Config::from_data_dir_without_env(Some(data_dir.clone()));
+    let reference = prior.provider_instances["openai"]
+        .credential_ref
+        .as_ref()
+        .unwrap();
+    let store = bamboo_config::CredentialStore::open(&data_dir);
+    store.clear(reference, store.revision().unwrap()).unwrap();
+    assert!(!store.status(reference).unwrap().configured);
     let updated = format!("{}/updated/v1", server.uri());
     run(bamboo(dir.path()).args([
         "init",
@@ -247,11 +309,12 @@ async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
         "updated-model",
     ]))
     .await;
-    let saved = bamboo_config::Config::from_data_dir_without_env(Some(dir.path().join("bamboo")));
+    let saved = bamboo_config::Config::from_data_dir_without_env(Some(data_dir));
     let instance = &saved.provider_instances["openai"];
     assert_eq!(instance.base_url.as_deref(), Some(updated.as_str()));
     assert_eq!(instance.model.as_deref(), Some("updated-model"));
     assert!(instance.credential_ref.is_some());
+    assert_eq!(instance.api_key, KEY);
     assert!(!saved
         .to_compatibility_value()
         .unwrap()

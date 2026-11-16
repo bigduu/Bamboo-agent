@@ -62,9 +62,7 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         if bamboo_config::modular_authority_boundary_present(&data_dir)? {
             let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir)?;
             let revision = facade.registry().providers.snapshot().revision;
-            let mut config = facade.effective_config();
-            config.hydrate_provider_credentials_from_store(&data_dir)?;
-            (config, Some(revision))
+            (facade.effective_config(), Some(revision))
         } else {
             (
                 Config::from_data_dir_without_env(Some(data_dir.clone())),
@@ -140,17 +138,29 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         .to_string();
 
     // 2. Overwrite guard — don't silently clobber an existing key.
-    if provider_has_key(&config, &provider) && !args.force {
+    let has_saved_credential = saved.as_ref().is_some_and(|instance| {
+        instance.credential_ref.is_some()
+            || matches!(
+                key_status(Some((
+                    &instance.api_key,
+                    instance.api_key_encrypted.as_deref()
+                ))),
+                CredentialStatus::Present
+            )
+    });
+    if has_saved_credential && !args.force {
         if interactive {
             if !prompt_yes_no(
-                &format!("Provider '{provider}' already has an API key. Overwrite?"),
+                &format!("Provider '{provider}' already has a saved credential. Overwrite?"),
                 false,
             )? {
                 println!("Aborted; existing configuration left unchanged.");
                 return Ok(());
             }
         } else {
-            bail!("provider '{provider}' already has an API key; pass --force to overwrite");
+            bail!(
+                "provider '{provider}' already has a saved credential. Pass --force to overwrite"
+            );
         }
     }
 
@@ -261,6 +271,13 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
         errors += 1;
     } else {
         info(&format!("default provider = {provider}"));
+        if config.has_invalid_runtime_provider_base_url(provider) {
+            err(&format!(
+                "invalid BAMBOO_{}_BASE_URL",
+                provider.to_ascii_uppercase()
+            ));
+            errors += 1;
+        }
         if config
             .provider_instances
             .get(provider)
@@ -814,13 +831,6 @@ fn key_status(pair: Option<(&str, Option<&str>)>) -> CredentialStatus {
         }
         _ => CredentialStatus::Missing,
     }
-}
-
-fn provider_has_key(config: &Config, provider: &str) -> bool {
-    matches!(
-        provider_credential_status(config, provider),
-        CredentialStatus::Present
-    )
 }
 
 // ---- health probe ----

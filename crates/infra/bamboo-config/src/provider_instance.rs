@@ -398,6 +398,27 @@ fn nonempty_env(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// A rejected runtime override occupies the endpoint slot until the user
+/// fixes it. This URL cannot send a request or expose the original value.
+#[doc(hidden)]
+pub const INVALID_RUNTIME_PROVIDER_BASE_URL: &str = "about:invalid";
+
+fn runtime_base_url(name: &'static str) -> Option<String> {
+    let error = match crate::runtime_env_var(name) {
+        Ok(raw) => {
+            let url = raw.trim();
+            match crate::validate_provider_base_url(url) {
+                Ok(()) => return Some(url.trim_end_matches('/').to_string()),
+                Err(error) => error,
+            }
+        }
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(_)) => "provider base URL must be valid UTF-8".into(),
+    };
+    tracing::warn!(variable = name, %error, "Provider endpoint override rejected");
+    Some(INVALID_RUNTIME_PROVIDER_BASE_URL.to_string())
+}
+
 pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys: bool) {
     restore_provider_metadata(config);
     let instance_mode = config.has_provider_instances();
@@ -409,14 +430,6 @@ pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys
             } else {
                 None
             };
-            let base_url = nonempty_env(concat!($prefix, "_BASE_URL")).map(|url| {
-                let base = url.trim_end_matches('/');
-                if base.is_empty() {
-                    url
-                } else {
-                    base.to_string()
-                }
-            });
             let model = nonempty_env(concat!($prefix, "_MODEL"));
             let mut metadata = ProviderMetadataOverride {
                 provider_type,
@@ -445,7 +458,10 @@ pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys
                                 && provider_instance_api_key_from_env(instance)
                         })
                 {
-                    metadata.base_url = MetadataOverride::apply(&mut instance.base_url, base_url);
+                    metadata.base_url = MetadataOverride::apply(
+                        &mut instance.base_url,
+                        runtime_base_url(concat!($prefix, "_BASE_URL")),
+                    );
                     metadata.model = MetadataOverride::apply(&mut instance.model, model);
                 }
             } else {
@@ -458,7 +474,10 @@ pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys
                     provider.api_key_from_env = true;
                 }
                 if let Some(provider) = config.providers_mut().$field.as_mut() {
-                    metadata.base_url = MetadataOverride::apply(&mut provider.base_url, base_url);
+                    metadata.base_url = MetadataOverride::apply(
+                        &mut provider.base_url,
+                        runtime_base_url(concat!($prefix, "_BASE_URL")),
+                    );
                     metadata.model = MetadataOverride::apply(&mut provider.model, model);
                 }
             }
@@ -470,6 +489,16 @@ pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys
     apply!(openai, "BAMBOO_OPENAI");
     apply!(anthropic, "BAMBOO_ANTHROPIC");
     apply!(gemini, "BAMBOO_GEMINI");
+}
+
+pub(crate) fn has_invalid_runtime_base_url(config: &Config, provider: &str) -> bool {
+    config.provider_metadata_overrides.0.iter().any(|metadata| {
+        metadata.provider_type == provider
+            && metadata
+                .base_url
+                .as_ref()
+                .is_some_and(|url| url.runtime == INVALID_RUNTIME_PROVIDER_BASE_URL)
+    })
 }
 
 pub(crate) fn restore_provider_metadata(config: &mut Config) {

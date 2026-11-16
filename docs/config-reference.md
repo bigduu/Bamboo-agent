@@ -118,6 +118,8 @@ serving a Gemini model via OpenAI Chat Completions uses the `openai` row.
 For the native protocols, use the API base path through its version segment,
 such as `/v1` or `/v1beta`. For Bodhi, use the proxy server's root URL and
 set `target_provider` on the instance. Use the model ID accepted by the gateway.
+The base URL must be an absolute HTTP(S) URL without user info, query
+parameters, or fragments. Supply the credential through the API key setting.
 
 | Setting | Saved configuration | Environment | Command line |
 |---|---|---|---|

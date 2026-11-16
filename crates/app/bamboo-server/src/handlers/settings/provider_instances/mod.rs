@@ -497,7 +497,8 @@ fn next_enabled_instance_id(config: &bamboo_config::Config) -> Option<String> {
 pub async fn list_provider_instances(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let config = app_state.config.read().await;
+    let mut config = app_state.config.read().await.clone();
+    config.restore_saved_provider_metadata();
     let instances: Vec<ProviderInstanceResponse> = config
         .provider_instances
         .iter()
@@ -601,6 +602,7 @@ pub async fn update_provider_instance(
             _ => false,
         });
     let update = move |config: &mut bamboo_config::Config| {
+        config.restore_saved_provider_metadata();
         let existing = config
             .provider_instances
             .get(&instance_id)
@@ -622,10 +624,11 @@ pub async fn update_provider_instance(
         config
             .provider_instances
             .insert(instance_id.clone(), updated);
+        config.apply_runtime_provider_metadata_overrides();
         Ok(())
     };
 
-    let new_config = if has_api_key_intent {
+    let mut new_config = if has_api_key_intent {
         app_state
             .update_config_with_provider_credentials(
                 update,
@@ -649,6 +652,7 @@ pub async fn update_provider_instance(
             .await?
     };
 
+    new_config.restore_saved_provider_metadata();
     let updated = new_config
         .provider_instances
         .get(&instance_id_for_response)

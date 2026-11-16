@@ -4205,6 +4205,11 @@ impl Config {
         crate::provider_instance::restore_provider_metadata(self);
     }
 
+    /// Whether the selected account has a rejected runtime endpoint override.
+    pub fn has_invalid_runtime_provider_base_url(&self, provider: &str) -> bool {
+        crate::provider_instance::has_invalid_runtime_base_url(self, provider)
+    }
+
     /// Load config from disk AND publish its env vars to the process-global cache
     /// (so Bash tools inject them). For the context that OWNS that cache — the
     /// server bootstrap. Library / secondary readers that only need to read a
