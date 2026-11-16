@@ -92,6 +92,7 @@ enum Protocol {
     Chat,
     Responses,
     Gemini,
+    BodhiMessages,
     BodhiGemini,
 }
 
@@ -133,6 +134,15 @@ impl Protocol {
                 Arc::new(
                     bamboo_llm::GeminiProvider::new("test-key")
                         .with_base_url(server.uri())
+                        .with_client(client),
+                ),
+            ),
+            Protocol::BodhiMessages => (
+                "/proxy/anthropic/v1/messages",
+                Arc::new(
+                    bamboo_llm::providers::BodhiProvider::new("test-key")
+                        .with_base_url(server.uri())
+                        .with_target_provider("anthropic")
                         .with_client(client),
                 ),
             ),
@@ -404,7 +414,10 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
 
 fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
     let mut frames = Vec::new();
-    if matches!(protocol, Protocol::Messages { .. }) {
+    if matches!(
+        protocol,
+        Protocol::Messages { .. } | Protocol::BodhiMessages
+    ) {
         frames.push(
             json!({"type":"message_start","message":{"usage":{"input_tokens":31,
             "cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":0}}}),
@@ -416,8 +429,10 @@ fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
     for chunk in reasoning.as_bytes().chunks(137) {
         let chunk = std::str::from_utf8(chunk).unwrap();
         frames.push(match protocol {
-            Protocol::Messages { .. } => json!({"type":"content_block_delta","index":0,
-                "delta":{"type":"thinking_delta","thinking":chunk}}),
+            Protocol::Messages { .. } | Protocol::BodhiMessages => {
+                json!({"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":chunk}})
+            }
             Protocol::Chat => json!({"type":"chunk","id":"response","choices":[
                 {"index":0,"delta":{"reasoning_content":chunk},"finish_reason":null}]}),
             Protocol::Responses => json!({"type":"response.reasoning_summary_text.delta",
@@ -462,6 +477,7 @@ async fn pipeline_detects_reasoning_repetition_on_each_normalized_stream() {
         Protocol::Chat,
         Protocol::Responses,
         Protocol::Gemini,
+        Protocol::BodhiMessages,
     ] {
         let run = run(
             protocol,
@@ -489,8 +505,52 @@ async fn pipeline_detects_reasoning_repetition_on_each_normalized_stream() {
         .find_map(|path| request.pointer(path).and_then(Value::as_u64))
         .expect("the dispatched request has a wire cap");
         assert_eq!(run.usage.total_completion_tokens, cap);
+        if matches!(
+            protocol,
+            Protocol::Messages { .. } | Protocol::BodhiMessages
+        ) {
+            assert_eq!(run.usage.total_prompt_tokens, 43);
+        }
         assert_eq!(run.tools.call_count(), 0);
         assert_eq!(run.session.messages.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_retains_usage_from_the_frame_where_reasoning_is_stopped() {
+    const KNOWN_INPUT: u64 = 9321;
+    let reasoning = REPEATED_REASONING.repeat(96);
+    for (protocol, frame) in [
+        (
+            Protocol::Chat,
+            json!({"type":"chunk","id":"response","choices":[
+            {"index":0,"delta":{"reasoning_content":reasoning},"finish_reason":null}],
+            "usage":{"prompt_tokens":KNOWN_INPUT,"completion_tokens":9}}),
+        ),
+        (
+            Protocol::Gemini,
+            json!({"type":"chunk","candidates":[{"content":{"parts":[
+            {"thought":true,"text":reasoning} ]}}],
+            "usageMetadata":{"promptTokenCount":KNOWN_INPUT,"candidatesTokenCount":0,
+            "thoughtsTokenCount":9}}),
+        ),
+    ] {
+        let run = run(
+            protocol,
+            None,
+            vec![mock_completion_sse(&[frame])],
+            bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            run.result,
+            Err(AgentError::ReasoningRepetition { .. })
+        ));
+        assert_eq!(run.usage.total_prompt_tokens, KNOWN_INPUT);
+        assert!(run.usage.total_completion_tokens > 9);
     }
 }
 
@@ -530,6 +590,24 @@ async fn pipeline_keeps_visible_or_tool_output_in_the_same_frame_as_repeated_rea
             assert!(run.requests[1].to_string().contains("confirmed result for"));
         }
     }
+}
+
+#[tokio::test]
+async fn pipeline_keeps_signed_visible_text_outside_reasoning_detection() {
+    let answer = REPEATED_REASONING.trim_end().repeat(96);
+    let reply = mock_completion_sse(&[
+        json!({"type":"chunk","candidates":[{"content":{"parts":[
+            {"text":answer,"thoughtSignature":"signature"}
+        ]}}]}),
+        json!({"type":"chunk","candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":97,"thoughtsTokenCount":0}
+        }),
+    ]);
+    let run = run(Protocol::Gemini, None, vec![reply], Default::default()).await;
+    assert!(run.result.unwrap());
+    let message = run.session.messages.last().unwrap();
+    assert_eq!(message.content, answer);
+    assert!(message.reasoning.is_none());
 }
 
 #[tokio::test]
@@ -1232,7 +1310,7 @@ async fn pipeline_output_limit_split_runs_after_convergence_on_other_protocols()
                         "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":if content.is_some() {7} else {0},
                             "thoughtsTokenCount":if content.is_some() {0} else {7}}})
                 }
-                Protocol::Messages { .. } => unreachable!(),
+                Protocol::Messages { .. } | Protocol::BodhiMessages => unreachable!(),
             };
             mock_completion_sse(&[event])
         };

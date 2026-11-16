@@ -108,13 +108,30 @@ where
             .eventsource()
             .map(move |event| {
                 let event = event.map_err(|e| LLMError::Stream(e.to_string()))?;
-                let chunks =
+                let mut chunks =
                     handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)?;
                 if let Some(completion) = &completion {
                     // Record every chunk of this frame before exposing its
                     // first reasoning delta to the agent's stream guard.
                     if chunks.iter().any(LLMChunk::blocks_reasoning_cutoff) {
                         completion.record_response_progress();
+                    }
+                    if chunks
+                        .iter()
+                        .any(|chunk| matches!(chunk, LLMChunk::ReasoningToken(_)))
+                    {
+                        // A cutoff can discard the rest of the frame. Deliver
+                        // already received accounting before its reasoning,
+                        // preserving the order within both groups.
+                        chunks.sort_by_key(|chunk| {
+                            !matches!(
+                                chunk,
+                                LLMChunk::ProviderUsage { .. }
+                                    | LLMChunk::ProviderUsageReplace(_)
+                                    | LLMChunk::CacheUsage { .. }
+                                    | LLMChunk::UsageSummary { .. }
+                            )
+                        });
                     }
                 }
                 Ok(chunks)

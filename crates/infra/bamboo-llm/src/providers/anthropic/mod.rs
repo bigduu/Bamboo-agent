@@ -2369,12 +2369,6 @@ fn parse_anthropic_sse_event_multi(
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
     capture_anthropic_native_event(state, event_type, data);
-    state.usage_snapshot.observe(event_type, data);
-    if matches!(event_type, "message_start" | "message_delta") {
-        if let Some(diagnostics) = &state.completion_diagnostics {
-            diagnostics.record_pending_usage(state.usage_snapshot.usage());
-        }
-    }
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {
         take_anthropic_provider_transcript_items(state)
@@ -2399,6 +2393,12 @@ pub fn parse_anthropic_sse_event(
     event_type: &str,
     data: &str,
 ) -> Result<Option<LLMChunk>> {
+    state.usage_snapshot.observe(event_type, data);
+    if matches!(event_type, "message_start" | "message_delta") {
+        if let Some(diagnostics) = &state.completion_diagnostics {
+            diagnostics.record_pending_usage(state.usage_snapshot.usage());
+        }
+    }
     match event_type {
         "ping" => Ok(None),
         "message_start" => {
