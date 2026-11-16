@@ -357,17 +357,18 @@ the active provider window, and directs the model to
 | Field | Default | What it does |
 |---|---|---|
 | `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
-| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the total model window. Output/safety headroom can move the effective trigger earlier. |
-| `target_usage_ratio` | `0.25` | Shared post-compression target relative to the total model window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
+| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the smaller of the joint model window and any independent input ceiling. Output and safety headroom can move the effective trigger earlier. |
+| `target_usage_ratio` | `0.25` | Shared post-compression target on the same window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` (legacy) | Compatibility input only. When the shared field is absent, a stricter legacy value migrates to the common trigger for every strategy. Explicit shared fields take precedence. |
 | `retrieval_window.target_usage_ratio` | `0.60` (legacy) | Compatibility input only. The former default adopts the shared `0.25` target; a stricter legacy value is retained as the common target. Historical archive receipts retain their original targets. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
 
-For a total window `W`, the input hard limit is `H = W - max_output_tokens -
-safety_margin`. The common calculator reserves additional maintenance headroom
-based on the output allowance and safety margin, bounded by one fifth of `H`.
+For a total window `W`, preparation reserves working output space and the
+counting margin. The input limit is the smaller of the space left and any
+independent input ceiling after its margin. The common calculator reserves
+additional maintenance headroom bounded by one fifth of that input limit.
 The effective trigger is the earlier of the configured window ratio and the
 remaining safe input boundary. This avoids the previous fixed-50K behavior that
 waited until 95% on a 1M window. Execution/verification task status does not delay
@@ -376,7 +377,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the ordinary default limits, a 1M window with 32K output and 10K safety
+For the compatibility defaults, a 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -771,11 +772,13 @@ engine-level `TokenBudget` remains an intentional higher-priority override. Mana
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
-With no matching user or provider limit, Bamboo uses compatibility limits of
-1M total context and 32K output for planning. Provider limits come from the
-selected route's catalog and are cached briefly. If configured catalog and
-generation headers differ for a model, Bamboo keeps the catalog ID and omits
-its capacities. Configure limits explicitly for that generation route.
+The file stores explicit overrides. With no matching user or provider limit,
+the runtime and the defaults API use 1,000,000 total context tokens and 64,000
+output tokens. When the window is known and the output ceiling is absent,
+the fallback output is one quarter of the window, up to 64,000. Provider limits
+come from the selected route's catalog and are cached briefly. If configured
+catalog and generation headers differ for a model, Bamboo keeps the catalog ID
+and omits its capacities. Configure limits explicitly for that generation route.
 
 ## Schedules (`schedules.json`)
 

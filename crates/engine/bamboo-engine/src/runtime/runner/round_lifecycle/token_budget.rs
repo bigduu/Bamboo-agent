@@ -848,6 +848,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn compatibility_output_default_preserves_a_saved_32k_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = "metadata-free-model";
+        let mut session = Session::new("default-model-limit", model);
+        let config = AgentLoopConfig {
+            app_data_dir: Some(dir.path().to_path_buf()),
+            provider_name: Some("compatible-route".into()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo::from_id(model)],
+        };
+
+        let fallback = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(fallback.max_context_tokens, 1_000_000);
+        assert_eq!(fallback.max_output_tokens, 64_000);
+
+        tokio::fs::write(
+            model_limits_path(&config),
+            r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#,
+        )
+        .await
+        .unwrap();
+        let saved = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(saved.max_output_tokens, 32_000);
+    }
+
     struct MutableMetadataProvider {
         max_context_tokens: AtomicU32,
         max_output_tokens: AtomicU32,
