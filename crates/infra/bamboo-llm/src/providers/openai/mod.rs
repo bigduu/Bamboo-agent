@@ -15,7 +15,7 @@ use crate::prompt_ir::PromptIR;
 use crate::provider::{
     required_tool_from_options, LLMError, LLMProvider, LLMRequestOptions, LLMStream,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
-    ResponsesRequestOptions, Result,
+    ResponsesRequestOptions, Result, DEFAULT_COMPRESSION_REASONING_EFFORT,
 };
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
@@ -25,7 +25,7 @@ use super::common::model_fetcher;
 use super::common::openai_compat::{
     build_openai_compat_body, looks_like_responses_only_error, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
-    ChatCompletionsResponse,
+    ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use super::common::openai_responses::{
     build_responses_body_with_capability_loading, retain_provider_transcript_family,
@@ -40,6 +40,7 @@ use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     responses_only_models: Vec<String>,
@@ -70,6 +71,7 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
@@ -232,6 +234,15 @@ impl OpenAIProvider {
         let normalized = self.base_url.trim_end_matches('/');
         normalized.eq_ignore_ascii_case("https://api.openai.com")
             || normalized.eq_ignore_ascii_case("https://api.openai.com/v1")
+    }
+
+    fn uses_native_chat_token_limit(&self) -> bool {
+        reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some_and(|host| {
+                    host == "api.openai.com" || host.ends_with(".openai.azure.com")
+                })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -476,6 +487,21 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl LLMProvider for OpenAIProvider {
+    fn default_compression_reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        // On compatible gateways, max_completion_tokens can spend a small
+        // summary allowance entirely on server-controlled reasoning. Leaving
+        // effort unset selects max_tokens without trying to disable reasoning.
+        (self.uses_responses_api(model)
+            || self.uses_native_chat_token_limit()
+            || self.default_reasoning_effort.is_some()
+            || request_overrides::chat_completions_controls_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            )
+            || crate::retry::work_request_budget_active())
+        .then_some(DEFAULT_COMPRESSION_REASONING_EFFORT)
+    }
+
     async fn capability_loading_mode(
         &self,
         model: &str,
@@ -728,6 +754,22 @@ impl LLMProvider for OpenAIProvider {
         let headers =
             self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
         let chat_url = format!("{}/chat/completions", self.base_url);
+        let correction = match (request_purpose, request_reasoning_effort) {
+            ("compression", Some(ReasoningEffort::Disabled)) if !self.is_official_base_url() => {
+                ChatCompletionsCorrection::ReasoningDisable
+            }
+            ("compression", None)
+                if reasoning_effort.is_none()
+                    && self.default_compression_reasoning_effort(model).is_none() =>
+            {
+                ChatCompletionsCorrection::CompressionTokenLimit {
+                    reasoning_effort: self
+                        .masking_config
+                        .apply_masking(DEFAULT_COMPRESSION_REASONING_EFFORT.as_str()),
+                }
+            }
+            _ => ChatCompletionsCorrection::None,
+        };
         let response = match send_chat_completions(
             &crate::retry::global(),
             "OpenAI",
@@ -738,9 +780,7 @@ impl LLMProvider for OpenAIProvider {
                     .json(body)
             },
             body,
-            !self.is_official_base_url()
-                && request_purpose == "compression"
-                && request_reasoning_effort == Some(ReasoningEffort::Disabled),
+            correction,
         )
         .await?
         {
@@ -754,6 +794,12 @@ impl LLMProvider for OpenAIProvider {
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)
                 );
+                let (reasoning_effort, reasoning_source) =
+                    if request_purpose == "compression" && reasoning_effort.is_none() {
+                        (Some(DEFAULT_COMPRESSION_REASONING_EFFORT), "request")
+                    } else {
+                        (reasoning_effort, reasoning_source)
+                    };
                 return self
                     .chat_stream_via_responses(
                         messages,
@@ -849,6 +895,35 @@ impl LLMProvider for OpenAIProvider {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "OpenAI").await
     }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "OpenAI",
+                model_fetcher::ModelListFormat::Compatible,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |model| {
+                if self.uses_responses_api(model) {
+                    &[request_overrides::ENDPOINT_RESPONSES]
+                } else {
+                    &[
+                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                        request_overrides::ENDPOINT_RESPONSES,
+                    ]
+                }
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -864,6 +939,108 @@ mod tests {
         FunctionSchema, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
         ProviderTranscriptItem, ProviderTranscriptOrigin, ToolSchema,
     };
+
+    #[test]
+    fn compression_default_preserves_native_routes_and_explicit_controls() {
+        for url in [
+            "https://api.openai.com:443/v1",
+            "https://fixture.openai.azure.com/openai/v1",
+        ] {
+            let provider = OpenAIProvider::new("fixture").with_base_url(url);
+            assert_eq!(
+                provider.default_compression_reasoning_effort("summary-model"),
+                Some(ReasoningEffort::Low)
+            );
+        }
+        let make_gateway =
+            || OpenAIProvider::new("fixture").with_base_url("https://gateway.example/api/v1");
+        let responses = make_gateway().with_responses_only_models(vec!["summary-model".into()]);
+        let patched = make_gateway().with_request_overrides(Some(
+            serde_json::from_value(json!({
+                "endpoints": {"chat_completions": {"body_patch": [
+                    {"op": "set", "path": "/max_completion_tokens", "value": 512}
+                ]}}
+            }))
+            .unwrap(),
+        ));
+        for provider in [
+            responses,
+            patched,
+            make_gateway().with_reasoning_effort(Some(ReasoningEffort::High)),
+        ] {
+            assert_eq!(
+                provider.default_compression_reasoning_effort("summary-model"),
+                Some(ReasoningEffort::Low)
+            );
+        }
+        assert_eq!(
+            make_gateway().default_compression_reasoning_effort("summary-model"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_restores_modern_limit_only_after_explicit_field_rejection() {
+        use futures::StreamExt;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for param in ["max_tokens", "messages"] {
+            let gateway = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_partial_json(json!({"max_tokens": 50})))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"param": param, "code": "unsupported_parameter"}
+                })))
+                .expect(1)
+                .mount(&gateway)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_partial_json(json!({"max_completion_tokens": 50, "reasoning_effort": "low"})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
+                )
+                .expect(u64::from(param == "max_tokens"))
+                .mount(&gateway)
+                .await;
+            let provider = OpenAIProvider::new("fixture")
+                .with_base_url(gateway.uri())
+                .with_client(Client::builder().no_proxy().build().unwrap());
+            let options = LLMRequestOptions {
+                reasoning_effort: provider.default_compression_reasoning_effort("summary-model"),
+                request_purpose: Some("compression".into()),
+                ..Default::default()
+            };
+            let result = provider
+                .chat_stream_with_options(
+                    &[Message::user("Summarize this")],
+                    &[],
+                    Some(50),
+                    "summary-model",
+                    Some(&options),
+                )
+                .await;
+            if param == "max_tokens" {
+                let mut stream = result.unwrap();
+                assert!(
+                    matches!(stream.next().await, Some(Ok(LLMChunk::Token(text))) if text == "summary")
+                );
+                let requests = gateway.received_requests().await.unwrap();
+                let mut initial: Value = requests[0].body_json().unwrap();
+                initial.as_object_mut().unwrap().remove("max_tokens");
+                initial["max_completion_tokens"] = json!(50);
+                initial["reasoning_effort"] = json!("low");
+                assert_eq!(requests[1].body_json::<Value>().unwrap(), initial);
+            } else {
+                assert!(matches!(result, Err(LLMError::Api(error)) if error.contains("HTTP 400")));
+                assert_eq!(gateway.received_requests().await.unwrap().len(), 1);
+            }
+        }
+    }
 
     // ===== Basic Tests (5 tests) =====
 
@@ -886,6 +1063,41 @@ mod tests {
     fn test_default_values() {
         let provider = OpenAIProvider::new("test_key");
         assert_eq!(provider.base_url, "https://api.openai.com/v1");
+    }
+
+    #[tokio::test]
+    async fn catalog_drops_limits_only_for_models_with_different_generation_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer catalog-account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+                {"id":"different-account","max_context_tokens":8192,"max_output_tokens":4096},
+                {"id":"same-account","max_context_tokens":8192,"max_output_tokens":4096}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let overrides = serde_json::from_value(json!({"rules":[{
+            "model_pattern":"different-account", "endpoint":"chat_completions",
+            "scope":{"headers":{"Authorization":"Bearer generation-account"}}
+        }]}))
+        .unwrap();
+        let provider = OpenAIProvider::new("catalog-account")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_request_overrides(Some(overrides));
+
+        let models = provider.list_model_info().await.unwrap();
+        assert_eq!(
+            models[0],
+            crate::provider::ProviderModelInfo::from_id("different-account")
+        );
+        assert_eq!(models[1].max_context_tokens, Some(8192));
+        assert_eq!(models[1].max_output_tokens, Some(4096));
     }
 
     #[test]

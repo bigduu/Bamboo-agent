@@ -185,6 +185,11 @@ pub fn build_merged_config(
     current: &Config,
     mut patch_obj: Map<String, Value>,
 ) -> Result<Config, AppError> {
+    // Merge editable provider fields against their saved values. This keeps an
+    // explicit value identical to the environment override meaningful.
+    let mut saved = current.clone();
+    saved.restore_saved_provider_metadata();
+    let current = &saved;
     if let Some(policy) = patch_obj.get_mut("plugin_trust") {
         current
             .plugin_trust
@@ -289,6 +294,7 @@ pub fn build_merged_config(
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
     new_config.normalize_plugin_trust_settings();
+    new_config.apply_runtime_provider_metadata_overrides();
 
     Ok(new_config)
 }
@@ -304,6 +310,35 @@ pub(crate) fn validate_provider_settings(config: &Config) -> Result<(), bamboo_l
 mod tests {
     use super::*;
     use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn explicit_provider_model_persists_when_it_matches_the_environment() {
+        let _model = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_MODEL",
+            Some("runtime-model"),
+        );
+        let mut current: Config = serde_json::from_value(serde_json::json!({
+            "default_provider_instance": "openai",
+            "provider_instances": {"openai": {
+                "provider_type": "openai", "api_key_from_env": true, "model": "saved-model",
+            }},
+        }))
+        .unwrap();
+        current.apply_runtime_provider_metadata_overrides();
+        assert_eq!(
+            current.provider_instances["openai"].model.as_deref(),
+            Some("runtime-model")
+        );
+        let patch = serde_json::json!({
+            "provider_instances": {"openai": {"model": "runtime-model"}}
+        });
+        let mut next = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+        next.restore_saved_provider_metadata();
+        assert_eq!(
+            next.provider_instances["openai"].model.as_deref(),
+            Some("runtime-model")
+        );
+    }
 
     #[test]
     fn compatibility_patch_preserves_retirement_and_rejects_reusing_an_alias() {

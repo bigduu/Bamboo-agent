@@ -467,6 +467,12 @@ impl LLMProvider for BudgetedProvider {
     async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
     }
+    async fn model_info_for_request(
+        &self,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],

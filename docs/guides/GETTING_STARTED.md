@@ -31,8 +31,37 @@ rest](../config-reference.md#encryption-at-rest)). Verify the install is
 sound at any point with:
 
 ```bash
-bamboo doctor    # checks config/credentials; reports server reachability; exits non-zero on config/credential errors
+bamboo doctor    # checks the selected provider, model, and credential; reports local server reachability
 ```
+
+### Use a custom gateway
+
+To try a model from a shell or CI job, supply the gateway key, base URL, and
+exact model ID in the process environment.
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "Reply with OK." --provider openai
+```
+
+Switch both the prefix and `--provider` for Anthropic Messages
+(`BAMBOO_ANTHROPIC`, `anthropic`) or Gemini
+(`BAMBOO_GEMINI`, `gemini`). An env-only setup can be checked with
+`BAMBOO_PROVIDER=openai bamboo doctor` after exporting the matching variables.
+
+For repeated local use, save the address and model with `init`. It prompts for
+the API key and stores it encrypted.
+
+```bash
+bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id
+bamboo -p "Reply with OK."
+```
+
+For several accounts, save each under its own provider instance ID. Select
+an admitted model with `bamboo -p "Reply with OK." -m work:your-model-id`.
+[Provider configuration and precedence](../config-reference.md#choosing-a-provider-and-model).
 
 ## 3. Your first agent turn — three ways
 
@@ -44,7 +73,8 @@ bamboo -p "List the files here and tell me what this project does."
 
 Boots the full runtime (including sub-agent support), runs one turn, prints
 the result, exits. Add `-s <session-id>` on a later call to continue the same
-conversation.
+conversation. Plain mode reports the number of reasoning characters received
+on stderr. Use `--stream-json` for NDJSON events on stdout.
 
 ### b) HTTP server + curl
 

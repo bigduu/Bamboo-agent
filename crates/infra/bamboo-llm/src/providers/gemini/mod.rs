@@ -61,6 +61,7 @@ use bamboo_domain::ToolSchema;
 /// Google Gemini API provider.
 pub struct GeminiProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     default_reasoning_effort: Option<ReasoningEffort>,
@@ -73,6 +74,7 @@ impl GeminiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_reasoning_effort: None,
@@ -363,6 +365,26 @@ impl LLMProvider for GeminiProvider {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = self.list_models_url();
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.list_models_url();
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "Gemini",
+                model_fetcher::ModelListFormat::Gemini,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+        ))
     }
 }
 

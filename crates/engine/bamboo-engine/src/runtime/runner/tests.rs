@@ -426,7 +426,13 @@ async fn agent_loop_explicit_gold_requires_managed_account_admission() {
         .expect("synthetic real runner must finish")
         .expect("synthetic foreground run must succeed");
         assert_eq!(main_calls.load(Ordering::SeqCst) - before_main, 2);
-        let requests = account_a.received_requests().await.unwrap();
+        let requests: Vec<_> = account_a
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .collect();
         let recent = &requests[request_offset..];
         request_offset = requests.len();
         let gold: Vec<_> = recent

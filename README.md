@@ -25,6 +25,10 @@ The runtime and session storage run locally. **Configured model providers, MCP s
 
 This README describes the **development source checkout**, with the original product audit at `025641317c5703226052a4b94a52d1844615c352` and this documentation refresh based on `dev` revision `10ca51ccdf1f253ff6ec1e78f21b4c74835e1582`. It is not a claim that every command or capability is in the latest crates.io release. Check the installed binary's `bamboo --help` and the [release/source audit](./docs/readme-audit.md) when comparing versions. Source manifests deliberately use `0.0.0`; publishing stamps the release version separately. The recording below retains its separate, older source provenance.
 
+## Terminal-Bench evaluation
+
+Bamboo `7efc6bbd0` solved **60 of 78 tasks (76.92%)** on a local Terminal-Bench 2.1 subset using DS Flash high and Auto permissions. It placed **2nd of 11** in a reference comparison restricted to the same tasks. Bamboo ran one valid trial per task, and the public data uses three. [Per-task results, configuration and rerun commands](./docs/benchmarks/terminal-bench-2.1-2026-11-15/README.md)
+
 ## See the browser interface prepare project context
 
 ![Lotus Next creates a demo project in Bamboo and selects its workspace for a new task.](docs/demos/project-workspace.gif)
@@ -100,6 +104,22 @@ bamboo sessions
 bamboo history <session-id>
 bamboo -p "What should I read next?" -s <session-id>
 ```
+
+For a custom gateway, choose the protocol it serves and supply its model ID.
+The OpenAI-compatible example runs from a fresh data directory.
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "Reply with OK." --provider openai
+```
+
+Anthropic and Gemini use the same variables with their provider prefixes.
+Use `bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id` to save the setup. [Provider configuration and precedence](./docs/config-reference.md#choosing-a-provider-and-model).
+
+Plain output shows reasoning progress on stderr. `--stream-json` emits the
+full event stream as NDJSON on stdout.
 
 Headless runs use the full agent runtime and the configured provider. If an interactive `bamboo -p` run pauses for a tool permission or question, answer the prompt in that same terminal. Browser responses and `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` target runs owned by a separately running `bamboo serve`; they do not unblock the in-process headless run. Do not disable permission checks just to make an example finish.
 

@@ -23,6 +23,8 @@ pub struct ModelCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -38,6 +40,7 @@ impl Default for ModelCapabilities {
             supports_reasoning: false,
             supports_streaming: None,
             max_context_tokens: None,
+            max_input_tokens: None,
             max_output_tokens: None,
         }
     }

@@ -54,7 +54,7 @@ use super::gold::{
     select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
-use super::output_limit_split::{SplitRecovery, Stage as SplitStage, DEFAULT_TOKEN_LIMIT};
+use super::output_limit_split::{SplitRecovery, Stage as SplitStage};
 use crate::runtime::runner::state_bridge;
 use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
@@ -3565,10 +3565,7 @@ async fn run_pipeline_inner(
     // to ever fire (#2425).
     let mut no_tool_call_continuation_streak: u32 = 0;
     let mut split_recovery: Option<SplitRecovery> = None;
-    let recovery_token_limit = config
-        .run_budget
-        .max_total_tokens
-        .unwrap_or(DEFAULT_TOKEN_LIMIT);
+    let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
@@ -3595,9 +3592,7 @@ async fn run_pipeline_inner(
             break;
         }
         if split_recovery.is_some()
-            && (run_tokens_used(&state.runtime_state.round) >= recovery_token_limit
-                || check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget)
-                    .is_some()
+            && (check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
                 || config
                     .run_budget
                     .max_rounds
@@ -3916,14 +3911,15 @@ async fn run_pipeline_inner(
             // transient record when context preparation/provider dispatch fails
             // before streaming starts.
             let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
-            let mut spent = state.runtime_state.round.clone();
-            round_activity.apply_to_round(&mut spent);
+            let remaining_run_tokens = recovery_token_limit.map(|limit| {
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                limit.saturating_sub(run_tokens_used(&spent))
+            });
             let output_limit_policy = RoundOutputLimitPolicy {
                 retry: output_limit_recovery,
-                remaining_run_tokens: Some(recovery_token_limit.saturating_sub(run_tokens_used(&spent))),
+                remaining_run_tokens,
                 previous_prompt_tokens,
-                can_cutoff: attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
-                    && check_run_budget_exceeded(&spent, &config.run_budget).is_none(),
                 task_split: split_request.as_ref().map(|(stage, advisory)| TaskSplitPrompt {
                     advisory,
                     private_plan: *stage == SplitStage::Plan,
@@ -4195,17 +4191,23 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
+            if let Some(split) = split_recovery.as_mut() {
+                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
+            }
             let validation_error = llm_output.terminal_validation_error.or_else(|| {
-                output_limit_recovery.and_then(|_| {
-                    let mut spent = state.runtime_state.round.clone();
-                    round_activity.apply_to_round(&mut spent);
-                    (run_tokens_used(&spent) > recovery_token_limit).then(|| AgentError::Budget(
-                        "output-limit recovery exceeded its token budget on reported usage".into(),
-                    ))
-                })
+                output_limit_recovery?;
+                let limit = recovery_token_limit?;
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                (run_tokens_used(&spent) > limit).then(|| AgentError::Budget(
+                    "output-limit recovery exceeded its token budget on reported usage".into(),
+                ))
             });
             if let Some(error) = validation_error {
-                if output_limit_recovery.is_some() || matches!(error, AgentError::OutputTokenLimit { .. }) {
+                let reasoning_repeated = matches!(error, AgentError::ReasoningRepetition { .. });
+                let response_rejected = reasoning_repeated
+                    || matches!(error, AgentError::OutputTokenLimit { .. });
+                if output_limit_recovery.is_some() || response_rejected {
                     if let Some(visible) = stream_output.visible_message {
                         let _ = event_tx
                             .send(AgentEvent::VisibleMessageDiscard {
@@ -4214,20 +4216,44 @@ async fn run_pipeline_inner(
                             .await;
                     }
                 }
-                if matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. })
-                    && split_request.is_none()
+                if matches!(split_request.as_ref(), Some((SplitStage::Plan, _)))
+                    && llm_output.can_resume_truncated_messages
                 {
+                    // The model has already spent its single planning request.
+                    // Try one bounded action using the existing checkpoint.
+                    split_recovery
+                        .as_mut()
+                        .expect("planning belongs to an active split")
+                        .continue_after_truncated_plan();
+                    crate::runtime::runner::metrics_lifecycle::record_round_completed(
+                        state.metrics_collector.as_ref(),
+                        &round_id,
+                        &state.session_id,
+                        session.messages.len() as u32,
+                        MetricsRoundStatus::Error,
+                        round_activity.token_usage(),
+                        0,
+                        0,
+                        Some(error.to_string()),
+                    );
+                    tracing::info!(session_id = %state.session_id, "Continuing with one action after the recovery plan was interrupted");
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
+                if response_rejected && split_request.is_none() {
+                    let reasoning_only = reasoning_repeated
+                        || matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. });
                     let mut spent = state.runtime_state.round.clone();
                     round_activity.apply_to_round(&mut spent);
                     previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
                     let next = llm_output.output_limit_recovery;
-                    let remaining_tokens = recovery_token_limit.saturating_sub(run_tokens_used(&spent));
-                    let split_candidate = next.filter(|candidate| candidate.prefers_task_split())
-                        .or_else(|| output_limit_recovery.filter(|attempt| attempt.is_convergence()))
+                    let remaining_tokens = recovery_token_limit.map(|limit| limit.saturating_sub(run_tokens_used(&spent)));
+                    let split_candidate = next.filter(|candidate| reasoning_repeated || candidate.prefers_task_split())
+                        .or_else(|| output_limit_recovery.filter(|attempt| reasoning_only && attempt.is_convergence()))
                         .filter(|candidate| candidate.allows_task_split());
                     if let Some(candidate) = split_candidate {
                         let cost = previous_prompt_tokens.saturating_add(candidate.output_limit());
-                        if cost.saturating_mul(2) <= remaining_tokens
+                        if remaining_tokens.is_none_or(|remaining| cost.saturating_mul(2) <= remaining)
                             && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
                             && can_split_tasks(session, config, &state.runtime_state, turn_counter)
                         {
@@ -4246,27 +4272,35 @@ async fn run_pipeline_inner(
                                 Some(error.to_string()),
                             );
                             abort_in_flight_evaluations(state, event_tx, "output_limit_task_split").await;
-                            tracing::info!(session_id = %state.session_id, "Splitting unfinished work after reasoning output exhaustion");
+                            tracing::info!(session_id = %state.session_id, "Splitting unfinished work after an interrupted response");
                             turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
                             break;
                         }
                     }
                     if let Some(recovery) = next.filter(|_| {
-                        attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                        !reasoning_repeated && reasoning_only
+                            && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                     }) {
                         let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
-                        if next_cost <= remaining_tokens && check_run_budget_exceeded(&spent, &config.run_budget).is_none() {
+                        if remaining_tokens.is_none_or(|remaining| next_cost <= remaining)
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                        {
                             output_limit_recovery = Some(recovery);
                             tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
                             continue;
                         }
                     }
+                    tracing::warn!(
+                        session_id = %state.session_id,
+                        ?remaining_tokens,
+                        recovery_available = next.is_some() || split_candidate.is_some(),
+                        "Recovery could not start under the current request and run limits"
+                    );
                 }
                 terminal_error = Some(error);
                 break;
             }
             if let (Some((stage, _)), Some(split)) = (split_request.as_ref(), split_recovery.as_mut()) {
-                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
                 let max_tools = usize::from(*stage == SplitStage::Work);
                 let invalid_tool = stream_output.tool_calls.len() > max_tools
                     || stream_output.tool_calls.iter().any(|call| {
@@ -10562,7 +10596,7 @@ mod tests {
         use bamboo_domain::ReasoningEffort;
         use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
         use wiremock::{Mock, MockServer};
 
         let reasoning_progress = "The reasoning reaches its limit.";
@@ -10596,9 +10630,10 @@ mod tests {
             ("truncated-tool", &truncated_tool, None, false),
             ("run-budget", &thinking, None, false),
             ("missing-output-usage", &unreported_thinking, None, false),
-            ("unset-effort", &thinking, None, false),
-            ("pinned-effort", &thinking, None, false),
+            ("unset-effort", &thinking, Some(&answer), true),
+            ("pinned-effort", &thinking, Some(&answer), true),
         ] {
+            let preserve_effort = matches!(scenario, "unset-effort" | "pinned-effort");
             let server = MockServer::start().await;
             let mut first_request = Mock::given(method("POST")).and(path("/messages"));
             if scenario != "unset-effort" {
@@ -10612,9 +10647,13 @@ mod tests {
                 .mount(&server)
                 .await;
             if let Some(retry) = retry {
-                Mock::given(method("POST"))
-                    .and(path("/messages"))
-                    .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                let request = Mock::given(method("POST")).and(path("/messages"));
+                let request = if preserve_effort {
+                    request.and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                } else {
+                    request.and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                };
+                request
                     .respond_with(retry.clone())
                     .with_priority(1)
                     .expect(if scenario == "repeated-limit" { 2 } else { 1 })
@@ -10650,9 +10689,8 @@ mod tests {
             if matches!(scenario, "run-budget" | "missing-output-usage") {
                 config.run_budget.max_total_tokens = Some(38);
             }
-            if scenario == "repeated-limit" {
-                config.run_budget.max_rounds = Some(1);
-            }
+            // Keep this fixture on the bounded single-round retry path.
+            config.run_budget.max_rounds = Some(1);
             let mut session = Session::new(scenario, "model");
             session.add_message(Message::user("Answer the original request."));
             let mut state = e2e_loop_state(scenario);
@@ -10681,9 +10719,17 @@ mod tests {
             }
             if retry.is_some() {
                 let second: Value = requests[1].body_json().unwrap();
-                let mut expected = first.clone();
-                expected["output_config"]["effort"] = json!("low");
-                assert_eq!(second, expected);
+                if preserve_effort {
+                    assert!(second["messages"]
+                        .to_string()
+                        .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                    assert_eq!(second.get("thinking"), first.get("thinking"));
+                    assert_eq!(second.get("output_config"), first.get("output_config"));
+                } else {
+                    let mut expected = first.clone();
+                    expected["output_config"]["effort"] = json!("low");
+                    assert_eq!(second, expected);
+                }
             }
             if scenario == "repeated-limit" {
                 assert!(String::from_utf8_lossy(&requests[2].body)
@@ -10746,7 +10792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_output_token_limit_converges_and_cuts_off_compatible_messages() {
+    async fn pipeline_output_token_limit_converges_after_wire_truncation() {
         use bamboo_domain::ReasoningEffort;
         use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
         use serde_json::{json, Value};
@@ -10755,40 +10801,10 @@ mod tests {
 
         let exhausted = mock_messages_completion(
             json!({"type":"thinking","thinking":"","signature":""}),
-            json!({"type":"thinking_delta","thinking":" reasoning".repeat(5200)}),
+            json!({"type":"thinking_delta","thinking":"Incomplete reasoning."}),
             "max_tokens",
             Some(16_384),
         );
-        let mut long_stream_events = vec![
-            json!({"type":"message_start","message":{"usage":{
-                "input_tokens":31,"cache_creation_input_tokens":5,"cache_read_input_tokens":7
-            }}}),
-            json!({"type":"content_block_start","index":0,"content_block":{
-                "type":"thinking","thinking":"","signature":""
-            }}),
-        ];
-        let mut calibrated_events = long_stream_events.clone();
-        calibrated_events.extend((0..8).map(|_| {
-            json!({
-                "type":"content_block_delta","index":0,"delta":{
-                    "type":"thinking_delta","thinking":" reasoning".repeat(650)
-                }
-            })
-        }));
-        calibrated_events
-            .push(json!({"type":"error","error":{"message":"past calibrated cutoff"}}));
-        let calibrated_stream = mock_completion_sse(&calibrated_events);
-        // Eight chunks of 2,000 locally counted tokens each. A cutoff at
-        // 14,336 drops the last chunk and never reads the provider's error.
-        long_stream_events.extend((0..8).map(|_| {
-            json!({
-                "type":"content_block_delta","index":0,"delta":{
-                    "type":"thinking_delta","thinking":" a".repeat(2000)
-                }
-            })
-        }));
-        long_stream_events.push(json!({"type":"error","error":{"message":"past cutoff"}}));
-        let long_stream = mock_completion_sse(&long_stream_events);
         let answer = mock_messages_completion(
             json!({"type":"text","text":""}),
             json!({"type":"text_delta","text":"A small next step."}),
@@ -10796,13 +10812,12 @@ mod tests {
             Some(3),
         );
 
-        for (scenario, low_stream, starts_low, pinned, run_limit) in [
-            ("reported-wire", &calibrated_stream, false, false, None),
-            ("local-cutoff", &long_stream, false, false, Some(75_000)),
-            ("configured-low", &exhausted, true, false, None),
-            ("patched-low", &long_stream, true, true, None),
-            ("final-cutoff", &exhausted, true, false, None),
-            ("run-budget", &exhausted, false, false, Some(40_000)),
+        for (scenario, starts_low, pinned, run_limit) in [
+            ("reported-wire", false, false, None),
+            ("configured-low", true, false, None),
+            ("patched-low", true, true, None),
+            ("final-limit", true, false, None),
+            ("run-budget", false, false, Some(40_000)),
         ] {
             let server = MockServer::start().await;
             let request = || Mock::given(method("POST")).and(path("/messages"));
@@ -10818,18 +10833,18 @@ mod tests {
             }
             request()
                 .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
-                .respond_with(low_stream.clone())
+                .respond_with(exhausted.clone())
                 .with_priority(2)
                 .expect(1)
                 .mount(&server)
                 .await;
             let sends_final = scenario != "run-budget";
-            let final_hits_limit = scenario == "final-cutoff";
+            let final_hits_limit = scenario == "final-limit";
             if sends_final {
                 request()
                     .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
                     .respond_with(if final_hits_limit {
-                        long_stream.clone()
+                        exhausted.clone()
                     } else {
                         answer.clone()
                     })
@@ -10928,8 +10943,7 @@ mod tests {
                 assert!(messages.contains("prior_signature"));
                 assert!(messages.contains("Confirmed result."));
                 assert!(messages.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
-                assert!(!messages.contains(&" a".repeat(100)));
-                assert!(!messages.contains(&" reasoning".repeat(100)));
+                assert!(!messages.contains("Incomplete reasoning."));
             }
             if sends_final && !final_hits_limit {
                 assert!(result.unwrap(), "{scenario}");
@@ -10940,33 +10954,21 @@ mod tests {
                 );
                 assert!(session.messages[prior_messages].reasoning.is_none());
             } else {
-                let expected_reason = if final_hits_limit {
-                    "reasoning_headroom"
-                } else {
-                    "max_tokens"
-                };
                 assert!(
                     matches!(
                         result,
                         Err(AgentError::OutputTokenLimit {
-                            finish_reason,
+                            finish_reason: "max_tokens",
                             reasoning_only: true,
                             ..
-                        }) if finish_reason == expected_reason
+                        })
                     ),
                     "{scenario}: {result:?}"
                 );
                 assert_eq!(session.messages.len(), prior_messages);
             }
             let round = &state.runtime_state.round;
-            let saw_cutoff = matches!(
-                scenario,
-                "reported-wire" | "local-cutoff" | "patched-low" | "final-cutoff"
-            );
-            assert_eq!(
-                round.total_prompt_tokens,
-                31 * requests.len() as u64 + 12 * u64::from(saw_cutoff)
-            );
+            assert_eq!(round.total_prompt_tokens, 31 * requests.len() as u64);
             assert_eq!(
                 round.total_completion_tokens,
                 16_384 * (failed_requests as u64 + u64::from(final_hits_limit))

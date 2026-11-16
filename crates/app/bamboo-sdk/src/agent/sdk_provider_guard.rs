@@ -5,7 +5,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use bamboo_domain::{CapabilityLoadingMode, Message, ToolSchema};
+use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 use bamboo_llm::provider::{queued_identity_for, ProviderModelInfo, QueuedRouteIdentity};
 use bamboo_llm::provider_registry::SdkProviderBinding;
 use bamboo_llm::{
@@ -138,6 +138,10 @@ impl BoundSdkProvider {
 
 #[async_trait]
 impl LLMProvider for BoundSdkProvider {
+    fn default_compression_reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        self.delegate.default_compression_reasoning_effort(model)
+    }
+
     fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
         Some(self.delegate.clone())
     }
@@ -265,6 +269,14 @@ impl LLMProvider for BoundSdkProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>, LLMError> {
         self.dispatch(None)?;
         self.delegate.list_model_info().await
+    }
+
+    async fn model_info_for_request(
+        &self,
+        model: &str,
+    ) -> Result<Option<ProviderModelInfo>, LLMError> {
+        self.dispatch(Some(model))?;
+        self.delegate.model_info_for_request(model).await
     }
 }
 

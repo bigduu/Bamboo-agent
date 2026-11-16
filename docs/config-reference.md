@@ -11,11 +11,10 @@ keys are encrypted automatically — see [Secrets](#secrets-and-masking) below),
 and `bamboo config [--show-secrets]` prints the resolved config. This document
 is for when you need to know exactly what a key does or edit the file by hand.
 
-**Precedence:** `config.json` < environment variables < CLI flags (`bamboo
-serve --port ...` wins over everything). Provider selection specifically is
-`providers.<name>` / `provider_instances.<id>` (file) → `BAMBOO_PROVIDER` /
-`BAMBOO_<PROVIDER>_API_KEY` (env, in-memory only, never persisted) →
-`--provider` (CLI).
+For a field with a runtime override, Bamboo starts with the built-in default,
+loads the saved setting, and applies the documented environment and command
+options. Provider selection, model admission, and path precedence are covered
+below. [Choosing a provider and model](#choosing-a-provider-and-model).
 
 Source of truth for every struct below: `crates/infra/bamboo-config/src/config.rs`
 (`pub struct Config`, around line 1069) unless noted otherwise. Struct field
@@ -105,6 +104,54 @@ not part of Bamboo Issue #597.
 New provider instances use OpenAI (including compatible endpoints), Anthropic
 or Gemini. Existing Bodhi gateway configurations remain readable and editable.
 
+### Choosing a provider and model
+
+| Protocol served by the endpoint | `--provider` for the built-in account | Process environment | Built-in base URL | Suggested model from `bamboo init` with the built-in endpoint |
+|---|---|---|---|---|
+| OpenAI-compatible | `openai` | `BAMBOO_OPENAI_API_KEY`, `BAMBOO_OPENAI_BASE_URL`, `BAMBOO_OPENAI_MODEL` | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| Anthropic Messages | `anthropic` | `BAMBOO_ANTHROPIC_API_KEY`, `BAMBOO_ANTHROPIC_BASE_URL`, `BAMBOO_ANTHROPIC_MODEL` | `https://api.anthropic.com/v1` | `claude-sonnet-4-6` |
+| Gemini | `gemini` | `BAMBOO_GEMINI_API_KEY`, `BAMBOO_GEMINI_BASE_URL`, `BAMBOO_GEMINI_MODEL` | `https://generativelanguage.googleapis.com/v1beta` | `gemini-2.0-flash-exp` |
+| Existing Bodhi proxy | Configured instance ID | Configure the existing account in provider settings | `http://localhost:8080` | Configured model, with `target_provider` selecting the upstream protocol |
+
+The protocol follows the API that the gateway serves. For example, a gateway
+serving a Gemini model via OpenAI Chat Completions uses the `openai` row.
+For the native protocols, use the API base path through its version segment,
+such as `/v1` or `/v1beta`. For Bodhi, use the proxy server's root URL and
+set `target_provider` on the instance. Use the model ID accepted by the gateway.
+The base URL must be an absolute HTTP(S) URL without user info, query
+parameters, or fragments. Supply the credential through the API key setting.
+
+| Setting | Saved configuration | Environment | Command line |
+|---|---|---|---|
+| Data directory | Holds Bamboo settings and sessions. The default is `~/.bamboo`. | `BAMBOO_DATA_DIR` | `--data-dir` wins. `--config PATH` supplies a containing directory when the environment variable is unset. |
+| Default provider | `default_provider_instance` (legacy `provider`, which defaults to `anthropic`) | `BAMBOO_PROVIDER` selects the runtime default account. | `bamboo -p ... --provider ID`, or `-m ID:MODEL` for that run. `bamboo init --provider TYPE` saves a built-in provider. |
+| API endpoint | `provider_instances.<id>.base_url` | The matching `*_BASE_URL` overrides the built-in account. | `bamboo init --base-url URL` saves the address. A one-shot run reads it from the account or runtime environment. |
+| Default model | `provider_instances.<id>.model`. With model references enabled, `defaults.chat` sets the chat role. | The matching `*_MODEL` supplies the built-in account's default model. | `bamboo -p ... --provider ID` uses that account's model. `-m ID:MODEL` pins an admitted model. `bamboo init --model MODEL` saves the model. |
+| API key | Encrypted credential store with a reference in provider settings. | The matching `*_API_KEY` supplies a runtime credential. | `bamboo init` prompts for a key. The existing `--api-key` argument also saves it. |
+| Model limits | Set model-specific context and output limits in `model_limits.json`. See [Model limits](#model-limits-model_limitsjson) for the fallback and precedence. | | |
+
+A new custom endpoint needs a model ID. `bamboo init` reuses a saved model when
+updating an account. Headless runs without a model selection use the saved
+session target on resume, or the configured chat/provider default for a new
+session. Keep a custom model in the account's `runtime_models` if that account
+uses an explicit list.
+
+Use the process environment for a one-shot or container launch. API keys,
+base URLs, and model IDs supplied this way are runtime overrides. A fresh data
+directory accepts all three variables without a prewritten configuration. In
+an existing instance layout, `*_BASE_URL` and `*_MODEL` apply to the exact
+built-in ID that has `api_key_from_env: true`. Named accounts keep their saved
+endpoints and models. Use one explicit instance ID per account when storing
+multiple gateways. Update a saved model with
+`bamboo config set provider_instances.work.model your-model-id`.
+[Copyable setup commands](./guides/GETTING_STARTED.md#use-a-custom-gateway).
+
+Built-in compression on a custom OpenAI Chat Completions gateway uses
+`max_tokens` for its summary allowance and leaves reasoning to the gateway when
+the effort and request controls are unset. This lets a gateway return summary
+text even when it always generates reasoning. Explicit Task Summary or Fast
+effort and request body controls still apply to the selected route.
+
 On upgrade, Bamboo removes GitHub Copilot instances and clears a default provider
 instance that selected one of them. References to those instances remain in
 saved model preferences and session history. Choose a supported provider and
@@ -137,6 +184,23 @@ forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 `thinking_replay_always` (needed by some Anthropic-compatible upstreams, e.g.
 GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 `target_provider` to select `openai`, `anthropic` or `gemini`.
+
+The agent can close a reasoning-only stream when its text repeats in a sustained
+cycle. This uses the normalized reasoning stream across providers.
+The [model limits](#model-limits-model_limitsjson) determine the output cap for
+Messages, Chat Completions, Responses and Gemini. An interrupted attempt can
+resume from confirmed tool results when the request allows recovery. The
+recovery request count is bounded, and an explicit
+`run_budget.max_total_tokens` applies to recovery. The
+`thinking_replay_always` option controls history replay independently.
+
+On compatible Messages routes, automatic agent requests for DeepSeek V4 and
+`deepseek-flash` send adaptive thinking with Bamboo's default `medium` effort
+when the request and provider leave effort unset. Explicit effort and reasoning
+body patches keep priority.
+
+DeepSeek treats `thinking.budget_tokens` as an ignored compatibility field.
+[DeepSeek Messages API](https://api-docs.deepseek.com/zh-cn/api/create-message/)
 
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
@@ -340,17 +404,18 @@ the active provider window, and directs the model to
 | Field | Default | What it does |
 |---|---|---|
 | `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
-| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the total model window. Output/safety headroom can move the effective trigger earlier. |
-| `target_usage_ratio` | `0.25` | Shared post-compression target relative to the total model window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
+| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the smaller of the joint model window and any independent input ceiling. Output and safety headroom can move the effective trigger earlier. |
+| `target_usage_ratio` | `0.25` | Shared post-compression target on the same window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` (legacy) | Compatibility input only. When the shared field is absent, a stricter legacy value migrates to the common trigger for every strategy. Explicit shared fields take precedence. |
 | `retrieval_window.target_usage_ratio` | `0.60` (legacy) | Compatibility input only. The former default adopts the shared `0.25` target; a stricter legacy value is retained as the common target. Historical archive receipts retain their original targets. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
 
-For a total window `W`, the input hard limit is `H = W - max_output_tokens -
-safety_margin`. The common calculator reserves additional maintenance headroom
-based on the output allowance and safety margin, bounded by one fifth of `H`.
+For a total window `W`, preparation reserves working output space and the
+counting margin. The input limit is the smaller of the space left and any
+independent input ceiling after its margin. The common calculator reserves
+additional maintenance headroom bounded by one fifth of that input limit.
 The effective trigger is the earlier of the configured window ratio and the
 remaining safe input boundary. This avoids the previous fixed-50K behavior that
 waited until 95% on a 1M window. Execution/verification task status does not delay
@@ -359,7 +424,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the ordinary default limits, a 1M window with 32K output and 10K safety
+For the compatibility defaults, a 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -438,7 +503,7 @@ the shipped defaults, so an empty `{}` is already reasonable:
 |---|---|---|
 | `background_model` | `None` | Model used for memory extraction/consolidation background work; falls back to the primary model. |
 | `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. The shared context target also bounds the available summary space, so an existing summary can be reduced again instead of growing without limit. |
-| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. |
+| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
 | `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
@@ -712,10 +777,8 @@ still enforces explicit policy and platform denials.
 
 ## Model limits (`model_limits.json`)
 
-A separate file, `${data_dir}/model_limits.json` — user-supplied
-context/output token limit overrides. Explicit user matches take precedence
-over provider runtime metadata. The legacy standalone representation is a raw
-array:
+`${data_dir}/model_limits.json` supplies context and output limits for individual
+models or model families. The legacy standalone representation uses a raw array.
 
 ```json
 [
@@ -727,19 +790,22 @@ array:
 runtime model id; `*` and other glob characters have no special meaning.
 Among substring matches, the longest pattern wins.
 
-`max_context_tokens` is the provider's **total input + output context
-window**, not its input allowance alone. Bamboo derives the per-request input
-limit as:
+`max_context_tokens` configures a **joint input and output window**.
+Bamboo checks the selected route for independent input, output and combined
+limits. Where configuration and metadata both provide a ceiling, the lower
+value applies. An omitted output field can use the provider's value. The sum of
+independent input and output ceilings is a planning bound when the joint window
+is unknown.
 
-```text
-max_request_input_tokens =
-    max_context_tokens - max_output_tokens - safety_margin
-```
-
-`safety_margin` is optional. When `max_output_tokens` is omitted, Bamboo
-derives it from the context window. Provider metadata that exposes separate
-`max_input_tokens` and `max_output_tokens` is normalized to the same total
-context-window contract before runtime budgeting.
+For ordinary Agent turns with model limits, Bamboo reserves working space
+during context preparation and recomputes the output allowance after projecting
+the final input and tools. A joint window bounds output by the space left after
+the measured input and `safety_margin`. When an independent input ceiling is
+smaller, the compression trigger, target and default counting margin use that
+smaller window. Numeric body overrides can lower the wire cap. Set the routed
+model through provider settings so Bamboo resolves its limits before sizing the
+request. Dynamic sizing rejects a body patch that changes that model. Body
+patches that rewrite prompt content can change the provider's actual token count.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
@@ -753,10 +819,13 @@ engine-level `TokenBudget` remains an intentional higher-priority override. Mana
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
-With no matching user or provider value, Bamboo falls back to a global default
-of 1M total context / 32K per-request output allowance. There is deliberately **no built-in
-per-model table**, so stale hard-coded model names cannot override live
-provider metadata.
+The file stores explicit overrides. With no matching user or provider limit,
+the runtime and the defaults API use 1,000,000 total context tokens and 64,000
+output tokens. When the window is known and the output ceiling is absent,
+the fallback output is one quarter of the window, up to 64,000. Provider limits
+come from the selected route's catalog and are cached briefly. If configured
+catalog and generation headers differ for a model, Bamboo keeps the catalog ID
+and omits its capacities. Configure limits explicitly for that generation route.
 
 ## Schedules (`schedules.json`)
 
@@ -788,11 +857,9 @@ optional; file config plus built-in defaults cover a fresh install.
 | `BAMBOO_HEADLESS` | Enable headless auth mode. |
 | `BAMBOO_WORKERS` | Actix worker-count override (CLI-level). |
 
-**Provider API keys** (in-memory only — never persisted to `config.json`,
-even after `bamboo config set`; the point is a plaintext-key-free config file
-for Docker/CI/secret-manager deploys):
-
-`BAMBOO_OPENAI_API_KEY`, `BAMBOO_ANTHROPIC_API_KEY`, `BAMBOO_GEMINI_API_KEY`.
+**Provider runtime overrides** use the `BAMBOO_OPENAI`, `BAMBOO_ANTHROPIC`,
+and `BAMBOO_GEMINI` prefixes with the `_API_KEY`, `_BASE_URL`, and `_MODEL`
+suffixes. [Provider variables and account scope](#choosing-a-provider-and-model).
 
 **Memory toggles** (override the matching `memory.*` config field):
 `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`, `BAMBOO_MEMORY_RELEVANT_RECALL`,

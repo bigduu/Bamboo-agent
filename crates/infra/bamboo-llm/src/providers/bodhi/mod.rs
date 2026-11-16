@@ -21,7 +21,7 @@ use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
-    ChatCompletionsResponse,
+    ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
@@ -32,6 +32,7 @@ const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 pub struct BodhiProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     target_provider: String,
@@ -44,6 +45,7 @@ impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "http://localhost:8080".to_string(),
             target_provider: "openai".to_string(),
@@ -269,7 +271,42 @@ impl LLMProvider for BodhiProvider {
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        Ok(vec![])
+        use model_fetcher::ModelListFormat;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.proxy_url("v1/models");
+        let (format, generation_endpoints): (_, &'static [_]) = match self.target_provider.as_str()
+        {
+            "anthropic" => (
+                ModelListFormat::Messages,
+                &[request_overrides::ENDPOINT_MESSAGES],
+            ),
+            "gemini" => (
+                ModelListFormat::Gemini,
+                &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+            ),
+            _ => (
+                ModelListFormat::Compatible,
+                &[request_overrides::ENDPOINT_CHAT_COMPLETIONS],
+            ),
+        };
+        match self
+            .model_info_cache
+            .get(&self.client, &url, headers, "Bodhi", format)
+            .await
+        {
+            Ok(models) => Ok(request_overrides::bind_catalog_limits(
+                models,
+                self.request_overrides.as_ref(),
+                |_| generation_endpoints,
+            )),
+            Err(error) => {
+                tracing::debug!(
+                    error_kind = llm_error_kind(&error),
+                    "Bodhi proxy model metadata not available"
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
@@ -313,7 +350,11 @@ impl BodhiProvider {
             "Bodhi",
             |body| self.client.post(&url).headers(headers.clone()).json(body),
             body,
-            allow_disable_correction,
+            if allow_disable_correction {
+                ChatCompletionsCorrection::ReasoningDisable
+            } else {
+                ChatCompletionsCorrection::None
+            },
         )
         .await?
         {
@@ -483,7 +524,15 @@ impl BodhiProvider {
                 if let Some(diagnostics) = &completion_diagnostics {
                     diagnostics.observe_sse(event, data);
                 }
-                parse_gemini_sse_event(&mut state, event, data)
+                let chunks = parse_gemini_sse_event(&mut state, event, data)?;
+                if let (Some(diagnostics), Some(usage)) =
+                    (&completion_diagnostics, state.pending_provider_usage())
+                {
+                    // The legacy proxy emits usage at completion. Retain
+                    // observed counts if the agent cuts the stream earlier.
+                    diagnostics.record_pending_usage(usage);
+                }
+                Ok(chunks)
             },
         );
 

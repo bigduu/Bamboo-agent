@@ -2,10 +2,11 @@ use super::*;
 
 #[test]
 fn all_strategies_use_the_same_output_aware_range() {
-    for (window, output, safety, trigger, target) in [
-        (1_000_000, 32_000, 10_000, 800_000, 250_000),
-        (200_000, 32_000, 2_000, 134_000, 50_000),
-        (32_000, 8_000, 1_000, 18_400, 8_000),
+    for (window, output, safety, input, trigger, target) in [
+        (1_000_000, 32_000, 10_000, None, 800_000, 250_000),
+        (200_000, 32_000, 2_000, None, 134_000, 50_000),
+        (32_000, 8_000, 1_000, None, 18_400, 8_000),
+        (1_000_000, 64_000, 1_000, Some(8_000), 6_000, 2_000),
     ] {
         for strategy in [
             ContextManagementStrategy::Summary,
@@ -19,9 +20,11 @@ fn all_strategies_use_the_same_output_aware_range() {
                 },
                 ..Default::default()
             };
-            let budget = config.context_management.apply_compression_policy(
+            let mut budget = config.context_management.apply_compression_policy(
                 TokenBudget::with_safety_margin(window, output, BudgetStrategy::default(), safety),
             );
+            budget.max_input_tokens = input;
+            budget.output_reserve_tokens = input.map(|_| safety);
             let range = budget.compression_thresholds();
             assert_eq!(range.trigger_tokens, trigger);
             assert_eq!(range.target_tokens, target);

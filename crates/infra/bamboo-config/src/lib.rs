@@ -54,7 +54,8 @@ pub use provider_configs::ProviderConfigsModule;
 pub use provider_instance::{
     materialize_legacy_provider_instances, provider_api_key_environment_override_active,
     provider_instance_api_key_from_env, provider_instance_environment_override_active,
-    synthesize_legacy_instances, PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
+    synthesize_legacy_instances, INVALID_RUNTIME_PROVIDER_BASE_URL,
+    PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
 };
 pub use runtime_models::*;
 pub use section_facade::*;

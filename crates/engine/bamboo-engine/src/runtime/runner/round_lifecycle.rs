@@ -12,7 +12,7 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::ProviderTranscriptItemKind;
-use bamboo_llm::provider::{OutputLimitRecovery, REASONING_HEADROOM_FINISH_REASON};
+use bamboo_llm::provider::{OutputLimitRecovery, REASONING_REPETITION_FINISH_REASON};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -51,21 +51,19 @@ fn rejected_output_limit(
 ) -> bool {
     // Responses explicitly marks this frame incomplete. A task split also
     // requires a complete plan, checkpoint or report on the other protocols.
-    matches!(
-        finish_reason,
-        "max_output_tokens" | REASONING_HEADROOM_FINISH_REASON
-    ) || (matches!(finish_reason, "max_tokens" | "length" | "MAX_TOKENS")
-        && (task_split
-            || output.content.trim().is_empty()
-            || !output.tool_calls.is_empty()
-            || output.provider_transcript_items.iter().any(|item| {
-                item.kind().is_discovery()
-                    || matches!(
-                        item.kind(),
-                        ProviderTranscriptItemKind::OpenAiFunctionCall
-                            | ProviderTranscriptItemKind::AnthropicToolUse
-                    )
-            })))
+    finish_reason == "max_output_tokens"
+        || (matches!(finish_reason, "max_tokens" | "length" | "MAX_TOKENS")
+            && (task_split
+                || output.content.trim().is_empty()
+                || !output.tool_calls.is_empty()
+                || output.provider_transcript_items.iter().any(|item| {
+                    item.kind().is_discovery()
+                        || matches!(
+                            item.kind(),
+                            ProviderTranscriptItemKind::OpenAiFunctionCall
+                                | ProviderTranscriptItemKind::AnthropicToolUse
+                        )
+                })))
 }
 
 fn request_tool_schemas_for_loading_mode<'a>(
@@ -204,6 +202,7 @@ pub(crate) struct RoundLlmExecutionOutput {
     /// a billed response is not turned into a zero-usage terminal round.
     pub terminal_validation_error: Option<AgentError>,
     pub output_limit_recovery: Option<OutputLimitRecovery>,
+    pub can_resume_truncated_messages: bool,
     pub(crate) host_gold_attempt: Option<Arc<crate::runtime::host_gold::HostGoldAttempt>>,
 }
 
@@ -218,7 +217,6 @@ pub(crate) struct RoundOutputLimitPolicy<'a> {
     pub retry: Option<OutputLimitRecovery>,
     pub remaining_run_tokens: Option<u64>,
     pub previous_prompt_tokens: u64,
-    pub can_cutoff: bool,
     pub task_split: Option<TaskSplitPrompt<'a>>,
 }
 
@@ -296,6 +294,20 @@ pub(crate) async fn execute_llm_round(
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
+    // Resolve mutable host handles once for the whole request. The model
+    // catalog, capability projection and provider send must use one route.
+    let request_provider = if config.provider_name.is_some()
+        && session.authority_identity.is_ordinary()
+        && host_gold_attempt.is_none()
+    {
+        Some(
+            bamboo_llm::provider::queued_snapshot_for(llm.clone())
+                .map_err(|error| AgentError::LLM(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let llm = request_provider.as_ref().unwrap_or(llm);
     // Scope prepared image descriptions to this request. A configuration reused
     // across rounds must never serve a description produced for another request.
     config.vision_description_reuse.clear();
@@ -341,8 +353,7 @@ pub(crate) async fn execute_llm_round(
         provider_type: config.provider_type.as_deref(),
         reasoning_effort: config.reasoning_effort,
         output_limit_recovery,
-        max_context_tokens: prepared.budget.max_context_tokens,
-        max_output_tokens: prepared.budget.max_output_tokens,
+        budget: &prepared.budget,
         observation_progress_hint,
         prompt_memory_exposure,
     };
@@ -374,24 +385,31 @@ pub(crate) async fn execute_llm_round(
     let finish_reason = completion.finish_reason();
     let task_split = output_limit_recovery.is_some_and(|policy| policy.task_split.is_some());
     let output_limited = rejected_output_limit(&stream_output, finish_reason, task_split);
-    let terminal_validation_error = if output_limited {
+    let reasoning_repeated = finish_reason == REASONING_REPETITION_FINISH_REASON;
+    let response_rejected = output_limited || reasoning_repeated;
+    let reasoning_only = empty_answer
+        && !completion.saw_provider_tool()
+        && (reasoning_repeated
+            || !stream_output.reasoning_content.trim().is_empty()
+            || stream_output.thinking_tokens > 0
+            || !stream_output.provider_transcript_items.is_empty())
+        && stream_output.provider_transcript_items.iter().all(|item| {
+            matches!(
+                item.kind(),
+                ProviderTranscriptItemKind::OpenAiReasoning
+                    | ProviderTranscriptItemKind::AnthropicThinking
+                    | ProviderTranscriptItemKind::AnthropicRedactedThinking
+            )
+        });
+    let terminal_validation_error = if reasoning_repeated {
+        Some(AgentError::ReasoningRepetition {
+            response_id: stream_output.response_id.clone(),
+        })
+    } else if output_limited {
         Some(AgentError::OutputTokenLimit {
             finish_reason,
             response_id: stream_output.response_id.clone(),
-            reasoning_only: empty_answer
-                && !completion.saw_provider_tool()
-                && (finish_reason == REASONING_HEADROOM_FINISH_REASON
-                    || !stream_output.reasoning_content.trim().is_empty()
-                    || stream_output.thinking_tokens > 0
-                    || !stream_output.provider_transcript_items.is_empty())
-                && stream_output.provider_transcript_items.iter().all(|item| {
-                    matches!(
-                        item.kind(),
-                        ProviderTranscriptItemKind::OpenAiReasoning
-                            | ProviderTranscriptItemKind::AnthropicThinking
-                            | ProviderTranscriptItemKind::AnthropicRedactedThinking
-                    )
-                }),
+            reasoning_only,
         })
     } else if is_recovery && !completion.has_recovery_completion() {
         Some(AgentError::LLMNonRetryable(
@@ -407,7 +425,7 @@ pub(crate) async fn execute_llm_round(
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
     // Missing usage on these paths can hide reasoning spend. Keep reported
     // usage authoritative and reserve the entire wire cap as the fallback.
-    let estimated_output = if output_limited || is_recovery {
+    let estimated_output = if response_rejected || is_recovery {
         let reasoning_estimate = estimate_completion_tokens(&stream_output.reasoning_content, &[]);
         completion_tokens
             .saturating_add(reasoning_estimate.max(stream_output.thinking_tokens))
@@ -415,7 +433,7 @@ pub(crate) async fn execute_llm_round(
     } else {
         completion_tokens
     };
-    let attempt_usage = if output_limited || is_recovery {
+    let attempt_usage = if response_rejected || is_recovery {
         // A partial usage snapshot can omit its full prompt total even when
         // the known cached input is large. Reserve at least that known sum
         // and the projected wire input when the total is missing.
@@ -423,9 +441,7 @@ pub(crate) async fn execute_llm_round(
             .input_tokens
             .saturating_add(stream_output.cache_creation_input_tokens)
             .saturating_add(stream_output.cache_read_input_tokens);
-        let known_output = if finish_reason == REASONING_HEADROOM_FINISH_REASON {
-            0
-        } else if completion.legacy_counts_reasoning_separately() {
+        let known_output = if completion.legacy_counts_reasoning_separately() {
             let missing_candidates = stream_output.output_tokens == 0 && completion_tokens > 0;
             let missing_thoughts = stream_output.thinking_tokens == 0
                 && !stream_output.reasoning_content.trim().is_empty();
@@ -439,8 +455,21 @@ pub(crate) async fn execute_llm_round(
         } else {
             stream_output.output_tokens
         };
+        let mut usage = stream_output.provider_usage;
+        let (known_output, estimated_output) = if reasoning_repeated {
+            // An interrupted stream can report a cumulative snapshot without
+            // its final usage. Reserve the wire cap even when a partial count
+            // exists, while keeping that count as an additional lower bound.
+            let partial_output = usage
+                .as_mut()
+                .and_then(|usage| usage.output_tokens.take())
+                .unwrap_or_default();
+            (0, estimated_output.max(known_output).max(partial_output))
+        } else {
+            (known_output, estimated_output)
+        };
         canonical_token_usage(
-            stream_output.provider_usage,
+            usage,
             0,
             known_output,
             prompt_tokens.max(known_input),
@@ -449,30 +478,19 @@ pub(crate) async fn execute_llm_round(
     } else {
         canonical_attempt_usage(&stream_output, prompt_tokens, estimated_output)
     };
-    let mut output_limit_recovery = completion.output_limit_recovery();
-    if matches!(
-        terminal_validation_error,
-        Some(AgentError::OutputTokenLimit {
-            finish_reason: "max_tokens",
-            reasoning_only: true,
-            ..
-        })
-    ) && stream_output.reasoning_signature.is_none()
-        && stream_output.reasoning_content.len() >= 4096
-    {
-        if let Some(retry) = output_limit_recovery
-            .filter(|retry| !retry.is_convergence() || retry.prefers_task_split())
-        {
-            if stream_output
-                .provider_usage
-                .and_then(|usage| usage.output_tokens)
-                == Some(retry.output_limit())
-            {
-                output_limit_recovery =
-                    Some(retry.with_capped_reasoning_bytes(stream_output.reasoning_content.len()));
-            }
-        }
-    }
+    // A compatible Messages gateway can hide its thinking or leave a
+    // provisional client tool call at the cap. Discarding this turn is safe
+    // only when it contains no provider-side work.
+    let can_resume_truncated_messages = response_rejected
+        && completion.is_compatible_messages()
+        && !completion.saw_provider_tool()
+        && stream_output
+            .provider_transcript_items
+            .iter()
+            .all(|item| !item.kind().is_discovery());
+    let output_limit_recovery = completion
+        .output_limit_recovery()
+        .filter(|_| response_rejected && (can_resume_truncated_messages || reasoning_only));
 
     tracing::debug!(
         "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, estimated_tokens={}, canonical_tokens={}",
@@ -496,6 +514,7 @@ pub(crate) async fn execute_llm_round(
         attempt_usage,
         terminal_validation_error,
         output_limit_recovery,
+        can_resume_truncated_messages,
         host_gold_attempt,
     })
 }

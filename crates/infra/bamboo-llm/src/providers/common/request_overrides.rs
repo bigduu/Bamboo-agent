@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::provider::{
-    current_completion_diagnostics, OutputLimitRecoveryControls, Result,
-    OUTPUT_LIMIT_CONVERGENCE_HINT,
+    current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, ProviderModelInfo,
+    Result, OUTPUT_LIMIT_CONVERGENCE_HINT,
 };
 use bamboo_config::{
     BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
@@ -112,6 +112,36 @@ pub fn apply_overrides_to_body(
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
 }
 
+/// Gateways can route the same model ID differently under request-specific
+/// headers. Keep catalog IDs but withhold capacities when these scopes differ.
+pub(crate) fn bind_catalog_limits(
+    mut models: Vec<ProviderModelInfo>,
+    overrides: Option<&RequestOverridesConfig>,
+    generation_endpoints: impl Fn(&str) -> &'static [&'static str],
+) -> Vec<ProviderModelInfo> {
+    let Some(overrides) = overrides.filter(|overrides| {
+        overrides
+            .endpoints
+            .values()
+            .any(|scope| !scope.headers.is_empty())
+            || overrides
+                .rules
+                .iter()
+                .any(|rule| !rule.scope.headers.is_empty())
+    }) else {
+        return models;
+    };
+    let catalog_headers = resolve_scope(overrides, ENDPOINT_MODELS, None).headers;
+    for model in &mut models {
+        if generation_endpoints(&model.id).iter().any(|endpoint| {
+            resolve_scope(overrides, endpoint, Some(&model.id)).headers != catalog_headers
+        }) {
+            *model = ProviderModelInfo::from_id(std::mem::take(&mut model.id));
+        }
+    }
+    models
+}
+
 /// Inspect the final wire controls after masking and operator body patches.
 /// Keep recovery bound to the observed protocol, effort and output cap.
 pub(crate) fn mask_and_prepare_agent_request(
@@ -146,12 +176,41 @@ pub(crate) fn mask_and_prepare_agent_request(
         ),
         _ => return Ok(()),
     };
+    let legacy_limit_path = (endpoint == ENDPOINT_CHAT_COMPLETIONS).then_some("/max_tokens");
+    if let Some(window_limit) = diagnostics.model_window_limit() {
+        // Gemini addresses the model in the URL. The other adapters must
+        // still address the model whose capacity the runtime resolved.
+        if endpoint != ENDPOINT_STREAM_GENERATE_CONTENT
+            && body.get("model").and_then(Value::as_str) != Some(model)
+        {
+            return Err(LLMError::RequestFailed(
+                "Set the routed model in provider settings when using model windows".into(),
+            ));
+        }
+        let limit_paths = std::iter::once(limit_path).chain(legacy_limit_path);
+        let mut wire_limit = u64::from(window_limit);
+        let mut has_output_control = false;
+        for field in limit_paths.clone().filter_map(|path| body.pointer(path)) {
+            let configured = field.as_u64().filter(|limit| *limit > 0).ok_or_else(|| {
+                LLMError::RequestFailed("Model output limit must be a positive integer".into())
+            })?;
+            wire_limit = wire_limit.min(configured);
+            has_output_control = true;
+        }
+        if !has_output_control {
+            return Err(LLMError::RequestFailed(
+                "Model window requires an output limit on the final request".into(),
+            ));
+        }
+        for path in limit_paths {
+            if let Some(field) = body.pointer_mut(path) {
+                *field = Value::from(wire_limit);
+            }
+        }
+    }
     let limit = body
         .pointer(limit_path)
-        .or_else(|| match endpoint {
-            ENDPOINT_CHAT_COMPLETIONS => body.get("max_tokens"),
-            _ => None,
-        })
+        .or_else(|| legacy_limit_path.and_then(|path| body.pointer(path)))
         .and_then(Value::as_u64)
         .filter(|limit| *limit > 0);
     let effort = body
@@ -172,25 +231,29 @@ pub(crate) fn mask_and_prepare_agent_request(
             .is_none(),
         _ => true,
     };
-    let candidate = effort
-        .zip(limit)
+    let compatible_messages = endpoint == ENDPOINT_MESSAGES && diagnostics.is_compatible_messages();
+    let candidate = limit
         .filter(|_| {
-            native_control
-                && client_tools_only(endpoint, body)
-                && !crate::retry::work_request_budget_active()
+            client_tools_only(endpoint, body) && !crate::retry::work_request_budget_active()
         })
-        .and_then(|(effort, output_limit)| {
+        .and_then(|output_limit| {
             let patches = overrides.map(|config| resolve_scope(config, endpoint, Some(model)));
             let mut patches = patches.iter().flat_map(|scope| &scope.body_patch);
             let effort_segments = parse_path(effort_path);
             let control_is_pinned = patches.clone().any(|patch| {
                 let path = parse_path(&patch.path);
                 patches_reasoning_control(endpoint, &path)
-                    && !(effort == ReasoningEffort::Low && path == effort_segments)
+                    && !(effort == Some(ReasoningEffort::Low) && path == effort_segments)
             });
-            if control_is_pinned
-                || (effort != ReasoningEffort::Low && masking.apply_masking(low) != low)
-            {
+            // Altering effort and resuming unfinished work have separate
+            // prerequisites. A custom gateway can keep reasoning even when the
+            // operator removes, pins or replaces its reasoning controls.
+            let lowerable_effort = effort.filter(|effort| {
+                native_control
+                    && !control_is_pinned
+                    && (*effort == ReasoningEffort::Low || masking.apply_masking(low) == low)
+            });
+            if !compatible_messages && lowerable_effort.is_none() {
                 return None;
             }
             let (prompt_key, candidate_count) = match endpoint {
@@ -209,9 +272,10 @@ pub(crate) fn mask_and_prepare_agent_request(
                 == OUTPUT_LIMIT_CONVERGENCE_HINT;
             Some(OutputLimitRecoveryControls {
                 endpoint,
-                effort,
+                lowerable_effort,
                 output_limit,
                 allows_convergence,
+                compatible_messages,
             })
         });
     if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
@@ -263,6 +327,38 @@ fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {
         }
         _ => false,
     }
+}
+
+pub(crate) fn messages_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_MESSAGES, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_MESSAGES, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if key == "model" || key == "tool_choice")
+            })
+    })
+}
+
+pub(crate) fn chat_completions_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_CHAT_COMPLETIONS, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_CHAT_COMPLETIONS, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if matches!(key.as_str(), "model" | "max_tokens" | "max_completion_tokens"))
+            })
+    })
 }
 
 /// A configured Work budget cannot accept arbitrary wire body patches (which
@@ -637,6 +733,197 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn messages_reasoning_overrides_are_preserved_on_task_split() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (path, op, value) in [
+            ("thinking", "remove", Value::Null),
+            (
+                "thinking",
+                "set",
+                json!({"type":"enabled","budget_tokens":1024}),
+            ),
+            ("output_config.effort", "set", json!("medium")),
+        ] {
+            let overrides = serde_json::from_value::<RequestOverridesConfig>(json!({
+                "common":{"body_patch":[{"path":path,"op":op,"value":value}]}
+            }))
+            .unwrap();
+            let mut body = json!({
+                "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}
+            });
+            apply_overrides_to_body(
+                &mut body,
+                Some(&overrides),
+                ENDPOINT_MESSAGES,
+                Some("fixture"),
+            );
+            let expected = body.clone();
+            let dispatch = |diagnostics, mut body| {
+                let overrides = &overrides;
+                async move {
+                    scope_completion_diagnostics(diagnostics, async {
+                        mask_and_prepare_agent_request(
+                            &mut body,
+                            &Default::default(),
+                            Some(overrides),
+                            ENDPOINT_MESSAGES,
+                            "fixture",
+                        )
+                        .unwrap();
+                        body
+                    })
+                    .await
+                }
+            };
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            diagnostics.mark_compatible_messages();
+            assert_eq!(dispatch(diagnostics.clone(), body.clone()).await, expected);
+            let split = diagnostics.output_limit_recovery().unwrap();
+            assert!(split.prefers_task_split(), "{path}");
+            let continuation = CompletionDiagnostics::for_agent_round(Some(split.for_task_split()));
+            continuation.mark_compatible_messages();
+            assert_eq!(dispatch(continuation, body).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_effort_only_allows_new_recovery_on_compatible_messages() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (ENDPOINT_MESSAGES, json!({"max_tokens":4096})),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"max_completion_tokens":4096}),
+            ),
+            (ENDPOINT_RESPONSES, json!({"max_output_tokens":4096})),
+            (
+                ENDPOINT_STREAM_GENERATE_CONTENT,
+                json!({"generationConfig":{"maxOutputTokens":4096}}),
+            ),
+        ] {
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "fixture",
+                )
+                .unwrap();
+            })
+            .await;
+            assert!(diagnostics.output_limit_recovery().is_none(), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_a_tighter_window_and_records_the_actual_wire_limit() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"model":"fixture","max_tokens":4096});
+        let initial =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+        initial.mark_compatible_messages();
+        scope_completion_diagnostics(initial.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        let recovery = initial.output_limit_recovery().unwrap().for_task_split();
+        let follow_up =
+            CompletionDiagnostics::for_agent_round(Some(recovery.tighten_output_limit(3900)))
+                .with_model_window_limit(Some(3900));
+        follow_up.mark_compatible_messages();
+        scope_completion_diagnostics(follow_up.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        assert_eq!(body["max_tokens"], 3900);
+        assert_eq!(follow_up.output_limit(), Some(3900));
+        assert!(follow_up.output_limit_recovery().is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_window_rejects_a_changed_wire_model_before_observing_the_request() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (
+                ENDPOINT_MESSAGES,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_RESPONSES,
+                json!({"model":"small","max_output_tokens":4096}),
+            ),
+        ] {
+            let diagnostics =
+                CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+            let error = scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "large",
+                )
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, LLMError::RequestFailed(_)), "{endpoint}");
+            assert_eq!(diagnostics.output_limit(), None, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_chat_window_uses_one_limit_for_both_output_fields() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"model":"fixture","max_tokens":4096,"max_completion_tokens":5000});
+        let diagnostics =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4500));
+        scope_completion_diagnostics(diagnostics.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_CHAT_COMPLETIONS,
+                "fixture",
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert_eq!(diagnostics.output_limit(), Some(4096));
+    }
+
+    #[tokio::test]
     async fn provider_tools_disable_all_output_limit_recovery() {
         use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
         for (field, tools) in [
@@ -649,8 +936,7 @@ mod tests {
                 serde_json::json!([{"type":"url","name":"remote"}]),
             ),
         ] {
-            let diagnostics =
-                CompletionDiagnostics::for_agent_round(None).with_reasoning_cutoff_budget(4096);
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
             let mut body = serde_json::json!({
                 "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}
             });
@@ -667,7 +953,6 @@ mod tests {
             })
             .await;
             assert!(diagnostics.output_limit_recovery().is_none(), "{field}");
-            assert!(diagnostics.reasoning_cutoff_budget().is_none(), "{field}");
         }
     }
 

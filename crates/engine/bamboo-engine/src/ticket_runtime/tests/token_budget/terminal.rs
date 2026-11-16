@@ -77,6 +77,7 @@ async fn token_budget_summary_and_vision_stop_at_done_with_measured_charges() {
         .with_heuristic_fallback_on_error(false)
         .with_request_budget(SummaryRequestBudget {
             context_window_tokens: 8192,
+            max_input_tokens: None,
             max_output_tokens: 40,
             safety_margin_tokens: 0,
             safe_window_percent: 90,

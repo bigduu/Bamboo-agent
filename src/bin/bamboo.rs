@@ -36,15 +36,15 @@ struct Cli {
     session: Option<String>,
 
     /// With -p: model as 'provider:model' OR a bare model id (bound to
-    /// --provider, else the configured default provider). Defaults to the
-    /// session/config default.
+    /// --provider, else the configured default provider). The model must be
+    /// admitted for that provider. Defaults to the session/config selection.
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// With -p: provider name (e.g. `anthropic`, `openai`, `gemini`). Combine
-    /// with a bare `-m <model>` to pin `provider:model`, or use alone to select
-    /// that provider (its configured default model). Conflicts with the
-    /// `provider:model` form of `-m` only when the providers differ.
+    /// With -p: provider instance ID or protocol (anthropic, openai, gemini,
+    /// or bodhi for configured gateways). Uses that provider's default
+    /// model unless -m is given. For a one-shot custom endpoint, set the
+    /// matching BAMBOO_<PROVIDER>_API_KEY, _BASE_URL and _MODEL variables.
     #[arg(long)]
     provider: Option<String>,
 
@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long = "project-id")]
     project_id: Option<String>,
 
-    /// With -p: data directory holding config.json (defaults to ~/.bamboo).
+    /// With -p: data directory for settings and sessions (BAMBOO_DATA_DIR, then ~/.bamboo).
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -257,7 +257,7 @@ enum Commands {
         no_auto_serve: bool,
     },
 
-    /// First-run setup: write `config.json` with a provider + API key.
+    /// Save a default provider, model, and encrypted API key.
     ///
     /// Interactive by default (prompts for anything not given as a flag). Pass
     /// `--non-interactive` for CI/scripts (then `--provider` + `--api-key` are
@@ -275,9 +275,13 @@ enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Default chat model. A sensible provider default is used if omitted.
+        /// Default chat model ID. Required for a new custom endpoint.
         #[arg(long)]
         model: Option<String>,
+
+        /// Save a custom HTTP(S) API base URL, including its version path (for example /v1).
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
 
         /// Overwrite an existing provider key without prompting.
         #[arg(long)]
@@ -288,7 +292,7 @@ enum Commands {
         non_interactive: bool,
     },
 
-    /// Diagnose the local install: config presence, provider credential, and
+    /// Diagnose the local install: default model, provider credential, and
     /// whether a server is reachable. Exits non-zero if a blocking problem is found.
     Doctor {
         /// Data directory holding config.json (defaults to ~/.bamboo).
@@ -1960,6 +1964,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             provider,
             api_key,
             model,
+            base_url,
             force,
             non_interactive,
         } => {
@@ -1968,6 +1973,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 provider,
                 api_key,
                 model,
+                base_url,
                 force,
                 non_interactive,
             });

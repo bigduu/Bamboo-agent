@@ -2194,9 +2194,17 @@ mod tests {
                 )
                 .await;
         });
+        let is_generation = |request: &wiremock::Request| {
+            request.method.as_str() == "POST" && request.url.path() == "/chat/completions"
+        };
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if !a.received_requests().await.unwrap().is_empty() {
+                if a.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(is_generation)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2208,8 +2216,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if a.received_requests().await.unwrap().iter().any(|request| {
-                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
-                        == "only-a-gold"
+                    is_generation(request)
+                        && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+                            ["model"]
+                            == "only-a-gold"
                 }) {
                     break;
                 }
@@ -2225,8 +2235,9 @@ mod tests {
         let seen_b = b.received_requests().await.unwrap();
         assert!(
             !seen_b.iter().any(|request| {
-                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
-                    == "only-a-gold"
+                is_generation(request)
+                    && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
             }),
             "Gold must never be sent to B"
         );

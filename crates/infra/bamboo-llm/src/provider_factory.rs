@@ -90,6 +90,12 @@ pub async fn create_provider_from_instance(
             instance.provider_type
         )));
     }
+    if instance.base_url.as_deref() == Some(bamboo_config::INVALID_RUNTIME_PROVIDER_BASE_URL) {
+        return Err(LLMError::Api(format!(
+            "Invalid BAMBOO_{}_BASE_URL",
+            instance.provider_type.to_ascii_uppercase()
+        )));
+    }
 
     let overrides = bamboo_config::model_vision_overrides(instance).map_err(LLMError::Api)?;
     let masking_config = config.keyword_masking.clone();

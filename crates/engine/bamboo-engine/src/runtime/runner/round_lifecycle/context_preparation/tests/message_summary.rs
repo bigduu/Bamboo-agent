@@ -481,6 +481,14 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
 
 #[tokio::test]
 async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
+    for effort in [None, Some(bamboo_domain::ReasoningEffort::Low)] {
+        assert_chat_empty_reduce_preserves_history(effort).await;
+    }
+}
+
+async fn assert_chat_empty_reduce_preserves_history(
+    effort: Option<bamboo_domain::ReasoningEffort>,
+) {
     use bamboo_agent_core::Storage;
 
     let model = "summary-secondary";
@@ -496,6 +504,14 @@ async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persist
     let pending = session.force_manual_compression.clone();
 
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "max_input_tokens": 16_000, "max_output_tokens": 2_000}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     let calls = AtomicUsize::new(0);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -532,9 +548,12 @@ async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persist
     let provider = bamboo_llm::OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
         .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
-    let mut config = message_summary_config(Arc::new(provider));
+    let mut target = bamboo_domain::ProviderModelRef::new("openai", model);
+    target.reasoning_effort = effort;
+    let resolved = bamboo_llm::ResolvedModel::from_ref(Arc::new(provider), &target);
+    let mut config = message_summary_config(resolved.provider);
     config.app_data_dir = Some(directory.path().to_path_buf());
-    config.summarization_model_name = Some(model.into());
+    config.summarization_model_name = Some(resolved.model_name);
     config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
         storage.clone(),
     )));
@@ -556,14 +575,28 @@ async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persist
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "one catalog lookup and two completions");
     let bodies = requests
         .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/chat/completions"
+        })
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(bodies.len(), 2, "Only the map and empty reduce are sent");
+    assert_eq!(bodies.len(), 2, "one map and one empty reduce completion");
+    let (limit, other_limit) = if effort.is_some() {
+        ("max_completion_tokens", "max_tokens")
+    } else {
+        ("max_tokens", "max_completion_tokens")
+    };
+    let expected_effort = effort.map(|value| serde_json::json!(value.as_str()));
     for body in &bodies {
         assert_eq!(body["model"], model);
-        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body.get("reasoning_effort"), expected_effort.as_ref());
+        assert!(body[limit]
+            .as_u64()
+            .is_some_and(|tokens| (1..=1_000).contains(&tokens)));
+        assert!(body.get(other_limit).is_none());
         assert!(body.get("enable_thinking").is_none());
     }
     assert_eq!(session.force_manual_compression, pending);

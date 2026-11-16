@@ -80,7 +80,8 @@ fn telemetry_error_outcome(error: &AgentError) -> bamboo_infrastructure::telemet
         AgentError::EmptyAssistantResponse { .. } => Outcome::EmptyResponse,
         AgentError::LLM(_)
         | AgentError::LLMNonRetryable(_)
-        | AgentError::OutputTokenLimit { .. } => Outcome::ProviderError,
+        | AgentError::OutputTokenLimit { .. }
+        | AgentError::ReasoningRepetition { .. } => Outcome::ProviderError,
         _ => Outcome::ExecutionError,
     }
 }

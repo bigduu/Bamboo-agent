@@ -4,3 +4,4 @@
 //! using Server-Sent Events (SSE).
 
 pub mod handler;
+pub(crate) mod reasoning_repetition;

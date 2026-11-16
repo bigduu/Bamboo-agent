@@ -19,7 +19,6 @@ use bamboo_compression::{
     HeuristicSummarizer, MessageSegmenter, Summarizer, TiktokenTokenCounter, TokenBudget,
     TokenCounter,
 };
-use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
     SessionMessageKind, SessionMessageSource,
@@ -49,6 +48,7 @@ pub enum SummaryMode {
 #[derive(Debug, Clone)]
 pub struct SummaryRequestBudget {
     pub context_window_tokens: u32,
+    pub max_input_tokens: Option<u32>,
     pub max_output_tokens: u32,
     pub safety_margin_tokens: u32,
     pub safe_window_percent: u8,
@@ -65,6 +65,7 @@ impl SummaryRequestBudget {
     ) -> Self {
         Self {
             context_window_tokens: budget.max_context_tokens.max(1),
+            max_input_tokens: budget.max_input_tokens,
             max_output_tokens: budget.max_output_tokens.max(1),
             safety_margin_tokens: budget.safety_margin,
             safe_window_percent: safe_window_percent.clamp(10, 95),
@@ -82,6 +83,12 @@ impl SummaryRequestBudget {
             .saturating_mul(self.safe_window_percent as u32)
             .saturating_div(100)
             .max(1)
+    }
+
+    fn input_ceiling(&self) -> u32 {
+        self.max_input_tokens.map_or(u32::MAX, |limit| {
+            limit.saturating_sub(self.safety_margin_tokens)
+        })
     }
 }
 
@@ -581,6 +588,7 @@ impl LlmSummarizer {
             .unwrap_or(0);
         SummaryRequestBudget {
             context_window_tokens: COMPATIBILITY_CONTEXT_WINDOW_TOKENS,
+            max_input_tokens: None,
             max_output_tokens: COMPATIBILITY_MAX_OUTPUT_TOKENS,
             safety_margin_tokens: COMPATIBILITY_SAFETY_MARGIN_TOKENS,
             safe_window_percent: COMPATIBILITY_SAFE_WINDOW_PERCENT,
@@ -602,10 +610,11 @@ impl LlmSummarizer {
         }
         let counter = TiktokenTokenCounter::default();
         let input_tokens = counter.count_messages(messages);
-        input_tokens
-            .saturating_add(requested_output_tokens)
-            .saturating_add(budget.safety_margin_tokens)
-            <= budget.safe_request_tokens()
+        input_tokens <= budget.input_ceiling()
+            && input_tokens
+                .saturating_add(requested_output_tokens)
+                .saturating_add(budget.safety_margin_tokens)
+                <= budget.safe_request_tokens()
     }
 
     fn source_units(&self, messages: &[Message]) -> Vec<SourceUnit> {
@@ -647,7 +656,8 @@ impl LlmSummarizer {
             .safe_request_tokens()
             .saturating_sub(budget.safety_margin_tokens)
             .saturating_sub(empty_prompt_tokens);
-        if available < 2 {
+        let max_by_input = budget.input_ceiling().saturating_sub(empty_prompt_tokens);
+        if available < 2 || max_by_input == 0 {
             return Err(bamboo_compression::types::BudgetError::TokenCountError(
                 "summarization model context is too small for map prompt overhead".to_string(),
             ));
@@ -656,7 +666,7 @@ impl LlmSummarizer {
         let ratio = budget.target_ratio.max(0.01);
         let max_by_window = ((available as f64) / (1.0 + ratio)).floor() as u32;
         let max_by_output = ((budget.max_output_tokens as f64) / ratio).floor() as u32;
-        let initial_piece_tokens = max_by_window.min(max_by_output).max(1);
+        let initial_piece_tokens = max_by_window.min(max_by_output).min(max_by_input).max(1);
 
         let mut remaining = unit.text;
         let mut remaining_represented = unit.represented_source_tokens;
@@ -975,11 +985,12 @@ impl LlmSummarizer {
     ) -> Result<String, bamboo_compression::types::BudgetError> {
         let counter = TiktokenTokenCounter::default();
         let input_tokens = counter.count_messages(messages);
+        let input_limit = budget.input_ceiling();
         let safe_request_tokens = budget.safe_request_tokens();
         if !self.request_fits(messages, requested_output_tokens, budget) {
             return Err(bamboo_compression::types::BudgetError::TokenCountError(
                 format!(
-                    "bounded summarization invariant failed for {stage}: input={input_tokens}, output={requested_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
+                    "bounded summarization invariant failed for {stage}: input={input_tokens}, input_limit={input_limit}, output={requested_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
                     budget.safety_margin_tokens,
                 ),
             ));
@@ -1003,6 +1014,7 @@ impl LlmSummarizer {
             stage_index,
             stage_count,
             input_tokens,
+            input_limit,
             requested_output_tokens,
             safe_request_tokens,
             model_context_tokens = budget.context_window_tokens,
@@ -1433,10 +1445,9 @@ impl LlmSummarizer {
         messages: &[Message],
         max_output_tokens: u32,
     ) -> Result<String, LLMError> {
-        // Compression calls reserve most of their output allowance for summary text.
         let options = LLMRequestOptions {
             session_id: None,
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: self.llm.default_compression_reasoning_effort(&self.model),
             parallel_tool_calls: None,
             required_tool: None,
             responses: None,
@@ -2346,6 +2357,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compression_uses_legacy_output_limit_on_openai_gateway() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let gateway = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let sse = if body["max_tokens"]
+                    .as_u64()
+                    .is_some_and(|limit| (1..=50).contains(&limit))
+                    && body.get("max_completion_tokens").is_none()
+                    && body.get("reasoning_effort").is_none()
+                {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"still thinking\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Saved progress.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                } else {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"used the whole budget\"},\"finish_reason\":\"length\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse)
+            })
+            .mount(&gateway)
+            .await;
+        let provider = bamboo_llm::OpenAIProvider::new("fixture")
+            .with_base_url(gateway.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        let summarizer = LlmSummarizer::new(Arc::new(provider), "custom-model".into(), None, None)
+            .with_request_budget(bounded_budget(10_000, 2_000, 100, 50));
+
+        let report = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .expect("both gateway stages produce a visible summary");
+        assert_eq!(report.content, "Saved progress.");
+        assert_eq!((report.map_calls, report.reduce_calls), (1, 1));
+        assert_eq!(gateway.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn bounded_small_source_still_uses_map_then_reduce() {
         let provider = Arc::new(BoundedRequestCaptureProvider::default());
         let budget = bounded_budget(10_000, 2_000, 100, 400);
@@ -2389,6 +2448,43 @@ mod tests {
                     .saturating_add(budget.safety_margin_tokens)
                     <= budget.safe_request_tokens()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_input_ceiling_bounds_summary_chunks_and_dispatch() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let mut token_budget = TokenBudget::with_safety_margin(
+            9_600,
+            6_400,
+            bamboo_compression::BudgetStrategy::default(),
+            100,
+        );
+        token_budget.max_input_tokens = Some(3_200);
+        let budget = SummaryRequestBudget::from_token_budget(&token_budget, 80, 400, 0.20);
+        let summarizer = LlmSummarizer::new(provider.clone(), "summary-model".into(), None, None)
+            .with_request_budget(budget.clone());
+        let source = [Message::user(" evidence".repeat(4_200))];
+        let counter = TiktokenTokenCounter::default();
+        let source_tokens = counter.count_messages(&source);
+        assert!(source_tokens > 3_200);
+        assert!(source_tokens + 400 + budget.safety_margin_tokens <= budget.safe_request_tokens());
+
+        let error = summarizer
+            .execute_bounded_request("final_reduce", 1, 1, &source, 400, &budget)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            bamboo_compression::types::BudgetError::TokenCountError(_)
+        ));
+        assert!(provider.requests.lock().unwrap().is_empty());
+
+        let report = summarizer.summarize_with_report(&source).await.unwrap();
+        assert!(report.map_calls > 1);
+        assert!(report.reduce_calls > 0);
+        for (request, _) in provider.requests.lock().unwrap().iter() {
+            assert!(counter.count_messages(request) + budget.safety_margin_tokens <= 3_200);
         }
     }
 
