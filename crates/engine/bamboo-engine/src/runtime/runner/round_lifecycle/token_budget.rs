@@ -79,13 +79,11 @@ pub(super) async fn resolve_auxiliary_token_budget(
     let configured_limit =
         resolve_configured_model_limit(config, model_name, &model_limits_path, "summarization")
             .await;
-    let reported = if configured_limit.is_none() {
-        reported_model_limits(llm, model_name)
-            .await
-            .filter(|info| info.max_context_tokens.is_some() || info.max_input_tokens.is_some())
-    } else {
-        None
-    };
+    let reported = reported_model_limits(llm, model_name).await.filter(|info| {
+        configured_limit.is_some()
+            || info.max_context_tokens.is_some()
+            || info.max_input_tokens.is_some()
+    });
     match resolve_window(configured_limit.as_ref(), reported.as_ref(), false) {
         Some(budget) => budget,
         None => {
@@ -1283,7 +1281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auxiliary_user_pattern_override_outranks_exact_provider_metadata() {
+    async fn auxiliary_budget_intersects_user_pattern_and_provider_input_ceiling() {
         let config = AgentLoopConfig {
             legacy_model_limits: Some(serde_json::json!([
                 {
@@ -1299,7 +1297,7 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: "summary-family-763-latest".to_string(),
                 max_context_tokens: Some(64_000),
-                max_input_tokens: None,
+                max_input_tokens: Some(8_500),
                 max_output_tokens: Some(8_000),
             }],
         };
@@ -1309,6 +1307,7 @@ mod tests {
         assert_eq!(budget.max_context_tokens, 16_000);
         assert_eq!(budget.max_output_tokens, 3_000);
         assert_eq!(budget.safety_margin, 500);
+        assert_eq!(budget.input_ceiling(), 8_000);
     }
 
     #[tokio::test]

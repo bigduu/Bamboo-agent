@@ -456,7 +456,7 @@ the shipped defaults, so an empty `{}` is already reasonable:
 |---|---|---|
 | `background_model` | `None` | Model used for memory extraction/consolidation background work; falls back to the primary model. |
 | `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. The shared context target also bounds the available summary space, so an existing summary can be reduced again instead of growing without limit. |
-| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. |
+| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
 | `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
