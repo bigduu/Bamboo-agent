@@ -40,6 +40,7 @@ use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     responses_only_models: Vec<String>,
@@ -70,6 +71,7 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
@@ -849,6 +851,35 @@ impl LLMProvider for OpenAIProvider {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "OpenAI").await
     }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "OpenAI",
+                model_fetcher::ModelListFormat::Compatible,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |model| {
+                if self.uses_responses_api(model) {
+                    &[request_overrides::ENDPOINT_RESPONSES]
+                } else {
+                    &[
+                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                        request_overrides::ENDPOINT_RESPONSES,
+                    ]
+                }
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -886,6 +917,41 @@ mod tests {
     fn test_default_values() {
         let provider = OpenAIProvider::new("test_key");
         assert_eq!(provider.base_url, "https://api.openai.com/v1");
+    }
+
+    #[tokio::test]
+    async fn catalog_drops_limits_only_for_models_with_different_generation_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer catalog-account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[
+                {"id":"different-account","max_context_tokens":8192,"max_output_tokens":4096},
+                {"id":"same-account","max_context_tokens":8192,"max_output_tokens":4096}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let overrides = serde_json::from_value(json!({"rules":[{
+            "model_pattern":"different-account", "endpoint":"chat_completions",
+            "scope":{"headers":{"Authorization":"Bearer generation-account"}}
+        }]}))
+        .unwrap();
+        let provider = OpenAIProvider::new("catalog-account")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_request_overrides(Some(overrides));
+
+        let models = provider.list_model_info().await.unwrap();
+        assert_eq!(
+            models[0],
+            crate::provider::ProviderModelInfo::from_id("different-account")
+        );
+        assert_eq!(models[1].max_context_tokens, Some(8192));
+        assert_eq!(models[1].max_output_tokens, Some(4096));
     }
 
     #[test]

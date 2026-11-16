@@ -32,6 +32,7 @@ const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 pub struct BodhiProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     target_provider: String,
@@ -44,6 +45,7 @@ impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "http://localhost:8080".to_string(),
             target_provider: "openai".to_string(),
@@ -269,7 +271,42 @@ impl LLMProvider for BodhiProvider {
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        Ok(vec![])
+        use model_fetcher::ModelListFormat;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.proxy_url("v1/models");
+        let (format, generation_endpoints): (_, &'static [_]) = match self.target_provider.as_str()
+        {
+            "anthropic" => (
+                ModelListFormat::Messages,
+                &[request_overrides::ENDPOINT_MESSAGES],
+            ),
+            "gemini" => (
+                ModelListFormat::Gemini,
+                &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+            ),
+            _ => (
+                ModelListFormat::Compatible,
+                &[request_overrides::ENDPOINT_CHAT_COMPLETIONS],
+            ),
+        };
+        match self
+            .model_info_cache
+            .get(&self.client, &url, headers, "Bodhi", format)
+            .await
+        {
+            Ok(models) => Ok(request_overrides::bind_catalog_limits(
+                models,
+                self.request_overrides.as_ref(),
+                |_| generation_endpoints,
+            )),
+            Err(error) => {
+                tracing::debug!(
+                    error_kind = llm_error_kind(&error),
+                    "Bodhi proxy model metadata not available"
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 }
 

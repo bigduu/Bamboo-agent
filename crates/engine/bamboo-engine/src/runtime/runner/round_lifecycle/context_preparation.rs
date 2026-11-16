@@ -1789,9 +1789,9 @@ pub(crate) async fn stage_user_context_compaction(
                 .compression_events
                 .last()
                 .expect("summary appended a compression event");
-            let total_tokens = (event.usage_after_percent * f64::from(budget.max_context_tokens)
-                / 100.0)
-                .round() as u32;
+            let total_tokens =
+                (event.usage_after_percent * f64::from(budget.compression_window_tokens()) / 100.0)
+                    .round() as u32;
             set_compaction_usage(session, &prepared, &budget, total_tokens);
         }
         applied
@@ -1853,19 +1853,16 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
     let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
+    let compression_window = budget.compression_window_tokens();
     let usage_percent =
         exposure
             .active_usage_percent
             .max(bamboo_compression::context_window_usage_percent(
                 preflight.active_tokens,
-                budget.max_context_tokens,
+                compression_window,
             ));
-    let trigger_context_tokens = budget.compression_trigger_context_tokens();
-    let auto_threshold = if budget.max_context_tokens > 0 {
-        (trigger_context_tokens as f64 / budget.max_context_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
+    let auto_threshold =
+        bamboo_compression::context_window_usage_percent(range.trigger_tokens, compression_window);
     let forced_requested = forced_trigger_type.is_some();
     let host_auto_requested = usage_percent >= auto_threshold
         || matches!(
@@ -2020,11 +2017,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 .saturating_sub(savings)
                 .saturating_add(native_delta)
                 .saturating_add(fixed);
-            let projected_pct = if budget.max_context_tokens > 0 {
-                (projected as f64 / budget.max_context_tokens as f64) * 100.0
-            } else {
-                0.0
-            };
+            let projected_pct =
+                bamboo_compression::context_window_usage_percent(projected, compression_window);
             if projected <= range.target_tokens {
                 tracing::info!(
                     "[{}] {} microcompact-first: skipping LLM summarization, prompt cache saves {} tokens (projected {:.1}%, target_tokens={})",
@@ -2238,10 +2232,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
             return command_target_outcome(user_command, projected_tokens, range.target_tokens);
         }
-        plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
-            projected_tokens,
-            budget.max_context_tokens,
-        );
+        plan.active_usage_after_percent =
+            bamboo_compression::context_window_usage_percent(projected_tokens, compression_window);
         plan.active_usage_before_percent = usage_percent;
         let changed = commit_message_summary_plan(session, config, &plan).await?;
         if changed > 0 {
@@ -2343,8 +2335,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
         let payload = HookPayload::Compression {
             estimated_tokens: active_tokens,
             usage_percent,
-            max_context_tokens: budget.max_context_tokens,
-            trigger_context_tokens,
+            max_context_tokens: compression_window,
+            trigger_context_tokens: range.trigger_tokens,
             trigger: trigger.to_string(),
             phase: phase_label.to_string(),
         };
@@ -2542,10 +2534,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
             &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
         return command_target_outcome(user_command, projected_tokens, range.target_tokens);
     }
-    plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
-        projected_tokens,
-        budget.max_context_tokens,
-    );
+    plan.active_usage_after_percent =
+        bamboo_compression::context_window_usage_percent(projected_tokens, compression_window);
     plan.active_usage_before_percent = usage_percent;
     plan.summary_budget_clamped |= summary_report.budget_clamped;
     plan.summary_budget_clamp_reason = summary_report
@@ -3106,6 +3096,7 @@ pub(super) async fn prepare_round_context(
             llm.as_ref(),
         )
         .await;
+        budget.output_reserve_tokens = None;
         if let Some(host) = binding.payload.token_budget.as_ref() {
             let input_limit = host
                 .max_request_input_tokens()

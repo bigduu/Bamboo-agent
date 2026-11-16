@@ -176,7 +176,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2757 reasoning repetition and optional recovery budgets are default Engine
 // cases in packages-3. Provider stream cases belong to default LLM packages-2.
 // The four additive contexts own their 20 explicitly selected cases.
-const FEATURE_SOURCE_SHA256 = "22f18f63cc0c92ffc6ae33f91ad371fcfc74d628dbec959e7fc691f63849d2e4";
+// #2772 model metadata and request window regressions use the default LLM
+// packages-2 and Engine packages-3 owners.
+const FEATURE_SOURCE_SHA256 = "6213eb528970b5e8d2d663b7f6076b9ef16576639f4bcf224e6b95d685e23ed1";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

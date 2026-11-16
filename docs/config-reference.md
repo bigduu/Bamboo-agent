@@ -140,9 +140,10 @@ GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
-`max_output_tokens` and the provider's wire cap still bound the request. An
-interrupted attempt can resume from confirmed tool results when the request
-allows recovery. The recovery request count is bounded, and an explicit
+The [model limits](#model-limits-model_limitsjson) determine the output cap for
+Messages, Chat Completions, Responses and Gemini. An interrupted attempt can
+resume from confirmed tool results when the request allows recovery. The
+recovery request count is bounded, and an explicit
 `run_budget.max_total_tokens` applies to recovery. The
 `thinking_replay_always` option controls history replay independently.
 
@@ -356,17 +357,18 @@ the active provider window, and directs the model to
 | Field | Default | What it does |
 |---|---|---|
 | `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
-| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the total model window. Output/safety headroom can move the effective trigger earlier. |
-| `target_usage_ratio` | `0.25` | Shared post-compression target relative to the total model window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
+| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the smaller of the joint model window and any independent input ceiling. Output and safety headroom can move the effective trigger earlier. |
+| `target_usage_ratio` | `0.25` | Shared post-compression target on the same window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` (legacy) | Compatibility input only. When the shared field is absent, a stricter legacy value migrates to the common trigger for every strategy. Explicit shared fields take precedence. |
 | `retrieval_window.target_usage_ratio` | `0.60` (legacy) | Compatibility input only. The former default adopts the shared `0.25` target; a stricter legacy value is retained as the common target. Historical archive receipts retain their original targets. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
 
-For a total window `W`, the input hard limit is `H = W - max_output_tokens -
-safety_margin`. The common calculator reserves additional maintenance headroom
-based on the output allowance and safety margin, bounded by one fifth of `H`.
+For a total window `W`, preparation reserves working output space and the
+counting margin. The input limit is the smaller of the space left and any
+independent input ceiling after its margin. The common calculator reserves
+additional maintenance headroom bounded by one fifth of that input limit.
 The effective trigger is the earlier of the configured window ratio and the
 remaining safe input boundary. This avoids the previous fixed-50K behavior that
 waited until 95% on a 1M window. Execution/verification task status does not delay
@@ -375,7 +377,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the ordinary default limits, a 1M window with 32K output and 10K safety
+For the compatibility defaults, a 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -454,7 +456,7 @@ the shipped defaults, so an empty `{}` is already reasonable:
 |---|---|---|
 | `background_model` | `None` | Model used for memory extraction/consolidation background work; falls back to the primary model. |
 | `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. The shared context target also bounds the available summary space, so an existing summary can be reduced again instead of growing without limit. |
-| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. |
+| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
 | `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
@@ -728,10 +730,8 @@ still enforces explicit policy and platform denials.
 
 ## Model limits (`model_limits.json`)
 
-A separate file, `${data_dir}/model_limits.json` — user-supplied
-context/output token limit overrides. Explicit user matches take precedence
-over provider runtime metadata. The legacy standalone representation is a raw
-array:
+`${data_dir}/model_limits.json` supplies context and output limits for individual
+models or model families. The legacy standalone representation uses a raw array.
 
 ```json
 [
@@ -743,19 +743,22 @@ array:
 runtime model id; `*` and other glob characters have no special meaning.
 Among substring matches, the longest pattern wins.
 
-`max_context_tokens` is the provider's **total input + output context
-window**, not its input allowance alone. Bamboo derives the per-request input
-limit as:
+`max_context_tokens` configures a **joint input and output window**.
+Bamboo checks the selected route for independent input, output and combined
+limits. Where configuration and metadata both provide a ceiling, the lower
+value applies. An omitted output field can use the provider's value. The sum of
+independent input and output ceilings is a planning bound when the joint window
+is unknown.
 
-```text
-max_request_input_tokens =
-    max_context_tokens - max_output_tokens - safety_margin
-```
-
-`safety_margin` is optional. When `max_output_tokens` is omitted, Bamboo
-derives it from the context window. Provider metadata that exposes separate
-`max_input_tokens` and `max_output_tokens` is normalized to the same total
-context-window contract before runtime budgeting.
+For ordinary Agent turns with model limits, Bamboo reserves working space
+during context preparation and recomputes the output allowance after projecting
+the final input and tools. A joint window bounds output by the space left after
+the measured input and `safety_margin`. When an independent input ceiling is
+smaller, the compression trigger, target and default counting margin use that
+smaller window. Numeric body overrides can lower the wire cap. Set the routed
+model through provider settings so Bamboo resolves its limits before sizing the
+request. Dynamic sizing rejects a body patch that changes that model. Body
+patches that rewrite prompt content can change the provider's actual token count.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
@@ -769,10 +772,13 @@ engine-level `TokenBudget` remains an intentional higher-priority override. Mana
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
-With no matching user or provider value, Bamboo falls back to a global default
-of 1M total context / 32K per-request output allowance. There is deliberately **no built-in
-per-model table**, so stale hard-coded model names cannot override live
-provider metadata.
+The file stores explicit overrides. With no matching user or provider limit,
+the runtime and the defaults API use 1,000,000 total context tokens and 64,000
+output tokens. When the window is known and the output ceiling is absent,
+the fallback output is one quarter of the window, up to 64,000. Provider limits
+come from the selected route's catalog and are cached briefly. If configured
+catalog and generation headers differ for a model, Bamboo keeps the catalog ID
+and omits its capacities. Configure limits explicitly for that generation route.
 
 ## Schedules (`schedules.json`)
 

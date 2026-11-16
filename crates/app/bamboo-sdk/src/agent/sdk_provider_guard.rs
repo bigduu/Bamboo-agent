@@ -266,6 +266,14 @@ impl LLMProvider for BoundSdkProvider {
         self.dispatch(None)?;
         self.delegate.list_model_info().await
     }
+
+    async fn model_info_for_request(
+        &self,
+        model: &str,
+    ) -> Result<Option<ProviderModelInfo>, LLMError> {
+        self.dispatch(Some(model))?;
+        self.delegate.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]

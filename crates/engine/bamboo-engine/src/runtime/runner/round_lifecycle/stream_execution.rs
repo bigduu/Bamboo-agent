@@ -27,7 +27,7 @@ use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
-use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
+use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
@@ -59,8 +59,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
-    pub max_context_tokens: u32,
-    pub max_output_tokens: u32,
+    pub budget: &'a TokenBudget,
     pub observation_progress_hint: Option<&'a str>,
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
@@ -1492,8 +1491,7 @@ pub(super) async fn execute_llm_stream(
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let cancel_token = frame.cancel_token;
-    let mut max_context_tokens = frame.max_context_tokens;
-    let mut max_output_tokens = frame.max_output_tokens;
+    let mut budget = frame.budget.clone();
     let model = frame.model;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
@@ -1526,7 +1524,7 @@ pub(super) async fn execute_llm_stream(
             .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT)
     });
     let private_plan = task_split.is_some_and(|split| split.private_plan);
-    let (mut prepared_envelope, previous_response_id, final_usage, loading_mode) = loop {
+    let (mut prepared_envelope, previous_response_id, final_usage, loading_mode, window_limit) = loop {
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
@@ -1575,9 +1573,25 @@ pub(super) async fn execute_llm_stream(
             }
         };
         let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-        let output_reserve =
-            recovery.map_or(u64::from(max_output_tokens), |retry| retry.output_limit());
-        let mut request_input_limit = u64::from(max_context_tokens).saturating_sub(output_reserve);
+        let requested_output = recovery.map_or(u64::from(budget.max_output_tokens), |retry| {
+            retry.output_limit()
+        });
+        let window_limit = budget.output_reserve_tokens.map(|_| {
+            budget
+                .output_limit_for_input(final_usage.input_tokens)
+                .min(u32::try_from(requested_output).unwrap_or(u32::MAX))
+        });
+        let planned_output = window_limit.map_or(requested_output, u64::from);
+        let reserved_space = if window_limit.is_some() {
+            requested_output
+                .min(u64::from(budget.output_reserve()))
+                .saturating_add(u64::from(budget.safety_margin))
+        } else {
+            requested_output
+        };
+        let mut request_input_limit = u64::from(budget.max_context_tokens)
+            .saturating_sub(reserved_space)
+            .min(u64::from(budget.input_ceiling()));
         if bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?
             .is_some()
@@ -1587,20 +1601,17 @@ pub(super) async fn execute_llm_stream(
         }
         let retry_exceeds_run_budget = frame
             .output_limit_recovery
-            .and_then(|policy| {
-                Some((
-                    policy.retry?,
-                    policy.remaining_run_tokens?,
-                    policy.previous_prompt_tokens,
-                ))
-            })
-            .is_some_and(|(retry, remaining, previous_input)| {
+            .filter(|policy| policy.retry.is_some())
+            .and_then(|policy| Some((policy.remaining_run_tokens?, policy.previous_prompt_tokens)))
+            .is_some_and(|(remaining, previous_input)| {
                 u64::from(final_usage.input_tokens)
                     .max(previous_input)
-                    .saturating_add(retry.output_limit())
+                    .saturating_add(planned_output)
                     > remaining
             });
-        if u64::from(final_usage.input_tokens) > request_input_limit
+        let cannot_fit =
+            u64::from(final_usage.input_tokens) > request_input_limit || window_limit == Some(0);
+        if cannot_fit
             || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
             || retry_exceeds_run_budget
         {
@@ -1615,6 +1626,21 @@ pub(super) async fn execute_llm_stream(
                 return Err(AgentError::Budget(
                     "output-limit retry would exceed the remaining run token budget".into(),
                 ));
+            }
+            if budget.max_output_tokens == 0 && window_limit.is_some() {
+                return Err(AgentError::Budget(
+                    "resolved model limits permit no output tokens".into(),
+                ));
+            }
+            if cannot_fit
+                && window_limit.is_some()
+                && recovery.is_none()
+                && final_usage.ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES
+            {
+                return Err(AgentError::LLMOverflow(format!(
+                    "projected input {} leaves too little output space in the model window (input limit {})",
+                    final_usage.input_tokens, request_input_limit
+                )));
             }
             return Err(AgentError::Budget(format!(
                 "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
@@ -1699,8 +1725,7 @@ pub(super) async fn execute_llm_stream(
                     ))
                     .await?
                 };
-                max_context_tokens = reprepared.budget.max_context_tokens;
-                max_output_tokens = reprepared.budget.max_output_tokens;
+                budget = reprepared.budget;
                 prepared_context = reprepared.prepared_context;
                 continue;
             }
@@ -1710,6 +1735,7 @@ pub(super) async fn execute_llm_stream(
             previous_response_id,
             final_usage,
             loading_mode,
+            window_limit,
         );
     };
     let wire_schemas = provider_tool_schemas(
@@ -1871,7 +1897,21 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
-    let completion = CompletionDiagnostics::for_agent_round(recovery);
+    let recovery = recovery.map(|retry| match window_limit {
+        Some(limit) => retry.tighten_output_limit(limit),
+        None => retry,
+    });
+    if let Some(limit) = window_limit {
+        tracing::debug!(
+            session_id,
+            input_tokens = final_usage.input_tokens,
+            output_tokens = limit,
+            safety_margin = budget.safety_margin,
+            "Computed output allowance for the projected model request"
+        );
+    }
+    let completion =
+        CompletionDiagnostics::for_agent_round(recovery).with_model_window_limit(window_limit);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -1881,7 +1921,7 @@ pub(super) async fn execute_llm_stream(
                     llm.chat_stream_ir(
                         &prepared_envelope.ir,
                         tool_schemas,
-                        Some(max_output_tokens),
+                        Some(window_limit.unwrap_or(budget.max_output_tokens)),
                         model,
                         Some(&planned.request_options),
                     ),
@@ -2022,7 +2062,7 @@ pub(super) async fn execute_llm_stream(
         summary_tokens: prepared_context.token_usage.summary_tokens,
         window_tokens: prepared_context.token_usage.window_tokens,
         total_tokens: prepared_context.token_usage.total_tokens,
-        max_context_tokens,
+        max_context_tokens: budget.max_context_tokens,
         budget_limit: prepared_context.token_usage.budget_limit,
         truncation_occurred: prepared_context.truncation_occurred,
         segments_removed: prepared_context.segments_removed,

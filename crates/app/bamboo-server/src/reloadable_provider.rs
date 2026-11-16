@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 
 use bamboo_agent_core::{tools::ToolSchema, Message};
 use bamboo_domain::CapabilityLoadingMode;
-use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, Result};
+use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, ProviderModelInfo, Result};
 use bamboo_llm::{LLMStream, PromptIR, ProviderVisibleToolFootprint};
 
 /// An `LLMProvider` wrapper that always delegates to the latest provider stored in a shared lock.
@@ -153,6 +153,14 @@ impl LLMProvider for ReloadableProvider {
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.current().await;
         provider.list_models().await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.current().await.list_model_info().await
+    }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.current().await.model_info_for_request(model).await
     }
 }
 

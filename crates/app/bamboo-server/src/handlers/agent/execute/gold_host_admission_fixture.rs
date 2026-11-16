@@ -165,8 +165,10 @@ async fn host_execute_explicit_gold_rechecks_managed_session_target() {
         let gold: Vec<_> = requests[offset..]
             .iter()
             .filter(|request| {
-                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
-                    == "explicit-gold"
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/chat/completions"
+                    && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "explicit-gold"
             })
             .collect();
         offset = requests.len();

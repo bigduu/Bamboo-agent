@@ -1,15 +1,19 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
-use bamboo_compression::limits::{load_model_limits_from_unified_config, ModelLimit};
+use bamboo_compression::limits::{
+    default_model_limit, load_model_limits_from_unified_config, ModelLimit,
+};
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
-use bamboo_llm::provider::LLMProvider;
+use bamboo_llm::provider::{LLMProvider, ProviderModelInfo};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 const CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS: u32 = 32_000;
 const CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS: u32 = 8_000;
 const CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN: u32 = 1_000;
+const MODEL_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
@@ -42,18 +46,20 @@ pub(crate) async fn resolve_known_token_ceilings(
         .is_none_or(|limit| limit.max_output_tokens.is_none())
     {
         provider
-            .list_model_info()
+            .model_info_for_request(model)
             .await
             .ok()?
-            .into_iter()
-            .find(|info| info.id == model)
+            .filter(|info| info.id == model)
     } else {
         None
     };
     let input = configured
         .as_ref()
         .map(|limit| limit.max_context_tokens)
-        .or_else(|| reported.as_ref()?.max_context_tokens)?;
+        .or_else(|| {
+            let reported = reported.as_ref()?;
+            reported.max_input_tokens.or(reported.max_context_tokens)
+        })?;
     let output = configured
         .and_then(|limit| limit.max_output_tokens)
         .or_else(|| reported?.max_output_tokens)?;
@@ -73,37 +79,13 @@ pub(super) async fn resolve_auxiliary_token_budget(
     let configured_limit =
         resolve_configured_model_limit(config, model_name, &model_limits_path, "summarization")
             .await;
-    let provider_limit = if configured_limit.is_some() {
-        None
-    } else {
-        match llm.list_model_info().await {
-            Ok(models) => models
-                .into_iter()
-                .find(|entry| entry.id == model_name)
-                .and_then(|model_info| {
-                    model_info.max_context_tokens.map(|max_context_tokens| {
-                        let mut limit = ModelLimit::new(model_name.to_string(), max_context_tokens);
-                        limit.max_output_tokens = model_info.max_output_tokens;
-                        limit
-                    })
-                }),
-            Err(error) => {
-                tracing::warn!(
-                    model = model_name,
-                    error = %error,
-                    "Failed to resolve summarization-model runtime limits"
-                );
-                None
-            }
-        }
-    };
-
-    // Explicit user overrides (including partial patterns) outrank exact
-    // provider metadata. Keeping every source in its own registry avoids an
-    // exact provider or legacy entry accidentally shadowing a higher-priority
-    // user pattern.
-    let model_limit = match configured_limit.or(provider_limit) {
-        Some(limit) => limit,
+    let reported = reported_model_limits(llm, model_name).await.filter(|info| {
+        configured_limit.is_some()
+            || info.max_context_tokens.is_some()
+            || info.max_input_tokens.is_some()
+    });
+    match resolve_window(configured_limit.as_ref(), reported.as_ref(), false) {
+        Some(budget) => budget,
         None => {
             let key = ("unknown-summarization-model-limit", model_name);
             let error = "no configured or provider-reported limit";
@@ -122,22 +104,14 @@ pub(super) async fn resolve_auxiliary_token_budget(
                     "No summarization-model limit is known; using conservative bounded fallback"
                 );
             }
-            let mut fallback = ModelLimit::new(
-                model_name.to_string(),
+            TokenBudget::with_safety_margin(
                 CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
-            );
-            fallback.max_output_tokens = Some(CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS);
-            fallback.safety_margin = Some(CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
-            fallback
+                CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
+                bamboo_compression::BudgetStrategy::default(),
+                CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN,
+            )
         }
-    };
-
-    TokenBudget::with_safety_margin(
-        model_limit.max_context_tokens,
-        model_limit.get_max_output_tokens(),
-        bamboo_compression::BudgetStrategy::default(),
-        model_limit.get_safety_margin(),
-    )
+    }
 }
 
 pub(super) async fn resolve_token_budget(
@@ -184,47 +158,29 @@ async fn resolve_token_budget_with_model_limits_path(
         return resolved;
     }
 
-    // Resolve each source independently so an exact lower-priority provider
-    // record cannot shadow a higher-priority partial user pattern:
-    // 1. dedicated model_limits.json
-    // 2. legacy config.json -> model_limits
-    // 3. provider runtime metadata (Copilot)
-    // 4. global fallback
+    // Resolve the existing per-model settings first, then intersect them with
+    // limits reported by the selected route. An omitted field can be filled by
+    // the route without replacing the configured fields of the same row.
     let configured_limit =
         resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
     let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
-    let matched_limit = configured_limit.or(provider_limit);
-    let model_limit = matched_limit
-        .clone()
-        .unwrap_or_else(|| ModelLimitsRegistry::new().get_or_default(model_name));
-
-    if matched_limit.is_some() {
-        tracing::debug!(
-            "Using model limit for '{}': context={}, max_output={}, safety_margin={}",
-            model_name,
-            model_limit.max_context_tokens,
-            model_limit.get_max_output_tokens(),
-            model_limit.get_safety_margin()
-        );
-    } else {
-        tracing::info!(
-            "No model limit match for '{}', using fallback '{}' (context={}). Override via {:?}",
-            model_name,
-            model_limit.model_pattern,
-            model_limit.max_context_tokens,
-            model_limits_path
-        );
-    }
-
-    let resolved =
-        config
-            .context_management
-            .apply_compression_policy(TokenBudget::with_safety_margin(
-                model_limit.max_context_tokens,
-                model_limit.get_max_output_tokens(),
+    let budget = resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), true)
+        .unwrap_or_else(|| {
+            let fallback = default_model_limit();
+            tracing::info!(
+                model = model_name,
+                context = fallback.max_context_tokens,
+                output = fallback.get_max_output_tokens(),
+                "Using compatibility token limits because the route supplied no capacity"
+            );
+            TokenBudget::with_safety_margin(
+                fallback.max_context_tokens,
+                fallback.get_max_output_tokens(),
                 bamboo_compression::BudgetStrategy::default(),
-                model_limit.get_safety_margin(),
-            ));
+                fallback.get_safety_margin(),
+            )
+        });
+    let resolved = config.context_management.apply_compression_policy(budget);
 
     // Publish the freshly resolved budget on the session so every downstream
     // reader in this round — `build_context_pressure` (tool-output truncation),
@@ -370,38 +326,94 @@ async fn resolve_provider_runtime_limit(
     config: &AgentLoopConfig,
     llm: &dyn LLMProvider,
     model_name: &str,
-) -> Option<ModelLimit> {
-    if config.provider_type.as_deref() != Some("copilot") {
+) -> Option<ProviderModelInfo> {
+    // Host-supplied providers without a configured route can still use local
+    // limits. Ordinary configured UI, CLI and SDK runs carry a provider name.
+    if config.provider_name.is_none() && config.provider_type.is_none() {
+        return None;
+    }
+    reported_model_limits(llm, model_name).await
+}
+
+async fn reported_model_limits(
+    llm: &dyn LLMProvider,
+    model_name: &str,
+) -> Option<ProviderModelInfo> {
+    match tokio::time::timeout(MODEL_INFO_TIMEOUT, llm.model_info_for_request(model_name)).await {
+        Ok(Ok(entry)) => entry.filter(|entry| {
+            entry.id == model_name
+                && (entry.max_context_tokens.is_some()
+                    || entry.max_input_tokens.is_some()
+                    || entry.max_output_tokens.is_some())
+        }),
+        _ => {
+            tracing::debug!(model = model_name, "Provider model limits unavailable");
+            None
+        }
+    }
+}
+
+fn resolve_window(
+    configured: Option<&ModelLimit>,
+    reported: Option<&ProviderModelInfo>,
+    dynamic: bool,
+) -> Option<TokenBudget> {
+    fn tighter(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => left.or(right),
+        }
+    }
+
+    let joint_window = tighter(
+        configured.map(|limit| limit.max_context_tokens),
+        reported.and_then(|info| info.max_context_tokens),
+    );
+    let input_limit = reported.and_then(|info| info.max_input_tokens);
+    let output_limit = tighter(
+        configured.and_then(|limit| limit.max_output_tokens),
+        reported.and_then(|info| info.max_output_tokens),
+    );
+    if joint_window.is_none() && input_limit.is_none() && output_limit.is_none() {
         return None;
     }
 
-    let model_info = match llm.list_model_info().await {
-        Ok(models) => models.into_iter().find(|entry| entry.id == model_name),
-        Err(error) => {
-            tracing::warn!(
-                "Failed to fetch Copilot model metadata for token budget: {}",
-                error
-            );
-            None
-        }
-    }?;
-
-    let max_context_tokens = model_info.max_context_tokens?;
-
-    let mut limit = ModelLimit::new(model_name.to_string(), max_context_tokens);
-    limit.max_output_tokens = model_info.max_output_tokens;
-
-    tracing::info!(
-        "Using Copilot runtime model metadata for '{}': context={}, max_output={}",
-        model_name,
-        max_context_tokens,
-        model_info
-            .max_output_tokens
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "auto".to_string())
+    let fallback = default_model_limit();
+    let output = output_limit.unwrap_or_else(|| {
+        let sizing_window = joint_window
+            .or(input_limit)
+            .unwrap_or(fallback.max_context_tokens);
+        ModelLimit::new("", sizing_window).get_max_output_tokens()
+    });
+    // Separate input/output limits give a planning bound. They do not
+    // establish a provider's joint context window.
+    let context = joint_window
+        .or_else(|| input_limit.map(|input| input.saturating_add(output)))
+        .unwrap_or(fallback.max_context_tokens);
+    let compression_window = context.min(input_limit.unwrap_or(u32::MAX));
+    let safety_margin = configured
+        .and_then(|limit| limit.safety_margin)
+        .unwrap_or_else(|| ModelLimit::new("", compression_window).get_safety_margin());
+    let mut budget = TokenBudget::with_safety_margin(
+        context,
+        output,
+        bamboo_compression::BudgetStrategy::default(),
+        safety_margin,
     );
-
-    Some(limit)
+    budget.max_input_tokens = input_limit;
+    if dynamic {
+        budget.output_reserve_tokens = Some(output.min(safety_margin.max(1)));
+    }
+    tracing::debug!(
+        configured = configured.is_some(),
+        provider_metadata = reported.is_some(),
+        ?joint_window,
+        ?input_limit,
+        ?output_limit,
+        planning_window = context,
+        "Resolved model token limits"
+    );
+    Some(budget)
 }
 
 #[cfg(test)]
@@ -512,6 +524,7 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: model.into(),
                 max_context_tokens: Some(128_000),
+                max_input_tokens: None,
                 max_output_tokens: Some(16_000),
             }],
         };
@@ -832,6 +845,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn compatibility_output_default_preserves_a_saved_32k_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = "metadata-free-model";
+        let mut session = Session::new("default-model-limit", model);
+        let config = AgentLoopConfig {
+            app_data_dir: Some(dir.path().to_path_buf()),
+            provider_name: Some("compatible-route".into()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo::from_id(model)],
+        };
+
+        let fallback = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(fallback.max_context_tokens, 1_000_000);
+        assert_eq!(fallback.max_output_tokens, 64_000);
+
+        let path = model_limits_path(&config);
+        let stored = r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#;
+        tokio::fs::write(&path, stored).await.unwrap();
+        let saved = resolve_token_budget(&mut session, &config, model, &provider).await;
+        assert_eq!(saved.max_output_tokens, 32_000);
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), stored);
+    }
+
     struct MutableMetadataProvider {
         max_context_tokens: AtomicU32,
         max_output_tokens: AtomicU32,
@@ -853,6 +892,7 @@ mod tests {
             Ok(vec![ProviderModelInfo {
                 id: "dynamic-model-limit-763".to_string(),
                 max_context_tokens: Some(self.max_context_tokens.load(Ordering::SeqCst)),
+                max_input_tokens: None,
                 max_output_tokens: Some(self.max_output_tokens.load(Ordering::SeqCst)),
             }])
         }
@@ -1031,6 +1071,7 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: "configured-family-763-v2".to_string(),
                 max_context_tokens: Some(128_000),
+                max_input_tokens: None,
                 max_output_tokens: Some(16_000),
             }],
         };
@@ -1081,9 +1122,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_provider_runtime_limit_uses_copilot_metadata() {
+    async fn resolve_provider_runtime_limit_uses_selected_route_metadata() {
         let config = AgentLoopConfig {
-            provider_type: Some("copilot".to_string()),
+            provider_name: Some("configured-route".to_string()),
             ..Default::default()
         };
 
@@ -1091,19 +1132,37 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: "gpt-5.3-codex".to_string(),
                 max_context_tokens: Some(222_000),
+                max_input_tokens: Some(200_000),
                 max_output_tokens: Some(33_000),
             }],
         };
 
         let limit = resolve_provider_runtime_limit(&config, &provider, "gpt-5.3-codex")
             .await
-            .expect("copilot metadata should resolve");
-        assert_eq!(limit.max_context_tokens, 222_000);
+            .expect("selected provider metadata should resolve");
+        assert_eq!(limit.max_context_tokens, Some(222_000));
+        assert_eq!(limit.max_input_tokens, Some(200_000));
         assert_eq!(limit.max_output_tokens, Some(33_000));
     }
 
     #[tokio::test]
-    async fn resolve_provider_runtime_limit_ignores_non_copilot_provider() {
+    async fn resolve_provider_runtime_limit_uses_no_catalog_for_unconfigured_provider() {
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "gpt-5.3-codex".to_string(),
+                max_context_tokens: Some(222_000),
+                max_input_tokens: None,
+                max_output_tokens: Some(33_000),
+            }],
+        };
+
+        let limit = resolve_provider_runtime_limit(&config, &provider, "gpt-5.3-codex").await;
+        assert!(limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_runtime_limit_preserves_an_output_only_record() {
         let config = AgentLoopConfig {
             provider_type: Some("openai".to_string()),
             ..Default::default()
@@ -1112,32 +1171,39 @@ mod tests {
         let provider = MetadataProvider {
             models: vec![ProviderModelInfo {
                 id: "gpt-5.3-codex".to_string(),
-                max_context_tokens: Some(222_000),
+                max_context_tokens: None,
+                max_input_tokens: None,
                 max_output_tokens: Some(33_000),
             }],
         };
 
-        let limit = resolve_provider_runtime_limit(&config, &provider, "gpt-5.3-codex").await;
-        assert!(limit.is_none());
+        let limit = resolve_provider_runtime_limit(&config, &provider, "gpt-5.3-codex")
+            .await
+            .unwrap();
+        assert_eq!(limit.max_context_tokens, None);
+        assert_eq!(limit.max_output_tokens, Some(33_000));
     }
 
-    #[tokio::test]
-    async fn resolve_provider_runtime_limit_requires_context_tokens() {
-        let config = AgentLoopConfig {
-            provider_type: Some("copilot".to_string()),
-            ..Default::default()
+    #[test]
+    fn model_window_intersects_operator_and_provider_limits_independently() {
+        let explicit = ModelLimit {
+            model_pattern: "same-model".into(),
+            max_context_tokens: 128_000,
+            max_output_tokens: Some(65_536),
+            safety_margin: Some(1_000),
         };
-
-        let provider = MetadataProvider {
-            models: vec![ProviderModelInfo {
-                id: "gpt-5.3-codex".to_string(),
-                max_context_tokens: None,
-                max_output_tokens: Some(33_000),
-            }],
+        let provider = ProviderModelInfo {
+            id: "same-model".into(),
+            max_context_tokens: Some(96_000),
+            max_input_tokens: Some(67_000),
+            max_output_tokens: Some(48_000),
         };
-
-        let limit = resolve_provider_runtime_limit(&config, &provider, "gpt-5.3-codex").await;
-        assert!(limit.is_none());
+        let budget = resolve_window(Some(&explicit), Some(&provider), true).unwrap();
+        assert_eq!(budget.max_context_tokens, 96_000);
+        assert_eq!(budget.max_request_input_tokens(), 66_000);
+        assert_eq!(budget.output_limit_for_input(10_000), 48_000);
+        assert_eq!(budget.output_limit_for_input(61_000), 34_000);
+        assert_eq!(budget.output_limit_for_input(67_000), 0);
     }
 
     #[tokio::test]
@@ -1181,6 +1247,7 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: "summary-model-763".to_string(),
                 max_context_tokens: Some(32_000),
+                max_input_tokens: None,
                 max_output_tokens: Some(6_000),
             }],
         };
@@ -1214,7 +1281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auxiliary_user_pattern_override_outranks_exact_provider_metadata() {
+    async fn auxiliary_budget_intersects_user_pattern_and_provider_input_ceiling() {
         let config = AgentLoopConfig {
             legacy_model_limits: Some(serde_json::json!([
                 {
@@ -1230,6 +1297,7 @@ mod tests {
             models: vec![ProviderModelInfo {
                 id: "summary-family-763-latest".to_string(),
                 max_context_tokens: Some(64_000),
+                max_input_tokens: Some(8_500),
                 max_output_tokens: Some(8_000),
             }],
         };
@@ -1239,6 +1307,7 @@ mod tests {
         assert_eq!(budget.max_context_tokens, 16_000);
         assert_eq!(budget.max_output_tokens, 3_000);
         assert_eq!(budget.safety_margin, 500);
+        assert_eq!(budget.input_ceiling(), 8_000);
     }
 
     #[tokio::test]

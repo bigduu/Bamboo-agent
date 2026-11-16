@@ -173,6 +173,7 @@ pub(super) fn apply_cache_ttl_header(headers: &mut HeaderMap, plan: Option<&Prom
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     max_tokens: u32,
@@ -204,6 +205,7 @@ impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
@@ -434,6 +436,26 @@ impl LLMProvider for AnthropicProvider {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "Anthropic",
+                model_fetcher::ModelListFormat::Messages,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_MESSAGES],
+        ))
     }
 }
 
