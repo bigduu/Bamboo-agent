@@ -199,6 +199,12 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         }
         config.default_provider_instance = Some(provider.clone());
         config.provider_instances.insert(provider.clone(), instance);
+        // Persisting an explicit default retires the legacy provider stanzas.
+        // Promote the remaining accounts before that durable projection.
+        bamboo_config::materialize_legacy_provider_instances(&mut config);
+        if !bamboo_config::synthesize_legacy_instances(&config).is_empty() {
+            bail!("legacy provider credentials must be recoverable before switching the default");
+        }
         instance_intents.insert(provider.clone());
     } else {
         config.default_provider_instance = None;

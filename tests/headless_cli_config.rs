@@ -14,6 +14,7 @@ const MODEL: &str = "fixture-model";
 const KEY: &str = "synthetic-api-key";
 const ANSWER: &str = "Fixture answer";
 const REASONING: &str = "fixture private thought";
+const ENCRYPTION_KEY: [u8; 32] = [0xc1; 32];
 
 fn gateway_environment(command: &mut Command, provider: &str, endpoint: &str) {
     let prefix = format!("BAMBOO_{}", provider.to_ascii_uppercase());
@@ -32,6 +33,7 @@ fn bamboo(directory: &Path) -> Command {
         .env("USERPROFILE", directory)
         .env("BAMBOO_DATA_DIR", directory.join("bamboo"))
         .env("BAMBOO_JIANDU_DATA_DIR", directory.join("jiandu"))
+        .env("BAMBOO_CONFIG_ENCRYPTION_KEY", hex::encode(ENCRYPTION_KEY))
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -255,6 +257,7 @@ async fn invalid_env_endpoint_is_redacted_and_prevents_fallback() {
 
 #[tokio::test]
 async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
+    let _key = bamboo_config::encryption::set_test_encryption_key(ENCRYPTION_KEY);
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     let endpoint = format!("{}/custom/v1", server.uri());
@@ -295,6 +298,14 @@ async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
     store.clear(reference, store.revision().unwrap()).unwrap();
     assert!(!store.status(reference).unwrap().configured);
     let updated = format!("{}/updated/v1", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/updated/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(body_partial_json(json!({"model": "updated-model"})))
+        .respond_with(openai_stream())
+        .expect(1..)
+        .mount(&server)
+        .await;
     run(bamboo(dir.path()).args([
         "init",
         "--non-interactive",
@@ -309,6 +320,9 @@ async fn init_saves_an_endpoint_and_model_for_the_next_headless_run() {
         "updated-model",
     ]))
     .await;
+    let output =
+        run(bamboo(dir.path()).args(["-p", "Give a concise answer.", "--timeout", "15"])).await;
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), ANSWER);
     let saved = bamboo_config::Config::from_data_dir_without_env(Some(data_dir));
     let instance = &saved.provider_instances["openai"];
     assert_eq!(instance.base_url.as_deref(), Some(updated.as_str()));
@@ -358,4 +372,53 @@ async fn a_saved_bodhi_gateway_can_be_selected_by_instance_and_model() {
     ]))
     .await;
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), ANSWER);
+}
+
+#[tokio::test]
+async fn init_keeps_all_accounts_in_a_legacy_hybrid_config() {
+    let _key = bamboo_config::encryption::set_test_encryption_key(ENCRYPTION_KEY);
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("bamboo");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::write(
+        data_dir.join("config.json"),
+        json!({
+            "provider": "openai",
+            "providers": {
+                "openai": {"api_key": "fixture-openai", "model": "previous-openai", "base_url": "http://127.0.0.1:1/openai"},
+                "anthropic": {"api_key": "fixture-anthropic", "model": "previous-anthropic"},
+            },
+            "provider_instances": {
+                "work": {"provider_type": "openai", "api_key": "fixture-work", "model": "previous-work"},
+            },
+        }).to_string(),
+    ).unwrap();
+    run(bamboo(dir.path()).args([
+        "init",
+        "--non-interactive",
+        "--provider",
+        "gemini",
+        "--api-key",
+        KEY,
+        "--model",
+        MODEL,
+    ]))
+    .await;
+    let saved = bamboo_config::Config::from_data_dir_without_env(Some(data_dir));
+    assert_eq!(saved.effective_default_provider(), "gemini");
+    for (id, model, key) in [
+        ("openai", "previous-openai", "fixture-openai"),
+        ("anthropic", "previous-anthropic", "fixture-anthropic"),
+        ("work", "previous-work", "fixture-work"),
+        ("gemini", MODEL, KEY),
+    ] {
+        let account = &saved.provider_instances[id];
+        assert_eq!(account.model.as_deref(), Some(model), "{id}");
+        assert_eq!(account.api_key, key, "{id}");
+        assert!(account.credential_ref.is_some(), "{id}");
+    }
+    assert_eq!(
+        saved.provider_instances["openai"].base_url.as_deref(),
+        Some("http://127.0.0.1:1/openai"),
+    );
 }
