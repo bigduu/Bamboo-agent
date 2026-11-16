@@ -292,8 +292,7 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
             provider_type: None,
             reasoning_effort: None,
             output_limit_recovery: None,
-            max_context_tokens: prepared.budget.max_context_tokens,
-            max_output_tokens: prepared.budget.max_output_tokens,
+            budget: &prepared.budget,
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -1200,6 +1199,7 @@ fn bounded_compression_llm_with_limits(
         model_info: ProviderModelInfo {
             id: "summary-model-763".to_string(),
             max_context_tokens: Some(max_context_tokens),
+            max_input_tokens: None,
             max_output_tokens: Some(max_output_tokens),
         },
         requests: Arc::clone(&requests),
@@ -1213,6 +1213,8 @@ fn bounded_compression_session(id: &str) -> Session {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 24_000,
         max_output_tokens: 4_000,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -1656,6 +1658,8 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_every_summary_
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -2578,6 +2582,8 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 2000,
         max_output_tokens: 0,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -2659,6 +2665,8 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -2824,6 +2832,8 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 64_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -2936,6 +2946,8 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 64_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5157,6 +5169,8 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5249,6 +5263,8 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         // must also accommodate fixed, non-droppable host context.
         max_context_tokens: 2000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5327,6 +5343,8 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 10_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5543,6 +5561,8 @@ async fn multi_round_compression_cycle() {
     let budget = TokenBudget {
         max_context_tokens: 2000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 50,
             enable_summarization: true,
@@ -6068,6 +6088,8 @@ async fn pre_summarization_degradation_skips_llm_for_auto_triggered_compression(
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 100_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -6160,6 +6182,8 @@ async fn tokens_saved_is_computed_from_compressed_messages() {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 100_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,

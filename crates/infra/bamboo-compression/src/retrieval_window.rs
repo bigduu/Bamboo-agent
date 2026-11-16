@@ -70,7 +70,7 @@ pub struct RetrievalWindowCandidatePlan {
     pub active_tokens_before: u32,
     /// Projected active tokens after the candidate messages are removed.
     pub projected_active_tokens_after: u32,
-    /// Provider context-window size used for the plan.
+    /// Compression window, including any tighter independent input ceiling.
     pub context_window_tokens: u32,
     /// Effective provider request-input limit after output and safety reserves.
     pub request_input_limit_tokens: u32,
@@ -493,7 +493,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         token_accounting_sha256: token_accounting_sha256(accounting),
         active_tokens_before,
         projected_active_tokens_after,
-        context_window_tokens: budget.max_context_tokens,
+        context_window_tokens: budget.compression_window_tokens(),
         request_input_limit_tokens: budget.max_request_input_tokens(),
         target_tokens,
         target_usage_percent: policy.target_usage_percent,
@@ -682,7 +682,7 @@ pub fn apply_retrieval_window_plan_with_trigger(
         summary_tokens: 0,
         window_tokens: usage.window_tokens,
         total_tokens: plan.projected_active_tokens_after,
-        max_context_tokens: plan.context_window_tokens,
+        max_context_tokens: current_budget.max_context_tokens,
         budget_limit: plan.request_input_limit_tokens,
         truncation_occurred: false,
         segments_removed: plan.archive_group_count,
@@ -977,7 +977,7 @@ fn validate_current_token_budget(
     plan: &RetrievalWindowCandidatePlan,
     current_budget: &TokenBudget,
 ) -> Result<(), RetrievalWindowApplyError> {
-    if current_budget.max_context_tokens != plan.context_window_tokens
+    if current_budget.compression_window_tokens() != plan.context_window_tokens
         || current_budget.max_request_input_tokens() != plan.request_input_limit_tokens
     {
         return Err(RetrievalWindowApplyError::StalePlan {
@@ -1445,7 +1445,7 @@ pub fn effective_retrieval_window_target_tokens(
     target_usage_percent: u8,
 ) -> u32 {
     effective_target_tokens(
-        budget.max_context_tokens,
+        budget.compression_window_tokens(),
         budget.max_request_input_tokens(),
         target_usage_percent,
     )
@@ -1837,6 +1837,29 @@ mod tests {
             &budget(100),
             &accounting_for_plan(plan),
         )
+    }
+
+    #[test]
+    fn retrieval_receipt_and_usage_keep_their_respective_windows() {
+        let (mut session, plan) = basic_session_and_plan();
+        let current_budget = TokenBudget {
+            max_input_tokens: Some(100),
+            ..budget(1_000_000)
+        };
+        apply_retrieval_window_plan(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &current_budget,
+            &accounting_for_plan(&plan),
+        )
+        .unwrap();
+
+        let event = &session.compression_events[0];
+        assert_eq!(event.retrieval_context_window_tokens, 100);
+        let usage = session.token_usage.unwrap();
+        assert_eq!(usage.max_context_tokens, 1_000_000);
+        assert_eq!(usage.budget_limit, 100);
     }
 
     fn assert_apply_error_without_mutation(

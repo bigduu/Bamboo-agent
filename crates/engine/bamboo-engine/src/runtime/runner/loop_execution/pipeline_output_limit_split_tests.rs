@@ -209,6 +209,11 @@ async fn run_with_executor<T: ToolExecutor + 'static>(
     config.reasoning_effort = effort;
     config.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
     config.run_budget = budget;
+    if matches!(protocol, Protocol::Messages { compatible: true }) {
+        config.legacy_model_limits = Some(json!([{
+            "model_pattern":"model","max_context_tokens":1_000_000,"max_output_tokens":64_000
+        }]));
+    }
     let mut session = Session::new("task-split", "model");
     if matches!(protocol, Protocol::Responses) {
         session
@@ -410,6 +415,150 @@ async fn pipeline_output_limit_split_reuses_results_and_keeps_attempts_bounded()
         );
         assert_eq!(run.usage.total_completion_tokens, CAP + 38);
     }
+}
+
+#[tokio::test]
+async fn dynamic_model_window_shrinks_the_wire_output_when_the_prompt_grows() {
+    use crate::runtime::runner::round_lifecycle::execute_llm_round;
+
+    for (protocol, output_field, short_output) in [
+        (Protocol::Messages { compatible: false }, "/max_tokens", CAP),
+        (Protocol::Chat, "/max_tokens", 6000),
+        (Protocol::Responses, "/max_output_tokens", 6000),
+        (Protocol::Gemini, "/generationConfig/maxOutputTokens", 6000),
+    ] {
+        let server = MockServer::start().await;
+        let (route, provider) = protocol.provider(&server);
+        let model = match protocol {
+            Protocol::Gemini => json!({"models":[{"name":"models/model",
+                "max_context_tokens":10000,"inputTokenLimit":9000,"outputTokenLimit":6000}]}),
+            Protocol::Messages { .. } => json!({"data":[{"id":"model",
+                "max_context_tokens":10000,"max_input_tokens":9000,"max_tokens":6000}]}),
+            _ => json!({"data":[{"id":"model","max_context_tokens":10000,
+                "max_input_tokens":9000,"max_output_tokens":6000}]}),
+        };
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(model))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = match protocol {
+            Protocol::Messages { .. } => text("Verified."),
+            Protocol::Chat => mock_completion_sse(&[json!({"type":"chunk","id":"resp",
+                "choices":[{"index":0,"delta":{"content":"Verified."},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":31,"completion_tokens":7}})]),
+            Protocol::Responses => mock_completion_sse(&[json!({"type":"response.completed",
+                "response":{"id":"resp_window","status":"completed","usage":{"input_tokens":31,"output_tokens":7},
+                    "output":[{"id":"msg_window","type":"message",
+                               "content":[{"type":"output_text","text":"Verified."}]}]}})]),
+            Protocol::Gemini => mock_completion_sse(&[json!({"type":"chunk","candidates":[
+                {"content":{"parts":[{"text":"Verified."}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":31,"candidatesTokenCount":7}})]),
+            _ => unreachable!(),
+        };
+        mount_replies(&server, route, vec![response.clone(), response]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = canonical_usage_pipeline_config();
+        config.provider_name = Some("configured-route".into());
+        config.app_data_dir = Some(dir.path().into());
+        let long_prompt = " decision".repeat(4800);
+        for prompt in ["Check the result.", long_prompt.as_str()] {
+            let mut session = Session::new("dynamic-window", "model");
+            session.add_message(Message::user(prompt));
+            let (events, _receiver) = tokio::sync::mpsc::channel(128);
+            let output = execute_llm_round(
+                &mut session,
+                &config,
+                &provider,
+                &events,
+                &CancellationToken::new(),
+                "dynamic-window",
+                "model",
+                &[],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(output.terminal_validation_error.is_none());
+            assert_eq!(output.stream_output.content, "Verified.");
+        }
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == route)
+            .map(|request| request.body_json().unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].pointer(output_field), Some(&json!(short_output)));
+        let long_output = bodies[1]
+            .pointer(output_field)
+            .and_then(Value::as_u64)
+            .unwrap();
+        assert!(
+            long_output > 0 && long_output < short_output,
+            "{output_field}"
+        );
+        assert!(bodies[1].to_string().contains(long_prompt.trim()));
+    }
+}
+
+#[tokio::test]
+async fn messages_honors_large_output_and_a_much_smaller_independent_input_cap() {
+    use crate::runtime::runner::round_lifecycle::execute_llm_round;
+
+    let server = MockServer::start().await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        bamboo_llm::AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"model",
+            "max_context_tokens":1_000_000,"max_input_tokens":8_000,"max_tokens":64_000}]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_replies(&server, "/messages", vec![text("Verified.")]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = canonical_usage_pipeline_config();
+    config.provider_name = Some("configured-route".into());
+    config.app_data_dir = Some(dir.path().into());
+    let mut session = Session::new("independent-input-window", "model");
+    session.add_message(Message::user("Check the result."));
+    let (events, _receiver) = tokio::sync::mpsc::channel(128);
+    let output = execute_llm_round(
+        &mut session,
+        &config,
+        &provider,
+        &events,
+        &CancellationToken::new(),
+        "independent-input-window",
+        "model",
+        &[],
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.stream_output.content, "Verified.");
+    let budget = &session.resolved_token_budget.as_ref().unwrap().1;
+    assert_eq!(budget.safety_margin, 1_000);
+    assert_eq!(budget.max_request_input_tokens(), 7_000);
+    assert_eq!(budget.compression_target_context_tokens(), 2_000);
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|request| request.url.path() == "/messages")
+        .unwrap();
+    let body: Value = request.body_json().unwrap();
+    assert_eq!(body["max_tokens"], 64_000);
 }
 
 fn repeated_reasoning(protocol: Protocol) -> ResponseTemplate {
@@ -1139,6 +1288,12 @@ async fn output_limit_step_failure_ends_execution_and_next_turn_uses_saved_resul
 
     let server = MockServer::start().await;
     let (route, provider) = Protocol::Messages { compatible: true }.provider(&server);
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"model"}]})))
+        .expect(1)
+        .mount(&server)
+        .await;
     mount_replies(
         &server,
         route,
@@ -1187,7 +1342,13 @@ async fn output_limit_step_failure_ends_execution_and_next_turn_uses_saved_resul
         ),
         "{first:?}"
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    let sends = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST");
+    assert_eq!(sends.count(), 4);
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(event) = event_rx.recv().await {
             assert!(!matches!(event, AgentEvent::Complete { .. }));
@@ -1219,7 +1380,13 @@ async fn output_limit_step_failure_ends_execution_and_next_turn_uses_saved_resul
     let completed_run = completed.agent_runtime_state.as_ref().unwrap();
     assert_eq!(completed_run.status, AgentStatusState::Completed);
     assert_eq!(completed_run.round.total_completion_tokens, 7);
-    let requests = server.received_requests().await.unwrap();
+    let requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect::<Vec<_>>();
     assert_eq!(requests.len(), 5);
     let body: Value = requests[4].body_json().unwrap();
     assert!(body["messages"]

@@ -37,6 +37,7 @@ impl LLMProvider for Metered {
         Ok(vec![ProviderModelInfo {
             id: MODEL.into(),
             max_context_tokens: Some(INPUT),
+            max_input_tokens: None,
             max_output_tokens: Some(OUTPUT),
         }])
     }

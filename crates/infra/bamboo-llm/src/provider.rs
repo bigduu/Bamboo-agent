@@ -157,10 +157,10 @@ pub struct ProviderVisibleToolFootprint {
 pub struct ProviderModelInfo {
     /// Model identifier.
     pub id: String,
-    /// Maximum total context window (input + output) in tokens when known.
-    /// Provider adapters that receive an input-only limit must add the model's
-    /// output capacity before populating this field.
+    /// Joint input/output window, when explicitly reported.
     pub max_context_tokens: Option<u32>,
+    /// Maximum input tokens, when independently reported.
+    pub max_input_tokens: Option<u32>,
     /// Maximum output/completion tokens when known.
     pub max_output_tokens: Option<u32>,
 }
@@ -171,6 +171,7 @@ impl ProviderModelInfo {
         Self {
             id: id.into(),
             max_context_tokens: None,
+            max_input_tokens: None,
             max_output_tokens: None,
         }
     }
@@ -243,6 +244,7 @@ pub struct CompletionDiagnostics {
     state: Arc<Mutex<CompletionDiagnosticState>>,
     agent_round: bool,
     recovery: Option<OutputLimitRecovery>,
+    model_window_limit: Option<u32>,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
@@ -281,6 +283,11 @@ impl OutputLimitRecovery {
 
     pub fn output_limit(self) -> u64 {
         self.controls.output_limit
+    }
+
+    pub fn tighten_output_limit(mut self, limit: u32) -> Self {
+        self.controls.output_limit = self.controls.output_limit.min(u64::from(limit));
+        self
     }
 
     pub fn allows_task_split(self) -> bool {
@@ -352,6 +359,15 @@ impl CompletionDiagnostics {
             recovery,
             ..Self::default()
         }
+    }
+
+    pub fn with_model_window_limit(mut self, limit: Option<u32>) -> Self {
+        self.model_window_limit = limit;
+        self
+    }
+
+    pub(crate) fn model_window_limit(&self) -> Option<u32> {
+        self.model_window_limit
     }
 
     pub(crate) fn is_agent_round(&self) -> bool {
@@ -939,6 +955,19 @@ pub trait LLMProvider: Send + Sync {
             .map(ProviderModelInfo::from_id)
             .collect())
     }
+
+    /// Look up limits for a model selected for an actual request. Routing
+    /// guards must check the selected model before delegating the lookup.
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        if let Some(error) = self.known_pre_dispatch_error() {
+            return Err(error);
+        }
+        Ok(self
+            .list_model_info()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == model))
+    }
 }
 
 /// Produce a stable, process-local identity for a known wrapper's inner Arc.
@@ -1125,6 +1154,9 @@ impl LLMProvider for QueuedBudgetProvider {
     }
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
+    }
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
     }
 }
 

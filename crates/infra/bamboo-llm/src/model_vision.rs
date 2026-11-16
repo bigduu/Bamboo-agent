@@ -99,6 +99,9 @@ impl LLMProvider for ModelVisionProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
     }
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +125,9 @@ mod tests {
         ) -> Result<LLMStream> {
             panic!("a known local refusal must not dispatch")
         }
+        async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+            panic!("a known local refusal must not query the provider catalog")
+        }
     }
 
     #[tokio::test]
@@ -135,6 +141,10 @@ mod tests {
         let selected = ResolvedModel::from_ref(vision, &reference);
         assert!(matches!(selected.provider.known_pre_dispatch_error(),
             Some(crate::provider::LLMError::Auth(message)) if message == "synthetic refusal"));
+        assert!(
+            matches!(selected.provider.model_info_for_request("model").await,
+            Err(crate::provider::LLMError::Auth(message)) if message == "synthetic refusal")
+        );
     }
     struct MetadataProvider;
     #[async_trait]

@@ -338,6 +338,13 @@ impl bamboo_llm::LLMProvider for ChildGoldPolicyProvider {
     ) -> Result<Vec<bamboo_llm::provider::ProviderModelInfo>, bamboo_llm::LLMError> {
         self.select(&self.model)?.list_model_info().await
     }
+
+    async fn model_info_for_request(
+        &self,
+        model: &str,
+    ) -> Result<Option<bamboo_llm::provider::ProviderModelInfo>, bamboo_llm::LLMError> {
+        self.dispatch(model)?.model_info_for_request(model).await
+    }
 }
 
 // ---------------------------------------------------------------------------

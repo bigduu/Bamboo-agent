@@ -76,11 +76,13 @@ impl LLMProvider for Provider {
             ProviderModelInfo {
                 id: "fixture-model".into(),
                 max_context_tokens: Some(100),
+                max_input_tokens: None,
                 max_output_tokens: Some(40),
             },
             ProviderModelInfo {
                 id: "auxiliary-model".into(),
                 max_context_tokens: Some(8192),
+                max_input_tokens: None,
                 max_output_tokens: Some(2048),
             },
         ])
