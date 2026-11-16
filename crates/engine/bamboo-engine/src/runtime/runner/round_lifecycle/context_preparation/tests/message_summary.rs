@@ -496,6 +496,14 @@ async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persist
     let pending = session.force_manual_compression.clone();
 
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "max_input_tokens": 16_000, "max_output_tokens": 2_000}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     let calls = AtomicUsize::new(0);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -556,11 +564,15 @@ async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persist
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "one catalog lookup and two completions");
     let bodies = requests
         .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/chat/completions"
+        })
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(bodies.len(), 2, "Only the map and empty reduce are sent");
+    assert_eq!(bodies.len(), 2, "one map and one empty reduce completion");
     for body in &bodies {
         assert_eq!(body["model"], model);
         assert_eq!(body["reasoning_effort"], "low");
