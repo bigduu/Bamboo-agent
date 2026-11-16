@@ -2493,6 +2493,7 @@ define_counted_struct! {
         pub(crate) memory: crate::MemoryConfigModule,
         pub(crate) subagents: crate::SubagentsConfigModule,
         pub(crate) providers: crate::ProviderConfigsModule,
+        pub(crate) provider_metadata_overrides: crate::provider_instance::ProviderMetadataOverrides,
         retired_provider_env_override: bool,
         recovery_status: Option<ConfigRecoveryStatus>,
     }
@@ -3651,6 +3652,7 @@ impl Config {
             memory: crate::MemoryConfigModule(memory),
             subagents: crate::SubagentsConfigModule(subagents),
             providers: crate::ProviderConfigsModule(providers),
+            provider_metadata_overrides: Default::default(),
             retired_provider_env_override: false,
             recovery_status: None,
         }
@@ -4181,67 +4183,7 @@ impl Config {
             memory.project_first_dream = parse_bool_env(&project_first_dream);
         }
 
-        // Per-provider API keys from the environment (highest priority). Lets a
-        // 12-factor / secret-manager / --env-file / k8s-Secret deploy supply the
-        // key at runtime instead of baking a plaintext `api_key` into a mounted
-        // config.json. The `api_key_from_env` flag keeps `refresh_provider_api_keys_encrypted`
-        // from re-encrypting these keys into `api_key_encrypted` on a later save,
-        // so an env key is never persisted to disk. (#253)
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_OPENAI_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let openai = self
-                        .providers
-                        .openai
-                        .get_or_insert_with(OpenAIConfig::default);
-                    openai.api_key = key.to_string();
-                    openai.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("openai", key);
-                }
-            }
-        }
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_ANTHROPIC_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let anthropic = self
-                        .providers
-                        .anthropic
-                        .get_or_insert_with(AnthropicConfig::default);
-                    anthropic.api_key = key.to_string();
-                    anthropic.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("anthropic", key);
-                }
-            }
-        }
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_GEMINI_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let gemini = self
-                        .providers
-                        .gemini
-                        .get_or_insert_with(GeminiConfig::default);
-                    gemini.api_key = key.to_string();
-                    gemini.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("gemini", key);
-                }
-            }
-        }
-    }
-
-    fn apply_provider_instance_env_key(&mut self, provider_type: &str, key: &str) {
-        for instance in self.provider_instances.values_mut().filter(|instance| {
-            instance.provider_type == provider_type
-                && crate::provider_instance_api_key_from_env(instance)
-        }) {
-            instance.api_key = key.to_string();
-            instance.api_key_encrypted = None;
-        }
+        crate::provider_instance::apply_provider_env_overrides(self, true);
     }
 
     /// Apply runtime-only `BAMBOO_*` overrides to a config assembled by the
@@ -4250,6 +4192,17 @@ impl Config {
     /// using the no-env load path so overrides are never persisted.
     pub fn apply_runtime_env_overrides(&mut self) {
         self.apply_env_overrides();
+    }
+
+    /// Apply endpoint and model overrides when staging a provider update.
+    /// The caller's credential inputs are left to the credential transaction.
+    pub fn apply_runtime_provider_metadata_overrides(&mut self) {
+        crate::provider_instance::apply_provider_env_overrides(self, false);
+    }
+
+    /// Restore saved endpoint and model values on a detached settings view.
+    pub fn restore_saved_provider_metadata(&mut self) {
+        crate::provider_instance::restore_provider_metadata(self);
     }
 
     /// Load config from disk AND publish its env vars to the process-global cache
@@ -4871,6 +4824,7 @@ impl Config {
             source.providers.0.retired_provider_aliases.clone();
         self.providers.0.copilot_default_retired = source.providers.0.copilot_default_retired;
         self.retired_provider_env_override = source.retired_provider_env_override;
+        self.provider_metadata_overrides = source.provider_metadata_overrides.clone();
     }
 
     /// Whether provider instances are configured (new multi-instance path).
@@ -5013,8 +4967,9 @@ impl Config {
     /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         crate::config_module::ensure_legacy_module_layout(data_dir)?;
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut config);
+        crate::validate_runtime_model_admission(&config).map_err(anyhow::Error::msg)?;
         config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
         config.providers.save_sync(data_dir)
@@ -5027,7 +4982,9 @@ impl Config {
         &self,
         provider_document: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
+        let mut to_save = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut to_save);
+        crate::validate_runtime_model_admission(&to_save).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
@@ -5035,7 +4992,6 @@ impl Config {
             );
         }
 
-        let mut to_save = self.clone();
         to_save.clear_legacy_provider_aliases_for_instance_mode();
         to_save.extra.remove("data_dir");
         to_save.extra.remove("model");
@@ -5189,7 +5145,9 @@ impl Config {
     /// an auto-persisted recovery. Call [`Config::confirm_recovery`] (or
     /// [`Config::confirm_recovery_and_save_to_dir`]) first.
     pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
+        let mut to_save = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut to_save);
+        crate::validate_runtime_model_admission(&to_save).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: it was recovered from corruption ({:?}) and \
@@ -5245,7 +5203,7 @@ impl Config {
         {
             crate::ConfigFacade::open_or_migrate(&data_dir)
                 .context("Failed to recover modular configuration before persistence")?;
-            crate::persist_facade_effective_config(&data_dir, self)
+            crate::persist_facade_effective_config(&data_dir, &to_save)
                 .context("Failed to persist modular configuration sections")?;
             return Ok(());
         }
@@ -5253,19 +5211,17 @@ impl Config {
         if crate::section_layout_is_active(&data_dir)
             .context("Failed to inspect modular configuration layout")?
         {
-            crate::persist_facade_effective_config(&data_dir, self)
+            crate::persist_facade_effective_config(&data_dir, &to_save)
                 .context("Failed to persist modular configuration sections")?;
             return Ok(());
         }
 
         let path = data_dir.join("config.json");
-
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
         }
 
-        let mut to_save = self.clone();
         to_save.clear_legacy_provider_aliases_for_instance_mode();
         // Never persist `data_dir` into config.json (data dir is runtime-derived).
         to_save.extra.remove("data_dir");

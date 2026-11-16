@@ -357,6 +357,159 @@ fn standard_provider_api_key_env_is_available(provider_type: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProviderMetadataOverrides(Vec<ProviderMetadataOverride>);
+
+#[derive(Debug, Clone)]
+struct ProviderMetadataOverride {
+    provider_type: &'static str,
+    instance: bool,
+    base_url: Option<MetadataOverride>,
+    model: Option<MetadataOverride>,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataOverride {
+    saved: Option<String>,
+    runtime: String,
+}
+
+impl MetadataOverride {
+    fn apply(field: &mut Option<String>, runtime: Option<String>) -> Option<Self> {
+        let runtime = runtime?;
+        if field.as_deref() == Some(runtime.as_str()) {
+            return None;
+        }
+        let saved = field.replace(runtime.clone());
+        Some(Self { saved, runtime })
+    }
+
+    fn restore(self, field: &mut Option<String>) {
+        // A detached writer may have explicitly changed this value since load.
+        if field.as_deref() == Some(self.runtime.as_str()) {
+            *field = self.saved;
+        }
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    let value = crate::runtime_env_var(name).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub(crate) fn apply_provider_env_overrides(config: &mut Config, include_api_keys: bool) {
+    restore_provider_metadata(config);
+    let instance_mode = config.has_provider_instances();
+    macro_rules! apply {
+        ($field:ident, $prefix:literal) => {{
+            let provider_type = stringify!($field);
+            let key = if include_api_keys {
+                nonempty_env(concat!($prefix, "_API_KEY"))
+            } else {
+                None
+            };
+            let base_url = nonempty_env(concat!($prefix, "_BASE_URL")).map(|url| {
+                let base = url.trim_end_matches('/');
+                if base.is_empty() {
+                    url
+                } else {
+                    base.to_string()
+                }
+            });
+            let model = nonempty_env(concat!($prefix, "_MODEL"));
+            let mut metadata = ProviderMetadataOverride {
+                provider_type,
+                instance: instance_mode,
+                base_url: None,
+                model: None,
+            };
+            if instance_mode {
+                // Preserve the existing type-wide key opt-in. Endpoint and model
+                // settings are scoped to the exact built-in slot.
+                if let Some(key) = key {
+                    for instance in config.provider_instances.values_mut().filter(|instance| {
+                        instance.provider_type == provider_type
+                            && provider_instance_api_key_from_env(instance)
+                    }) {
+                        instance.api_key.clone_from(&key);
+                        instance.api_key_encrypted = None;
+                    }
+                }
+                if let Some(instance) =
+                    config
+                        .provider_instances
+                        .get_mut(provider_type)
+                        .filter(|instance| {
+                            instance.provider_type == provider_type
+                                && provider_instance_api_key_from_env(instance)
+                        })
+                {
+                    metadata.base_url = MetadataOverride::apply(&mut instance.base_url, base_url);
+                    metadata.model = MetadataOverride::apply(&mut instance.model, model);
+                }
+            } else {
+                if let Some(key) = key {
+                    let provider = config
+                        .providers_mut()
+                        .$field
+                        .get_or_insert_with(Default::default);
+                    provider.api_key = key;
+                    provider.api_key_from_env = true;
+                }
+                if let Some(provider) = config.providers_mut().$field.as_mut() {
+                    metadata.base_url = MetadataOverride::apply(&mut provider.base_url, base_url);
+                    metadata.model = MetadataOverride::apply(&mut provider.model, model);
+                }
+            }
+            if metadata.base_url.is_some() || metadata.model.is_some() {
+                config.provider_metadata_overrides.0.push(metadata);
+            }
+        }};
+    }
+    apply!(openai, "BAMBOO_OPENAI");
+    apply!(anthropic, "BAMBOO_ANTHROPIC");
+    apply!(gemini, "BAMBOO_GEMINI");
+}
+
+pub(crate) fn restore_provider_metadata(config: &mut Config) {
+    for metadata in std::mem::take(&mut config.provider_metadata_overrides).0 {
+        let restore = |base_url: &mut Option<String>, model: &mut Option<String>| {
+            if let Some(value) = metadata.base_url {
+                value.restore(base_url);
+            }
+            if let Some(value) = metadata.model {
+                value.restore(model);
+            }
+        };
+        if metadata.instance {
+            if let Some(instance) = config.provider_instances.get_mut(metadata.provider_type) {
+                restore(&mut instance.base_url, &mut instance.model);
+            }
+        } else {
+            let providers = config.providers_mut();
+            let fields = match metadata.provider_type {
+                "openai" => providers
+                    .openai
+                    .as_mut()
+                    .map(|p| (&mut p.base_url, &mut p.model)),
+                "anthropic" => providers
+                    .anthropic
+                    .as_mut()
+                    .map(|p| (&mut p.base_url, &mut p.model)),
+                "gemini" => providers
+                    .gemini
+                    .as_mut()
+                    .map(|p| (&mut p.base_url, &mut p.model)),
+                _ => unreachable!("only standard provider metadata can be overridden"),
+            };
+            if let Some((base_url, model)) = fields {
+                restore(base_url, model);
+            }
+        }
+    }
+}
+
 fn provider_display_label(provider_type: &str) -> &str {
     match provider_type {
         "openai" => "OpenAI",
@@ -814,6 +967,55 @@ mod tests {
         assert!(provider_instance_environment_override_active(
             &config.provider_instances["anthropic"]
         ));
+    }
+
+    #[test]
+    fn runtime_endpoint_and_model_overlay_only_the_bound_builtin_instance() {
+        let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+        let _base = crate::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_BASE_URL",
+            Some(" https://runtime.example/v1/ "),
+        );
+        let model =
+            crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_MODEL", Some(" runtime "));
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "default_provider_instance": "openai",
+            "provider_instances": {
+                "openai": {
+                    "provider_type": "openai", "api_key_from_env": true,
+                    "base_url": "https://saved.example/v1", "model": "saved"
+                },
+                "named": {
+                    "provider_type": "openai", "api_key_from_env": true,
+                    "base_url": "https://named.example/v1", "model": "named"
+                }
+            }
+        }))
+        .unwrap();
+        config.apply_runtime_env_overrides();
+        let built_in = &config.provider_instances["openai"];
+        assert_eq!(
+            built_in.base_url.as_deref(),
+            Some("https://runtime.example/v1")
+        );
+        assert_eq!(built_in.model.as_deref(), Some("runtime"));
+        let named = &config.provider_instances["named"];
+        assert_eq!(named.base_url.as_deref(), Some("https://named.example/v1"));
+        assert_eq!(named.model.as_deref(), Some("named"));
+
+        let projection =
+            crate::SectionProjection::from_config(&config, crate::ModelLimitsSection(Vec::new()))
+                .unwrap();
+        let saved = &projection.providers.provider_instances["openai"];
+        assert_eq!(saved.base_url.as_deref(), Some("https://saved.example/v1"));
+        assert_eq!(saved.model.as_deref(), Some("saved"));
+
+        model.replace(Some("   "));
+        config.apply_runtime_env_overrides();
+        assert_eq!(
+            config.provider_instances["openai"].model.as_deref(),
+            Some("saved")
+        );
     }
 
     #[test]

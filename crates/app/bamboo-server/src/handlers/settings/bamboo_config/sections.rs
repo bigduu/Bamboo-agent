@@ -303,7 +303,8 @@ pub async fn get_provider_settings_section(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let _io = app_state.config_io_lock.lock().await;
-    let config = app_state.config.read().await.clone();
+    let mut config = app_state.config.read().await.clone();
+    config.restore_saved_provider_metadata();
     let providers = sanitized_provider_metadata(config.providers())?;
     let provider_instances = sanitized_provider_instance_metadata(&config.provider_instances)?;
     let mut builtin_status = Map::new();

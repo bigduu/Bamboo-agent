@@ -105,6 +105,22 @@ bamboo history <session-id>
 bamboo -p "What should I read next?" -s <session-id>
 ```
 
+For a custom gateway, choose the protocol it serves and supply its model ID.
+The OpenAI-compatible example runs from a fresh data directory.
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "Reply with OK." --provider openai
+```
+
+Anthropic and Gemini use the same variables with their provider prefixes.
+Use `bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id` to save the setup. [Provider configuration and precedence](./docs/config-reference.md#choosing-a-provider-and-model).
+
+Plain output shows reasoning progress on stderr. `--stream-json` emits the
+full event stream as NDJSON on stdout.
+
 Headless runs use the full agent runtime and the configured provider. If an interactive `bamboo -p` run pauses for a tool permission or question, answer the prompt in that same terminal. Browser responses and `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` target runs owned by a separately running `bamboo serve`; they do not unblock the in-process headless run. Do not disable permission checks just to make an example finish.
 
 No key yet? `bamboo -p "ping" --echo` is a **transport smoke test only**: it uses an echo executor, not an LLM, and does not demonstrate model reasoning or successful tool work.

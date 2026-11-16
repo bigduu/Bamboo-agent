@@ -528,6 +528,7 @@ impl SectionProjection {
         model_limits: ModelLimitsSection,
     ) -> ConfigStoreResult<Self> {
         let mut disk = config.clone();
+        crate::provider_instance::restore_provider_metadata(&mut disk);
         let instance_native = disk
             .default_provider_instance
             .as_ref()
@@ -2149,6 +2150,11 @@ fn validate_secret_free_http_url(label: &str, raw: &str, allow_empty: bool) -> R
         ));
     }
     Ok(())
+}
+
+/// Validate a non-empty endpoint before saving a custom provider setup.
+pub fn validate_provider_base_url(raw: &str) -> Result<(), String> {
+    validate_secret_free_http_url("provider base", raw, false)
 }
 
 fn validate_provider_urls_and_overrides(value: &Value) -> Result<(), String> {

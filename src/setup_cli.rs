@@ -40,6 +40,7 @@ pub struct InitArgs {
     pub provider: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub base_url: Option<String>,
     pub force: bool,
     pub non_interactive: bool,
 }
@@ -56,10 +57,20 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
 
-    // Load existing (or default) config from the target dir. No env overrides
-    // (this one-shot writer immediately re-saves; applying `BAMBOO_*` here would
-    // bake transient env values into config.json) and no cache publish (#40).
-    let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
+    // A setup write starts from the saved settings and their revision.
+    let (mut config, providers_revision) =
+        if bamboo_config::modular_authority_boundary_present(&data_dir)? {
+            let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir)?;
+            let revision = facade.registry().providers.snapshot().revision;
+            let mut config = facade.effective_config();
+            config.hydrate_provider_credentials_from_store(&data_dir)?;
+            (config, Some(revision))
+        } else {
+            (
+                Config::from_data_dir_without_env(Some(data_dir.clone())),
+                None,
+            )
+        };
 
     // 1. Provider.
     let provider = match args.provider {
@@ -70,6 +81,63 @@ pub fn run_init(args: InitArgs) -> Result<()> {
             KEYED_PROVIDERS.join(", ")
         ),
     };
+
+    if config.is_retired_provider_alias(&provider) {
+        bail!("provider id '{provider}' is reserved for a retired provider");
+    }
+    if config
+        .provider_instances
+        .get(&provider)
+        .is_some_and(|instance| instance.provider_type != provider)
+    {
+        bail!("provider instance '{provider}' uses a different protocol");
+    }
+    let base_url = args
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .map(|url| {
+            bamboo_config::validate_provider_base_url(url).map_err(anyhow::Error::msg)?;
+            Ok::<_, anyhow::Error>(url.trim_end_matches('/').to_string())
+        })
+        .transpose()?;
+    let saved = config
+        .provider_instances
+        .get(&provider)
+        .cloned()
+        .or_else(|| {
+            bamboo_config::synthesize_legacy_instances(&config)
+                .into_iter()
+                .find_map(|(id, instance)| (id == provider).then_some(instance))
+        });
+    if saved.as_ref().is_some_and(|instance| !instance.enabled) {
+        bail!("provider instance '{provider}' is disabled; enable it in provider settings");
+    }
+    let saved_endpoint = saved
+        .as_ref()
+        .and_then(|instance| instance.base_url.as_deref());
+    let has_custom_endpoint =
+        base_url.is_some() || saved_endpoint.is_some_and(|url| !url.is_empty());
+    let saved_model = saved
+        .as_ref()
+        .and_then(|instance| instance.model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "unknown");
+    let model = args
+        .model
+        .as_deref()
+        .or(saved_model)
+        .or_else(|| {
+            if has_custom_endpoint {
+                None
+            } else {
+                default_model_for(&provider)
+            }
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "unknown")
+        .context("supply the gateway model id with --model")?
+        .to_string();
 
     // 2. Overwrite guard — don't silently clobber an existing key.
     if provider_has_key(&config, &provider) && !args.force {
@@ -97,31 +165,63 @@ pub fn run_init(args: InitArgs) -> Result<()> {
         bail!("API key must not be empty");
     }
 
-    // 4. Model (explicit, else a sensible provider default).
-    let model = args
-        .model
-        .or_else(|| default_model_for(&provider).map(String::from));
-
-    // 5. Apply + persist. Credential storage is committed before the metadata
-    // sidecar so no ordinary config document ever contains the plaintext.
+    // 4. Commit metadata together with the credential.
     config.provider = provider.clone();
-    configure_provider_credential(&mut config, &provider, &api_key)?;
-    if let Some(m) = &model {
-        set_provider_model(&mut config, &provider, m)?;
+    if let Some(defaults) = config.defaults.as_mut() {
+        if defaults.chat.provider != provider || defaults.chat.model != model {
+            defaults.chat = bamboo_domain::ProviderModelRef::new(provider.clone(), model.clone());
+        }
     }
-    let provider_intents = BTreeSet::from([provider.clone()]);
-    bamboo_config::persist_provider_credential_transaction(
-        &data_dir,
-        &mut config,
-        &provider_intents,
-    )?;
+    let mut legacy_intents = BTreeSet::new();
+    let mut instance_intents = BTreeSet::new();
+    if config.has_provider_instances() {
+        let mut instance = match saved {
+            Some(instance) => instance,
+            None => serde_json::from_value(serde_json::json!({
+                "provider_type": provider,
+                "api_key_from_env": true,
+            }))?,
+        };
+        instance.api_key.clone_from(&api_key);
+        instance.model = Some(model.clone());
+        if base_url.is_some() {
+            instance.base_url.clone_from(&base_url);
+        }
+        config.default_provider_instance = Some(provider.clone());
+        config.provider_instances.insert(provider.clone(), instance);
+        instance_intents.insert(provider.clone());
+    } else {
+        config.default_provider_instance = None;
+        configure_provider_credential(&mut config, &provider, &api_key)?;
+        set_provider_model(&mut config, &provider, &model)?;
+        if let Some(base_url) = base_url.as_ref() {
+            set_provider_base_url(&mut config, &provider, base_url)?;
+        }
+        legacy_intents.insert(provider.clone());
+    }
+    if let Some(revision) = providers_revision {
+        bamboo_config::persist_provider_credential_transaction_at_revision(
+            &data_dir,
+            &mut config,
+            &legacy_intents,
+            &instance_intents,
+            revision,
+        )?;
+    } else {
+        bamboo_config::persist_provider_instance_credential_transaction(
+            &data_dir,
+            &mut config,
+            &legacy_intents,
+            &instance_intents,
+        )?;
+    }
 
-    // 6. Report + next steps.
-    let path = data_dir.join("config.json");
-    println!("✓ Wrote {}", path.display());
+    // 5. Report + next steps.
+    println!("✓ Saved provider settings in {}", data_dir.display());
     println!("  provider = {provider}");
-    if let Some(m) = &model {
-        println!("  model    = {m}");
+    println!("  model    = {model}");
+    if let Some(url) = base_url.as_ref() {
+        println!("  base_url = {url}");
     }
     println!("  api_key  = {} (stored encrypted)", mask_secret(&api_key));
     println!();
@@ -143,32 +243,38 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
     println!("Bamboo doctor — data dir: {}", data_dir.display());
     println!();
 
-    // 1. config.json presence.
+    // 1. Config source.
     if config_path.exists() {
         ok(&format!("config.json found ({})", config_path.display()));
+    } else if bamboo_config::modular_authority_boundary_present(&data_dir)? {
+        info("using modular configuration");
     } else {
-        err(&format!(
-            "config.json not found ({}) — run `bamboo init`",
-            config_path.display()
-        ));
-        errors += 1;
+        info("using built-in defaults and environment");
     }
 
     let config = Config::from_data_dir_without_publish(Some(data_dir.clone()));
 
     // 2. Active provider + credential.
-    let provider = config.provider.clone();
+    let provider = config.effective_default_provider();
     if provider.trim().is_empty() {
         err("no default provider set — run `bamboo init`");
         errors += 1;
     } else {
         info(&format!("default provider = {provider}"));
-        match provider_credential_status(&config, &provider) {
+        if config
+            .provider_instances
+            .get(provider)
+            .is_some_and(|instance| !instance.enabled)
+        {
+            err(&format!("provider instance '{provider}' is disabled"));
+            errors += 1;
+        }
+        match provider_credential_status(&config, provider) {
             CredentialStatus::Present => ok(&format!("provider '{provider}' has an API key")),
             CredentialStatus::Missing => {
                 err(&format!(
-                    "provider '{provider}' has no API key — run `bamboo init` or \
-                     `bamboo config set providers.{provider}.api_key <key>`"
+                    "provider '{provider}' has no API key — use the provider's runtime environment \
+                     or configure its credential with `bamboo init` or provider settings"
                 ));
                 errors += 1;
             }
@@ -177,6 +283,16 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
                     "provider '{provider}' is not a recognized keyed provider; cannot verify a credential"
                 ));
                 warns += 1;
+            }
+        }
+        match config
+            .get_model()
+            .filter(|model| !model.trim().is_empty() && model != "unknown")
+        {
+            Some(model) => info(&format!("default model = {model}")),
+            None => {
+                err("no default model configured — set a provider model in settings or with its environment variable");
+                errors += 1;
             }
         }
     }
@@ -624,6 +740,23 @@ fn set_provider_model(config: &mut Config, provider: &str, model: &str) -> Resul
     Ok(())
 }
 
+fn set_provider_base_url(config: &mut Config, provider: &str, url: &str) -> Result<()> {
+    let providers = config.providers_mut();
+    let base_url = match provider {
+        "anthropic" => {
+            &mut providers
+                .anthropic
+                .get_or_insert_with(empty_provider)
+                .base_url
+        }
+        "openai" => &mut providers.openai.get_or_insert_with(empty_provider).base_url,
+        "gemini" => &mut providers.gemini.get_or_insert_with(empty_provider).base_url,
+        _ => bail!("unsupported provider '{provider}'"),
+    };
+    *base_url = Some(url.to_string());
+    Ok(())
+}
+
 enum CredentialStatus {
     Present,
     Missing,
@@ -631,6 +764,12 @@ enum CredentialStatus {
 }
 
 fn provider_credential_status(config: &Config, provider: &str) -> CredentialStatus {
+    if let Some(instance) = config.provider_instances.get(provider) {
+        return key_status(Some((
+            &instance.api_key,
+            instance.api_key_encrypted.as_deref(),
+        )));
+    }
     match provider {
         "anthropic" => key_status(
             config
