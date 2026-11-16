@@ -67,6 +67,7 @@ impl ModelCatalogService {
                         capabilities: ModelCapabilities {
                             supports_vision: provider.as_ref().unwrap().supports_vision(&id).await,
                             max_context_tokens: upstream.and_then(|info| info.max_context_tokens),
+                            max_input_tokens: upstream.and_then(|info| info.max_input_tokens),
                             max_output_tokens: upstream.and_then(|info| info.max_output_tokens),
                             ..ModelCapabilities::default()
                         },
@@ -118,6 +119,7 @@ impl ModelCatalogService {
                 capabilities: ModelCapabilities {
                     supports_vision: provider.supports_vision(&info.id).await,
                     max_context_tokens: info.max_context_tokens,
+                    max_input_tokens: info.max_input_tokens,
                     max_output_tokens: info.max_output_tokens,
                     ..ModelCapabilities::default()
                 },
@@ -338,6 +340,7 @@ mod tests {
                 vec![ProviderModelInfo {
                     id: "dynamic-model".to_string(),
                     max_context_tokens: Some(264_000),
+                    max_input_tokens: Some(250_000),
                     max_output_tokens: Some(64_000),
                 }],
             )],
@@ -349,6 +352,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].capabilities.max_context_tokens, Some(264_000));
         assert_eq!(models[0].capabilities.max_output_tokens, Some(64_000));
+        assert_eq!(models[0].capabilities.max_input_tokens, Some(250_000));
     }
 
     #[tokio::test]

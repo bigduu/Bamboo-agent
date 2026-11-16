@@ -140,9 +140,10 @@ GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
-`max_output_tokens` and the provider's wire cap still bound the request. An
-interrupted attempt can resume from confirmed tool results when the request
-allows recovery. The recovery request count is bounded, and an explicit
+The [model limits](#model-limits-model_limitsjson) determine the output cap for
+Messages, Chat Completions, Responses and Gemini. An interrupted attempt can
+resume from confirmed tool results when the request allows recovery. The
+recovery request count is bounded, and an explicit
 `run_budget.max_total_tokens` applies to recovery. The
 `thinking_replay_always` option controls history replay independently.
 
@@ -728,10 +729,8 @@ still enforces explicit policy and platform denials.
 
 ## Model limits (`model_limits.json`)
 
-A separate file, `${data_dir}/model_limits.json` — user-supplied
-context/output token limit overrides. Explicit user matches take precedence
-over provider runtime metadata. The legacy standalone representation is a raw
-array:
+`${data_dir}/model_limits.json` supplies context and output limits for individual
+models or model families. The legacy standalone representation uses a raw array.
 
 ```json
 [
@@ -743,19 +742,20 @@ array:
 runtime model id; `*` and other glob characters have no special meaning.
 Among substring matches, the longest pattern wins.
 
-`max_context_tokens` is the provider's **total input + output context
-window**, not its input allowance alone. Bamboo derives the per-request input
-limit as:
+`max_context_tokens` configures a **joint input and output window**.
+Bamboo checks the selected route for independent input, output and combined
+limits. Where configuration and metadata both provide a ceiling, the lower
+value applies. An omitted output field can use the provider's value. The sum of
+independent input and output ceilings is a planning bound when the joint window
+is unknown.
 
-```text
-max_request_input_tokens =
-    max_context_tokens - max_output_tokens - safety_margin
-```
-
-`safety_margin` is optional. When `max_output_tokens` is omitted, Bamboo
-derives it from the context window. Provider metadata that exposes separate
-`max_input_tokens` and `max_output_tokens` is normalized to the same total
-context-window contract before runtime budgeting.
+For ordinary Agent turns with model limits, Bamboo reserves working space
+during context preparation and recomputes the output allowance after projecting
+the final input and tools. A joint window bounds output by the space left after
+the measured input and `safety_margin`. An independent input ceiling is also
+checked. The counting margin is optional and defaults to the model window's
+derived margin. Numeric body overrides can lower the wire cap. Body patches that
+rewrite prompt content can change the provider's actual token count.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
@@ -769,10 +769,9 @@ engine-level `TokenBudget` remains an intentional higher-priority override. Mana
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
-With no matching user or provider value, Bamboo falls back to a global default
-of 1M total context / 32K per-request output allowance. There is deliberately **no built-in
-per-model table**, so stale hard-coded model names cannot override live
-provider metadata.
+With no matching user or provider limit, Bamboo uses compatibility limits of
+1M total context and 32K output for planning. Provider limits come from the
+selected route's catalog and are cached briefly.
 
 ## Schedules (`schedules.json`)
 

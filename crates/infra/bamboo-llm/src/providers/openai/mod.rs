@@ -40,6 +40,7 @@ use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     responses_only_models: Vec<String>,
@@ -70,6 +71,7 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
@@ -848,6 +850,20 @@ impl LLMProvider for OpenAIProvider {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "OpenAI").await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        self.model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "OpenAI",
+                model_fetcher::ModelListFormat::Compatible,
+            )
+            .await
     }
 }
 

@@ -3106,6 +3106,7 @@ pub(super) async fn prepare_round_context(
             llm.as_ref(),
         )
         .await;
+        budget.output_reserve_tokens = None;
         if let Some(host) = binding.payload.token_budget.as_ref() {
             let input_limit = host
                 .max_request_input_tokens()

@@ -1780,6 +1780,8 @@ mod tests {
         TokenBudget {
             max_context_tokens: 1000,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -1907,6 +1909,8 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: 1200,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -1982,6 +1986,8 @@ mod tests {
         session.token_budget = Some(TokenBudget {
             max_context_tokens: 100_000,
             max_output_tokens: 1_000,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -2038,6 +2044,8 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: 1200,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -2195,6 +2203,8 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: 1200,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -2287,6 +2297,8 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: 1200,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,
@@ -2550,6 +2562,8 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: 1200,
             max_output_tokens: 100,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy: BudgetStrategy::Hybrid {
                 window_size: 20,
                 enable_summarization: true,

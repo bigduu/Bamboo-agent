@@ -294,6 +294,20 @@ pub(crate) async fn execute_llm_round(
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
+    // Resolve mutable host handles once for the whole request. The model
+    // catalog, capability projection and provider send must use one route.
+    let request_provider = if config.provider_name.is_some()
+        && session.authority_identity.is_ordinary()
+        && host_gold_attempt.is_none()
+    {
+        Some(
+            bamboo_llm::provider::queued_snapshot_for(llm.clone())
+                .map_err(|error| AgentError::LLM(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let llm = request_provider.as_ref().unwrap_or(llm);
     // Scope prepared image descriptions to this request. A configuration reused
     // across rounds must never serve a description produced for another request.
     config.vision_description_reuse.clear();
@@ -339,8 +353,7 @@ pub(crate) async fn execute_llm_round(
         provider_type: config.provider_type.as_deref(),
         reasoning_effort: config.reasoning_effort,
         output_limit_recovery,
-        max_context_tokens: prepared.budget.max_context_tokens,
-        max_output_tokens: prepared.budget.max_output_tokens,
+        budget: &prepared.budget,
         observation_progress_hint,
         prompt_memory_exposure,
     };

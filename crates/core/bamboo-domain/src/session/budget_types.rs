@@ -5,10 +5,17 @@ use serde::{Deserialize, Serialize};
 /// Token budget configuration for a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBudget {
-    /// Maximum context window size for the model (input + output)
+    /// Joint input/output window used for planning.
     pub max_context_tokens: u32,
-    /// Maximum tokens reserved for model output
+    /// Maximum tokens available for model output.
     pub max_output_tokens: u32,
+    /// An independently reported input ceiling, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u32>,
+    /// Amount to reserve during prompt preparation. An absent reserve uses the
+    /// full output ceiling and keeps the fixed budget contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reserve_tokens: Option<u32>,
     /// Budget enforcement strategy
     pub strategy: BudgetStrategy,
     /// Safety margin for tokenizer estimation errors
@@ -112,6 +119,8 @@ impl TokenBudget {
         Self {
             max_context_tokens,
             max_output_tokens,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy,
             safety_margin,
             compression_trigger_percent: default_compression_trigger_percent(),
@@ -136,6 +145,8 @@ impl TokenBudget {
         Self {
             max_context_tokens,
             max_output_tokens,
+            max_input_tokens: None,
+            output_reserve_tokens: None,
             strategy,
             safety_margin,
             compression_trigger_percent: default_compression_trigger_percent(),
@@ -153,13 +164,36 @@ impl TokenBudget {
 
     /// Maximum estimated input tokens that may be sent in one model request.
     ///
-    /// `max_context_tokens` is the provider's total input + output window, so
-    /// prompt preparation must reserve both the configured output allowance and
-    /// the tokenizer-estimation safety margin before selecting input messages.
+    /// Prompt preparation reserves working space and the counting margin, then
+    /// intersects the result with any independent input ceiling.
     pub fn max_request_input_tokens(&self) -> u32 {
+        let joint_limit = self
+            .max_context_tokens
+            .saturating_sub(self.output_reserve())
+            .saturating_sub(self.safety_margin);
+        joint_limit.min(self.input_ceiling())
+    }
+
+    pub fn output_reserve(&self) -> u32 {
+        self.output_reserve_tokens
+            .unwrap_or(self.max_output_tokens)
+            .min(self.max_output_tokens)
+    }
+
+    pub fn input_ceiling(&self) -> u32 {
+        self.max_input_tokens
+            .map_or(u32::MAX, |limit| limit.saturating_sub(self.safety_margin))
+    }
+
+    /// Maximum output that fits the measured request and this model's window.
+    pub fn output_limit_for_input(&self, input_tokens: u32) -> u32 {
+        if input_tokens > self.input_ceiling() {
+            return 0;
+        }
         self.max_context_tokens
-            .saturating_sub(self.max_output_tokens)
+            .saturating_sub(input_tokens)
             .saturating_sub(self.safety_margin)
+            .min(self.max_output_tokens)
     }
 
     /// Resolve one range shared by summarization, archival and prompt fitting.
@@ -172,7 +206,7 @@ impl TokenBudget {
         let window = self.max_context_tokens;
         let input_limit = self.max_request_input_tokens();
         let headroom = self
-            .max_output_tokens
+            .output_reserve()
             .max(self.safety_margin)
             .max(1)
             .min((input_limit / 5).max(1));

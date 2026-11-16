@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::provider::{
-    current_completion_diagnostics, OutputLimitRecoveryControls, Result,
+    current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, Result,
     OUTPUT_LIMIT_CONVERGENCE_HINT,
 };
 use bamboo_config::{
@@ -146,12 +146,27 @@ pub(crate) fn mask_and_prepare_agent_request(
         ),
         _ => return Ok(()),
     };
+    let legacy_limit_path = (endpoint == ENDPOINT_CHAT_COMPLETIONS).then_some("/max_tokens");
+    if let Some(window_limit) = diagnostics.model_window_limit() {
+        let mut has_output_control = false;
+        for path in std::iter::once(limit_path).chain(legacy_limit_path) {
+            if let Some(field) = body.pointer_mut(path) {
+                let configured = field.as_u64().ok_or_else(|| {
+                    LLMError::RequestFailed("Model output limit must be an integer".into())
+                })?;
+                *field = Value::from(configured.min(u64::from(window_limit)));
+                has_output_control = true;
+            }
+        }
+        if !has_output_control {
+            return Err(LLMError::RequestFailed(
+                "Model window requires an output limit on the final request".into(),
+            ));
+        }
+    }
     let limit = body
         .pointer(limit_path)
-        .or_else(|| match endpoint {
-            ENDPOINT_CHAT_COMPLETIONS => body.get("max_tokens"),
-            _ => None,
-        })
+        .or_else(|| legacy_limit_path.and_then(|path| body.pointer(path)))
         .and_then(Value::as_u64)
         .filter(|limit| *limit > 0);
     let effort = body
@@ -744,6 +759,47 @@ mod tests {
             .await;
             assert!(diagnostics.output_limit_recovery().is_none(), "{endpoint}");
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_a_tighter_window_and_records_the_actual_wire_limit() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"max_tokens":4096});
+        let initial =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+        initial.mark_compatible_messages();
+        scope_completion_diagnostics(initial.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        let recovery = initial.output_limit_recovery().unwrap().for_task_split();
+        let follow_up =
+            CompletionDiagnostics::for_agent_round(Some(recovery.tighten_output_limit(3900)))
+                .with_model_window_limit(Some(3900));
+        follow_up.mark_compatible_messages();
+        scope_completion_diagnostics(follow_up.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        assert_eq!(body["max_tokens"], 3900);
+        assert_eq!(follow_up.output_limit(), Some(3900));
+        assert!(follow_up.output_limit_recovery().is_none());
     }
 
     #[tokio::test]

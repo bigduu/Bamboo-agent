@@ -5,6 +5,16 @@ use futures::StreamExt;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
+async fn generation_requests(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect()
+}
+
 #[tokio::test]
 async fn actual_provider_failure_receipt_reaches_the_session_and_survives_cold_storage() {
     let server = MockServer::start().await;
@@ -40,7 +50,7 @@ async fn actual_provider_failure_receipt_reaches_the_session_and_survives_cold_s
     assert_eq!(persisted.diagnostic_id(), captured.diagnostic_id());
     assert!(persisted.matches_error_message(&cold.last_run_error().unwrap()));
     assert_eq!(
-        server.received_requests().await.unwrap().len(),
+        generation_requests(&server).await.len(),
         bamboo_llm::retry::global().max_attempts as usize
     );
 }
@@ -126,7 +136,7 @@ async fn connector_exhaustion_preserves_context_and_never_replays_successful_too
     assert!(error.to_string().contains("temporarily recovering"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(tools.0.load(Ordering::SeqCst), 1);
-    let requests = server.received_requests().await.unwrap();
+    let requests = generation_requests(&server).await;
     assert_eq!(
         requests.len(),
         bamboo_llm::retry::global().max_attempts as usize
@@ -206,7 +216,7 @@ async fn connector_recovery_then_zero_semantic_stream_failure_does_not_reset_htt
         .await
         .unwrap_err();
     assert!(matches!(error, AgentError::LLMNonRetryable(_)));
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(generation_requests(&server).await.len(), 2);
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
     assert_eq!(
         saved
@@ -391,7 +401,7 @@ async fn cancelling_anthropic_backoff_stops_without_another_model_request() {
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     let cancellation = async {
-        while server.received_requests().await.unwrap().is_empty() {
+        while generation_requests(&server).await.is_empty() {
             tokio::task::yield_now().await;
         }
         trigger.cancel();
@@ -405,7 +415,7 @@ async fn cancelling_anthropic_backoff_stops_without_another_model_request() {
     .await
     .unwrap();
     assert!(matches!(result, Err(AgentError::Cancelled)));
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(generation_requests(&server).await.len(), 1);
 }
 
 const RECOVERIES_BEFORE_REJECTION: usize = 3;
@@ -442,7 +452,7 @@ async fn connector_recovery_then_terminal_422_does_not_reset_the_request_budget(
     assert!(error.to_string().contains("422"));
     // A larger ceiling does not authorize retrying the first terminal response.
     assert!(bamboo_llm::retry::global().max_attempts as usize > RECOVERIES_BEFORE_REJECTION + 1);
-    let requests = server.received_requests().await.unwrap();
+    let requests = generation_requests(&server).await;
     assert_eq!(requests.len(), RECOVERIES_BEFORE_REJECTION + 1);
     assert!(requests
         .iter()
@@ -541,7 +551,7 @@ async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
         }
         other => panic!("expected bounded post-headers provider hang, got {other:?}"),
     }
-    let requests = server.received_requests().await.unwrap();
+    let requests = generation_requests(&server).await;
     assert_eq!(requests.len(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -568,7 +578,7 @@ async fn anthropic_zero_semantic_stream_timeout_does_not_restart_a_managed_budge
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut buffer = [0; 4096];
@@ -578,6 +588,11 @@ async fn anthropic_zero_semantic_stream_timeout_does_not_restart_a_managed_budge
                 request.extend_from_slice(&buffer[..read]);
                 if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    if attempt == 0 {
+                        assert!(headers.starts_with("get /models "));
+                        break;
+                    }
+                    assert!(headers.starts_with("post /messages "));
                     let length = headers
                         .lines()
                         .find_map(|l| l.strip_prefix("content-length:"))
@@ -591,6 +606,11 @@ async fn anthropic_zero_semantic_stream_timeout_does_not_restart_a_managed_budge
                 }
             }
             if attempt == 0 {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}")
+                    .await
+                    .unwrap();
+            } else if attempt == 1 {
                 let body = serde_json::json!({"error":{"type":"auth_error","message":RECOVERY}})
                     .to_string();
                 socket.write_all(format!("HTTP/1.1 401 Error\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -642,7 +662,7 @@ async fn credential_and_permission_denials_with_overflow_text_remain_terminal() 
             .await
             .unwrap_err();
         assert!(matches!(error, AgentError::LLMNonRetryable(_)), "{error:?}");
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(generation_requests(&server).await.len(), 1);
         let saved = storage.load_session(&session.id).await.unwrap().unwrap();
         assert!(saved
             .messages
@@ -772,7 +792,7 @@ async fn execute_opt_in_retries_initial_http_without_replaying_tools_or_user_mes
         assert_eq!(hits.load(Ordering::SeqCst), if continuous { 4 } else { 1 });
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(tools.0.load(Ordering::SeqCst), 1);
-        let requests = server.received_requests().await.unwrap();
+        let requests = generation_requests(&server).await;
         assert!(requests.iter().all(|r| r.body == requests[0].body));
         let cold = storage.load_session(&session.id).await.unwrap().unwrap();
         assert_eq!(
@@ -863,7 +883,7 @@ async fn actual_openai_bounded_consumer_stops_when_retry_after_cannot_fit_withou
         .expect("long hint must terminate without resetting a turn")
         .unwrap_err();
         assert!(matches!(error, AgentError::LLMNonRetryable(_)));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(generation_requests(&server).await.len(), 1);
         let cold = storage.load_session(&session.id).await.unwrap().unwrap();
         assert_eq!(
             cold.messages
@@ -925,5 +945,5 @@ async fn legacy_public_http_policy_cannot_be_reset_by_an_engine_turn_retry() {
     .unwrap()
     .unwrap_err();
     assert!(matches!(error, AgentError::LLMNonRetryable(_)));
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(generation_requests(&server).await.len(), 1);
 }

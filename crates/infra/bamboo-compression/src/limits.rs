@@ -1,10 +1,8 @@
 //! Model context window limits registry.
 //!
-//! There is intentionally **no** built-in per-model table. Real per-model
-//! values come from provider runtime metadata (e.g. Copilot reports real
-//! context/output) and user overrides persisted in `model_limits.json`.
-//! Runtime resolution gives explicit user configuration precedence over
-//! provider metadata.
+//! Runtime model limits come from provider metadata and user settings in
+//! `model_limits.json`. The registry resolves the local settings and supplies
+//! the compatibility fallback for models with unknown limits.
 //!
 //! Anything without a match falls back to a single global default
 //! (`DEFAULT_MAX_CONTEXT_TOKENS` / `DEFAULT_MAX_OUTPUT_TOKENS`). This keeps the
@@ -317,6 +315,8 @@ pub fn create_budget_for_model(
     crate::TokenBudget {
         max_context_tokens: limit.max_context_tokens,
         max_output_tokens: limit.get_max_output_tokens(),
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy,
         safety_margin: limit.get_safety_margin(),
         compression_trigger_percent: 85, // legacy — only used when working_reserve_tokens == 0
