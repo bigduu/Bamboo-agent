@@ -199,8 +199,12 @@ On compatible Messages routes, automatic agent requests for DeepSeek V4 and
 when the request and provider leave effort unset. Explicit effort and reasoning
 body patches keep priority.
 
-DeepSeek treats `thinking.budget_tokens` as an ignored compatibility field.
-[DeepSeek Messages API](https://api-docs.deepseek.com/zh-cn/api/create-message/)
+Before sending a Messages request, Bamboo discards the retired
+`thinking.budget_tokens` and `thinking_budget` fields that a saved body patch
+may supply. If such a patch removed the selected tier, Bamboo restores it as
+`output_config.effort`. When a retired budget came with an enabled thinking
+block, Bamboo uses the selected or explicit effort to choose the modern mode.
+If there is no effort, Bamboo omits that block so the model can use its default.
 
 For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
 stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.

@@ -93,6 +93,58 @@ fn is_official_anthropic_base_url(base_url: &str) -> bool {
         || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
 }
 
+fn remove_legacy_thinking_budget(body: &mut Value, selected_effort: Option<ReasoningEffort>) {
+    let Some(fields) = body.as_object_mut() else {
+        return;
+    };
+    let had_legacy_budget = fields.remove("thinking_budget").is_some();
+    let had_nested_budget = fields
+        .get_mut("thinking")
+        .and_then(Value::as_object_mut)
+        .and_then(|thinking| thinking.remove("budget_tokens"))
+        .is_some();
+    if !had_legacy_budget && !had_nested_budget {
+        return;
+    }
+
+    let thinking_mode = fields
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+    let replace_legacy_mode =
+        thinking_mode == Some("enabled") || (had_nested_budget && thinking_mode.is_none());
+    let wire_effort = fields
+        .get("output_config")
+        .and_then(|output| output.get("effort"))
+        .and_then(Value::as_str);
+    let replacement_mode = match wire_effort.or(selected_effort.map(ReasoningEffort::as_str)) {
+        Some("none") => Some("disabled"),
+        Some(_) => Some("adaptive"),
+        None => None,
+    };
+
+    // An old override may have removed the modern effort together with
+    // installing the numeric budget. Restore the selected tier in that case.
+    if wire_effort.is_none() && thinking_mode != Some("disabled") {
+        if let Some(effort) = selected_effort.filter(|effort| *effort != ReasoningEffort::Disabled)
+        {
+            let output = fields.entry("output_config").or_insert_with(|| json!({}));
+            if !output.is_object() {
+                *output = json!({});
+            }
+            output["effort"] = json!(effort.as_str());
+        }
+    }
+
+    if replace_legacy_mode {
+        if let Some(mode) = replacement_mode {
+            body["thinking"]["type"] = json!(mode);
+        } else {
+            fields.remove("thinking");
+        }
+    }
+}
+
 fn is_deepseek_v4_model(model: &str) -> bool {
     let model = model
         .trim()
@@ -556,6 +608,7 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
+        remove_legacy_thinking_budget(&mut body, reasoning_effort);
         apply_required_tool_choice(&mut body, required_tool);
         // A compatible gateway can enforce reasoning without advertising it
         // on the request. This identifies the wire controls for recovery.
@@ -611,12 +664,8 @@ impl AnthropicProvider {
             .pointer("/thinking/type")
             .and_then(Value::as_str)
             .is_some_and(|mode| mode != "disabled");
-        let thinking_budget_tokens = body
-            .get("thinking")
-            .and_then(|thinking| thinking.get("budget_tokens"))
-            .and_then(|value| value.as_u64());
         tracing::info!(
-            "[session_hash={}] Anthropic request model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} purpose_hash={}",
+            "[session_hash={}] Anthropic request model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} max_tokens={} purpose_hash={}",
             log_identity(session_log_id),
             log_identity(model),
             applied_reasoning_effort
@@ -625,9 +674,6 @@ impl AnthropicProvider {
             reasoning_source,
             applied_reasoning_effort.is_some(),
             thinking_enabled,
-            thinking_budget_tokens
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string()),
             max_tokens,
             log_identity(request_purpose)
         );
@@ -669,7 +715,6 @@ impl AnthropicProvider {
         let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
-            request_thinking_budget_tokens: thinking_budget_tokens,
             completion_diagnostics,
             ..Default::default()
         }));
@@ -1790,7 +1835,6 @@ pub struct AnthropicStreamState {
     saw_thinking_signal: bool,
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
-    request_thinking_budget_tokens: Option<u64>,
     native_blocks_by_index: HashMap<usize, Value>,
     native_input_json_by_index: HashMap<usize, String>,
     /// Thinking blocks that have received a signature delta. This ordering
@@ -2556,16 +2600,12 @@ pub fn parse_anthropic_sse_event(
         "message_stop" => {
             if state.request_thinking_enabled || state.saw_thinking_signal {
                 tracing::info!(
-                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} request_thinking_budget_tokens={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
+                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
                     state
                         .requested_reasoning_effort
                         .map(ReasoningEffort::as_str)
                         .unwrap_or("none"),
                     state.request_thinking_enabled,
-                    state
-                        .request_thinking_budget_tokens
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
                     state.saw_thinking_signal,
                     state.thinking_blocks_started,
                     state.thinking_chars_streamed
@@ -7676,7 +7716,7 @@ mod anthropic_provider_tests {
     }
 
     #[tokio::test]
-    async fn deepseek_messages_default_respects_an_effort_body_patch() {
+    async fn deepseek_messages_default_respects_modern_effort_and_ignores_retired_budget() {
         use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
 
         let server = MockServer::start().await;
@@ -7687,33 +7727,163 @@ mod anthropic_provider_tests {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(ANTHROPIC_SSE_OK),
             )
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
-        let overrides = serde_json::from_value(json!({"common":{"body_patch":[
-            {"op":"set","path":"/output_config/effort","value":"none"}
-        ]}}))
-        .unwrap();
-        let provider = AnthropicProvider::new("test-key")
-            .with_base_url(server.uri())
-            .with_request_overrides(Some(overrides));
-        drop(
-            scope_completion_diagnostics(
-                CompletionDiagnostics::for_agent_round(None),
-                provider.chat_stream(
-                    &[Message::user("Inspect the fixture.")],
-                    &[],
-                    Some(4096),
-                    "deepseek-flash",
-                ),
-            )
-            .await
-            .unwrap(),
+        for (patch, mode, effort) in [
+            (
+                json!({"op":"set","path":"/output_config/effort","value":"none"}),
+                None,
+                Some("none"),
+            ),
+            (
+                json!({"op":"set","path":"/thinking/budget_tokens","value":16384}),
+                Some("adaptive"),
+                Some(DEFAULT_REASONING_EFFORT.as_str()),
+            ),
+            (
+                json!({"op":"set","path":"/thinking/type","value":"enabled"}),
+                Some("enabled"),
+                None,
+            ),
+        ] {
+            let overrides =
+                serde_json::from_value(json!({"common":{"body_patch":[patch]}})).unwrap();
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_request_overrides(Some(overrides));
+            drop(
+                scope_completion_diagnostics(
+                    CompletionDiagnostics::for_agent_round(None),
+                    provider.chat_stream(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        "deepseek-flash",
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
+            assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
+            assert!(body.pointer("/thinking/budget_tokens").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_never_send_retired_budgets_from_saved_overrides() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(|request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                if body.get("thinking_budget").is_some()
+                    || body.pointer("/thinking/budget_tokens").is_some()
+                {
+                    return ResponseTemplate::new(400)
+                        .set_body_string("Parameter thinking_budget is not supported.");
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK)
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        for (selected_effort, override_effort, expected_mode, expected_effort) in [
+            (
+                Some(ReasoningEffort::Max),
+                None,
+                Some("adaptive"),
+                Some("max"),
+            ),
+            (None, None, None, None),
+            (
+                Some(ReasoningEffort::Disabled),
+                None,
+                Some("disabled"),
+                None,
+            ),
+            (
+                Some(ReasoningEffort::Max),
+                Some("medium"),
+                Some("adaptive"),
+                Some("medium"),
+            ),
+        ] {
+            let mut patches = vec![
+                json!({"op":"set","path":"/thinking","value":{"type":"enabled","budget_tokens":16384}}),
+                json!({"op":"remove","path":"/output_config"}),
+                json!({"op":"set","path":"/stop_sequences","value":["done"]}),
+            ];
+            if let Some(effort) = override_effort {
+                patches.push(json!({"op":"set","path":"/output_config/effort","value":effort}));
+            }
+            let overrides = serde_json::from_value(json!({
+                "common":{"body_patch":[{"op":"set","path":"/thinking_budget","value":32768}]},
+                "endpoints":{"messages":{"body_patch":patches}}
+            }))
+            .unwrap();
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_request_overrides(Some(overrides));
+            let options = LLMRequestOptions {
+                reasoning_effort: selected_effort,
+                ..Default::default()
+            };
+            drop(
+                provider
+                    .chat_stream_with_options(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        "custom-route",
+                        Some(&options),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert!(body.get("thinking_budget").is_none());
+            assert!(body.pointer("/thinking/budget_tokens").is_none());
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                expected_mode
+            );
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["stop_sequences"], json!(["done"]));
+        }
+    }
+
+    #[test]
+    fn retiring_a_budget_keeps_other_output_config_and_thinking_settings() {
+        let mut body = json!({
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking_budget": 16_384,
+            "output_config": {"format": {"type": "json_schema"}}
+        });
+        remove_legacy_thinking_budget(&mut body, Some(ReasoningEffort::Xhigh));
+        assert_eq!(
+            body,
+            json!({
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"format": {"type": "json_schema"}, "effort": "xhigh"}
+            })
         );
-        let requests = server.received_requests().await.unwrap();
-        let body: Value = requests[0].body_json().unwrap();
-        assert_eq!(body["output_config"]["effort"], "none");
-        assert!(body.get("thinking").is_none());
     }
 
     #[tokio::test]
