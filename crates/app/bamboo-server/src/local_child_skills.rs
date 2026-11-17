@@ -15,8 +15,8 @@ use bamboo_engine::runtime::managers::lifecycle::{
     with_scoped_input_request_data, BoundedInputRequestBatch, ProjectedInputRequest,
 };
 use bamboo_server_tools::skill_runtime::{
-    skill_response_byte_budget, SkillCatalogCaller, SkillCatalogCallerResolver, SkillsListTool,
-    SkillsReadTool,
+    skill_response_byte_budget, SkillCatalogCaller, SkillCatalogCallerResolver, SkillScopeLease,
+    SkillsListTool, SkillsReadTool,
 };
 use bamboo_server_tools::{OverlayToolExecutor, ToolSurface, ToolSurfaceFactory};
 use bamboo_skills::progressive::{render_skill_usage_instructions, SkillMetadataBudget};
@@ -106,6 +106,7 @@ impl LocalChildSkillFactory for ServerChildSkillFactory {
             config: self.config.clone(),
             sessions: self.sessions.clone(),
             projects: self.projects.clone(),
+            skill_scope_lease: Arc::new(SkillScopeLease::default()),
             live: AtomicBool::new(true),
             epoch: AtomicU64::new(0),
             current: RwLock::new(Current::default()),
@@ -173,6 +174,7 @@ struct ChildRun {
     config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     sessions: bamboo_engine::SessionRepository,
     projects: Arc<bamboo_projects::ProjectStore>,
+    skill_scope_lease: Arc<SkillScopeLease>,
     live: AtomicBool,
     epoch: AtomicU64,
     current: RwLock<Current>,
@@ -181,6 +183,7 @@ impl ChildRun {
     fn revoke(&self) {
         self.live.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.skill_scope_lease.close();
     }
     fn check_live(&self) -> Result<u64, ToolError> {
         if !self.live.load(Ordering::Acquire) || self.authority.cancel_token().is_cancelled() {
@@ -236,6 +239,7 @@ impl ChildRun {
             Arc::new(Resolver { run: self.clone() }),
         )
         .with_project_store(self.projects.clone())
+        .with_scope_lease(&self.skill_scope_lease)
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
         let epoch = self.check_live()?;

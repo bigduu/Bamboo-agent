@@ -574,6 +574,79 @@ async fn native_http_automatic_skill_prompt_is_task_bounded_and_metadata_only() 
     }
 }
 
+#[actix_web::test]
+async fn native_http_execute_reaches_model_after_idle_workspace_cache_fills() {
+    #[derive(Default)]
+    struct Provider(AtomicU64);
+
+    #[async_trait]
+    impl LLMProvider for Provider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("Workspace run completed".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("next-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let provider = Arc::new(Provider::default());
+    let state = state(&root, provider.clone()).await;
+    let project = state
+        .project_store
+        .create_with_project_path("Workspace churn", None, workspace.to_string_lossy(), vec![])
+        .unwrap();
+    let project_home = state.project_store.paths().project_home(&project.id);
+
+    // Populate the cache up to its idle Project/workspace store limit.
+    for index in 0..64 {
+        let previous = root.join(format!("previous-workspace-{index}"));
+        std::fs::create_dir(&previous).unwrap();
+        state
+            .skill_manager
+            .store_for_project_workspace(&project.id, &project_home, Some(&previous))
+            .await
+            .unwrap();
+    }
+
+    let id = "native-workspace-cache-churn";
+    let mut session = Session::new(id, "test-model");
+    session.title_generated = true;
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.to_string_lossy());
+    session.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+        "explicit".into(),
+    );
+    state.storage.save_session(&session).await.unwrap();
+    state
+        .workspace_resolver
+        .publish_resolved_workspace(id, workspace, "test_initial");
+    let (status, receipt) = http(
+        &state,
+        "/api/v1/chat",
+        json!({"session_id":id,"message":"Complete the new workspace run"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{receipt}");
+    let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    let terminal = done(&state, id).await;
+    assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+    assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+}
+
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
     static TAPS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>>> =
         std::sync::OnceLock::new();
