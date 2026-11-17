@@ -264,7 +264,7 @@ fn hash_field(fingerprint: &mut Sha256, bytes: &[u8]) {
     fingerprint.update(bytes);
 }
 
-const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
+const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "Write",
     "Edit",
     "NotebookEdit",
