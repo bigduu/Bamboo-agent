@@ -2168,8 +2168,6 @@ mod tests {
         let tools = builtin_tools();
         let aliases = [
             "read_file",
-            "file_exists",
-            "fileExists",
             "list_directory",
             "get_file_info",
             "getFileInfo",
