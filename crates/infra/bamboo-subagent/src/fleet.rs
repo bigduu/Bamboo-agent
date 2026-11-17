@@ -427,7 +427,6 @@ mod tests {
             Vec::<String>::new(),
             vec!["Read".into()],
             vec![
-                "Bash".into(),
                 "Edit".into(),
                 "Glob".into(),
                 "Read".into(),

@@ -247,6 +247,12 @@ pub trait ToolExecutor: Send + Sync {
         None
     }
 
+    /// Whether this exact local registration belongs to the native builtin
+    /// set. Inspect the concrete owner returned by `exact_tool_owner`.
+    fn local_tool_is_native_builtin(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Observe semantics through the existing exact-owner chain. Calling only
     /// the owner's local hook avoids recursion when an owner returns `self`.
     /// Opaque wrappers supply no provenance, even when their catalog has a name.

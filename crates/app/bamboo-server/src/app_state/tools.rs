@@ -56,7 +56,6 @@ pub(super) fn build_base_tools(
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
-    Arc<bamboo_tools::BuiltinToolExecutor>,
 ) {
     let ceiling_config = config.clone();
     let ceiling_projects = project_store.clone();
@@ -224,7 +223,7 @@ pub(super) fn build_base_tools(
         config: ceiling_config,
         projects: ceiling_projects,
     });
-    (base, ceiling, builtin_executor)
+    (base, ceiling)
 }
 
 /// Keep the actual instances and complete resolver assembled above. No Root
@@ -243,21 +242,22 @@ impl HostNativeToolCeiling {
         }) && self.builtin.eligible_native_tool(name)
     }
 
-    fn resolve(&self, reference: &str) -> Option<String> {
-        bamboo_domain::resolve_tool_reference_name(reference, |name| {
+    fn resolve_disabled(&self, reference: &str) -> Vec<String> {
+        let resolved = bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| {
             self.base.owns_exact_tool(name)
         })
-    }
-
-    fn resolve_disabled(&self, reference: &str) -> Vec<String> {
-        let Some(name) = self.resolve(reference) else {
+        .or_else(|| {
+            if self.native_owner("exec_command") || self.native_owner("write_stdin") {
+                return bamboo_domain::tool_names::retired_default_shell_policy_name(reference);
+            }
+            None
+        });
+        let Some(name) = resolved else {
             return Vec::new();
         };
         let mut names = vec![name.clone()];
         if name == "Bash" {
             names.push("write_stdin".into());
-        } else if name == "bash" && self.native_owner("bash") {
-            names.extend(["Bash".into(), "exec_command".into(), "write_stdin".into()]);
         }
         names.extend(bamboo_domain::legacy_shell_replacements(&name).map(str::to_owned));
         names
@@ -556,12 +556,10 @@ mod native_ceiling_tests {
         assert_eq!(
             source.observe(&child).await.unwrap(),
             [
-                "Bash",
                 "Edit",
                 "Glob",
                 "Read",
                 "Write",
-                "bash",
                 "exec_command",
                 "write_stdin"
             ]
@@ -615,7 +613,8 @@ mod native_ceiling_tests {
                 })
                 .to_string(),
             );
-            assert_eq!(source.observe(&child).await.unwrap(), tools);
+            let expected = if tools == ["Bash"] { vec![] } else { tools };
+            assert_eq!(source.observe(&child).await.unwrap(), expected);
         }
     }
 
@@ -624,7 +623,7 @@ mod native_ceiling_tests {
         let home = tempfile::tempdir().unwrap();
         let mut source = source(home.path());
         let mut child = bamboo_domain::Session::new_child("denied-child", "root", "", "");
-        for reference in ["Bash", "default::execute_command"] {
+        for reference in ["bash", "Bash", "default::execute_command"] {
             child.metadata.insert(
                 "disabled_tools".into(),
                 serde_json::to_string(&[reference]).unwrap(),
@@ -707,7 +706,7 @@ mod native_ceiling_tests {
             .unwrap();
         let mut foreign = source.projects.create("foreign fixture", None).unwrap();
         session.set_project_id_meta(project.id.as_str());
-        assert_eq!(source.observe(&session).await.unwrap().len(), 8);
+        assert_eq!(source.observe(&session).await.unwrap().len(), 6);
         session
             .metadata
             .insert("project_id".into(), "another-project".into());

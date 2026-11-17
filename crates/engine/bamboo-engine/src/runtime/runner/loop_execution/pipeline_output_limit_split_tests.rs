@@ -286,31 +286,29 @@ async fn run_compatible(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pipeline_output_limit_split_uses_foreground_bash_contract() {
-    use bamboo_tools::{
-        tools::foreground_bash::ForegroundBashTool, BuiltinToolExecutor, ToolRegistry,
-    };
+async fn pipeline_output_limit_split_checks_the_exec_command_exit_code() {
+    use bamboo_tools::{tools::ExecCommandTool, BuiltinToolExecutor, ToolRegistry};
 
-    for (command, success) in [
-        ("printf 'foreground evidence'", true),
-        ("printf 'foreground evidence'; exit 7", false),
+    for (command, exit_code) in [
+        ("printf 'shell evidence'", 0),
+        ("printf 'shell evidence'; exit 7", 7),
     ] {
         let registry = ToolRegistry::new();
-        registry.register(ForegroundBashTool).unwrap();
+        registry.register(ExecCommandTool::new()).unwrap();
         let mut replies = vec![
             limit(),
             text(r#"["Run the shell command","Use its output"]"#),
             mock_messages_completion(
-                json!({"type":"tool_use","id":"call_bash","name":"bash","input":{}}),
-                json!({"type":"input_json_delta","partial_json":json!({"command":command}).to_string()}),
+                json!({"type":"tool_use","id":"call_exec","name":"exec_command","input":{}}),
+                json!({"type":"input_json_delta","partial_json":json!({"cmd":command}).to_string()}),
                 "tool_use",
                 Some(9),
             ),
         ];
-        if success {
+        if exit_code == 0 {
             replies.extend([
-                text("CHECKPOINT: Foreground output was received."),
-                text("Final foreground report."),
+                text("CHECKPOINT: Shell output was received."),
+                text("Final shell report."),
             ]);
         }
         let run = run_with_executor(
@@ -326,20 +324,20 @@ async fn pipeline_output_limit_split_uses_foreground_bash_contract() {
             .messages
             .iter()
             .find(|message| {
-                message.role == Role::Tool && message.tool_call_id.as_deref() == Some("call_bash")
+                message.role == Role::Tool && message.tool_call_id.as_deref() == Some("call_exec")
             })
-            .expect("the foreground executor must return a result for the call");
-        assert_eq!(result.tool_success, Some(success));
-        assert!(result.content.contains("foreground evidence"));
-        if success {
-            assert_eq!(result.content, "foreground evidence");
+            .expect("the executor must return a result for the call");
+        assert_eq!(result.tool_success, Some(true));
+        let receipt: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(receipt["exit_code"], exit_code);
+        assert!(result.content.contains("shell evidence"));
+        if exit_code == 0 {
             assert!(run.result.unwrap());
             assert_eq!(
                 run.session.messages.last().unwrap().content,
-                "Final foreground report."
+                "Final shell report."
             );
         } else {
-            assert!(result.content.contains("Command exited with code 7"));
             assert!(matches!(run.result, Err(AgentError::Tool(ref error))
                 if error.contains("unconfirmed step")));
         }
@@ -1252,7 +1250,6 @@ async fn pipeline_output_limit_split_reserves_confirmed_cache_and_refuses_provid
 #[test]
 fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_results() {
     use super::super::output_limit_split::{confirms_tool_result, forbidden_tool};
-    use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
     for name in ["default::SubAgent", "default::spawnSession", "deploy_agent"] {
         assert!(forbidden_tool(name), "{name}");
     }
@@ -1268,22 +1265,15 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
     ] {
         let message = Message::tool_result("command", result.to_string());
         assert_eq!(
-            confirms_tool_result("default::exec_command", "command", None, &message),
+            confirms_tool_result("default::exec_command", "command", &message),
             success
         );
     }
     assert!(confirms_tool_result(
         "Bash",
         "command",
-        None,
         &Message::tool_result("command", r#"{"exit_code":0}"#),
     ));
-
-    let output = Message::tool_result("command", "plain foreground output");
-    let contract = Some(FOREGROUND_BASH_EXECUTION_CONTRACT);
-    assert!(!confirms_tool_result("bash", "command", None, &output));
-    assert!(!confirms_tool_result("bash", "other", contract, &output));
-    assert!(confirms_tool_result("bash", "command", contract, &output));
 }
 
 #[tokio::test]

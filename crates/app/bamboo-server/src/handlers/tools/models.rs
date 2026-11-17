@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Fields
 ///
-/// * `tool_name` - Name of the tool to execute (e.g., "read_file", "execute_command")
+/// * `tool_name` - Name of the tool to execute (e.g., "Read", "exec_command")
 /// * `parameters` - List of tool parameters as key-value pairs
 ///
 /// # Example

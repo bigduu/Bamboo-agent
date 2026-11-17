@@ -1277,23 +1277,42 @@ mod process_tests {
     }
 
     #[tokio::test]
-    async fn legacy_tools_cannot_read_write_or_kill_polled_handles() {
+    async fn retired_tool_names_cannot_route_to_a_live_exec_handle() {
+        use bamboo_agent_core::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+
         let _environment = environment();
         let first = start("cat".into(), "legacy-boundary-exec", true).await;
         let id = first["session_id"].as_str().unwrap();
-        for owner in ["legacy-boundary-exec", "other-exec"] {
-            let read = crate::tools::BashOutputTool::new()
-                .invoke(json!({"bash_id":id}), context(owner))
+        let executor = crate::BuiltinToolExecutor::new();
+        for (name, args) in [
+            ("bash", json!({"command":"exit 0"})),
+            ("Bash", json!({"command":"exit 0"})),
+            ("execute_command", json!({"command":"exit 0"})),
+            ("BashOutput", json!({"bash_id":id})),
+            ("BashInput", json!({"bash_id":id,"input":"injected"})),
+            ("KillShell", json!({"shell_id":id})),
+        ] {
+            let call = ToolCall {
+                id: format!("retired-{name}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: args.to_string(),
+                },
+            };
+            let result = executor
+                .execute_with_context(
+                    &call,
+                    ToolExecutionContext {
+                        session_id: Some("legacy-boundary-exec"),
+                        ..ToolExecutionContext::none(&call.id)
+                    },
+                )
                 .await;
-            let write = crate::tools::BashInputTool::new()
-                .invoke(json!({"bash_id":id,"input":"injected"}), context(owner))
-                .await;
-            let kill = crate::tools::KillShellTool::new()
-                .invoke(json!({"shell_id":id}), context(owner))
-                .await;
-            assert!(matches!(read, Err(ToolError::Execution(_))));
-            assert!(matches!(write, Err(ToolError::Execution(_))));
-            assert!(matches!(kill, Err(ToolError::Execution(_))));
+            assert!(
+                matches!(result, Err(ToolError::NotFound(_))),
+                "{name}: {result:?}"
+            );
         }
         let last = payload(
             WriteStdinTool::new()

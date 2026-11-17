@@ -711,14 +711,14 @@ async fn ordinary_child_and_synthetic_callers_do_not_acquire_supervisor_authorit
         let mut synthetic = ToolCtx::none("synthetic-call");
         synthetic.session_id = Some(original.session_id.as_str().into());
         let result = ProtectedTool {
-            name: "Bash".into(),
+            name: "exec_command".into(),
             service: SupervisorSessionService::new(fixture.store.clone()),
             probe: fixture.probe.clone(),
             config: management_config(),
             second_context: false,
             barrier: None,
         }
-        .invoke(json!({"command":"current-command"}), synthetic)
+        .invoke(json!({"cmd":"current-command"}), synthetic)
         .await;
         assert!(result.is_err());
         assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);

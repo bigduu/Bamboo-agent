@@ -66,14 +66,6 @@ impl LocalChildTools {
                 for replacement in bamboo_domain::legacy_shell_replacements(&name) {
                     allowed.remove(replacement);
                 }
-                if name == "bash"
-                    && inner.execution_contract_for_exact("bash")
-                        == Some(bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT)
-                {
-                    allowed.remove("Bash");
-                    allowed.remove("exec_command");
-                    allowed.remove("write_stdin");
-                }
             }
         }
         let read_only = session

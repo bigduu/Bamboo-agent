@@ -6,8 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
-    "bash",
+pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -120,23 +119,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "First identify candidate files, then use Read or scoped content mode.",
             )],
         )),
-        "bash" => Some(guide(
-            "bash",
-            ToolCategory::CommandExecution,
-            "Run terminal commands in this session's working directory. The result includes combined output when the command exits. Set timeout in seconds when a command needs a time limit.",
-            "Use dedicated file tools for reading, editing, and searching when available.",
-            &[],
-            vec![example(
-                "Run tests",
-                json!({"command":"cargo test","timeout":120}),
-                "The command reports a nonzero exit as a failure.",
-            )],
-        )),
         "exec_command" => Some(guide(
             "exec_command",
             ToolCategory::CommandExecution,
             "Run terminal commands (build/test/git/npm/docker/gh). yield_time_ms waits up to 250–30000 ms (default 10000). Fast commands return output and exit_code directly; longer commands return status=running and session_id. Continue work or pull incremental output and final status with write_stdin. Results normally remain pull-only; when the runtime explicitly hands a quiet command to background monitoring, its terminal result returns automatically and you can continue the conversation while it runs. Output is bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded output.",
-            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it, or shell echo/printf to communicate with the user. Expect automatic results only after an explicit runtime background handoff; do not use legacy BashOutput for an exec session. interactive=true supplies a stdin pipe, not a PTY; terminal-only programs may not work.",
+            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it, or shell echo/printf to communicate with the user. Expect automatic results only after an explicit runtime background handoff. interactive=true supplies a stdin pipe, not a PTY; terminal-only programs may not work.",
             &["write_stdin"],
             vec![example(
                 "Start tests with a short initial wait",
@@ -162,62 +149,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "The command must have been started with interactive=true; bytes are sent exactly as supplied.",
                 ),
             ],
-        )),
-        // Retained for explicit host-side legacy lookups, not default model guides.
-        "Bash" => Some(guide(
-            "Bash",
-            ToolCategory::CommandExecution,
-            "Run terminal commands (build/test/git/npm/docker/gh), optionally in background — a backgrounded command runs detached and notifies you with its result when it finishes, so you can keep working.",
-            "Do not use for file reads/edits/search when Read/Edit/Write/Glob/Grep can handle it; do not use shell echo/printf to communicate with the user; do not sit polling BashOutput to wait for a background command — the completion notification comes to you.",
-            &["BashOutput", "KillShell"],
-            vec![example(
-                "Run tests",
-                json!({"command":"cargo test","timeout":120000}),
-                "Use for build/test/CLI operations.",
-            )],
-        )),
-        "BashInput" => Some(guide(
-            "BashInput",
-            ToolCategory::CommandExecution,
-            "Send input to the stdin of an interactive background shell (spawned with Bash interactive=true) to answer a prompt, or close stdin (eof:true) to let a stdin-consumer finish.",
-            "Do not use without a bash_id from an interactive Bash shell; the shell must have been spawned with interactive=true (piped stdin), otherwise this returns an error. The input is written as UTF-8 bytes; eof:true sends end-of-input so a consumer that reads until EOF (cat/sort/REPL) terminates instead of hanging.",
-            &["Bash", "BashOutput"],
-            vec![
-                example(
-                    "Answer a prompt",
-                    json!({"bash_id":"<bash_id-from-Bash-interactive>","input":"y"}),
-                    "Use when a background command is waiting for input (e.g. a confirmation prompt).",
-                ),
-                example(
-                    "Send EOF so a consumer finishes",
-                    json!({"bash_id":"<bash_id>","input":"data","eof":true}),
-                    "Close stdin after writing so a command that reads until EOF terminates instead of running until killed.",
-                ),
-            ],
-        )),
-        "BashOutput" => Some(guide(
-            "BashOutput",
-            ToolCategory::CommandExecution,
-            "Read the full/incremental output of a background shell on demand.",
-            "Do not poll a background shell to wait for it — you are notified automatically when it completes (with its exit status and an output tail). Use BashOutput only when you want its output BEFORE that notification arrives; needs a bash_id from Bash.",
-            &["Bash", "KillShell"],
-            vec![example(
-                "Inspect output early",
-                json!({"bash_id":"abc"}),
-                "Use to check on a still-running shell; you don't need it just to learn a shell finished.",
-            )],
-        )),
-        "KillShell" => Some(guide(
-            "KillShell",
-            ToolCategory::CommandExecution,
-            "Terminate a background shell.",
-            "Do not use for foreground commands; use the ID returned by Bash(run_in_background=true), not chat session_id.",
-            &["Bash", "BashOutput"],
-            vec![example(
-                "Stop runaway process",
-                json!({"shell_id":"<bash_id-from-Bash>"}),
-                "Use when process should no longer run.",
-            )],
         )),
         "Task" => Some(guide(
             "Task",
@@ -731,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn default_shell_guides_teach_pull_results_and_keep_legacy_lookup_explicit() {
+    fn shell_guides_teach_pull_results_and_exclude_retired_tools() {
         let exec = builtin_guide_spec("exec_command").unwrap();
         assert!(exec.when_to_use.contains("session_id"));
         assert!(exec.when_to_use.contains("normally remain pull-only"));
@@ -755,9 +686,9 @@ mod tests {
             .when_not_to_use
             .contains("infer completion from silence"));
         assert_eq!(poll.examples[0].parameters["chars"], "");
-        for legacy in ["Bash", "BashInput", "BashOutput", "KillShell"] {
+        for legacy in ["bash", "Bash", "BashInput", "BashOutput", "KillShell"] {
             assert!(!BUILTIN_GUIDE_NAMES.contains(&legacy));
-            assert!(builtin_guide_spec(legacy).is_some());
+            assert!(builtin_guide_spec(legacy).is_none());
         }
     }
 

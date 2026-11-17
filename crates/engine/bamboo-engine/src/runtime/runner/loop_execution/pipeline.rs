@@ -3045,7 +3045,7 @@ async fn handle_tool_calls_path(
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
     output_limit_recovery: bool,
-) -> Result<(TurnOutcome, Option<String>), AgentError> {
+) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
     // The signature only ever covers the reasoning text, so it rides along only
@@ -3212,14 +3212,10 @@ async fn handle_tool_calls_path(
                     .await;
             }
         }
-        return Ok((
-            TurnOutcome {
-                should_break: true,
-                sent_complete: ticket_question_yield
-                    && !super::defers_terminal_complete(frame.config),
-            },
-            None,
-        ));
+        return Ok(TurnOutcome {
+            should_break: true,
+            sent_complete: ticket_question_yield && !super::defers_terminal_complete(frame.config),
+        });
     }
 
     if frame.debug_enabled {
@@ -3314,13 +3310,10 @@ async fn handle_tool_calls_path(
         round_error,
     );
 
-    Ok((
-        TurnOutcome {
-            should_break: false,
-            sent_complete: false,
-        },
-        tool_execution.completed_single_tool_contract,
-    ))
+    Ok(TurnOutcome {
+        should_break: false,
+        sent_complete: false,
+    })
 }
 
 // ---- Core pipeline ----
@@ -4685,7 +4678,7 @@ async fn run_pipeline_inner(
             };
 
             match handler_result {
-                Ok((outcome, completed_tool_contract)) => {
+                Ok(outcome) => {
                     if let Some(attempt) = activation_attempt.as_ref() {
                         if !outcome.should_break {
                             if let Err(error) =
@@ -4700,7 +4693,7 @@ async fn run_pipeline_inner(
                         if !outcome.should_break {
                             let confirmed = session.messages.iter().skip(before_tool).any(|message| {
                                 super::output_limit_split::confirms_tool_result(
-                                    &name, &id, completed_tool_contract.as_deref(), message,
+                                    &name, &id, message,
                                 )
                             });
                             split.finish_step(confirmed);

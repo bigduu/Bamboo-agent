@@ -166,8 +166,8 @@ impl ToolExecutor for RecordingExecutor {
 
     fn list_tools(&self) -> Vec<ToolSchema> {
         vec![serde_json::from_value(json!({
-            "type": "function", "function": { "name": "Bash", "description": "record execution",
-            "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } }
+            "type": "function", "function": { "name": "exec_command", "description": "record execution",
+            "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } } } }
         }))
         .unwrap()]
     }
@@ -416,7 +416,7 @@ fn request(
         request_generation: generation.into(),
         session_id: id.into(),
         workspace_path: None,
-        tool_name: "Bash".into(),
+        tool_name: "exec_command".into(),
         permission_type,
         resource: resource.into(),
         operation_summary: format!("operate on {resource}"),
@@ -472,8 +472,8 @@ fn parked(id: &str, typed: bool) -> (Session, PermissionRequest) {
                 id: CALL.into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: "Bash".into(),
-                    arguments: json!({"command": request.resource}).to_string(),
+                    name: "exec_command".into(),
+                    arguments: json!({"cmd": request.resource}).to_string(),
                 },
             }]),
         ));
@@ -490,7 +490,7 @@ fn parked(id: &str, typed: bool) -> (Session, PermissionRequest) {
     }
     session.set_pending_question_with_source(
         CALL.into(),
-        "Bash".into(),
+        "exec_command".into(),
         "Permission required".into(),
         vec!["Approve".into(), "Deny".into()],
         false,
@@ -525,7 +525,7 @@ async fn legacy_public_answer_run_replays_only_the_latest_occurrence() {
     agent.run(&mut session, "continue").await.unwrap();
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+    assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
     assert!(calls[0].generation.is_none());
     assert_eq!(result_message(&session, "result-old"), old);
     assert!(result_message(&session, "result-current")["content"]
@@ -549,7 +549,7 @@ async fn typed_public_resume_restores_exact_once_after_storage_and_serde_reload(
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].arguments, json!({"command": "current-command"}));
+    assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
     assert_eq!(calls[0].generation.as_deref(), Some(CURRENT));
     assert!(calls[0].supervisor_absent);
     assert_eq!(calls[0].flags, ToolExecutionSessionFlags::default());
@@ -612,7 +612,7 @@ fn current_request(session: &Session) -> PermissionRequest {
 fn alias_config() -> Arc<PermissionConfig> {
     let config = Arc::new(PermissionConfig::new());
     config.set_ask_rules([
-        "Bash(current-command)".into(),
+        "exec_command(current-command)".into(),
         "default::exec_command".into(),
     ]);
     config
@@ -1164,8 +1164,7 @@ async fn approve_second_context_and_resume(fixture: &mut Fixture, pending: &Sess
     assert_eq!(calls[1].generation.as_deref(), Some(SECOND));
     assert!(calls
         .iter()
-        .all(|call| call.supervisor_absent
-            && call.arguments == json!({"command": "current-command"})));
+        .all(|call| call.supervisor_absent && call.arguments == json!({"cmd": "current-command"})));
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
     assert_eq!(
         std::fs::read_to_string(fixture.directory.path().join("actions.log")).unwrap(),

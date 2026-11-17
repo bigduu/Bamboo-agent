@@ -12,7 +12,6 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
-use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
@@ -291,6 +290,13 @@ fn resolve_catalog_with_activation(
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
     }
+    let shell_pair = ["exec_command", "write_stdin"];
+    let owned_shell = |name| {
+        tools
+            .exact_tool_owner(name)
+            .is_some_and(|owner| owner.local_tool_is_native_builtin(name))
+    };
+    let has_owned_shell = shell_pair.into_iter().any(owned_shell);
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
@@ -304,6 +310,14 @@ fn resolve_catalog_with_activation(
                 resolve_disabled_tool_reference_name(reference, |name| {
                     by_execution_name.contains_key(name)
                 })
+                .or_else(|| {
+                    if has_owned_shell {
+                        return bamboo_domain::tool_names::retired_default_shell_policy_name(
+                            reference,
+                        );
+                    }
+                    None
+                })
             }
         })
         .flat_map(|name| {
@@ -311,20 +325,23 @@ fn resolve_catalog_with_activation(
             std::iter::once(name).chain(replacements)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
-    if tools.execution_contract_for_exact("bash") == Some(FOREGROUND_BASH_EXECUTION_CONTRACT) {
-        let yielding_shell = ["exec_command", "write_stdin"].into_iter().all(|name| {
-            by_execution_name.contains_key(name) && session.allows_model_tool_execution(name)
-        });
-        // A yielded handle needs both tools. Preserve existing shell denials
-        // when switching the default surface from foreground to yielding.
-        if yielding_shell && !disabled_execution_names.contains("bash") {
-            by_execution_name.remove("bash");
-        } else {
-            by_execution_name.remove("exec_command");
-            by_execution_name.remove("write_stdin");
+    // An owned command can yield a handle, so its native continuation must
+    // remain available even after an upstream profile filters the catalog.
+    if has_owned_shell
+        && shell_pair.into_iter().any(|name| {
+            !by_execution_name.contains_key(name)
+                || !owned_shell(name)
+                || disabled_execution_names.contains(name)
+                || !session.allows_model_tool_execution(name)
+        })
+    {
+        for name in shell_pair {
+            if owned_shell(name) {
+                by_execution_name.remove(name);
+            }
         }
     }
+    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     retain_legacy_plan_exit(session, &mut by_execution_name);
     // Root and Child models delegate through the logical SubAgent facade. Keep the
     // physical broker/deployment tools registered for existing direct callers,
@@ -567,6 +584,55 @@ mod live_disabled_tests {
 
     struct PositiveShellCatalog(&'static [&'static str]);
 
+    struct PrefilteredNativeShell {
+        tools: bamboo_tools::BuiltinToolExecutor,
+        hidden: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PrefilteredNativeShell {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("catalog projection only")
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut schemas = self.tools.list_tools();
+            schemas.retain(|schema| schema.function.name != self.hidden);
+            schemas.push(schema("vendor::exec_command"));
+            schemas
+        }
+
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            (name != self.hidden)
+                .then(|| self.tools.exact_tool_owner(name))
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn owned_shell_requires_both_native_tools_after_upstream_profile_filtering() {
+        let config = AgentLoopConfig::default();
+        let root = Session::new("shell-profile-root", "model");
+        let child = Session::new_child_of("shell-profile-child", &root, "model", "worker");
+        for hidden in ["exec_command", "write_stdin"] {
+            let tools = PrefilteredNativeShell {
+                tools: bamboo_tools::BuiltinToolExecutor::new(),
+                hidden,
+            };
+            for session in [&root, &child] {
+                let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, session);
+                let present = |name| catalog.iter().any(|entry| entry.execution_name() == name);
+                assert!(!present("exec_command"), "{hidden}");
+                assert!(!present("write_stdin"), "{hidden}");
+                assert!(present("Read"));
+                assert!(present("vendor::exec_command"));
+            }
+        }
+        let tools = bamboo_tools::BuiltinToolExecutor::new();
+        assert!(offered(&config, &tools, &root, "exec_command"));
+        assert!(offered(&config, &tools, &root, "write_stdin"));
+    }
+
     #[async_trait::async_trait]
     impl ToolExecutor for PositiveShellCatalog {
         async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -617,7 +683,7 @@ mod live_disabled_tests {
             // These references are already accepted by the shared resolver;
             // compatibility must not invent an additional alias vocabulary.
             assert_eq!(
-                bamboo_domain::resolve_tool_reference_name(denied, |name| name == legacy),
+                bamboo_domain::resolve_disabled_tool_reference_name(denied, |name| name == legacy),
                 Some(legacy.to_owned()),
                 "unsupported test reference {denied}",
             );

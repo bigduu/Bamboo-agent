@@ -15,9 +15,7 @@ use serde_json::{json, Value};
 mod background_exec_tests;
 
 fn yielding_executor() -> bamboo_tools::BuiltinToolExecutor {
-    let executor = bamboo_tools::BuiltinToolExecutor::new();
-    assert!(executor.registry().unregister("bash"));
-    executor
+    bamboo_tools::BuiltinToolExecutor::new()
 }
 
 // Release the command even when an assertion unwinds before the explicit poll.

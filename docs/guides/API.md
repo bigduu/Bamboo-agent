@@ -625,6 +625,15 @@ permission gate, or a compatible persisted session.
 
 ### Tool Execution
 
+Use `exec_command` with `cmd` to start a command. When it yields a handle,
+use `write_stdin` to collect output and the exit status, send input, close
+stdin, or stop the process with a lone Ctrl-C. Direct HTTP calls to either
+tool require the owning Bamboo `session_id` in the request. The `session_id`
+parameter of `write_stdin` is the handle returned by `exec_command`.
+
+Callers of `Bash`, `bash`, and `execute_command` should use `exec_command`.
+Replace `BashInput`, `BashOutput`, and `KillShell` calls with `write_stdin`.
+
 #### Execute Tool Directly
 
 ```http
