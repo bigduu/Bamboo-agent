@@ -4,7 +4,7 @@ mod crud;
 mod maintenance;
 
 pub use attachments::get_attachment;
-pub use compact::compact_session;
+pub use compact::{compact_session, get_session_compaction};
 pub use crud::{
     activate_discoverable_tools, copy_session, create_session, deactivate_discoverable_tools,
     get_session, get_session_create_operation, get_system_prompt_snapshot,
