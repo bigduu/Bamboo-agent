@@ -2139,27 +2139,30 @@ mod tests {
 
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("session_note", json!({"action": "read"})),
+                &tool_call_with_args("memory", json!({"action": "session_read"})),
                 &tools
             ),
             ToolSchedulingMode::ParallelSafe,
-            "session_note read action should be parallel-safe"
+            "memory session_read action should be parallel-safe"
         );
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("session_note", json!({"action": "list_topics"})),
+                &tool_call_with_args("memory", json!({"action": "session_list_topics"})),
                 &tools
             ),
             ToolSchedulingMode::ParallelSafe,
-            "session_note list_topics action should be parallel-safe"
+            "memory session_list_topics action should be parallel-safe"
         );
         assert_eq!(
             scheduling_mode_for_tool_call(
-                &tool_call_with_args("session_note", json!({"action": "append", "content": "x"})),
+                &tool_call_with_args(
+                    "memory",
+                    json!({"action": "session_append", "content": "x"})
+                ),
                 &tools
             ),
             ToolSchedulingMode::Sequential,
-            "session_note append action should be sequential"
+            "memory session_append action should be sequential"
         );
     }
 

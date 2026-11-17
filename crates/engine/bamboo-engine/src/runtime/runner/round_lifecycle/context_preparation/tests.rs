@@ -6490,7 +6490,7 @@ fn context_pressure_notification_copy_is_strategy_aware() {
         assert_eq!(level, expected_level);
         assert!(message.contains("archiv"));
         assert!(message.contains("session_history_current"));
-        assert!(message.contains("session_note"));
+        assert!(message.contains("memory session_replace"));
         assert!(message.contains("decisions, paths, progress, and blockers"));
         assert!(message.contains("Do not copy raw transcript"));
         assert!(!message.contains("compact_context"));

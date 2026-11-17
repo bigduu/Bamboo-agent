@@ -50,7 +50,7 @@ const LEDGER_AGENDA_PROMPT_MAX_CHARS: usize = 1_200;
 const LEDGER_AGENDA_ITEMS_PER_BUCKET: usize = 5;
 /// Days ahead the injected agenda looks.
 const LEDGER_AGENDA_HORIZON_DAYS: i64 = 7;
-const EXTERNAL_MEMORY_TOOL_NAME: &str = "session_note";
+const EXTERNAL_MEMORY_TOOL_NAME: &str = "memory";
 pub(crate) const PROMPT_MEMORY_OBSERVABILITY_KEY: &str = "runtime_prompt_memory_observability";
 
 /// Context usage percentage at which we warn the LLM to save memory.
@@ -1102,7 +1102,7 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
         section.push_str("\n````\n");
         if s.truncated {
             section.push_str(&format!(
-                "\nNote is truncated in the system prompt (showing first {} chars of {}). Use `{}` action=read to view it and then action=replace to compress it.\n\n",
+                "\nNote is truncated in the system prompt (showing first {} chars of {}). Use `{}` action=session_read to view it and then action=session_replace to compress it.\n\n",
                 count_chars(&s.content),
                 s.full_len,
                 EXTERNAL_MEMORY_TOOL_NAME
@@ -1117,7 +1117,7 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
         section.push_str(&format!("### Session Memory Topic: `{}`\n", s.name));
         section.push_str("````md\n");
         if s.content.is_empty() {
-            section.push_str("_(truncated — use action=read topic=");
+            section.push_str("_(truncated — use action=session_read topic=");
             section.push_str(&s.name);
             section.push_str(" to view)_");
         } else {
@@ -1126,7 +1126,7 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
         section.push_str("\n````\n");
         if s.truncated && !s.content.is_empty() {
             section.push_str(&format!(
-                "_(showing {} of {} chars — use action=read topic={} to see full content)_\n",
+                "_(showing {} of {} chars — use action=session_read topic={} to see full content)_\n",
                 count_chars(&s.content),
                 s.full_len,
                 s.name

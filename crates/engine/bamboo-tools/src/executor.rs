@@ -14,7 +14,7 @@ use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide}
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
     EditTool, ExecCommandTool, ExitPlanModeTool, GetFileInfoTool, GlobTool, GrepTool,
-    LoopControlTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool,
+    LoopControlTool, ReadTool, RequestPermissionsTool, SessionMemoryTool, SleepTool, TaskTool,
     ToolRegistry, UpdateGoalTool, ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool,
     WriteTool,
 };
@@ -367,7 +367,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(LoopControlTool::new());
-        let _ = registry.register(SessionNoteTool::new());
+        let _ = registry.register(SessionMemoryTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);
         }

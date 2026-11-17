@@ -11,7 +11,7 @@ pub mod glob;
 pub mod goal;
 pub mod grep;
 pub mod loop_control;
-pub mod memory_note;
+pub mod memory;
 mod parameter_schema;
 pub mod read;
 pub mod read_tracker;
@@ -38,7 +38,7 @@ pub use grep::GrepTool;
 pub use loop_control::{
     parse_loop_control_request, LoopControlRequest, LoopControlTool, LOOP_CONTROL_TOOL_NAME,
 };
-pub use memory_note::SessionNoteTool;
+pub use memory::SessionMemoryTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use request_permissions::RequestPermissionsTool;

@@ -170,7 +170,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "ViewImage",
     "Workspace",
     "BashOutput",
-    "session_note",
     "session_history",
     "session_history_current",
     "bamboo_diagnostics",
@@ -219,6 +218,8 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             // This mixed-action tool checks Plan posture itself: target
             // discovery is read-only, while send/reply remain forbidden.
             "session_message",
+            // Memory enforces Session-note-only operations in Plan posture.
+            "memory",
         ]
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(tool_name))
@@ -275,6 +276,7 @@ mod tests {
             ToolMutability::Mutating
         );
         for retired in [
+            "session_note",
             "FileExists",
             "GetCurrentDir",
             "SetWorkspace",

@@ -485,7 +485,12 @@ fn session_note_tool_call_ids(session: &Session) -> HashSet<&str> {
         .iter()
         .filter_map(|message| message.tool_calls.as_ref())
         .flatten()
-        .filter(|call| bamboo_domain::canonical_tool_name(&call.function.name) == "session_note")
+        .filter(|call| {
+            matches!(
+                bamboo_domain::canonical_tool_name(&call.function.name).as_str(),
+                "memory" | "session_note" | "memory_note"
+            )
+        })
         .map(|call| call.id.as_str())
         .collect()
 }
@@ -509,14 +514,30 @@ fn sanitized_session_note_result(
     let action = source.get("action")?.as_str()?;
     if !matches!(
         action,
-        "read" | "append" | "replace" | "clear" | "list_topics"
+        "read"
+            | "append"
+            | "replace"
+            | "clear"
+            | "list_topics"
+            | "session_read"
+            | "session_append"
+            | "session_replace"
+            | "session_clear"
+            | "session_list_topics"
     ) {
         return None;
     }
     let mut safe = serde_json::Map::new();
     safe.insert(
         "tool".to_string(),
-        serde_json::Value::String("session_note".to_string()),
+        serde_json::Value::String(
+            if action.starts_with("session_") {
+                "memory"
+            } else {
+                "session_note"
+            }
+            .to_string(),
+        ),
     );
     safe.insert(
         "action".to_string(),

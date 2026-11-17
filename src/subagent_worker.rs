@@ -503,18 +503,18 @@ fn bamboo_runtime_execution_permission_mode(
     }
 }
 
-fn bind_worker_session_note(
+fn bind_worker_memory(
     builtin: &bamboo_tools::BuiltinToolExecutor,
     memory_store: MemoryStore,
 ) -> Result<(), String> {
-    if !builtin.registry().unregister("session_note") {
-        return Err("builtin session_note tool is unavailable for Jiandu root binding".to_string());
+    if !builtin.registry().unregister("memory") {
+        return Err("builtin memory tool is unavailable for Jiandu root binding".to_string());
     }
     builtin
-        .register_tool(bamboo_tools::tools::SessionNoteTool::with_memory_store(
+        .register_tool(bamboo_tools::tools::SessionMemoryTool::with_memory_store(
             memory_store,
         ))
-        .map_err(|error| format!("bind session_note to the worker Jiandu store: {error}"))
+        .map_err(|error| format!("bind memory to the worker Jiandu store: {error}"))
 }
 
 fn validate_native_startup(spec: &ProvisionSpec) -> Result<(), String> {
@@ -539,7 +539,7 @@ impl BambooRuntimeExecutor {
         let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
         // Local actor processes inherit the managed launcher's environment.
         // Resolve again at the worker boundary, then inject this single store
-        // into both prompt preparation and the worker's session_note tool.
+        // into both prompt preparation and the worker's memory tool.
         let jiandu_selection =
             resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))?;
         let jiandu_mode = jiandu_selection.mode();
@@ -680,7 +680,7 @@ impl BambooRuntimeExecutor {
                 None,
             )
         };
-        bind_worker_session_note(&builtin, memory_store.clone())?;
+        bind_worker_memory(&builtin, memory_store.clone())?;
         let builtin = if let Some(ceiling) = &spec.capabilities.native_tool_ceiling {
             builtin
                 .with_native_tool_ceiling(ceiling.tools.clone())
@@ -5266,18 +5266,14 @@ mod tests {
         let builtin = bamboo_tools::BuiltinToolExecutor::new_with_config(Arc::new(
             tokio::sync::RwLock::new(Config::default()),
         ));
-        bind_worker_session_note(&builtin, selected_store.clone())
-            .expect("bind worker session_note");
+        bind_worker_memory(&builtin, selected_store.clone()).expect("bind worker memory");
 
-        let tool = builtin
-            .registry()
-            .get("session_note")
-            .expect("bound session_note tool");
+        let tool = builtin.registry().get("memory").expect("bound memory tool");
         let mut context = ToolCtx::none("worker-note-call");
         context.session_id = Some(Arc::from("worker-note-session"));
         tool.invoke(
             serde_json::json!({
-                "action": "replace",
+                "action": "session_replace",
                 "topic": "acceptance",
                 "content": "isolated worker note"
             }),
