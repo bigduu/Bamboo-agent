@@ -1,5 +1,6 @@
 use crate::llm_summarizer::{LlmSummarizer, SummaryRequestBudget};
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::context_compaction::{CompactionPhase, ContextCompaction};
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_external_memory_context_block,
     build_history_boundary_reservation_context_block, build_plan_mode_context_block,
@@ -11,8 +12,9 @@ use bamboo_agent_core::{
     AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Message, MessagePart, Role,
     Session, ToolResult,
 };
+use bamboo_compression::retrieval_window::apply_retrieval_window_plan_with_event_id;
 use bamboo_compression::{
-    active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
+    active_messages_for_budget, apply_compression_plan,
     build_forced_compression_candidate_plan_with_input_costs,
     build_message_summary_candidate_plan_with_input_costs,
     build_retrieval_window_candidate_plan_with_token_accounting,
@@ -491,6 +493,22 @@ fn refit_transformed_context(
     }
     refitted.compressed_message_ids = compressed_message_ids;
     Ok(refitted)
+}
+
+fn observe_compaction(
+    config: &AgentLoopConfig,
+    session: &Session,
+    manual_snapshot: bool,
+    strategy: ContextManagementStrategy,
+) -> Option<Arc<ContextCompaction>> {
+    let registry = config.context_compactions.as_ref()?;
+    let attempt = if manual_snapshot {
+        registry.current(&session.id)?
+    } else {
+        registry.begin(session)
+    };
+    attempt.select_strategy(strategy);
+    Some(attempt)
 }
 
 async fn emit_context_compression_status(
@@ -1272,6 +1290,12 @@ async fn maybe_prepare_retrieval_window_context(
             .min_recent_user_turns,
         target_usage_percent: range.target_usage_percent,
     };
+    let progress = observe_compaction(
+        config,
+        session,
+        stage_only,
+        ContextManagementStrategy::RetrievalWindow,
+    );
     let mut candidate_base = session.clone();
 
     for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
@@ -1401,13 +1425,17 @@ async fn maybe_prepare_retrieval_window_context(
             }
         };
 
-        let applied = apply_retrieval_window_plan_with_trigger(
+        if let Some(progress) = &progress {
+            progress.set_phase(CompactionPhase::Validating);
+        }
+        let applied = apply_retrieval_window_plan_with_event_id(
             &mut staged,
             &plan,
             policy,
             budget,
             &frame.accounting,
             trigger_type.clone(),
+            progress.as_ref().map(|attempt| attempt.id.as_str()),
         )
         .map_err(|error| {
             AgentError::Budget(format!(
@@ -1486,6 +1514,9 @@ async fn maybe_prepare_retrieval_window_context(
             set_compaction_usage(&mut staged, &retained, budget, projected_input_tokens);
             *session = staged;
             return Ok(RetrievalWindowPreparationOutcome::Archived(retained));
+        }
+        if let Some(progress) = &progress {
+            progress.saving();
         }
         match persistence
             .expect("durable retrieval requires persistence")
@@ -2041,7 +2072,20 @@ async fn maybe_apply_summary_context_compression_with_budget(
     };
 
     let trigger_type_clone = trigger_type.clone();
-    let logical_pass_id = uuid::Uuid::new_v4().to_string();
+    let activity = observe_compaction(
+        config,
+        session,
+        user_command,
+        if message_summary {
+            ContextManagementStrategy::MessageSummary
+        } else {
+            ContextManagementStrategy::Summary
+        },
+    );
+    let logical_pass_id = activity.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |attempt| attempt.id.clone(),
+    );
 
     let active_non_system_count = session
         .messages
@@ -2204,6 +2248,9 @@ async fn maybe_apply_summary_context_compression_with_budget(
         let mut plan = finalize_compression_candidate_plan(session, candidate, summary)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
         plan.logical_pass_id = Some(logical_pass_id);
+        if let Some(activity) = &activity {
+            activity.set_phase(CompactionPhase::Validating);
+        }
         let projected_tokens = projected_summary_request_tokens(
             session,
             &plan,
@@ -2236,6 +2283,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
         plan.active_usage_after_percent =
             bamboo_compression::context_window_usage_percent(projected_tokens, compression_window);
         plan.active_usage_before_percent = usage_percent;
+        if !user_command {
+            if let Some(activity) = &activity {
+                activity.saving();
+            }
+        }
         let changed = commit_message_summary_plan(session, config, &plan).await?;
         if changed > 0 {
             if let Some(output) = prepared_output {
@@ -2436,25 +2488,38 @@ async fn maybe_apply_summary_context_compression_with_budget(
     .with_request_budget(summary_request_budget);
     let mut summarizer =
         summarizer.with_logical_pass_context(logical_pass_id.clone(), phase_label.to_string());
-    if let Some(tx) = event_tx {
-        let progress_tx = tx.clone();
+    if event_tx.is_some() || activity.is_some() {
+        let progress_tx = event_tx.cloned();
+        let observed = activity.clone();
         let progress_phase = phase_label.to_string();
         summarizer = summarizer.with_progress_callback(Arc::new(
             move |progress: &crate::llm_summarizer::SummarizationProgress| {
-                let status = format!(
-                    "{}:{}/{} input={} output={} safe={} model_limit={}",
-                    progress.stage,
-                    progress.stage_index,
-                    progress.stage_count,
-                    progress.estimated_input_tokens,
-                    progress.requested_output_tokens,
-                    progress.safe_request_tokens,
-                    progress.model_context_tokens,
-                );
-                let _ = progress_tx.try_send(AgentEvent::ContextCompressionStatus {
-                    phase: progress_phase.clone(),
-                    status,
-                });
+                if let Some(observed) = &observed {
+                    let part = progress.stage_index;
+                    let total = progress.stage_count;
+                    let phase = if progress.stage.ends_with("reduce") {
+                        CompactionPhase::Merging { part, total }
+                    } else {
+                        CompactionPhase::Summarizing { part, total }
+                    };
+                    observed.set_phase(phase);
+                }
+                if let Some(progress_tx) = &progress_tx {
+                    let status = format!(
+                        "{}:{}/{} input={} output={} safe={} model_limit={}",
+                        progress.stage,
+                        progress.stage_index,
+                        progress.stage_count,
+                        progress.estimated_input_tokens,
+                        progress.requested_output_tokens,
+                        progress.safe_request_tokens,
+                        progress.model_context_tokens,
+                    );
+                    let _ = progress_tx.try_send(AgentEvent::ContextCompressionStatus {
+                        phase: progress_phase.clone(),
+                        status,
+                    });
+                }
             },
         ));
     }
@@ -2483,6 +2548,9 @@ async fn maybe_apply_summary_context_compression_with_budget(
         }
     };
 
+    if let Some(activity) = &activity {
+        activity.set_phase(CompactionPhase::Validating);
+    }
     let mut plan =
         match finalize_compression_candidate_plan(session, candidate, summary_report.content) {
             Ok(plan) => plan,
@@ -2558,6 +2626,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
     plan.model_used = Some(summary_model.to_string());
     plan.latency_ms = latency_ms;
 
+    if !user_command {
+        if let Some(activity) = &activity {
+            activity.saving();
+        }
+    }
     let compressed_count = if message_summary {
         commit_message_summary_plan(session, config, &plan).await?
     } else {

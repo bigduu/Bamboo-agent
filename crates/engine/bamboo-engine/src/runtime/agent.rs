@@ -403,6 +403,22 @@ impl SdkInputSubmission {
 }
 
 impl Agent {
+    #[doc(hidden)]
+    pub fn begin_context_compaction(
+        &self,
+        session: &Session,
+    ) -> Arc<super::context_compaction::ContextCompaction> {
+        self.runtime.context_compactions.begin(session)
+    }
+
+    #[doc(hidden)]
+    pub fn context_compaction_progress(
+        &self,
+        session_id: &str,
+    ) -> Option<super::context_compaction::ContextCompactionSnapshot> {
+        self.runtime.context_compactions.snapshot(session_id)
+    }
+
     /// Stage compaction with the current Host configuration and the Session's
     /// existing model route. The caller must commit under its own idle writer.
     pub async fn stage_context_compaction(
@@ -424,6 +440,9 @@ impl Agent {
         use bamboo_agent_core::AgentError;
 
         let config = self.runtime.config.read().await.clone();
+        if let Some(attempt) = self.runtime.context_compactions.current(&session.id) {
+            attempt.select_strategy(config.context_management.strategy);
+        }
         let default_provider =
             resolve_provider_routing_key(&config, config.effective_default_provider(), registry);
         let (target, model, _) = resolve_execution_model(
@@ -498,6 +517,7 @@ impl Agent {
                 .or(target.reasoning_effort)
                 .or_else(|| get_reasoning_effort_for_provider(&config, provider_name)),
             context_management: config.context_management.clone(),
+            context_compactions: Some(self.runtime.context_compactions.clone()),
             gold_config: resolve_gold_config(
                 &config,
                 session

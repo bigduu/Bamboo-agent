@@ -166,6 +166,7 @@ pub struct AgentRuntime {
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
+    pub(crate) context_compactions: super::context_compaction::ContextCompactions,
     pub(crate) model_limits_section:
         Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     /// Live process-wide permission policy when the embedding exposes one.
@@ -378,6 +379,7 @@ impl AgentRuntimeBuilder {
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
             config: self.config.ok_or_else(|| format_missing("config"))?,
+            context_compactions: Default::default(),
             model_limits_section: self.model_limits_section,
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
@@ -1256,6 +1258,7 @@ impl AgentRuntime {
                 .map(|memory| memory.summary_target_ratio)
                 .unwrap_or(0.20),
             context_management: config.context_management.clone(),
+            context_compactions: Some(self.context_compactions.clone()),
             summary_safe_window_percent: config
                 .memory()
                 .as_ref()
