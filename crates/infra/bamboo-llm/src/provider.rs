@@ -245,6 +245,7 @@ pub struct CompletionDiagnostics {
     agent_round: bool,
     recovery: Option<OutputLimitRecovery>,
     model_window_limit: Option<u32>,
+    provider_default_output: bool,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
@@ -352,6 +353,16 @@ pub(crate) fn current_completion_diagnostics() -> Option<CompletionDiagnostics> 
     COMPLETION_DIAGNOSTICS.try_with(Clone::clone).ok()
 }
 
+pub(crate) fn optional_protocol_output_limit(limit: Option<u32>) -> Option<u32> {
+    if current_completion_diagnostics()
+        .is_some_and(|diagnostics| diagnostics.allows_provider_default_output())
+    {
+        None
+    } else {
+        limit
+    }
+}
+
 impl CompletionDiagnostics {
     pub fn for_agent_round(recovery: Option<OutputLimitRecovery>) -> Self {
         Self {
@@ -364,6 +375,15 @@ impl CompletionDiagnostics {
     pub fn with_model_window_limit(mut self, limit: Option<u32>) -> Self {
         self.model_window_limit = limit;
         self
+    }
+
+    pub fn with_provider_default_output(mut self, enabled: bool) -> Self {
+        self.provider_default_output = enabled;
+        self
+    }
+
+    pub(crate) fn allows_provider_default_output(&self) -> bool {
+        self.provider_default_output && !crate::retry::work_request_budget_active()
     }
 
     pub(crate) fn model_window_limit(&self) -> Option<u32> {

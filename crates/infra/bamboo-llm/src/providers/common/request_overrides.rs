@@ -197,7 +197,9 @@ pub(crate) fn mask_and_prepare_agent_request(
             wire_limit = wire_limit.min(configured);
             has_output_control = true;
         }
-        if !has_output_control {
+        if !has_output_control
+            && (endpoint == ENDPOINT_MESSAGES || !diagnostics.allows_provider_default_output())
+        {
             return Err(LLMError::RequestFailed(
                 "Model window requires an output limit on the final request".into(),
             ));
@@ -897,6 +899,40 @@ mod tests {
             assert!(matches!(error, LLMError::RequestFailed(_)), "{endpoint}");
             assert_eq!(diagnostics.output_limit(), None, "{endpoint}");
         }
+    }
+
+    #[tokio::test]
+    async fn provider_default_keeps_numeric_overrides_and_required_fields_guarded() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let diagnostics = CompletionDiagnostics::for_agent_round(None)
+            .with_model_window_limit(Some(4_096))
+            .with_provider_default_output(true);
+        scope_completion_diagnostics(diagnostics.clone(), async {
+            let mut body = json!({"model": "fixture", "max_tokens": 6_000});
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_CHAT_COMPLETIONS,
+                "fixture",
+            )
+            .unwrap();
+            assert_eq!(body["max_tokens"], 4_096);
+
+            let error = mask_and_prepare_agent_request(
+                &mut json!({"model": "fixture"}),
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap_err();
+            assert!(matches!(error, LLMError::RequestFailed(_)));
+        })
+        .await;
+        assert_eq!(diagnostics.output_limit(), Some(4_096));
     }
 
     #[tokio::test]

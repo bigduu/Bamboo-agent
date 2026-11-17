@@ -822,10 +822,19 @@ server is running.
 The file stores explicit overrides. With no matching user or provider limit,
 the runtime and the defaults API use 1,000,000 total context tokens and 64,000
 output tokens. When the window is known and the output ceiling is absent,
-the fallback output is one quarter of the window, up to 64,000. Provider limits
-come from the selected route's catalog and are cached briefly. If configured
-catalog and generation headers differ for a model, Bamboo keeps the catalog ID
-and omits its capacities. Configure limits explicitly for that generation route.
+the fallback output is one quarter of the window, up to 64,000. Set
+`unlimited_output` to `true` and omit `max_output_tokens` to let ordinary Agent
+turns use the selected route's output ceiling and the available joint window.
+When the route does not report an output ceiling, Bamboo leaves the optional
+output field unset so the provider uses its own default. Protocols that require
+an output field, such as Messages, use the compatibility allowance, limited by
+the remaining context. Explicit run budgets and bounded retries still send a
+numeric allowance.
+
+Provider limits come from the selected route's catalog and are cached briefly.
+If the configured catalog and generation headers differ for a model, Bamboo
+keeps the catalog ID and omits its capacities. Configure limits explicitly for
+that generation route.
 
 ## Schedules (`schedules.json`)
 

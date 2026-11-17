@@ -375,6 +375,7 @@ fn checkpoint_manual_archive_outcome<'a>(
 pub(super) struct PreparedRoundContext {
     pub prepared_context: PreparedContext,
     pub budget: TokenBudget,
+    pub provider_default_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3142,6 +3143,7 @@ pub(super) async fn prepare_output_limit_recovery_context(
     Ok(PreparedRoundContext {
         prepared_context,
         budget,
+        provider_default_output: false,
     })
 }
 
@@ -3162,7 +3164,7 @@ pub(super) async fn prepare_round_context(
         // Later rounds also fail closed when complete history no longer fits.
         let mut model_session = session.clone();
         model_session.token_budget = None;
-        let mut budget = super::token_budget::resolve_token_budget(
+        let mut budget = super::token_budget::resolve_child_token_budget(
             &mut model_session,
             config,
             model_name,
@@ -3211,6 +3213,7 @@ pub(super) async fn prepare_round_context(
                 return Ok(PreparedRoundContext {
                     prepared_context,
                     budget,
+                    provider_default_output: false,
                 });
             }
             let Some(index) = shadow
@@ -3264,8 +3267,9 @@ pub(super) async fn prepare_round_context(
         ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
     }
 
-    let budget =
-        super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    let (budget, provider_default_output) =
+        super::token_budget::resolve_round_token_budget(session, config, model_name, llm.as_ref())
+            .await;
     ensure_compression_range(&budget)?;
 
     let counter = TiktokenTokenCounter::default();
@@ -3540,6 +3544,7 @@ pub(super) async fn prepare_round_context(
     Ok(PreparedRoundContext {
         prepared_context,
         budget,
+        provider_default_output,
     })
 }
 
