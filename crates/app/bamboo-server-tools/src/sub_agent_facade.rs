@@ -1190,21 +1190,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_subagent_tutorial_examples_match_the_real_facade() {
-        let guide = bamboo_tools::guide::builtin_guides::builtin_guide_spec("SubAgent")
-            .expect("SubAgent guide");
-        for example in guide.examples {
-            let normalized = normalize(example.parameters)
-                .unwrap_or_else(|error| panic!("{}: {error}", example.scenario));
-            assert!(
-                normalized.projection.is_some(),
-                "{} used the legacy API",
-                example.scenario
-            );
-        }
-    }
-
-    #[test]
     fn complete_message_and_target_normalize_before_owner_classification() {
         let message = "  Keep this full task 🪷\n\nDo not trim the ending.  ";
         let create = normalize(json!({"message":message})).unwrap();

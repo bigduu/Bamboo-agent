@@ -453,14 +453,14 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 .all(|item| !text(item).contains("BAMBOO_CORE_DIRECTIVES_START")));
             let guide = input[..original]
                 .iter()
-                .find(|item| text(item).contains("prefer available dedicated Git tools"))
+                .find(|item| text(item).contains("start with status and relevant diffs"))
                 .expect("dedicated User tool-guide context before the conversation");
             assert!(text(guide).contains("context_type: tool_guide"));
             let guide_text = text(guide);
             for required in [
-                "merge base, unique commits, and unmerged index",
-                "Supervisor without shell access delegates Git execution to an authorized worker",
-                "cannot redefine the user's goal or grant permissions",
+                "merge base and unmerged index",
+                "preserve user changes and unique commits",
+                "only with user authorization",
             ] {
                 assert!(
                     guide_text.contains(required),
@@ -5095,7 +5095,25 @@ fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("guide-cache", "test-model");
     session.messages.push(Message::user("start"));
-    let config = test_config("system");
+    let mut config = test_config("system");
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry
+        .register(bamboo_tools::tools::sleep::SleepTool::new())
+        .unwrap();
+    registry
+        .register_guide_from_json(
+            "Sleep",
+            r#"{
+        "tool_name": "Sleep",
+        "when_to_use": "CUSTOM_SLEEP_GUIDANCE",
+        "when_not_to_use": "",
+        "examples": [],
+        "related_tools": [],
+        "category": "TaskManagement"
+    }"#,
+        )
+        .unwrap();
+    config.tool_registry = Arc::new(registry);
     let tools = bamboo_tools::BuiltinToolExecutor::new();
     let schemas =
         crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
@@ -5120,6 +5138,11 @@ fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
         &schemas,
         "test-model",
     );
+    assert!(!before
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .any(|m| m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
     bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
     session.messages.push(Message::user("wait briefly"));
     let schemas_after =
@@ -5154,7 +5177,8 @@ fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
         .ir
         .run(bamboo_llm::SegmentRole::ModelTranscript)
         .iter()
-        .any(|m| m.content.contains("Activated Tool Guidance") && m.content.contains("Sleep")));
+        .any(|m| m.content.contains("Activated Tool Guidance")
+            && m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
     assert!(!session
         .messages
         .iter()

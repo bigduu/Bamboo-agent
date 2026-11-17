@@ -130,7 +130,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Wait on the session_id returned by exec_command. Empty chars reads output and the actual exit status. After three empty polls, assess whether to diagnose the command or continue other work. An unattended Root can wait for the terminal result when its next action is only another empty poll of the same command with closed stdin. Nonempty chars writes exact bytes to an interactive stdin pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the command. A terminal result carries status and any exit code."
+        "Continue the process identified by exec_command's session_id. Empty chars waits for output and exit status. Silence and exit_observed are advisory. Use terminal status and exit code to verify completion. After three empty polls, reassess the command. A sole empty poll with closed stdin can wait longer. Nonempty chars sends exact bytes to the interactive pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the process."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

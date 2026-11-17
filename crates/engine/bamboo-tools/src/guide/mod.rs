@@ -26,17 +26,15 @@
 //! println!("{}", prompt);
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::exposure::{canonical_tool_name, has_full_tool_guide};
+use crate::exposure::has_full_tool_guide;
 use bamboo_agent_core::ToolSchema;
 use serde::{Deserialize, Serialize};
 
-pub mod builtin_guides;
 pub mod context;
 
-use builtin_guides::builtin_tool_guide;
-use context::{GuideBuildContext, GuideLanguage};
+use context::GuideBuildContext;
 
 use crate::tools::ToolRegistry;
 
@@ -120,74 +118,6 @@ impl ToolCategory {
     /// Returns categories in their standard presentation order
     pub fn ordered() -> &'static [ToolCategory] {
         &Self::ORDER
-    }
-
-    /// Returns the display title for this category in the specified language
-    fn title(self, language: GuideLanguage) -> &'static str {
-        match (self, language) {
-            (ToolCategory::FileReading, GuideLanguage::Chinese) => "File Reading Tools",
-            (ToolCategory::FileWriting, GuideLanguage::Chinese) => "File Writing Tools",
-            (ToolCategory::CodeSearch, GuideLanguage::Chinese) => "Code Search Tools",
-            (ToolCategory::CommandExecution, GuideLanguage::Chinese) => "Command Execution Tools",
-            (ToolCategory::GitOperations, GuideLanguage::Chinese) => "Git Tools",
-            (ToolCategory::TaskManagement, GuideLanguage::Chinese) => "Task Management Tools",
-            (ToolCategory::UserInteraction, GuideLanguage::Chinese) => "User Interaction Tools",
-            (ToolCategory::FileReading, GuideLanguage::English) => "File Reading Tools",
-            (ToolCategory::FileWriting, GuideLanguage::English) => "File Writing Tools",
-            (ToolCategory::CodeSearch, GuideLanguage::English) => "Code Search Tools",
-            (ToolCategory::CommandExecution, GuideLanguage::English) => "Command Tools",
-            (ToolCategory::GitOperations, GuideLanguage::English) => "Git Tools",
-            (ToolCategory::TaskManagement, GuideLanguage::English) => "Task Management Tools",
-            (ToolCategory::UserInteraction, GuideLanguage::English) => "User Interaction Tools",
-        }
-    }
-
-    /// Returns the description for this category in the specified language
-    fn description(self, language: GuideLanguage) -> &'static str {
-        match (self, language) {
-            (ToolCategory::FileReading, GuideLanguage::Chinese) => {
-                "Use these to understand existing files, directory structure, and metadata."
-            }
-            (ToolCategory::FileWriting, GuideLanguage::Chinese) => {
-                "Use these to create files or make content modifications."
-            }
-            (ToolCategory::CodeSearch, GuideLanguage::Chinese) => {
-                "Use these to locate definitions, references, and key text."
-            }
-            (ToolCategory::CommandExecution, GuideLanguage::Chinese) => {
-                "Use these to run commands, confirm or switch working directories."
-            }
-            (ToolCategory::GitOperations, GuideLanguage::Chinese) => {
-                "Use these to view repository status and code differences."
-            }
-            (ToolCategory::TaskManagement, GuideLanguage::Chinese) => {
-                "Use these to break down tasks and track execution progress."
-            }
-            (ToolCategory::UserInteraction, GuideLanguage::Chinese) => {
-                "Use this to confirm uncertain matters with the user."
-            }
-            (ToolCategory::FileReading, GuideLanguage::English) => {
-                "Use these to inspect existing files and structure."
-            }
-            (ToolCategory::FileWriting, GuideLanguage::English) => {
-                "Use these to create files and apply edits."
-            }
-            (ToolCategory::CodeSearch, GuideLanguage::English) => {
-                "Use these to find symbols, references, and patterns."
-            }
-            (ToolCategory::CommandExecution, GuideLanguage::English) => {
-                "Use these for shell commands and workspace context."
-            }
-            (ToolCategory::GitOperations, GuideLanguage::English) => {
-                "Use these to inspect repository status and diffs."
-            }
-            (ToolCategory::TaskManagement, GuideLanguage::English) => {
-                "Use these for planning and progress tracking."
-            }
-            (ToolCategory::UserInteraction, GuideLanguage::English) => {
-                "Use this when user clarification is required."
-            }
-        }
     }
 }
 
@@ -315,717 +245,161 @@ impl ToolGuide for ToolGuideSpec {
     }
 }
 
-/// Builds enhanced prompt sections with tool usage guidelines
-///
-/// This builder constructs formatted markdown sections containing:
-/// - Categorized tool guides with examples
-/// - Best practices for tool usage
-/// - Schema-only fallback for tools without guides
-///
-/// # Output Format
-///
-/// The generated prompts follow this structure:
-///
-/// ```markdown
-/// ## Tool Usage Guidelines
-///
-/// ### File Reading Tools
-/// Use these to inspect existing files and structure.
-///
-/// **read_file**
-/// - When to use: Read file contents when you need to understand code
-/// - When NOT to use: When you only need to check if a file exists
-/// - Example: {"path": "/src/main.rs"} -> Reads the main source file
-/// - Related tools: list_directory, search_files
-///
-/// ### Best Practices
-/// 1. Always verify file paths before reading
-/// 2. Use appropriate tools for the task
-/// ```
+/// Supplements callable schemas with explicitly registered notes and shared rules.
 pub struct EnhancedPromptBuilder;
 
 impl EnhancedPromptBuilder {
-    /// Builds an enhanced prompt section for available tools
-    ///
-    /// This method looks up guides for all provided schemas and generates
-    /// a formatted markdown section with usage guidelines.
-    ///
-    /// # Arguments
-    ///
-    /// * `registry` - Optional tool registry with registered guides
-    /// * `available_schemas` - List of tool schemas to document
-    /// * `context` - Build context (language, max examples, etc.)
-    ///
-    /// # Returns
-    ///
-    /// Formatted markdown string with tool usage guidelines
     pub fn build(
         registry: Option<&ToolRegistry>,
         available_schemas: &[ToolSchema],
         context: &GuideBuildContext,
     ) -> String {
-        let mut tool_names: Vec<String> = available_schemas
+        let tool_names = available_schemas
             .iter()
             .map(|schema| schema.function.name.clone())
-            .collect();
-        tool_names.sort();
-        tool_names.dedup();
-
+            .collect::<Vec<_>>();
         Self::build_for_tools(registry, &tool_names, available_schemas, context)
     }
 
-    /// Builds an enhanced prompt for a specific set of tools
-    ///
-    /// This method allows specifying exactly which tools to include,
-    /// even if they're not in the available schemas.
-    ///
-    /// # Arguments
-    ///
-    /// * `registry` - Optional tool registry with registered guides
-    /// * `tool_names` - Specific tools to document
-    /// * `fallback_schemas` - Schemas for tools without guides
-    /// * `context` - Build context (language, max examples, etc.)
-    ///
-    /// # Returns
-    ///
-    /// Formatted markdown string with tool usage guidelines
+    /// Render registered notes for the selected tools. Schema content travels
+    /// through the provider's tool definitions.
     pub fn build_for_tools(
         registry: Option<&ToolRegistry>,
         tool_names: &[String],
-        fallback_schemas: &[ToolSchema],
+        _fallback_schemas: &[ToolSchema],
         context: &GuideBuildContext,
     ) -> String {
-        let guides = Self::collect_guides(registry, tool_names);
-
-        // Split legacy guide detail independently of callable loading policy.
-        let activated = &context.activated_discoverable_tools;
-        let mut full_guides: Vec<ToolGuideSpec> = Vec::new();
-        let mut activated_discoverable: Vec<ToolGuideSpec> = Vec::new();
-        let mut inactive_discoverable: Vec<ToolGuideSpec> = Vec::new();
-
-        for guide in guides {
-            let canonical = canonical_tool_name(&guide.tool_name);
-            if has_full_tool_guide(&canonical) {
-                full_guides.push(guide);
-            } else if activated.contains(&canonical) {
-                activated_discoverable.push(guide);
-            } else {
-                inactive_discoverable.push(guide);
-            }
-        }
-
-        let mut output = String::from("## Tool Usage Guidelines\n");
-        let mut rendered_any = false;
-
-        // Render legacy full-detail guides.
-        if !full_guides.is_empty() {
-            rendered_any = true;
-            let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
-            for guide in &full_guides {
-                grouped.entry(guide.category).or_default().push(guide);
-            }
-
-            for guides in grouped.values_mut() {
-                guides.sort_by_key(|g| g.tool_name.clone());
-            }
-
-            for category in ToolCategory::ordered() {
-                let Some(category_guides) = grouped.get(category) else {
-                    continue;
-                };
-
-                output.push_str(&format!("\n### {}\n", category.title(context.language)));
-                output.push_str(category.description(context.language));
-                output.push('\n');
-
-                for guide in category_guides {
-                    Self::render_full_guide(&mut output, guide, context);
-                }
-            }
-        }
-
-        // Render activated discoverable tools with full detail.
-        if !activated_discoverable.is_empty() {
-            rendered_any = true;
-            let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
-            for guide in &activated_discoverable {
-                grouped.entry(guide.category).or_default().push(guide);
-            }
-
-            for guides in grouped.values_mut() {
-                guides.sort_by_key(|g| g.tool_name.clone());
-            }
-
-            output.push_str(&format!(
-                "\n### {}\n",
-                activated_discoverable_title(context.language)
-            ));
-            output.push_str(activated_discoverable_description(context.language));
-            output.push('\n');
-
-            for category in ToolCategory::ordered() {
-                let Some(category_guides) = grouped.get(category) else {
-                    continue;
-                };
-
-                output.push_str(&format!("\n#### {}\n", category.title(context.language)));
-                output.push_str(category.description(context.language));
-                output.push('\n');
-
-                for guide in category_guides {
-                    Self::render_full_guide(&mut output, guide, context);
-                }
-            }
-        }
-
-        // Render inactive discoverable tools with short summaries.
-        if !inactive_discoverable.is_empty() {
-            rendered_any = true;
-            output.push('\n');
-            output.push_str(&Self::render_discoverable_section(
-                &inactive_discoverable,
-                context,
-            ));
-        }
-
-        let guided_names: BTreeSet<String> = full_guides
+        let names = tool_names
             .iter()
-            .chain(activated_discoverable.iter())
-            .chain(inactive_discoverable.iter())
-            .map(|guide| guide.tool_name.clone())
-            .collect();
-        let unguided_schemas: Vec<ToolSchema> = fallback_schemas
-            .iter()
-            .filter(|schema| !guided_names.contains(schema.function.name.as_str()))
-            .cloned()
-            .collect();
-
-        if !unguided_schemas.is_empty() {
-            rendered_any = true;
-            output.push('\n');
-            output.push_str(&Self::render_schema_only_section(
-                &unguided_schemas,
-                context,
-                false,
-            ));
-        }
-
-        if !rendered_any {
-            return Self::render_schema_only_section(fallback_schemas, context, true);
-        }
-
-        if context.include_best_practices {
-            output.push_str(&format!(
-                "\n### {}\n",
-                best_practices_title(context.language)
-            ));
-            for (index, rule) in context.best_practices().iter().enumerate() {
-                output.push_str(&format!("{}. {}\n", index + 1, rule));
+            .map(|name| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut notes = String::new();
+        for name in &names {
+            let Some(guide) = registry.and_then(|registry| registry.get_guide(name)) else {
+                continue;
+            };
+            if has_full_tool_guide(name) || context.activated_discoverable_tools.contains(*name) {
+                Self::render_full_guide(
+                    &mut notes,
+                    &ToolGuideSpec::from_guide(guide.as_ref()),
+                    context,
+                );
             }
         }
-
-        output
+        if !names.is_empty() && context.include_best_practices {
+            for rule in context.best_practices() {
+                notes.push_str("- ");
+                notes.push_str(rule);
+                notes.push('\n');
+            }
+        }
+        if notes.is_empty() {
+            return notes;
+        }
+        format!("## Tool Guidance\n{}", notes.trim_end())
     }
 
     fn render_full_guide(output: &mut String, guide: &ToolGuideSpec, context: &GuideBuildContext) {
         output.push_str(&format!("\n**{}**\n", guide.tool_name));
-        output.push_str(&format!(
-            "- {}: {}\n",
-            when_to_use_label(context.language),
-            guide.when_to_use
-        ));
-        output.push_str(&format!(
-            "- {}: {}\n",
-            when_not_to_use_label(context.language),
-            guide.when_not_to_use
-        ));
-
+        output.push_str("When to use\n");
+        output.push_str(&guide.when_to_use);
+        output.push('\n');
+        if !guide.when_not_to_use.is_empty() {
+            output.push_str("When NOT to use\n");
+            output.push_str(&guide.when_not_to_use);
+            output.push('\n');
+        }
         for example in guide.examples.iter().take(context.max_examples_per_tool) {
             let params =
                 serde_json::to_string(&example.parameters).unwrap_or_else(|_| "{}".to_string());
-            output.push_str(&format!(
-                "- {}: {}\n  -> {}\n",
-                example_label(context.language),
-                params,
-                example.explanation
-            ));
+            output.push_str(&format!("- `{params}`\n  {}\n", example.explanation));
         }
-
         if !guide.related_tools.is_empty() {
             output.push_str(&format!(
-                "- {}: {}\n",
-                related_tools_label(context.language),
+                "Related tools include {}.\n",
                 guide.related_tools.join(", ")
             ));
         }
-    }
-
-    /// Collects guides for the specified tools from registry and built-in guides
-    fn collect_guides(
-        registry: Option<&ToolRegistry>,
-        tool_names: &[String],
-    ) -> Vec<ToolGuideSpec> {
-        let mut seen = BTreeSet::new();
-        let mut guides = Vec::new();
-
-        for raw_name in tool_names {
-            let name = raw_name.trim();
-            if name.is_empty() || !seen.insert(name.to_string()) {
-                continue;
-            }
-
-            let guide = registry
-                .and_then(|registry| registry.get_guide(name))
-                .or_else(|| builtin_tool_guide(name));
-
-            if let Some(guide) = guide {
-                guides.push(ToolGuideSpec::from_guide(guide.as_ref()));
-            }
-        }
-
-        guides.sort_by_key(|g| g.tool_name.clone());
-        guides
-    }
-
-    /// Renders a compact summary for discoverable tools.
-    fn render_discoverable_section(
-        guides: &[ToolGuideSpec],
-        context: &GuideBuildContext,
-    ) -> String {
-        if guides.is_empty() {
-            return String::new();
-        }
-
-        let mut sorted = guides.to_vec();
-        sorted.sort_by_key(|g| g.tool_name.clone());
-
-        let mut output = String::new();
-        output.push_str(&format!(
-            "### {}\n",
-            discoverable_tools_title(context.language)
-        ));
-        output.push_str(discoverable_tools_description(context.language));
-        output.push('\n');
-        for guide in sorted {
-            output.push_str(&format!("- `{}`: {}\n", guide.tool_name, guide.when_to_use));
-        }
-        output
-    }
-
-    /// Renders a section listing tools by schema only (no detailed guides)
-    fn render_schema_only_section(
-        schemas: &[ToolSchema],
-        context: &GuideBuildContext,
-        include_header: bool,
-    ) -> String {
-        if schemas.is_empty() {
-            return String::new();
-        }
-
-        let mut output = String::new();
-        if include_header {
-            output.push_str("## Tool Usage Guidelines\n");
-        }
-
-        output.push_str(&format!("\n### {}\n", schema_only_title(context.language)));
-        output.push_str(schema_only_description(context.language));
-        output.push('\n');
-
-        let mut sorted = schemas.to_vec();
-        sorted.sort_by_key(|s| s.function.name.clone());
-
-        for schema in sorted {
-            output.push_str(&format!(
-                "- `{}`: {}\n",
-                schema.function.name, schema.function.description
-            ));
-        }
-
-        output
-    }
-}
-
-// Helper functions for internationalized labels
-
-/// Returns the "When to use" label in the appropriate language
-fn when_to_use_label(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "When to use",
-        GuideLanguage::English => "When to use",
-    }
-}
-
-/// Returns the "When NOT to use" label in the appropriate language
-fn when_not_to_use_label(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "When NOT to use",
-        GuideLanguage::English => "When NOT to use",
-    }
-}
-
-/// Returns the "Example" label in the appropriate language
-fn example_label(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Example",
-        GuideLanguage::English => "Example",
-    }
-}
-
-/// Returns the "Related tools" label in the appropriate language
-fn related_tools_label(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Related tools",
-        GuideLanguage::English => "Related tools",
-    }
-}
-
-/// Returns the "Best Practices" title in the appropriate language
-fn best_practices_title(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Best Practices",
-        GuideLanguage::English => "Best Practices",
-    }
-}
-
-/// Returns the discoverable-tools section title in the appropriate language
-fn discoverable_tools_title(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Discoverable Tools",
-        GuideLanguage::English => "Discoverable Tools",
-    }
-}
-
-/// Returns the discoverable-tools section description in the appropriate language
-fn discoverable_tools_description(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => {
-            "These lower-frequency tools are available but listed here only in brief to save context. Their full parameter details and examples become visible once they are activated for this session (activation is handled by the app or user, not via a tool call)."
-        }
-        GuideLanguage::English => {
-            "These lower-frequency tools are available but listed here only in brief to save context. Their full parameter details and examples become visible once they are activated for this session (activation is handled by the app or user, not via a tool call)."
-        }
-    }
-}
-
-/// Returns the activated-discoverable section title in the appropriate language
-fn activated_discoverable_title(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Activated Discoverable Tools",
-        GuideLanguage::English => "Activated Discoverable Tools",
-    }
-}
-
-/// Returns the activated-discoverable section description in the appropriate language
-fn activated_discoverable_description(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => {
-            "These discoverable tools are currently activated and available with full detail."
-        }
-        GuideLanguage::English => {
-            "These discoverable tools are currently activated and available with full detail."
-        }
-    }
-}
-
-/// Returns the "Additional Tools (Schema Only)" title in the appropriate language
-fn schema_only_title(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "Additional Tools (Schema Only)",
-        GuideLanguage::English => "Additional Tools (Schema Only)",
-    }
-}
-
-/// Returns the description for schema-only tools in the appropriate language
-fn schema_only_description(language: GuideLanguage) -> &'static str {
-    match language {
-        GuideLanguage::Chinese => "No detailed guide is available for these tools; rely on schema.",
-        GuideLanguage::English => "No detailed guide is available for these tools; rely on schema.",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use serde_json::json;
-
-    use crate::{
-        tools::{ReadTool, ToolRegistry},
-        BuiltinToolExecutor,
-    };
-    use bamboo_agent_core::{FunctionSchema, ToolExecutor, ToolSchema};
-
-    use super::{
-        context::GuideBuildContext, context::GuideLanguage, EnhancedPromptBuilder, ToolCategory,
-        ToolGuideSpec,
-    };
-
-    fn render_legacy_full_prompt(schemas: &[ToolSchema], context: &GuideBuildContext) -> String {
-        let tool_names: Vec<String> = schemas
-            .iter()
-            .map(|schema| schema.function.name.clone())
-            .collect();
-        let guides = EnhancedPromptBuilder::collect_guides(None, &tool_names);
-
-        if guides.is_empty() {
-            return EnhancedPromptBuilder::render_schema_only_section(schemas, context, true);
-        }
-
-        let mut output = String::from("## Tool Usage Guidelines\n");
-        let mut grouped: BTreeMap<ToolCategory, Vec<&ToolGuideSpec>> = BTreeMap::new();
-
-        for guide in &guides {
-            grouped.entry(guide.category).or_default().push(guide);
-        }
-
-        for guides in grouped.values_mut() {
-            guides.sort_by_key(|g| g.tool_name.clone());
-        }
-
-        for category in ToolCategory::ordered() {
-            let Some(category_guides) = grouped.get(category) else {
-                continue;
-            };
-
-            output.push_str(&format!("\n### {}\n", category.title(context.language)));
-            output.push_str(category.description(context.language));
-            output.push('\n');
-
-            for guide in category_guides {
-                output.push_str(&format!("\n**{}**\n", guide.tool_name));
-                output.push_str(&format!(
-                    "- {}: {}\n",
-                    super::when_to_use_label(context.language),
-                    guide.when_to_use
-                ));
-                output.push_str(&format!(
-                    "- {}: {}\n",
-                    super::when_not_to_use_label(context.language),
-                    guide.when_not_to_use
-                ));
-
-                for example in guide.examples.iter().take(context.max_examples_per_tool) {
-                    let params = serde_json::to_string(&example.parameters)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    output.push_str(&format!(
-                        "- {}: {}\n  -> {}\n",
-                        super::example_label(context.language),
-                        params,
-                        example.explanation
-                    ));
-                }
-
-                if !guide.related_tools.is_empty() {
-                    output.push_str(&format!(
-                        "- {}: {}\n",
-                        super::related_tools_label(context.language),
-                        guide.related_tools.join(", ")
-                    ));
-                }
-            }
-        }
-
-        let guided_names: BTreeSet<&str> = guides
-            .iter()
-            .map(|guide| guide.tool_name.as_str())
-            .collect();
-        let unguided_schemas: Vec<ToolSchema> = schemas
-            .iter()
-            .filter(|schema| !guided_names.contains(schema.function.name.as_str()))
-            .cloned()
-            .collect();
-
-        if !unguided_schemas.is_empty() {
-            output.push('\n');
-            output.push_str(&EnhancedPromptBuilder::render_schema_only_section(
-                &unguided_schemas,
-                context,
-                false,
-            ));
-        }
-
-        if context.include_best_practices {
-            output.push_str(&format!(
-                "\n### {}\n",
-                super::best_practices_title(context.language)
-            ));
-            for (index, rule) in context.best_practices().iter().enumerate() {
-                output.push_str(&format!("{}. {}\n", index + 1, rule));
-            }
-        }
-
-        output
-    }
+    use super::*;
+    use crate::{tools::SleepTool, BuiltinToolExecutor, ReadTool};
+    use bamboo_agent_core::ToolExecutor;
 
     #[test]
-    fn build_renders_builtin_guides() {
-        let registry = ToolRegistry::new();
-        registry.register(ReadTool::new()).unwrap();
-
-        let schemas = registry.list_tools();
-        let prompt =
-            EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
-
-        assert!(prompt.contains("## Tool Usage Guidelines"));
-        assert!(prompt.contains("**Read**"));
-    }
-
-    #[test]
-    fn build_falls_back_to_schema_without_guides() {
-        let schema = ToolSchema {
-            schema_type: "function".to_string(),
-            function: FunctionSchema {
-                name: "dynamic_tool".to_string(),
-                description: "A runtime tool".to_string(),
-                parameters: json!({ "type": "object", "properties": {} }),
-            },
-        };
-        let context = GuideBuildContext {
-            language: GuideLanguage::English,
-            ..GuideBuildContext::default()
-        };
-
-        let prompt = EnhancedPromptBuilder::build(None, &[schema], &context);
-
-        assert!(prompt.contains("Additional Tools (Schema Only)"));
-        assert!(prompt.contains("dynamic_tool"));
-    }
-
-    #[test]
-    fn build_summarizes_discoverable_tools() {
-        let registry = ToolRegistry::new();
-        registry.register(ReadTool::new()).unwrap();
-        registry.register(crate::tools::SleepTool::new()).unwrap();
-
-        let schemas = registry.list_tools();
-        let prompt =
-            EnhancedPromptBuilder::build(Some(&registry), &schemas, &GuideBuildContext::default());
-
-        assert!(prompt.contains("### Discoverable Tools"));
-        assert!(prompt.contains("`Sleep`"));
-        assert!(!prompt.contains("**Sleep**"));
-    }
-
-    #[test]
-    fn build_reduces_prompt_length_vs_legacy_full_guides_for_builtin_surface() {
+    fn default_guide_supplements_schemas_with_only_shared_rules() {
         let executor = BuiltinToolExecutor::new();
         let schemas = executor.list_tools();
         let context = GuideBuildContext::default();
-
-        let legacy = render_legacy_full_prompt(&schemas, &context);
-        let current = EnhancedPromptBuilder::build(None, &schemas, &context);
-
-        assert!(current.len() < legacy.len());
-        let saved = legacy.len() - current.len();
-        let saved_ratio = saved as f64 / legacy.len() as f64;
-        eprintln!(
-            "guide_length_metrics: legacy={}, current={}, saved={}, saved_ratio={:.3}",
-            legacy.len(),
-            current.len(),
-            saved,
-            saved_ratio,
-        );
-        assert!(
-            saved > 0,
-            "expected prompt savings for summarized discoverable tools"
-        );
+        let prompt = EnhancedPromptBuilder::build(None, &schemas, &context);
+        assert!(prompt.len() < 640);
+        for schema in schemas {
+            assert!(!prompt.contains(&format!("**{}**", schema.function.name)));
+            assert!(!prompt.contains(&schema.function.description));
+        }
+        assert!(!prompt.contains("Discoverable"));
+        assert!(!prompt.contains("Example"));
+        assert!(EnhancedPromptBuilder::build(None, &[], &context).is_empty());
     }
 
     #[test]
-    fn build_shows_activated_discoverable_tools_with_full_detail() {
+    fn custom_guides_follow_exposure_and_example_limits() {
         let registry = ToolRegistry::new();
-        registry.register(crate::tools::SleepTool::new()).unwrap();
-
+        registry.register(SleepTool::new()).unwrap();
+        let spec = ToolGuideSpec {
+            tool_name: "Sleep".into(),
+            when_to_use: "CUSTOM_SLEEP_NOTES".into(),
+            when_not_to_use: String::new(),
+            examples: vec![
+                ToolExample::new("first", serde_json::json!({"seconds":1}), "FIRST_EXAMPLE"),
+                ToolExample::new("second", serde_json::json!({"seconds":2}), "SECOND_EXAMPLE"),
+            ],
+            related_tools: vec![],
+            category: ToolCategory::CommandExecution,
+        };
+        registry.register_guide("Sleep", spec).unwrap();
+        let mut context = GuideBuildContext {
+            include_best_practices: false,
+            max_examples_per_tool: 1,
+            ..Default::default()
+        };
         let schemas = registry.list_tools();
-        let mut context = GuideBuildContext::default();
-        context
-            .activated_discoverable_tools
-            .insert("Sleep".to_string());
-
+        assert!(EnhancedPromptBuilder::build(Some(&registry), &schemas, &context).is_empty());
+        context.activated_discoverable_tools.insert("Sleep".into());
         let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
-
-        assert!(
-            prompt.contains("### Activated Discoverable Tools"),
-            "activated discoverable section should appear"
-        );
-        assert!(
-            prompt.contains("**Sleep**"),
-            "activated Sleep should show full guide with bold name"
-        );
-        assert!(
-            prompt.contains("When to use"),
-            "activated Sleep should include when_to_use"
-        );
-        assert!(
-            prompt.contains("When NOT to use"),
-            "activated Sleep should include when_not_to_use"
-        );
-        assert!(
-            !prompt.contains("### Discoverable Tools"),
-            "inactive discoverable section should not appear when all discoverable tools are activated"
-        );
+        assert!(prompt.contains("CUSTOM_SLEEP_NOTES"));
+        assert!(prompt.contains("FIRST_EXAMPLE"));
+        assert!(!prompt.contains("SECOND_EXAMPLE"));
+        assert!(EnhancedPromptBuilder::build(Some(&registry), &[], &context).is_empty());
     }
 
     #[test]
-    fn build_shows_inactive_discoverable_tools_with_short_summary() {
-        let registry = ToolRegistry::new();
-        registry.register(crate::tools::SleepTool::new()).unwrap();
-
-        let schemas = registry.list_tools();
-        let context = GuideBuildContext::default();
-
-        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
-
-        assert!(
-            prompt.contains("### Discoverable Tools"),
-            "inactive discoverable section should appear"
-        );
-        assert!(
-            prompt.contains("`Sleep`"),
-            "inactive Sleep should show as short summary"
-        );
-        assert!(
-            !prompt.contains("**Sleep**"),
-            "inactive Sleep should NOT show full guide with bold name"
-        );
-        assert!(
-            !prompt.contains("Activated Discoverable Tools"),
-            "activated section should not appear when no discoverable tools are activated"
-        );
-    }
-
-    #[test]
-    fn build_separates_full_and_expandable_tool_guides_correctly() {
+    fn custom_resident_guides_are_available_without_activation() {
         let registry = ToolRegistry::new();
         registry.register(ReadTool::new()).unwrap();
-        registry.register(crate::tools::SleepTool::new()).unwrap();
-
-        let schemas = registry.list_tools();
-        let mut context = GuideBuildContext::default();
-        context
-            .activated_discoverable_tools
-            .insert("Sleep".to_string());
-
-        let prompt = EnhancedPromptBuilder::build(Some(&registry), &schemas, &context);
-
-        // Full-guide tool (Read) appears in its category section.
-        assert!(
-            prompt.contains("### File Reading Tools"),
-            "full guides should appear in category section"
+        registry
+            .register_guide(
+                "Read",
+                ToolGuideSpec {
+                    tool_name: "Read".into(),
+                    when_to_use: "CUSTOM_READ_NOTES".into(),
+                    when_not_to_use: "CUSTOM_READ_AVOID".into(),
+                    examples: vec![],
+                    related_tools: vec![],
+                    category: ToolCategory::FileReading,
+                },
+            )
+            .unwrap();
+        let prompt = EnhancedPromptBuilder::build(
+            Some(&registry),
+            &registry.list_tools(),
+            &GuideBuildContext::default(),
         );
-        assert!(
-            prompt.contains("**Read**"),
-            "Read should show its full guide"
-        );
-
-        // Activated discoverable should appear in activated section
-        assert!(
-            prompt.contains("### Activated Discoverable Tools"),
-            "activated discoverable section should appear"
-        );
-        assert!(
-            prompt.contains("**Sleep**"),
-            "activated Sleep should show full guide"
-        );
+        assert!(prompt.contains("When to use\nCUSTOM_READ_NOTES"));
+        assert!(prompt.contains("When NOT to use\nCUSTOM_READ_AVOID"));
+        assert_eq!(prompt.matches("**Read**").count(), 1);
     }
 }

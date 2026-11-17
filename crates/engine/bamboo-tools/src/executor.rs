@@ -2443,8 +2443,8 @@ mod tests {
     fn test_executor_builds_enhanced_prompt() {
         let executor = BuiltinToolExecutor::new();
         let prompt = executor.build_enhanced_prompt(GuideBuildContext::default());
-        assert!(prompt.contains("## Tool Usage Guidelines"));
-        assert!(prompt.contains("**Read**"));
+        assert!(prompt.contains("## Tool Guidance"));
+        assert!(!prompt.contains("**Read**"));
     }
 
     #[test]
