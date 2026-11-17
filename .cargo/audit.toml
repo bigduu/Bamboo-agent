@@ -46,4 +46,25 @@ ignore = [
     # delivery. Remove both tracked ignores when an accepted dependency
     # release replaces pin-utils with maintained pinning primitives.
     "RUSTSEC-2026-0441",
+
+    # RUSTSEC-2026-0543 records the unmaintained status of chrono 0.4.45.
+    # The locked graph includes direct workspace users and transitive users
+    # such as cron, Arrow and rusqlite. This informational advisory lists
+    # zero patched releases. RustSec recommends jiff or time. Moving Bamboo's
+    # timestamp APIs still leaves transitive users to migrate. Reviewed in #2792.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0543.html
+    "RUSTSEC-2026-0543",
+
+    # RUSTSEC-2026-0555 records the unmaintained status of chrono-tz 0.10.4.
+    # bamboo-agent and bamboo-server depend on it directly. The server uses
+    # IANA zones for schedule validation and recurrence. A replacement needs
+    # to preserve timezone and DST behavior. This informational advisory
+    # lists zero patched releases. Reviewed in #2792.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0555.html
+    #
+    # Each Chrono exception applies to its ID across the dependency graph.
+    # Review lock updates, new dependency paths, upstream releases and
+    # advisory changes. Remove the affected ID from both lists if affected
+    # versions leave the graph or the advisory reports a vulnerability.
+    "RUSTSEC-2026-0555",
 ]
