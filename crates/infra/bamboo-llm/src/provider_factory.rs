@@ -134,14 +134,12 @@ pub async fn create_provider_from_instance(
             if let Some(tool_search_execution) = tool_search_execution {
                 provider = provider.with_tool_search_execution(tool_search_execution);
             }
-            if instance
-                .extra
-                .get("sticky_tool_loading")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                provider = provider.with_sticky_tool_loading(true);
-            }
+            provider = provider.with_sticky_tool_loading(
+                instance
+                    .extra
+                    .get("sticky_tool_loading")
+                    .is_none_or(|setting| setting.as_bool() == Some(true)),
+            );
 
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_explicit_prompt_cache(
@@ -463,8 +461,11 @@ mod tests {
             },
         );
 
-        let result = create_provider(&config).await;
-        assert!(result.is_ok());
+        let provider = create_provider(&config).await.unwrap();
+        assert_eq!(
+            provider.capability_loading_mode("gpt-4o", None).await,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        );
     }
 
     #[tokio::test]
@@ -588,18 +589,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_sticky_tool_loading_requires_literal_true_and_preserves_native_precedence() {
+    async fn openai_sticky_tool_loading_defaults_on_and_preserves_native_precedence() {
         for (configured, expected) in [
-            (
-                None,
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
+            (None, bamboo_domain::CapabilityLoadingMode::StickyFallback),
             (
                 Some(serde_json::json!(false)),
                 bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
             ),
             (
                 Some(serde_json::json!("true")),
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some(serde_json::Value::Null),
                 bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
             ),
             (
@@ -623,7 +625,9 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 provider.capability_loading_mode("gpt-4o-mini", None).await,
-                expected
+                expected,
+                "sticky_tool_loading={:?}",
+                instance.extra.get("sticky_tool_loading")
             );
             assert_eq!(
                 provider

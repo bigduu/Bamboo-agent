@@ -32,6 +32,13 @@ and limits outside 1–5 fail. Rebuilding from the current registry prevents
 removed, disabled and HostOnly tools from being returned or gaining callable
 authority. Historical loaded names still require current registry eligibility.
 
+OpenAI provider instances default to on-demand loading for Chat Completions.
+The top-level tool list contains Core tools and the discovery function
+`discover_capabilities`. A discovery result carries the definitions of
+matching tools into conversation history. Set `"sticky_tool_loading": false`
+in the provider instance to send the full catalog to gateways that require
+each callable tool in the top-level list.
+
 OpenAI Responses client `tool_search` exposes `query` and optional `limit` and
 searches Tools only. New requests with explicit Skill/Workflow kinds fail;
 completed historical search transcripts continue to replay. The StickyFallback
