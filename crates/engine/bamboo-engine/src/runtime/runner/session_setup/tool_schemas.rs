@@ -621,9 +621,11 @@ mod live_disabled_tests {
         for (reference, target) in [
             ("FileExists", "GetFileInfo"),
             ("default::fileExists", "GetFileInfo"),
+            ("DEFAULT::fileExists", "GetFileInfo"),
             ("GetCurrentDir", "Workspace"),
             ("default::get_current_dir", "Workspace"),
             ("set_workspace", "Workspace"),
+            ("Default::set_workspace", "Workspace"),
         ] {
             let config = AgentLoopConfig {
                 disabled_tools: BTreeSet::from([reference.to_owned()]),
