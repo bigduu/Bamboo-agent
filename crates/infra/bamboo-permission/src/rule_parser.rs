@@ -237,7 +237,8 @@ impl ParsedRule {
             let Some(action) = args
                 .get("action")
                 .and_then(Value::as_str)
-                .and_then(|action| action.strip_prefix("session_"))
+                .map(|action| action.trim().to_ascii_lowercase())
+                .and_then(|action| action.strip_prefix("session_").map(str::to_owned))
             else {
                 return false;
             };
@@ -424,6 +425,26 @@ mod tests {
         assert!(!rule.matches_tool_call_for_allow("memory", &note));
         assert!(!rule.matches_tool_call("memory", &json!({"action":"write","content":"durable"})));
         assert!(!rule.matches_tool_call("memory", &json!({"action":"session_read"})));
+
+        for name in [
+            "session_note",
+            "session_note(replace)",
+            "memory_note",
+            "memory_note(replace)",
+        ] {
+            let rule = ParsedRule::parse(name);
+            for action in ["session_replace", "SESSION_REPLACE", " SESSION_REPLACE "] {
+                let note = json!({"action":action,"content":"updated"});
+                assert!(rule.matches_tool_call("memory", &note), "{name}: {action}");
+                assert!(
+                    !rule.matches_tool_call_for_allow("memory", &note),
+                    "{name}: {action}"
+                );
+            }
+            assert!(
+                !rule.matches_tool_call("memory", &json!({"action":"write","content":"durable"}))
+            );
+        }
     }
 
     #[test]

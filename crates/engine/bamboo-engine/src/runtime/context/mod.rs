@@ -21,8 +21,6 @@ For ordinary executing Sessions, delegate to sub-agents sparingly, and only when
 
 If Bamboo has already injected relevant workspace or environment context, treat it as available working context instead of re-asking the user for the same information. Prefer a minimal verifiable attempt first, then diagnose failures and only ask follow-up questions for information that is still genuinely missing.
 
-You have a persistent cross-session memory via the `memory` tool. When you learn a durable, non-derivable fact (a user preference, a confirmed decision, a stable reference), save it as one atomic memory with a specific, descriptive title. Treat injected memory as context to verify against current files, not as authoritative truth. Conversely, when the user refers to their own preferences, past decisions, or personal context you don't already know — including first-person questions about themselves ("what do I...", "did I...", "我...?") — query memory before answering instead of saying you don't know.
-
 When making function calls using tools, always include a brief text explanation before or alongside the tool calls describing what you are about to do and why. Never silently call tools without any visible narration to the user."#;
 
 /// Framework-invariant agent operating directives, applied on top of whatever
