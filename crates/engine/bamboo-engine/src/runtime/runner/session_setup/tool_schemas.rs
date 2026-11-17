@@ -284,17 +284,20 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
             std::iter::once(name).chain(replacements)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    // When the owned shell pair is installed, a model must be able to
-    // continue a command after its initial wait yields a handle.
-    if shell_pair
-        .into_iter()
-        .all(|name| by_execution_name.contains_key(name) && owned_shell(name))
+    // An owned command can yield a handle, so its native continuation must
+    // remain available even after an upstream profile filters the catalog.
+    if has_owned_shell
         && shell_pair.into_iter().any(|name| {
-            disabled_execution_names.contains(name) || !session.allows_model_tool_execution(name)
+            !by_execution_name.contains_key(name)
+                || !owned_shell(name)
+                || disabled_execution_names.contains(name)
+                || !session.allows_model_tool_execution(name)
         })
     {
         for name in shell_pair {
-            by_execution_name.remove(name);
+            if owned_shell(name) {
+                by_execution_name.remove(name);
+            }
         }
     }
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
@@ -539,6 +542,55 @@ mod live_disabled_tests {
     }
 
     struct PositiveShellCatalog(&'static [&'static str]);
+
+    struct PrefilteredNativeShell {
+        tools: bamboo_tools::BuiltinToolExecutor,
+        hidden: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PrefilteredNativeShell {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("catalog projection only")
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut schemas = self.tools.list_tools();
+            schemas.retain(|schema| schema.function.name != self.hidden);
+            schemas.push(schema("vendor::exec_command"));
+            schemas
+        }
+
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            (name != self.hidden)
+                .then(|| self.tools.exact_tool_owner(name))
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn owned_shell_requires_both_native_tools_after_upstream_profile_filtering() {
+        let config = AgentLoopConfig::default();
+        let root = Session::new("shell-profile-root", "model");
+        let child = Session::new_child_of("shell-profile-child", &root, "model", "worker");
+        for hidden in ["exec_command", "write_stdin"] {
+            let tools = PrefilteredNativeShell {
+                tools: bamboo_tools::BuiltinToolExecutor::new(),
+                hidden,
+            };
+            for session in [&root, &child] {
+                let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, session);
+                let present = |name| catalog.iter().any(|entry| entry.execution_name() == name);
+                assert!(!present("exec_command"), "{hidden}");
+                assert!(!present("write_stdin"), "{hidden}");
+                assert!(present("Read"));
+                assert!(present("vendor::exec_command"));
+            }
+        }
+        let tools = bamboo_tools::BuiltinToolExecutor::new();
+        assert!(offered(&config, &tools, &root, "exec_command"));
+        assert!(offered(&config, &tools, &root, "write_stdin"));
+    }
 
     #[async_trait::async_trait]
     impl ToolExecutor for PositiveShellCatalog {
