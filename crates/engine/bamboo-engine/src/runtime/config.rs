@@ -997,6 +997,7 @@ pub struct AgentLoopConfig {
     /// Frozen host context-management strategy for this run. Missing public
     /// configuration resolves to the legacy summary behavior.
     pub(crate) context_management: bamboo_config::ContextManagementConfig,
+    pub(crate) context_compactions: Option<super::context_compaction::ContextCompactions>,
     /// Safe request ceiling as a percentage of the selected summarization
     /// model's context window.
     pub(crate) summary_safe_window_percent: u8,
@@ -1212,6 +1213,7 @@ impl Default for AgentLoopConfig {
             compression_instructions: None,
             summary_target_ratio: 0.20,
             context_management: bamboo_config::ContextManagementConfig::default(),
+            context_compactions: None,
             summary_safe_window_percent: 80,
             summarization_model_name: None,
             background_model_provider: None,

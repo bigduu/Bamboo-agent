@@ -566,6 +566,27 @@ pub fn apply_retrieval_window_plan_with_trigger(
     current_accounting: &RetrievalWindowTokenAccounting,
     trigger_type: CompressionTriggerType,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+    apply_retrieval_window_plan_with_event_id(
+        session,
+        plan,
+        current_policy,
+        current_budget,
+        current_accounting,
+        trigger_type,
+        None,
+    )
+}
+
+/// Apply a plan with the same identity that was used to report its progress.
+pub fn apply_retrieval_window_plan_with_event_id(
+    session: &mut Session,
+    plan: &RetrievalWindowCandidatePlan,
+    current_policy: RetrievalWindowPolicy,
+    current_budget: &TokenBudget,
+    current_accounting: &RetrievalWindowTokenAccounting,
+    trigger_type: CompressionTriggerType,
+    event_id: Option<&str>,
+) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let usage = validate_apply_plan_arithmetic(plan)?;
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
@@ -628,6 +649,9 @@ pub fn apply_retrieval_window_plan_with_trigger(
         0,
     );
     event.kind = CompressionEventKind::RetrievalWindow;
+    if let Some(id) = event_id {
+        event.id = id.to_owned();
+    }
     event.source_tokens = plan.archive_message_tokens;
     event.fixed_prompt_tokens = plan.fixed_prompt_tokens;
     event.retrieval_active_tokens_before = plan.active_tokens_before;

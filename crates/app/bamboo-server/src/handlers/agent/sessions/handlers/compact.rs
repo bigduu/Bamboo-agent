@@ -26,6 +26,38 @@ fn not_found() -> HttpResponse {
     HttpResponse::NotFound().json(json!({ "error": error_value("Session not found") }))
 }
 
+/// Observe the active attempt and last durably applied compression for a Session.
+pub async fn get_session_compaction(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse> {
+    let id = path.into_inner();
+    // Take the live observation first. Reading disk second also covers a commit
+    // completed between the two reads.
+    let active = state.agent.context_compaction_progress(&id);
+    let Some(session) = state.storage.load_session(&id).await.map_err(|error| {
+        json_internal_server_error(format!("Could not load the Session: {error}"))
+    })?
+    else {
+        return Ok(not_found());
+    };
+    let configured_strategy = state.config.read().await.context_management.strategy;
+    let applied = session.compression_events.last().map(|event| {
+        json!({
+            "id": event.id,
+            "strategy": event.kind,
+        })
+    });
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "no-store"))
+        .json(json!({
+            "session_id": id,
+            "configured_strategy": configured_strategy,
+            "active": active.filter(|attempt| attempt.is_active_for(&session)),
+            "applied": applied,
+        })))
+}
+
 /// Compress an idle ordinary chat through the Session's fenced history writer.
 pub async fn compact_session(
     state: web::Data<AppState>,
@@ -130,6 +162,7 @@ async fn compact_owned_session(
     }
     let snapshot = serde_json::to_value(&staged)
         .map_err(|error| json_internal_server_error(error.to_string()))?;
+    let activity = state.agent.begin_context_compaction(&staged);
     let tools = state.tools_for(ToolSurface::Root);
     let result = tokio::time::timeout(
         COMPACTION_DEADLINE,
@@ -174,6 +207,7 @@ async fn compact_owned_session(
         .id
         .clone();
     staged.updated_at = chrono::Utc::now();
+    activity.saving();
     let saved = access
         .mutate_for_response(
             id,
@@ -237,6 +271,8 @@ async fn compact_owned_session(
             Ok(HttpResponse::Ok().json(json!({
                 "session_id": id,
                 "status": "compacted",
+                "compaction_id": event.id,
+                "strategy": event.kind,
                 "usage_before_percent": event.usage_before_percent,
                 "usage_after_percent": f64::from(usage.total_tokens) * 100.0
                     / f64::from(usage.max_context_tokens),
