@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 17] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -14,7 +14,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
     "GetFileInfo",
     "Glob",
     "Grep",
-    "session_note",
     "Read",
     "request_permissions",
     "Sleep",
@@ -237,89 +236,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use as a fast existence probe before deciding create vs update.",
             )],
         )),
-        "session_note" | "memory_note" => Some(guide(
-            if tool_name == "memory_note" {
-                "memory_note"
-            } else {
-                "session_note"
-            },
-            ToolCategory::TaskManagement,
-            "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
-            "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
-            &["Task", "session_history_current"],
-            vec![
-                example(
-                    "Persist a durable session constraint",
-                    json!({"action":"append","content":"User prefers pnpm and strict TypeScript."}),
-                    "Use append for stable session/workstream facts; use replace to compress long notes.",
-                ),
-                example(
-                    "Store notes for a specific topic",
-                    json!({"action":"append","topic":"backend-api","content":"REST endpoints finalized: /users, /orders."}),
-                    "Use topic to keep separate workstreams isolated from each other.",
-                ),
-            ],
-        )),
-        "memory" => Some(guide(
-            "memory",
-            ToolCategory::TaskManagement,
-            "Use Session memory for current-session continuity, Section memory for facts shared within the current server-assigned Section, Project memory for project-wide facts and decisions, and Global memory for cross-project user context. Without Section context, keep Section-only facts in Session notes and use the other scopes for facts that apply to them. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing and store one confirmed atomic fact with a few useful keywords, entities, and tags.",
-            "Do not store secrets, unverified claims, live state that you can inspect directly, embeddings, or unrelated facts in one memory. Treat canonical Project memory as trusted durable project authority but verify live state before acting; treat Dream as a low-trust derived orientation snapshot. Do not increase the query limit or get every hit by default, and merge or consolidate only the same confirmed fact.",
-            &["session_note", "session_history_current", "Task"],
-            vec![
-                example(
-                    "Read the current session note topic",
-                    json!({"action":"session_read","topic":"default","options":{"max_chars":4000}}),
-                    "Use for continuity state inside the current session.",
-                ),
-                example(
-                    "Shortlist durable memories before reading full content",
-                    json!({"action":"query","scope":"project","query":"mobile release freeze"}),
-                    "Use Jiandu's compact default top three ID/summary results, then select only the item that needs full context.",
-                ),
-                example(
-                    "Get the selected durable memory",
-                    json!({"action":"get","id":"mem_20260403_001","options":{"max_chars":5000}}),
-                    "Use after query for the one selected ID whose full body or frontmatter is needed.",
-                ),
-                example(
-                    "Recall before answering about the user's own context",
-                    json!({"action":"query","scope":"global","query":"preferred testing framework"}),
-                    "When the user refers to their own preferences, opinions, or past decisions you don't already know — especially first-person questions ('what do I...', 'did I...', '我...?') — query memory BEFORE answering; do not say you don't know without checking.",
-                ),
-                example(
-                    "Recall a past project decision before acting",
-                    json!({"action":"query","scope":"project","query":"HTTP Tauri IPC decision"}),
-                    "Treat a matching canonical Project memory as trusted durable project authority, then verify any live implementation state before acting.",
-                ),
-                example(
-                    "Query before writing a durable fact",
-                    json!({"action":"query","scope":"project","query":"mobile release freeze Tuesday"}),
-                    "Check whether the same fact already exists before write; merge only when the selected existing item is the same confirmed fact.",
-                ),
-                example(
-                    "Write a durable project memory",
-                    json!({"action":"write","scope":"project","type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["mobile","release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
-                    "Write one confirmed atomic fact with a specific title and only a few lexical retrieval hints.",
-                ),
-                example(
-                    "Merge follow-up details into an existing durable memory",
-                    json!({"action":"merge","id":"mem_20260403_001","content":"The release manager confirmed the Tuesday freeze.","keywords":["release freeze","Tuesday"],"entities":["release manager"],"tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
-                    "Use ONLY when the new evidence is the same fact as the target memory and older overlapping items should be superseded. Do not merge unrelated facts together — create a separate memory instead.",
-                ),
-                example(
-                    "Split a multi-topic memory into atomic memories",
-                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm.","keywords":["pnpm","package manager"],"entities":["pnpm"],"tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}]}),
-                    "Use when one memory has accreted several unrelated facts (a 'blob'): split archives the original and creates one atomic memory per fact, preserving lineage via supersedes.",
-                ),
-                example(
-                    "Consolidate near-duplicate memories into one",
-                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
-                    "Use ONLY when two or more memories are the SAME fact: consolidate archives them all and creates one canonical atomic memory, preserving lineage via supersedes. Confirm sameness (e.g. via scan_duplicates / find_duplicates) before consolidating — never merge distinct facts.",
-                ),
-            ],
-        )),
-
         // Workspace is the unified tool replacing GetCurrentDir + SetWorkspace
         "Workspace" => Some(guide(
             "Workspace",
@@ -439,7 +355,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::FileReading,
             "Use the always-resident session_history_current to search your own Session with search_current, then recover complete turns with read_around or page them with read_current, including archived turns. When the Host allows current-user peer history, use session_history with inspect for another Session's saved progress, or read_messages to page its visible dialogue. Pass the target session_id and use offset to continue. Other cross-Session actions require their own authority. When export_context is available, keep its returned revision fixed across bounded continuation reads. Raw Session history is transcript authority, and memory is selective durable knowledge.",
             "Do not pass a Session ID, boundary, or compressed-state mutation to current-Session actions: the host derives identity and the current-call boundary. Treat cursors only as opaque continuations and reuse them unchanged. Do not use history as a broad substitute for code search. Privileged cross-session actions exist only when the supplied schema lists them, and export quota/corruption errors do not authorize deleting snapshots.",
-            &["session_note", "Read", "Task"],
+            &["memory", "Read", "Task"],
             vec![
                 example(
                     "Search this Session's stored history",
@@ -631,6 +547,9 @@ mod tests {
     #[test]
     fn builtin_guides_cover_all_builtin_tool_names() {
         for name in BUILTIN_TOOL_NAMES {
+            if name == "memory" {
+                continue; // The scoped memory schema supplies its supported actions.
+            }
             assert!(
                 builtin_guide_spec(name).is_some(),
                 "missing builtin guide coverage for {}",
@@ -680,19 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_server_tool_has_fallback_guide_spec() {
-        let guide = builtin_guide_spec("memory").expect("memory guide should exist");
-        assert_eq!(guide.tool_name, "memory");
-        assert!(guide.examples.iter().any(|example| {
-            example
-                .parameters
-                .get("action")
-                .and_then(|value| value.as_str())
-                == Some("merge")
-        }));
-    }
-
-    #[test]
     fn current_history_guide_teaches_exact_retrieval_and_authority_boundaries() {
         let guide = builtin_guide_spec("session_history_current")
             .expect("current-history guide should exist");
@@ -710,55 +616,6 @@ mod tests {
         assert!(guide.when_to_use.contains("transcript authority"));
         assert!(guide.when_to_use.contains("memory is selective"));
         assert!(guide.when_not_to_use.contains("Session ID"));
-    }
-
-    #[test]
-    fn memory_guide_teaches_compact_recall_and_small_lexical_hints() {
-        let guide = builtin_guide_spec("memory").expect("memory guide should exist");
-        let examples_for = |action: &str| {
-            guide
-                .examples
-                .iter()
-                .filter(|example| {
-                    example
-                        .parameters
-                        .get("action")
-                        .and_then(|value| value.as_str())
-                        == Some(action)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let queries = examples_for("query");
-        assert!(!queries.is_empty());
-        assert!(queries
-            .iter()
-            .all(|example| example.parameters.pointer("/options/limit").is_none()));
-        assert_eq!(examples_for("get").len(), 1);
-
-        for action in ["write", "merge", "consolidate"] {
-            let examples = examples_for(action);
-            assert_eq!(examples.len(), 1, "missing {action} example");
-            for field in ["keywords", "entities", "tags"] {
-                let hints = examples[0].parameters[field]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{action} example is missing {field}"));
-                assert!(!hints.is_empty() && hints.len() <= 3);
-            }
-        }
-
-        let split = examples_for("split");
-        let pieces = split[0].parameters["pieces"]
-            .as_array()
-            .expect("split example should contain pieces");
-        for piece in pieces {
-            for field in ["keywords", "entities", "tags"] {
-                let hints = piece[field]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("split piece is missing {field}"));
-                assert!(!hints.is_empty() && hints.len() <= 3);
-            }
-        }
     }
 
     #[test]

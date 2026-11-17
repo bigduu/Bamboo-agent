@@ -38,7 +38,7 @@ You MAY:
 - Fetch web content (WebFetch, WebSearch)
 - Use SubAgent with subagent_type="plan" to spawn read-only exploration agents
 - Update the task list (Task tool) — tasks created in plan mode default to phase=planning
-- Write notes to session memory (session_note tool)
+- Write notes with the memory tool using session_* actions
 
 Your goal: Explore the codebase thoroughly, understand the problem, and produce a detailed implementation plan.
 
