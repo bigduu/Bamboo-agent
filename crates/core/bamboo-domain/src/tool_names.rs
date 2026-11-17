@@ -239,7 +239,7 @@ pub fn resolve_disabled_tool_reference_name(
         return Some(name);
     }
     let reference = reference.trim();
-    let unqualified = reference.strip_prefix("default::").unwrap_or(reference);
+    let unqualified = default_namespace_tool_name(reference).unwrap_or(reference);
     let retired_replacement = match unqualified {
         name if name.eq_ignore_ascii_case("FileExists") || name == "file_exists" => {
             Some("GetFileInfo")
@@ -281,8 +281,16 @@ fn retired_shell_policy_name(reference: &str) -> Option<&'static str> {
 /// Preserve an old default-namespace deny after exact resolution misses.
 /// Use only where Bamboo's own terminal is installed.
 pub fn retired_default_shell_policy_name(reference: &str) -> Option<String> {
-    let name = reference.trim().strip_prefix("default::")?.trim();
+    let name = default_namespace_tool_name(reference.trim())?;
     retired_shell_policy_name(name).map(str::to_owned)
+}
+
+fn default_namespace_tool_name(reference: &str) -> Option<&str> {
+    let (namespace, name) = reference.split_once("::")?;
+    namespace
+        .trim()
+        .eq_ignore_ascii_case("default")
+        .then_some(name.trim())
 }
 
 /// Checks if a tool reference is a built-in tool
@@ -300,15 +308,19 @@ mod tests {
             ("FileExists", "GetFileInfo"),
             ("file_exists", "GetFileInfo"),
             ("default::fileExists", "GetFileInfo"),
+            ("DEFAULT::FiLeExIsTs", "GetFileInfo"),
             ("fIlEeXiStS", "GetFileInfo"),
             ("GetCurrentDir", "Workspace"),
             ("get_current_dir", "Workspace"),
             ("default::getCurrentDir", "Workspace"),
+            ("Default::getCurrentDir", "Workspace"),
             ("SetWorkspace", "Workspace"),
             ("set_workspace", "Workspace"),
             ("default::setWorkspace", "Workspace"),
+            (" Default:: setWorkspace ", "Workspace"),
             ("memory_note", "session_note"),
             ("default::memory_note", "session_note"),
+            ("DEFAULT::memory_note", "session_note"),
             ("recall", "session_history"),
             ("session_inspector", "session_history"),
             ("default::sessionInspector", "session_history"),
@@ -349,6 +361,17 @@ mod tests {
             .contains(&name)),
             Some("FileExists".into())
         );
+    }
+
+    #[test]
+    fn retired_default_namespace_denials_preserve_case_insensitive_references() {
+        for reference in ["default::Bash", "DEFAULT::bAsH", " Default:: Bash "] {
+            assert_eq!(
+                retired_default_shell_policy_name(reference),
+                Some("Bash".into())
+            );
+        }
+        assert_eq!(retired_default_shell_policy_name("vendor::Bash"), None);
     }
 
     #[test]
