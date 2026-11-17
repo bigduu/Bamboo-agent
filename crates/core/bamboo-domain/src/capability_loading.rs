@@ -606,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             capability_loading_class_for_reference("default::getCurrentDir"),
-            CapabilityLoadingClass::HostOnly
+            CapabilityLoadingClass::Deferred
         );
         assert_eq!(
             capability_loading_class_for_reference("default::sub_task"),

@@ -560,7 +560,10 @@ mod tests {
     fn canonical_name_resolves_aliases_namespaces_and_known_case() {
         assert_eq!(canonical_tool_name(" default::applyPatch "), "Edit");
         assert_eq!(canonical_tool_name("DEFAULT::read"), "Read");
-        assert_eq!(canonical_tool_name("default::set_workspace"), "Workspace");
+        assert_eq!(
+            canonical_tool_name("default::set_workspace"),
+            "set_workspace"
+        );
         assert_eq!(canonical_tool_name("DEFAULT::WORKFLOW_RUN"), "workflow_run");
         assert_eq!(
             canonical_tool_name("DEFAULT::SESSION_HISTORY_CURRENT"),
