@@ -1260,6 +1260,9 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    if let Some(code) = bamboo_agent::server::tailscale_serve_helper_entry() {
+        std::process::exit(code);
+    }
     // AppKit's views run on the initial main thread in a UI-only own-executable
     // helper. It cannot initialize configuration, AppState, sockets or model work.
     if let Some(code) = bamboo_agent::server::native_scope_confirmation_helper_entry() {
