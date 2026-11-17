@@ -173,8 +173,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "session_history",
     "session_history_current",
     "bamboo_diagnostics",
-    "recall",
-    "session_inspector",
     "archive_context",
     "compact_context",
     "Sleep",
@@ -182,7 +180,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // mutation happens in the engine, and it touches no user-facing state, so it
     // never needs approval.
     "update_goal",
-    // `notify` (an overlay tool, like `compact_context`/`session_inspector`
+    // `notify` (an overlay tool, like `compact_context`/`session_history`
     // above) fires an outbound OS popup / push side effect but mutates
     // nothing in the session or workspace and produces no result the model
     // reads back — safe both to run in the concurrent read-only batch
@@ -277,6 +275,23 @@ mod tests {
             classify_tool("totally_unknown_tool"),
             ToolMutability::Mutating
         );
+        for retired in [
+            "session_note",
+            "FileExists",
+            "GetCurrentDir",
+            "SetWorkspace",
+            "memory_note",
+            "recall",
+            "session_inspector",
+            "schedule_tasks",
+        ] {
+            assert_eq!(
+                classify_tool(retired),
+                ToolMutability::Mutating,
+                "{retired}"
+            );
+            assert!(!plan_mode_allows_tool(retired), "{retired}");
+        }
     }
 
     #[test]
