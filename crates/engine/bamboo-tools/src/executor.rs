@@ -360,7 +360,6 @@ impl BuiltinToolExecutor {
             framework_tools.insert(name, tool);
         }
         let _ = registry.register(ExitPlanModeTool::new());
-        // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, GlobTool::new()) {
             framework_tools.insert(name, tool);
@@ -379,7 +378,6 @@ impl BuiltinToolExecutor {
         }
         let _ = registry.register(ViewImageTool::new());
         let _ = registry.register(WebFetchTool::new());
-        // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
         let _ = registry.register(WorkspaceTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteTool::new()) {
             framework_tools.insert(name, tool);
@@ -2011,6 +2009,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn retired_tool_aliases_cannot_dispatch() {
+        let executor = BuiltinToolExecutor::new();
+        for name in [
+            "FileExists",
+            "file_exists",
+            "default::fileExists",
+            "GetCurrentDir",
+            "getCurrentDir",
+            "default::get_current_dir",
+            "SetWorkspace",
+            "set_workspace",
+            "default::setWorkspace",
+            "memory_note",
+            "recall",
+            "session_inspector",
+            "schedule_tasks",
+        ] {
+            let call = make_tool_call(name, json!({}));
+            assert!(
+                matches!(executor.execute(&call).await, Err(ToolError::NotFound(_))),
+                "{name}"
+            );
+        }
+        assert!(
+            executor
+                .execute(&make_tool_call("Workspace", json!({})))
+                .await
+                .unwrap()
+                .success
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            executor
+                .execute(&make_tool_call("GetFileInfo", json!({"path": file.path()})))
+                .await
+                .unwrap()
+                .success
+        );
+    }
+
     #[test]
     fn tool_ref_excludes_retired_shell_names() {
         for name in [
@@ -2028,22 +2067,13 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_camel_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::fileExists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::getCurrentDir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::fileExists"), None);
+        assert_eq!(normalize_tool_ref("default::getCurrentDir"), None);
         assert_eq!(
             normalize_tool_ref("default::getFileInfo"),
             Some("GetFileInfo".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::setWorkspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::setWorkspace"), None);
         assert_eq!(
             normalize_tool_ref("default::sleep"),
             Some("Sleep".to_string())
@@ -2052,14 +2082,8 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_snake_case_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::file_exists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::get_current_dir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::file_exists"), None);
+        assert_eq!(normalize_tool_ref("default::get_current_dir"), None);
         assert_eq!(
             normalize_tool_ref("default::get_file_info"),
             Some("GetFileInfo".to_string())
@@ -2068,18 +2092,12 @@ mod tests {
             normalize_tool_ref("default::list_directory"),
             Some("Glob".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::memory_note"),
-            Some("memory_note".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::memory_note"), None);
         assert_eq!(
             normalize_tool_ref("default::read_file"),
             Some("Read".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::set_workspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::set_workspace"), None);
         assert_eq!(
             normalize_tool_ref("default::write_file"),
             Some("Write".to_string())

@@ -83,51 +83,37 @@ async fn test_execute_tool_list_directory() {
 }
 
 #[actix_web::test]
-async fn test_execute_tool_file_exists() {
+async fn test_execute_tool_file_metadata_reports_existence() {
     let state = crate::e2e::common::create_test_app().await;
-
     let app = test::init_service(
         App::new()
             .app_data(state)
             .route("/v1/tools/execute", web::post().to(tools::execute_tool)),
     )
     .await;
-
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let test_file = temp_dir.path().join("exists.txt");
     tokio::fs::write(&test_file, "test")
         .await
         .expect("Failed to write file");
-
-    let req = test::TestRequest::post()
-        .uri("/v1/tools/execute")
-        .set_json(json!({
-            "tool_name": "file_exists",
-            "parameters": [
-                {
-                    "name": "path",
-                    "value": test_file.to_str().unwrap()
-                }
-            ]
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_success());
-
-    let req = test::TestRequest::post()
-        .uri("/v1/tools/execute")
-        .set_json(json!({
-            "tool_name": "file_exists",
-            "parameters": [
-                {
-                    "name": "path",
-                    "value": "/nonexistent/path/to/file.txt"
-                }
-            ]
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_success());
+    for (path, expected_exists) in [
+        (test_file, true),
+        (temp_dir.path().join("missing.txt"), false),
+    ] {
+        let req = test::TestRequest::post()
+            .uri("/v1/tools/execute")
+            .set_json(json!({
+                "tool_name":"GetFileInfo",
+                "parameters":[{"name":"path","value":path.to_str().unwrap()}]
+            }))
+            .to_request();
+        let response = test::call_service(&app, req).await;
+        assert!(response.status().is_success());
+        let body: Value = test::read_body_json(response).await;
+        let payload: Value = serde_json::from_str(body["result"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["tool_name"], "GetFileInfo");
+        assert_eq!(payload["success"], true);
+        let info: Value = serde_json::from_str(payload["result"].as_str().unwrap()).unwrap();
+        assert_eq!(info["exists"], expected_exists);
+    }
 }

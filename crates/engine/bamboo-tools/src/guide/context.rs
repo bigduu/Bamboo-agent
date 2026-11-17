@@ -78,7 +78,7 @@ impl GuideBuildContext {
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: Glob, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -93,7 +93,7 @@ impl GuideBuildContext {
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
+                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: Glob, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -133,6 +133,9 @@ mod tests {
             assert!(guidance.contains("Use shell tools for terminal operations"));
             assert!(!guidance.contains("exec_command"));
             assert!(!guidance.contains("write_stdin"));
+            for retired in ["FileExists", "GetCurrentDir", "SetWorkspace"] {
+                assert!(!guidance.contains(retired), "{retired}");
+            }
         }
     }
 

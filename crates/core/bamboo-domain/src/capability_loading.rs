@@ -606,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             capability_loading_class_for_reference("default::getCurrentDir"),
-            CapabilityLoadingClass::HostOnly
+            CapabilityLoadingClass::Deferred
         );
         assert_eq!(
             capability_loading_class_for_reference("default::sub_task"),
@@ -661,8 +661,8 @@ mod tests {
             );
         }
         let host_alias =
-            ClassifiedToolIdentity::from_schema_name("GetCurrentDir").expect("host alias identity");
-        assert_eq!(host_alias.execution_name(), "GetCurrentDir");
+            ClassifiedToolIdentity::from_schema_name("Workspace").expect("host identity");
+        assert_eq!(host_alias.execution_name(), "Workspace");
         assert_eq!(host_alias.loading_class(), CapabilityLoadingClass::HostOnly);
         assert_eq!(
             ClassifiedToolIdentity::from_schema_name("exec_command")

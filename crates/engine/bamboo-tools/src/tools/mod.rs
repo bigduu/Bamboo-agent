@@ -38,7 +38,7 @@ pub use grep::GrepTool;
 pub use loop_control::{
     parse_loop_control_request, LoopControlRequest, LoopControlTool, LOOP_CONTROL_TOOL_NAME,
 };
-pub use memory_note::{MemoryNoteTool, SessionNoteTool};
+pub use memory_note::SessionNoteTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use request_permissions::RequestPermissionsTool;

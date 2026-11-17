@@ -667,6 +667,32 @@ mod live_disabled_tests {
     }
 
     #[test]
+    fn retired_file_denials_constrain_the_canonical_catalog() {
+        let tools = PositiveShellCatalog(&["Read", "GetFileInfo", "Workspace"]);
+        let session = Session::new("file-denial", "m");
+        for (reference, target) in [
+            ("FileExists", "GetFileInfo"),
+            ("default::fileExists", "GetFileInfo"),
+            ("DEFAULT::fileExists", "GetFileInfo"),
+            ("GetCurrentDir", "Workspace"),
+            ("default::get_current_dir", "Workspace"),
+            ("set_workspace", "Workspace"),
+            ("Default::set_workspace", "Workspace"),
+        ] {
+            let config = AgentLoopConfig {
+                disabled_tools: BTreeSet::from([reference.to_owned()]),
+                ..Default::default()
+            };
+            let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+            assert!(
+                catalog.iter().all(|entry| entry.execution_name() != target),
+                "{reference}"
+            );
+            assert!(catalog.iter().any(|entry| entry.execution_name() == "Read"));
+        }
+    }
+
+    #[test]
     fn supported_unqualified_legacy_alias_denials_constrain_pair_only_catalog_and_admission() {
         let tools = PositiveShellCatalog(&["exec_command", "write_stdin", "Read"]);
         for (denied, legacy, replacement) in [

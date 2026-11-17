@@ -32,23 +32,9 @@ pub const BUILTIN_TOOL_NAMES: [&str; 18] = [
 /// Tool names that are accepted as aliases for built-in/server tools but are not
 /// independently listed in `BUILTIN_TOOL_NAMES`/`SERVER_TOOL_NAMES`. Calls to these names are
 /// transparently routed to their canonical counterpart.
-pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 10] = [
+pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 3] = [
     // apply_patch is a patch-only alias for Edit
     ("apply_patch", "Edit"),
-    // FileExists is subsumed by GetFileInfo (returns {exists: false} for missing paths)
-    ("FileExists", "GetFileInfo"),
-    // GetCurrentDir + SetWorkspace are subsumed by Workspace
-    ("GetCurrentDir", "Workspace"),
-    ("SetWorkspace", "Workspace"),
-    // Session note rename
-    ("memory_note", "session_note"),
-    // Server tool renames: `recall` was ambiguous with durable-memory recall
-    // (RAG-style relevant-memory injection). The canonical name is now
-    // `session_history` — strictly a read-only viewer over local SQLite
-    // session storage. Older names still route to the canonical tool.
-    ("recall", "session_history"),
-    ("session_inspector", "session_history"),
-    ("schedule_tasks", "scheduler"),
     // SubAgent manager alias
     ("sub_session_manager", "SubAgent"),
     ("SubSession", "SubAgent"),
@@ -58,19 +44,12 @@ pub const BUILTIN_TOOL_ALIASES: [(&str, &str); 10] = [
 ///
 /// This table is public so classification, compatibility tests, and future
 /// admission code can prove that every accepted spelling shares one resolver.
-pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 34] = [
+pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 25] = [
     ("execute_command", "Bash"),
-    ("file_exists", "FileExists"),
-    ("fileExists", "FileExists"),
-    ("get_current_dir", "GetCurrentDir"),
-    ("getCurrentDir", "GetCurrentDir"),
     ("get_file_info", "GetFileInfo"),
     ("getFileInfo", "GetFileInfo"),
     ("list_directory", "Glob"),
-    ("memory_note", "memory_note"),
     ("read_file", "Read"),
-    ("set_workspace", "SetWorkspace"),
-    ("setWorkspace", "SetWorkspace"),
     ("sleep", "Sleep"),
     ("applyPatch", "apply_patch"),
     ("spawn_session", "SubAgent"),
@@ -91,8 +70,6 @@ pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 34] = [
     ("view_image", "ViewImage"),
     ("viewImage", "ViewImage"),
     ("write_file", "Write"),
-    ("sessionInspector", "session_inspector"),
-    ("scheduleTasks", "schedule_tasks"),
 ];
 
 pub const SERVER_TOOL_NAMES: [&str; 12] = [
@@ -249,18 +226,45 @@ pub fn legacy_shell_replacements(execution_name: &str) -> impl Iterator<Item = &
     names.iter().copied()
 }
 
-/// Resolve a disabled reference without losing legacy shell denials when a
+/// Resolve disabled references, including retired aliases and shell names, when a
 /// positive catalog omits the old route. Exact registrations keep priority.
-/// Only missing unqualified references may use this denial-only fallback;
+/// Missing unqualified and default-namespace references may use alias replacements;
 /// callable resolution and qualified foreign identities remain unchanged.
 pub fn resolve_disabled_tool_reference_name(
     reference: &str,
-    contains_registered_name: impl FnMut(&str) -> bool,
+    mut contains_registered_name: impl FnMut(&str) -> bool,
 ) -> Option<String> {
-    if let Some(name) = crate::resolve_tool_reference_name(reference, contains_registered_name) {
+    if let Some(name) = crate::resolve_tool_reference_name(reference, &mut contains_registered_name)
+    {
         return Some(name);
     }
     let reference = reference.trim();
+    let unqualified = default_namespace_tool_name(reference).unwrap_or(reference);
+    let retired_replacement = match unqualified {
+        name if name.eq_ignore_ascii_case("FileExists") || name == "file_exists" => {
+            Some("GetFileInfo")
+        }
+        name if name.eq_ignore_ascii_case("GetCurrentDir")
+            || name.eq_ignore_ascii_case("SetWorkspace")
+            || matches!(name, "get_current_dir" | "set_workspace") =>
+        {
+            Some("Workspace")
+        }
+        name if name.eq_ignore_ascii_case("memory_note") => Some("session_note"),
+        name if name.eq_ignore_ascii_case("recall")
+            || name.eq_ignore_ascii_case("session_inspector")
+            || name == "sessionInspector" =>
+        {
+            Some("session_history")
+        }
+        name if name.eq_ignore_ascii_case("schedule_tasks") || name == "scheduleTasks" => {
+            Some("scheduler")
+        }
+        _ => None,
+    };
+    if let Some(replacement) = retired_replacement.filter(|name| contains_registered_name(name)) {
+        return Some(replacement.to_owned());
+    }
     if reference.contains("::") {
         return None;
     }
@@ -297,6 +301,67 @@ pub fn is_builtin_tool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_names_have_only_disabled_policy_replacements() {
+        for (reference, replacement) in [
+            ("FileExists", "GetFileInfo"),
+            ("file_exists", "GetFileInfo"),
+            ("default::fileExists", "GetFileInfo"),
+            ("DEFAULT::FiLeExIsTs", "GetFileInfo"),
+            ("fIlEeXiStS", "GetFileInfo"),
+            ("GetCurrentDir", "Workspace"),
+            ("get_current_dir", "Workspace"),
+            ("default::getCurrentDir", "Workspace"),
+            ("Default::getCurrentDir", "Workspace"),
+            ("SetWorkspace", "Workspace"),
+            ("set_workspace", "Workspace"),
+            ("default::setWorkspace", "Workspace"),
+            (" Default:: setWorkspace ", "Workspace"),
+            ("memory_note", "session_note"),
+            ("default::memory_note", "session_note"),
+            ("DEFAULT::memory_note", "session_note"),
+            ("recall", "session_history"),
+            ("session_inspector", "session_history"),
+            ("default::sessionInspector", "session_history"),
+            ("schedule_tasks", "scheduler"),
+            ("default::scheduleTasks", "scheduler"),
+        ] {
+            let registered = [
+                "GetFileInfo",
+                "Workspace",
+                "session_note",
+                "session_history",
+                "scheduler",
+            ];
+            assert_eq!(normalize_tool_ref(reference), None, "{reference}");
+            assert_eq!(
+                crate::resolve_tool_reference_name(reference, |name| registered.contains(&name)),
+                None
+            );
+            assert_eq!(
+                resolve_disabled_tool_reference_name(reference, |name| registered.contains(&name)),
+                Some(replacement.into())
+            );
+        }
+        assert_eq!(
+            resolve_disabled_tool_reference_name("FileExists", |_| false),
+            None
+        );
+        assert_eq!(
+            resolve_disabled_tool_reference_name("vendor::FileExists", |name| name
+                == "GetFileInfo"),
+            None
+        );
+        assert_eq!(
+            resolve_disabled_tool_reference_name("FileExists", |name| [
+                "FileExists",
+                "GetFileInfo"
+            ]
+            .contains(&name)),
+            Some("FileExists".into())
+        );
+    }
 
     #[test]
     fn retired_default_namespace_denials_preserve_case_insensitive_references() {
@@ -414,22 +479,13 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_camel_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::fileExists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::getCurrentDir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::fileExists"), None);
+        assert_eq!(normalize_tool_ref("default::getCurrentDir"), None);
         assert_eq!(
             normalize_tool_ref("default::getFileInfo"),
             Some("GetFileInfo".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::setWorkspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::setWorkspace"), None);
         assert_eq!(
             normalize_tool_ref("default::sleep"),
             Some("Sleep".to_string())
@@ -448,14 +504,8 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_snake_case_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::file_exists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::get_current_dir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::file_exists"), None);
+        assert_eq!(normalize_tool_ref("default::get_current_dir"), None);
         assert_eq!(
             normalize_tool_ref("default::get_file_info"),
             Some("GetFileInfo".to_string())
@@ -464,18 +514,12 @@ mod tests {
             normalize_tool_ref("default::list_directory"),
             Some("Glob".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::memory_note"),
-            Some("memory_note".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::memory_note"), None);
         assert_eq!(
             normalize_tool_ref("default::read_file"),
             Some("Read".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::set_workspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::set_workspace"), None);
         assert_eq!(
             normalize_tool_ref("default::write_file"),
             Some("Write".to_string())
@@ -531,7 +575,7 @@ mod tests {
     #[test]
     fn test_resolve_alias() {
         assert_eq!(resolve_alias("apply_patch"), Some("Edit"));
-        assert_eq!(resolve_alias("FileExists"), Some("GetFileInfo"));
+        assert_eq!(resolve_alias("FileExists"), None);
         assert_eq!(resolve_alias("Bash"), None);
     }
 
@@ -539,7 +583,10 @@ mod tests {
     fn canonical_name_resolves_aliases_namespaces_and_known_case() {
         assert_eq!(canonical_tool_name(" default::applyPatch "), "Edit");
         assert_eq!(canonical_tool_name("DEFAULT::read"), "Read");
-        assert_eq!(canonical_tool_name("default::set_workspace"), "Workspace");
+        assert_eq!(
+            canonical_tool_name("default::set_workspace"),
+            "set_workspace"
+        );
         assert_eq!(canonical_tool_name("DEFAULT::WORKFLOW_RUN"), "workflow_run");
         assert_eq!(
             canonical_tool_name("DEFAULT::SESSION_HISTORY_CURRENT"),
