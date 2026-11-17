@@ -28,7 +28,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::exposure::has_full_tool_guide;
+use crate::exposure::{canonical_tool_name, has_full_tool_guide};
 use bamboo_agent_core::ToolSchema;
 use serde::{Deserialize, Serialize};
 
@@ -278,7 +278,11 @@ impl EnhancedPromptBuilder {
             let Some(guide) = registry.and_then(|registry| registry.get_guide(name)) else {
                 continue;
             };
-            if has_full_tool_guide(name) || context.activated_discoverable_tools.contains(*name) {
+            if has_full_tool_guide(name)
+                || context
+                    .activated_discoverable_tools
+                    .contains(&canonical_tool_name(name))
+            {
                 Self::render_full_guide(
                     &mut notes,
                     &ToolGuideSpec::from_guide(guide.as_ref()),

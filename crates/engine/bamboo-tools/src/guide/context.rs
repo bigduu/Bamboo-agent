@@ -35,8 +35,8 @@ pub struct GuideBuildContext {
     /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
     /// Discoverable tools that are currently activated for the session.
-    /// Activated discoverable tools render with full guides; inactive ones
-    /// render with short summaries only.
+    /// Activated tools render their explicitly registered guides; inactive
+    /// guides are omitted.
     pub activated_discoverable_tools: std::collections::BTreeSet<String>,
 }
 

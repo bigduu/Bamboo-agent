@@ -907,7 +907,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if !newly_activated.is_empty() {
         let schemas = tool_schemas
             .iter()
-            .filter(|schema| newly_activated.contains(&schema.function.name))
+            .filter(|schema| {
+                newly_activated.contains(&bamboo_domain::canonical_tool_name(&schema.function.name))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let guide_context = bamboo_tools::guide::context::GuideBuildContext {

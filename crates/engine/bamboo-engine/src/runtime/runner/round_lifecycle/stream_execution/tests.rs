@@ -5093,107 +5093,131 @@ fn overflow_error_detection_matches_common_provider_messages() {
 #[test]
 fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
     let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("guide-cache", "test-model");
-    session.messages.push(Message::user("start"));
-    let mut config = test_config("system");
-    let registry = bamboo_tools::ToolRegistry::new();
-    registry
-        .register(bamboo_tools::tools::sleep::SleepTool::new())
-        .unwrap();
-    registry
-        .register_guide_from_json(
-            "Sleep",
-            r#"{
-        "tool_name": "Sleep",
-        "when_to_use": "CUSTOM_SLEEP_GUIDANCE",
-        "when_not_to_use": "",
-        "examples": [],
-        "related_tools": [],
-        "category": "TaskManagement"
-    }"#,
-        )
-        .unwrap();
-    config.tool_registry = Arc::new(registry);
-    let tools = bamboo_tools::BuiltinToolExecutor::new();
-    let schemas =
-        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
-            &config,
-            &tools,
+    struct GuideOnlyTool(&'static str);
+    #[async_trait]
+    impl bamboo_agent_core::Tool for GuideOnlyTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Custom guide activation fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: bamboo_agent_core::ToolCtx,
+        ) -> Result<bamboo_agent_core::ToolOutcome, bamboo_agent_core::ToolError> {
+            panic!("guide fixture must not execute")
+        }
+    }
+    for tool_name in ["Sleep", "default::Sleep", "sub_session_manager"] {
+        let mut session = Session::new("guide-cache", "test-model");
+        session.messages.push(Message::user("start"));
+        let mut config = test_config("system");
+        let registry = bamboo_tools::ToolRegistry::new();
+        registry.register(GuideOnlyTool(tool_name)).unwrap();
+        registry
+            .register_guide_from_json(
+                tool_name,
+                &serde_json::json!({
+                    "tool_name": tool_name,
+                    "when_to_use": "CUSTOM_SLEEP_GUIDANCE",
+                    "when_not_to_use": "",
+                    "examples": [],
+                    "related_tools": [],
+                    "category": "TaskManagement"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        config.tool_registry = Arc::new(registry);
+        let tools = bamboo_tools::BuiltinToolExecutor::new();
+        if tool_name != "Sleep" {
+            tools.register_tool(GuideOnlyTool(tool_name)).unwrap();
+        }
+        let schemas =
+            crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+                &config,
+                &tools,
+                &mut session,
+            );
+        let prepare = |session: &Session| PreparedContext {
+            messages: session.messages.clone(),
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let prepared = prepare(&session);
+        let before = super::build_request_envelope_reconciled(
             &mut session,
-        );
-    let prepare = |session: &Session| PreparedContext {
-        messages: session.messages.clone(),
-        token_usage: usage(0, 22),
-        truncation_occurred: false,
-        segments_removed: 0,
-        compressed_message_ids: Vec::new(),
-        prompt_cached_tool_outputs: 0,
-        prompt_cached_tool_tokens_saved: 0,
-    };
-    let prepared = prepare(&session);
-    let before = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas,
-        "test-model",
-    );
-    assert!(!before
-        .ir
-        .run(bamboo_llm::SegmentRole::ModelTranscript)
-        .iter()
-        .any(|m| m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
-    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
-    session.messages.push(Message::user("wait briefly"));
-    let schemas_after =
-        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &prepared,
             &config,
-            &tools,
-            &mut session,
+            &schemas,
+            "test-model",
         );
-    let prepared = prepare(&session);
-    let after = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas_after,
-        "test-model",
-    );
-    assert_eq!(
-        serde_json::to_string(&schemas).unwrap(),
-        serde_json::to_string(&schemas_after).unwrap()
-    );
-    let prefix = |envelope: &super::PreparedRequestEnvelope| {
-        envelope
+        assert!(!before
             .ir
-            .run(bamboo_llm::SegmentRole::StablePrefix)
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
             .iter()
-            .map(|m| m.content.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(before.ir.system_text, after.ir.system_text);
-    assert_eq!(prefix(&before), prefix(&after));
-    assert!(after
-        .ir
-        .run(bamboo_llm::SegmentRole::ModelTranscript)
-        .iter()
-        .any(|m| m.content.contains("Activated Tool Guidance")
-            && m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
-    assert!(!session
-        .messages
-        .iter()
-        .any(|m| m.content.contains("Activated Tool Guidance")));
-    let third = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas_after,
-        "test-model",
-    );
-    assert_eq!(
-        after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
-        third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
-    );
+            .any(|m| m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
+        bamboo_tools::exposure::activate_discoverable_tools(&mut session, [tool_name]);
+        session.messages.push(Message::user("wait briefly"));
+        let schemas_after =
+            crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+                &config,
+                &tools,
+                &mut session,
+            );
+        let prepared = prepare(&session);
+        let after = super::build_request_envelope_reconciled(
+            &mut session,
+            &prepared,
+            &config,
+            &schemas_after,
+            "test-model",
+        );
+        assert_eq!(
+            serde_json::to_string(&schemas).unwrap(),
+            serde_json::to_string(&schemas_after).unwrap()
+        );
+        let prefix = |envelope: &super::PreparedRequestEnvelope| {
+            envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(before.ir.system_text, after.ir.system_text);
+        assert_eq!(prefix(&before), prefix(&after));
+        assert!(after
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .iter()
+            .any(|m| m.content.contains("Activated Tool Guidance")
+                && m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Activated Tool Guidance")));
+        let third = super::build_request_envelope_reconciled(
+            &mut session,
+            &prepared,
+            &config,
+            &schemas_after,
+            "test-model",
+        );
+        assert_eq!(
+            after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
+            third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
+        );
+    }
 }
 
 fn browser_history_fixture() -> (Session, ToolSchema, String) {
