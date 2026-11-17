@@ -96,22 +96,22 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> EffectiveCallableSet {
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
-        if legacy_browser_needs_discovery(
-            session,
-            tool_schemas,
-            crate::runtime::runner::round_lifecycle::required_tool_for_session(session),
-        ) {
-            let without_browser = tool_schemas
-                .iter()
-                .filter(|schema| schema.function.name != "browser")
-                .cloned()
-                .collect::<Vec<_>>();
-            return crate::runtime::runner::tool_execution::legacy_effective_callable_set(
-                &without_browser,
+    // An ordinary Ultra Root advertises its bounded orchestration catalog eagerly.
+    let uses_eager_catalog = capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog
+        || (capability_loading_mode == CapabilityLoadingMode::StickyFallback
+            && session.root_orchestration_only_enabled()
+            && session.supervisor_incarnation_id().is_none());
+    if uses_eager_catalog {
+        let advertised =
+            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_loading_mode(
+                session,
+                tool_schemas,
+                capability_loading_mode,
+                crate::runtime::runner::round_lifecycle::required_tool_for_session(session),
             );
-        }
-        return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
+        return crate::runtime::runner::tool_execution::legacy_effective_callable_set(
+            advertised.as_ref(),
+        );
     }
 
     let loaded_names = if capability_loading_mode == CapabilityLoadingMode::StickyFallback {

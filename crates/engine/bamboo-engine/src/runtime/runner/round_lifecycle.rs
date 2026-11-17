@@ -66,7 +66,7 @@ fn rejected_output_limit(
                 })))
 }
 
-fn request_tool_schemas_for_loading_mode<'a>(
+pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
     mode: bamboo_domain::CapabilityLoadingMode,
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_root_provider_never_receives_discovery_or_denied_tools() {
+    async fn selected_root_can_call_its_advertised_tools_in_sticky_mode() {
         let provider = Arc::new(StickyCapturingProvider {
             requests: Mutex::new(Vec::new()),
         });
@@ -862,6 +862,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Read", "SubAgent", "Task"]
         );
+        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+            &session,
+            &tools,
+            CapabilityLoadingMode::StickyFallback,
+        );
+        for name in ["Read", "SubAgent", "Task"] {
+            assert!(callable.contains_execution_name(name), "{name}");
+        }
+        for name in ["Plan", "exec_command", "discover_capabilities"] {
+            assert!(!callable.contains_execution_name(name), "{name}");
+        }
     }
 
     #[tokio::test]

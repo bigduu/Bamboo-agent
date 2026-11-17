@@ -230,6 +230,35 @@ impl OpenAIProvider {
             .any(|p| Self::matches_model_pattern(p, model))
     }
 
+    fn chat_completions_selects_named_tools(&self, model: &str) -> bool {
+        let Some(overrides) = self.request_overrides.as_ref() else {
+            return false;
+        };
+        let mut body = json!({});
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            Some(overrides),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(model),
+        );
+        let choice = &body["tool_choice"];
+        let has_name = |path| {
+            choice
+                .pointer(path)
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+        };
+        match choice["type"].as_str() {
+            Some("function") => has_name("/function/name"),
+            Some("custom") => has_name("/custom/name"),
+            Some("allowed_tools") => choice
+                .pointer("/allowed_tools/tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty()),
+            _ => false,
+        }
+    }
+
     fn is_official_base_url(&self) -> bool {
         let normalized = self.base_url.trim_end_matches('/');
         normalized.eq_ignore_ascii_case("https://api.openai.com")
@@ -516,6 +545,7 @@ impl LLMProvider for OpenAIProvider {
         } else if required_tool.is_none()
             && self.sticky_tool_loading
             && !self.uses_responses_api(model)
+            && !self.chat_completions_selects_named_tools(model)
         {
             CapabilityLoadingMode::StickyFallback
         } else {
@@ -1489,6 +1519,59 @@ mod tests {
             native.capability_loading_mode("gpt-5.6", None).await,
             CapabilityLoadingMode::Progressive
         );
+    }
+
+    #[tokio::test]
+    async fn sticky_loading_preserves_effective_chat_tool_choice_overrides() {
+        let named_choice = json!({"type": "function", "function": {"name": "Glob"}});
+        let allowed_choice = json!({
+            "type": "allowed_tools",
+            "allowed_tools": {"mode": "auto", "tools": [named_choice]}
+        });
+        let overrides = serde_json::from_value(json!({
+            "rules": [
+                {
+                    "model_pattern": "fixture-*",
+                    "endpoint": "chat_completions",
+                    "scope": {"body_patch": [{"path": "tool_choice", "value": named_choice}]}
+                },
+                {
+                    "model_pattern": "fixture-auto",
+                    "endpoint": "chat_completions",
+                    "scope": {"body_patch": [{"path": "/tool_choice", "value": "auto"}]}
+                },
+                {
+                    "model_pattern": "fixture-allowed",
+                    "endpoint": "chat_completions",
+                    "scope": {"body_patch": [{"path": "tool_choice", "value": allowed_choice}]}
+                },
+                {
+                    "model_pattern": "responses-override-only",
+                    "endpoint": "responses",
+                    "scope": {"body_patch": [{"path": "tool_choice", "value": named_choice}]}
+                }
+            ]
+        }))
+        .unwrap();
+        let provider = OpenAIProvider::new("fixture")
+            .with_sticky_tool_loading(true)
+            .with_request_overrides(Some(overrides));
+
+        for (model, expected) in [
+            ("fixture-forced", CapabilityLoadingMode::LegacyFullCatalog),
+            ("fixture-allowed", CapabilityLoadingMode::LegacyFullCatalog),
+            ("fixture-auto", CapabilityLoadingMode::StickyFallback),
+            (
+                "responses-override-only",
+                CapabilityLoadingMode::StickyFallback,
+            ),
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                expected,
+                "model={model}"
+            );
+        }
     }
 
     #[test]
