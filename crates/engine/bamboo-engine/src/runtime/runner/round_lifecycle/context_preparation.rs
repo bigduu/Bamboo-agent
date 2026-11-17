@@ -3089,7 +3089,7 @@ pub(super) async fn prepare_round_context(
         // Later rounds also fail closed when complete history no longer fits.
         let mut model_session = session.clone();
         model_session.token_budget = None;
-        let mut budget = super::token_budget::resolve_token_budget(
+        let mut budget = super::token_budget::resolve_child_token_budget(
             &mut model_session,
             config,
             model_name,

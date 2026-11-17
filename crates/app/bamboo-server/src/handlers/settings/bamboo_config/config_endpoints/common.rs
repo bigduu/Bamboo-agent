@@ -242,6 +242,7 @@ mod tests {
                 model_pattern: format!("model-{ctx}-{r}"),
                 max_context_tokens: ctx,
                 max_output_tokens: Some(ctx),
+                unlimited_output: false,
                 safety_margin: Some(ctx),
             })
             .collect();

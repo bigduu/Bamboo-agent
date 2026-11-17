@@ -127,6 +127,24 @@ pub(super) async fn resolve_token_budget(
         model_name,
         llm,
         &model_limits_path,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn resolve_child_token_budget(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    llm: &dyn LLMProvider,
+) -> TokenBudget {
+    resolve_token_budget_with_model_limits_path(
+        session,
+        config,
+        model_name,
+        llm,
+        &model_limits_path(config),
+        false,
     )
     .await
 }
@@ -137,6 +155,7 @@ async fn resolve_token_budget_with_model_limits_path(
     model_name: &str,
     llm: &dyn LLMProvider,
     model_limits_path: &Path,
+    dynamic: bool,
 ) -> TokenBudget {
     // Priority: session/child override > config override > freshly-resolved
     // model defaults.
@@ -164,7 +183,7 @@ async fn resolve_token_budget_with_model_limits_path(
     let configured_limit =
         resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
     let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
-    let budget = resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), true)
+    let budget = resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), dynamic)
         .unwrap_or_else(|| {
             let fallback = default_model_limit();
             tracing::info!(
@@ -383,6 +402,9 @@ fn resolve_window(
         let sizing_window = joint_window
             .or(input_limit)
             .unwrap_or(fallback.max_context_tokens);
+        if dynamic && configured.is_some_and(|limit| limit.unlimited_output) {
+            return sizing_window;
+        }
         ModelLimit::new("", sizing_window).get_max_output_tokens()
     });
     // Separate input/output limits give a planning bound. They do not
@@ -970,6 +992,7 @@ mod tests {
             "live-sidecar-model-763",
             &provider,
             &path,
+            true,
         )
         .await;
         assert_eq!(first.max_context_tokens, 64_000);
@@ -982,6 +1005,7 @@ mod tests {
             "live-sidecar-model-763",
             &provider,
             &path,
+            true,
         )
         .await;
 
@@ -1082,6 +1106,7 @@ mod tests {
             "configured-family-763-v2",
             &provider,
             &path,
+            true,
         )
         .await;
 
@@ -1113,6 +1138,7 @@ mod tests {
             model,
             &provider,
             &missing_path,
+            true,
         )
         .await;
 
@@ -1190,6 +1216,7 @@ mod tests {
             model_pattern: "same-model".into(),
             max_context_tokens: 128_000,
             max_output_tokens: Some(65_536),
+            unlimited_output: false,
             safety_margin: Some(1_000),
         };
         let provider = ProviderModelInfo {
@@ -1204,6 +1231,39 @@ mod tests {
         assert_eq!(budget.output_limit_for_input(10_000), 48_000);
         assert_eq!(budget.output_limit_for_input(61_000), 34_000);
         assert_eq!(budget.output_limit_for_input(67_000), 0);
+    }
+
+    #[test]
+    fn unlimited_output_uses_remaining_context_and_respects_route_ceilings() {
+        let mut configured = ModelLimit::new("fixture-model", 256_000);
+        configured.safety_margin = Some(1_000);
+        let automatic = resolve_window(Some(&configured), None, true).unwrap();
+        assert_eq!(automatic.output_limit_for_input(32_000), 64_000);
+
+        configured.unlimited_output = true;
+        let unlimited = resolve_window(Some(&configured), None, true).unwrap();
+        assert_eq!(unlimited.max_request_input_tokens(), 254_000);
+        assert_eq!(unlimited.output_limit_for_input(32_000), 223_000);
+        assert_eq!(unlimited.output_limit_for_input(255_000), 0);
+
+        let mut reported = ProviderModelInfo {
+            id: "fixture-model".into(),
+            max_context_tokens: Some(160_000),
+            max_input_tokens: Some(110_000),
+            max_output_tokens: Some(80_000),
+        };
+        let with_metadata = resolve_window(Some(&configured), Some(&reported), true).unwrap();
+        assert_eq!(with_metadata.output_limit_for_input(32_000), 80_000);
+        assert_eq!(with_metadata.output_limit_for_input(108_000), 51_000);
+        assert_eq!(with_metadata.output_limit_for_input(110_000), 0);
+
+        reported.max_output_tokens = None;
+        let joint_only = resolve_window(Some(&configured), Some(&reported), true).unwrap();
+        assert_eq!(joint_only.output_limit_for_input(32_000), 127_000);
+
+        let fixed = resolve_window(Some(&configured), None, false).unwrap();
+        assert_eq!(fixed.max_output_tokens, 64_000);
+        assert_eq!(fixed.output_reserve_tokens, None);
     }
 
     #[tokio::test]

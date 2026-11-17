@@ -466,6 +466,14 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
             }]),
             96_000,
         ),
+        (
+            json!([{
+                "model_pattern": "legacy-hosted-model",
+                "max_context_tokens": 192_000,
+                "unlimited_output": true
+            }]),
+            192_000,
+        ),
         (json!([]), DEFAULT_MAX_CONTEXT_TOKENS),
     ]
     .into_iter()
@@ -482,7 +490,13 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
         assert!(response.status().is_success());
         let snapshot = section.snapshot();
         assert_eq!(snapshot.revision, initial_revision + run as u64 + 1);
-        assert_eq!(snapshot.data.0.len(), if run == 2 { 0 } else { 1 });
+        assert_eq!(snapshot.data.0.len(), rows.as_array().unwrap().len());
+
+        if rows[0]["unlimited_output"] == true {
+            let saved: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(saved["model_limits"][0]["unlimited_output"], true);
+            assert!(saved["model_limits"][0]["max_output_tokens"].is_null());
+        }
 
         let mut session = Session::new(
             format!("compatibility-model-limit-{run}"),
@@ -507,6 +521,7 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
                 model_pattern: "legacy-hosted-model".into(),
                 max_context_tokens: context,
                 max_output_tokens: Some(output),
+                unlimited_output: false,
                 safety_margin: None,
             })
             .unwrap(),
@@ -527,7 +542,7 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
     clear.unwrap();
     last.unwrap();
     let snapshot = section.snapshot();
-    assert_eq!(snapshot.revision, initial_revision + 6);
+    assert_eq!(snapshot.revision, initial_revision + 7);
     assert_eq!(snapshot.data.0, rows(144_000, 12_000));
     let mut session = Session::new(
         "compatibility-model-limit-concurrent",
@@ -592,11 +607,12 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
             expected_context
         );
     }
+    let output_limits = probe.output_limits.lock().unwrap().clone();
+    assert_eq!(output_limits[..2], [Some(4_000), Some(8_000)]);
+    assert!((DEFAULT_MAX_OUTPUT_TOKENS + 1..192_000).contains(&output_limits[2].unwrap()));
     assert_eq!(
-        *probe.output_limits.lock().unwrap(),
+        output_limits[3..],
         [
-            Some(4_000),
-            Some(8_000),
             Some(DEFAULT_MAX_OUTPUT_TOKENS),
             Some(12_000),
             Some(12_000),
