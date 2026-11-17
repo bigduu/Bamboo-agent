@@ -223,7 +223,6 @@ pub(crate) fn mask_and_prepare_agent_request(
     let native_control = match endpoint {
         ENDPOINT_MESSAGES => {
             body.pointer("/thinking/type").and_then(Value::as_str) == Some("adaptive")
-                && body.pointer("/thinking/budget_tokens").is_none()
         }
         ENDPOINT_CHAT_COMPLETIONS => {
             body.get("enable_thinking").is_none() && body.get("thinking").is_none()
@@ -317,7 +316,7 @@ fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {
         _ => None,
     };
     match (endpoint, key(0)) {
-        (ENDPOINT_MESSAGES, Some("thinking")) => true,
+        (ENDPOINT_MESSAGES, Some("thinking")) => key(1) != Some("budget_tokens"),
         (ENDPOINT_MESSAGES, Some("output_config")) => key(1).is_none_or(|key| key == "effort"),
         (
             ENDPOINT_CHAT_COMPLETIONS,
@@ -741,11 +740,7 @@ mod tests {
 
         for (path, op, value) in [
             ("thinking", "remove", Value::Null),
-            (
-                "thinking",
-                "set",
-                json!({"type":"enabled","budget_tokens":1024}),
-            ),
+            ("thinking", "set", json!({"type":"disabled"})),
             ("output_config.effort", "set", json!("medium")),
         ] {
             let overrides = serde_json::from_value::<RequestOverridesConfig>(json!({

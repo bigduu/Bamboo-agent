@@ -28,6 +28,7 @@ use crate::handlers::{command, settings, skill, tools, workflow_runs, workspace}
 pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
     web::scope("")
         .service(settings::config_share_routes())
+        .service(crate::server::tailscale::routes())
         // Command routes
         .route("/commands", web::get().to(command::list_commands))
         .route(

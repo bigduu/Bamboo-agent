@@ -459,6 +459,7 @@ impl NativeSource {
 
 pub(super) struct SourceBinding {
     pub(super) generation: u64,
+    pub(super) skill_scope_lease: Arc<SkillScopeLease>,
     policy: Arc<Policy>,
     pub(super) catalog: Arc<SkillsListTool>,
     pub(super) tools: Arc<dyn ToolExecutor>,
@@ -471,8 +472,11 @@ impl SourceBinding {
             policy: policy.clone(),
             generation,
         });
-        let catalog = Arc::new(policy.catalog(resolver.clone()));
-        let reader = Arc::new(SkillsReadTool::new(policy.catalog(resolver)));
+        let skill_scope_lease = Arc::new(SkillScopeLease::default());
+        let catalog = Arc::new(policy.catalog(resolver.clone(), &skill_scope_lease));
+        let reader = Arc::new(SkillsReadTool::new(
+            policy.catalog(resolver, &skill_scope_lease),
+        ));
         #[cfg(all(test, unix))]
         tests::observe_workspace_reader(run, &reader);
         let tools = Arc::new(OverlayToolExecutor::new(
@@ -482,6 +486,7 @@ impl SourceBinding {
         let tools = Arc::new(OverlayToolExecutor::new(tools, reader)) as Arc<dyn ToolExecutor>;
         Arc::new(Self {
             generation,
+            skill_scope_lease,
             policy,
             catalog,
             tools,

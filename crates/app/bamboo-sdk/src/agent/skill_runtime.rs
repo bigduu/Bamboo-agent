@@ -27,7 +27,8 @@ use bamboo_llm::Config;
 use bamboo_projects::ProjectStore;
 use bamboo_server_tools::skill_runtime::{
     skill_response_byte_budget, SkillCatalogCaller, SkillCatalogCallerResolver,
-    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillScopeLease, SkillsListTool,
+    SkillsReadTool,
 };
 use bamboo_server_tools::OverlayToolExecutor;
 use bamboo_skills::progressive::{render_skill_usage_instructions, SkillMetadataBudget};
@@ -132,6 +133,7 @@ impl DefaultSdkSkills {
                 submitted_input_id: input_id,
                 submitted_request: request,
                 cancel,
+                skill_scope_lease: Arc::new(SkillScopeLease::default()),
                 live: AtomicBool::new(true),
                 epoch: AtomicU64::new(0),
                 explicit_prepared: AtomicBool::new(false),
@@ -342,6 +344,7 @@ struct SdkSkillRun {
     submitted_input_id: Option<String>,
     submitted_request: Option<SessionSkillRequest>,
     cancel: CancellationToken,
+    skill_scope_lease: Arc<SkillScopeLease>,
     live: AtomicBool,
     epoch: AtomicU64,
     explicit_prepared: AtomicBool,
@@ -436,6 +439,7 @@ impl SdkSkillRun {
     fn revoke(&self) {
         self.live.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.skill_scope_lease.close();
     }
     fn check_live(&self) -> Result<u64, ToolError> {
         if !self.live.load(Ordering::Acquire) || self.cancel.is_cancelled() {
@@ -459,6 +463,7 @@ impl SdkSkillRun {
             Arc::new(SdkSkillCallerResolver { run: self.clone() }),
         )
         .with_project_store(self.defaults.projects.clone())
+        .with_scope_lease(&self.skill_scope_lease)
     }
     fn phase(&self, ctx: &ToolCtx) -> Result<Purpose, ToolError> {
         SDK_SKILL_PHASE

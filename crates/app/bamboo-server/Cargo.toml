@@ -74,7 +74,8 @@ actix-web = { version = "4.18.2", default-features = false, features = [
     "compat",
     "ws",
 ] }
-actix-http = { version = "3.20.3", default-features = false, features = ["rustls-0_23"] }
+# This minimum includes the Actix security fixes tracked in #2792.
+actix-http = { version = "3.21.3", default-features = false, features = ["rustls-0_23"] }
 actix-server = "2"
 actix-service = "2"
 socket2 = "0.6"

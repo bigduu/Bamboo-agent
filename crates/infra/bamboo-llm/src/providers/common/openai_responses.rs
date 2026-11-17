@@ -713,9 +713,9 @@ pub fn build_responses_body_with_capability_loading(
     }
 
     let projected_tools = match capability_loading_mode {
-        CapabilityLoadingMode::LegacyFullCatalog | CapabilityLoadingMode::StickyFallback => {
-            tools_to_responses_json(tools)
-        }
+        CapabilityLoadingMode::LegacyFullCatalog
+        | CapabilityLoadingMode::StickyFallback
+        | CapabilityLoadingMode::StickyFallbackForRootChat => tools_to_responses_json(tools),
         CapabilityLoadingMode::Progressive => {
             tools_to_progressive_responses_json(tools, tool_search_execution)
         }

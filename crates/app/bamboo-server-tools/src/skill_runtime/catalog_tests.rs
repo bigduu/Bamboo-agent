@@ -990,6 +990,85 @@ fn reader(fixture: &Fixture) -> SkillsReadTool {
         fixture.resolver.clone(),
     ))
 }
+
+#[tokio::test]
+async fn active_reader_keeps_its_mode_store_through_workspace_cache_pressure() {
+    let fixture = Fixture::new(1).await;
+    let root = fixture._directory.path();
+    let workspace = root.join("reader-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut session = fixture.repo.load("catalog-session").await.unwrap();
+    session.set_workspace_path_meta(workspace.to_string_lossy());
+    session.metadata_version += 1;
+    fixture.repo.save(&mut session).await.unwrap();
+    {
+        let mut binding = fixture.resolver.0.write().await;
+        let caller = binding.as_mut().unwrap();
+        caller.response_bytes = 512;
+        caller.mode = Some("review".into());
+    }
+
+    let lease = Arc::new(SkillScopeLease::default());
+    let reader = SkillsReadTool::new(
+        SkillsListTool::new(
+            fixture.manager.clone(),
+            fixture.config.clone(),
+            fixture.repo.clone(),
+            fixture.resolver.clone(),
+        )
+        .with_scope_lease(&lease),
+    );
+    let (_, first) = read_page(
+        &reader,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        None,
+    )
+    .await
+    .unwrap();
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("Reader has more pages");
+    let active_store = Arc::downgrade(
+        &fixture
+            .manager
+            .store_for_workspace(Some(&workspace))
+            .await
+            .unwrap(),
+    );
+    for index in 0..64 {
+        let other_workspace = root.join(format!("other-workspace-{index}"));
+        std::fs::create_dir(&other_workspace).unwrap();
+        fixture
+            .manager
+            .store_for_workspace(Some(&other_workspace))
+            .await
+            .unwrap();
+    }
+    assert!(active_store.upgrade().is_some());
+    let (_, continuation) = read_page(
+        &reader,
+        &fixture.ctx,
+        "catalog-0",
+        "references/raw.txt",
+        Some(cursor),
+    )
+    .await
+    .unwrap();
+    assert!(!continuation["contents"].as_str().unwrap().is_empty());
+
+    lease.close();
+    let next_workspace = root.join("workspace-after-reader-finished");
+    std::fs::create_dir(&next_workspace).unwrap();
+    fixture
+        .manager
+        .store_for_workspace(Some(&next_workspace))
+        .await
+        .unwrap();
+    assert!(active_store.upgrade().is_none());
+}
+
 async fn read_page(
     tool: &SkillsReadTool,
     ctx: &ToolCtx,

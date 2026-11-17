@@ -17,7 +17,7 @@ use bamboo_skills::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::RwLock;
 
 pub const MAX_SKILLS_LIST_BYTES: usize = 512 * 1024;
@@ -530,11 +530,42 @@ struct SelectedCatalogContext {
     automatic_prompt: Option<(Vec<SkillCatalogMetadata>, AutomaticSkillOutcome)>,
 }
 
+/// Keeps the current Skill store alive for a finite host execution. The lease
+/// grants no access. Each catalog and Reader call still verifies its caller.
+#[derive(Default)]
+pub struct SkillScopeLease {
+    state: Mutex<SkillScopeLeaseState>,
+}
+
+#[derive(Default)]
+struct SkillScopeLeaseState {
+    store: Option<Arc<SkillStore>>,
+    closed: bool,
+}
+
+impl SkillScopeLease {
+    pub fn close(&self) {
+        let mut state = self.state.lock().expect("Skill scope lease lock");
+        state.closed = true;
+        state.store = None;
+    }
+
+    fn retain(&self, store: Arc<SkillStore>) -> Result<(), ToolError> {
+        let mut state = self.state.lock().expect("Skill scope lease lock");
+        if state.closed {
+            return Err(ToolError::Execution("Skill scope lease has ended".into()));
+        }
+        state.store = Some(store);
+        Ok(())
+    }
+}
+
 /// Exported metadata Tool; a trusted resolver is mandatory at construction.
 /// It is intentionally not installed in any live registry by this API slice.
 pub struct SkillsListTool {
     access: SkillToolAccess,
     resolver: Arc<dyn SkillCatalogCallerResolver>,
+    scope_lease: Option<Weak<SkillScopeLease>>,
     #[cfg(test)]
     pub(super) store_selection_barrier: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
@@ -548,6 +579,7 @@ impl SkillsListTool {
         Self {
             access: SkillToolAccess::new(manager, config, sessions),
             resolver,
+            scope_lease: None,
             #[cfg(test)]
             store_selection_barrier: None,
         }
@@ -556,6 +588,12 @@ impl SkillsListTool {
         self.access = self.access.with_project_store(projects);
         self
     }
+
+    pub fn with_scope_lease(mut self, lease: &Arc<SkillScopeLease>) -> Self {
+        self.scope_lease = Some(Arc::downgrade(lease));
+        self
+    }
+
     /// Render eligible metadata using the same fresh caller/input projection as
     /// skills_list. This does not install a live Tool or read Skill bodies.
     pub async fn render_catalog(&self, ctx: &ToolCtx) -> Result<SkillCatalogRender, ToolError> {
@@ -674,19 +712,19 @@ impl SkillsListTool {
             entered.notify_one();
             release.notified().await;
         }
+        let store = store
+            .retain_mode_store(caller.mode.as_deref())
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
         let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none() {
             let (snapshot, candidates, outcome) = store
-                .progressive_automatic_catalog_for_mode(
-                    caller.mode.as_deref(),
-                    &access,
-                    &input.content,
-                )
+                .progressive_automatic_catalog_for_mode(None, &access, &input.content)
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
             (snapshot, Some((candidates, outcome)))
         } else {
             let snapshot = store
-                .progressive_catalog_for_mode(caller.mode.as_deref(), &access)
+                .progressive_catalog_for_mode(None, &access)
                 .await
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
             (snapshot, None)
@@ -709,6 +747,12 @@ impl SkillsListTool {
             automatic_prompt,
         };
         self.recheck(ctx, &prepared).await?;
+        if let Some(lease) = &self.scope_lease {
+            lease
+                .upgrade()
+                .ok_or_else(|| ToolError::Execution("Skill scope lease has ended".into()))?
+                .retain(prepared.store.clone())?;
+        }
         Ok(prepared)
     }
 
@@ -764,7 +808,7 @@ impl SkillsListTool {
         let snapshot = prepared
             .store
             .selected_source_for_mode(
-                prepared.caller.mode.as_deref(),
+                None,
                 &prepared.access,
                 &prepared.snapshot,
                 package,
@@ -797,7 +841,7 @@ impl SkillsListTool {
         let identity = prepared
             .store
             .probe_selected_source_for_mode(
-                prepared.caller.mode.as_deref(),
+                None,
                 &prepared.access,
                 &prepared.snapshot,
                 &selected.snapshot.package,

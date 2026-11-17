@@ -147,6 +147,12 @@ curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
 
 嵌入 SDK 时，`bamboo_sdk::agent::Agent` 通过 `run`、`run_stream`、`execute` 使用同一引擎；默认装配需要已配置的 provider，不会提供凭据。参见 [CLI / HTTP / SDK 入门示例](./docs/guides/GETTING_STARTED.md)、[API 参考](./docs/guides/API.md)及[发布包 rustdoc](https://docs.rs/bamboo-agent)。
 
+## 通过 Tailscale 访问 Bamboo 和 Lotus
+
+在运行 Bamboo 的电脑上安装 Tailscale 客户端和命令行工具。通过绑定回环地址的 Bamboo HTTP 服务打开本机 Lotus，进入 **系统设置 → 系统 → Tailscale 远程访问**。连接这台电脑，按提示登录 Tailscale，再设置 Bamboo 访问密码。组网启用 MagicDNS 和 HTTPS 证书后，开启远程访问并复制 HTTPS 地址。[Tailscale CLI 安装指南](https://tailscale.com/docs/reference/tailscale-cli)
+
+在组网内以用户身份登录 Tailscale 的设备上打开该地址，再用 Bamboo 访问密码登录。Bamboo 重启后会为保存的 Tailscale 设备和 HTTPS 端口恢复远程访问。点击 **关闭远程访问** 会停止分享并断开已有的实时连接。
+
 ## 数据与运行边界
 
 - Bamboo 配置和会话默认在 `~/.bamboo`，可用 `BAMBOO_DATA_DIR` 或 `--data-dir` 覆盖。Jiandu 独立持有 `~/.jiandu` 下的规范记忆。隔离运行时，`BAMBOO_JIANDU_DATA_DIR` 必须是非空绝对路径；仅设置 `--data-dir` 不会迁移记忆目录。
