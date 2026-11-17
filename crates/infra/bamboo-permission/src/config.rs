@@ -3362,6 +3362,57 @@ mod integration_tests {
     }
 
     #[test]
+    fn session_memory_action_patterns_preserve_denials_and_always_ask() {
+        for rule in [
+            "memory(session_replace)",
+            "session_note(replace)",
+            "memory_note(replace)",
+        ] {
+            let denies = crate::hierarchy::PermissionRuleSet::from_rules(&[], &[rule.into()]);
+            let allows = crate::hierarchy::PermissionRuleSet::from_rules(&[rule.into()], &[]);
+            let config = PermissionConfig::new();
+            config.set_ask_rules([rule.into()]);
+            for action in ["session_replace", "SESSION_REPLACE", " SESSION_REPLACE "] {
+                let args = serde_json::json!({"action":action,"content":"updated"});
+                assert_eq!(
+                    denies.match_tool_call("memory", &args),
+                    Some(false),
+                    "{rule}: {action}"
+                );
+                assert_eq!(
+                    allows.match_tool_call("memory", &args),
+                    (rule == "memory(session_replace)" && action == "session_replace")
+                        .then_some(true)
+                );
+                assert!(config.requires_forced_confirmation("memory", &args));
+                let context = crate::check_permissions("memory", &args)
+                    .unwrap()
+                    .unwrap()
+                    .remove(0);
+                for bypass in [false, true] {
+                    let mut input =
+                        evaluation("memory-owner", "memory-call", &context.resource, bypass);
+                    input.tool_name = "memory".into();
+                    input.tool_args = args.clone();
+                    input.permission_type = context.permission_type;
+                    input.risk_level = context.risk_level();
+                    assert!(
+                        matches!(config.evaluate(input), PermissionOutcome::Ask(request)
+                        if request.reason_code == PermissionReasonCode::ConfiguredAlwaysAsk)
+                    );
+                }
+            }
+            assert_eq!(
+                denies.match_tool_call(
+                    "memory",
+                    &serde_json::json!({"action":"write","content":"durable"})
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn forced_confirmation_js_repl_always_asks() {
         let config = PermissionConfig::new();
         // js_repl runs arbitrary code (it can shell out via `child_process`), so
