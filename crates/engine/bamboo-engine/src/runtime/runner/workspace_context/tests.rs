@@ -35,12 +35,12 @@ fn file_operations_do_not_supply_session_workspace() {
 }
 
 #[test]
-fn extract_workspace_path_from_tool_result_supports_alias_name() {
-    let tool_call = ToolCall {
+fn extract_workspace_path_from_tool_result_accepts_canonical_workspace_only() {
+    let mut tool_call = ToolCall {
         id: "call_1".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "setWorkspace".to_string(),
+            name: "Workspace".to_string(),
             arguments: "{}".to_string(),
         },
     };
@@ -58,6 +58,20 @@ fn extract_workspace_path_from_tool_result_supports_alias_name() {
             binding_status: WorkspaceBindingStatus::Unregistered,
         })
     );
+    for retired in [
+        "SetWorkspace",
+        "set_workspace",
+        "setWorkspace",
+        "GetCurrentDir",
+        "get_current_dir",
+        "getCurrentDir",
+    ] {
+        tool_call.function.name = retired.into();
+        assert!(
+            extract_workspace_path_from_tool_result(&tool_call, &result).is_none(),
+            "{retired}"
+        );
+    }
 }
 
 #[test]

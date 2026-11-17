@@ -956,11 +956,19 @@ pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String>
             let mut generated = false;
             for call in calls {
                 let canonical_name = bamboo_domain::canonical_tool_name(&call.function.name);
-                let is_history_retrieval =
-                    matches!(
-                        canonical_name.as_str(),
-                        "session_history" | "session_history_current"
-                    ) && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                // Retain persisted names in derived-history classification
+                // after retiring their callable aliases.
+                let is_history_tool = [
+                    "session_history",
+                    "session_history_current",
+                    "recall",
+                    "session_inspector",
+                    "sessionInspector",
+                ]
+                .iter()
+                .any(|name| canonical_name.eq_ignore_ascii_case(name));
+                let is_history_retrieval = is_history_tool
+                    && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
                         .ok()
                         .is_some_and(|arguments| {
                             matches!(
@@ -1452,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn self_history_artifacts_cover_all_current_retrieval_actions() {
+    fn self_history_artifacts_cover_current_and_persisted_legacy_retrieval_names() {
         let mut session = Session::new("history-artifacts", "test-model");
         let mut expected = HashSet::new();
         for (index, (tool_name, action)) in [
@@ -1460,6 +1468,10 @@ mod tests {
             ("session_history", "read_current"),
             ("session_history", "read_around"),
             ("recall", "read_current"),
+            ("session_inspector", "search_current"),
+            ("sessionInspector", "read_around"),
+            ("default::recall", "read_current"),
+            ("DEFAULT::session_inspector", "search_current"),
             ("session_history_current", "search_current"),
             ("session_history_current", "read_current"),
             ("session_history_current", "read_around"),
