@@ -307,6 +307,14 @@ impl ParsedRule {
 
         // Normalize tool name for case-insensitive matching
         let tool_name_lower = tool_name.to_ascii_lowercase();
+        let normalized_session_action = if restrictive && tool_name_lower == "memory" {
+            args.get("action")
+                .and_then(Value::as_str)
+                .map(|action| action.trim().to_ascii_lowercase())
+                .filter(|action| action.starts_with("session_"))
+        } else {
+            None
+        };
 
         // Extract the relevant argument based on tool type
         let target = match tool_name_lower.as_str() {
@@ -320,9 +328,9 @@ impl ParsedRule {
             "js_repl" => args.get("code").and_then(|v| v.as_str()),
             "bashoutput" | "killshell" => args.get("bash_id").and_then(|v| v.as_str()),
             "write_stdin" => args.get("session_id").and_then(|v| v.as_str()),
-            "session_note" | "memory_note" | "memory" => {
-                args.get("action").and_then(|v| v.as_str())
-            }
+            "session_note" | "memory_note" | "memory" => normalized_session_action
+                .as_deref()
+                .or_else(|| args.get("action").and_then(Value::as_str)),
             _ => None,
         };
 
