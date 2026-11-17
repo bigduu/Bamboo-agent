@@ -36,6 +36,9 @@ pub enum CapabilityLoadingMode {
     /// discovery function while loaded definitions live in conversation
     /// history.
     StickyFallback,
+    /// Session policy selects sticky loading for ordinary Root Chat.
+    /// An unresolved mode uses the legacy catalog.
+    StickyFallbackForRootChat,
 }
 
 /// The complete and intentionally small always-resident function surface.
@@ -380,7 +383,8 @@ impl EffectiveCallableSet {
         let mut callable_execution_names = catalog
             .iter()
             .filter(|entry| match mode {
-                CapabilityLoadingMode::LegacyFullCatalog => entry.is_model_visible(),
+                CapabilityLoadingMode::LegacyFullCatalog
+                | CapabilityLoadingMode::StickyFallbackForRootChat => entry.is_model_visible(),
                 CapabilityLoadingMode::Progressive | CapabilityLoadingMode::StickyFallback => {
                     entry.is_initially_visible()
                 }
@@ -830,18 +834,21 @@ mod tests {
     #[test]
     fn legacy_effective_set_keeps_core_and_deferred_but_excludes_host_only() {
         let catalog = classified_catalog(&["Read", "Glob", "custom_tool", "Workspace"]);
-        let effective = EffectiveCallableSet::from_catalog(
-            &catalog,
+        for mode in [
             CapabilityLoadingMode::LegacyFullCatalog,
-            std::iter::empty::<&str>(),
-        );
+            CapabilityLoadingMode::StickyFallbackForRootChat,
+        ] {
+            let effective =
+                EffectiveCallableSet::from_catalog(&catalog, mode, std::iter::empty::<&str>());
 
-        assert_eq!(
-            effective.execution_names().collect::<Vec<_>>(),
-            vec!["Glob", "Read", "custom_tool"]
-        );
-        assert_eq!(effective.discovery_gateway(), DISCOVERY_CONTROL_GATEWAY);
-        assert!(effective.discovery_gateway().is_initially_visible());
+            assert_eq!(
+                effective.execution_names().collect::<Vec<_>>(),
+                vec!["Glob", "Read", "custom_tool"],
+                "{mode:?}"
+            );
+            assert_eq!(effective.discovery_gateway(), DISCOVERY_CONTROL_GATEWAY);
+            assert!(effective.discovery_gateway().is_initially_visible());
+        }
     }
 
     #[test]

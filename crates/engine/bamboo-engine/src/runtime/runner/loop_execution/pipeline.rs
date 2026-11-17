@@ -23,7 +23,10 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
-use crate::runtime::runner::round_lifecycle::{RoundOutputLimitPolicy, TaskSplitPrompt};
+use crate::runtime::runner::round_lifecycle::{
+    capability_loading_mode_for_session, uses_sticky_fallback, RoundOutputLimitPolicy,
+    TaskSplitPrompt,
+};
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
@@ -114,7 +117,7 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
         );
     }
 
-    let loaded_names = if capability_loading_mode == CapabilityLoadingMode::StickyFallback {
+    let mut loaded_names = if uses_sticky_fallback(capability_loading_mode) {
         validated_sticky_fallback_loaded_tool_names(session)
     } else {
         let transcript = &session.provider_transcript;
@@ -149,9 +152,23 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
         .cloned()
         .filter_map(ClassifiedToolSchema::new)
         .collect::<Vec<_>>();
+    let effective_mode =
+        if capability_loading_mode == CapabilityLoadingMode::StickyFallbackForRootChat {
+            let advertised =
+                crate::runtime::runner::round_lifecycle::request_tool_schemas_for_loading_mode(
+                    session,
+                    tool_schemas,
+                    capability_loading_mode,
+                    crate::runtime::runner::round_lifecycle::required_tool_for_session(session),
+                );
+            loaded_names.extend(advertised.iter().map(|schema| schema.function.name.clone()));
+            CapabilityLoadingMode::StickyFallback
+        } else {
+            capability_loading_mode
+        };
     EffectiveCallableSet::from_catalog(
         &catalog,
-        capability_loading_mode,
+        effective_mode,
         loaded_names.iter().map(String::as_str),
     )
 }
@@ -3075,10 +3092,9 @@ async fn handle_tool_calls_path(
         &eligible_tool_schemas,
     );
     let tool_schemas = request_tool_schemas.as_ref();
-    let capability_loading_mode = frame
-        .llm
-        .capability_loading_mode(model_name, required_tool)
-        .await;
+    let capability_loading_mode =
+        capability_loading_mode_for_session(session, frame.llm.as_ref(), model_name, required_tool)
+            .await;
     let effective_callable_set =
         effective_callable_set_for_round(session, tool_schemas, capability_loading_mode);
 
@@ -4578,13 +4594,17 @@ async fn run_pipeline_inner(
 
             let required_tool =
                 crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
-            let capability_loading_mode = llm
-                .capability_loading_mode(&state.model_name, required_tool)
-                .await;
+            let capability_loading_mode = capability_loading_mode_for_session(
+                session,
+                llm.as_ref(),
+                &state.model_name,
+                required_tool,
+            )
+            .await;
             let legacy_browser_discovery = capability_loading_mode
                 == CapabilityLoadingMode::LegacyFullCatalog
                 && legacy_browser_needs_discovery(session, &tool_schemas, required_tool);
-            if (capability_loading_mode == CapabilityLoadingMode::StickyFallback
+            if (uses_sticky_fallback(capability_loading_mode)
                 || legacy_browser_discovery)
                 && stream_output.tool_calls.iter().any(|call| {
                     call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME

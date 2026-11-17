@@ -11,7 +11,7 @@ use crate::runtime::stream::handler::StreamHandlingOutput;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
-use bamboo_domain::ProviderTranscriptItemKind;
+use bamboo_domain::{CapabilityLoadingMode, ProviderTranscriptItemKind, SessionKind};
 use bamboo_llm::provider::{OutputLimitRecovery, REASONING_REPETITION_FINISH_REASON};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
@@ -66,10 +66,41 @@ fn rejected_output_limit(
                 })))
 }
 
+pub(super) async fn capability_loading_mode_for_session(
+    session: &Session,
+    llm: &dyn LLMProvider,
+    model: &str,
+    required_tool: Option<&str>,
+) -> CapabilityLoadingMode {
+    let mode = llm.capability_loading_mode(model, required_tool).await;
+    // The omitted setting applies to ordinary Standard Root Chat. Keep
+    // specialized tool contracts and explicit provider choices intact.
+    if mode == CapabilityLoadingMode::StickyFallbackForRootChat
+        && (session.kind != SessionKind::Root
+            || session.parent_session_id.is_some()
+            || !session.authority_identity.is_ordinary()
+            || session.id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+            || session.root_orchestration_only_enabled()
+            || session
+                .metadata
+                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY))
+    {
+        return CapabilityLoadingMode::LegacyFullCatalog;
+    }
+    mode
+}
+
+pub(super) fn uses_sticky_fallback(mode: CapabilityLoadingMode) -> bool {
+    matches!(
+        mode,
+        CapabilityLoadingMode::StickyFallback | CapabilityLoadingMode::StickyFallbackForRootChat
+    )
+}
+
 pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
-    mode: bamboo_domain::CapabilityLoadingMode,
+    mode: CapabilityLoadingMode,
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
     if session.model_orchestration_only_enabled() {
@@ -86,7 +117,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
             .cloned()
             .collect::<Vec<_>>();
         if session.supervisor_incarnation_id().is_some()
-            && mode == bamboo_domain::CapabilityLoadingMode::StickyFallback
+            && mode == CapabilityLoadingMode::StickyFallback
         {
             // The existing read-only control gateway loads only this bounded
             // catalog. Never force a named delegation tool or expose a shell.
@@ -99,7 +130,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
         }
         return Cow::Owned(bounded);
     }
-    if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
+    if mode == CapabilityLoadingMode::LegacyFullCatalog {
         // Legacy providers keep every other Deferred function unchanged. Only
         // the shared browser is replaced with a small discovery gateway until
         // this chat has a validated browser definition in its own history.
@@ -128,7 +159,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
         return Cow::Owned(projected);
     }
 
-    if mode != bamboo_domain::CapabilityLoadingMode::StickyFallback {
+    if !uses_sticky_fallback(mode) {
         return Cow::Borrowed(tool_schemas);
     }
 
@@ -136,7 +167,16 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
         .iter()
         .cloned()
         .filter_map(bamboo_domain::ClassifiedToolSchema::new)
-        .filter(|entry| entry.loading_class() == bamboo_domain::CapabilityLoadingClass::Core)
+        .filter(|entry| {
+            // Standard Root can delegate immediately. Native Skill guidance
+            // also names the finite Source controls when they are available.
+            entry.is_initially_visible()
+                || (mode == CapabilityLoadingMode::StickyFallbackForRootChat
+                    && matches!(
+                        entry.execution_name(),
+                        "SubAgent" | "skills_list" | "skills_read"
+                    ))
+        })
         .map(bamboo_domain::ClassifiedToolSchema::into_schema)
         .collect::<Vec<_>>();
     projected.push(bamboo_domain::discovery_control_fallback_schema());
@@ -155,7 +195,8 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
     tool_schemas: &'a [ToolSchema],
 ) -> Cow<'a, [ToolSchema]> {
     let required_tool = required_tool_for_session(session);
-    let capability_loading_mode = llm.capability_loading_mode(model_name, required_tool).await;
+    let capability_loading_mode =
+        capability_loading_mode_for_session(session, llm.as_ref(), model_name, required_tool).await;
     request_tool_schemas_for_loading_mode(
         session,
         tool_schemas,
@@ -562,8 +603,9 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_llm_round, is_openai_client_tool_search_boundary,
-        request_tool_schemas_for_loading_mode, request_tool_schemas_for_session,
+        capability_loading_mode_for_session, execute_llm_round,
+        is_openai_client_tool_search_boundary, request_tool_schemas_for_loading_mode,
+        request_tool_schemas_for_session,
     };
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -607,6 +649,7 @@ mod tests {
     }
 
     struct StickyCapturingProvider {
+        mode: CapabilityLoadingMode,
         requests: Mutex<Vec<Vec<ToolSchema>>>,
     }
 
@@ -618,7 +661,7 @@ mod tests {
             required_tool: Option<&str>,
         ) -> CapabilityLoadingMode {
             if required_tool.is_none() {
-                CapabilityLoadingMode::StickyFallback
+                self.mode
             } else {
                 CapabilityLoadingMode::LegacyFullCatalog
             }
@@ -792,6 +835,7 @@ mod tests {
     #[tokio::test]
     async fn sticky_overflow_projection_uses_core_plus_discovery_catalog() {
         let provider = Arc::new(StickyCapturingProvider {
+            mode: CapabilityLoadingMode::StickyFallback,
             requests: Mutex::new(Vec::new()),
         });
         let llm: Arc<dyn LLMProvider> = provider;
@@ -819,8 +863,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_sticky_loading_preserves_root_controls_and_specialized_catalogs() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let root = Session::new("chat-root", "chat-model");
+        let child = Session::new_child_of("worker", &root, "chat-model", "read files");
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "chat-model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let mut ultra = root.clone();
+        ultra.set_root_orchestration_only(true).unwrap();
+        let mut ticket = root.clone();
+        ticket.metadata.insert(
+            crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+            "assignment".into(),
+        );
+        let default = StickyCapturingProvider {
+            mode: CapabilityLoadingMode::StickyFallbackForRootChat,
+            requests: Mutex::new(Vec::new()),
+        };
+        let explicit = StickyCapturingProvider {
+            mode: CapabilityLoadingMode::StickyFallback,
+            requests: Mutex::new(Vec::new()),
+        };
+        for session in [&child, &supervisor, &ultra, &ticket] {
+            assert_eq!(
+                capability_loading_mode_for_session(session, &default, "chat-model", None).await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+            );
+            assert_eq!(
+                capability_loading_mode_for_session(session, &explicit, "chat-model", None).await,
+                CapabilityLoadingMode::StickyFallback,
+            );
+        }
+
+        let schemas = ["Read", "SubAgent", "skills_list", "skills_read", "Glob"].map(schema);
+        let mode = capability_loading_mode_for_session(&root, &default, "chat-model", None).await;
+        assert_eq!(mode, CapabilityLoadingMode::StickyFallbackForRootChat);
+        let projected = request_tool_schemas_for_loading_mode(&root, &schemas, mode, None);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Read",
+                "SubAgent",
+                "skills_list",
+                "skills_read",
+                "discover_capabilities"
+            ],
+        );
+        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+            &root, &schemas, mode,
+        );
+        for name in ["Read", "SubAgent", "skills_list", "skills_read"] {
+            assert!(callable.contains_execution_name(name), "{name}");
+        }
+        assert!(!callable.contains_execution_name("Glob"));
+    }
+
+    #[tokio::test]
     async fn selected_root_can_call_its_advertised_tools_in_sticky_mode() {
         let provider = Arc::new(StickyCapturingProvider {
+            mode: CapabilityLoadingMode::StickyFallback,
             requests: Mutex::new(Vec::new()),
         });
         let llm: Arc<dyn LLMProvider> = provider.clone();
@@ -878,6 +984,7 @@ mod tests {
     #[tokio::test]
     async fn sticky_first_and_next_round_use_byte_identical_core_plus_discovery_tools() {
         let provider = Arc::new(StickyCapturingProvider {
+            mode: CapabilityLoadingMode::StickyFallback,
             requests: Mutex::new(Vec::new()),
         });
         let llm: Arc<dyn LLMProvider> = provider.clone();
