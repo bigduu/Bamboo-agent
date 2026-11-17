@@ -16,7 +16,7 @@ pub(super) fn extract_workspace_path_from_tool_result(
     if !result.success
         || !matches!(
             bamboo_tools::normalize_tool_ref(&tool_call.function.name).as_deref(),
-            Some("SetWorkspace" | "Workspace")
+            Some("Workspace")
         )
     {
         return None;

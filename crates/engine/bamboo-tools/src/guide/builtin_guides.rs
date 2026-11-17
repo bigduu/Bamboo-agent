@@ -320,19 +320,6 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ],
         )),
 
-        // SetWorkspace is now an alias for Workspace (set mode)
-        "SetWorkspace" => Some(guide(
-            "SetWorkspace",
-            ToolCategory::CommandExecution,
-            "Change the current session workspace. (Alias for Workspace with path argument.)",
-            "Do not use with non-directory or missing paths.",
-            &["Workspace", "Read"],
-            vec![example(
-                "Switch session workspace",
-                json!({"path":"/workspace/project"}),
-                "Use before running commands or edits in another repo root.",
-            )],
-        )),
         // Workspace is the unified tool replacing GetCurrentDir + SetWorkspace
         "Workspace" => Some(guide(
             "Workspace",

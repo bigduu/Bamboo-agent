@@ -1,7 +1,6 @@
 //! Persistent session-scoped note tool.
 //!
 //! Canonical tool name: `session_note`.
-//! The legacy `memory_note` name is accepted via executor-level alias routing.
 //!
 //! This tool lets the model store (and later retrieve) per-session notes that
 //! are loaded into the system prompt at the start of each round.
@@ -43,10 +42,6 @@ impl Default for SessionNoteTool {
         Self::new()
     }
 }
-
-/// Deprecated compatibility alias for older code paths. The canonical tool type
-/// and registered tool name is [`SessionNoteTool`] / `session_note`.
-pub type MemoryNoteTool = SessionNoteTool;
 
 #[async_trait]
 impl Tool for SessionNoteTool {

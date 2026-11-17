@@ -4745,7 +4745,16 @@ impl Config {
     pub fn disabled_tool_names(&self) -> BTreeSet<String> {
         self.disabled_tool_references()
             .into_iter()
-            .map(|reference| normalize_tool_ref(&reference).unwrap_or(reference))
+            .map(|reference| {
+                normalize_tool_ref(&reference)
+                    .or_else(|| {
+                        bamboo_domain::resolve_disabled_tool_reference_name(&reference, |name| {
+                            bamboo_domain::BUILTIN_TOOL_NAMES.contains(&name)
+                                || bamboo_domain::SERVER_TOOL_NAMES.contains(&name)
+                        })
+                    })
+                    .unwrap_or(reference)
+            })
             // This compatibility facade predates the exact lowercase tool.
             .map(|name| if name == "bash" { "Bash".into() } else { name })
             .collect()
@@ -9331,7 +9340,7 @@ mod tests {
             config.disabled_tool_names(),
             BTreeSet::from([
                 "Bash".to_string(),
-                "GetCurrentDir".to_string(),
+                "Workspace".to_string(),
                 "Read".to_string()
             ])
         );
