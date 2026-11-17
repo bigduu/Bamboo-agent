@@ -2173,8 +2173,6 @@ mod tests {
             "list_directory",
             "get_file_info",
             "getFileInfo",
-            "get_current_dir",
-            "getCurrentDir",
         ];
         for alias in &aliases {
             assert_eq!(
@@ -2184,30 +2182,13 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "read"})),
-                &tools
-            ),
-            ToolSchedulingMode::ParallelSafe,
-            "memory_note read alias should be parallel-safe"
-        );
-        assert_eq!(
-            scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "list_topics"})),
-                &tools
-            ),
-            ToolSchedulingMode::ParallelSafe,
-            "memory_note list_topics alias should be parallel-safe"
-        );
-        assert_eq!(
-            scheduling_mode_for_tool_call(
-                &tool_call_with_args("memory_note", json!({"action": "append", "content": "x"})),
-                &tools
-            ),
-            ToolSchedulingMode::Sequential,
-            "memory_note append alias should be sequential"
-        );
+        for retired in ["get_current_dir", "getCurrentDir", "memory_note"] {
+            assert_eq!(
+                scheduling_mode_for_tool_call(&tool_call(retired), &tools),
+                ToolSchedulingMode::Sequential,
+                "retired alias {retired} has no registered parallel-safe owner"
+            );
+        }
     }
 
     #[test]
