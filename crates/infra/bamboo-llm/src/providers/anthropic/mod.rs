@@ -103,16 +103,16 @@ fn remove_legacy_thinking_budget(body: &mut Value, selected_effort: Option<Reaso
         .and_then(Value::as_object_mut)
         .and_then(|thinking| thinking.remove("budget_tokens"))
         .is_some();
+    if !had_legacy_budget && !had_nested_budget {
+        return;
+    }
+
     let thinking_mode = fields
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))
         .and_then(Value::as_str);
     let replace_legacy_mode =
         thinking_mode == Some("enabled") || (had_nested_budget && thinking_mode.is_none());
-    if !had_legacy_budget && !had_nested_budget && !replace_legacy_mode {
-        return;
-    }
-
     let wire_effort = fields
         .get("output_config")
         .and_then(|output| output.get("effort"))
@@ -7727,19 +7727,24 @@ mod anthropic_provider_tests {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(ANTHROPIC_SSE_OK),
             )
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         for (patch, mode, effort) in [
             (
                 json!({"op":"set","path":"/output_config/effort","value":"none"}),
                 None,
-                "none",
+                Some("none"),
             ),
             (
                 json!({"op":"set","path":"/thinking/budget_tokens","value":16384}),
                 Some("adaptive"),
-                DEFAULT_REASONING_EFFORT.as_str(),
+                Some(DEFAULT_REASONING_EFFORT.as_str()),
+            ),
+            (
+                json!({"op":"set","path":"/thinking/type","value":"enabled"}),
+                Some("enabled"),
+                None,
             ),
         ] {
             let overrides =
@@ -7762,7 +7767,11 @@ mod anthropic_provider_tests {
             );
             let requests = server.received_requests().await.unwrap();
             let body: Value = requests.last().unwrap().body_json().unwrap();
-            assert_eq!(body["output_config"]["effort"], effort);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
             assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
             assert!(body.pointer("/thinking/budget_tokens").is_none());
         }
