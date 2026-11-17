@@ -373,6 +373,25 @@ impl Tool for MemoryTool {
                     .to_string(),
             ));
         }
+        if ctx.plan_read_only
+            && !args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| {
+                    matches!(
+                        action,
+                        "session_read"
+                            | "session_append"
+                            | "session_replace"
+                            | "session_clear"
+                            | "session_list_topics"
+                    )
+                })
+        {
+            return Err(ToolError::Execution(
+                "Plan Mode permits only Session note operations through memory".into(),
+            ));
+        }
         let parsed: MemoryArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid memory args: {error}"))
         })?;

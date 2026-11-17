@@ -82,16 +82,6 @@ pub(super) fn build_base_tools(
         mcp_tools,
     ));
 
-    // Replace the built-in default-root session_note instance so note writes
-    // and next-round prompt reads share this AppState's one concrete store.
-    let session_note_tool = Arc::new(bamboo_tools::tools::SessionNoteTool::with_memory_store(
-        memory_store.clone(),
-    ));
-    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        base,
-        session_note_tool,
-    ));
-
     // Replace the framework Workspace tool with the Project-aware server
     // overlay and expose the explicit Project registry tool. Overlay dispatch
     // still delegates permission decisions to the built-in executor.

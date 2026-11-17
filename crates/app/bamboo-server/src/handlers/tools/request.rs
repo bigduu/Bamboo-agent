@@ -75,7 +75,6 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "write_stdin"
             | "SubAgent"
             | "memory"
-            | "session_note"
             | "scheduler"
             | "session_history"
             | "session_history_current"

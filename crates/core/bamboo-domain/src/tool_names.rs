@@ -16,7 +16,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 18] = [
     "GetFileInfo",
     "Glob",
     "Grep",
-    "session_note",
+    "memory",
     "Read",
     "request_permissions",
     "Sleep",
@@ -250,7 +250,11 @@ pub fn resolve_disabled_tool_reference_name(
         {
             Some("Workspace")
         }
-        name if name.eq_ignore_ascii_case("memory_note") => Some("session_note"),
+        name if name.eq_ignore_ascii_case("memory_note")
+            || name.eq_ignore_ascii_case("session_note") =>
+        {
+            Some("memory")
+        }
         name if name.eq_ignore_ascii_case("recall")
             || name.eq_ignore_ascii_case("session_inspector")
             || name == "sessionInspector" =>
@@ -318,9 +322,10 @@ mod tests {
             ("set_workspace", "Workspace"),
             ("default::setWorkspace", "Workspace"),
             (" Default:: setWorkspace ", "Workspace"),
-            ("memory_note", "session_note"),
-            ("default::memory_note", "session_note"),
-            ("DEFAULT::memory_note", "session_note"),
+            ("memory_note", "memory"),
+            ("default::memory_note", "memory"),
+            ("DEFAULT::memory_note", "memory"),
+            ("session_note", "memory"),
             ("recall", "session_history"),
             ("session_inspector", "session_history"),
             ("default::sessionInspector", "session_history"),
@@ -330,7 +335,7 @@ mod tests {
             let registered = [
                 "GetFileInfo",
                 "Workspace",
-                "session_note",
+                "memory",
                 "session_history",
                 "scheduler",
             ];

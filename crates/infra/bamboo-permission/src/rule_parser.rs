@@ -226,6 +226,32 @@ impl ParsedRule {
         args: &Value,
         restrictive: bool,
     ) -> bool {
+        // Retired Session-note rules can restrict their corresponding memory
+        // actions without granting access to the durable memory operations.
+        if restrictive
+            && tool_name.eq_ignore_ascii_case("memory")
+            && ["session_note", "memory_note"]
+                .iter()
+                .any(|name| self.tool_name.eq_ignore_ascii_case(name))
+        {
+            let Some(action) = args
+                .get("action")
+                .and_then(Value::as_str)
+                .and_then(|action| action.strip_prefix("session_"))
+            else {
+                return false;
+            };
+            let mut projected = args
+                .as_object()
+                .expect("action came from an object")
+                .clone();
+            projected.insert("action".into(), Value::String(action.to_owned()));
+            return self.matches_tool_call_with_restrictions(
+                &self.tool_name,
+                &Value::Object(projected),
+                restrictive,
+            );
+        }
         // Preserve old operation-specific always-ask rules when the model uses
         // the combined continuation API. Do not let an input rule match a poll
         // or a kill rule match ordinary stdin bytes. Every continuation also
@@ -293,7 +319,9 @@ impl ParsedRule {
             "js_repl" => args.get("code").and_then(|v| v.as_str()),
             "bashoutput" | "killshell" => args.get("bash_id").and_then(|v| v.as_str()),
             "write_stdin" => args.get("session_id").and_then(|v| v.as_str()),
-            "session_note" | "memory" => args.get("action").and_then(|v| v.as_str()),
+            "session_note" | "memory_note" | "memory" => {
+                args.get("action").and_then(|v| v.as_str())
+            }
             _ => None,
         };
 
@@ -387,6 +415,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn retired_session_note_rules_preserve_restrictions_without_granting_memory() {
+        let rule = ParsedRule::parse("session_note(replace)");
+        let note = json!({"action":"session_replace","content":"updated"});
+        assert!(rule.matches_tool_call("memory", &note));
+        assert!(!rule.matches_tool_call_for_allow("memory", &note));
+        assert!(!rule.matches_tool_call("memory", &json!({"action":"write","content":"durable"})));
+        assert!(!rule.matches_tool_call("memory", &json!({"action":"session_read"})));
+    }
 
     #[test]
     fn test_parse_tool_only() {
