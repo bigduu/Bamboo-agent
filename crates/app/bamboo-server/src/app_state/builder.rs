@@ -2118,13 +2118,29 @@ mod broker_embed_tests {
         assert!(state.config.read().await.subagents().broker.is_none());
         assert!(!dir.path().join("broker").exists());
         let child_tools = state.tools_for(crate::tools::ToolSurface::Child);
-        for name in ["Read", "Write", "Edit", "Bash", "Task"] {
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "exec_command",
+            "write_stdin",
+            "Task",
+        ] {
             assert!(
                 child_tools.owns_exact_tool(name),
                 "missing native tool {name}"
             );
         }
-        for name in ["ask_agent", "deploy_agent", "cluster"] {
+        for name in [
+            "ask_agent",
+            "deploy_agent",
+            "cluster",
+            "Bash",
+            "bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
             assert!(!state
                 .tools_for(crate::tools::ToolSurface::Root)
                 .owns_exact_tool(name));

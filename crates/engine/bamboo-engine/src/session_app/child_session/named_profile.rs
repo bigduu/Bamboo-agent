@@ -126,7 +126,7 @@ impl ResolvedChildProfile {
             .iter()
             .filter(|name| {
                 (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
-                    && **name != "bash"
+                    && !matches!(**name, "Bash" | "bash")
                     && !declares_tool(definition.tool_deny(), name)
                     && !(foreground_denied
                         && matches!(**name, "Bash" | "exec_command" | "write_stdin"))
@@ -456,7 +456,6 @@ mod tests {
             (
                 "tools:\n  allow: [Bash, exec_command, write_stdin, Edit, Glob, Read, Write]",
                 vec![
-                    "Bash",
                     "exec_command",
                     "write_stdin",
                     "Edit",
@@ -467,7 +466,7 @@ mod tests {
             ),
             (
                 "tools:\n  allow: [Bash]",
-                vec!["Bash", "exec_command", "write_stdin"],
+                vec!["exec_command", "write_stdin"],
             ),
             (
                 "tools:\n  allow: [exec_command, write_stdin]",
@@ -479,7 +478,7 @@ mod tests {
             ),
             (
                 "tools:\n  allow: [Bash]\n  deny: [exec_command]",
-                vec!["Bash", "write_stdin"],
+                vec!["write_stdin"],
             ),
             (
                 "tools:\n  deny: [bash]",

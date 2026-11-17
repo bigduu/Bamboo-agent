@@ -12,9 +12,6 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
-use bamboo_tools::tools::{
-    exec_command::EXEC_COMMAND_EXECUTION_CONTRACT, write_stdin::WRITE_STDIN_EXECUTION_CONTRACT,
-};
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
@@ -293,6 +290,13 @@ fn resolve_catalog_with_activation(
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
     }
+    let shell_pair = ["exec_command", "write_stdin"];
+    let owned_shell = |name| {
+        tools
+            .exact_tool_owner(name)
+            .is_some_and(|owner| owner.local_tool_is_native_builtin(name))
+    };
+    let has_owned_shell = shell_pair.into_iter().any(owned_shell);
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
@@ -306,6 +310,14 @@ fn resolve_catalog_with_activation(
                 resolve_disabled_tool_reference_name(reference, |name| {
                     by_execution_name.contains_key(name)
                 })
+                .or_else(|| {
+                    if has_owned_shell {
+                        return bamboo_domain::tool_names::retired_default_shell_policy_name(
+                            reference,
+                        );
+                    }
+                    None
+                })
             }
         })
         .flat_map(|name| {
@@ -313,19 +325,16 @@ fn resolve_catalog_with_activation(
             std::iter::once(name).chain(replacements)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let shell_pair = [
-        ("exec_command", EXEC_COMMAND_EXECUTION_CONTRACT),
-        ("write_stdin", WRITE_STDIN_EXECUTION_CONTRACT),
-    ];
     // When the owned shell pair is installed, a model must be able to
     // continue a command after its initial wait yields a handle.
-    if shell_pair.iter().all(|(name, contract)| {
-        by_execution_name.contains_key(*name)
-            && tools.execution_contract_for_exact(name) == Some(*contract)
-    }) && shell_pair.iter().any(|(name, _)| {
-        disabled_execution_names.contains(*name) || !session.allows_model_tool_execution(name)
-    }) {
-        for (name, _) in shell_pair {
+    if shell_pair
+        .into_iter()
+        .all(|name| by_execution_name.contains_key(name) && owned_shell(name))
+        && shell_pair.into_iter().any(|name| {
+            disabled_execution_names.contains(name) || !session.allows_model_tool_execution(name)
+        })
+    {
+        for name in shell_pair {
             by_execution_name.remove(name);
         }
     }

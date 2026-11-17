@@ -1265,14 +1265,13 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
     ] {
         let message = Message::tool_result("command", result.to_string());
         assert_eq!(
-            confirms_tool_result("default::exec_command", "command", None, &message),
+            confirms_tool_result("default::exec_command", "command", &message),
             success
         );
     }
     assert!(confirms_tool_result(
         "Bash",
         "command",
-        None,
         &Message::tool_result("command", r#"{"exit_code":0}"#),
     ));
 }

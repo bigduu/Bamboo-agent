@@ -1505,7 +1505,7 @@ fn default_models_use_yielding_shell_and_resident_view_image() {
         assert!(callable.contains_execution_name("exec_command"));
         assert!(callable.contains_execution_name("write_stdin"));
         assert!(callable.contains_execution_name("ViewImage"));
-        for retired in ["Bash", "bash"] {
+        for retired in ["Bash", "bash", "BashInput", "BashOutput", "KillShell"] {
             assert!(
                 callable.resolve_callable_reference(retired).is_none(),
                 "{retired}"
@@ -1529,7 +1529,14 @@ fn default_models_use_yielding_shell_and_resident_view_image() {
     assert!(guide.content.contains("write_stdin"));
     assert!(guide.content.contains("exec_command"));
 
-    for disabled in ["bash", "Bash", "exec_command", "write_stdin", "BashOutput"] {
+    for disabled in [
+        "bash",
+        "Bash",
+        "default::execute_command",
+        "exec_command",
+        "write_stdin",
+        "BashOutput",
+    ] {
         let config = crate::runtime::config::AgentLoopConfig {
             disabled_tools: [disabled.into()].into(),
             ..Default::default()

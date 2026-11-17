@@ -8,10 +8,7 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
-    "Bash",
-    "BashInput",
-    "BashOutput",
+pub const BUILTIN_TOOL_NAMES: [&str; 18] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -19,7 +16,6 @@ pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "GetFileInfo",
     "Glob",
     "Grep",
-    "KillShell",
     "session_note",
     "Read",
     "request_permissions",
@@ -164,10 +160,6 @@ pub fn canonical_tool_name(value: &str) -> String {
     }
 
     let unqualified = trimmed.rsplit("::").next().unwrap_or(trimmed).trim();
-    // The retired lower-case tool must not alias the classic Bash executor.
-    if unqualified == "bash" {
-        return unqualified.to_string();
-    }
     let normalized = normalize_builtin_alias(unqualified);
     let canonical = resolve_alias(normalized).unwrap_or(normalized);
 
@@ -192,9 +184,6 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         return None;
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
-    if raw_tool_name == "bash" {
-        return None;
-    }
     // Keep the ambiguous spelling until the actual Session registry/version
     // selects its owner. Canonical v1 alias resolution itself remains unchanged.
     if crate::independent_root_spawn_reference(raw_tool_name) {
@@ -275,13 +264,21 @@ pub fn resolve_disabled_tool_reference_name(
     if reference.contains("::") {
         return None;
     }
-    // A missing lower-case registration retains the original shell deny.
-    let legacy = if reference == "bash" {
-        "Bash".to_owned()
-    } else {
-        canonical_tool_name(reference)
-    };
-    legacy_shell_replacements(&legacy).next().map(|_| legacy)
+    retired_shell_policy_name(reference).map(str::to_owned)
+}
+
+fn retired_shell_policy_name(reference: &str) -> Option<&'static str> {
+    let normalized = normalize_builtin_alias(reference);
+    ["Bash", "BashInput", "BashOutput", "KillShell"]
+        .into_iter()
+        .find(|name| name.eq_ignore_ascii_case(normalized))
+}
+
+/// Preserve an old default-namespace deny after exact resolution misses.
+/// Use only where Bamboo's own terminal is installed.
+pub fn retired_default_shell_policy_name(reference: &str) -> Option<String> {
+    let name = reference.trim().strip_prefix("default::")?.trim();
+    retired_shell_policy_name(name).map(str::to_owned)
 }
 
 /// Checks if a tool reference is a built-in tool
@@ -318,14 +315,11 @@ mod tests {
             ("bashoutput", "BashOutput"),
             ("kIlLsHeLl", "KillShell"),
         ] {
-            let expected = if reference.trim() == "bash" {
-                None
-            } else {
-                Some(legacy.to_owned())
-            };
             assert_eq!(
-                crate::resolve_tool_reference_name(reference, |name| name == legacy),
-                expected,
+                crate::resolve_tool_reference_name(reference, |name| {
+                    matches!(name, "exec_command" | "write_stdin")
+                }),
+                None,
                 "{reference}",
             );
             assert_eq!(
@@ -385,12 +379,18 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_tool_ref_accepts_claude_style_names() {
-        assert_eq!(
-            normalize_tool_ref("default::Bash"),
-            Some("Bash".to_string())
-        );
-        assert_eq!(normalize_tool_ref("default::bash"), None);
+    fn retired_shell_names_are_not_normalized_as_builtins() {
+        for name in [
+            "Bash",
+            "default::Bash",
+            "default::bash",
+            "execute_command",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
+            assert_eq!(normalize_tool_ref(name), None, "{name}");
+        }
     }
 
     #[test]
@@ -429,10 +429,6 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_snake_case_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::execute_command"),
-            Some("Bash".to_string())
-        );
         assert_eq!(
             normalize_tool_ref("default::file_exists"),
             Some("FileExists".to_string())
@@ -507,8 +503,8 @@ mod tests {
 
     #[test]
     fn test_is_builtin_tool() {
-        assert!(is_builtin_tool("Bash"));
-        assert!(is_builtin_tool("default::Bash"));
+        assert!(is_builtin_tool("exec_command"));
+        assert!(is_builtin_tool("default::write_stdin"));
         assert!(!is_builtin_tool("unknown_tool"));
         assert!(!is_builtin_tool("compress_context"));
     }

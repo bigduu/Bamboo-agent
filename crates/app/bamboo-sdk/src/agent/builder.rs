@@ -2386,15 +2386,21 @@ mod tests {
             id: "bypass-forced".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "Bash".to_string(),
+                name: "exec_command".to_string(),
                 arguments: serde_json::json!({
-                    "command": format!("eval 'printf bypass > {}'", bypass_path.display())
+                    "cmd": format!("eval 'printf bypass > {}'", bypass_path.display())
                 })
                 .to_string(),
             },
         };
         bypass
-            .execute(&bypass_forced)
+            .execute_with_context(
+                &bypass_forced,
+                bamboo_agent_core::ToolExecutionContext {
+                    session_id: Some("sdk-test-bypass"),
+                    ..bamboo_agent_core::ToolExecutionContext::none(&bypass_forced.id)
+                },
+            )
             .await
             .expect_err("Bypass must retain forced confirmations");
         assert!(!bypass_path.exists());
@@ -2407,16 +2413,22 @@ mod tests {
             id: "auto-forced".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "Bash".to_string(),
+                name: "exec_command".to_string(),
                 arguments: serde_json::json!({
-                    "command": format!("eval 'printf auto > {}'", auto_path.display())
+                    "cmd": format!("eval 'printf auto > {}'", auto_path.display())
                 })
                 .to_string(),
             },
         };
-        auto.execute(&forced)
-            .await
-            .expect("Auto should suppress forced confirmation");
+        auto.execute_with_context(
+            &forced,
+            bamboo_agent_core::ToolExecutionContext {
+                session_id: Some("sdk-test-auto"),
+                ..bamboo_agent_core::ToolExecutionContext::none(&forced.id)
+            },
+        )
+        .await
+        .expect("Auto should suppress forced confirmation");
         assert_eq!(std::fs::read_to_string(auto_path).unwrap(), "auto");
 
         let assembled_dir = tempfile::tempdir().unwrap();

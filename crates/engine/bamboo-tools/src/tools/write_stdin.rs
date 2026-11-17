@@ -11,7 +11,6 @@ use super::{
 };
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
-pub const WRITE_STDIN_EXECUTION_CONTRACT: &str = "bamboo.write-stdin.v1";
 
 tokio::task_local! {
     static DEFER_EMPTY_POLL_ADVISORY: ();
@@ -128,10 +127,6 @@ impl WriteStdinTool {
 impl Tool for WriteStdinTool {
     fn name(&self) -> &str {
         "write_stdin"
-    }
-
-    fn execution_contract(&self) -> Option<&'static str> {
-        Some(WRITE_STDIN_EXECUTION_CONTRACT)
     }
 
     fn description(&self) -> &str {

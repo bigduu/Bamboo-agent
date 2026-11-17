@@ -72,6 +72,8 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "SetWorkspace"
             | "Workspace"
             | "Task"
+            | "exec_command"
+            | "write_stdin"
             | "SubAgent"
             | "memory"
             | "session_note"

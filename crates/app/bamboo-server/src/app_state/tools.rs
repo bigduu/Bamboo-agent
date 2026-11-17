@@ -243,9 +243,16 @@ impl HostNativeToolCeiling {
     }
 
     fn resolve_disabled(&self, reference: &str) -> Vec<String> {
-        let Some(name) = bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| {
+        let resolved = bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| {
             self.base.owns_exact_tool(name)
-        }) else {
+        })
+        .or_else(|| {
+            if self.native_owner("exec_command") || self.native_owner("write_stdin") {
+                return bamboo_domain::tool_names::retired_default_shell_policy_name(reference);
+            }
+            None
+        });
+        let Some(name) = resolved else {
             return Vec::new();
         };
         let mut names = vec![name.clone()];
@@ -549,7 +556,6 @@ mod native_ceiling_tests {
         assert_eq!(
             source.observe(&child).await.unwrap(),
             [
-                "Bash",
                 "Edit",
                 "Glob",
                 "Read",
@@ -607,7 +613,8 @@ mod native_ceiling_tests {
                 })
                 .to_string(),
             );
-            assert_eq!(source.observe(&child).await.unwrap(), tools);
+            let expected = if tools == ["Bash"] { vec![] } else { tools };
+            assert_eq!(source.observe(&child).await.unwrap(), expected);
         }
     }
 
@@ -699,7 +706,7 @@ mod native_ceiling_tests {
             .unwrap();
         let mut foreign = source.projects.create("foreign fixture", None).unwrap();
         session.set_project_id_meta(project.id.as_str());
-        assert_eq!(source.observe(&session).await.unwrap().len(), 7);
+        assert_eq!(source.observe(&session).await.unwrap().len(), 6);
         session
             .metadata
             .insert("project_id".into(), "another-project".into());

@@ -129,6 +129,31 @@ fn canonical_tool_name_or_error_accepts_memory_server_tool() {
 }
 
 #[test]
+fn direct_terminal_dispatch_uses_the_current_pair_with_session_context() {
+    for name in [
+        "Bash",
+        "bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
+        "execute_command",
+    ] {
+        assert!(
+            matches!(
+                canonical_tool_name_or_error(name),
+                Err(crate::error::AppError::ToolNotFound(_))
+            ),
+            "{name}"
+        );
+    }
+    for name in ["exec_command", "write_stdin"] {
+        assert_eq!(canonical_tool_name_or_error(name).unwrap(), name);
+        assert!(validate_session_context_requirement(name, None).is_err());
+        assert!(validate_session_context_requirement(name, Some("owner-session")).is_ok());
+    }
+}
+
+#[test]
 fn parse_arguments_parses_json_and_plain_strings() {
     let args = parse_arguments(vec![
         ToolParameter {
