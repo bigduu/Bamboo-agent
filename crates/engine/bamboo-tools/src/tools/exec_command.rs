@@ -12,6 +12,8 @@ use tokio::time::{timeout, Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
 
+pub const EXEC_COMMAND_EXECUTION_CONTRACT: &str = "bamboo.exec-command.v1";
+
 const MAX_RETAINED_SESSIONS: usize = 64;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_TOKENS: usize = 8192;
@@ -727,6 +729,10 @@ impl ExecCommandTool {
 impl Tool for ExecCommandTool {
     fn name(&self) -> &str {
         "exec_command"
+    }
+
+    fn execution_contract(&self) -> Option<&'static str> {
+        Some(EXEC_COMMAND_EXECUTION_CONTRACT)
     }
 
     fn description(&self) -> &str {

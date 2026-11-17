@@ -21,12 +21,10 @@ const NATIVE_NAMES: [&str; 8] = [
     "Write",
 ];
 
-/// Legacy start-command declarations also cover the foreground shell.
 /// Apply only while resolving source declarations; frozen grants stay exact.
 fn declares_tool(declarations: &[String], tool: &str) -> bool {
     declarations.iter().any(|name| match name.as_str() {
-        "Bash" => matches!(tool, "Bash" | "bash" | "exec_command" | "write_stdin"),
-        "exec_command" => matches!(tool, "exec_command" | "bash"),
+        "Bash" => matches!(tool, "Bash" | "exec_command" | "write_stdin"),
         name => name == tool,
     })
 }
@@ -128,6 +126,7 @@ impl ResolvedChildProfile {
             .iter()
             .filter(|name| {
                 (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
+                    && **name != "bash"
                     && !declares_tool(definition.tool_deny(), name)
                     && !(foreground_denied
                         && matches!(**name, "Bash" | "exec_command" | "write_stdin"))
@@ -460,7 +459,6 @@ mod tests {
                     "Bash",
                     "exec_command",
                     "write_stdin",
-                    "bash",
                     "Edit",
                     "Glob",
                     "Read",
@@ -469,11 +467,11 @@ mod tests {
             ),
             (
                 "tools:\n  allow: [Bash]",
-                vec!["Bash", "exec_command", "write_stdin", "bash"],
+                vec!["Bash", "exec_command", "write_stdin"],
             ),
             (
                 "tools:\n  allow: [exec_command, write_stdin]",
-                vec!["exec_command", "write_stdin", "bash"],
+                vec!["exec_command", "write_stdin"],
             ),
             (
                 "tools:\n  allow: [exec_command, write_stdin, Read]\n  deny: [Bash]",

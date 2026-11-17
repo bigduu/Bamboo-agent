@@ -12,7 +12,9 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
-use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
+use bamboo_tools::tools::{
+    exec_command::EXEC_COMMAND_EXECUTION_CONTRACT, write_stdin::WRITE_STDIN_EXECUTION_CONTRACT,
+};
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
@@ -311,20 +313,23 @@ fn resolve_catalog_with_activation(
             std::iter::once(name).chain(replacements)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
-    if tools.execution_contract_for_exact("bash") == Some(FOREGROUND_BASH_EXECUTION_CONTRACT) {
-        let yielding_shell = ["exec_command", "write_stdin"].into_iter().all(|name| {
-            by_execution_name.contains_key(name) && session.allows_model_tool_execution(name)
-        });
-        // A yielded handle needs both tools. Preserve existing shell denials
-        // when switching the default surface from foreground to yielding.
-        if yielding_shell && !disabled_execution_names.contains("bash") {
-            by_execution_name.remove("bash");
-        } else {
-            by_execution_name.remove("exec_command");
-            by_execution_name.remove("write_stdin");
+    let shell_pair = [
+        ("exec_command", EXEC_COMMAND_EXECUTION_CONTRACT),
+        ("write_stdin", WRITE_STDIN_EXECUTION_CONTRACT),
+    ];
+    // When the owned shell pair is installed, a model must be able to
+    // continue a command after its initial wait yields a handle.
+    if shell_pair.iter().all(|(name, contract)| {
+        by_execution_name.contains_key(*name)
+            && tools.execution_contract_for_exact(name) == Some(*contract)
+    }) && shell_pair.iter().any(|(name, _)| {
+        disabled_execution_names.contains(*name) || !session.allows_model_tool_execution(name)
+    }) {
+        for (name, _) in shell_pair {
+            by_execution_name.remove(name);
         }
     }
+    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
     retain_legacy_plan_exit(session, &mut by_execution_name);
     // Root and Child models delegate through the logical SubAgent facade. Keep the
     // physical broker/deployment tools registered for existing direct callers,
@@ -617,7 +622,7 @@ mod live_disabled_tests {
             // These references are already accepted by the shared resolver;
             // compatibility must not invent an additional alias vocabulary.
             assert_eq!(
-                bamboo_domain::resolve_tool_reference_name(denied, |name| name == legacy),
+                bamboo_domain::resolve_disabled_tool_reference_name(denied, |name| name == legacy),
                 Some(legacy.to_owned()),
                 "unsupported test reference {denied}",
             );

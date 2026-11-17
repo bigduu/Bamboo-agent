@@ -8,9 +8,8 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
     "Bash",
-    "bash",
     "BashInput",
     "BashOutput",
     "exec_command",
@@ -165,6 +164,10 @@ pub fn canonical_tool_name(value: &str) -> String {
     }
 
     let unqualified = trimmed.rsplit("::").next().unwrap_or(trimmed).trim();
+    // The retired lower-case tool must not alias the classic Bash executor.
+    if unqualified == "bash" {
+        return unqualified.to_string();
+    }
     let normalized = normalize_builtin_alias(unqualified);
     let canonical = resolve_alias(normalized).unwrap_or(normalized);
 
@@ -189,6 +192,9 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         return None;
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
+    if raw_tool_name == "bash" {
+        return None;
+    }
     // Keep the ambiguous spelling until the actual Session registry/version
     // selects its owner. Canonical v1 alias resolution itself remains unchanged.
     if crate::independent_root_spawn_reference(raw_tool_name) {
@@ -196,7 +202,6 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
     }
     let normalized = normalize_builtin_alias(raw_tool_name);
 
-    // The exact foreground and historical Bash spellings are distinct.
     let mut names = BUILTIN_TOOL_NAMES
         .iter()
         .chain(SERVER_TOOL_NAMES.iter())
@@ -245,12 +250,10 @@ pub fn legacy_shell_replacement(execution_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Denial-only expansion for current catalogs. A start-command restriction
-/// carries forward to the foreground tool without changing direct-call aliases.
+/// Denial-only expansion for current catalogs.
 pub fn legacy_shell_replacements(execution_name: &str) -> impl Iterator<Item = &'static str> {
     let names: &[&str] = match execution_name {
-        "Bash" => &["exec_command", "bash"],
-        "exec_command" => &["bash"],
+        "Bash" => &["exec_command"],
         "BashInput" | "BashOutput" | "KillShell" => &["write_stdin"],
         _ => &[],
     };
@@ -294,17 +297,14 @@ mod tests {
     fn legacy_shell_disabled_policy_only_expands_exact_builtin_names() {
         assert_eq!(
             legacy_shell_replacements("Bash").collect::<Vec<_>>(),
-            ["exec_command", "bash"]
+            ["exec_command"]
         );
         assert_eq!(
             legacy_shell_replacements("BashOutput").collect::<Vec<_>>(),
             ["write_stdin"]
         );
         assert_eq!(legacy_shell_replacements("vendor::Bash").next(), None);
-        assert_eq!(
-            legacy_shell_replacements("exec_command").collect::<Vec<_>>(),
-            ["bash"]
-        );
+        assert_eq!(legacy_shell_replacements("exec_command").next(), None);
     }
 
     #[test]
@@ -314,14 +314,19 @@ mod tests {
             (" bash ", "Bash"),
             ("bAsH", "Bash"),
             ("execute_command", "Bash"),
-            ("exec_command", "exec_command"),
             ("bashinput", "BashInput"),
             ("bashoutput", "BashOutput"),
             ("kIlLsHeLl", "KillShell"),
         ] {
+            let expected = if reference.trim() == "bash" {
+                None
+            } else {
+                Some(legacy.to_owned())
+            };
             assert_eq!(
                 crate::resolve_tool_reference_name(reference, |name| name == legacy),
-                Some(legacy.to_owned()),
+                expected,
+                "{reference}",
             );
             assert_eq!(
                 resolve_disabled_tool_reference_name(reference, |_| false),
@@ -332,6 +337,7 @@ mod tests {
         for reference in [
             "",
             "EXECUTE_COMMAND",
+            "exec_command",
             "unknown",
             "Read",
             "write_stdin",
@@ -384,6 +390,7 @@ mod tests {
             normalize_tool_ref("default::Bash"),
             Some("Bash".to_string())
         );
+        assert_eq!(normalize_tool_ref("default::bash"), None);
     }
 
     #[test]

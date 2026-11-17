@@ -9,8 +9,7 @@
 //! same way.
 //!
 //! For model shell access, select [`BuiltinTool::ExecCommand`] with
-//! [`BuiltinTool::WriteStdin`]. An explicit SDK catalog can select
-//! [`BuiltinTool::ForegroundBash`] for foreground-only execution.
+//! [`BuiltinTool::WriteStdin`].
 //!
 //! The canonical source of truth for built-in tool *names* is
 //! [`bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`]; [`BuiltinTool`] is kept in
@@ -105,7 +104,6 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinTool {
     Bash,
-    ForegroundBash,
     BashInput,
     BashOutput,
     ExecCommand,
@@ -131,9 +129,8 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 23] = [
+    pub const ALL: [BuiltinTool; 22] = [
         BuiltinTool::Bash,
-        BuiltinTool::ForegroundBash,
         BuiltinTool::BashInput,
         BuiltinTool::BashOutput,
         BuiltinTool::ExecCommand,
@@ -161,7 +158,6 @@ impl BuiltinTool {
     pub const fn name(self) -> &'static str {
         match self {
             BuiltinTool::Bash => "Bash",
-            BuiltinTool::ForegroundBash => "bash",
             BuiltinTool::BashInput => "BashInput",
             BuiltinTool::BashOutput => "BashOutput",
             BuiltinTool::ExecCommand => "exec_command",
@@ -264,8 +260,9 @@ mod tests {
 
     #[test]
     fn exec_session_catalog_preserves_legacy_shell_variants() {
+        assert_eq!(BuiltinTool::from_name("bash"), None);
+        assert!(default_builtin_executor().registry().get("bash").is_none());
         for (name, variant) in [
-            ("bash", BuiltinTool::ForegroundBash),
             ("exec_command", BuiltinTool::ExecCommand),
             ("write_stdin", BuiltinTool::WriteStdin),
             ("Bash", BuiltinTool::Bash),
@@ -282,7 +279,6 @@ mod tests {
     async fn explicit_builder_shell_selection_registers_only_requested_tools() {
         for (selected, expected) in [
             (vec![BuiltinTool::Bash], vec!["Bash".to_owned()]),
-            (vec![BuiltinTool::ForegroundBash], vec!["bash".to_owned()]),
             (
                 vec![BuiltinTool::ExecCommand, BuiltinTool::WriteStdin],
                 vec!["exec_command".to_owned(), "write_stdin".to_owned()],

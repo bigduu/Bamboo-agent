@@ -262,10 +262,7 @@ pub(super) fn shell_accounting_outcome(
         .as_ref()
         .map(|tool| tool.execution_name())
         .or(admitted_execution_name);
-    if !matches!(
-        execution_name,
-        Some("bash" | "exec_command" | "write_stdin")
-    ) {
+    if !matches!(execution_name, Some("exec_command" | "write_stdin")) {
         return ShellAccountingOutcome::Ordinary;
     }
     if outcome.needs_human.is_some() {
@@ -280,9 +277,6 @@ pub(super) fn shell_accounting_outcome(
     // the JSON body; use the same success/marker contract as clarification.
     if result.success && result.display_preference.as_deref() == Some("request_permissions") {
         return ShellAccountingOutcome::Pending;
-    }
-    if execution_name == Some("bash") {
-        return ShellAccountingOutcome::Terminal(result.success);
     }
     let envelope = serde_json::from_str::<serde_json::Value>(&result.result).ok();
     let status = envelope.as_ref().and_then(|value| value["status"].as_str());
@@ -1777,7 +1771,6 @@ mod task_progress_tests {
 
     async fn real_shell_permission_ack_is_neutral(cap: u32) {
         for (requested, execution_name) in [
-            ("bash", "bash"),
             ("exec_command", "exec_command"),
             ("default::exec_command", "exec_command"),
             ("write_stdin", "write_stdin"),
@@ -1796,7 +1789,6 @@ mod task_progress_tests {
             let schemas = tools.list_tools();
             let command = format!("printf forbidden > '{}'", sentinel.display());
             let args = match execution_name {
-                "bash" => serde_json::json!({"command":command}),
                 "exec_command" => serde_json::json!({"cmd":command}),
                 // The gate must pause before the actual tool rejects this unknown handle.
                 _ => {

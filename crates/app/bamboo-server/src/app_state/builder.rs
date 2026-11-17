@@ -663,7 +663,7 @@ impl AppState {
             crate::skill_runtime::WorkspaceHandoffs::new(storage.clone(), agent_runners.clone())
                 .with_actor_directory(session_store.clone()),
         );
-        let (base_tools, native_tool_ceiling, _builtin_permission_executor) = build_base_tools(
+        let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -1595,8 +1595,6 @@ impl AppState {
             schedule_manager,
             connect_manager,
             tool_factory,
-            #[cfg(test)]
-            legacy_shell_fixture_executor: _builtin_permission_executor,
             permission_checker,
             permission_section,
             permission_io_lock,

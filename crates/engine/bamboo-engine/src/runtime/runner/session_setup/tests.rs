@@ -1529,7 +1529,7 @@ fn default_models_use_yielding_shell_and_resident_view_image() {
     assert!(guide.content.contains("write_stdin"));
     assert!(guide.content.contains("exec_command"));
 
-    for disabled in ["bash", "Bash", "exec_command"] {
+    for disabled in ["bash", "Bash", "exec_command", "write_stdin", "BashOutput"] {
         let config = crate::runtime::config::AgentLoopConfig {
             disabled_tools: [disabled.into()].into(),
             ..Default::default()
@@ -1542,18 +1542,6 @@ fn default_models_use_yielding_shell_and_resident_view_image() {
             )),
             "{disabled}"
         );
-    }
-    for disabled in ["write_stdin", "BashOutput"] {
-        let config = crate::runtime::config::AgentLoopConfig {
-            disabled_tools: [disabled.into()].into(),
-            ..Default::default()
-        };
-        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-        assert!(schemas.iter().any(|schema| schema.function.name == "bash"));
-        assert!(!schemas.iter().any(|schema| matches!(
-            schema.function.name.as_str(),
-            "exec_command" | "write_stdin"
-        )));
     }
 }
 
