@@ -277,8 +277,16 @@ fn retired_shell_policy_name(reference: &str) -> Option<&'static str> {
 /// Preserve an old default-namespace deny after exact resolution misses.
 /// Use only where Bamboo's own terminal is installed.
 pub fn retired_default_shell_policy_name(reference: &str) -> Option<String> {
-    let name = reference.trim().strip_prefix("default::")?.trim();
+    let name = default_namespace_tool_name(reference.trim())?;
     retired_shell_policy_name(name).map(str::to_owned)
+}
+
+fn default_namespace_tool_name(reference: &str) -> Option<&str> {
+    let (namespace, name) = reference.split_once("::")?;
+    namespace
+        .trim()
+        .eq_ignore_ascii_case("default")
+        .then_some(name.trim())
 }
 
 /// Checks if a tool reference is a built-in tool
@@ -289,6 +297,17 @@ pub fn is_builtin_tool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_default_namespace_denials_preserve_case_insensitive_references() {
+        for reference in ["default::Bash", "DEFAULT::bAsH", " Default:: Bash "] {
+            assert_eq!(
+                retired_default_shell_policy_name(reference),
+                Some("Bash".into())
+            );
+        }
+        assert_eq!(retired_default_shell_policy_name("vendor::Bash"), None);
+    }
 
     #[test]
     fn legacy_shell_disabled_policy_only_expands_exact_builtin_names() {
