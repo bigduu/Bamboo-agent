@@ -1668,6 +1668,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_names.contains("Edit"));
     assert!(child_names.contains("load_skill"));
     assert!(child_names.contains("mcp__external__read"));
+    assert!(!child_names.contains("work_overview"));
     let child_provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &child)
         .into_iter()
         .map(|entry| entry.function.name)
@@ -1675,6 +1676,58 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_provider_names.contains("exec_command"));
     assert!(child_provider_names.contains("write_stdin"));
     assert!(!child_provider_names.contains("Bash"));
+}
+
+#[test]
+fn shared_work_registry_is_visible_only_to_a_trusted_supervisor() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "Write",
+            "Edit",
+            "work_overview",
+            "work_dispatch",
+            "work_review",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let exposed = |session: &Session| {
+        resolve_available_tool_schemas_for_session(&config, &tools, session)
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect::<Vec<_>>()
+    };
+    let mut root = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    root.metadata.insert("role".into(), "supervisor".into());
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        root.set_root_orchestration_only(ultra).unwrap();
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        assert_eq!(exposed(&root), ["Edit", "Write"]);
+        assert_eq!(
+            exposed(&supervisor),
+            ["work_dispatch", "work_overview", "work_review"]
+        );
+        let child = Session::new_child_of("child", &supervisor, "model", "worker");
+        assert_eq!(exposed(&child), ["Edit", "Write"]);
+    }
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["Write".to_string()].into_iter().collect(),
+        ..config
+    };
+    assert_eq!(
+        resolve_available_tool_schemas_for_session(&config, &tools, &root)
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect::<Vec<_>>(),
+        ["Edit"]
+    );
 }
 
 #[test]
@@ -1942,8 +1995,8 @@ fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
         .iter()
         .map(|schema| schema.function.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["Read", "SubAgent"]);
-    assert!(!schemas[1].function.description.contains("Discoverable"));
+    assert_eq!(names, vec!["Edit", "Read", "SubAgent"]);
+    assert!(!schemas[2].function.description.contains("Discoverable"));
     let guide = super::prompt_setup::build_tool_guide_context(
         &config,
         &schemas,
@@ -2178,7 +2231,7 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
 
     assert_eq!(
         effective.execution_names().collect::<Vec<_>>(),
-        vec!["Read"]
+        vec!["Edit", "Read"]
     );
     for denied in [
         "Bash",
@@ -2186,8 +2239,6 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         "exec_command",
         "default::exec_command",
         "write_stdin",
-        "Edit",
-        "apply_patch",
         "mcp__x__run",
     ] {
         assert_eq!(
@@ -2196,6 +2247,13 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
             "{denied}"
         );
     }
+    assert_eq!(
+        effective.resolve_callable_reference("Edit"),
+        Some("Edit".into())
+    );
+    assert!(!catalog
+        .iter()
+        .any(|entry| entry.execution_name() == "apply_patch"));
     assert_eq!(
         effective.resolve_callable_reference("default::Read"),
         Some("Read".to_string())
