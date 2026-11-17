@@ -32,6 +32,19 @@ and limits outside 1–5 fail. Rebuilding from the current registry prevents
 removed, disabled and HostOnly tools from being returned or gaining callable
 authority. Historical loaded names still require current registry eligibility.
 
+An OpenAI provider instance with no `sticky_tool_loading` setting uses on-demand
+loading for ordinary Root Chat on Chat Completions. The default request declares
+Core tools, `discover_capabilities`, and eligible `SubAgent`, `skills_list`, and
+`skills_read` tools. These allow required-child workflows and native Skill access
+to start directly. Discovery carries matching tool definitions into conversation
+history. Ultra uses its bounded eager catalog. Child sessions, Supervisors and
+Ticket runs use their session-specific tool projections.
+
+Set `"sticky_tool_loading": true` to opt in explicitly or `"sticky_tool_loading": false`
+when a gateway needs every callable tool in the top-level list. Requests that
+name allowed tools declare the full eligible catalog so the gateway receives
+those definitions.
+
 OpenAI Responses client `tool_search` exposes `query` and optional `limit` and
 searches Tools only. New requests with explicit Skill/Workflow kinds fail;
 completed historical search transcripts continue to replay. The StickyFallback

@@ -45,7 +45,9 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
-use super::{PromptMemoryExposureFrame, RoundOutputLimitPolicy};
+use super::{
+    capability_loading_mode_for_session, PromptMemoryExposureFrame, RoundOutputLimitPolicy,
+};
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -769,7 +771,8 @@ pub(super) async fn project_request_usage(
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
-    let loading_mode = llm.capability_loading_mode(model, required_tool).await;
+    let loading_mode =
+        capability_loading_mode_for_session(&shadow, llm.as_ref(), model, required_tool).await;
     let browser_results = legacy_browser_results_for_projection(
         &shadow,
         effective_tool_schemas.as_ref(),
@@ -1537,7 +1540,8 @@ pub(super) async fn execute_llm_stream(
         };
         let previous_model_context_state = session.model_context_state.clone();
         let previous_provider_transcript = session.provider_transcript.clone();
-        let loading_mode = llm.capability_loading_mode(model, required_tool).await;
+        let loading_mode =
+            capability_loading_mode_for_session(session, llm.as_ref(), model, required_tool).await;
         let prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
             session,
             &prepared_context,
