@@ -21,7 +21,8 @@ use bamboo_engine::runtime::managers::lifecycle::{
 };
 use bamboo_server_tools::skill_runtime::{
     skill_response_byte_budget, SkillCatalogCaller, SkillCatalogCallerResolver,
-    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillScopeLease, SkillsListTool,
+    SkillsReadTool,
 };
 use bamboo_server_tools::OverlayToolExecutor;
 use bamboo_skills::progressive::{render_skill_usage_instructions, SkillMetadataBudget};
@@ -343,7 +344,11 @@ impl Policy {
         self.check_source_scope(session)?;
         Ok(tightened)
     }
-    fn catalog(&self, resolver: Arc<dyn SkillCatalogCallerResolver>) -> SkillsListTool {
+    fn catalog(
+        &self,
+        resolver: Arc<dyn SkillCatalogCallerResolver>,
+        lease: &Arc<SkillScopeLease>,
+    ) -> SkillsListTool {
         SkillsListTool::new(
             self.state.skill_manager.clone(),
             self.state.config.clone(),
@@ -351,6 +356,7 @@ impl Policy {
             resolver,
         )
         .with_project_store(self.state.project_store.clone())
+        .with_scope_lease(lease)
     }
 }
 
@@ -474,6 +480,13 @@ impl NativeRun {
     fn revoke(&self) {
         self.live.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.revoke_skills();
+    }
+    fn revoke_skills(&self) {
+        self.skills_revoked.store(true, Ordering::Release);
+        if let Ok(binding) = self.source.binding() {
+            binding.skill_scope_lease.close();
+        }
     }
     fn check_live(&self) -> Result<u64, ToolError> {
         self.policy.check()?;
@@ -541,7 +554,7 @@ impl NativeRun {
         {
             // Sticky for this exact execution. Returning to bypass must not
             // revive a retained Reader or its page cursor.
-            self.skills_revoked.store(true, Ordering::Release);
+            self.revoke_skills();
         }
         Ok(())
     }
@@ -714,7 +727,7 @@ impl SkillCatalogCallerResolver for NativeResolver {
         {
             // Retain the strict Reader rejection below, and make its observed
             // revocation sticky even if the Host later restores bypass.
-            run.skills_revoked.store(true, Ordering::Release);
+            run.revoke_skills();
         }
         workspace_handoff::check_session(self.policy.clone(), session).await?;
         run.check_owner().await?;

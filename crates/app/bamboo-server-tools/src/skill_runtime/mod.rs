@@ -25,8 +25,8 @@ mod tests;
 
 pub use assembly::{assemble_legacy_skill_tools, LegacySkillContextRegistry};
 pub use catalog::{
-    SelectedSkillSource, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
-    MAX_SKILLS_LIST_BYTES,
+    SelectedSkillSource, SkillInputFactory, SkillInputSession, SkillScopeLease, SkillsListTool,
+    SkillsReadTool, MAX_SKILLS_LIST_BYTES,
 };
 pub use load_skill::LoadSkillTool;
 pub use output_budget::skill_response_byte_budget;
