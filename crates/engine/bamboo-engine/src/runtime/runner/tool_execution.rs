@@ -2180,7 +2180,17 @@ mod tests {
             );
         }
 
-        for retired in ["get_current_dir", "getCurrentDir", "memory_note"] {
+        for retired in [
+            "FileExists",
+            "file_exists",
+            "get_current_dir",
+            "getCurrentDir",
+            "SetWorkspace",
+            "memory_note",
+            "recall",
+            "session_inspector",
+            "schedule_tasks",
+        ] {
             assert_eq!(
                 scheduling_mode_for_tool_call(&tool_call(retired), &tools),
                 ToolSchedulingMode::Sequential,
