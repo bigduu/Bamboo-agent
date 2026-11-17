@@ -56,8 +56,8 @@ pub struct ModelLimit {
     /// DEFAULT_MAX_OUTPUT_TOKENS) when unset — see [`Self::get_max_output_tokens`])
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    /// When no output ceiling is configured or reported, let ordinary agent
-    /// rounds size their output from the remaining joint context window.
+    /// Let ordinary agent rounds use the provider's default when the route
+    /// has no known output ceiling and the protocol accepts an absent cap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlimited_output: bool,
     /// Safety margin for token counting (defaults to 1000)

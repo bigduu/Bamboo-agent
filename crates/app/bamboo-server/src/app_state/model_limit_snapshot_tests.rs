@@ -607,12 +607,12 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
             expected_context
         );
     }
-    let output_limits = probe.output_limits.lock().unwrap().clone();
-    assert_eq!(output_limits[..2], [Some(4_000), Some(8_000)]);
-    assert!((DEFAULT_MAX_OUTPUT_TOKENS + 1..192_000).contains(&output_limits[2].unwrap()));
     assert_eq!(
-        output_limits[3..],
+        *probe.output_limits.lock().unwrap(),
         [
+            Some(4_000),
+            Some(8_000),
+            Some(48_000),
             Some(DEFAULT_MAX_OUTPUT_TOKENS),
             Some(12_000),
             Some(12_000),

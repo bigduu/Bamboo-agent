@@ -170,7 +170,11 @@ pub fn build_openai_compat_body(
         body["tool_choice"] = tool_choice;
     }
 
-    set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
+    set_openai_compat_token_limit(
+        &mut body,
+        crate::provider::optional_protocol_output_limit(max_output_tokens),
+        reasoning_effort.is_some(),
+    );
 
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = json!(effort.as_str());

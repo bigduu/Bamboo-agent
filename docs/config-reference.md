@@ -824,9 +824,12 @@ the runtime and the defaults API use 1,000,000 total context tokens and 64,000
 output tokens. When the window is known and the output ceiling is absent,
 the fallback output is one quarter of the window, up to 64,000. Set
 `unlimited_output` to `true` and omit `max_output_tokens` to let ordinary Agent
-turns use the available joint window for output when the selected route reports
-no output ceiling. Bamboo still subtracts the input and safety margin and
-honors any reported output ceiling.
+turns use the selected route's output ceiling and the available joint window.
+When the route does not report an output ceiling, Bamboo leaves the optional
+output field unset so the provider uses its own default. Protocols that require
+an output field, such as Messages, use the compatibility allowance, limited by
+the remaining context. Explicit run budgets and bounded retries still send a
+numeric allowance.
 
 Provider limits come from the selected route's catalog and are cached briefly.
 If the configured catalog and generation headers differ for a model, Bamboo

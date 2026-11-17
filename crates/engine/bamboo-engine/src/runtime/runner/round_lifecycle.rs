@@ -354,6 +354,7 @@ pub(crate) async fn execute_llm_round(
         reasoning_effort: config.reasoning_effort,
         output_limit_recovery,
         budget: &prepared.budget,
+        provider_default_output: prepared.provider_default_output,
         observation_progress_hint,
         prompt_memory_exposure,
     };

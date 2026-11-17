@@ -730,7 +730,7 @@ pub fn build_responses_body_with_capability_loading(
         body["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
 
-    if let Some(max_tokens) = max_output_tokens {
+    if let Some(max_tokens) = crate::provider::optional_protocol_output_limit(max_output_tokens) {
         body["max_output_tokens"] = json!(max_tokens);
     }
 
