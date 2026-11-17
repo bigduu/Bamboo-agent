@@ -273,6 +273,11 @@ fn request_host_candidates(req: &HttpRequest) -> Vec<String> {
 }
 
 fn is_local_request(req: &HttpRequest) -> bool {
+    // The managed listener receives Tailnet traffic from the local Tailscale
+    // daemon. Its socket address distinguishes it from the desktop listener.
+    if crate::server::tailscale::is_ingress(req) {
+        return false;
+    }
     // The real TCP peer is the source of truth for the local-bypass decision. A
     // client-controlled `Host` / `X-Forwarded-Host` header MUST NOT upgrade a
     // known-REMOTE peer to "local" — that was an auth bypass (#199): a request
@@ -321,9 +326,9 @@ fn is_local_request(req: &HttpRequest) -> bool {
 
 /// Best-effort client-IP key for per-IP throttling (#190).
 ///
-/// Mirrors the precedence `is_local_request` uses to read the client address:
-/// `peer_addr` first (the real TCP peer — the hardest to spoof when there is no
-/// reverse proxy), then `connection_info().realip_remote_addr()` (an
+/// The managed Serve ingress uses Tailscale's forwarded peer address. On the
+/// other listeners, use `peer_addr` first, then
+/// `connection_info().realip_remote_addr()` (an
 /// `X-Forwarded-For`-derived address, used when a trusted proxy fronts the app),
 /// then the raw `connection_info().peer_addr()`. The address is normalized
 /// (stripping an `::ffff:` v4-mapped prefix) so the same client maps to one key
@@ -337,6 +342,9 @@ fn is_local_request(req: &HttpRequest) -> bool {
 /// source IPs — this raises the cost of a brute force, it does not make it
 /// impossible. This is the documented trade-off of per-IP throttling.
 fn client_ip_key(req: &HttpRequest) -> Option<String> {
+    if let Some(ip) = crate::server::tailscale::client_ip(req) {
+        return Some(normalize_ip(&ip.to_string()).to_string());
+    }
     if let Some(peer) = req.peer_addr() {
         return Some(normalize_ip(&peer.ip().to_string()).to_string());
     }
@@ -562,6 +570,24 @@ fn access_verification_cookie_value(config: &Config) -> Option<String> {
     ))
 }
 
+pub(crate) fn has_usable_access_password(config: &Config) -> bool {
+    config.access_control.as_ref().is_some_and(|access| {
+        access.password_enabled
+            && !access.repair_required
+            && access.password_hash.as_ref().is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            && access.password_salt.as_ref().is_some_and(|salt| {
+                !salt.is_empty()
+                    && salt.len().is_multiple_of(2)
+                    && salt.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    })
+}
+
 fn request_has_verified_access_cookie(req: &HttpRequest, config: &Config) -> bool {
     let expected = match access_verification_cookie_value(config) {
         Some(value) => value,
@@ -644,6 +670,9 @@ fn is_public_access_route(path: &str) -> bool {
 /// This MUST stay a pure extraction of the middleware's prior allow expression:
 /// changing it changes the gate for every route at once.
 pub(crate) fn request_is_authorized(req: &HttpRequest, config: &Config) -> bool {
+    if crate::server::tailscale::is_ingress(req) && !has_usable_access_password(config) {
+        return false;
+    }
     if access_repair_required(config) {
         // A quarantined access document may still contain a verifier that was
         // structurally recoverable. Do not let that partial recovery reopen
@@ -903,7 +932,8 @@ pub async fn verify_access_password(
         app_state.root_password_guard.record_success(key);
     }
 
-    let secure = req.connection_info().scheme().eq_ignore_ascii_case("https");
+    let secure = crate::server::tailscale::is_ingress(&req)
+        || req.connection_info().scheme().eq_ignore_ascii_case("https");
     let cookie = build_access_verified_cookie(&config, secure)
         .ok_or_else(|| AppError::Unauthorized("access password is not enabled".to_string()))?;
 

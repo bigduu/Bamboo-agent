@@ -179,6 +179,12 @@ HTTP / SDK examples](./docs/guides/GETTING_STARTED.md), [API
 reference](./docs/guides/API.md), and the [published crate's
 rustdoc](https://docs.rs/bamboo-agent).
 
+## Access Bamboo and Lotus through Tailscale
+
+Install the Tailscale client and CLI on the computer running Bamboo. Serve Lotus from a loopback-bound Bamboo HTTP server and open **Settings → System → Tailscale remote access** locally. Connect this computer, complete Tailscale sign-in if prompted, and set a Bamboo access password. Once the tailnet has MagicDNS and HTTPS certificates enabled, turn on remote access and copy the HTTPS address. [Tailscale CLI setup](https://tailscale.com/docs/reference/tailscale-cli)
+
+Open that address from a user device in the tailnet and sign in with the Bamboo password. Bamboo restores the share for the saved Tailscale device and HTTPS port when it restarts. **Turn off remote access** closes the share and any open real-time connections.
+
 ## Your data and operating boundaries
 
 - Bamboo configuration and sessions default to `~/.bamboo` (`BAMBOO_DATA_DIR` or `--data-dir` can override it). Jiandu owns canonical memory separately under `~/.jiandu`. `BAMBOO_JIANDU_DATA_DIR` must be a non-empty absolute path when used for isolation; `--data-dir` alone does not relocate memory.

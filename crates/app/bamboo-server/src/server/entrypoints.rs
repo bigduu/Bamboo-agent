@@ -9,6 +9,7 @@ use tracing::{error, info};
 
 use super::h1::build_h1_server;
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
+use super::tailscale::{restrict_ingress, TailscaleAccess};
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{
@@ -338,6 +339,31 @@ async fn run_with_static_options(
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();
     let workers = resolve_worker_count();
+    // Validate the TLS configuration before opening any listeners.
+    let rustls_cfg = match &tls {
+        Some(tls) => Some(build_rustls_config(tls)?),
+        None => None,
+    };
+    let mut listeners = build_bind_listeners(bind, port)?;
+    let tailscale = if !apply_rate_limit
+        && rustls_cfg.is_none()
+        && static_dir.is_some()
+        && TailscaleAccess::supported()
+    {
+        match TailscaleAccess::bind(&bamboo_home_dir).await {
+            Ok((listener, access)) => {
+                listeners.push(listener);
+                Some(access)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Tailscale ingress unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tailscale_for_factory = tailscale.clone();
 
     // Per-IP rate limiter for the network-exposed production server (#13). Built
     // once and shared (Clone) across workers. It is wrapped so that a throttled
@@ -367,8 +393,12 @@ async fn run_with_static_options(
         .wrap(actix_web::middleware::from_fn(
             crate::config::add_asset_cache_headers,
         ))
+        .wrap(actix_web::middleware::from_fn(restrict_ingress))
         .configure(configure_routes_with_rate_limiting);
 
+        if let Some(access) = &tailscale_for_factory {
+            app = app.app_data(access.clone());
+        }
         if let Some(static_path) = &static_dir {
             info!("Serving static files from: {:?}", static_path);
             app = app.service(frontend_files(static_path));
@@ -376,16 +406,6 @@ async fn run_with_static_options(
 
         app
     };
-
-    // Fail-fast: build the rustls config before binding so a bad/missing cert
-    // refuses startup rather than silently downgrading to plaintext. `None` →
-    // unchanged plaintext H1 path (desktop/loopback behavior preserved). #181.
-    let rustls_cfg = match &tls {
-        Some(tls) => Some(build_rustls_config(tls)?),
-        None => None,
-    };
-
-    let listeners = build_bind_listeners(bind, port)?;
 
     let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
         .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
@@ -405,7 +425,17 @@ async fn run_with_static_options(
         None
     };
 
+    let reconcile = tailscale
+        .as_ref()
+        .map(|access| TailscaleAccess::reconcile(access.clone(), app_state_for_shutdown.clone()));
     let result = server.await;
+    if let Some(reconcile) = reconcile {
+        reconcile.abort();
+        let _ = reconcile.await;
+    }
+    if let Some(access) = tailscale {
+        access.shutdown().await;
+    }
     if let Some(channel) = native_channel {
         channel.shutdown().await;
     }
