@@ -207,6 +207,7 @@ async fn dispatch_and_pull_from_context(
         &prepared.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,
@@ -240,6 +241,7 @@ async fn dispatch_and_pull_from_context(
         &prepared.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,
@@ -315,6 +317,7 @@ async fn dispatch_and_pull_from_context(
         &after.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,

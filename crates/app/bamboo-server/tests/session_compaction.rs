@@ -221,6 +221,20 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
             panic!("expected one durable compression event");
         };
         assert_eq!(event.kind, kind);
+        assert_eq!(body["compaction_id"], event.id);
+        assert_eq!(body["strategy"], json!(kind));
+        let observation =
+            test::call_service(&app, test::TestRequest::get().uri(ENDPOINT).to_request()).await;
+        assert_eq!(observation.status(), StatusCode::OK);
+        assert_eq!(
+            observation.headers().get("cache-control").unwrap(),
+            "no-store"
+        );
+        let observation: Value = test::read_body_json(observation).await;
+        assert_eq!(observation["configured_strategy"], json!(strategy));
+        assert!(observation["active"].is_null());
+        assert_eq!(observation["applied"]["id"], event.id);
+        assert_eq!(observation["applied"]["strategy"], json!(kind));
         assert!(matches!(event.trigger_type, CompressionTriggerType::Manual));
         assert_eq!(json!(durable.token_usage), body["token_usage"]);
         let bamboo_agent_core::AgentEvent::TokenBudgetUpdated { usage } =
@@ -605,6 +619,15 @@ async fn dropping_compaction_preserves_the_run_and_releases_its_writer() {
     })
     .await
     .expect("compaction reached its summary provider");
+    let observation: Value =
+        test::call_and_read_body_json(&app, test::TestRequest::get().uri(ENDPOINT).to_request())
+            .await;
+    let interrupted_id = observation["active"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(observation["active"]["phase"], "summarizing");
+    assert_eq!(observation["active"]["strategy"], "summary");
+    assert_eq!(observation["active"]["part"], 1);
+    assert!(observation["active"]["total"].as_u64().unwrap() >= 1);
+    assert!(observation["applied"].is_null());
     drop(request);
 
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -623,6 +646,11 @@ async fn dropping_compaction_preserves_the_run_and_releases_its_writer() {
     assert_previous_run(&after_drop, &before);
     assert_eq!(after_drop.agent_runtime_state, before.agent_runtime_state);
     assert!(after_drop.compression_events.is_empty());
+    let observation: Value =
+        test::call_and_read_body_json(&app, test::TestRequest::get().uri(ENDPOINT).to_request())
+            .await;
+    assert!(observation["active"].is_null());
+    assert!(observation["applied"].is_null());
 
     let recovered = state
         .storage
@@ -639,6 +667,7 @@ async fn dropping_compaction_preserves_the_run_and_releases_its_writer() {
         test::call_and_read_body_json(&app, test::TestRequest::post().uri(ENDPOINT).to_request())
             .await;
     assert_eq!(retry["status"], "compacted", "{retry}");
+    assert_ne!(retry["compaction_id"], interrupted_id);
     let durable = state.storage.load_session(ID).await.unwrap().unwrap();
     assert_previous_run(&durable, &before);
     assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);

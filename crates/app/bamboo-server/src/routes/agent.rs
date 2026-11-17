@@ -404,6 +404,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::sessions::compact_session),
         )
         .route(
+            "/sessions/{session_id}/compact",
+            web::get().to(agent::sessions::get_session_compaction),
+        )
+        .route(
             "/sessions/{session_id}/project-dream/run",
             web::post().to(agent::sessions::run_project_dream),
         )

@@ -2928,6 +2928,8 @@ struct ModelLimitRowShape {
     _max_context_tokens: u32,
     #[serde(default, rename = "max_output_tokens")]
     _max_output_tokens: Option<u32>,
+    #[serde(default, rename = "unlimited_output")]
+    _unlimited_output: bool,
     #[serde(default, rename = "safety_margin")]
     _safety_margin: Option<u32>,
 }
@@ -6686,6 +6688,7 @@ mod tests {
             "model_pattern": "model-family",
             "max_context_tokens": 0,
             "max_output_tokens": null,
+            "unlimited_output": true,
             "safety_margin": 0,
             "future_option": {"enabled": true}
         })]);
@@ -6709,6 +6712,7 @@ mod tests {
             json!({"model_pattern": "model", "max_context_tokens": u64::MAX}),
             json!({"model_pattern": "model", "max_context_tokens": "48000"}),
             json!({"model_pattern": "model", "max_context_tokens": 48_000, "max_output_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "unlimited_output": "true"}),
             json!({"model_pattern": "model", "max_context_tokens": 48_000, "safety_margin": "500"}),
         ] {
             assert!(

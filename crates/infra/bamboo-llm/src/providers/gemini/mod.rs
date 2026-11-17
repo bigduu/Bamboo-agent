@@ -41,6 +41,7 @@ pub(crate) fn apply_generation_config(
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
 ) {
+    let max_output_tokens = crate::provider::optional_protocol_output_limit(max_output_tokens);
     if max_output_tokens.is_none() && reasoning_effort.is_none() {
         return;
     }

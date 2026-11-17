@@ -332,6 +332,7 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 &prepared,
                 &tools,
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &CancellationToken::new(),
                     session_id: "autonomous-goal-payload",
@@ -735,6 +736,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-1",
@@ -902,6 +904,7 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
                 &prepared_context,
                 &[],
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &cancel,
                     session_id: &session_id,
@@ -1027,6 +1030,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1080,6 +1084,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1170,6 +1175,7 @@ async fn observation_progress_checkpoint_reprepares_from_merged_durable_suffix()
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1254,6 +1260,7 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "observation-progress-budget",
@@ -1425,6 +1432,7 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
                 &prepared_context,
                 &tools,
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &CancellationToken::new(),
                     session_id: "serialized-prefix-session",
@@ -1540,6 +1548,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         &prepared_context,
         &tool_schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-explicit-guard",
@@ -2066,6 +2075,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-final-budget",
@@ -2182,6 +2192,7 @@ async fn openai_prompt_budget_omits_unknown_cache_but_keeps_explicit_zero() {
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &CancellationToken::new(),
                 session_id: "session-openai-cache-availability",
@@ -2257,6 +2268,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-task",
@@ -2364,6 +2376,7 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &CancellationToken::new(),
                 session_id,
@@ -2446,6 +2459,7 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
         &prepared_context,
         &tools,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -2599,6 +2613,7 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let frame = LlmStreamFrame {
+        provider_default_output: false,
         event_tx: &event_tx,
         cancel_token: &CancellationToken::new(),
         session_id: "session-ledger-reseed-refit",
@@ -3041,6 +3056,7 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-lanes",
@@ -4449,6 +4465,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2",
@@ -4615,6 +4632,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2a",
@@ -4713,6 +4731,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2plan",
@@ -4802,6 +4821,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2b",
@@ -4905,6 +4925,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-3",
@@ -5017,6 +5038,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-4",
@@ -5499,6 +5521,7 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
         &prepared,
         &[browser],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "browser-history",
@@ -5661,6 +5684,7 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &cancel_token,
                 session_id: "synthetic-body-overflow",
@@ -5740,6 +5764,7 @@ async fn synthetic_provider_api_overflow_stays_recoverable() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &cancel_token,
             session_id: "synthetic-model-overflow",
@@ -5870,6 +5895,7 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &cancel_token,
                 session_id: "synthetic-response-body",
@@ -6319,6 +6345,7 @@ async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,

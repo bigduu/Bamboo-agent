@@ -60,6 +60,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
     pub budget: &'a TokenBudget,
+    pub provider_default_output: bool,
     pub observation_progress_hint: Option<&'a str>,
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
@@ -1492,6 +1493,7 @@ pub(super) async fn execute_llm_stream(
     let event_tx = frame.event_tx;
     let cancel_token = frame.cancel_token;
     let mut budget = frame.budget.clone();
+    let mut provider_default_output = frame.provider_default_output;
     let model = frame.model;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
@@ -1726,6 +1728,7 @@ pub(super) async fn execute_llm_stream(
                     .await?
                 };
                 budget = reprepared.budget;
+                provider_default_output = reprepared.provider_default_output;
                 prepared_context = reprepared.prepared_context;
                 continue;
             }
@@ -1910,8 +1913,16 @@ pub(super) async fn execute_llm_stream(
             "Computed output allowance for the projected model request"
         );
     }
-    let completion =
-        CompletionDiagnostics::for_agent_round(recovery).with_model_window_limit(window_limit);
+    let provider_default_output = provider_default_output
+        && recovery.is_none()
+        && task_split.is_none()
+        && config.run_budget.max_total_tokens.is_none()
+        && frame
+            .output_limit_recovery
+            .is_none_or(|policy| policy.remaining_run_tokens.is_none());
+    let completion = CompletionDiagnostics::for_agent_round(recovery)
+        .with_model_window_limit(window_limit)
+        .with_provider_default_output(provider_default_output);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,

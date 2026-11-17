@@ -506,6 +506,86 @@ async fn dynamic_model_window_shrinks_the_wire_output_when_the_prompt_grows() {
 }
 
 #[tokio::test]
+async fn unlimited_model_output_uses_gateway_default_without_an_output_ceiling() {
+    use crate::runtime::runner::round_lifecycle::execute_llm_round;
+
+    let server = MockServer::start().await;
+    let (route, provider) = Protocol::Chat.provider(&server);
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"model"}]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(route))
+        .respond_with(|request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            if ["max_tokens", "max_completion_tokens"].iter().any(|field| {
+                body.get(*field)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|cap| cap > 131_072)
+            }) {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": "max_tokens must be within [1, 131072]"}
+                }));
+            }
+            mock_completion_sse(&[json!({"type":"chunk","id":"resp",
+                "choices":[{"index":0,"delta":{"content":"Verified."},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":31,"completion_tokens":7}})])
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = canonical_usage_pipeline_config();
+    config.provider_name = Some("configured-route".into());
+    config.app_data_dir = Some(dir.path().into());
+    config.legacy_model_limits = Some(json!([{
+        "model_pattern": "model",
+        "max_context_tokens": 1_000_000,
+        "unlimited_output": true
+    }]));
+    for max_total_tokens in [None, Some(100_000)] {
+        config.run_budget.max_total_tokens = max_total_tokens;
+        let mut session = Session::new("unlimited-window", "model");
+        session.add_message(Message::user("Check the result."));
+        let (events, _receiver) = tokio::sync::mpsc::channel(128);
+        let output = execute_llm_round(
+            &mut session,
+            &config,
+            &provider,
+            &events,
+            &CancellationToken::new(),
+            "unlimited-window",
+            "model",
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.terminal_validation_error.is_none());
+        assert_eq!(output.stream_output.content, "Verified.");
+    }
+
+    let bodies: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == route)
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0].get("max_tokens").is_none());
+    assert!(bodies[0].get("max_completion_tokens").is_none());
+    assert_eq!(bodies[1]["max_tokens"], 64_000);
+}
+
+#[tokio::test]
 async fn messages_honors_large_output_and_a_much_smaller_independent_input_cap() {
     use crate::runtime::runner::round_lifecycle::execute_llm_round;
 

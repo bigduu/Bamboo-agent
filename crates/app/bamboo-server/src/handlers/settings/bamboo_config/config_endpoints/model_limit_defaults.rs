@@ -16,6 +16,7 @@ struct ModelLimitDefault {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ModelLimitDefaultsResponse {
+    supports_unlimited_output: bool,
     /// The single global default applied to any model without provider runtime
     /// metadata or a user override. There is no per-model built-in table; this
     /// list always contains exactly one entry (`model_limits[0]`).
@@ -35,6 +36,7 @@ pub async fn get_model_limit_defaults() -> Result<HttpResponse, AppError> {
     };
 
     Ok(HttpResponse::Ok().json(ModelLimitDefaultsResponse {
+        supports_unlimited_output: true,
         model_limits: vec![default],
     }))
 }
@@ -61,6 +63,7 @@ mod tests {
         assert!(response.status().is_success());
 
         let payload: ModelLimitDefaultsResponse = test::read_body_json(response).await;
+        assert!(payload.supports_unlimited_output);
         assert_eq!(payload.model_limits.len(), 1);
 
         let default = &payload.model_limits[0];

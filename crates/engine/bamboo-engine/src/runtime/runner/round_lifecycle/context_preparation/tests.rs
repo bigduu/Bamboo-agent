@@ -284,6 +284,7 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
         &prepared.prepared_context,
         &tools,
         &super::super::stream_execution::LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &tokio_util::sync::CancellationToken::new(),
             session_id: "packet-child",
