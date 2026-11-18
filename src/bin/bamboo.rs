@@ -72,6 +72,11 @@ struct Cli {
     #[arg(long = "stream-json", alias = "raw")]
     stream_json: bool,
 
+    /// Write one terminal result object as JSON to stdout for a full -p run.
+    /// Logs go to stderr.
+    #[arg(long = "json", requires = "prompt", conflicts_with_all = ["stream_json", "echo"])]
+    headless_json: bool,
+
     /// With -p: permission mode for the headless run, which has no interactive
     /// approver. One of: default | plan | accept-edits | dont-ask | bypass.
     /// Use `bypass` to let a tool-using agent run unattended (otherwise the run
@@ -1314,11 +1319,11 @@ fn exit_after_telemetry(
 
 fn exit_cli_startup_error(
     telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard,
-    stream_json: bool,
+    json_output: bool,
     error: &str,
     code: i32,
 ) -> ! {
-    if stream_json {
+    if json_output {
         bamboo_agent::headless::print_stream_startup_error(error);
     }
     eprintln!("{error}");
@@ -1327,8 +1332,13 @@ fn exit_cli_startup_error(
 
 async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     let cli = Cli::parse();
-    let headless_stream_json =
-        cli.command.is_none() && cli.prompt.is_some() && cli.stream_json && !cli.echo;
+    if cli.headless_json && cli.command.is_some() {
+        exit_cli_startup_error(telemetry, true, "--json requires a headless -p run", 2);
+    }
+    let headless_json_output = cli.command.is_none()
+        && cli.prompt.is_some()
+        && (cli.stream_json || cli.headless_json)
+        && !cli.echo;
 
     // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
     // directory it resolves to, so every flow that falls back to
@@ -1352,7 +1362,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             Err(e) => {
                 exit_cli_startup_error(
                     telemetry,
-                    headless_stream_json,
+                    headless_json_output,
                     &format!("invalid --config '{}': {e}", path.display()),
                     2,
                 );
@@ -1371,7 +1381,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
         if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
             exit_cli_startup_error(
                 telemetry,
-                headless_stream_json,
+                headless_json_output,
                 &format!(
                     "invalid --log-level '{level}' (expected: {})",
                     LEVELS.join(" | ")
@@ -1478,7 +1488,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 if std::io::stdin().read_to_string(&mut buf).is_err() {
                     exit_cli_startup_error(
                         telemetry,
-                        headless_stream_json,
+                        headless_json_output,
                         "failed to read prompt from stdin",
                         1,
                     );
@@ -1487,7 +1497,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 if trimmed.is_empty() {
                     exit_cli_startup_error(
                         telemetry,
-                        headless_stream_json,
+                        headless_json_output,
                         "empty prompt on stdin",
                         1,
                     );
@@ -1540,7 +1550,12 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 provider: cli.provider,
                 timeout_secs: cli.timeout,
             };
-            if let Err(e) = bamboo_agent::headless::run(args).await {
+            let result = if cli.headless_json {
+                bamboo_agent::headless::run_json(args).await
+            } else {
+                bamboo_agent::headless::run(args).await
+            };
+            if let Err(e) = result {
                 eprintln!("run failed: {e}");
                 exit_after_telemetry(telemetry, 1);
             }
