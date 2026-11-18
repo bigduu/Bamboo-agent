@@ -743,6 +743,7 @@ pub(super) async fn project_request_usage(
         &shadow,
         effective_tool_schemas.as_ref(),
         loading_mode,
+        true,
     );
     let discovery_history =
         crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
@@ -1167,7 +1168,8 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         cache: cache_plan,
         continuation: None,
     };
-    let wire_schemas = request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode);
+    let wire_schemas =
+        request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode, true);
     let discovery_history =
         crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
             session,
@@ -1535,8 +1537,12 @@ pub(super) async fn execute_llm_stream(
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
-        let wire_schemas =
-            request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode);
+        let wire_schemas = request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            task_split.is_none(),
+        );
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
@@ -1729,8 +1735,12 @@ pub(super) async fn execute_llm_stream(
             },
         );
     };
-    let wire_schemas =
-        request_tool_schemas_for_loading_mode(session, &tool_dispatch.catalog, tool_dispatch.mode);
+    let wire_schemas = request_tool_schemas_for_loading_mode(
+        session,
+        &tool_dispatch.catalog,
+        tool_dispatch.mode,
+        task_split.is_none(),
+    );
     let tool_schemas = wire_schemas.as_ref();
     // Freeze the already-reconciled request's Session before the following
     // diagnostic-only mutations. The final IR, schemas and options below are

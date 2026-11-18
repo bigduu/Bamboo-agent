@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::Duration;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
-use bamboo_domain::RootThinkingMode;
+use bamboo_domain::{RootThinkingMode, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -53,32 +53,52 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             }
             wake.await;
         }
-        if probe.planner_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            (
-                json!({"tool_calls":[{"index":0,"id":"workspace-glob","type":"function","function":{"name":"Glob","arguments":json!({"pattern":MARKER,"limit":1}).to_string()}}]}),
-                "tool_calls",
-            )
-        } else {
-            // The argument names only a file: full-path Tool evidence proves
-            // the worker used the selected workspace, not its process cwd.
-            let marker = probe.workspace.lock().unwrap().join(MARKER);
-            let observed = body["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["role"] == "tool"
-                        && message["content"]
-                            .as_str()
-                            .is_some_and(|content| content.contains(marker.to_str().unwrap()))
-                })
-            });
-            probe
-                .workspace_tool_observed
-                .store(observed, Ordering::SeqCst);
-            (
-                reported_result(
-                    "PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection",
-                ),
-                "stop",
-            )
+        let declares = |name: &str| {
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == name)
+        };
+        match probe.planner_calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                assert!(declares(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+                assert!(!declares("Glob"));
+                (
+                    json!({"tool_calls":[{"index":0,"id":"workspace-load-glob","type":"function","function":{"name":DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,"arguments":json!({"query":"Glob","limit":1}).to_string()}}]}),
+                    "tool_calls",
+                )
+            }
+            1 => {
+                assert!(declares("Glob"));
+                (
+                    json!({"tool_calls":[{"index":0,"id":"workspace-glob","type":"function","function":{"name":"Glob","arguments":json!({"pattern":MARKER,"limit":1}).to_string()}}]}),
+                    "tool_calls",
+                )
+            }
+            2 => {
+                // The argument names only a file: its full path establishes
+                // which workspace the worker used.
+                let marker = probe.workspace.lock().unwrap().join(MARKER);
+                let observed = body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "tool"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains(marker.to_str().unwrap()))
+                    })
+                });
+                probe
+                    .workspace_tool_observed
+                    .store(observed, Ordering::SeqCst);
+                (
+                    reported_result(
+                        "PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection",
+                    ),
+                    "stop",
+                )
+            }
+            step => panic!("unexpected planner request {step}"),
         }
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
@@ -274,10 +294,10 @@ async fn run_workspace_fixture() {
     assert!(!child_request
         .to_string()
         .contains("Ultra Root thinking mode"));
-    assert_eq!(probe.planner_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.planner_calls.load(Ordering::SeqCst), 3);
     assert!(
         probe.workspace_tool_observed.load(Ordering::SeqCst),
-        "the second actual planner request must contain pathless Glob's full-path Tool result"
+        "the final planner request must contain pathless Glob's full-path Tool result"
     );
     server_handle.stop(false).await;
 }

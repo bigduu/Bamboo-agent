@@ -12,8 +12,9 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
-    CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity,
-    ProviderTranscriptItemKind, SessionKind,
+    CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity, ProviderFamily,
+    ProviderProtocol, ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    SessionKind,
 };
 use bamboo_llm::provider::{
     OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
@@ -49,6 +50,34 @@ pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
             && item.kind() == bamboo_domain::ProviderTranscriptItemKind::OpenAiToolSearchCall
             && item.payload()["execution"].as_str() == Some("client")
     })
+}
+
+fn tool_choice_requirement_met(
+    selection: &RequestToolSelection,
+    mode: CapabilityLoadingMode,
+    has_tool_calls: bool,
+    native_items: &[ProviderTranscriptItem],
+) -> bool {
+    if !selection.requires_call() || has_tool_calls {
+        return true;
+    }
+    matches!(selection, RequestToolSelection::Required)
+        && mode == CapabilityLoadingMode::Progressive
+        && native_items.iter().any(|item| {
+            matches!(
+                (item.family(), item.protocol(), item.kind()),
+                (
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    ProviderTranscriptItemKind::OpenAiToolSearchCall
+                ) | (
+                    ProviderFamily::Anthropic,
+                    ProviderProtocol::AnthropicMessages2023_06_01,
+                    ProviderTranscriptItemKind::AnthropicServerToolUse
+                )
+            )
+        })
+        && ProviderTranscriptGroup::validate_items(native_items).is_ok()
 }
 
 fn rejected_output_limit(
@@ -88,10 +117,7 @@ pub(super) async fn request_tool_policy(
                 "required tool '{name}' is excluded by the provider request's tool selection"
             )));
         }
-        RequestToolSelection::Named {
-            names: vec![name.to_owned()],
-            required: true,
-        }
+        RequestToolSelection::Forced(name.to_owned())
     } else {
         configured
     };
@@ -140,15 +166,14 @@ pub(super) fn select_request_tool_schemas<'a>(
                 .collect(),
         )
     };
-    if let RequestToolSelection::Named { names, .. } = selection {
-        if let Some(name) = names
-            .iter()
-            .find(|name| !selected.iter().any(|tool| tool.function.name == **name))
-        {
-            return Err(AgentError::LLMNonRetryable(format!(
-                "requested tool '{name}' is unavailable under the current tool policy"
-            )));
-        }
+    if let Some(name) = selection
+        .names()
+        .iter()
+        .find(|name| !selected.iter().any(|tool| tool.function.name == **name))
+    {
+        return Err(AgentError::LLMNonRetryable(format!(
+            "requested tool '{name}' is unavailable under the current tool policy"
+        )));
     }
     Ok(selected)
 }
@@ -172,6 +197,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
     mode: CapabilityLoadingMode,
+    allow_discovery: bool,
 ) -> Cow<'a, [ToolSchema]> {
     if !uses_sticky_fallback(mode) {
         return Cow::Borrowed(tool_schemas);
@@ -190,9 +216,10 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
         .cloned()
         .collect::<Vec<_>>();
     // The gateway remains available for new queries after an earlier lookup.
-    if tool_schemas
-        .iter()
-        .any(|schema| !fallback_tool_is_resident(session, &schema.function.name))
+    if allow_discovery
+        && tool_schemas
+            .iter()
+            .any(|schema| !fallback_tool_is_resident(session, &schema.function.name))
     {
         projected.push(bamboo_domain::discovery_control_fallback_schema());
     }
@@ -211,7 +238,7 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
         .await
         .unwrap();
     let eligible = select_request_tool_schemas(session, tool_schemas, &selection).unwrap();
-    request_tool_schemas_for_loading_mode(session, eligible.as_ref(), mode).into_owned()
+    request_tool_schemas_for_loading_mode(session, eligible.as_ref(), mode, true).into_owned()
 }
 
 pub(super) struct RoundToolDispatch {
@@ -329,18 +356,9 @@ pub(crate) async fn execute_llm_round(
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
     // Resolve mutable host handles once for the whole request. The model
     // catalog, capability projection and provider send must use one route.
-    let request_provider = if config.provider_name.is_some()
-        && session.authority_identity.is_ordinary()
-        && host_gold_attempt.is_none()
-    {
-        Some(
-            bamboo_llm::provider::queued_snapshot_for(llm.clone())
-                .map_err(|error| AgentError::LLM(error.to_string()))?,
-        )
-    } else {
-        None
-    };
-    let llm = request_provider.as_ref().unwrap_or(llm);
+    let request_provider = bamboo_llm::provider::queued_snapshot_for(llm.clone())
+        .map_err(|error| AgentError::LLM(error.to_string()))?;
+    let llm = &request_provider;
     // Scope prepared image descriptions to this request. A configuration reused
     // across rounds must never serve a description produced for another request.
     config.vision_description_reuse.clear();
@@ -452,7 +470,12 @@ pub(crate) async fn execute_llm_round(
             response_id: stream_output.response_id.clone(),
             reasoning_only,
         })
-    } else if tool_dispatch.selection.requires_call() && stream_output.tool_calls.is_empty() {
+    } else if !tool_choice_requirement_met(
+        &tool_dispatch.selection,
+        tool_dispatch.mode,
+        !stream_output.tool_calls.is_empty(),
+        &stream_output.provider_transcript_items,
+    ) {
         Some(AgentError::LLMNonRetryable(
             "provider completed without the tool call required by this request".into(),
         ))
@@ -650,6 +673,103 @@ mod tests {
         assert!(!is_openai_client_tool_search_boundary(&[
             client_search_item(ProviderFamily::Copilot)
         ]));
+    }
+
+    #[test]
+    fn unnamed_required_selection_accepts_only_valid_native_search_progress() {
+        use super::tool_choice_requirement_met;
+
+        let native = |family, protocol, author, payload| {
+            ProviderTranscriptItem::try_from_payload(
+                family,
+                protocol,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let responses = |author, payload| {
+            native(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                author,
+                payload,
+            )
+        };
+        let messages = |author, payload| {
+            native(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                author,
+                payload,
+            )
+        };
+        let client = vec![client_search_item(ProviderFamily::OpenAi)];
+        let hosted = vec![
+            responses(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","id":"hosted","call_id":"server-search","execution":"server",
+                    "status":"completed","arguments":{"query":"files"}
+                }),
+            ),
+            responses(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","id":"hosted-output","call_id":"server-search",
+                    "execution":"server","status":"completed","tools":[]
+                }),
+            ),
+        ];
+        let anthropic = vec![
+            messages(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"search","name":"tool_search_tool_regex",
+                    "input":{"pattern":"files"}
+                }),
+            ),
+            messages(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"search",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[]}
+                }),
+            ),
+        ];
+        let named = RequestToolSelection::Named {
+            names: vec!["Read".into()],
+            required: true,
+        };
+        for items in [&client, &hosted, &anthropic] {
+            assert!(tool_choice_requirement_met(
+                &RequestToolSelection::Required,
+                CapabilityLoadingMode::Progressive,
+                false,
+                items
+            ));
+            assert!(!tool_choice_requirement_met(
+                &named,
+                CapabilityLoadingMode::Progressive,
+                false,
+                items
+            ));
+            assert!(!tool_choice_requirement_met(
+                &RequestToolSelection::Required,
+                CapabilityLoadingMode::StickyFallback,
+                false,
+                items
+            ));
+        }
+        for items in [&[][..], &hosted[..1], &anthropic[..1]] {
+            assert!(!tool_choice_requirement_met(
+                &RequestToolSelection::Required,
+                CapabilityLoadingMode::Progressive,
+                false,
+                items
+            ));
+        }
     }
 
     struct StickyCapturingProvider {
@@ -850,7 +970,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(mode, CapabilityLoadingMode::StickyFallback);
                 let eligible = select_request_tool_schemas(session, &schemas, &selection).unwrap();
-                let projected = request_tool_schemas_for_loading_mode(session, &eligible, mode);
+                let projected =
+                    request_tool_schemas_for_loading_mode(session, &eligible, mode, true);
                 assert_eq!(
                     projected
                         .iter()

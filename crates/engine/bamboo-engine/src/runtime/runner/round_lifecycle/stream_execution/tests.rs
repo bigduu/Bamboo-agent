@@ -5290,6 +5290,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &before_session,
         std::slice::from_ref(&browser),
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     let before_prepared = browser_history_prepared(&before_session);
     let before = super::build_request_envelope_reconciled_for_loading_mode(
@@ -5312,6 +5313,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &session,
         std::slice::from_ref(&browser),
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     assert_eq!(loaded_tools[0].function.name, "browser");
     let prepared = browser_history_prepared(&session);

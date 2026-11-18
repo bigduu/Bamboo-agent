@@ -61,6 +61,15 @@ fn record_discovery(session: &mut Session, definitions: &[ToolSchema]) {
 }
 
 async fn send(session: &mut Session, provider: &Arc<dyn LLMProvider>, catalog: &[ToolSchema]) {
+    send_round(session, provider, catalog, None).await;
+}
+
+async fn send_round(
+    session: &mut Session,
+    provider: &Arc<dyn LLMProvider>,
+    catalog: &[ToolSchema],
+    output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
+) {
     let config = AgentLoopConfig {
         model_name: Some(MODEL.into()),
         ..Default::default()
@@ -78,7 +87,7 @@ async fn send(session: &mut Session, provider: &Arc<dyn LLMProvider>, catalog: &
         catalog,
         None,
         None,
-        None,
+        output_limit_policy,
     )
     .await;
     assert!(
@@ -189,6 +198,54 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
         assert!(pair
             .iter()
             .all(|body| !body.to_string().contains(DENIED_SCHEMA_MARKER)));
+    }
+}
+
+#[tokio::test]
+async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let providers: [Arc<dyn LLMProvider>; 2] = [
+        Arc::new(
+            GeminiProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(client.clone()),
+        ),
+        Arc::new(
+            BodhiProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(client)
+                .with_target_provider("gemini"),
+        ),
+    ];
+    let catalog = ["Read", "Glob"].map(schema);
+    for provider in &providers {
+        let mut session = Session::new("split-wire", MODEL);
+        session.add_message(Message::user("Read a file"));
+        send_round(
+            &mut session,
+            provider,
+            &catalog,
+            Some(super::RoundOutputLimitPolicy {
+                retry: None,
+                remaining_run_tokens: None,
+                previous_prompt_tokens: 0,
+                task_split: Some(super::TaskSplitPrompt {
+                    advisory: "Complete a smaller part of the request",
+                    private_plan: false,
+                }),
+            }),
+        )
+        .await;
+    }
+    let bodies = capture(&server).await;
+    assert_eq!(bodies.len(), providers.len());
+    for body in &bodies {
+        assert_eq!(tool_names(body), ["Read"]);
     }
 }
 

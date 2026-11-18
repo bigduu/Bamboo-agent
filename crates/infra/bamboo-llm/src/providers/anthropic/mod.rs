@@ -352,7 +352,7 @@ impl LLMProvider for AnthropicProvider {
         }
         if is_official_anthropic_base_url(&self.base_url)
             && supports_anthropic_tool_search(model)
-            && matches!(choice, Ok(crate::provider::RequestToolSelection::Automatic))
+            && choice.is_ok()
         {
             CapabilityLoadingMode::Progressive
         } else {
@@ -7553,6 +7553,23 @@ mod anthropic_provider_tests {
                 .capability_loading_mode("claude-sonnet-4-6", None)
                 .await,
             CapabilityLoadingMode::StickyFallback
+        );
+    }
+
+    #[tokio::test]
+    async fn any_tool_choice_retains_native_messages_tool_search() {
+        let overrides = serde_json::from_value(json!({
+            "endpoints":{"messages":{"body_patch":[
+                {"path":"tool_choice","value":{"type":"any"}}
+            ]}}
+        }))
+        .unwrap();
+        let provider = AnthropicProvider::new("fixture").with_request_overrides(Some(overrides));
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::Progressive
         );
     }
 

@@ -725,6 +725,7 @@ pub enum RequestToolSelection {
     Automatic,
     Required,
     Disabled,
+    Forced(String),
     Named {
         names: Vec<String>,
         required: bool,
@@ -733,17 +734,29 @@ pub enum RequestToolSelection {
 
 impl RequestToolSelection {
     pub fn restricts_names(&self) -> bool {
-        matches!(self, Self::Disabled | Self::Named { .. })
+        matches!(self, Self::Disabled | Self::Forced(_) | Self::Named { .. })
     }
 
     pub fn requires_call(&self) -> bool {
-        matches!(self, Self::Required | Self::Named { required: true, .. })
+        matches!(
+            self,
+            Self::Required | Self::Forced(_) | Self::Named { required: true, .. }
+        )
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Forced(name) => std::slice::from_ref(name),
+            Self::Named { names, .. } => names,
+            _ => &[],
+        }
     }
 
     pub fn allows(&self, name: &str) -> bool {
         match self {
             Self::Automatic | Self::Required => true,
             Self::Disabled => false,
+            Self::Forced(candidate) => candidate == name,
             Self::Named { names, .. } => names.iter().any(|candidate| candidate == name),
         }
     }
@@ -1057,6 +1070,7 @@ pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLM
             require_current: provider.queue_requires_current_route(),
             original: provider,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })),
         None => Ok(provider),
     }
@@ -1071,6 +1085,7 @@ pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProv
         original: provider,
         require_current: true,
         fixed_inner: false,
+        main_dispatch_origin: None,
     })
 }
 
@@ -1088,6 +1103,7 @@ pub fn fixed_provider_with_identity(
         original,
         require_current: true,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
 }
 
@@ -1105,7 +1121,22 @@ pub fn fixed_injected_provider_with_identity(
         original,
         require_current: false,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
+}
+
+/// Retain a forwarding boundary's chosen provider across preparation and send.
+/// The dispatch observer still receives the selected Arc at that same boundary.
+#[doc(hidden)]
+pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    let inner = queued_snapshot_for(selected.clone())?;
+    Ok(Arc::new(QueuedBudgetProvider {
+        require_current: inner.queue_requires_current_route(),
+        inner,
+        original: selected.clone(),
+        fixed_inner: true,
+        main_dispatch_origin: Some(selected),
+    }))
 }
 
 struct QueuedBudgetProvider {
@@ -1114,6 +1145,7 @@ struct QueuedBudgetProvider {
     require_current: bool,
     // A receipt-bound delegate must not later resnapshot a mutable wrapper.
     fixed_inner: bool,
+    main_dispatch_origin: Option<Arc<dyn LLMProvider>>,
 }
 
 #[async_trait]
@@ -1141,6 +1173,7 @@ impl LLMProvider for QueuedBudgetProvider {
             original: self.original.clone(),
             require_current: self.require_current,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })))
     }
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
@@ -1217,6 +1250,11 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        if let Some(origin) = self.main_dispatch_origin.as_ref().filter(|_| {
+            options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop")
+        }) {
+            observe_main_dispatch(origin.clone());
+        }
         self.inner
             .chat_stream_ir(ir, tools, max_output_tokens, model, options)
             .await

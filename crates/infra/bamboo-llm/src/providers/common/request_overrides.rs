@@ -166,17 +166,25 @@ pub(crate) fn configured_tool_selection(
 }
 
 fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelection> {
-    use RequestToolSelection::{Automatic, Disabled, Named, Required};
+    use RequestToolSelection::{Automatic, Disabled, Forced, Named, Required};
 
     let invalid = || LLMError::RequestFailed("Invalid or unsupported agent tool choice".into());
-    let named = |names: Vec<&str>, required: bool| {
+    let named = |mut names: Vec<&str>, required: bool| {
         if names.is_empty() || names.iter().any(|name| name.is_empty()) {
             return Err(invalid());
         }
+        names.sort_unstable();
+        names.dedup();
         Ok(Named {
             names: names.into_iter().map(str::to_owned).collect(),
             required,
         })
+    };
+    let forced = |name: &Value| {
+        name.as_str()
+            .filter(|name| !name.is_empty())
+            .map(|name| Forced(name.to_owned()))
+            .ok_or_else(invalid)
     };
     if endpoint == ENDPOINT_STREAM_GENERATE_CONTENT {
         let Some(config) = body
@@ -224,16 +232,14 @@ fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelec
         Some("auto") => Ok(Automatic),
         Some("required" | "any") => Ok(Required),
         Some("none") => Ok(Disabled),
-        Some("tool") if endpoint == ENDPOINT_MESSAGES => {
-            named(vec![choice["name"].as_str().ok_or_else(invalid)?], true)
-        }
+        Some("tool") if endpoint == ENDPOINT_MESSAGES => forced(&choice["name"]),
         Some("function") if endpoint != ENDPOINT_MESSAGES => {
             let name = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
                 &choice["function"]["name"]
             } else {
                 &choice["name"]
             };
-            named(vec![name.as_str().ok_or_else(invalid)?], true)
+            forced(name)
         }
         Some("allowed_tools") if endpoint != ENDPOINT_MESSAGES => {
             let choice = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
@@ -322,15 +328,14 @@ pub(crate) fn mask_and_prepare_agent_request(
     let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
         return Ok(());
     };
-    if let RequestToolSelection::Named { names, .. } = parse_tool_selection(body, endpoint)? {
-        if names
-            .iter()
-            .any(|name| !wire_declares_tool(body, endpoint, name))
-        {
-            return Err(LLMError::RequestFailed(
-                "A tool selected by the provider request is missing from its declarations".into(),
-            ));
-        }
+    if parse_tool_selection(body, endpoint)?
+        .names()
+        .iter()
+        .any(|name| !wire_declares_tool(body, endpoint, name))
+    {
+        return Err(LLMError::RequestFailed(
+            "A tool selected by the provider request is missing from its declarations".into(),
+        ));
     }
     if diagnostics.is_task_split() {
         if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
