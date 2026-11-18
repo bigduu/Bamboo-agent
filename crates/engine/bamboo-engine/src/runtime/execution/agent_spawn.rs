@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Session, TokenUsage};
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
@@ -24,8 +24,8 @@ use crate::runtime::config::{
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
-    finalize_rejected_runner_if_distinct, finalize_runner_exact, reserve_runner_core,
-    reserve_runner_for_registration, ReserveOutcome, RunnerReservation,
+    finalize_rejected_runner_if_distinct, finalize_runner_exact, finalize_runner_exact_with_usage,
+    reserve_runner_core, reserve_runner_for_registration, ReserveOutcome, RunnerReservation,
 };
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -1596,6 +1596,10 @@ pub fn spawn_session_execution_with_upstream_retry(
             // unwinding panic would leave a zombie Running runner entry (which
             // blinds liveness checks) and, for a child session, strand its
             // waiting parent. Map a panic to a terminal error instead.
+            let previous_round = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.round.last_round_id.clone());
             let result = {
                 use futures::FutureExt;
                 let run = async {
@@ -1643,6 +1647,23 @@ pub fn spawn_session_execution_with_upstream_retry(
                     }
                 }
             };
+            // Admission and early setup can fail before replacing the previous
+            // run's runtime state. Only a new execution-scoped round contributes.
+            let usage = session
+                .agent_runtime_state
+                .as_ref()
+                .map(|runtime| &runtime.round)
+                .filter(|round| {
+                    round.last_round_id.is_some() && round.last_round_id != previous_round
+                })
+                .map_or_else(TokenUsage::default, |round| {
+                    TokenUsage {
+                        prompt_tokens: round.total_prompt_tokens,
+                        completion_tokens: round.total_completion_tokens,
+                        total_tokens: 0,
+                    }
+                    .clamped_for_durable_metrics()
+                });
             let stopped_work = if let Some(work) = work {
                 match work.resources.close_and_drain().await {
                     Ok(drained) => Some((work, drained)),
@@ -1840,7 +1861,14 @@ pub fn spawn_session_execution_with_upstream_retry(
             // persisted above, so `is_running` and `last_run_status` become
             // visible together and the frontend settles immediately instead of
             // lingering in its optimistic-settle window.
-            finalize_runner_exact(&runners, &session_id, &activation_run_id, &result).await;
+            finalize_runner_exact_with_usage(
+                &runners,
+                &session_id,
+                &activation_run_id,
+                &result,
+                Some(usage),
+            )
+            .await;
 
             #[cfg(test)]
             if let Some(outer) = &task_outer {

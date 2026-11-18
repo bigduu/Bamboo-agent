@@ -5,9 +5,13 @@ use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+use bamboo_agent_core::{storage::Storage, Message, Session};
+use bamboo_domain::{AgentRuntimeState, AgentStatusState};
 use serde_json::{json, Value};
 use tokio::process::Command;
-use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+use wiremock::matchers::{
+    body_partial_json, body_string_contains, header, method, path, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MODEL: &str = "fixture-model";
@@ -101,6 +105,277 @@ fn anthropic_stream() -> ResponseTemplate {
             .map(|(name, body)| format!("event: {name}\ndata: {body}\n\n"))
             .collect(),
     )
+}
+
+fn ndjson_events(output: &Output) -> Vec<Value> {
+    let events: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "result")
+            .count(),
+        1,
+        "stdout: {:?}, stderr: {}",
+        events,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(events.last().unwrap()["type"], "result");
+    events
+}
+
+fn terminal_usage(input: u64, output: u64) -> Value {
+    json!({"input_tokens": input, "output_tokens": output, "total_tokens": input + output})
+}
+
+fn anthropic_counted_stream(
+    input: u64,
+    output: u64,
+    reason: &str,
+    block: Value,
+    delta: Value,
+) -> ResponseTemplate {
+    let events = [
+        (
+            "message_start",
+            json!({"message":{
+                "id":"msg_fixture","type":"message","role":"assistant","model":MODEL,"content":[],
+                "usage":{"input_tokens":input,"output_tokens":0,
+                    "cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+            }}),
+        ),
+        (
+            "content_block_start",
+            json!({"index":0,"content_block":block}),
+        ),
+        ("content_block_delta", json!({"index":0,"delta":delta})),
+        ("content_block_stop", json!({"index":0})),
+        (
+            "message_delta",
+            json!({"delta":{"stop_reason":reason},"usage":{"output_tokens":output}}),
+        ),
+        ("message_stop", json!({})),
+    ];
+    stream(
+        events
+            .into_iter()
+            .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("bamboo");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        data.join("config.json"),
+        r#"{"memory":{"auto_dream_enabled":false}}"#,
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    let file = dir.path().join("fixture.txt");
+    std::fs::write(&file, "Fixture content").unwrap();
+    let tool_input = json!({"file_path": file}).to_string();
+    Mock::given(path("/initial/v1/messages"))
+        .respond_with(anthropic_counted_stream(
+            101,
+            17,
+            "tool_use",
+            json!({"type":"tool_use","id":"toolu_fixture_read","name":"Read","input":{}}),
+            json!({"type":"input_json_delta","partial_json":tool_input}),
+        ))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/initial/v1/messages"))
+        .and(body_string_contains("toolu_fixture_read"))
+        .respond_with(anthropic_counted_stream(
+            211,
+            29,
+            "end_turn",
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":ANSWER}),
+        ))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/resume/v1/messages"))
+        .respond_with(anthropic_counted_stream(
+            43,
+            13,
+            "max_tokens",
+            json!({"type":"thinking","thinking":"","signature":""}),
+            json!({"type":"thinking_delta","thinking":REASONING}),
+        ))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let mut initial = bamboo(dir.path());
+    gateway_environment(
+        &mut initial,
+        "anthropic",
+        &format!("{}/initial/v1/", server.uri()),
+    );
+    let output = run(initial.args([
+        "-p",
+        "Read fixture.txt and answer.",
+        "--stream-json",
+        "--provider",
+        "anthropic",
+        "--permission-mode",
+        "auto",
+        "--timeout",
+        "15",
+    ]))
+    .await;
+    let events = ndjson_events(&output);
+    let result = events.last().unwrap();
+    assert_eq!(events[0]["type"], "session_started");
+    assert!(result["session_id"].as_str().is_some());
+    assert_eq!(events[0]["session_id"], result["session_id"]);
+    assert!(events.iter().any(|event| event["type"] == "tool_complete"));
+    assert_eq!(result["status"], "finished");
+    assert_eq!(result["result"], ANSWER);
+    assert_eq!(result["usage"], terminal_usage(312, 46));
+
+    // A saved legacy session can have usage from a previous turn without an
+    // Actor activation. Its counters must not carry into the next execution.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut session = Session::new(&session_id, MODEL);
+    session.title_generated = true;
+    session.add_message(Message::user("Previous prompt"));
+    session.add_message(Message::assistant("Previous answer", None));
+    let mut previous = AgentRuntimeState::new(&session_id);
+    previous.status = AgentStatusState::Completed;
+    previous.round.last_round_id = Some("previous-round".into());
+    previous.round.total_prompt_tokens = 312;
+    previous.round.total_completion_tokens = 46;
+    session.agent_runtime_state = Some(previous);
+    bamboo_storage::SessionStoreV2::new(data)
+        .await
+        .unwrap()
+        .save_session(&session)
+        .await
+        .unwrap();
+
+    let mut resume = bamboo(dir.path());
+    gateway_environment(
+        &mut resume,
+        "anthropic",
+        &format!("{}/resume/v1/", server.uri()),
+    );
+    let output = run_to_exit(resume.args([
+        "-p",
+        "Continue with a new answer.",
+        "-s",
+        &session_id,
+        "--stream-json",
+        "--provider",
+        "anthropic",
+        "--timeout",
+        "15",
+    ]))
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    let events = ndjson_events(&output);
+    let result = events.last().unwrap();
+    assert_eq!(events[0]["type"], "session_started", "{events:#?}");
+    assert_eq!(events[0]["resumed"], true);
+    assert_eq!(result["session_id"], session_id);
+    assert_eq!(result["status"], "error");
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("output token limit"));
+    let attempts = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/resume/v1/messages")
+        .count() as u64;
+    assert!(attempts > 0);
+    assert_eq!(
+        result["usage"],
+        terminal_usage(43 * attempts, 13 * attempts)
+    );
+}
+
+#[tokio::test]
+async fn headless_stream_startup_errors_emit_one_result_without_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, error_text, exit_code) in [
+        (
+            ["-p", "prompt", "--timeout", "0"].as_slice(),
+            "invalid --timeout",
+            1,
+        ),
+        (["-p", "-"].as_slice(), "empty prompt on stdin", 1),
+        (
+            ["-p", "prompt", "--log-level", "bogus"].as_slice(),
+            "invalid --log-level",
+            2,
+        ),
+    ] {
+        let output = run_to_exit(bamboo(dir.path()).arg("--stream-json").args(args)).await;
+        assert_eq!(output.status.code(), Some(exit_code));
+        let events = ndjson_events(&output);
+        assert_eq!(events.len(), 1);
+        let result = &events[0];
+        assert_eq!(result["status"], "error");
+        assert!(result["session_id"].is_null());
+        assert!(result["result"].is_null());
+        assert!(result["error"].as_str().unwrap().contains(error_text));
+        assert_eq!(result["usage"], terminal_usage(0, 0));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(error_text));
+    }
+}
+
+#[tokio::test]
+async fn headless_stream_execute_rejection_closes_an_announced_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let data = dir.path().join("bamboo");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        data.join("config.json"),
+        json!({
+            "default_provider_instance": "fixture",
+            "provider_instances": {"fixture": {
+                "provider_type": "anthropic",
+                "api_key": KEY,
+                "base_url": format!("{}/v1/", server.uri()),
+            }},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = run_to_exit(bamboo(dir.path()).args(["-p", "prompt", "--stream-json"])).await;
+    assert_eq!(output.status.code(), Some(1));
+    let events = ndjson_events(&output);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["type"], "session_started");
+    assert!(events[0]["session_id"].as_str().is_some());
+    assert_eq!(events[1]["session_id"], events[0]["session_id"]);
+    assert_eq!(events[1]["status"], "error");
+    assert!(events[1]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("execute rejected: HTTP 400"));
+    assert_eq!(events[1]["usage"], terminal_usage(0, 0));
 }
 
 #[tokio::test]
