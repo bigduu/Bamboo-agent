@@ -215,7 +215,16 @@ impl Fixture {
         assert_eq!(response.status(), StatusCode::OK);
         let result: Value = test::read_body_json(response).await;
         assert_eq!(result["session"]["permission_mode"], json!(mode));
-        assert_eq!(result["supervisor_auto_dispatch"], auto_dispatch);
+        assert_eq!(result["session"]["supervisor_auto_dispatch"], auto_dispatch);
+        assert_eq!(
+            self.state
+                .session_store
+                .get_index_entry(&self.supervisor.session_id)
+                .await
+                .unwrap()
+                .supervisor_auto_dispatch,
+            Some(auto_dispatch)
+        );
     }
 
     async fn dispatch_named(

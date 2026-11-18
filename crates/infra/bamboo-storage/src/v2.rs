@@ -1161,6 +1161,8 @@ pub struct SessionIndexEntry {
     /// Typed permission mode mirrored from the session runtime state.
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_auto_dispatch: Option<bool>,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6026,6 +6028,9 @@ impl SessionStoreV2 {
             plan_mode,
             bypass_permissions,
             permission_mode,
+            supervisor_auto_dispatch: session
+                .supervisor_incarnation_id()
+                .map(|_| session.supervisor_auto_dispatch()),
             last_run_status,
             last_run_error,
             token_usage: session.token_usage.clone(),

@@ -186,13 +186,14 @@ pub async fn get_session(
                 Some(durable_session.root_orchestration_only_enabled());
             summary.thinking_mode = Some(durable_session.root_thinking_mode());
             summary.reasoning_effort = durable_session.reasoning_effort;
-            summary.permission_mode = durable_session
-                .agent_runtime_state
-                .as_ref()
-                .map(|runtime| runtime.effective_permission_mode())
-                .unwrap_or_default();
-            summary.bypass_permissions =
-                summary.permission_mode != bamboo_domain::SessionPermissionMode::Default;
+            if let Some(runtime) = durable_session.agent_runtime_state.as_ref() {
+                summary.permission_mode = runtime.effective_permission_mode();
+                summary.bypass_permissions =
+                    summary.permission_mode != bamboo_domain::SessionPermissionMode::Default;
+            }
+            summary.supervisor_auto_dispatch = durable_session
+                .supervisor_incarnation_id()
+                .map(|_| durable_session.supervisor_auto_dispatch());
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
             {
@@ -258,12 +259,7 @@ pub async fn get_session(
 
             let mut response = HttpResponse::Ok();
             response.insert_header((actix_web::http::header::ETAG, format!("\"{etag}\"")));
-            Ok(response.json(GetSessionResponse {
-                session: summary,
-                supervisor_auto_dispatch: durable_session
-                    .supervisor_incarnation_id()
-                    .map(|_| durable_session.supervisor_auto_dispatch()),
-            }))
+            Ok(response.json(GetSessionResponse { session: summary }))
         }
         None => Ok(HttpResponse::NotFound().json(serde_json::json!({
             // Canonical nested error envelope — matches `AppError`'s shape

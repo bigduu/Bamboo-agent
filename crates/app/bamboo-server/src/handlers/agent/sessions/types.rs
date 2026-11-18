@@ -174,6 +174,10 @@ pub struct SessionSummary {
     /// this distinguishes legacy Bypass from zero-prompt Auto.
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
+    /// The current setting on a supported Supervisor. List values are hints
+    /// and detail responses pair this value with the permission ETag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_auto_dispatch: Option<bool>,
     /// Which machine this session's agent runs on (deployment kind + host).
     /// Always present: a session with no stamped placement (root sessions,
     /// local children, legacy rows) defaults to this backend's own local host,
@@ -262,6 +266,7 @@ impl SessionSummary {
             bypass_permissions: entry.bypass_permissions
                 || permission_mode != bamboo_domain::SessionPermissionMode::Default,
             permission_mode,
+            supervisor_auto_dispatch: entry.supervisor_auto_dispatch,
             placement: entry.placement.unwrap_or_else(local_placement),
         }
     }
@@ -422,9 +427,6 @@ pub struct SessionCreateOperationResponse {
 #[derive(Debug, Serialize)]
 pub struct GetSessionResponse {
     pub session: SessionSummary,
-    /// Present only for a canonical Supervisor with this policy supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_auto_dispatch: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -699,6 +701,7 @@ mod tests {
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
+            supervisor_auto_dispatch: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
@@ -757,6 +760,7 @@ mod tests {
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
+            supervisor_auto_dispatch: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
@@ -798,10 +802,7 @@ mod tests {
             gold_config: None,
         };
 
-        let response = GetSessionResponse {
-            session: summary,
-            supervisor_auto_dispatch: None,
-        };
+        let response = GetSessionResponse { session: summary };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"session-123\""));
@@ -905,6 +906,7 @@ mod tests {
             project_id: None,
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
+            supervisor_auto_dispatch: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
