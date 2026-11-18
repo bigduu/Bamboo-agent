@@ -177,7 +177,11 @@ impl Fixture {
         serde_json::from_str(&result.result).unwrap()
     }
 
-    async fn set_supervisor_permission_mode(&self, mode: SessionPermissionMode) {
+    async fn set_supervisor_permission_mode(
+        &self,
+        mode: SessionPermissionMode,
+        auto_dispatch: bool,
+    ) {
         let supervisor = self
             .state
             .storage
@@ -191,21 +195,27 @@ impl Fixture {
                 .configure(crate::routes::configure_routes),
         )
         .await;
+        let mut payload = json!({"permission_mode": mode});
+        if auto_dispatch {
+            payload["supervisor_auto_dispatch"] = json!(true);
+        }
         let response = test::call_service(
             &app,
             test::TestRequest::patch()
                 .uri(&format!("/api/v1/sessions/{}", supervisor.id))
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
                 .insert_header((
                     actix_web::http::header::IF_MATCH,
                     format!("\"{}\"", supervisor.metadata_version),
                 ))
-                .set_json(json!({"permission_mode": mode}))
+                .set_json(payload)
                 .to_request(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let result: Value = test::read_body_json(response).await;
         assert_eq!(result["session"]["permission_mode"], json!(mode));
+        assert_eq!(result["supervisor_auto_dispatch"], auto_dispatch);
     }
 
     async fn dispatch_named(
@@ -347,6 +357,58 @@ const PERMISSION_PROBES: [(&str, &str); 4] = [
 ];
 const SHELL_PROBES_DONE: &str = "Worker permission checks finished.";
 
+#[actix_web::test]
+async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
+    let f = Fixture::new(false).await;
+    f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
+        .await;
+    let store = f.state.session_store.clone();
+    let current = f
+        .state
+        .storage
+        .load_execution_admission_snapshot(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = SessionCallerReference::from(&current);
+    let reserving_caller = caller.clone();
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, proceed) = tokio::sync::oneshot::channel();
+    let reservation = tokio::spawn(async move {
+        store
+            .with_supervisor_dispatch_consent(&reserving_caller, |allowed| async move {
+                entered.send(allowed).unwrap();
+                proceed.await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap()
+    });
+    assert!(held.await.unwrap());
+    let revoke = f
+        .state
+        .session_store
+        .update_supervisor_execution_profile(&current, |session| {
+            session.set_supervisor_auto_dispatch(false);
+            session.metadata_version += 1;
+            Ok::<_, std::io::Error>(())
+        });
+    tokio::pin!(revoke);
+    assert!(timeout(Duration::from_millis(100), &mut revoke)
+        .await
+        .is_err());
+    release.send(()).unwrap();
+    reservation.await.unwrap();
+    revoke.await.unwrap().unwrap();
+    assert!(!f
+        .state
+        .session_store
+        .with_supervisor_dispatch_consent(&caller, |allowed| async move { Ok(allowed) })
+        .await
+        .unwrap());
+    f.state.shutdown().await;
+}
+
 struct WorkerPermissionProvider;
 
 #[async_trait::async_trait]
@@ -407,7 +469,7 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
                 std::collections::HashMap::from([("openai".into(), provider)]),
                 "openai".into(),
             ));
-        f.set_supervisor_permission_mode(SessionPermissionMode::Auto)
+        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
             .await;
         let permissions = f.state.permission_checker.permission_config().unwrap();
         permissions.set_ask_rules(["Bash".into()]);
@@ -488,24 +550,8 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
             }
         }
 
-        f.set_supervisor_permission_mode(SessionPermissionMode::Default)
+        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, false)
             .await;
-        if !ultra {
-            permissions
-                .grant_typed_scoped_session_permission(
-                    &f.supervisor.session_id,
-                    PermissionType::ExecuteCommand,
-                    PermissionMatcher {
-                        id: "retry-standalone".into(),
-                        kind: PermissionMatcherKind::ExactResource,
-                        value: format!(
-                            "session_control create [unassigned] {}",
-                            request["operation_id"].as_str().unwrap()
-                        ),
-                    },
-                )
-                .unwrap();
-        }
         let replay = f.invoke_named(route, request).await;
         assert_eq!(replay["target_session_id"], id);
         assert_eq!(replay["receipt_id"], created["receipt_id"]);
@@ -520,6 +566,21 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
                 .unwrap()
                 .effective_permission_mode(),
             SessionPermissionMode::Auto
+        );
+        let next = f.invoke(f.request(uuid::Uuid::new_v4())).await;
+        let without_dispatch_auto = f
+            .state
+            .storage
+            .load_root_authority(next["target_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            without_dispatch_auto
+                .agent_runtime_state
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Bypass
         );
         f.state.shutdown().await;
     }

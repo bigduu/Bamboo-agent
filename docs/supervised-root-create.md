@@ -22,11 +22,16 @@ Project binding or permission is automatically changed.
 
 The worker is a new Standard Ordinary Root. Its ordinary global defaults and
 Project context come from the same pure creation use case as `POST /sessions`.
-When the owner selects Auto on the Supervisor, fresh independent execution
-Sessions start in Auto. Otherwise these Sessions start in Bypass, which skips
+When the owner confirms Auto for dispatches on the Supervisor, fresh independent
+execution Sessions start in Auto. The revisioned Supervisor profile stores
+this distinct consent through `supervisor_auto_dispatch: true` together with
+`permission_mode: "auto"`. Standard Auto is scoped to the Supervisor Session.
+Bypass is the default for independent execution Sessions. It skips
 ordinary approvals and retains forced confirmations for shell operations such
 as `source` and `sudo`. The initial permission mode is saved with the creation
-reservation and reused on retry. Each existing Session owns its permission mode.
+reservation and reused on retry. The reservation holds the same physical
+profile lock as consent changes, so each new dispatch uses the consent valid
+when its reservation commits. Each existing Session owns its permission mode.
 
 The new Root has its own history, prompt, model, workspace and Ordinary Root
 authority. A bounded SubAgent creates a Child, and formal Work/Ticket uses the

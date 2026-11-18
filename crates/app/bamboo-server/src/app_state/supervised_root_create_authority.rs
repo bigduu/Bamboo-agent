@@ -1,10 +1,7 @@
 //! Caller selection and Host integration for the one existing Root-create flow.
 
 use super::*;
-use bamboo_domain::{
-    host_session_create_identity, HostSessionScopeToken, SessionCallerReference,
-    SessionPermissionMode,
-};
+use bamboo_domain::{host_session_create_identity, HostSessionScopeToken, SessionCallerReference};
 use bamboo_engine::SessionPeerDeliveryReceipt;
 use bamboo_server_tools::session_control::root_creation::SessionRootCreatePort;
 
@@ -395,7 +392,7 @@ impl CreationAuthority {
         &self,
         creator: &SupervisedRootCreator,
         request: &SupervisedRootCreateRequest,
-    ) -> Result<(u64, Option<SessionPermissionMode>), CreationAuthorizationError> {
+    ) -> Result<u64, CreationAuthorizationError> {
         if request.notify_on_material_event
             && !matches!(
                 self,
@@ -415,34 +412,25 @@ impl CreationAuthority {
                 reference,
                 original_caller,
             } => {
-                let requested_mode = if let Some(caller) = original_caller {
+                if let Some(caller) = original_caller {
                     creator
                         .check_original_caller(caller)
                         .await
                         .map_err(|error| {
                             CreationAuthorizationError::blocked("scope_denied", error)
-                        })?
-                        .agent_runtime_state
-                        .map(|runtime| runtime.effective_permission_mode())
-                        .unwrap_or_default()
+                        })?;
                 } else if request.project_id.is_none() {
                     return Err(CreationAuthorizationError::blocked(
                         "scope_denied",
                         "Standalone creation requires the original executing Supervisor",
                     ));
-                } else {
-                    SessionPermissionMode::Default
-                };
+                }
                 let scope = creator
                     .store
                     .inspect_supervisor_current_user_scope(reference)
                     .await
                     .map_err(CreationAuthorizationError::io)?;
-                let mode =
-                    bamboo_orchestration::managed_session::supervisor_execution_permission_mode(
-                        requested_mode,
-                    );
-                Ok((scope.legacy_state_revision, Some(mode)))
+                Ok(scope.legacy_state_revision)
             }
             Self::Host { token, .. } => {
                 let revision = self
@@ -472,7 +460,7 @@ impl CreationAuthority {
                         "Created-target rights require a separate explicit Host installation",
                     ));
                 }
-                Ok((revision, None))
+                Ok(revision)
             }
         }
     }

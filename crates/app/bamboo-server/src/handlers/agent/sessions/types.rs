@@ -422,6 +422,9 @@ pub struct SessionCreateOperationResponse {
 #[derive(Debug, Serialize)]
 pub struct GetSessionResponse {
     pub session: SessionSummary,
+    /// Present only for a canonical Supervisor with this policy supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_auto_dispatch: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +505,9 @@ pub struct PatchSessionRequest {
     /// or the legacy boolean, never both in the same request.
     #[serde(default)]
     pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+    /// Explicit opt-in to Auto on future independent Supervisor dispatches.
+    #[serde(default)]
+    pub supervisor_auto_dispatch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -792,7 +798,10 @@ mod tests {
             gold_config: None,
         };
 
-        let response = GetSessionResponse { session: summary };
+        let response = GetSessionResponse {
+            session: summary,
+            supervisor_auto_dispatch: None,
+        };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"session-123\""));

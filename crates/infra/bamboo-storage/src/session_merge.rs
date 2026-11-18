@@ -50,6 +50,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
     "gold_config",
+    bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY,
     "workflow.run_ids.v1",
     "ticket.runtime.dispatch.v1",
     "ticket.runtime.owned_stop.v1",
