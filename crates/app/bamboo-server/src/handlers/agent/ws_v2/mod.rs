@@ -1500,7 +1500,7 @@ mod tests {
     #[actix_web::test]
     async fn agent_subscription_replays_the_published_start_before_live_output() {
         use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
-        use bamboo_agent_core::{AgentEvent, Message, Session, Storage};
+        use bamboo_agent_core::{AgentEvent, Message, Session};
         use bamboo_engine::execution::reserve_runner_core;
 
         let dir = tempdir().unwrap();
@@ -1538,7 +1538,7 @@ mod tests {
             events,
             sender,
             None,
-            Some(binding.owner),
+            Some(binding.owner.clone()),
         );
         let wait = std::time::Duration::from_secs(5);
         let started = tokio::time::timeout(wait, existing.recv())
