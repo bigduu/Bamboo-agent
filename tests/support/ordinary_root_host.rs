@@ -7,6 +7,7 @@ use std::{
 };
 
 const LOG_TAIL_BYTES: u64 = 16 * 1024;
+const DISCOVERY_READ_BYTES: u64 = 64 * 1024;
 const STARTUP_BUDGET: Duration = Duration::from_secs(30);
 
 struct Launch {
@@ -89,6 +90,50 @@ fn announced_address(log: &[u8]) -> Option<SocketAddr> {
     })
 }
 
+struct ListenerDiscovery {
+    offset: u64,
+    pending: Vec<u8>,
+    address: Option<SocketAddr>,
+}
+
+impl ListenerDiscovery {
+    fn new(offset: u64) -> Self {
+        Self {
+            offset,
+            pending: Vec::new(),
+            address: None,
+        }
+    }
+
+    fn read(&mut self, path: &Path) -> std::io::Result<Option<SocketAddr>> {
+        if self.address.is_some() {
+            return Ok(self.address);
+        }
+        let mut file = std::fs::File::open(path)?;
+        if file.metadata()?.len() < self.offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Host log was truncated during listener discovery",
+            ));
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.take(DISCOVERY_READ_BYTES).read_to_end(&mut bytes)?;
+        self.offset += bytes.len() as u64;
+        self.pending.extend_from_slice(&bytes);
+        if let Some(end) = self.pending.iter().rposition(|byte| *byte == b'\n') {
+            self.address = announced_address(&self.pending[..=end]);
+            self.pending = self.pending[end + 1..].to_vec();
+        }
+        // Retain a split announcement/address, without buffering an arbitrary
+        // long unrelated line. Accept addresses only after its newline arrives.
+        if self.pending.len() > 256 {
+            self.pending.drain(..self.pending.len() - 256);
+        }
+        Ok(self.address)
+    }
+}
+
 impl Host {
     pub fn generation(&self) -> usize {
         self.1.generation
@@ -116,6 +161,7 @@ impl Host {
     }
 
     pub async fn ready(&mut self, client: &reqwest::Client) -> Result<String, String> {
+        let mut discovery = ListenerDiscovery::new(self.1.log_start);
         let ready = tokio::time::timeout(STARTUP_BUDGET, async {
             loop {
                 match self.0.try_wait() {
@@ -125,9 +171,10 @@ impl Host {
                         return Err(self.diagnostics(&format!("Host status failed: {error}")))
                     }
                 }
-                let log = current_log_tail(&self.1.log, self.1.log_start)
+                let address = discovery
+                    .read(&self.1.log)
                     .map_err(|error| self.diagnostics(&format!("Host log read failed: {error}")))?;
-                if let Some(address) = announced_address(&log) {
+                if let Some(address) = address {
                     let base = format!("http://{address}/api/v1");
                     if client
                         .get(format!("{base}/health"))
@@ -310,7 +357,7 @@ mod tests {
             .open(&path)
             .unwrap();
         use std::io::Write;
-        log.write_all(&vec![b'x'; (LOG_TAIL_BYTES * 2) as usize])
+        log.write_all(&[b'x'; (LOG_TAIL_BYTES * 2) as usize])
             .unwrap();
         log.write_all(b"\nUnified server running on http://127.0.0.1:45679\n")
             .unwrap();
@@ -322,5 +369,49 @@ mod tests {
             Some("127.0.0.1:45679".parse().unwrap())
         );
         assert!(current_log_tail(&path, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn discovery_retains_announcements_across_large_logs_and_split_writes() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("host.log");
+        let stale = b"Unified server running on http://127.0.0.1:45678\n";
+        std::fs::write(&path, stale).unwrap();
+        let mut discovery = ListenerDiscovery::new(stale.len() as u64);
+        assert_eq!(discovery.read(&path).unwrap(), None);
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        log.write_all(&[b'x'; (DISCOVERY_READ_BYTES * 2) as usize])
+            .unwrap();
+        log.write_all(b"\nUnified server running on http://127.0.0.1:45679\n")
+            .unwrap();
+        log.write_all(&[b'x'; (DISCOVERY_READ_BYTES * 2) as usize])
+            .unwrap();
+        assert!(announced_address(&current_log_tail(&path, stale.len() as u64).unwrap()).is_none());
+        let expected = Some("127.0.0.1:45679".parse().unwrap());
+        let mut found = None;
+        for _ in 0..8 {
+            found = discovery.read(&path).unwrap();
+            if found.is_some() {
+                break;
+            }
+        }
+        assert_eq!(found, expected);
+        log.write_all(b"\nUnified server running on http://127.0.0.1:45680\n")
+            .unwrap();
+        assert_eq!(discovery.read(&path).unwrap(), expected);
+
+        let mut split = ListenerDiscovery::new(log.metadata().unwrap().len());
+        log.write_all(b"Unified server running on http://127.0.0.1:456")
+            .unwrap();
+        assert_eq!(split.read(&path).unwrap(), None);
+        log.write_all(b"81\n").unwrap();
+        assert_eq!(
+            split.read(&path).unwrap(),
+            Some("127.0.0.1:45681".parse().unwrap())
+        );
     }
 }
