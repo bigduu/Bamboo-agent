@@ -218,6 +218,7 @@ impl TicketApplication {
             )?,
             title: Some(spec.contract.title.trim().chars().take(256).collect()),
             notify_on_material_event: false,
+            thinking_mode: None,
         };
         let result = host
             .creator

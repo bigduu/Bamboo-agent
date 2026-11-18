@@ -83,6 +83,7 @@ impl Fixture {
             message: "Inspect only this explicit assignment".into(),
             title: Some("Independent task".into()),
             notify_on_material_event: false,
+            thinking_mode: None,
         };
         Self {
             home,
@@ -192,7 +193,8 @@ impl Fixture {
                 std::path::Path::new(self.workspace()),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         self.creator
             .project_context
             .refresh_session_prompt_read_only(&mut candidate)
