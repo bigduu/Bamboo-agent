@@ -5,12 +5,12 @@
 //! orchestration layer across all background paths (HTTP execute, spawn, schedule).
 
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{AgentEvent, TokenUsage};
 
 fn subagent_lifecycle_key(event: &AgentEvent) -> Option<(&str, &str)> {
     event
@@ -89,6 +89,7 @@ pub struct AgentRunner {
     // visible status/completed_at when it signals, which is not finalization;
     // an unqualified finalizer cannot prove which run it finalized.
     pub(super) execution_finalized: CancellationToken,
+    pub(super) terminal_usage: Arc<OnceLock<TokenUsage>>,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
@@ -174,6 +175,11 @@ impl AgentRunner {
         self.execution_finalized.is_cancelled()
     }
 
+    /// Cumulative loop usage recorded by this exact runner's finalizer.
+    pub fn terminal_usage(&self) -> Option<TokenUsage> {
+        self.terminal_usage.get().copied()
+    }
+
     /// Subscribe to the exact run's finalizer without granting the caller a way to signal it.
     pub fn wait_for_exact_finalization(
         &self,
@@ -251,6 +257,7 @@ impl AgentRunner {
             started_at: Utc::now(),
             completed_at: None,
             execution_finalized: CancellationToken::new(),
+            terminal_usage: Arc::default(),
             supervisor_run_target: None,
             supervisor_run_workspace: None,
             last_budget_event: None,
