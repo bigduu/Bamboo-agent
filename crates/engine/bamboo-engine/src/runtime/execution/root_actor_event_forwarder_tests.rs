@@ -248,6 +248,7 @@ async fn bound_generic_started_critical_and_history_wait_for_actual_account_rece
     {
         let runners = forwarder.runners.read().await;
         let runner = runners.get(ROOT).unwrap();
+        assert_frame(runner.running_execution_started().unwrap(), &started);
         assert_eq!(runner.last_critical_events.len(), 1);
         assert_frame(&runner.last_critical_events[0], &critical);
         assert!(runner.last_event_at.is_some());
@@ -479,6 +480,7 @@ async fn expired_current_root_rejects_started_without_account_or_legacy_publicat
         .is_empty());
     let runners = forwarder.runners.read().await;
     let runner = runners.get(ROOT).unwrap();
+    assert!(runner.published_execution_started.is_none());
     assert!(runner.last_critical_events.is_empty());
     assert!(runner.last_event_at.is_none());
 }
