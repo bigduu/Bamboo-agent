@@ -451,6 +451,55 @@ mod live_disabled_tests {
     }
 
     #[test]
+    fn sdk_command_builder_exposes_native_pair_only_with_native_continuation() {
+        use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+
+        struct CustomContinuation;
+
+        #[async_trait::async_trait]
+        impl Tool for CustomContinuation {
+            fn name(&self) -> &str {
+                "write_stdin"
+            }
+
+            fn description(&self) -> &str {
+                "Custom continuation"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                _: ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                unreachable!("catalog projection only")
+            }
+        }
+
+        let tools = bamboo_tools::BuiltinToolExecutorBuilder::new()
+            .with_command_tool("exec_command")
+            .unwrap()
+            .with_command_tool("write_stdin")
+            .unwrap()
+            .build();
+        let session = Session::new("sdk-shell-pair", "model");
+        let config = AgentLoopConfig::default();
+
+        assert!(offered(&config, &tools, &session, "exec_command"));
+        assert!(offered(&config, &tools, &session, "write_stdin"));
+
+        assert!(tools.registry().unregister("write_stdin"));
+        tools.register_tool(CustomContinuation).unwrap();
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].function.name, "write_stdin");
+        assert_eq!(schemas[0].function.description, "Custom continuation");
+    }
+
+    #[test]
     fn live_disabled_resolver_filters_tools_on_the_next_round() {
         // A resolver whose disabled set flips mid-run: round 1 nothing disabled,
         // round 2 "beta_tool" disabled — mirrors a user disabling a tool mid-run.

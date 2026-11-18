@@ -183,6 +183,18 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         self.runners[0].native_task_liveness(session_id, run_id, child_birth)
     }
 
+    fn shell_wait_activity_at(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.runners
+            .iter()
+            .find_map(|runner| runner.shell_wait_activity_at(session_id, run_id, child_birth, now))
+    }
+
     fn supports_native_ticket_budget(&self) -> bool {
         // Deliberately conservative for this native-only first slice. Mixed
         // process/remote routers retain their existing explicit dispatch path.

@@ -3993,7 +3993,21 @@ impl ChildCompletionCoordinator {
                     // per-child watchdog machinery itself is dead (task
                     // panicked or lost), because it would have cancelled and
                     // published a timeout long before.
-                    let last_activity = runner.last_activity_at().unwrap_or(runner.started_at);
+                    let scheduler = self.spawn_scheduler.read().await.upgrade();
+                    let shell_wait = control_plane.as_ref().zip(scheduler.as_ref()).and_then(
+                        |(child, scheduler)| {
+                            scheduler.shell_wait_activity_at(
+                                child_id,
+                                &runner.run_id,
+                                child.created_at,
+                                now,
+                            )
+                        },
+                    );
+                    let last_activity = runner
+                        .last_activity_at()
+                        .max(shell_wait)
+                        .unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
                     let policy = match &control_plane {
@@ -4003,7 +4017,6 @@ impl ChildCompletionCoordinator {
                         None => Default::default(),
                     };
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
-                    let scheduler = self.spawn_scheduler.read().await.upgrade();
                     let current_native_work =
                         if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {
                             match (&control_plane, scheduler) {

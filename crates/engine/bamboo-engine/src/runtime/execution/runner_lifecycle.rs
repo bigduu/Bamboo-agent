@@ -12,7 +12,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::{AgentError, AgentEvent};
+use bamboo_agent_core::{AgentError, AgentEvent, TokenUsage};
 
 use super::runner_state::{AgentRunner, AgentStatus};
 
@@ -222,12 +222,25 @@ pub async fn finalize_runner_exact(
     run_id: &str,
     result: &Result<(), AgentError>,
 ) -> bool {
+    finalize_runner_exact_with_usage(runners, session_id, run_id, result, None).await
+}
+
+pub(super) async fn finalize_runner_exact_with_usage(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    run_id: &str,
+    result: &Result<(), AgentError>,
+    usage: Option<TokenUsage>,
+) -> bool {
     let mut guard = runners.write().await;
     let Some(runner) = guard.get_mut(session_id) else {
         return false;
     };
     if runner.run_id != run_id {
         return false;
+    }
+    if let Some(usage) = usage {
+        let _ = runner.terminal_usage.set(usage);
     }
     runner.status = status_from_execution_result(result);
     runner.completed_at = Some(Utc::now());

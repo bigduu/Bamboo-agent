@@ -1366,20 +1366,24 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific command tool by name
     pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "exec_command" {
-            let (name, tool) = BuiltinToolExecutor::register_tracked_builtin(
-                &self.registry,
-                ExecCommandTool::new(),
-            )?;
-            self.framework_builtin_tools.insert(name, tool);
+        if name == "Task" {
+            self.registry
+                .register(TaskTool::new())
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
             return Ok(self);
         }
-        match name {
-            "write_stdin" => self.registry.register(WriteStdinTool::new()),
-            "Task" => self.registry.register(TaskTool::new()),
+        let (name, tool) = match name {
+            "exec_command" => BuiltinToolExecutor::register_tracked_builtin(
+                &self.registry,
+                ExecCommandTool::new(),
+            )?,
+            "write_stdin" => BuiltinToolExecutor::register_tracked_builtin(
+                &self.registry,
+                WriteStdinTool::new(),
+            )?,
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
-        }
-        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        };
+        self.framework_builtin_tools.insert(name, tool);
         Ok(self)
     }
 

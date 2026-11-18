@@ -9,6 +9,7 @@ use bamboo_infrastructure::process::{
 };
 use bamboo_infrastructure::test_support::override_command_environment;
 use std::collections::HashMap;
+use tokio::time::timeout;
 
 fn context(owner: &str) -> ToolCtx {
     let mut ctx = ToolCtx::none("initial-cleanup-test");

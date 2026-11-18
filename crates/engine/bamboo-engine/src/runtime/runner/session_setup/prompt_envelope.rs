@@ -56,15 +56,20 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
 /// A session-selected prompt enhancement for a root that coordinates child
 /// work. Keep this independent of the current SubAgent action schema: the
 /// runtime will continue to own the concrete delegation and inspection calls.
-const ROOT_ORCHESTRATION_GUIDANCE: &str = "Root delegation mode (explicitly selected for this Session):\n\
-Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate. Split multi-part work into non-overlapping independently verifiable slices and run them as parallel children; serialize dependent slices or shared-file writes.\n\
-For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.\n\
-Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
+const ROOT_ORCHESTRATION_INTRO: &str = "Root delegation mode (explicitly selected for this Session):\n\
+Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate. Split multi-part work into non-overlapping independently verifiable slices and run them as parallel children; serialize dependent slices or shared-file writes.";
+
+const ROOT_ORCHESTRATION_GUIDANCE: &str = "Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
 Inspect authoritative child progress and results when needed. Correct or revise the same child's assignment, then confirm the child received the change.\n\
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
-const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode prioritizes parallel SubAgents for independent work. Make authorized file edits directly when they are quicker or unblock the work. This mode is independent of each model call's reasoning effort.";
+const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
+
+const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
+Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
+This mode is independent of each model call's reasoning effort.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
 Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to authorized workers. Use only bounded Session/Work/plan views here. Delegate every direct workspace/file read, search, image read, write, shell or process operation to another Session; read-only file tools are not an exception. A Skill, Workflow, browser or external tool is not a shortcut. Split multi-part execution into independently verifiable slices with non-overlapping file ownership and dispatch them in parallel to separate workers instead of funneling everything through one worker; serialize only dependent slices or shared-file writes.\n\
@@ -92,9 +97,9 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
     (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
         || {
             let guidance = if session.root_orchestration_only_enabled() {
-                format!("{ULTRA_ROOT_GUIDANCE}\n\n{ROOT_ORCHESTRATION_GUIDANCE}")
+                format!("{ULTRA_ROOT_GUIDANCE}\n\n{ROOT_ORCHESTRATION_INTRO}\n{ROOT_ORCHESTRATION_GUIDANCE}")
             } else {
-                ROOT_ORCHESTRATION_GUIDANCE.to_string()
+                format!("{ROOT_ORCHESTRATION_INTRO}\n{ROOT_PLANNING_GUIDANCE}\n{ROOT_ORCHESTRATION_GUIDANCE}")
             };
             ContextBlock::new(
                 ContextBlockType::RootOrchestration,
@@ -161,17 +166,11 @@ pub(crate) fn build_root_orchestration_context_block_for_tools(
 #[cfg(test)]
 #[test]
 fn root_orchestration_guidance_is_bounded_and_schema_independent() {
-    assert!(ROOT_ORCHESTRATION_GUIDANCE.len() <= 1_200);
-    assert!(ULTRA_ROOT_GUIDANCE.len() + ROOT_ORCHESTRATION_GUIDANCE.len() <= 1_800);
-    for concept in [
-        "explorer",
-        "progress",
-        "Correct",
-        "scope",
-        "approval",
-        "evidence",
-        "parallel children",
-    ] {
+    let shared_len = ROOT_ORCHESTRATION_INTRO.len() + ROOT_ORCHESTRATION_GUIDANCE.len();
+    assert!(shared_len + ROOT_PLANNING_GUIDANCE.len() + 2 <= 1_200);
+    assert!(shared_len + ULTRA_ROOT_GUIDANCE.len() + 3 <= 1_800);
+    assert!(ROOT_ORCHESTRATION_INTRO.contains("parallel children"));
+    for concept in ["progress", "Correct", "scope", "approval", "evidence"] {
         assert!(
             ROOT_ORCHESTRATION_GUIDANCE.contains(concept),
             "missing {concept}"
@@ -200,10 +199,18 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     assert!(guidance.content.contains("read-only explorer role"));
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance.content.contains("independent of each model call"));
-    assert!(guidance.content.contains("prioritizes parallel SubAgents"));
-    assert!(guidance
-        .content
-        .contains("Make authorized file edits directly"));
+    for concept in [
+        "Launch ready independent SubAgent assignments in parallel",
+        "within the available capacity and budget",
+        "While children run, dispatch additional ready assignments and advance your own independent work",
+        "Make authorized file edits directly",
+        "prerequisites only for the work that depends on them",
+        "Wait when a required child result blocks further useful work",
+        "one child can be enough for simple or sequential tasks",
+    ] {
+        assert!(guidance.content.contains(concept), "missing {concept}");
+    }
+    assert!(!guidance.content.contains(ROOT_PLANNING_GUIDANCE));
 
     let child = Session::new_child_of("child", &restored, "model", "worker");
     assert!(build_root_orchestration_context_block(&child).is_none());
@@ -216,6 +223,7 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     disabled.set_root_orchestration_prompt_enabled(true);
     let prompt_only = build_root_orchestration_context_block(&disabled).unwrap();
     assert!(!prompt_only.content.contains("Ultra Root thinking mode"));
+    assert!(prompt_only.content.contains(ROOT_PLANNING_GUIDANCE));
 }
 
 #[cfg(test)]

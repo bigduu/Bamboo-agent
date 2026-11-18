@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{timeout_at, Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
 
@@ -202,6 +202,11 @@ impl PolledShellState {
     }
 
     pub(super) async fn wait(&self, yield_time_ms: u64) {
+        self.wait_until(Instant::now() + Duration::from_millis(yield_time_ms))
+            .await;
+    }
+
+    pub(super) async fn wait_until(&self, deadline: Instant) {
         let notified = self.completed.notified();
         tokio::pin!(notified);
         // Register before observing completion: even an immediate child exit
@@ -209,7 +214,7 @@ impl PolledShellState {
         notified.as_mut().enable();
         let running = self.output.lock().await.completion.is_none();
         if running {
-            let _ = timeout(Duration::from_millis(yield_time_ms), notified).await;
+            let _ = timeout_at(deadline, notified).await;
         }
     }
 
@@ -560,7 +565,7 @@ pub(super) async fn poll_result(
     empty_poll: Option<EmptyPoll<'_>>,
 ) -> ToolOutcome {
     let state = shell.polled.as_ref().expect("validated exec session");
-    state.wait(yield_time_ms).await;
+    shell.wait_for_polled_output(yield_time_ms).await;
     let result = state
         .take_poll(&shell.id, max_output_tokens, empty_poll)
         .await;
@@ -605,14 +610,15 @@ async fn poll_initial_result(
         shell,
         delivered: false,
     };
-    let state = shell.polled.as_ref().expect("validated initial exec");
     if let Some(owner) = &shell.initial_handoff {
+        // The initial handoff is used only outside a LocalTaskResources scope.
+        let state = shell.polled.as_ref().expect("validated initial exec");
         tokio::select! {
             _ = state.wait(yield_time_ms) => {},
             _ = owner.capture_ready() => {},
         }
     } else {
-        state.wait(yield_time_ms).await;
+        shell.wait_for_polled_output(yield_time_ms).await;
     }
     let result = take_initial_result(shell, max_output_tokens, &mut delivery, || {}).await?;
     if result.session_id.is_none() {
