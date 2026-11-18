@@ -23,6 +23,7 @@ use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
     SessionMessageKind, SessionMessageSource,
 };
+use bamboo_llm::provider::{scope_completion_diagnostics, CompletionDiagnostics};
 use bamboo_llm::LLMChunk;
 use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions};
 use serde::Deserialize;
@@ -90,6 +91,17 @@ impl SummaryRequestBudget {
             limit.saturating_sub(self.safety_margin_tokens)
         })
     }
+
+    fn output_ceiling_for_input(&self, input_tokens: u32) -> u32 {
+        if input_tokens > self.input_ceiling() {
+            return 0;
+        }
+        self.max_output_tokens.min(
+            self.safe_request_tokens()
+                .saturating_sub(self.safety_margin_tokens)
+                .saturating_sub(input_tokens),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +145,12 @@ struct SummaryPart {
     represented_source_tokens: u32,
     first_message_id: String,
     last_message_id: String,
+}
+
+struct SummaryResponse {
+    content: String,
+    finish_reason: &'static str,
+    saw_reasoning: bool,
 }
 
 /// LLM-based summarizer that calls the current session's model to generate
@@ -605,16 +623,9 @@ impl LlmSummarizer {
         requested_output_tokens: u32,
         budget: &SummaryRequestBudget,
     ) -> bool {
-        if requested_output_tokens == 0 || requested_output_tokens > budget.max_output_tokens {
-            return false;
-        }
         let counter = TiktokenTokenCounter::default();
         let input_tokens = counter.count_messages(messages);
-        input_tokens <= budget.input_ceiling()
-            && input_tokens
-                .saturating_add(requested_output_tokens)
-                .saturating_add(budget.safety_margin_tokens)
-                <= budget.safe_request_tokens()
+        (1..=budget.output_ceiling_for_input(input_tokens)).contains(&requested_output_tokens)
     }
 
     fn source_units(&self, messages: &[Message]) -> Vec<SourceUnit> {
@@ -987,7 +998,8 @@ impl LlmSummarizer {
         let input_tokens = counter.count_messages(messages);
         let input_limit = budget.input_ceiling();
         let safe_request_tokens = budget.safe_request_tokens();
-        if !self.request_fits(messages, requested_output_tokens, budget) {
+        let output_ceiling = budget.output_ceiling_for_input(input_tokens);
+        if !(1..=output_ceiling).contains(&requested_output_tokens) {
             return Err(bamboo_compression::types::BudgetError::TokenCountError(
                 format!(
                     "bounded summarization invariant failed for {stage}: input={input_tokens}, input_limit={input_limit}, output={requested_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
@@ -1021,15 +1033,40 @@ impl LlmSummarizer {
             model = %self.model,
             "Executing bounded summarization request"
         );
-        let content = self
+        let stage_error = |error: LLMError| {
+            bamboo_compression::types::BudgetError::SummaryGenerationError(format!(
+                "{stage} stage {stage_index}/{stage_count} failed: {error}"
+            ))
+        };
+        let mut response = self
             .collect_stream_response(messages, requested_output_tokens)
             .await
-            .map_err(|error| {
-                bamboo_compression::types::BudgetError::SummaryGenerationError(format!(
-                    "{stage} stage {stage_index}/{stage_count} failed: {error}"
-                ))
-            })?;
-        if content.trim().is_empty() {
+            .map_err(stage_error)?;
+        if response.finish_reason == "length"
+            && response.saw_reasoning
+            && response.content.trim().is_empty()
+            && output_ceiling > requested_output_tokens
+        {
+            tracing::info!(
+                logical_pass_id = self.logical_pass_id.as_deref().unwrap_or("untracked"),
+                stage,
+                stage_index,
+                stage_count,
+                requested_output_tokens,
+                retry_output_tokens = output_ceiling,
+                "Retrying a summarization stage that exhausted its output on reasoning"
+            );
+            response = self
+                .collect_stream_response(messages, output_ceiling)
+                .await
+                .map_err(stage_error)?;
+            if response.finish_reason == "length" && !response.content.trim().is_empty() {
+                return Err(bamboo_compression::types::BudgetError::SummaryGenerationError(
+                    format!("{stage} stage {stage_index}/{stage_count} reached its output limit after retry"),
+                ));
+            }
+        }
+        if response.content.trim().is_empty() {
             return Err(
                 bamboo_compression::types::BudgetError::EmptySummaryResponse {
                     stage: stage.to_string(),
@@ -1038,7 +1075,7 @@ impl LlmSummarizer {
                 },
             );
         }
-        Ok(content)
+        Ok(response.content)
     }
 
     async fn build_bounded_shared_context_capsule(
@@ -1439,12 +1476,12 @@ impl LlmSummarizer {
         }
     }
 
-    /// Consume an LLM stream and collect the full text response.
+    /// Collect visible text and the evidence needed to identify a reasoning cutoff.
     async fn collect_stream_response(
         &self,
         messages: &[Message],
         max_output_tokens: u32,
-    ) -> Result<String, LLMError> {
+    ) -> Result<SummaryResponse, LLMError> {
         let options = LLMRequestOptions {
             session_id: None,
             reasoning_effort: self.llm.default_compression_reasoning_effort(&self.model),
@@ -1454,24 +1491,37 @@ impl LlmSummarizer {
             request_purpose: Some("compression".to_string()),
             cache: None,
         };
-        let stream = self
-            .llm
-            .chat_stream_with_options(
+        let completion = CompletionDiagnostics::default();
+        let mut stream = scope_completion_diagnostics(
+            completion.clone(),
+            self.llm.chat_stream_with_options(
                 messages,
                 &[],
                 Some(max_output_tokens.max(1)),
                 &self.model,
                 Some(&options),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         let mut content = String::new();
-        let mut stream = stream;
+        let mut saw_reasoning = false;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result? {
                 LLMChunk::Token(text) => content.push_str(&text),
-                LLMChunk::Done => return Ok(content),
-                _ => {} // Ignore reasoning tokens, tool calls, etc.
+                LLMChunk::ReasoningToken(text) => saw_reasoning |= !text.trim().is_empty(),
+                LLMChunk::ProviderUsage {
+                    reasoning_tokens: Some(tokens),
+                    ..
+                } => saw_reasoning |= tokens > 0,
+                LLMChunk::Done => {
+                    return Ok(SummaryResponse {
+                        content,
+                        finish_reason: completion.finish_reason(),
+                        saw_reasoning,
+                    });
+                }
+                _ => {}
             }
         }
 
