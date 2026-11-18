@@ -9,7 +9,9 @@ use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_agent_core::workspace_state::{
     preview_default_session_workspace_dir, preview_pin_workspace_path,
 };
-use bamboo_domain::{Session, SessionActivationDisposition, Storage, SupervisorReference};
+use bamboo_domain::{
+    RootThinkingMode, Session, SessionActivationDisposition, Storage, SupervisorReference,
+};
 use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
 use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
 use bamboo_engine::{SessionMessenger, SessionMessengerError, SessionRepository};
@@ -233,6 +235,20 @@ impl SupervisedRootCreator {
         request: SupervisedRootCreateRequest,
         managed: Option<&ManagedRootCreation>,
     ) -> Result<ToolResult, ToolError> {
+        if request.thinking_mode == Some(RootThinkingMode::Ultra)
+            && (managed.is_some()
+                || !matches!(
+                    authority,
+                    CreationAuthority::Supervisor {
+                        original_caller: Some(_),
+                        ..
+                    }
+                ))
+        {
+            return Err(ToolError::InvalidArguments(
+                "Ultra creation requires an observed Supervisor creating an independent execution Session".into(),
+            ));
+        }
         let operation_id = request.operation_id;
         let (digest, reserved_id, mut fingerprint) = authority.operation_identity(&request)?;
         if let Some(managed) = managed {
@@ -393,7 +409,7 @@ impl SupervisedRootCreator {
             managed.and_then(|managed| managed.spec.managed_root.as_ref().map(|root| &root.model));
         let mut candidate = self
             .build_candidate(&operation, &request, &workspace, model)
-            .await;
+            .await?;
         if let Some(managed) = managed {
             candidate.metadata.insert(
                 ticket_runtime::TICKET_DISPATCH_KEY.into(),
@@ -599,7 +615,7 @@ impl SupervisedRootCreator {
         request: &SupervisedRootCreateRequest,
         workspace: &std::path::Path,
         model: Option<&bamboo_domain::ProviderModelRef>,
-    ) -> Session {
+    ) -> Result<Session, ToolError> {
         use bamboo_engine::session_app::session_create::{
             build_new_session, CreateSessionConfig, CreateSessionInput,
         };
@@ -630,6 +646,11 @@ impl SupervisedRootCreator {
                 builtin_fallback_prompt: super::DEFAULT_BASE_PROMPT,
             },
         );
+        if let Some(mode) = request.thinking_mode {
+            candidate
+                .set_root_orchestration_only(mode.enabled())
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        }
         if request.project_id.is_none() {
             candidate.metadata.insert(
                 WORKSPACE_SOURCE_METADATA_KEY.into(),
@@ -648,7 +669,7 @@ impl SupervisedRootCreator {
         candidate
             .metadata
             .insert("session.origin.v1".into(), "supervisor_created".into());
-        candidate
+        Ok(candidate)
     }
 
     fn standalone_workspace(&self, id: &str) -> io::Result<PathBuf> {

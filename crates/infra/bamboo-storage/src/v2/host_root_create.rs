@@ -25,9 +25,10 @@ fn root_first_input_request(
     operation_id: Uuid,
     candidate: &Session,
     envelope: &bamboo_domain::SessionMessageEnvelope,
+    allow_ultra: bool,
 ) -> io::Result<(Option<bamboo_domain::ProjectId>, String)> {
     use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
-    let project = super::supervisor_management::new_root_candidate_project(candidate)?;
+    let project = super::supervisor_management::new_root_candidate_project(candidate, allow_ultra)?;
     let workspace = candidate
         .workspace_path_meta()
         .ok_or_else(|| denied("host_session_create_workspace_missing"))?;
@@ -88,7 +89,7 @@ impl SessionStoreV2 {
         candidate: &Session,
         envelope: &bamboo_domain::SessionMessageEnvelope,
     ) -> io::Result<super::host_session_scope::LegacySessionDeliveryGuards> {
-        root_first_input_request(caller, operation_id, candidate, envelope)?;
+        root_first_input_request(caller, operation_id, candidate, envelope, true)?;
         let authority = self
             .lock_unscoped_supervisor_delivery(
                 caller,
@@ -110,7 +111,7 @@ impl SessionStoreV2 {
         envelope: &bamboo_domain::SessionMessageEnvelope,
     ) -> io::Result<HostCreatedRootDeliveryGuards> {
         let (project, workspace) =
-            root_first_input_request(caller, operation_id, candidate, envelope)?;
+            root_first_input_request(caller, operation_id, candidate, envelope, false)?;
         let project = project.ok_or_else(|| denied("target has no Project"))?;
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
@@ -158,7 +159,7 @@ impl SessionStoreV2 {
         if candidate.id != reserved_id || candidate.id == caller.session_id {
             return Err(denied("host_session_create_reservation_changed"));
         }
-        let project = super::supervisor_management::new_root_candidate_project(candidate)?
+        let project = super::supervisor_management::new_root_candidate_project(candidate, false)?
             .ok_or_else(|| denied("target has no Project"))?;
         let workspace = candidate
             .workspace_path_meta()
