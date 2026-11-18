@@ -1,5 +1,5 @@
-//! Ultra uses the production Root runner, SubAgent and a real BambooRuntime
-//! worker. Only the remote model is replaced by a loopback SSE provider.
+//! Ultra uses the production Root runner, SubAgent and real BambooRuntime
+//! workers. Only the remote model is replaced by a loopback SSE provider.
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Mutex,
@@ -17,13 +17,17 @@ use read_only_child_host::{reported_result, Host};
 
 const REQUIRED: &str =
     "ULTRA_REQUIRED: update the Root output and delegate independent read-only verification";
+const CHECKS: [&str; 3] = ["CHECK_INPUTS", "CHECK_SCOPE", "CHECK_ACCEPTANCE"];
+const EVIDENCE_PREFIX: &str = "PLAN_PROVIDER_EVIDENCE: ";
 
 #[derive(Default)]
 struct ProviderProbe {
     requests: Mutex<Vec<Value>>,
     root_calls: AtomicUsize,
-    release_child: AtomicBool,
-    child_ready: Notify,
+    child_calls: AtomicUsize,
+    child_started: Notify,
+    release_children: AtomicBool,
+    children_released: Notify,
     root_output_path: Mutex<std::path::PathBuf>,
 }
 
@@ -37,42 +41,79 @@ fn chunk(delta: Value, finish_reason: Option<&str>) -> String {
     )
 }
 
+fn tool_response(id: &str, name: &str, arguments: Value) -> (Value, &'static str) {
+    (
+        json!({"tool_calls": [{
+            "index": 0,
+            "id": id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments.to_string()}
+        }]}),
+        "tool_calls",
+    )
+}
+
 async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>) -> HttpResponse {
     let body = body.into_inner();
     let rendered = body.to_string();
     probe.requests.lock().unwrap().push(body.clone());
     let (delta, finish) = if body["model"] == "planner-test" {
-        // Hold the actual worker's provider call until the test observes the
-        // durable parent wait. No runtime is allowed to invent child success.
+        let check = CHECKS
+            .iter()
+            .find(|check| rendered.contains(**check))
+            .expect("planner receives a distinct assigned check");
+        probe.child_calls.fetch_add(1, Ordering::SeqCst);
+        probe.child_started.notify_waiters();
+        // Hold each real worker in inference until the Root has done its work
+        // and the test observes its durable wait.
         loop {
-            let wake = probe.child_ready.notified();
-            if probe.release_child.load(Ordering::SeqCst) {
+            let wake = probe.children_released.notified();
+            if probe.release_children.load(Ordering::SeqCst) {
                 break;
             }
             wake.await;
         }
         (
-            reported_result("PLAN_PROVIDER_EVIDENCE: verified the read-only scope"),
+            reported_result(&format!("{EVIDENCE_PREFIX}{check}")),
             "stop",
         )
     } else if rendered.contains("Ultra Root thinking mode") {
-        match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
-            0 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-write","type":"function","function":{"name":"Write","arguments":json!({"file_path":probe.root_output_path.lock().unwrap().clone(),"content":"root draft"}).to_string()}}]}),
-                "tool_calls",
+        let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
+        match round {
+            0..=2 => tool_response(
+                &format!("ultra-plan-{round}"),
+                "SubAgent",
+                json!({"role": "explorer", "message": format!("{}\n{REQUIRED}", CHECKS[round])}),
             ),
-            1 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-edit","type":"function","function":{"name":"Edit","arguments":json!({"file_path":probe.root_output_path.lock().unwrap().clone(),"old_string":"root draft","new_string":"root verified"}).to_string()}}]}),
-                "tool_calls",
+            3 => {
+                loop {
+                    let started = probe.child_started.notified();
+                    if probe.child_calls.load(Ordering::SeqCst) >= CHECKS.len() {
+                        break;
+                    }
+                    started.await;
+                }
+                tool_response(
+                    "ultra-write",
+                    "Write",
+                    json!({"file_path": probe.root_output_path.lock().unwrap().clone(), "content": "root draft"}),
+                )
+            }
+            4 => tool_response(
+                "ultra-edit",
+                "Edit",
+                json!({"file_path": probe.root_output_path.lock().unwrap().clone(), "old_string": "root draft", "new_string": "root verified"}),
             ),
-            2 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
-                "tool_calls",
-            ),
-            3 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
-                "tool_calls",
-            ),
+            _ if CHECKS
+                .iter()
+                .any(|check| !rendered.contains(&format!("{EVIDENCE_PREFIX}{check}"))) =>
+            {
+                tool_response(
+                    &format!("ultra-plan-wait-{round}"),
+                    "SubAgent",
+                    json!({"intent": "wait"}),
+                )
+            }
             _ => (
                 json!({"content":"ROOT_VERIFIED_PLAN: synthesized the delegated provider evidence"}),
                 "stop",
@@ -88,7 +129,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
 }
 
 #[test]
-fn ultra_root_delegates_to_a_real_read_only_provider_worker_and_resumes() {
+fn ultra_root_works_while_parallel_read_only_children_run_and_resumes() {
     // Run the loopback provider fixture on its own Actix system thread.
     std::thread::Builder::new()
         .name("ultra-root-fixture".into())
@@ -131,7 +172,7 @@ async fn run_ultra_fixture() {
         "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test", "runtime_models":["root-test","planner-test"]}},
         "defaults":{"chat":{"provider":"openai","model":"root-test","reasoning_effort":"high"},
                     "subagent_models":{"explorer":{"provider":"openai","model":"planner-test"}}},
-        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
+        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "fabric_dir":home_path.join("fabric"), "max_concurrent":CHECKS.len()}
     });
     std::fs::write(
         home_path.join("config.json"),
@@ -148,24 +189,16 @@ async fn run_ultra_fixture() {
     assert_eq!(response.status().as_u16(), 201);
     let response = host.post(&format!("execute/{root_id}"), json!({})).await;
     assert!(response.status().is_success(), "execute must start");
-    let (waiting_root, child_id) = tokio::time::timeout(Duration::from_secs(45), async {
+    let (waiting_root, child_ids) = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let root = host.session(root_id).await;
             let wait = root
                 .agent_runtime_state
                 .as_ref()
                 .and_then(|runtime| runtime.waiting_for_children.as_ref());
-            let child_called_provider = probe
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request["model"] == "planner-test");
-            if child_called_provider {
-                if let Some(wait) = wait {
-                    let child_id = wait.child_session_ids[0].clone();
-                    break (root, child_id);
-                }
+            if let Some(wait) = wait {
+                let child_ids = wait.child_session_ids.clone();
+                break (root, child_ids);
             }
             if root
                 .messages
@@ -180,16 +213,18 @@ async fn run_ultra_fixture() {
                     .map(|message| message.content.chars().take(512).collect::<String>())
                     .collect();
                 panic!(
-                    "Root finished before a real planner request; tool_results={tool_results:?}"
+                    "Root finished before waiting for the children; tool_results={tool_results:?}"
                 );
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the Root must wait for the real provider worker");
+    .expect("the Root must wait after running its own tools alongside three provider workers");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
     assert_eq!(waiting_root.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(child_ids.len(), CHECKS.len());
+    assert_eq!(probe.child_calls.load(Ordering::SeqCst), CHECKS.len());
     for call_id in ["ultra-write", "ultra-edit"] {
         assert!(
             waiting_root.messages.iter().any(|message| {
@@ -203,21 +238,23 @@ async fn run_ultra_fixture() {
         std::fs::read_to_string(&root_output_path).unwrap(),
         "root verified"
     );
-    let child = host.session(&child_id).await;
-    assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
-    assert_eq!(child.root_thinking_mode(), RootThinkingMode::Standard);
-    assert_eq!(child.reasoning_effort, None);
-    assert_eq!(
-        child.metadata.get("external.protocol").map(String::as_str),
-        Some("actor")
-    );
+    for child_id in &child_ids {
+        let child = host.session(child_id).await;
+        assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
+        assert_eq!(child.root_thinking_mode(), RootThinkingMode::Standard);
+        assert_eq!(child.reasoning_effort, None);
+        assert_eq!(
+            child.metadata.get("external.protocol").map(String::as_str),
+            Some("actor")
+        );
+    }
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        4,
-        "Root has not synthesized an unfinished child"
+        6,
+        "Root has dispatched three children, written, edited and requested one wait"
     );
-    probe.release_child.store(true, Ordering::SeqCst);
-    probe.child_ready.notify_waiters();
+    probe.release_children.store(true, Ordering::SeqCst);
+    probe.children_released.notify_waiters();
     let completed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let root = host.session(root_id).await;
@@ -232,38 +269,53 @@ async fn run_ultra_fixture() {
         }
     })
     .await
-    .expect("Root must resume and synthesize actual child evidence");
-    assert!(completed
-        .messages
-        .iter()
-        .any(|message| message.content.contains("PLAN_PROVIDER_EVIDENCE")));
-    let child = host.session(&child_id).await;
-    assert!(child
-        .messages
-        .iter()
-        .any(|message| message.content.contains("PLAN_PROVIDER_EVIDENCE")));
+    .expect("Root must resume and synthesize all actual child evidence");
+    let mut child_evidence = Vec::new();
+    for child_id in &child_ids {
+        let child = host.session(child_id).await;
+        let report = child
+            .messages
+            .into_iter()
+            .find(|message| message.content.contains(EVIDENCE_PREFIX))
+            .expect("each Child persisted a provider report");
+        child_evidence.push(report.content);
+    }
+    for check in CHECKS {
+        let evidence = format!("{EVIDENCE_PREFIX}{check}");
+        assert!(completed
+            .messages
+            .iter()
+            .any(|message| message.content.contains(&evidence)));
+        assert!(child_evidence
+            .iter()
+            .any(|report| report.contains(&evidence)));
+    }
     let requests = probe.requests.lock().unwrap().clone();
     let root_requests: Vec<_> = requests
         .iter()
         .filter(|request| request.to_string().contains("Ultra Root thinking mode"))
         .collect();
-    assert!(root_requests.len() >= 5);
+    assert!(root_requests.len() >= 7);
     for request in root_requests {
         assert_eq!(request["reasoning_effort"], "high");
         assert!(request.to_string().contains(REQUIRED));
+        assert!(request
+            .to_string()
+            .contains("Launch ready independent SubAgent assignments in parallel"));
     }
-    let child_request = requests
+    let child_requests: Vec<_> = requests
         .iter()
-        .find(|request| request["model"] == "planner-test")
-        .unwrap();
-    assert!(
-        child_request.get("reasoning_effort").is_none(),
-        "planner uses its own ordinary provider default, not the Root's High override"
-    );
-    assert!(child_request.to_string().contains(REQUIRED));
-    assert!(!child_request
-        .to_string()
-        .contains("Ultra Root thinking mode"));
+        .filter(|request| request["model"] == "planner-test")
+        .collect();
+    assert_eq!(child_requests.len(), CHECKS.len());
+    for request in child_requests {
+        assert!(
+            request.get("reasoning_effort").is_none(),
+            "planner uses its own provider default"
+        );
+        assert!(request.to_string().contains(REQUIRED));
+        assert!(!request.to_string().contains("Ultra Root thinking mode"));
+    }
     assert!(requests
         .iter()
         .all(|request| request["reasoning_effort"] != "ultra"
