@@ -450,6 +450,22 @@ impl LocalTaskChildRunner {
             .clone()
             .ok_or("Host local task runtime is unavailable".into())
     }
+
+    fn is_live_execution(
+        &self,
+        execution: &Execution,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && execution.owner.fence.run_id == run_id
+            && execution.owner.created_at == child_birth
+            && execution.owner.fence.actor_id == session_id
+            && !execution.cancel.is_cancelled()
+            && *lock(&execution.launch) == LaunchState::Running
+            && lock(&execution.slot).is_some()
+    }
 }
 
 #[async_trait]
@@ -542,14 +558,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let renewal_started_at = *lock(&execution.signals.renewal_started_at);
         // Sample first so a renewal confirmed during closure cannot pass a
         // lifecycle check that preceded the sample.
-        if self.closed.load(Ordering::Acquire)
-            || execution.owner.fence.run_id != run_id
-            || execution.owner.created_at != child_birth
-            || execution.owner.fence.actor_id != session_id
-            || execution.cancel.is_cancelled()
-            || *lock(&execution.launch) != LaunchState::Running
-            || lock(&execution.slot).is_none()
-        {
+        if !self.is_live_execution(&execution, session_id, run_id, child_birth) {
             return None;
         }
         Some(crate::execution::spawn::NativeTaskLiveness {
@@ -562,6 +571,19 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             },
             renewal_started_at,
         })
+    }
+
+    fn shell_wait_activity_at(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let execution = lock(&self.executions).get(session_id)?.clone();
+        let activity = execution.resources.shell_wait_activity_at(now)?;
+        self.is_live_execution(&execution, session_id, run_id, child_birth)
+            .then_some(activity)
     }
 
     fn supports_native_ticket_budget(&self) -> bool {

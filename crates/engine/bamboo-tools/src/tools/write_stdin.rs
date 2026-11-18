@@ -183,7 +183,7 @@ impl Tool for WriteStdinTool {
                 // A failed write may race process exit or output-pump drain.
                 // Wait once without consuming output, then keep polling an
                 // observed exit even if its captured result is not final yet.
-                state.wait(wait_ms).await;
+                shell.wait_for_polled_output(wait_ms).await;
                 if !state.is_complete().await && !state.process_exited() {
                     return Err(ToolError::Execution(error));
                 }

@@ -2,6 +2,7 @@ use super::*;
 use crate::tools::WriteStdinTool;
 use serde_json::Value;
 use tokio::io::{duplex, AsyncWriteExt};
+use tokio::time::timeout;
 
 fn context(owner: &str) -> ToolCtx {
     let mut ctx = ToolCtx::none("exec-session-test");
@@ -862,6 +863,44 @@ mod process_tests {
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("out"));
         assert!(output.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn owned_initial_exec_records_wait_completion() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("owned-initial-capture-{}", uuid::Uuid::new_v4());
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let started = chrono::Utc::now();
+        let resources = crate::LocalTaskResources::new(&owner, "initial-capture-run", started);
+        let result = resources
+            .scope(async {
+                let tool = ExecCommandTool::new();
+                let mut invocation = tool.invoke(
+                    json!({"cmd":"exit 7", "yield_time_ms":30_000}),
+                    context(&owner),
+                );
+                assert!(futures::poll!(invocation.as_mut()).is_pending());
+                let ids = bash_runtime::uncollected_polled_shells_for_session(&owner);
+                assert_eq!(ids.len(), 1);
+                let shell = bash_runtime::get_shell(&ids[0]).unwrap();
+                assert!(shell.initial_handoff.is_none());
+                payload(
+                    timeout(Duration::from_secs(5), invocation)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            })
+            .await;
+        let finished = resources.shell_wait_activity_at(chrono::Utc::now());
+        timeout(Duration::from_secs(5), resources.close_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.get("session_id").is_none());
+        assert_eq!(result["exit_code"], 7);
+        assert!(finished.is_some_and(|finished| finished >= started));
     }
 
     #[tokio::test]
