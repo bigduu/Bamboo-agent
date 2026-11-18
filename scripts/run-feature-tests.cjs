@@ -183,7 +183,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2802 changes unconditional disabled-tool alias resolution in Config.
 // Its regression stays in default packages-4. Feature cfg, four additive
 // contexts and twenty feature-only cases retain their existing owners.
-const FEATURE_SOURCE_SHA256 = "5e7db1631013b9b1ea9566fd1851a53b748952035f7992c9c914eb9a8bfc1da2";
+// #2807 changes guidance assembly in the feature-sensitive stream runner.
+// Guide/cache cases stay in default Engine/packages-3. The token-usage-log
+// cfg, four additive contexts and twenty feature-only cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "1064fa19d6f98919a7402530a5fb8e8f5d2c0f84371f2576f50880b42bc902e6";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

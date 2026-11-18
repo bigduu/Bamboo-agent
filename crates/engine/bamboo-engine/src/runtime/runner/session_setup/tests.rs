@@ -1350,7 +1350,7 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
 }
 
 #[test]
-fn legacy_projection_keeps_deferred_tools_with_short_guide_descriptions() {
+fn legacy_projection_uses_real_descriptions_for_deferred_tools() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
         schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
@@ -1365,17 +1365,10 @@ fn legacy_projection_keeps_deferred_tools_with_short_guide_descriptions() {
 
     assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
 
-    // Inactive discoverable tools get shortened descriptions
-    let sleep = resolved
-        .iter()
-        .find(|s| s.function.name == "Sleep")
-        .unwrap();
-    assert!(sleep.function.description.contains("Discoverable"));
-    let scheduler = resolved
-        .iter()
-        .find(|s| s.function.name == "scheduler")
-        .unwrap();
-    assert!(scheduler.function.description.contains("Discoverable"));
+    assert_eq!(
+        serde_json::to_value(&resolved).unwrap(),
+        serde_json::to_value(&tools.schemas).unwrap()
+    );
 }
 
 #[test]
@@ -1526,8 +1519,8 @@ fn default_models_use_yielding_shell_and_resident_view_image() {
         .iter()
         .find(|section| section.name == "tool_guide")
         .unwrap();
-    assert!(guide.content.contains("write_stdin"));
-    assert!(guide.content.contains("exec_command"));
+    assert!(!guide.content.contains("write_stdin"));
+    assert!(!guide.content.contains("exec_command"));
 
     for disabled in [
         "bash",
@@ -1790,7 +1783,7 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
 }
 
 #[test]
-fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_disabled_tool_leak() {
+fn supervisor_delegation_contract_without_user_activation_or_disabled_tool_leak() {
     use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
@@ -1826,9 +1819,12 @@ fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_dis
             &supervisor.id,
             &effective_guide_activation(&config, &supervisor),
         );
-        assert!(guide.contains("**SubAgent**"));
-        assert!(guide.contains("A trusted Supervisor delegates execution even for simple tasks"));
-        assert!(guide.contains("From a child session"));
+        assert!(!guide.contains("**SubAgent**"));
+        let role = super::prompt_envelope::build_root_orchestration_context_block(&supervisor)
+            .expect("Supervisor role context");
+        assert!(role
+            .content
+            .contains("Delegate execution, including simple implementation tasks"));
     }
     let config = crate::runtime::config::AgentLoopConfig {
         disabled_tools: ["SubAgent".into()].into(),
@@ -1963,7 +1959,7 @@ fn session_port_catalog_uses_concrete_host_schema_for_ordinary_ultra_supervisor_
 }
 
 #[test]
-fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
+fn ultra_root_keeps_subagent_schema_without_a_second_builtin_guide() {
     use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
     let config = crate::runtime::config::AgentLoopConfig {
         freeze_tool_exposure_for_cache: true,
@@ -1996,7 +1992,10 @@ fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
         .map(|schema| schema.function.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["Edit", "Read", "SubAgent"]);
-    assert!(!schemas[2].function.description.contains("Discoverable"));
+    assert_eq!(
+        schemas[2].function.description,
+        schema("SubAgent").function.description
+    );
     let guide = super::prompt_setup::build_tool_guide_context(
         &config,
         &schemas,
@@ -2004,16 +2003,7 @@ fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
         &root.id,
         &effective_guide_activation(&config, &root),
     );
-    assert!(guide.contains("**SubAgent**"));
-    assert!(guide.contains("omit unused fields"));
-    assert!(guide.contains("intent=inspect"));
-    assert!(guide.contains("ParentRequest"));
-    assert!(guide.contains("approve_once or deny"));
-    let spec = bamboo_tools::guide::builtin_guides::builtin_guide_spec("SubAgent")
-        .expect("SubAgent guide");
-    for example in spec.examples.iter().take(2) {
-        assert!(guide.contains(&serde_json::to_string(&example.parameters).unwrap()));
-    }
+    assert!(!guide.contains("SubAgent"));
     assert_eq!(root.metadata["prompt_tool_exposure_activated"], "[]");
     assert!(bamboo_tools::exposure::activated_discoverable_tools(&root).is_empty());
 }
@@ -2067,13 +2057,15 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
     assert!(!child_schemas
         .iter()
         .any(|schema| schema.function.name == "Bash"));
-    assert!(child_schemas
-        .iter()
-        .find(|schema| schema.function.name == "SubAgent")
-        .unwrap()
-        .function
-        .description
-        .contains("Discoverable"));
+    assert_eq!(
+        child_schemas
+            .iter()
+            .find(|schema| schema.function.name == "SubAgent")
+            .unwrap()
+            .function
+            .description,
+        schema("SubAgent").function.description
+    );
     root.set_root_orchestration_only(false).unwrap();
     assert!(!effective_guide_activation(&ordinary_config, &root).contains("SubAgent"));
 }
@@ -2081,11 +2073,11 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
 #[test]
 fn default_delegation_prompts_use_the_compact_subagent_contract() {
     let base = crate::runtime::context::DEFAULT_BASE_PROMPT;
-    for field in ["intent", "target", "role", "message", "reply_to"] {
-        assert!(base.contains(&format!("`{field}`")), "missing {field}");
-    }
-    assert!(base.contains("workspace paths and files"));
-    assert!(base.contains("runtime manages activation and waiting"));
+    assert!(
+        !base.contains("SubAgent"),
+        "the schema supplies the SubAgent call contract"
+    );
+    assert!(crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("delegate independent work"));
     for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
         for stale in [
             "set `workspace`",
@@ -2533,16 +2525,16 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    // All tools are available; inactive discoverable ones get shortened descriptions
+    // Guide activation does not change the callable schema.
     assert_eq!(names, vec!["Write", "session_history"]);
     let session_history = resolved
         .iter()
         .find(|s| s.function.name == "session_history")
         .unwrap();
-    assert!(session_history
-        .function
-        .description
-        .contains("Discoverable"));
+    assert_eq!(
+        session_history.function.description,
+        schema("session_history").function.description
+    );
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")
@@ -3043,9 +3035,7 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
         .content
         .contains(&format!("Workspace path: {}", workspace.display())));
     assert!(instruction_context.content.contains("Workspace policy"));
-    assert!(env_context
-        .content
-        .contains("environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(env_context.content.contains("available to tool processes."));
     let expected_layout = format!(
         "base_prompt:core_static:static:1:{};project_context:environment_project:static:0:0;workspace_context:environment_workspace:dynamic:1:{};instruction_context:environment_instruction:dynamic:1:{};env_context:environment_configuration:dynamic:1:{};skill_context:skill_metadata:dynamic:1:{};tool_guide_context:capability_tool:dynamic:1:{}",
         base_prompt.len(),
@@ -3223,7 +3213,7 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
         .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
     assert!(!stable
         .stable_instructions
-        .contains("environment variables were explicitly configured by the user inside Bodhi"));
+        .contains("available to tool processes."));
     assert!(!stable.stable_instructions.contains("## Skill"));
     assert!(!stable
         .stable_instructions
@@ -3450,7 +3440,7 @@ fn cached_tool_descriptions_stay_stable_while_live_disables_still_apply() {
 }
 
 #[test]
-fn disabling_cache_freeze_restores_live_guide_expansion() {
+fn disabling_cache_freeze_keeps_descriptions_and_uses_live_custom_guide_activation() {
     use super::tool_schemas::resolve_tool_schemas_for_round;
     let mut config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
@@ -3461,7 +3451,11 @@ fn disabling_cache_freeze_restores_live_guide_expansion() {
     bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
     config.freeze_tool_exposure_for_cache = false;
     let live = resolve_tool_schemas_for_round(&config, &tools, &mut session);
-    assert!(!live[0].function.description.contains("Discoverable"));
+    assert_eq!(
+        serde_json::to_value(&live).unwrap(),
+        serde_json::to_value(&tools.schemas).unwrap()
+    );
+    assert!(super::tool_schemas::effective_guide_activation(&config, &session).contains("Sleep"));
     assert!(!session
         .metadata
         .contains_key("prompt_tool_exposure_activated"));
@@ -3543,7 +3537,7 @@ async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_
 }
 
 #[test]
-fn supervisor_task_routing_schemas_preserve_ordinary_contracts() {
+fn supervisor_task_routing_appears_once_in_role_context() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     use bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
     let config = crate::runtime::config::AgentLoopConfig::default();
@@ -3561,7 +3555,7 @@ fn supervisor_task_routing_schemas_preserve_ordinary_contracts() {
         let schemas =
             resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor);
         assert_eq!(schemas.len(), 3);
-        assert!(schemas.iter().all(|schema| schema
+        assert!(schemas.iter().all(|schema| !schema
             .function
             .description
             .contains(SUPERVISOR_SESSION_ROUTING_GUIDANCE)));
@@ -3576,10 +3570,19 @@ fn supervisor_task_routing_schemas_preserve_ordinary_contracts() {
             &supervisor.id,
             &super::tool_schemas::effective_guide_activation(&config, &supervisor),
         );
-        assert!(guide.contains("session_history list"));
-        assert!(guide.contains("auxiliary planning"));
+        assert!(!guide.contains("session_history list"));
+        assert!(!guide.contains("auxiliary planning"));
+        let role =
+            super::prompt_envelope::build_root_orchestration_context_block(&supervisor).unwrap();
+        assert_eq!(
+            role.content
+                .matches(SUPERVISOR_SESSION_ROUTING_GUIDANCE)
+                .count(),
+            1
+        );
     }
     let ordinary = Session::new("ordinary-policy", "model");
+    assert!(super::prompt_envelope::build_root_orchestration_context_block(&ordinary).is_none());
     let ordinary_schemas =
         resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &ordinary);
     assert!(ordinary_schemas.iter().all(|schema| !schema

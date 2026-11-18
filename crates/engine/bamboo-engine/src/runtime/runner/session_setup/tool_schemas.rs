@@ -4,14 +4,14 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_agent_core::Session;
 use bamboo_domain::{
-    resolve_disabled_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
-    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
+    resolve_disabled_tool_reference_name, CapabilityLoadingMode, ClassifiedToolSchema,
+    EffectiveCallableSet, SessionKind,
 };
 #[cfg(test)]
 use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
-use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
+use bamboo_tools::exposure::activated_discoverable_tools;
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
@@ -46,14 +46,9 @@ pub(crate) fn resolve_tool_schemas_for_round(
     tools: &dyn ToolExecutor,
     session: &mut Session,
 ) -> Vec<ToolSchema> {
+    let catalog = resolve_classified_tool_catalog_for_session(config, tools, session);
     if config.freeze_tool_exposure_for_cache {
         use sha2::{Digest, Sha256};
-        let catalog = resolve_catalog_with_activation(
-            config,
-            tools,
-            session,
-            &std::collections::BTreeSet::new(),
-        );
         let schemas = catalog
             .iter()
             .map(|entry| entry.schema())
@@ -79,7 +74,7 @@ pub(crate) fn resolve_tool_schemas_for_round(
         session.metadata.remove(EXPOSURE_SIGNATURE);
         session.metadata.remove(EXPOSURE_ACTIVATED);
     }
-    resolve_available_tool_schemas_for_session(config, tools, session)
+    model_tool_schemas(catalog)
 }
 
 /// Only an already active legacy Plan Mode session needs its exit handshake.
@@ -101,7 +96,12 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     tools: &dyn ToolExecutor,
     session: &Session,
 ) -> Vec<ToolSchema> {
-    let catalog = resolve_classified_tool_catalog_for_session(config, tools, session);
+    model_tool_schemas(resolve_classified_tool_catalog_for_session(
+        config, tools, session,
+    ))
+}
+
+fn model_tool_schemas(catalog: Vec<ClassifiedToolSchema>) -> Vec<ToolSchema> {
     let effective = EffectiveCallableSet::from_catalog(
         &catalog,
         CapabilityLoadingMode::LegacyFullCatalog,
@@ -125,20 +125,6 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
     session: &Session,
-) -> Vec<ClassifiedToolSchema> {
-    resolve_catalog_with_activation(
-        config,
-        tools,
-        session,
-        &effective_guide_activation(config, session),
-    )
-}
-
-fn resolve_catalog_with_activation(
-    config: &AgentLoopConfig,
-    tools: &dyn ToolExecutor,
-    session: &Session,
-    activated: &std::collections::BTreeSet<String>,
 ) -> Vec<ClassifiedToolSchema> {
     let bound = tools.for_session(session);
     let tools = bound.as_deref().unwrap_or(tools);
@@ -204,31 +190,7 @@ fn resolve_catalog_with_activation(
 
     super::legacy_instruction::retain_terminal_activation_tools(session, &mut tool_schemas);
 
-    // Legacy providers keep Deferred schemas visible during migration;
-    // activation only controls the depth of the existing tool-guide summaries.
-    for schema in &mut tool_schemas {
-        let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
-            continue;
-        };
-        // The guide shortener also canonicalizes legacy aliases internally.
-        // Keep the complete Root contract instead of turning its description
-        // back into the old Child-spawn guide through that compatibility path.
-        if schema.function.name == "spawn_session" {
-            continue;
-        }
-        let guide_name = identity.alias_fallback_name();
-        if identity.loading_class() == CapabilityLoadingClass::Deferred
-            && !activated.contains(guide_name)
-        {
-            if let Some(short) = expandable_tool_short_description(guide_name) {
-                schema.function.description =
-                    format!("[Discoverable — not fully activated] {}", short);
-            }
-        }
-    }
-
     if session.supervisor_incarnation_id().is_some() {
-        let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
         let has_project_create = session.allows_model_tool_execution("session_control")
             && tool_schemas.iter().any(|schema| {
                 schema.function.name == "session_control"
@@ -250,7 +212,7 @@ fn resolve_catalog_with_activation(
             match schema.function.name.as_str() {
                 "SubAgent" => {
                     *description = format!(
-                        "Supervisor: delegate execution to an authorized independent Session. {routing} Use session_history list and bounded inspect to verify a candidate when needed. Use SubAgent only for auxiliary planning, review or verification; keep main execution in the independent Root. If no suitable authorized target or creation route is available, report the actual recoverable blocker. {description}"
+                        "Supervisor: delegate execution to an authorized independent Session. Use SubAgent only for auxiliary planning, review or verification. {description}"
                     );
                 }
                 "spawn_session" if has_project_create => {
@@ -268,9 +230,6 @@ fn resolve_catalog_with_activation(
                         properties.remove("project_id");
                         properties.remove("workspace_path");
                     }
-                }
-                "session_control" | "session_message" | "spawn_session" => {
-                    *description = format!("{routing} {description}");
                 }
                 _ => {}
             }

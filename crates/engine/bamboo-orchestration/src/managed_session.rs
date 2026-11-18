@@ -46,7 +46,7 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
     Ok(())
 }
 
-/// Shared by the Supervisor prompt and the tool guide.
+/// Placement and dispatch policy in the Supervisor's role context.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
     "When a new assignment requires a specific Project, use session_control create with its verified Project and bound workspace. ",
