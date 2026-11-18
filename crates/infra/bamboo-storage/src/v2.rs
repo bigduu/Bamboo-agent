@@ -1161,6 +1161,8 @@ pub struct SessionIndexEntry {
     /// Typed permission mode mirrored from the session runtime state.
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_profile_revision: Option<u64>,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6026,6 +6028,9 @@ impl SessionStoreV2 {
             plan_mode,
             bypass_permissions,
             permission_mode,
+            supervisor_profile_revision: session
+                .supervisor_incarnation_id()
+                .map(|_| session.metadata_version),
             last_run_status,
             last_run_error,
             token_usage: session.token_usage.clone(),
@@ -7754,7 +7759,11 @@ impl SessionStoreV2 {
         )
         .await?;
         self.validate_authority_for_save(session).await?;
-        self.validate_root_context_for_full_save(session).await?;
+        self.validate_root_context_for_full_save(
+            session,
+            guards.writes_supervisor_execution_profile(),
+        )
+        .await?;
         self.validate_child_project_for_write(session, true, None)
             .await?;
         self.reject_regressing_runtime_task(session).await?;

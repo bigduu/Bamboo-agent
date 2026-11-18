@@ -26,11 +26,21 @@ Supervisor can select `thinking_mode: "ultra"` in either `spawn_session` or
 including direct reads and edits and delegation of shell work to SubAgents.
 Keep the selected mode in the exact request when retrying a creation.
 
-The worker's ordinary global defaults and
-Project context come from the same pure creation use case as `POST /sessions`;
-its initial session permission mode is Default. It inherits no Supervisor
-history, private prompt, selected model, workspace or privileges. A bounded
-SubAgent creates a Child; a formal Work/Ticket uses the canonical Ticket API.
+The worker uses the same global defaults and Project context as `POST /sessions`.
+When the owner confirms Auto for dispatches on the Supervisor, fresh independent
+execution Sessions start in Auto. The revisioned Supervisor profile stores
+this distinct consent through `supervisor_auto_dispatch: true` together with
+`permission_mode: "auto"`. The plain Auto choice applies to the Supervisor Session.
+Bypass is the default for independent execution Sessions. It skips
+ordinary approvals and retains forced confirmations for shell operations such
+as `source` and `sudo`. The initial permission mode is saved with the creation
+reservation and reused on retry. The reservation holds the same physical
+profile lock as consent changes, so each new dispatch uses the consent valid
+when its reservation commits. Each existing Session owns its permission mode.
+
+The new Root has its own history, prompt, model, workspace and Ordinary Root
+authority. A bounded SubAgent creates a Child, and formal Work/Ticket uses the
+canonical Ticket API.
 This entry creates neither a Ticket nor an isolated Git worktree. The Host must
 prepare an appropriate workspace before invoking it.
 

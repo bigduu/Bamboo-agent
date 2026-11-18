@@ -6,12 +6,12 @@ use actix_web::{http::StatusCode, test, web, App};
 
 use bamboo_agent_core::tools::{
     with_executing_session_caller, ExecutingSupervisorObservation, FunctionCall, ToolCall,
-    ToolError, ToolExecutionContext, ToolOutcome,
+    ToolError, ToolExecutionContext, ToolExecutionSessionFlags, ToolOutcome,
 };
 use bamboo_domain::{
     ActorActivationStatus, ActorDirectoryPort, RootModeOperationAction, RootModeOperationRequest,
     RootThinkingMode, SessionCallerReference, SessionInboxPort, SessionKind, SessionMessageId,
-    SupervisorReference,
+    SessionPermissionMode, SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
@@ -177,6 +177,65 @@ impl Fixture {
         serde_json::from_str(&result.result).unwrap()
     }
 
+    async fn set_supervisor_permission_mode(
+        &self,
+        mode: SessionPermissionMode,
+        auto_dispatch: bool,
+    ) {
+        let supervisor = self
+            .state
+            .storage
+            .load_root_authority(&self.supervisor.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(self.state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let mut payload = json!({"permission_mode": mode});
+        if auto_dispatch {
+            payload["supervisor_auto_dispatch"] = json!(true);
+        }
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", supervisor.id))
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", supervisor.metadata_version),
+                ))
+                .set_json(payload)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .parse::<u64>()
+            .unwrap();
+        let result: Value = test::read_body_json(response).await;
+        assert_eq!(result["session"]["permission_mode"], json!(mode));
+        assert_eq!(result["session"]["supervisor_auto_dispatch"], auto_dispatch);
+        assert_eq!(
+            self.state
+                .session_store
+                .get_index_entry(&self.supervisor.session_id)
+                .await
+                .unwrap()
+                .supervisor_profile_revision,
+            Some(etag)
+        );
+    }
+
     async fn dispatch_named(
         &self,
         name: &str,
@@ -201,6 +260,10 @@ impl Fixture {
         let mut ctx = ToolExecutionContext::none(&call.id);
         ctx.session_id = Some(&executing.id);
         ctx.root_session_id = Some(&executing.id);
+        let flags = ToolExecutionSessionFlags::from_session(&executing);
+        ctx.bypass_permissions = flags.bypass_permissions;
+        ctx.auto_approve_permissions = flags.auto_approve_permissions;
+        ctx.plan_read_only = flags.plan_read_only;
         let ctx = ctx.with_executing_supervisor(
             ExecutingSupervisorObservation::capture_from_executing_session(&executing),
         );
@@ -302,6 +365,255 @@ async fn supervisor_standard_creates_independent_root_and_retries_once() {
 #[actix_web::test]
 async fn supervisor_ultra_creates_independent_root_and_retries_once() {
     assert_create_is_independent_and_exact_retry(true).await;
+}
+
+const PERMISSION_PROBES: [(&str, &str); 4] = [
+    ("shell-first", "echo first-worker-check"),
+    ("shell-second", "echo second-worker-check"),
+    ("shell-third", "echo third-worker-check"),
+    ("shell-denied", "echo denied-worker-check"),
+];
+const SHELL_PROBES_DONE: &str = "Worker permission checks finished.";
+
+#[actix_web::test]
+async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
+    let f = Fixture::new(false).await;
+    f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
+        .await;
+    let store = f.state.session_store.clone();
+    let current = f
+        .state
+        .storage
+        .load_execution_admission_snapshot(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = SessionCallerReference::from(&current);
+    let reserving_caller = caller.clone();
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, proceed) = tokio::sync::oneshot::channel();
+    let reservation = tokio::spawn(async move {
+        store
+            .with_supervisor_dispatch_consent(&reserving_caller, |allowed| async move {
+                entered.send(allowed).unwrap();
+                proceed.await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap()
+    });
+    assert!(held.await.unwrap());
+    let revoke = f
+        .state
+        .session_store
+        .update_supervisor_execution_profile(&current, |session| {
+            session.set_supervisor_auto_dispatch(false);
+            session.metadata_version += 1;
+            Ok::<_, std::io::Error>(())
+        });
+    tokio::pin!(revoke);
+    assert!(timeout(Duration::from_millis(100), &mut revoke)
+        .await
+        .is_err());
+    release.send(()).unwrap();
+    reservation.await.unwrap();
+    revoke.await.unwrap().unwrap();
+    let mut stale_workspace_update = current.clone();
+    stale_workspace_update.metadata_version += 1;
+    stale_workspace_update.set_workspace_path_meta(&f.workspace);
+    let stale_error = f
+        .state
+        .storage
+        .save_session(&stale_workspace_update)
+        .await
+        .unwrap_err();
+    assert!(stale_error
+        .to_string()
+        .contains("Supervisor dispatch consent"));
+    assert!(!f
+        .state
+        .session_store
+        .with_supervisor_dispatch_consent(&caller, |allowed| async move { Ok(allowed) })
+        .await
+        .unwrap());
+    f.state.shutdown().await;
+}
+
+struct WorkerPermissionProvider;
+
+#[async_trait::async_trait]
+impl LLMProvider for WorkerPermissionProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let next = PERMISSION_PROBES.iter().find(|(id, _)| {
+            !messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some(*id))
+        });
+        let response = if let Some((id, command)) = next {
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: (*id).into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "exec_command".into(),
+                    arguments: json!({"cmd": command}).to_string(),
+                },
+            }])
+        } else {
+            LLMChunk::Token(SHELL_PROBES_DONE.into())
+        };
+        Ok(Box::pin(futures::stream::iter([
+            Ok(response),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[actix_web::test]
+async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
+    use bamboo_tools::permission::{
+        DurablePermissionRule, PermissionRuleEffect, PermissionRuleScope, PermissionRuleSource,
+    };
+
+    for ultra in [false, true] {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("worker-permission-fixture".into()),
+            ..Default::default()
+        });
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        let provider: Arc<dyn LLMProvider> = Arc::new(WorkerPermissionProvider);
+        let f = Fixture::with_provider(ultra, config, provider.clone()).await;
+        f.state
+            .provider_registry
+            .replace_with(ProviderRegistry::new(
+                std::collections::HashMap::from([("openai".into(), provider)]),
+                "openai".into(),
+            ));
+        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
+            .await;
+        let permissions = f.state.permission_checker.permission_config().unwrap();
+        permissions.set_ask_rules(["Bash".into()]);
+        permissions
+            .add_durable_rule(DurablePermissionRule {
+                id: "worker-shell-deny".into(),
+                permission_type: PermissionType::ExecuteCommand,
+                effect: PermissionRuleEffect::Deny,
+                scope: PermissionRuleScope::Global,
+                workspace_path: None,
+                matcher: PermissionMatcher {
+                    id: "worker-shell-deny".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: PERMISSION_PROBES[3].1.into(),
+                },
+                source: PermissionRuleSource::User,
+                expires_at: None,
+            })
+            .unwrap();
+
+        let mut request = f.request(uuid::Uuid::new_v4());
+        if !ultra {
+            request = request["request"].clone();
+            request.as_object_mut().unwrap().remove("project_id");
+            request.as_object_mut().unwrap().remove("workspace_path");
+        }
+        let route = if ultra {
+            "session_control"
+        } else {
+            "spawn_session"
+        };
+        let created = f.invoke_named(route, request.clone()).await;
+        let id = created["target_session_id"].as_str().unwrap();
+        let root = timeout(Duration::from_secs(20), async {
+            loop {
+                let root = f.state.storage.load_session(id).await.unwrap().unwrap();
+                assert!(
+                    root.pending_question.is_none(),
+                    "Auto worker asked for approval"
+                );
+                if root
+                    .messages
+                    .iter()
+                    .any(|message| message.content == SHELL_PROBES_DONE)
+                {
+                    break root;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the new worker executes its first input and answers");
+        assert_eq!(
+            root.agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        for (index, (call_id, command)) in PERMISSION_PROBES.iter().enumerate() {
+            let result = root
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(*call_id))
+                .unwrap();
+            if index == 3 {
+                assert!(
+                    result.content.contains("worker-shell-deny"),
+                    "{}",
+                    result.content
+                );
+            } else {
+                assert!(
+                    result.content.contains(command.trim_start_matches("echo ")),
+                    "{}",
+                    result.content
+                );
+            }
+        }
+
+        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, false)
+            .await;
+        let replay = f.invoke_named(route, request).await;
+        assert_eq!(replay["target_session_id"], id);
+        assert_eq!(replay["receipt_id"], created["receipt_id"]);
+        assert_eq!(
+            f.state
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_runtime_state
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        let next = f.invoke(f.request(uuid::Uuid::new_v4())).await;
+        let without_dispatch_auto = f
+            .state
+            .storage
+            .load_root_authority(next["target_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            without_dispatch_auto
+                .agent_runtime_state
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Bypass
+        );
+        f.state.shutdown().await;
+    }
 }
 
 const PARALLEL_ROOT_INPUTS: [&str; 3] = [

@@ -10,7 +10,8 @@ use bamboo_agent_core::workspace_state::{
     preview_default_session_workspace_dir, preview_pin_workspace_path,
 };
 use bamboo_domain::{
-    RootThinkingMode, Session, SessionActivationDisposition, Storage, SupervisorReference,
+    RootThinkingMode, Session, SessionActivationDisposition, SessionPermissionMode, Storage,
+    SupervisorReference,
 };
 use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
 use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
@@ -446,7 +447,30 @@ impl SupervisedRootCreator {
         if !replayed {
             // Reserve the same UUID and immutable birth before any Root/link
             // side effect, reusing the normal creation operation store/claim.
-            self.operations.save(&operation).await.map_err(|error| {
+            let save = match authority {
+                CreationAuthority::Supervisor {
+                    original_caller: Some(caller),
+                    ..
+                } if managed.is_none() => {
+                    let reserved = &mut operation;
+                    let worker = &mut candidate;
+                    self.store
+                        .with_supervisor_dispatch_consent(caller, |auto| async move {
+                            if auto {
+                                reserved.supervisor_execution_permission_mode =
+                                    Some(SessionPermissionMode::Auto);
+                                worker
+                                    .agent_runtime_state
+                                    .get_or_insert_with(Default::default)
+                                    .set_permission_mode(SessionPermissionMode::Auto);
+                            }
+                            self.operations.save(reserved).await
+                        })
+                        .await
+                }
+                _ => self.operations.save(&operation).await,
+            };
+            save.map_err(|error| {
                 ToolError::Execution(format!("creation reservation unavailable: {error}"))
             })?;
         }
