@@ -186,7 +186,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2807 changes guidance assembly in the feature-sensitive stream runner.
 // Guide/cache cases stay in default Engine/packages-3. The token-usage-log
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "1064fa19d6f98919a7402530a5fb8e8f5d2c0f84371f2576f50880b42bc902e6";
+// #2831 changes the default Storage save path. Supervisor dispatch consent
+// cases stay in the default Server owners; all 20 additive cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "2cc74e5fc0b1279f3a24a4012cf877ccea6b243ff9d106bf9391bc4c5671dc34";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
