@@ -246,7 +246,8 @@ impl SessionStoreV2 {
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session_lock = self.acquire_session_write_lock(id, SaveKind::Full).await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, task, session_lock);
+        let guards =
+            DefaultWriterGuards::supervisor_execution_profile(lifecycle, task, session_lock);
         let mut current = self
             .load_execution_admission_unchecked(id)
             .await?

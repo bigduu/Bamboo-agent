@@ -213,6 +213,15 @@ impl Fixture {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .parse::<u64>()
+            .unwrap();
         let result: Value = test::read_body_json(response).await;
         assert_eq!(result["session"]["permission_mode"], json!(mode));
         assert_eq!(result["session"]["supervisor_auto_dispatch"], auto_dispatch);
@@ -222,8 +231,8 @@ impl Fixture {
                 .get_index_entry(&self.supervisor.session_id)
                 .await
                 .unwrap()
-                .supervisor_auto_dispatch,
-            Some(auto_dispatch)
+                .supervisor_profile_revision,
+            Some(etag)
         );
     }
 
@@ -409,6 +418,18 @@ async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
     release.send(()).unwrap();
     reservation.await.unwrap();
     revoke.await.unwrap().unwrap();
+    let mut stale_workspace_update = current.clone();
+    stale_workspace_update.metadata_version += 1;
+    stale_workspace_update.set_workspace_path_meta(&f.workspace);
+    let stale_error = f
+        .state
+        .storage
+        .save_session(&stale_workspace_update)
+        .await
+        .unwrap_err();
+    assert!(stale_error
+        .to_string()
+        .contains("Supervisor dispatch consent"));
     assert!(!f
         .state
         .session_store
