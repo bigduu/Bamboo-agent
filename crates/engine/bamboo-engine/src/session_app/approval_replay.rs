@@ -1559,24 +1559,26 @@ mod tests {
                 &storage,
                 &mut owned,
                 PermissionMode::Default,
-                Some("Write"),
+                Some("exec_command"),
             )
             .await
             .unwrap(),
             ApprovalReplayDecision::BlockedByRootToolAuthority
         );
         assert!(owned.root_orchestration_only_enabled());
-        assert!(matches!(
-            refresh_approval_replay_posture(
-                &storage,
-                &mut owned,
-                PermissionMode::Default,
-                Some("Read")
-            )
-            .await
-            .unwrap(),
-            ApprovalReplayDecision::Execute(_)
-        ));
+        for name in ["Read", "Write", "Edit"] {
+            assert!(matches!(
+                refresh_approval_replay_posture(
+                    &storage,
+                    &mut owned,
+                    PermissionMode::Default,
+                    Some(name)
+                )
+                .await
+                .unwrap(),
+                ApprovalReplayDecision::Execute(_)
+            ));
+        }
         assert_eq!(
             refresh_approval_replay_posture(&storage, &mut owned, PermissionMode::Default, None)
                 .await

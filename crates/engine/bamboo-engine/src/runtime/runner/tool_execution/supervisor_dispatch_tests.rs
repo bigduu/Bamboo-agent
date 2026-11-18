@@ -489,5 +489,5 @@ async fn supervisor_native_ordinary_reserved_id_and_child_cannot_acquire_identit
         )
         .await;
     }
-    assert_eq!(*observed.lock().unwrap(), vec![(None, false); 3]);
+    assert!(observed.lock().unwrap().is_empty());
 }
