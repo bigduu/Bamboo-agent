@@ -2,14 +2,17 @@
 //! Only the OpenAI-compatible provider is controlled; canonical V2 storage is read-only evidence.
 #![cfg(unix)]
 
+#[path = "support/ordinary_root_host.rs"]
+mod host_startup;
+
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{Role, Session, SessionInboxPort, SessionMessageEnvelope, SessionMessageId};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+use host_startup::{start_host, Host};
 use serde_json::{json, Value};
 use std::{
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -209,42 +212,9 @@ fn child_projection(content: &str) -> Option<Value> {
     serde_json::from_str(projection.lines().next()?).ok()
 }
 
-struct Host(Child);
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn start_host(data: &Path, port: u16, generation: usize) -> Host {
-    let log = std::fs::File::create(data.join(format!("host-{generation}.log"))).unwrap();
-    Host(
-        Command::new(env!("CARGO_BIN_EXE_bamboo"))
-            .args([
-                "serve",
-                "--bind",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--data-dir",
-            ])
-            .arg(data)
-            .current_dir(data)
-            .env("BAMBOO_JIANDU_DATA_DIR", data.join("jiandu"))
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    )
-}
-
 struct Fixture {
     _temp: tempfile::TempDir,
     data: PathBuf,
-    port: u16,
     base: String,
     client: reqwest::Client,
     host: Option<Host>,
@@ -515,19 +485,13 @@ impl Fixture {
             )
             .unwrap();
         }
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let client = fixture_http_client();
         let mut fixture = Self {
             _temp: temp,
             data: data.clone(),
-            port,
-            base: format!("http://127.0.0.1:{port}/api/v1"),
+            base: String::new(),
             client,
-            host: Some(start_host(&data, port, 1)),
+            host: Some(start_host(&data, 1)),
             probe,
             provider_handle,
         };
@@ -558,26 +522,13 @@ impl Fixture {
     }
 
     async fn healthy(&mut self) {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                assert!(
-                    self.host.as_mut().unwrap().0.try_wait().unwrap().is_none(),
-                    "Host exited"
-                );
-                if self
-                    .client
-                    .get(format!("{}/health", self.base))
-                    .send()
-                    .await
-                    .is_ok_and(|r| r.status().is_success())
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .expect("real Host becomes healthy");
+        self.base = self
+            .host
+            .as_mut()
+            .unwrap()
+            .ready(&self.client)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 
     async fn canonical(&self) -> Session {
@@ -779,8 +730,9 @@ impl Fixture {
     }
 
     async fn restart(&mut self) {
+        let generation = self.host.as_ref().unwrap().generation() + 1;
         drop(self.host.take());
-        self.host = Some(start_host(&self.data, self.port, 2));
+        self.host = Some(start_host(&self.data, generation));
         self.healthy().await;
     }
 

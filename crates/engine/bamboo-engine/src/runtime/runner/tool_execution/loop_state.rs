@@ -5,7 +5,6 @@ use super::RoundToolExecutionResult;
 #[derive(Debug)]
 pub(super) struct RoundExecutionState {
     pub single_tool_call: bool,
-    pub completed_single_tool_contract: Option<String>,
     pub quiet_exec_handle: Option<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
@@ -17,7 +16,6 @@ impl Default for RoundExecutionState {
     fn default() -> Self {
         Self {
             single_tool_call: false,
-            completed_single_tool_contract: None,
             quiet_exec_handle: None,
             awaiting_clarification: false,
             waiting_for_children: false,
@@ -53,7 +51,6 @@ impl RoundExecutionState {
 
     pub(super) fn into_result(self) -> RoundToolExecutionResult {
         RoundToolExecutionResult {
-            completed_single_tool_contract: self.completed_single_tool_contract,
             quiet_exec_handle: self.quiet_exec_handle,
             awaiting_clarification: self.awaiting_clarification,
             waiting_for_children: self.waiting_for_children,

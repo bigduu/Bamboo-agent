@@ -1,62 +1,14 @@
-//! Real SDK -> Agent -> BuiltinToolExecutor -> Bash ownership, including the
+//! Real SDK -> Agent -> BuiltinToolExecutor -> exec_command ownership, including the
 //! final publication barrier. The controlled provider only chooses the tool;
 //! it neither launches nor terminates the process on behalf of the runtime.
 use super::*;
-use bamboo_agent_core::tools::{FunctionCall, ToolExecutionContext, ToolOutcome};
-
-const LEGACY_BASH_FIXTURE: &str = "legacy_bash_host_fixture";
-
-/// The model catalog hides Bash. This test-only host compatibility adapter
-/// preserves coverage of its actual SDK cancellation/publication lifecycle.
-/// Only the exposed fixture name changes; the builtin receives the same call
-/// arguments and execution context, including its LocalTask resource owner.
-struct LegacyBashHostFixture(bamboo_tools::BuiltinToolExecutor);
-
-impl LegacyBashHostFixture {
-    fn builtin_call(call: &ToolCall) -> Result<ToolCall, ToolError> {
-        if call.function.name != LEGACY_BASH_FIXTURE {
-            return Err(ToolError::NotFound(call.function.name.clone()));
-        }
-        let mut builtin_call = call.clone();
-        builtin_call.function.name = "Bash".into();
-        Ok(builtin_call)
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for LegacyBashHostFixture {
-    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        self.0.execute(&Self::builtin_call(call)?).await
-    }
-
-    async fn execute_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        self.0
-            .execute_with_context_outcome(&Self::builtin_call(call)?, ctx)
-            .await
-    }
-
-    fn list_tools(&self) -> Vec<ToolSchema> {
-        self.0
-            .list_tools()
-            .into_iter()
-            .filter(|schema| schema.function.name == "Bash")
-            .map(|mut schema| {
-                schema.function.name = LEGACY_BASH_FIXTURE.into();
-                schema
-            })
-            .collect()
-    }
-}
+use bamboo_agent_core::tools::FunctionCall;
 
 struct BashCeiling;
 #[async_trait]
 impl NativeToolCeilingSource for BashCeiling {
     async fn observe(&self, _: &Session) -> Result<Vec<String>, String> {
-        Ok(vec![LEGACY_BASH_FIXTURE.into()])
+        Ok(vec!["exec_command".into(), "write_stdin".into()])
     }
 }
 
@@ -69,28 +21,36 @@ struct BashProvider {
 impl LLMProvider for BashProvider {
     async fn chat_stream(
         &self,
-        _: &[Message],
+        messages: &[Message],
         tools: &[ToolSchema],
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
         assert_eq!(model, MODEL);
-        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+        assert_eq!(
+            self.calls.fetch_add(1, Ordering::SeqCst),
+            0,
+            "unexpected retry after tool result: {:?}",
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Tool)
+                .map(|message| message.content.chars().take(600).collect::<String>())
+        );
         assert!(tools
             .iter()
-            .any(|tool| tool.function.name == LEGACY_BASH_FIXTURE));
+            .any(|tool| tool.function.name == "exec_command"));
         assert!(!tools.iter().any(|tool| tool.function.name == "Bash"));
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(LLMChunk::ToolCalls(vec![ToolCall {
                 id: "owned-builtin-bash".into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: LEGACY_BASH_FIXTURE.into(),
+                    name: "exec_command".into(),
                     arguments: serde_json::json!({
-                        "command": self.command,
+                        "cmd": self.command,
                         "workdir": self.workspace,
-                        "run_in_background": false,
-                        "timeout": 60000,
+                        "yield_time_ms": 1000,
                     })
                     .to_string(),
                 },
@@ -123,15 +83,16 @@ async fn sdk_owned_bash_stops_before_publication(shutdown: bool) {
         &root_id(),
         provider.clone(),
         1,
-        Arc::new(LegacyBashHostFixture(
-            bamboo_tools::BuiltinToolExecutor::new(),
-        )),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
         Arc::new(BashCeiling),
     )
     .await;
-    let child = harness
-        .child("owned-bash", "Run the owned Bash command.")
+    let mut child = harness
+        .child("owned-bash", "Run the owned shell command.")
         .await;
+    child.set_workspace_path_meta(workspace.to_string_lossy());
+    harness.store.save_session(&child).await.unwrap();
+    bamboo_agent_core::workspace_state::set_workspace(&child.id, workspace.canonicalize().unwrap());
     let mut events = {
         let mut senders = harness.ctx.session_event_senders.write().await;
         let sender = senders[&harness.parent.id].clone();

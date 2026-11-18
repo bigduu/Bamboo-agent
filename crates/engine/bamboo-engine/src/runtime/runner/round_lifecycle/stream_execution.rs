@@ -905,31 +905,27 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if !newly_activated.is_empty() {
-        let names = tool_schemas
+        let schemas = tool_schemas
             .iter()
             .filter(|schema| {
                 newly_activated.contains(&bamboo_domain::canonical_tool_name(&schema.function.name))
             })
-            .map(|schema| schema.function.name.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        if !names.is_empty() {
-            let mut guide_context =
-                bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
-                    &stable_instructions,
-                );
-            guide_context.activated_discoverable_tools = newly_activated;
-            guide_context.include_best_practices = false;
-            let schemas = tool_schemas
-                .iter()
-                .filter(|schema| names.contains(&schema.function.name))
-                .cloned()
-                .collect::<Vec<_>>();
-            let content = bamboo_tools::guide::EnhancedPromptBuilder::build_for_tools(
-                Some(config.tool_registry.as_ref()),
-                &names,
-                &schemas,
-                &guide_context,
-            );
+        let guide_context = bamboo_tools::guide::context::GuideBuildContext {
+            activated_discoverable_tools: newly_activated,
+            include_best_practices: false,
+            max_examples_per_tool: 1,
+            ..bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
+                &stable_instructions,
+            )
+        };
+        let content = bamboo_tools::guide::EnhancedPromptBuilder::build(
+            Some(config.tool_registry.as_ref()),
+            &schemas,
+            &guide_context,
+        );
+        if !content.is_empty() {
             context_blocks.push(ContextBlock::new(
                 ContextBlockType::ToolGuide,
                 ContextBlockPriority::High,
@@ -993,8 +989,8 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
     //
-    // The tool/server guide (tool schemas + each connected MCP server's
-    // `initialize` instructions — e.g. nova's targeting workflow) is relocated OUT
+    // Supplemental tool guidance and each connected MCP server's
+    // `initialize` instructions are relocated OUT
     // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
     // invariant identity/directives, and the large, session-stable guide rides as
     // a typed context block at a known position with its own cache

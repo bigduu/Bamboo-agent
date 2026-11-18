@@ -222,7 +222,7 @@ async fn app_state_creation_reconciles_stale_running_metrics_from_durable_sessio
 }
 
 #[tokio::test]
-async fn root_tools_include_server_overlays_and_session_note() {
+async fn root_tools_include_server_overlays_and_memory() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -243,7 +243,8 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("session_note"));
+    assert!(names.contains("memory"));
+    assert!(!names.contains("session_note"));
     assert!(names.contains("ViewImage"));
     for retired in [
         "Plan",
@@ -319,7 +320,6 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
     assert_eq!(
         core_names,
         std::collections::BTreeSet::from([
-            "bash".to_string(),
             "exec_command".to_string(),
             "write_stdin".to_string(),
             "Edit".to_string(),
@@ -373,7 +373,8 @@ async fn shared_base_history_keeps_host_scopes_separate_from_current_history() {
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("session_note"));
+    assert!(names.contains("memory"));
+    assert!(!names.contains("session_note"));
 
     let history = tools
         .iter()
@@ -1178,9 +1179,9 @@ async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
         .tools_for(ToolSurface::Root)
         .execute_with_context(
             &make_tool_call(
-                "session_note",
+                "memory",
                 json!({
-                    "action": "replace",
+                    "action": "session_replace",
                     "content": "Shared AppState Jiandu note"
                 }),
             ),
@@ -1200,7 +1201,7 @@ async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
             },
         )
         .await
-        .expect("session_note replace should succeed");
+        .expect("memory session_replace should succeed");
 
     assert_eq!(
         state

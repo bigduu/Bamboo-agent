@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn canonical_name_resolves_builtin_aliases() {
-        assert_eq!(canonical_tool_name("FileExists"), "GetFileInfo");
-        assert_eq!(canonical_tool_name("default::set_workspace"), "Workspace");
+        assert_eq!(canonical_tool_name("GetFileInfo"), "GetFileInfo");
+        assert_eq!(canonical_tool_name("default::Workspace"), "Workspace");
         assert_eq!(canonical_tool_name("default::applyPatch"), "Edit");
         assert_eq!(
             canonical_tool_name("mcp__filesystem__read_file"),

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{de, Deserialize, Deserializer};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use super::{ScheduleManager, ScheduleRunConfig, ScheduleRunJob, ScheduleStore, ScheduleTrigger};
@@ -206,6 +206,28 @@ impl ScheduleTasksTool {
     }
 }
 
+fn deserialize_run_config<'de, D>(deserializer: D) -> Result<Option<ScheduleRunConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let has_auto_execute = raw.get("auto_execute").is_some();
+    let config: ScheduleRunConfig = serde_json::from_value(raw).map_err(de::Error::custom)?;
+    if !has_auto_execute
+        && config
+            .task_message
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty())
+    {
+        return Err(de::Error::custom(
+            "Specify run_config.auto_execute when supplying a task_message. Use true to run the agent when the schedule fires or false to save the message for manual execution.",
+        ));
+    }
+    Ok(Some(config))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ScheduleTasksArgs {
@@ -225,7 +247,7 @@ enum ScheduleTasksArgs {
         overlap_policy: Option<super::OverlapPolicy>,
         #[serde(default)]
         enabled: Option<bool>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_run_config")]
         run_config: Option<ScheduleRunConfig>,
     },
     Patch {
@@ -246,7 +268,7 @@ enum ScheduleTasksArgs {
         misfire_policy: Option<super::MisFirePolicy>,
         #[serde(default)]
         overlap_policy: Option<super::OverlapPolicy>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_run_config")]
         run_config: Option<ScheduleRunConfig>,
     },
     Delete {
@@ -297,7 +319,10 @@ impl Tool for ScheduleTasksTool {
                     "description": "Schedule run configuration (create/patch).",
                     "properties": {
                         "system_prompt": { "type": "string" },
-                        "task_message": { "type": "string" },
+                        "task_message": {
+                            "type": "string",
+                            "description": "First user message in each scheduled conversation. Requires an explicit auto_execute value."
+                        },
                         "model": { "type": "string" },
                         "project_id": {
                             "type": "string",
@@ -309,7 +334,10 @@ impl Tool for ScheduleTasksTool {
                         },
                         "workspace_path": { "type": "string" },
                         "enhance_prompt": { "type": "string" },
-                        "auto_execute": { "type": "boolean" }
+                        "auto_execute": {
+                            "type": "boolean",
+                            "description": "Set true to start an agent turn when the schedule fires. Set false to create a session for manual execution."
+                        }
                     }
                 }
             },

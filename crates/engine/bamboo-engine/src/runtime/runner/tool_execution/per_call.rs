@@ -148,7 +148,6 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 pub(super) struct PortableToolExecution {
     name: String,
     input: serde_json::Value,
-    execution_contract: Option<String>,
 }
 
 impl PortableToolExecution {
@@ -173,7 +172,6 @@ impl PortableToolExecution {
         Self {
             name: execution_name.to_owned(),
             input,
-            execution_contract: None,
         }
     }
 }
@@ -203,7 +201,6 @@ pub(super) fn portable_tool_for_admitted_call(
         PortableToolExecution {
             name,
             input: parse_tool_args_best_effort(&call.function.arguments).0,
-            execution_contract: None,
         }
     })
 }
@@ -262,10 +259,7 @@ pub(super) fn shell_accounting_outcome(
         .as_ref()
         .map(|tool| tool.execution_name())
         .or(admitted_execution_name);
-    if !matches!(
-        execution_name,
-        Some("bash" | "exec_command" | "write_stdin")
-    ) {
+    if !matches!(execution_name, Some("exec_command" | "write_stdin")) {
         return ShellAccountingOutcome::Ordinary;
     }
     if outcome.needs_human.is_some() {
@@ -280,9 +274,6 @@ pub(super) fn shell_accounting_outcome(
     // the JSON body; use the same success/marker contract as clarification.
     if result.success && result.display_preference.as_deref() == Some("request_permissions") {
         return ShellAccountingOutcome::Pending;
-    }
-    if execution_name == Some("bash") {
-        return ShellAccountingOutcome::Terminal(result.success);
     }
     let envelope = serde_json::from_str::<serde_json::Value>(&result.result).ok();
     let status = envelope.as_ref().and_then(|value| value["status"].as_str());
@@ -431,7 +422,10 @@ async fn execute_tool_call_only_with_execution_name_inner(
             .tools
             .framework_session_tool_for_exact(execution_name)
             .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
+    let work_unavailable =
+        bamboo_domain::supervisor_work_tool(execution_name) && !executing_supervisor;
     if framework_unavailable
+        || work_unavailable
         || ((ctx.root_orchestration_only || executing_supervisor)
             && (exact_owner_shadowed
                 || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
@@ -461,6 +455,8 @@ async fn execute_tool_call_only_with_execution_name_inner(
                     "session_framework_port_unavailable"
                 };
                 format!("{code}: {execution_name} requires an installed concrete Host instance; names/contracts grant no capability and no operation was started")
+            } else if work_unavailable {
+                "Work tools require a trusted Supervisor session".into()
             } else if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {
@@ -891,7 +887,6 @@ async fn execute_tool_call_only_with_execution_name_inner(
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
-            execution_contract: execution.execution_contract().map(str::to_owned),
         }),
         tool_duration,
     })
@@ -1422,12 +1417,6 @@ async fn apply_completed_tool_execution_outcome(
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
     let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
-    if ctx.state.single_tool_call && outcome.post_tool_hook_eligible && is_success {
-        ctx.state.completed_single_tool_contract = outcome
-            .portable_tool
-            .as_ref()
-            .and_then(|tool| tool.execution_contract.clone());
-    }
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1655,7 +1644,6 @@ mod task_progress_tests {
             portable_tool: Some(PortableToolExecution {
                 name: execution_name.into(),
                 input: serde_json::json!({}),
-                execution_contract: None,
             }),
             permission_replay_origin: None,
             result: Ok(result),
@@ -1777,7 +1765,6 @@ mod task_progress_tests {
 
     async fn real_shell_permission_ack_is_neutral(cap: u32) {
         for (requested, execution_name) in [
-            ("bash", "bash"),
             ("exec_command", "exec_command"),
             ("default::exec_command", "exec_command"),
             ("write_stdin", "write_stdin"),
@@ -1796,7 +1783,6 @@ mod task_progress_tests {
             let schemas = tools.list_tools();
             let command = format!("printf forbidden > '{}'", sentinel.display());
             let args = match execution_name {
-                "bash" => serde_json::json!({"command":command}),
                 "exec_command" => serde_json::json!({"cmd":command}),
                 // The gate must pause before the actual tool rejects this unknown handle.
                 _ => {
@@ -2490,7 +2476,6 @@ mod hook_tests {
                         portable_tool: Some(PortableToolExecution {
                             name: execution_name.into(),
                             input: serde_json::json!({}),
-                            execution_contract: None,
                         }),
                         permission_replay_origin: None,
                         result: Ok(ToolResult::text(true, payload.to_string())),
@@ -3147,6 +3132,57 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn stale_work_catalog_cannot_grant_supervisor_authority_to_roots_or_children() {
+        let names = ["work_overview", "work_dispatch", "work_review"];
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let root = Session::new("ordinary", "model");
+        let mut ultra = root.clone();
+        ultra.set_root_orchestration_only(true).unwrap();
+        let child = Session::new_child_of("child", &root, "model", "worker");
+        for session in [root, ultra, child] {
+            let concrete = Arc::new(NameRecordingExecutor::new(&names));
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            let (tx, mut rx) = mpsc::channel(16);
+            for name in names {
+                let call = probe_call(name);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
+                        session_behavior_version: None,
+                        vision_support: true,
+                        output_cap: None,
+                        executing_caller: None,
+                        executing_supervisor: None,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: &session.id,
+                        root_session_id: &session.root_session_id,
+                        root_orchestration_only: session.root_orchestration_only_enabled(),
+                        round_id: "work-role-scope",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&session),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(outcome.result.unwrap_err().contains("trusted Supervisor"));
+                assert!(!outcome.post_tool_hook_eligible);
+            }
+            assert!(concrete.entered().is_empty());
+            assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_delegation_first_final_gate_rejects_stale_execution_schemas_in_both_modes()
     {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
@@ -3360,7 +3396,6 @@ mod hook_tests {
             "exec_command",
             "default::exec_command",
             "write_stdin",
-            "Edit",
             "apply_patch",
             "default::Read",
         ] {
@@ -3378,20 +3413,22 @@ mod hook_tests {
             ));
             assert!(!outcome.post_tool_hook_eligible);
         }
-        let allowed = execute_without_hooks_with_root_authority(
-            &stale,
-            &tools,
-            &probe_call("read_file"),
-            &event_tx,
-            true,
-        )
-        .await;
-        assert!(allowed.result.is_ok());
-        assert_eq!(concrete_tools.entered(), ["Read"]);
+        for name in ["read_file", "Edit"] {
+            let allowed = execute_without_hooks_with_root_authority(
+                &stale,
+                &tools,
+                &probe_call(name),
+                &event_tx,
+                true,
+            )
+            .await;
+            assert!(allowed.result.is_ok());
+        }
+        assert_eq!(concrete_tools.entered(), ["Read", "Edit"]);
         let starts = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
             .count();
-        assert_eq!(starts, 1);
+        assert_eq!(starts, 2);
     }
 
     #[tokio::test]

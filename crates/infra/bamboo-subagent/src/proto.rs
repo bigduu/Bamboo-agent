@@ -281,14 +281,12 @@ fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NativeToolCeiling {
-    pub const NAMES: [&'static str; 9] = [
-        "Bash",
+    pub const NAMES: [&'static str; 7] = [
         "Edit",
         "Glob",
         "Read",
         "Task",
         "Write",
-        "bash",
         "exec_command",
         "write_stdin",
     ];
@@ -1054,15 +1052,9 @@ mod tests {
         assert_eq!(restored, ceiling);
         restored.validate().unwrap();
 
-        // Old frozen ceilings keep their exact legacy grant after decoding.
-        let mut legacy = ceiling.clone();
-        legacy.tools = vec!["Bash".into()];
-        let restored: NativeToolCeiling =
-            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
-        restored.validate().unwrap();
-        assert_eq!(restored.tools, ["Bash"]);
-
         for tools in [
+            vec!["Bash".into()],
+            vec!["bash".into()],
             vec!["default::exec_command".into()],
             vec!["Exec_Command".into()],
             vec!["exec_command".into(), "exec_command".into()],

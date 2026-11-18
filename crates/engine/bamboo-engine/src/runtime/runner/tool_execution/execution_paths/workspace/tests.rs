@@ -46,6 +46,10 @@ fn file_operations_preserve_existing_and_missing_session_scope() {
         "write_file",
         "default::Write",
         "default::Edit",
+        "SetWorkspace",
+        "setWorkspace",
+        "set_workspace",
+        "default::setWorkspace",
     ] {
         for target in &targets {
             for initial_workspace in [None, Some(""), Some(workspace.as_str())] {
@@ -93,14 +97,8 @@ fn file_operations_preserve_existing_and_missing_session_scope() {
 }
 
 #[test]
-fn explicit_workspace_results_and_legacy_aliases_still_update_session_scope() {
-    for name in [
-        "Workspace",
-        "SetWorkspace",
-        "setWorkspace",
-        "set_workspace",
-        "default::setWorkspace",
-    ] {
+fn explicit_workspace_results_update_session_scope() {
+    for name in ["Workspace", "default::Workspace"] {
         let mut session = Session::new("explicit-workspace", "test-model");
         session.set_project_id_meta("project-1");
         session.set_workspace_path_meta("old-workspace");

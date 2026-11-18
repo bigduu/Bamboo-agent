@@ -180,7 +180,13 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // packages-2 and Engine packages-3 owners.
 // #2790 scopes the default Chat Completions tool projection in the engine.
 // Its regression stays in the default Engine owner with the same additive cases.
-const FEATURE_SOURCE_SHA256 = "7191fb610f21b59051f7c1c9b92a6eb0c605679b57126bd63780b18296588fef";
+// #2802 changes unconditional disabled-tool alias resolution in Config.
+// Its regression stays in default packages-4. Feature cfg, four additive
+// contexts and twenty feature-only cases retain their existing owners.
+// #2807 changes guidance assembly in the feature-sensitive stream runner.
+// Guide/cache cases stay in default Engine/packages-3. The token-usage-log
+// cfg, four additive contexts and twenty feature-only cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "1064fa19d6f98919a7402530a5fb8e8f5d2c0f84371f2576f50880b42bc902e6";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

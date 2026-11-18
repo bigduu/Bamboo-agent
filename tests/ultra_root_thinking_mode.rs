@@ -15,7 +15,8 @@ use tokio::sync::Notify;
 mod read_only_child_host;
 use read_only_child_host::{reported_result, Host};
 
-const REQUIRED: &str = "ULTRA_REQUIRED: inspect only; preserve the user constraints";
+const REQUIRED: &str =
+    "ULTRA_REQUIRED: update the Root output and delegate independent read-only verification";
 
 #[derive(Default)]
 struct ProviderProbe {
@@ -23,7 +24,7 @@ struct ProviderProbe {
     root_calls: AtomicUsize,
     release_child: AtomicBool,
     child_ready: Notify,
-    forbidden_path: Mutex<std::path::PathBuf>,
+    root_output_path: Mutex<std::path::PathBuf>,
 }
 
 fn chunk(delta: Value, finish_reason: Option<&str>) -> String {
@@ -57,14 +58,18 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-denied-write","type":"function","function":{"name":"Write","arguments":json!({"file_path":probe.forbidden_path.lock().unwrap().clone(),"content":"must not write"}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"ultra-write","type":"function","function":{"name":"Write","arguments":json!({"file_path":probe.root_output_path.lock().unwrap().clone(),"content":"root draft"}).to_string()}}]}),
                 "tool_calls",
             ),
             1 => (
-                json!({"tool_calls":[{"index":0,"id":"ultra-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"ultra-edit","type":"function","function":{"name":"Edit","arguments":json!({"file_path":probe.root_output_path.lock().unwrap().clone(),"old_string":"root draft","new_string":"root verified"}).to_string()}}]}),
                 "tool_calls",
             ),
             2 => (
+                json!({"tool_calls":[{"index":0,"id":"ultra-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                "tool_calls",
+            ),
+            3 => (
                 json!({"tool_calls":[{"index":0,"id":"ultra-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
                 "tool_calls",
             ),
@@ -98,8 +103,8 @@ async fn run_ultra_fixture() {
     let home = tempfile::tempdir().unwrap();
     let home_path = home.path().canonicalize().unwrap();
     let probe = web::Data::new(ProviderProbe::default());
-    let forbidden_path = home_path.join("root-must-not-write.txt");
-    *probe.forbidden_path.lock().unwrap() = forbidden_path.clone();
+    let root_output_path = home_path.join("root-output.txt");
+    *probe.root_output_path.lock().unwrap() = root_output_path.clone();
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
         App::new()
@@ -185,14 +190,19 @@ async fn run_ultra_fixture() {
     .expect("the Root must wait for the real provider worker");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
     assert_eq!(waiting_root.reasoning_effort, Some(ReasoningEffort::High));
-    assert!(
-        waiting_root.messages.iter().any(|message| message
-            .content
-            .contains("not callable at the current conversation position")
-            && message.content.contains("Write")),
-        "real dispatch must block direct Root implementation"
+    for call_id in ["ultra-write", "ultra-edit"] {
+        assert!(
+            waiting_root.messages.iter().any(|message| {
+                message.tool_call_id.as_deref() == Some(call_id)
+                    && message.tool_success == Some(true)
+            }),
+            "authorized Ultra call {call_id} must succeed in real dispatch"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&root_output_path).unwrap(),
+        "root verified"
     );
-    assert!(!forbidden_path.exists());
     let child = host.session(&child_id).await;
     assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
     assert_eq!(child.root_thinking_mode(), RootThinkingMode::Standard);
@@ -203,7 +213,7 @@ async fn run_ultra_fixture() {
     );
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        3,
+        4,
         "Root has not synthesized an unfinished child"
     );
     probe.release_child.store(true, Ordering::SeqCst);
@@ -237,7 +247,7 @@ async fn run_ultra_fixture() {
         .iter()
         .filter(|request| request.to_string().contains("Ultra Root thinking mode"))
         .collect();
-    assert!(root_requests.len() >= 4);
+    assert!(root_requests.len() >= 5);
     for request in root_requests {
         assert_eq!(request["reasoning_effort"], "high");
         assert!(request.to_string().contains(REQUIRED));

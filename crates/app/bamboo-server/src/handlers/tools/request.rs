@@ -69,18 +69,14 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
         tool_name,
         "Write"
             | "Edit"
-            | "SetWorkspace"
             | "Workspace"
             | "Task"
+            | "exec_command"
+            | "write_stdin"
             | "SubAgent"
             | "memory"
-            | "session_note"
-            | "memory_note"
             | "scheduler"
-            | "schedule_tasks"
             | "session_history"
             | "session_history_current"
-            | "recall"
-            | "session_inspector"
     )
 }

@@ -285,7 +285,9 @@ impl CapabilityDiscoveryIndex {
             .disabled_tool_names
             .iter()
             .filter_map(|reference| {
-                resolve_tool_reference_name(reference, |name| projected_tools.contains_key(name))
+                bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| {
+                    projected_tools.contains_key(name)
+                })
             })
             .collect::<BTreeSet<_>>();
         let allowed_execution_names = eligibility.allowed_tool_names.as_ref().map(|references| {
@@ -2276,21 +2278,16 @@ mod tests {
 
     #[test]
     fn snapshot_boundary_rejects_forged_host_only_metadata() {
-        let mut metadata = [
-            "Workspace",
-            "request_permissions",
-            "GetCurrentDir",
-            "SetWorkspace",
-        ]
-        .into_iter()
-        .map(|name| ToolCapabilityMetadata {
-            canonical_name: name.to_string(),
-            summary: "inspect host".to_string(),
-            source: CapabilitySource::Custom,
-            aliases: Vec::new(),
-            available: true,
-        })
-        .collect::<Vec<_>>();
+        let mut metadata = ["Workspace", "request_permissions"]
+            .into_iter()
+            .map(|name| ToolCapabilityMetadata {
+                canonical_name: name.to_string(),
+                summary: "inspect host".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            })
+            .collect::<Vec<_>>();
         metadata.push(ToolCapabilityMetadata {
             canonical_name: "VisibleTool".to_string(),
             summary: "inspect visible".to_string(),

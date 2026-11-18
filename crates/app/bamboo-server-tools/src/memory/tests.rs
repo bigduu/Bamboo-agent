@@ -71,6 +71,36 @@ async fn build_memory_tool_with_session(
     MemoryTool::new(session_repo, data_dir)
 }
 
+#[tokio::test]
+async fn plan_memory_keeps_session_notes_and_rejects_durable_mutations() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool = build_memory_tool(directory.path());
+    let mut ctx = test_context("plan-memory");
+    ctx.plan_read_only = true;
+    assert!(bamboo_agent_core::plan_mode_allows_tool("memory"));
+    let result = tool
+        .invoke(
+            json!({"action":"session_replace","content":"Plan note","topic":"planning"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_json(result)["action"], "session_replace");
+    let read = tool
+        .invoke(
+            json!({"action":"session_read","topic":"planning"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_json(read)["content"], "Plan note");
+    let denied = tool.invoke(
+        json!({"action":"write","scope":"global","title":"Forbidden change","content":"durable"}),
+        ctx,
+    ).await.unwrap_err();
+    assert!(denied.to_string().contains("Plan Mode"));
+}
+
 fn completed_json(outcome: ToolOutcome) -> serde_json::Value {
     let ToolOutcome::Completed(result) = outcome else {
         panic!("expected Completed")

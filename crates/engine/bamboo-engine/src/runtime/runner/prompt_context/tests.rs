@@ -598,7 +598,7 @@ async fn external_memory_truncates_multi_topic_content_and_is_idempotent() {
     assert!(system_prompt.contains("### Session Memory Topic: `alpha`"));
     assert!(system_prompt.contains("### Session Memory Topic: `beta`"));
     assert!(system_prompt.contains("showing "));
-    assert!(system_prompt.contains("use action=read topic=alpha"));
+    assert!(system_prompt.contains("use action=session_read topic=alpha"));
 }
 
 #[tokio::test]

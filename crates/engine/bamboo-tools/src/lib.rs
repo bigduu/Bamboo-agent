@@ -55,8 +55,8 @@ pub use output_manager::{ArtifactRef, ToolOutputManager};
 
 // Re-export all tool implementations
 pub use tools::{
-    BashInputTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GlobTool, GrepTool,
-    KillShellTool, ReadTool, TaskTool, ToolRegistry, ViewImageTool, WebFetchTool, WriteTool,
+    EditTool, ExitPlanModeTool, GlobTool, GrepTool, ReadTool, TaskTool, ToolRegistry,
+    ViewImageTool, WebFetchTool, WriteTool,
 };
 
 // Re-export task types for convenience

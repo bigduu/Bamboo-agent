@@ -86,15 +86,14 @@ selecting Ultra on an Ordinary Root does not make it a Supervisor.
 | Executing Session | Model posture | Management authority |
 | --- | --- | --- |
 | Ordinary Root, Standard | Existing configured execution tools and permissions | Existing ordinary checks; no Supervisor exception |
-| Ordinary Root, Ultra | Bounded planning, delegation, read-only acquisition and verification | No Supervisor-only exception |
-| Trusted Supervisor, Standard or Ultra | Bounded orchestration and necessary dedicated read-only acquisition | Only current, explicitly authorized scope |
+| Ordinary Root, Ultra | Parallel delegation, verification and authorized file edits | No Supervisor-only exception |
+| Trusted Supervisor, Standard or Ultra | Bounded Session and Work orchestration | Only current, explicitly authorized scope |
 | Child | Its own profile, tools and permissions | Does not inherit Supervisor identity or management scope |
 
 The Supervisor owns task boundaries, planning, dispatch, progress, coordination,
 evidence verification and synthesis. It delegates implementation, including
-simple changes. Necessary reads use dedicated `Read`, `Grep`, `Glob`,
-`GetFileInfo`, `ViewImage` and scoped history tools. Shell commands, editing,
-Skill/Workflow execution and external tools cannot become read-only shortcuts.
+simple changes. It uses scoped Session and Work views and delegates direct
+workspace reads, file edits, shell commands, and Skill or Workflow execution.
 Catalog projection, final dispatch, approval replay and queued tool actions
 apply the same exact execution-name boundary.
 

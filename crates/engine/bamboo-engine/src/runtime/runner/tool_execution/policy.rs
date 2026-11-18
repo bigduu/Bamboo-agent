@@ -264,7 +264,7 @@ fn hash_field(fingerprint: &mut Sha256, bytes: &[u8]) {
     fingerprint.update(bytes);
 }
 
-const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
+const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Write",
     "Edit",
     "NotebookEdit",
@@ -274,8 +274,7 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "SubAgent",
     "scheduler",
     "sub_session_manager",
-    "session_note",
-    "memory_note",
+    "memory",
 ];
 
 fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
@@ -354,7 +353,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
     tool_call: &ToolCall,
     execution_name: &str,
 ) -> Result<(), String> {
-    let exact_shell = matches!(execution_name, "bash" | "exec_command" | "write_stdin");
+    let exact_shell = matches!(execution_name, "exec_command" | "write_stdin");
     let normalized_tool_name = if exact_shell {
         execution_name.to_owned()
     } else {
@@ -368,9 +367,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
         return Ok(());
     }
 
-    if normalized_tool_name.eq_ignore_ascii_case("session_note")
-        || normalized_tool_name.eq_ignore_ascii_case("memory_note")
-    {
+    if normalized_tool_name.eq_ignore_ascii_case("memory") {
         let (parsed, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
         if parse_warning.is_some()
             && parsed
@@ -379,7 +376,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
                 .unwrap_or(false)
         {
             return Err(format!(
-                "Tool policy blocked '{}' due to invalid JSON arguments: unable to recover arguments. Rewrite the {} call with a valid JSON object, for example {{\"action\":\"read\",\"topic\":\"default\"}}.",
+                "Tool policy blocked '{}' due to invalid JSON arguments: unable to recover arguments. Rewrite the {} call with a valid JSON object, for example {{\"action\":\"session_read\",\"topic\":\"default\"}}.",
                 normalized_tool_name, normalized_tool_name,
             ));
         }
@@ -859,16 +856,16 @@ mod tests {
     }
 
     #[test]
-    fn session_note_accepts_repairable_json_arguments() {
-        let call = tool_call("session_note", r#"{"action":"read""#);
+    fn memory_accepts_repairable_json_arguments() {
+        let call = tool_call("memory", r#"{"action":"session_read""#);
         assert!(validate_tool_call_arguments(&call).is_ok());
     }
 
     #[test]
-    fn session_note_rejects_unrecoverable_json_with_retry_guidance() {
-        let call = tool_call("session_note", "not-json");
+    fn memory_rejects_unrecoverable_json_with_retry_guidance() {
+        let call = tool_call("memory", "not-json");
         let err = validate_tool_call_arguments(&call).expect_err("expected strict rejection");
-        assert!(err.contains("Rewrite the session_note call with a valid JSON object"));
+        assert!(err.contains("Rewrite the memory call with a valid JSON object"));
     }
 
     #[test]

@@ -739,7 +739,7 @@ impl Tool for ExecCommandTool {
             "workdir":{"type":"string","description":"Working directory within the current session workspace, relative or absolute; paths and symlinks outside the workspace are rejected"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding a running session; default 10000, clamped to 250..30000 ms"},
             "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000 and capped at 8192; estimated as four JSON-encoded bytes per token, including string quotes and escapes. Status/session/exit metadata is additional"},
-            "interactive":{"type":"boolean","description":"Keep a piped stdin open for write_stdin; default false sends immediate EOF"}
+            "interactive":{"type":"boolean","description":"Keep stdin open for write_stdin using a pipe. Default false sends EOF immediately."}
         },"required":["cmd"],"additionalProperties":false})
     }
 

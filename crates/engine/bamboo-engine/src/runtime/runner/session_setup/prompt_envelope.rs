@@ -64,7 +64,7 @@ Inspect authoritative child progress and results when needed. Correct or revise 
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
-const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode: increase task-wide reasoning through independent child planning and narrow delegated execution, followed by Root verification and synthesis. Use SubAgent's explorer role for planning. Split the work into non-overlapping independently verifiable slices and run them in parallel rather than funneling all work through one delegate; serialize dependent slices or shared-file writes. Keep required user goals, constraints and acceptance criteria intact. This product policy is independent of each model call's reasoning effort; it does not claim a native provider Ultra budget.";
+const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode prioritizes parallel SubAgents for independent work. Make authorized file edits directly when they are quicker or unblock the work. This mode is independent of each model call's reasoning effort.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
 Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to authorized workers. Use only bounded Session/Work/plan views here. Delegate every direct workspace/file read, search, image read, write, shell or process operation to another Session; read-only file tools are not an exception. A Skill, Workflow, browser or external tool is not a shortcut. Split multi-part execution into independently verifiable slices with non-overlapping file ownership and dispatch them in parallel to separate workers instead of funneling everything through one worker; serialize only dependent slices or shared-file writes.\n\
@@ -79,8 +79,7 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
         let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
         if session.root_orchestration_only_enabled() {
-            guidance.push_str("\n\n");
-            guidance.push_str(ULTRA_ROOT_GUIDANCE);
+            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification when the assignments are independent.");
         }
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
@@ -201,9 +200,10 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     assert!(guidance.content.contains("read-only explorer role"));
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance.content.contains("independent of each model call"));
+    assert!(guidance.content.contains("prioritizes parallel SubAgents"));
     assert!(guidance
         .content
-        .contains("run them in parallel rather than funneling"));
+        .contains("Make authorized file edits directly"));
 
     let child = Session::new_child_of("child", &restored, "model", "worker");
     assert!(build_root_orchestration_context_block(&child).is_none());
@@ -232,13 +232,15 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
-        assert_eq!(block.content.contains("Ultra Root thinking mode"), ultra);
         assert_eq!(
             block
                 .content
-                .contains("Split the work into non-overlapping independently verifiable slices"),
+                .contains("In Ultra, prefer parallel auxiliary"),
             ultra
         );
+        assert!(!block
+            .content
+            .contains("Make authorized file edits directly"));
         assert!(block.content.contains("before retrying"));
         for concept in [
             "Supervisor",

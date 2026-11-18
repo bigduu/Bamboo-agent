@@ -4171,6 +4171,12 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
         BudgetStrategy::default(),
         0,
     ));
+    // Keep real history pressure above the target after tool-guide compaction.
+    session
+        .token_budget
+        .as_mut()
+        .unwrap()
+        .compression_target_percent = 10;
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
         "resp-before-manual-archive".to_string(),
@@ -4198,6 +4204,8 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
 
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
     let mut config = retrieval_window_config(persistence);
+    // Exercise manual archival below the automatic trigger with compact tool guidance.
+    config.context_management.target_usage_ratio = 0.20;
     config
         .context_management
         .retrieval_window
@@ -6490,7 +6498,7 @@ fn context_pressure_notification_copy_is_strategy_aware() {
         assert_eq!(level, expected_level);
         assert!(message.contains("archiv"));
         assert!(message.contains("session_history_current"));
-        assert!(message.contains("session_note"));
+        assert!(message.contains("memory session_replace"));
         assert!(message.contains("decisions, paths, progress, and blockers"));
         assert!(message.contains("Do not copy raw transcript"));
         assert!(!message.contains("compact_context"));

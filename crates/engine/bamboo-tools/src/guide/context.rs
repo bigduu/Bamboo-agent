@@ -3,8 +3,6 @@
 //! This module provides language detection and context building for generating
 //! localized tool usage guidelines that match the language of the system prompt.
 
-const GIT_TOOL_GUIDANCE: &str = "For Git work, prefer available dedicated Git tools over reconstructing repository state by reading files one by one. Start with status and staged/unstaged diff; for branch comparison or conflicts, inspect the merge base, unique commits, and unmerged index before reading the necessary diff hunks and surrounding source to resolve intent. Batch independent read-only queries. Preserve dirty user work and unique commits; verify the resolved diff and relevant checks. Use the available shell tool only when a dedicated tool cannot provide the needed operation and your role permits shell execution. A Supervisor without shell access delegates Git execution to an authorized worker and reviews its evidence; missing tools never expand permissions.";
-
 /// Language options for guide generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuideLanguage {
@@ -37,8 +35,8 @@ pub struct GuideBuildContext {
     /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
     /// Discoverable tools that are currently activated for the session.
-    /// Activated discoverable tools render with full guides; inactive ones
-    /// render with short summaries only.
+    /// Activated tools render their explicitly registered guides; inactive
+    /// guides are omitted.
     pub activated_discoverable_tools: std::collections::BTreeSet<String>,
 }
 
@@ -66,40 +64,13 @@ impl GuideBuildContext {
         }
     }
 
-    /// Returns best practices appropriate for the configured language.
+    /// Shared rules that apply across tool schemas.
     pub fn best_practices(&self) -> &'static [&'static str] {
-        match self.language {
-            GuideLanguage::Chinese => &[
-                "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
-                "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
-                "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
-                "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Use dedicated tools for file operations when available.",
-                "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
-                "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                GIT_TOOL_GUIDANCE,
-                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
-                "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
-                "When referencing code locations in responses, use file_path:line_number format.",
-            ],
-            GuideLanguage::English => &[
-                "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
-                "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
-                "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
-                "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Use dedicated tools for file operations when available.",
-                "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
-                "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                GIT_TOOL_GUIDANCE,
-                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
-                "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
-                "When referencing code locations in responses, use file_path:line_number format.",
-            ],
-        }
+        &[
+            "Assist only with defensive security. Refuse offensive activity, credential harvesting, and malware-oriented changes.",
+            "Batch independent read-only calls. Narrow searches by path or pattern before requesting content.",
+            "Prefer dedicated file and Git tools when available. For Git, start with status and relevant diffs. Inspect the merge base and unmerged index for conflicts, preserve user changes and unique commits, and verify the resolved diff. Commit or publish only with user authorization.",
+        ]
     }
 }
 
@@ -123,40 +94,19 @@ mod tests {
     }
 
     #[test]
-    fn best_practices_do_not_assume_a_shell_protocol() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let context = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            };
-            let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("Use shell tools for terminal operations"));
-            assert!(!guidance.contains("exec_command"));
-            assert!(!guidance.contains("write_stdin"));
+    fn shared_rules_keep_security_and_git_boundaries_without_tool_names() {
+        let guidance = GuideBuildContext::default().best_practices().join("\n");
+        for required in [
+            "defensive security",
+            "Batch independent read-only calls",
+            "merge base and unmerged index",
+            "preserve user changes and unique commits",
+            "only with user authorization",
+        ] {
+            assert!(guidance.contains(required), "missing {required}");
         }
-    }
-
-    #[test]
-    fn best_practices_prefer_git_tools_and_preserve_role_and_work_boundaries() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let guidance = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            }
-            .best_practices()
-            .join("\n");
-            for required in [
-                "prefer available dedicated Git tools",
-                "status and staged/unstaged diff",
-                "merge base, unique commits, and unmerged index",
-                "necessary diff hunks and surrounding source",
-                "Preserve dirty user work and unique commits",
-                "Supervisor without shell access delegates Git execution to an authorized worker",
-                "missing tools never expand permissions",
-                "current or standing user authorization",
-            ] {
-                assert!(guidance.contains(required), "missing {required}");
-            }
+        for name in ["FileExists", "GetCurrentDir", "BashOutput", "exec_command"] {
+            assert!(!guidance.contains(name), "unexpected {name}");
         }
     }
 

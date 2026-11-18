@@ -408,8 +408,11 @@ pub(crate) fn build_tool_guide_context(
     activated_discoverable_tools: &BTreeSet<String>,
 ) -> String {
     let normalized_base_prompt = normalize_base_prompt(base_prompt_for_language);
-    let mut guide_context = GuideBuildContext::from_system_prompt(&normalized_base_prompt);
-    guide_context.activated_discoverable_tools = activated_discoverable_tools.clone();
+    let guide_context = GuideBuildContext {
+        activated_discoverable_tools: activated_discoverable_tools.clone(),
+        max_examples_per_tool: 1,
+        ..GuideBuildContext::from_system_prompt(&normalized_base_prompt)
+    };
     let mut tool_guide_context = EnhancedPromptBuilder::build(
         Some(config.tool_registry.as_ref()),
         tool_schemas,

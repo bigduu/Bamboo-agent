@@ -2706,21 +2706,20 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
 ///
 /// `timed_out` selects the wording: the normal path (all shells finished)
 /// announces completion; the deadline path (the 6h+10m wait ceiling was hit with
-/// shells STILL running) must NOT claim the shells completed — it says they may
-/// still be running so the model verifies with BashOutput instead of assuming
-/// success on a false premise.
+/// shells still running) asks the model to verify the command's effects before
+/// assuming completion.
 fn bash_completion_resume_message(bash_ids: &[String], timed_out: bool) -> Message {
     let body = if timed_out {
         format!(
             "Runtime notification: the background-Bash wait ceiling was reached while one or more \
-             shell(s) ({}) may still be running. The session is being resumed so it is not \
-             stranded; verify their actual status with BashOutput before assuming completion.",
+             shell(s) ({}) may still be running. Verify the command's expected effects before \
+             assuming completion or restarting it.",
             bash_ids.join(", ")
         )
     } else {
         format!(
             "Runtime notification: all background Bash shell(s) ({}) have completed. \
-             Review their output with BashOutput and resume the task from where you left off.",
+             Review the recorded output and exit status before continuing the task.",
             bash_ids.join(", ")
         )
     };
@@ -3223,10 +3222,6 @@ fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
         body.push_str("\n\nOutput tail:\n");
         body.push_str(&info.output_tail);
     }
-    body.push_str(&format!(
-        "\n\nUse BashOutput with bash_id=\"{}\" for the full output, then continue the task.",
-        info.bash_id
-    ));
     body
 }
 
@@ -8049,7 +8044,7 @@ mod tests {
     fn bash_completion_resume_message_deadline_does_not_claim_completion() {
         // The 6h+10m deadline force-breaks with shells STILL running. The message
         // must NOT say "have completed" — that would let the model assume success
-        // on a false premise. It must direct the model to verify with BashOutput.
+        // on a false premise. It must direct the model to verify the effects.
         let ids = vec!["bg-long".to_string()];
         let message = bash_completion_resume_message(&ids, true);
         assert!(
@@ -8063,8 +8058,10 @@ mod tests {
             message.content
         );
         assert!(
-            message.content.contains("BashOutput"),
-            "deadline resume message must direct verification via BashOutput: {}",
+            message
+                .content
+                .contains("Verify the command's expected effects"),
+            "deadline resume message must direct verification: {}",
             message.content
         );
         // Same hidden/kind shape so the resume gate is satisfied identically.
@@ -8134,9 +8131,7 @@ mod tests {
         assert!(body.contains("completed"), "body: {body}");
         assert!(body.contains("exit code 0"), "body: {body}");
         assert!(body.contains("BUILD OK"), "body: {body}");
-        // The model is pointed at BashOutput for the full log.
-        assert!(body.contains("BashOutput"), "body: {body}");
-        assert!(body.contains("bash_id=\"abc123\""), "body: {body}");
+        assert!(!body.contains("BashOutput"), "body: {body}");
     }
 
     #[test]
@@ -8491,7 +8486,7 @@ mod tests {
             msg.content
         );
         assert!(
-            msg.content.contains("BashOutput"),
+            !msg.content.contains("BashOutput"),
             "content: {}",
             msg.content
         );

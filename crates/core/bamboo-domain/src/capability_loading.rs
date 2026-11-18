@@ -47,8 +47,7 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 16] = [
-    "bash",
+pub const CORE_TOOL_NAMES: [&str; 15] = [
     "exec_command",
     "write_stdin",
     "Read",
@@ -283,10 +282,7 @@ pub fn resolve_tool_reference_name(
     }
 
     let fallback = canonical_tool_name(exact);
-    if !fallback.is_empty() && contains_registered_name(&fallback) {
-        return Some(fallback);
-    }
-    (fallback == "bash" && contains_registered_name("Bash")).then(|| "Bash".into())
+    (!fallback.is_empty() && contains_registered_name(&fallback)).then_some(fallback)
 }
 
 /// A logical catalog entry carrying provider-neutral loading policy alongside
@@ -469,7 +465,6 @@ mod tests {
         assert_eq!(
             CORE_TOOL_NAMES,
             [
-                "bash",
                 "exec_command",
                 "write_stdin",
                 "Read",
@@ -611,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             capability_loading_class_for_reference("default::getCurrentDir"),
-            CapabilityLoadingClass::HostOnly
+            CapabilityLoadingClass::Deferred
         );
         assert_eq!(
             capability_loading_class_for_reference("default::sub_task"),
@@ -666,8 +661,8 @@ mod tests {
             );
         }
         let host_alias =
-            ClassifiedToolIdentity::from_schema_name("GetCurrentDir").expect("host alias identity");
-        assert_eq!(host_alias.execution_name(), "GetCurrentDir");
+            ClassifiedToolIdentity::from_schema_name("Workspace").expect("host identity");
+        assert_eq!(host_alias.execution_name(), "Workspace");
         assert_eq!(host_alias.loading_class(), CapabilityLoadingClass::HostOnly);
         assert_eq!(
             ClassifiedToolIdentity::from_schema_name("exec_command")
@@ -710,7 +705,7 @@ mod tests {
                 .unwrap()
                 .is_model_visible());
         }
-        for name in ["bash", "exec_command", "write_stdin"] {
+        for name in ["exec_command", "write_stdin"] {
             let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
             assert_eq!(identity.execution_name(), name);
             assert_eq!(identity.loading_class(), CapabilityLoadingClass::Core);

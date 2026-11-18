@@ -29,15 +29,6 @@ pub struct SessionMemoryActionNames {
     pub list_topics: &'static str,
 }
 
-pub const SESSION_NOTE_ACTION_NAMES: SessionMemoryActionNames = SessionMemoryActionNames {
-    tool_name: "session_note",
-    read: "read",
-    append: "append",
-    replace: "replace",
-    clear: "clear",
-    list_topics: "list_topics",
-};
-
 pub const MEMORY_SESSION_ACTION_NAMES: SessionMemoryActionNames = SessionMemoryActionNames {
     tool_name: "memory",
     read: "session_read",
@@ -59,15 +50,15 @@ pub fn session_memory_lock(session_id: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-pub fn parse_session_note_action(action: &str) -> Result<SessionMemoryAction, ToolError> {
+pub fn parse_memory_session_action(action: &str) -> Result<SessionMemoryAction, ToolError> {
     match action.trim().to_ascii_lowercase().as_str() {
-        "read" => Ok(SessionMemoryAction::Read),
-        "append" => Ok(SessionMemoryAction::Append),
-        "replace" => Ok(SessionMemoryAction::Replace),
-        "clear" => Ok(SessionMemoryAction::Clear),
-        "list_topics" => Ok(SessionMemoryAction::ListTopics),
+        "session_read" => Ok(SessionMemoryAction::Read),
+        "session_append" => Ok(SessionMemoryAction::Append),
+        "session_replace" => Ok(SessionMemoryAction::Replace),
+        "session_clear" => Ok(SessionMemoryAction::Clear),
+        "session_list_topics" => Ok(SessionMemoryAction::ListTopics),
         _ => Err(ToolError::InvalidArguments(
-            "action must be one of: read, append, replace, clear, list_topics. Rewrite the session_note call with valid JSON.".to_string(),
+            "action must be one of: session_read, session_append, session_replace, session_clear, session_list_topics. Rewrite the memory call with valid JSON.".to_string(),
         )),
     }
 }
@@ -282,13 +273,13 @@ mod tests {
             Some("default"),
             None,
             Some(8),
-            SESSION_NOTE_ACTION_NAMES,
+            MEMORY_SESSION_ACTION_NAMES,
         )
         .await
         .expect("read should succeed");
 
         let value: serde_json::Value = serde_json::from_str(&result.result).expect("valid json");
-        assert_eq!(value["action"], "read");
+        assert_eq!(value["action"], "session_read");
         assert_eq!(value["length_chars"], 32);
         assert_eq!(value["body_truncated"], true);
         assert_eq!(value["content"].as_str().unwrap().chars().count(), 8);
