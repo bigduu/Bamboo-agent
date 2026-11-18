@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+};
 
 use actix_files as fs;
 use actix_web::{
@@ -22,6 +25,27 @@ use crate::services::frontend_package::{
     has_embedded_frontend_package, resolve_frontend_package_path,
 };
 use bamboo_config::TlsConfig;
+
+fn bound_addresses(listeners: &[TcpListener]) -> Result<Vec<SocketAddr>, String> {
+    listeners
+        .iter()
+        .map(|listener| {
+            listener
+                .local_addr()
+                .map_err(|error| format!("Failed to read bound HTTP address: {error}"))
+        })
+        .collect()
+}
+
+fn log_running_server(scheme: &str, bind: &str, port: u16, addresses: &[SocketAddr]) {
+    if port == 0 {
+        for address in addresses {
+            info!("Unified server running on {scheme}://{address}");
+        }
+    } else {
+        info!("Unified server running on {scheme}://{bind}:{port}");
+    }
+}
 
 /// Whether `path` belongs to bamboo's API surface (as opposed to a SPA
 /// frontend route the static-file fallback should serve `index.html` for).
@@ -198,6 +222,7 @@ pub async fn run_with_tls(
     };
 
     let listeners = build_desktop_listeners(port)?;
+    let addresses = bound_addresses(&listeners)?;
 
     let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
         .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
@@ -207,7 +232,7 @@ pub async fn run_with_tls(
     } else {
         "http"
     };
-    info!("Unified server running on {scheme}://127.0.0.1:{port}");
+    log_running_server(scheme, "127.0.0.1", port, &addresses);
 
     let result = server.await;
 
@@ -345,6 +370,7 @@ async fn run_with_static_options(
         None => None,
     };
     let mut listeners = build_bind_listeners(bind, port)?;
+    let addresses = bound_addresses(&listeners)?;
     let tailscale = if !apply_rate_limit
         && rustls_cfg.is_none()
         && static_dir.is_some()
@@ -415,7 +441,7 @@ async fn run_with_static_options(
     } else {
         "http"
     };
-    info!("Unified server running on {scheme}://{}:{}", bind, port);
+    log_running_server(scheme, bind, port, &addresses);
     let native_channel = if native_scope {
         Some(
             super::supervisor_host_protocol::NativeChannel::start(app_state_for_shutdown.clone())
