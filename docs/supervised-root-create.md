@@ -20,10 +20,16 @@ and ownership checks. A native ExecuteCommand permission check describes this
 Project/workspace before the Host service runs. No existing security setting,
 Project binding or permission is automatically changed.
 
-The worker is a new Standard Ordinary Root. Its ordinary global defaults and
+The worker is a new Ordinary Root. Standard is the default. An observed
+Supervisor can select `thinking_mode: "ultra"` in either `spawn_session` or
+`session_control create`. The first turn uses the ordinary Ultra tool catalog,
+including direct reads and edits and delegation of shell work to SubAgents.
+Keep the selected mode in the exact request when retrying a creation.
+
+The worker's ordinary global defaults and
 Project context come from the same pure creation use case as `POST /sessions`;
 its initial session permission mode is Default. It inherits no Supervisor
-history, private prompt, selected model, workspace, mode or privileges. A bounded
+history, private prompt, selected model, workspace or privileges. A bounded
 SubAgent creates a Child; a formal Work/Ticket uses the canonical Ticket API.
 This entry creates neither a Ticket nor an isolated Git worktree. The Host must
 prepare an appropriate workspace before invoking it.
