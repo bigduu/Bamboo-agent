@@ -127,7 +127,7 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
             let (publication, visible_messages, cancel_token) = {
-                let runners = state.agent_runners.clone().read_owned().await;
+                let mut runners = state.agent_runners.clone().write_owned().await;
                 let Some(runner) = runners
                     .get(&session_id)
                     .filter(|runner| runner.run_id == run_id)
@@ -137,10 +137,12 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 let publication = runner.event_publication.clone();
                 let visible_messages = runner.visible_messages.clone();
                 let cancel_token = runner.cancel_token.clone();
+                let publish_session = session_id.clone();
                 let publish_tx = session_tx.clone();
                 let account_event = started_event.clone();
                 let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &session_id, &account_event, Box::new(move || {
-                    let _runners = runners;
+                    let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
+                    runner.published_execution_started = Some(started_event.clone());
                     let _ = publish_tx.send(started_event);
                     true
                 })).await;

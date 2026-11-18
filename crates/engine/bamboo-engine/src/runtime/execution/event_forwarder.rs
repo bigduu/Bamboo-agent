@@ -716,7 +716,7 @@ pub fn create_event_forwarder_with_root_actor(
             started_at: Utc::now().to_rfc3339(),
         };
         let (publication, visible_messages, cancel_token) = {
-            let guard = runners.clone().read_owned().await;
+            let mut guard = runners.clone().write_owned().await;
             let Some(runner) = guard
                 .get(&session_id)
                 .filter(|runner| runner.run_id == run_id)
@@ -735,7 +735,8 @@ pub fn create_event_forwarder_with_root_actor(
                 &session_id,
                 &frame,
                 Box::new(move || {
-                    let _guard = guard;
+                    let runner = guard.get_mut(&sid).expect("retained exact runner guard");
+                    runner.published_execution_started = Some(started_event.clone());
                     mirror_to_account_feed(&feed, &sid, &started_event);
                     let _ = tx.send(started_event);
                     true

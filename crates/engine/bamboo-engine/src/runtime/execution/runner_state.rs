@@ -95,6 +95,9 @@ pub struct AgentRunner {
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
     supervisor_run_workspace: Option<Option<String>>,
 
+    /// The exact start event published by this runner's forwarder.
+    pub published_execution_started: Option<AgentEvent>,
+
     /// Last token budget event to replay for new subscribers.
     ///
     /// When a new client subscribes to an ongoing run, this
@@ -180,6 +183,14 @@ impl AgentRunner {
         self.terminal_usage.get().copied()
     }
 
+    /// Retain start identity independently of the bounded critical event cache.
+    pub fn running_execution_started(&self) -> Option<&AgentEvent> {
+        self.published_execution_started.as_ref().filter(|event| {
+            matches!(self.status, AgentStatus::Running)
+                && matches!(event, AgentEvent::ExecutionStarted { run_id, .. } if run_id == &self.run_id)
+        })
+    }
+
     /// Subscribe to the exact run's finalizer without granting the caller a way to signal it.
     pub fn wait_for_exact_finalization(
         &self,
@@ -260,6 +271,7 @@ impl AgentRunner {
             terminal_usage: Arc::default(),
             supervisor_run_target: None,
             supervisor_run_workspace: None,
+            published_execution_started: None,
             last_budget_event: None,
             last_critical_events: Vec::new(),
             last_tool_name: None,
