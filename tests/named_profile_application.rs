@@ -106,7 +106,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         match probe.root.fetch_add(1, Ordering::SeqCst) {
             0 => call(
                 "Write",
-                json!({"file_path":probe.workspace.join("root-denied.txt"),"content":"forbidden root"}),
+                json!({"file_path":probe.workspace.join("root-write.txt"),"content":"authorized Ultra root"}),
             ),
             1 => {
                 let mut args = json!({"action":"create","title":"Profile child","responsibility":"Complete a bounded assignment with evidence","prompt":"Use the real file tools and report evidence","subagent_type":role(probe.case),"workspace":probe.workspace,"auto_run":false});
@@ -404,7 +404,14 @@ async fn fixture(case: Case) {
             std::fs::read_to_string(data.join("host.log")).unwrap()
         )
     });
-    assert!(!workspace.join("root-denied.txt").exists());
+    if case == Case::Narrow {
+        assert!(!workspace.join("root-write.txt").exists());
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("root-write.txt")).unwrap(),
+            "authorized Ultra root"
+        );
+    }
     {
         assert!(
             parent
@@ -483,11 +490,20 @@ async fn fixture(case: Case) {
             .iter()
             .filter(|r| r["model"] == "native-root" && r["tools"].to_string().contains("SubAgent"))
             .collect();
-        assert!(root_calls.iter().all(|r| !r["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["function"]["name"] == "Write")));
+        assert!(!root_calls.is_empty());
+        for request in root_calls {
+            for tool in ["Write", "Edit"] {
+                assert_eq!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["function"]["name"] == tool),
+                    case != Case::Narrow,
+                    "Root {tool} visibility for {case:?}"
+                );
+            }
+        }
         if case == Case::Narrow || read_only(case) {
             assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
             assert!(!workspace.join("child-write.txt").exists());
@@ -1350,13 +1366,19 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
             );
         }
     }
-    assert!(requests
+    let root_requests: Vec<_> = requests
         .iter()
         .filter(|r| r["model"] == "handoff-root" && r["tools"].is_array())
-        .all(|r| r["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|t| t["function"]["name"] != "Write")));
+        .collect();
+    assert!(!root_requests.is_empty());
+    for request in root_requests {
+        for tool in ["Write", "Edit"] {
+            assert!(request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == tool));
+        }
+    }
     handle.stop(true).await;
 }

@@ -116,8 +116,8 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
         match probe.root.fetch_add(1, Ordering::SeqCst) {
             0 => call(
-                "Write",
-                json!({"file_path":probe.workspace.join("root-denied.txt"),"content":"forbidden root"}),
+                "exec_command",
+                json!({"cmd":"printf 'forbidden root' > root-denied.txt","workdir":probe.workspace}),
             ),
             1 => {
                 let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
@@ -600,11 +600,26 @@ async fn fixture(case: Case) {
             .iter()
             .filter(|r| r["model"] == "native-root" && r["tools"].to_string().contains("SubAgent"))
             .collect();
-        assert!(root_calls.iter().all(|r| !r["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["function"]["name"] == "Write")));
+        assert!(!root_calls.is_empty());
+        for request in root_calls {
+            for tool in ["Write", "Edit"] {
+                assert_eq!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["function"]["name"] == tool),
+                    case != Case::Narrow,
+                    "Root {tool} visibility for {case:?}"
+                );
+            }
+            assert!(request["tools"].as_array().unwrap().iter().all(|t| {
+                !matches!(
+                    t["function"]["name"].as_str(),
+                    Some("exec_command" | "write_stdin")
+                )
+            }));
+        }
         if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
             assert!(probe.audit_seen.load(Ordering::SeqCst));
