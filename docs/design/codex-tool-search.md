@@ -40,8 +40,10 @@ request declares eligible Core tools, session controls, and
 requests declare the exact eligible tools loaded in the session. A definition
 already declared for the current request can be replaced by a short
 acknowledgement in provider-visible history. The session retains its discovery
-results for resume. The old OpenAI `sticky_tool_loading` setting does not
-change this behavior.
+results for resume. For typed local Actor completion, the Worker keeps the
+lookup steps in its execution context and sends the Host the executed tools
+and replies. A fresh Actor activation discovers its eligible tools again.
+The old OpenAI `sticky_tool_loading` setting does not change this behavior.
 
 Forced functions and named provider allowlists declare just their requested
 functions. Each exact name must be present in the current role's catalog.

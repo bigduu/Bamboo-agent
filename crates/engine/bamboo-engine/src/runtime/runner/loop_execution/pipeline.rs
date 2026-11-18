@@ -44,6 +44,7 @@ use bamboo_domain::{
     EffectiveCallableSet, HookPayload, HookResult, ProviderFamily, ProviderProtocol,
     ProviderTranscriptAuthor, ProviderTranscriptItem, ProviderTranscriptItemKind,
     ProviderTranscriptOrigin, RootFinalMessageCandidate, RootFinalMessageReference,
+    STICKY_DISCOVERY_RUNTIME_KIND, STICKY_DISCOVERY_RUNTIME_VERSION,
 };
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
@@ -63,8 +64,6 @@ use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
-const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
-const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
 const STICKY_DISCOVERY_RESULT_START: &str = "<loaded_tools>";
 const STICKY_DISCOVERY_RESULT_END: &str = "</loaded_tools>";
 

@@ -1839,20 +1839,14 @@ async fn fixture_with_followups(
         serde_json::to_value(&completed.messages).unwrap()
     );
     if glob && !reasoning {
-        let discovery = &cold.messages[cold.messages.len() - 5..cold.messages.len() - 3];
-        let lookup = discovery[0].tool_calls.as_ref().unwrap();
-        assert_eq!(lookup.len(), 1);
-        assert_eq!(lookup[0].id, GLOB_DISCOVERY_ID);
-        assert_eq!(
-            lookup[0].function.name,
-            DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
-        );
-        assert_eq!(
-            discovery[1].tool_call_id.as_deref(),
-            Some(GLOB_DISCOVERY_ID)
-        );
-        assert_eq!(discovery[1].tool_success, Some(true));
-        assert!(discovery[1].content.contains("\"name\":\"Glob\""));
+        assert!(!cold.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some(GLOB_DISCOVERY_ID)
+                || message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .any(|call| call.id == GLOB_DISCOVERY_ID)
+        }));
         let tail = &cold.messages[cold.messages.len() - 3..];
         assert_eq!(tail[0].role, bamboo_domain::Role::Assistant);
         let calls = tail[0].tool_calls.as_ref().unwrap();
