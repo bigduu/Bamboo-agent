@@ -78,6 +78,32 @@ fn call(id: &str, name: &str, args: Value) -> (Value, &'static str) {
         "tool_calls",
     )
 }
+fn call_with_discovery(body: &Value, id: &str, name: &str, args: Value) -> (Value, &'static str) {
+    let declares = |name: &str| {
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == name)
+    };
+    if declares(name) {
+        return call(id, name, args);
+    }
+    let discovery_id = format!("load-{name}");
+    assert!(
+        declares("discover_capabilities"),
+        "missing discovery for {name}"
+    );
+    assert!(
+        !has_tool_result(body, &discovery_id),
+        "{name} was not declared after discovery"
+    );
+    call(
+        &discovery_id,
+        "discover_capabilities",
+        json!({"query":name,"limit":1}),
+    )
+}
 fn envelopes(session: &Session) -> Vec<SessionMessageEnvelope> {
     session
         .messages
@@ -134,6 +160,14 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         (json!({"content":"INDEPENDENT_WORK_DONE"}), "stop")
     } else if body["model"] == "wait-supervisor" {
         let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            let declarations = body["tools"].as_array().unwrap();
+            for tool in ["session_control", "session_history", "SubAgent"] {
+                assert!(declarations
+                    .iter()
+                    .all(|entry| entry["function"]["name"] != tool));
+            }
+        }
         assert!(
             round < 24,
             "controlled negative bound: inspect polling never parks"
@@ -181,7 +215,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         } else if has(&body, STEER) && !has(&body, "STEERING_HANDLED") {
             (json!({"content":"STEERING_HANDLED"}), "stop")
         } else if result(&body, "directory").is_none() {
-            call(
+            call_with_discovery(
+                &body,
                 "directory",
                 "session_control",
                 json!({"action":"directory","query":WORK,"limit":2}),
@@ -189,7 +224,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         } else if result(&body, "select-root").is_none() {
             let directory = result(&body, "directory").unwrap();
             assert_eq!(directory["entries"][0]["session_id"], WORK);
-            call(
+            call_with_discovery(
+                &body,
                 "select-root",
                 "session_history",
                 json!({"action":"inspect","session_id":WORK}),
@@ -216,7 +252,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 result(&body, "follow-original").unwrap()["target_session_id"],
                 WORK
             );
-            call(
+            call_with_discovery(
+                &body,
                 "create-verifier-0",
                 "SubAgent",
                 json!({"message":"Perform bounded auxiliary verification in the assigned workspace and return a v1 child report; do not implement the main task."}),

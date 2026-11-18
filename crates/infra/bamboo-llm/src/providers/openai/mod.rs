@@ -45,7 +45,6 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     tool_search_execution: Option<ResponsesToolSearchExecution>,
-    chat_completions_loading_mode: CapabilityLoadingMode,
     default_reasoning_effort: Option<ReasoningEffort>,
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
@@ -76,7 +75,6 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             tool_search_execution: None,
-            chat_completions_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
             default_reasoning_effort: None,
             explicit_prompt_cache: true,
             request_overrides: None,
@@ -117,19 +115,9 @@ impl OpenAIProvider {
         self
     }
 
-    /// Enable Bamboo's sticky conversation-history fallback on Chat-compatible
-    /// routes that do not use native Responses tool search.
-    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
-        self.chat_completions_loading_mode = if enabled {
-            CapabilityLoadingMode::StickyFallback
-        } else {
-            CapabilityLoadingMode::LegacyFullCatalog
-        };
-        self
-    }
-
-    pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
-        self.chat_completions_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+    /// Retained for callers using the old setting. Agent requests on
+    /// compatibility routes always use on-demand tool loading.
+    pub fn with_sticky_tool_loading(self, _enabled: bool) -> Self {
         self
     }
 
@@ -239,35 +227,6 @@ impl OpenAIProvider {
             .any(|p| Self::matches_model_pattern(p, model))
     }
 
-    fn chat_completions_selects_named_tools(&self, model: &str) -> bool {
-        let Some(overrides) = self.request_overrides.as_ref() else {
-            return false;
-        };
-        let mut body = json!({});
-        request_overrides::apply_overrides_to_body(
-            &mut body,
-            Some(overrides),
-            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-            Some(model),
-        );
-        let choice = &body["tool_choice"];
-        let has_name = |path| {
-            choice
-                .pointer(path)
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
-        };
-        match choice["type"].as_str() {
-            Some("function") => has_name("/function/name"),
-            Some("custom") => has_name("/custom/name"),
-            Some("allowed_tools") => choice
-                .pointer("/allowed_tools/tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| !tools.is_empty()),
-            _ => false,
-        }
-    }
-
     fn is_official_base_url(&self) -> bool {
         let normalized = self.base_url.trim_end_matches('/');
         normalized.eq_ignore_ascii_case("https://api.openai.com")
@@ -342,6 +301,13 @@ impl OpenAIProvider {
         );
         if let Some(name) = required_tool {
             body["tool_choice"] = json!({"type": "function", "name": name});
+        }
+        if request_purpose == "agent_loop" {
+            super::common::openai_responses::scope_agent_tool_search_history(
+                &mut body,
+                tools,
+                capability_loading_mode,
+            );
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
         request_overrides::mask_and_prepare_agent_request(
@@ -443,6 +409,13 @@ impl OpenAIProvider {
                 if let Some(name) = required_tool {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
+                if request_purpose == "agent_loop" {
+                    super::common::openai_responses::scope_agent_tool_search_history(
+                        &mut fallback_body,
+                        tools,
+                        capability_loading_mode,
+                    );
+                }
                 request_overrides::mask_and_prepare_agent_request(
                     &mut fallback_body,
                     &self.masking_config,
@@ -540,25 +513,39 @@ impl LLMProvider for OpenAIProvider {
         .then_some(DEFAULT_COMPRESSION_REASONING_EFFORT)
     }
 
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        let endpoint = if self.uses_responses_api(model) {
+            request_overrides::ENDPOINT_RESPONSES
+        } else {
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS
+        };
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        )
+    }
+
     async fn capability_loading_mode(
         &self,
         model: &str,
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
-        if required_tool.is_none()
+        let choice = self.request_tool_selection(model).await;
+        if required_tool.is_some() || choice.as_ref().is_ok_and(|choice| choice.restricts_names()) {
+            return CapabilityLoadingMode::LegacyFullCatalog;
+        }
+        if matches!(choice, Ok(crate::provider::RequestToolSelection::Automatic))
             && self.tool_search_execution.is_some()
             && self.is_official_base_url()
             && self.uses_responses_api(model)
         {
             CapabilityLoadingMode::Progressive
-        } else if required_tool.is_none()
-            && self.chat_completions_loading_mode != CapabilityLoadingMode::LegacyFullCatalog
-            && !self.uses_responses_api(model)
-            && !self.chat_completions_selects_named_tools(model)
-        {
-            self.chat_completions_loading_mode
         } else {
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         }
     }
 
@@ -830,6 +817,23 @@ impl LLMProvider for OpenAIProvider {
                 body,
                 corrected_disable: false,
             } if looks_like_responses_only_error(status, &body) => {
+                use crate::provider::RequestToolSelection::Automatic;
+                for endpoint in [
+                    request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                    request_overrides::ENDPOINT_RESPONSES,
+                ] {
+                    let selection = request_overrides::configured_tool_selection(
+                        self.request_overrides.as_ref(),
+                        endpoint,
+                        model,
+                    )?;
+                    if required_tool.map_or(selection != Automatic, |name| !selection.allows(name))
+                    {
+                        return Err(LLMError::RequestFailed(
+                            "OpenAI protocol fallback would change the configured tool choice; configure this model for Responses explicitly".into(),
+                        ));
+                    }
+                }
                 tracing::info!(
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)
@@ -1455,7 +1459,7 @@ mod tests {
             || OpenAIProvider::new("k").with_responses_only_models(vec!["gpt-5*".to_string()]);
         assert_eq!(
             official().capability_loading_mode("gpt-5.6", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog,
+            CapabilityLoadingMode::StickyFallback,
             "progressive loading requires explicit execution opt-in"
         );
         let client = official().with_tool_search_execution(ResponsesToolSearchExecution::Client);
@@ -1471,7 +1475,7 @@ mod tests {
         );
         assert_eq!(
             client.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
         let server = official().with_tool_search_execution(ResponsesToolSearchExecution::Server);
         assert_eq!(
@@ -1485,21 +1489,21 @@ mod tests {
             .with_tool_search_execution(ResponsesToolSearchExecution::Client);
         assert_eq!(
             custom.capability_loading_mode("gpt-5.6", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
     }
 
     #[tokio::test]
-    async fn sticky_loading_is_explicit_chat_only_and_native_responses_search_wins() {
+    async fn compatibility_routes_default_to_on_demand_and_native_responses_search_wins() {
         let unset = OpenAIProvider::new("k");
         assert_eq!(
             unset.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
         let disabled = unset.with_sticky_tool_loading(false);
         assert_eq!(
             disabled.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
 
         let sticky = disabled.with_sticky_tool_loading(true);
@@ -1520,7 +1524,7 @@ mod tests {
             responses_without_native
                 .capability_loading_mode("gpt-5.6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog,
+            CapabilityLoadingMode::StickyFallback,
             "sticky fallback must not replace native Responses search"
         );
         let native = responses_without_native
@@ -1563,20 +1567,15 @@ mod tests {
             ]
         }))
         .unwrap();
-        let provider = OpenAIProvider::new("fixture")
-            .with_default_sticky_tool_loading()
-            .with_request_overrides(Some(overrides));
+        let provider = OpenAIProvider::new("fixture").with_request_overrides(Some(overrides));
 
         for (model, expected) in [
             ("fixture-forced", CapabilityLoadingMode::LegacyFullCatalog),
             ("fixture-allowed", CapabilityLoadingMode::LegacyFullCatalog),
-            (
-                "fixture-auto",
-                CapabilityLoadingMode::StickyFallbackForRootChat,
-            ),
+            ("fixture-auto", CapabilityLoadingMode::StickyFallback),
             (
                 "responses-override-only",
-                CapabilityLoadingMode::StickyFallbackForRootChat,
+                CapabilityLoadingMode::StickyFallback,
             ),
         ] {
             assert_eq!(

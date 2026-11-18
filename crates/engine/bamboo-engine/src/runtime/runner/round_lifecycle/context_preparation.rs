@@ -1769,7 +1769,6 @@ pub(crate) async fn stage_user_context_compaction(
         ));
     }
     let id = session.id.clone();
-    let schemas = super::context_tool_schemas_for_session(session, provider, model, tools).await;
     let budget =
         super::token_budget::resolve_token_budget(session, config, model, provider.as_ref()).await;
     let staged = if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow
@@ -1786,7 +1785,7 @@ pub(crate) async fn stage_user_context_compaction(
                 config,
                 model,
                 &id,
-                &schemas,
+                tools,
                 provider,
                 &budget,
                 None,
@@ -1804,7 +1803,7 @@ pub(crate) async fn stage_user_context_compaction(
             config,
             model,
             &id,
-            &schemas,
+            tools,
             provider,
             &budget,
             None,
@@ -2872,18 +2871,12 @@ pub(super) async fn maybe_apply_host_context_compression(
                 llm.as_ref(),
             )
             .await;
-            // Preserve the Supervisor's logical catalog for current loading
-            // observations. Request-usage projection measures its provider wire
-            // shape separately, so omitted definitions do not over-archive.
-            let request_tool_schemas =
-                super::context_tool_schemas_for_session(session, llm, model_name, tool_schemas)
-                    .await;
             return match Box::pin(maybe_prepare_retrieval_window_context(
                 session,
                 config,
                 model_name,
                 session_id,
-                request_tool_schemas.as_ref(),
+                tool_schemas,
                 llm,
                 &budget,
                 event_tx,

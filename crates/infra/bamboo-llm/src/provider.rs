@@ -717,6 +717,38 @@ pub(crate) fn required_tool_from_options<'a>(
 
 pub(crate) const DEFAULT_COMPRESSION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
+/// A provider request override can narrow the tools the session may offer.
+/// Names use the exact function identities in the provider's declarations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum RequestToolSelection {
+    #[default]
+    Automatic,
+    Required,
+    Disabled,
+    Named {
+        names: Vec<String>,
+        required: bool,
+    },
+}
+
+impl RequestToolSelection {
+    pub fn restricts_names(&self) -> bool {
+        matches!(self, Self::Disabled | Self::Named { .. })
+    }
+
+    pub fn requires_call(&self) -> bool {
+        matches!(self, Self::Required | Self::Named { required: true, .. })
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::Automatic | Self::Required => true,
+            Self::Disabled => false,
+            Self::Named { names, .. } => names.iter().any(|candidate| candidate == name),
+        }
+    }
+}
+
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -839,14 +871,20 @@ pub trait LLMProvider: Send + Sync {
 
     /// Select the provider's callable-catalog policy for one model request.
     ///
-    /// Providers must opt in explicitly. The default preserves the complete
-    /// legacy function catalog for compatibility endpoints and unknown models.
+    /// Configured generation adapters select native or compatibility loading.
+    /// The default preserves the catalog supplied to existing custom Rust adapters.
     async fn capability_loading_mode(
         &self,
         _model: &str,
         _required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
         CapabilityLoadingMode::LegacyFullCatalog
+    }
+
+    /// Resolve the generation endpoint's configured tool choice before the
+    /// agent projects the role's eligible catalog for this request.
+    async fn request_tool_selection(&self, _model: &str) -> Result<RequestToolSelection> {
+        Ok(RequestToolSelection::Automatic)
     }
 
     /// Lower the tool definitions visible to the model at this request.
@@ -1133,6 +1171,10 @@ impl LLMProvider for QueuedBudgetProvider {
             .capability_loading_mode(model, required_tool)
             .await
     }
+    async fn request_tool_selection(&self, model: &str) -> Result<RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,

@@ -450,6 +450,13 @@ impl LLMProvider for BudgetedProvider {
     ) -> CapabilityLoadingMode {
         self.inner.capability_loading_mode(model, required).await
     }
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<bamboo_llm::provider::RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,

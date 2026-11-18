@@ -39,7 +39,9 @@ impl ToolExecutor for SplitExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        OutputLimitExecutor::default().list_tools()
+        let mut tools = OutputLimitExecutor::default().list_tools();
+        tools[0].function.name = "Read".into();
+        tools
     }
 }
 
@@ -70,7 +72,7 @@ fn message_text(content: &str, finish: &str, tokens: Option<u64>) -> ResponseTem
 
 fn tool(id: &str, tokens: u64) -> ResponseTemplate {
     mock_messages_completion(
-        json!({"type":"tool_use","id":id,"name":"fixture_tool","input":{}}),
+        json!({"type":"tool_use","id":id,"name":"Read","input":{}}),
         json!({"type":"input_json_delta","partial_json":"{}"}),
         "tool_use",
         Some(tokens),
@@ -229,7 +231,7 @@ async fn run_with_executor<T: ToolExecutor + 'static>(
             id: "call_prior".into(),
             tool_type: "function".into(),
             function: bamboo_domain::FunctionCall {
-                name: "fixture_tool".into(),
+                name: "Read".into(),
                 arguments: "{}".into(),
             },
         }]),
@@ -790,7 +792,7 @@ async fn pipeline_keeps_visible_or_tool_output_in_the_same_frame_as_repeated_rea
     };
     for (output, expected_tool_calls) in [
         (json!({"text":"Visible progress."}), 0),
-        (json!({"functionCall":{"name":"fixture_tool","args":{}}}), 1),
+        (json!({"functionCall":{"name":"Read","args":{}}}), 1),
     ] {
         let mixed = json!({"type":"chunk","candidates":[{"content":{"parts":[
             {"thought":true,"text":REPEATED_REASONING.repeat(96)}, output
@@ -939,7 +941,7 @@ async fn pipeline_splits_a_capped_messages_turn_without_reasoning_or_a_complete_
         json!({"type":"message_stop"}),
     ]);
     let provisional = mock_messages_completion(
-        json!({"type":"tool_use","id":CAPPED_TOOL_ID,"name":"fixture_tool","input":{}}),
+        json!({"type":"tool_use","id":CAPPED_TOOL_ID,"name":"Read","input":{}}),
         json!({"type":"input_json_delta","partial_json":"{}"}),
         "max_tokens",
         Some(CAP),
@@ -973,7 +975,7 @@ async fn pipeline_output_limit_split_uses_only_an_explicit_total_token_budget() 
             "input_tokens":31,"cache_creation_input_tokens":0,"cache_read_input_tokens":250_000
         }}}),
         json!({"type":"content_block_start","index":0,"content_block":{
-            "type":"tool_use","id":"prior_work","name":"fixture_tool","input":{}
+            "type":"tool_use","id":"prior_work","name":"Read","input":{}
         }}),
         json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
         json!({"type":"content_block_stop","index":0}),
@@ -1193,7 +1195,7 @@ async fn pipeline_output_token_limit_recovery_never_retries_after_a_failed_http_
 async fn pipeline_output_limit_split_rejects_a_tool_before_messages_stop() {
     let incomplete = mock_completion_sse(&[
         json!({"type":"content_block_start","index":0,"content_block":{
-            "type":"tool_use","id":"partial_tool","name":"fixture_tool","input":{}
+            "type":"tool_use","id":"partial_tool","name":"Read","input":{}
         }}),
         json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
         json!({"type":"content_block_stop","index":0}),
@@ -1253,7 +1255,7 @@ fn output_limit_split_restricts_delegation_aliases_and_requires_terminal_shell_r
     for name in ["default::SubAgent", "default::spawnSession", "deploy_agent"] {
         assert!(forbidden_tool(name), "{name}");
     }
-    assert!(!forbidden_tool("fixture_tool"));
+    assert!(!forbidden_tool("Read"));
     for (result, success) in [
         (json!({"status":"running","exit_code":null}), false),
         (json!({"status":"exited","exit_code":1}), false),
@@ -1475,7 +1477,7 @@ async fn pipeline_output_limit_split_rejects_tool_batches_before_dispatch() {
     for index in 0..2 {
         events.extend([
             json!({"type":"content_block_start","index":index,"content_block":{
-                "type":"tool_use","id":format!("forbidden_{index}"),"name":"fixture_tool","input":{}
+                "type":"tool_use","id":format!("forbidden_{index}"),"name":"Read","input":{}
             }}),
             json!({"type":"content_block_stop","index":index}),
         ]);

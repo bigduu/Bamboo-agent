@@ -32,12 +32,11 @@ pub enum CapabilityLoadingMode {
     LegacyFullCatalog,
     Progressive,
     /// Compatibility path for providers without native deferred-tool search.
-    /// The top-level catalog stays fixed at Core plus Bamboo's synthetic
-    /// discovery function while loaded definitions live in conversation
-    /// history.
+    /// Bamboo declares initially available functions and its discovery gateway.
+    /// Validated discovery history supplies further callable definitions.
     StickyFallback,
-    /// Session policy selects sticky loading for ordinary Root Chat.
-    /// An unresolved mode uses the legacy catalog.
+    /// Compatibility value used by older provider adapters. The agent treats
+    /// it as StickyFallback for every session role.
     StickyFallbackForRootChat,
 }
 

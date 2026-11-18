@@ -32,18 +32,22 @@ and limits outside 1–5 fail. Rebuilding from the current registry prevents
 removed, disabled and HostOnly tools from being returned or gaining callable
 authority. Historical loaded names still require current registry eligibility.
 
-An OpenAI provider instance with no `sticky_tool_loading` setting uses on-demand
-loading for ordinary Root Chat on Chat Completions. The default request declares
-Core tools, `discover_capabilities`, and eligible `SubAgent`, `skills_list`, and
-`skills_read` tools. These allow required-child workflows and native Skill access
-to start directly. Discovery carries matching tool definitions into conversation
-history. Ultra uses its bounded eager catalog. Child sessions, Supervisors and
-Ticket runs use their session-specific tool projections.
+Bamboo resolves the current role, executor catalog, and disabled tools before
+selecting how to load definitions. This applies to Standard and Ultra Root,
+Child, Supervisor, and Ticket sessions. On compatibility routes the first
+request declares eligible Core tools, session controls, and
+`discover_capabilities` when the role has discoverable tools. Subsequent
+requests declare the exact eligible tools loaded in the session. A definition
+already declared for the current request can be replaced by a short
+acknowledgement in provider-visible history. The session retains its discovery
+results for resume. The old OpenAI `sticky_tool_loading` setting does not
+change this behavior.
 
-Set `"sticky_tool_loading": true` to opt in explicitly or `"sticky_tool_loading": false`
-when a gateway needs every callable tool in the top-level list. Requests that
-name allowed tools declare the full eligible catalog so the gateway receives
-those definitions.
+Forced functions and named provider allowlists declare just their requested
+functions. Each exact name must be present in the current role's catalog.
+Bamboo fails before dispatch when any name is unavailable and validates
+returned calls against the selection. Provider-native choices and formats
+retain their configured semantics.
 
 OpenAI Responses client `tool_search` exposes `query` and optional `limit` and
 searches Tools only. New requests with explicit Skill/Workflow kinds fail;
@@ -60,10 +64,12 @@ gateways are appended only while schema capacity remains. Tools-only requests
 retain complete original schemas.
 
 Anthropic native server search and OpenAI hosted server search retain their
-provider-owned ranking and wire protocol. They receive the eligible Deferred
-tool catalog using the existing native protocol. This host BM25 implementation
-applies to OpenAI client search and the fallback gateway. Unsupported surfaces
-retain the existing full catalog behavior.
+provider-owned ranking. Their HTTP requests include eligible definitions
+marked `defer_loading` so the model loads those definitions only after a search.
+OpenAI Responses client search sends no Deferred definitions in its first
+request. Provider-native replay checks the active catalog before re-exposing
+discovered definitions. The host BM25 implementation applies to OpenAI client
+search and the compatibility gateway.
 
 An adjacent admission gap remains outside this search slice: a changed schema
 retaining the same execution name can inherit previous loaded membership.

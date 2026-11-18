@@ -21,8 +21,8 @@ mod counted_tests;
 
 use pipeline::run_pipeline;
 pub(in crate::runtime::runner) use pipeline::{
-    effective_callable_set_for_round, legacy_browser_loaded_result_content,
-    legacy_browser_needs_discovery,
+    effective_callable_set_for_round, projected_sticky_fallback_results,
+    validated_sticky_fallback_loaded_tool_names,
 };
 use startup::{initialize_loop_state, LoopRunState};
 

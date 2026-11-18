@@ -346,14 +346,29 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
-        if required_tool.is_none()
-            && is_official_anthropic_base_url(&self.base_url)
+        let choice = self.request_tool_selection(model).await;
+        if required_tool.is_some() || choice.as_ref().is_ok_and(|choice| choice.restricts_names()) {
+            return CapabilityLoadingMode::LegacyFullCatalog;
+        }
+        if is_official_anthropic_base_url(&self.base_url)
             && supports_anthropic_tool_search(model)
+            && matches!(choice, Ok(crate::provider::RequestToolSelection::Automatic))
         {
             CapabilityLoadingMode::Progressive
         } else {
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         }
+    }
+
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )
     }
 
     async fn provider_visible_tool_footprint(
@@ -364,7 +379,7 @@ impl LLMProvider for AnthropicProvider {
         required_tool: Option<&str>,
     ) -> Result<ProviderVisibleToolFootprint> {
         let mode = self.capability_loading_mode(model, required_tool).await;
-        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+        if mode != CapabilityLoadingMode::Progressive {
             let projected = tools_to_anthropic_json(tools, mode);
             if projected.is_empty() {
                 return Ok(ProviderVisibleToolFootprint::default());
@@ -1023,7 +1038,7 @@ fn apply_anthropic_native_groups(
         items: Vec<Value>,
     }
 
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return;
     }
 
@@ -1683,7 +1698,7 @@ pub(crate) fn tools_to_anthropic_json(
     tools: &[ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> Vec<Value> {
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return tools.iter().map(tool_to_anthropic_json).collect();
     }
 
@@ -7522,7 +7537,7 @@ mod anthropic_provider_tests {
         ] {
             assert_eq!(
                 provider.capability_loading_mode(model, None).await,
-                CapabilityLoadingMode::LegacyFullCatalog,
+                CapabilityLoadingMode::StickyFallback,
                 "{model}"
             );
         }
@@ -7537,7 +7552,7 @@ mod anthropic_provider_tests {
                 .with_base_url("https://compatible.example/v1")
                 .capability_loading_mode("claude-sonnet-4-6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
     }
 

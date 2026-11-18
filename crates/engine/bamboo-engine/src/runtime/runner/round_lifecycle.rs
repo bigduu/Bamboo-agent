@@ -11,8 +11,13 @@ use crate::runtime::stream::handler::StreamHandlingOutput;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
-use bamboo_domain::{CapabilityLoadingMode, ProviderTranscriptItemKind, SessionKind};
-use bamboo_llm::provider::{OutputLimitRecovery, REASONING_REPETITION_FINISH_REASON};
+use bamboo_domain::{
+    CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity,
+    ProviderTranscriptItemKind, SessionKind,
+};
+use bamboo_llm::provider::{
+    OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
+};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -25,13 +30,15 @@ mod stream_execution;
 mod token_budget;
 pub(crate) use token_budget::{configured_model_ceilings, resolve_known_token_ceilings};
 mod token_estimation;
+#[cfg(test)]
+mod tool_loading_http_tests;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;
 pub(crate) use context_preparation::stage_user_context_compaction;
 pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
-pub(in crate::runtime::runner) use stream_execution::{
-    effective_tool_schemas, required_tool_for_session,
-};
+#[cfg(test)]
+pub(in crate::runtime::runner) use stream_execution::effective_tool_schemas;
+pub(in crate::runtime::runner) use stream_execution::required_tool_for_session;
 
 pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
     items: &[bamboo_domain::ProviderTranscriptItem],
@@ -66,28 +73,41 @@ fn rejected_output_limit(
                 })))
 }
 
-pub(super) async fn capability_loading_mode_for_session(
-    session: &Session,
+pub(super) async fn request_tool_policy(
     llm: &dyn LLMProvider,
     model: &str,
     required_tool: Option<&str>,
-) -> CapabilityLoadingMode {
-    let mode = llm.capability_loading_mode(model, required_tool).await;
-    // The omitted setting applies to ordinary Standard Root Chat. Keep
-    // specialized tool contracts and explicit provider choices intact.
-    if mode == CapabilityLoadingMode::StickyFallbackForRootChat
-        && (session.kind != SessionKind::Root
-            || session.parent_session_id.is_some()
-            || !session.authority_identity.is_ordinary()
-            || session.id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
-            || session.root_orchestration_only_enabled()
-            || session
-                .metadata
-                .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY))
-    {
-        return CapabilityLoadingMode::LegacyFullCatalog;
-    }
-    mode
+) -> Result<(CapabilityLoadingMode, RequestToolSelection), AgentError> {
+    let configured = llm
+        .request_tool_selection(model)
+        .await
+        .map_err(|error| AgentError::LLMNonRetryable(error.to_string()))?;
+    let selection = if let Some(name) = required_tool {
+        if !configured.allows(name) {
+            return Err(AgentError::LLMNonRetryable(format!(
+                "required tool '{name}' is excluded by the provider request's tool selection"
+            )));
+        }
+        RequestToolSelection::Named {
+            names: vec![name.to_owned()],
+            required: true,
+        }
+    } else {
+        configured
+    };
+    let mode = if selection.restricts_names() {
+        // Named definitions must be present in the provider's initial tools.
+        // The catalog for this mode is reduced to the selected names first.
+        CapabilityLoadingMode::LegacyFullCatalog
+    } else {
+        match llm.capability_loading_mode(model, None).await {
+            CapabilityLoadingMode::StickyFallbackForRootChat => {
+                CapabilityLoadingMode::StickyFallback
+            }
+            mode => mode,
+        }
+    };
+    Ok((mode, selection))
 }
 
 pub(super) fn uses_sticky_fallback(mode: CapabilityLoadingMode) -> bool {
@@ -97,141 +117,113 @@ pub(super) fn uses_sticky_fallback(mode: CapabilityLoadingMode) -> bool {
     )
 }
 
+pub(super) fn select_request_tool_schemas<'a>(
+    session: &Session,
+    tool_schemas: &'a [ToolSchema],
+    selection: &RequestToolSelection,
+) -> Result<Cow<'a, [ToolSchema]>, AgentError> {
+    let eligible = |schema: &ToolSchema| {
+        let name = &schema.function.name;
+        selection.allows(name)
+            && session.allows_model_tool_execution(name)
+            && ClassifiedToolIdentity::from_schema_name(name)
+                .is_some_and(|tool| tool.loading_class() != CapabilityLoadingClass::HostOnly)
+    };
+    let selected = if tool_schemas.iter().all(eligible) {
+        Cow::Borrowed(tool_schemas)
+    } else {
+        Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| eligible(schema))
+                .cloned()
+                .collect(),
+        )
+    };
+    if let RequestToolSelection::Named { names, .. } = selection {
+        if let Some(name) = names
+            .iter()
+            .find(|name| !selected.iter().any(|tool| tool.function.name == **name))
+        {
+            return Err(AgentError::LLMNonRetryable(format!(
+                "requested tool '{name}' is unavailable under the current tool policy"
+            )));
+        }
+    }
+    Ok(selected)
+}
+
+pub(in crate::runtime::runner) fn fallback_tool_is_resident(session: &Session, name: &str) -> bool {
+    ClassifiedToolIdentity::from_schema_name(name)
+        .is_some_and(|tool| tool.loading_class() == CapabilityLoadingClass::Core)
+        || match name {
+            // These controls have runtime contracts for delegation, private
+            // steps, active goals and suspended/legacy loops.
+            "SubAgent" => session.supervisor_incarnation_id().is_none(),
+            "Task" | "update_goal" | "loop_control" | "ExitPlanMode" => true,
+            "skills_list" | "skills_read" => {
+                session.kind == SessionKind::Root && !session.model_orchestration_only_enabled()
+            }
+            _ => false,
+        }
+}
+
 pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
     mode: CapabilityLoadingMode,
-    required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
-    if session.model_orchestration_only_enabled() {
-        // Preserve exact model authority in every provider projection. The
-        // trusted Supervisor may use the existing read-only loading gateway
-        // to discover only its bounded orchestration catalog.
-        let mut bounded = tool_schemas
-            .iter()
-            .filter(|schema| {
-                bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(|entry| {
-                    session.allows_model_tool_execution(entry.execution_name())
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if session.supervisor_incarnation_id().is_some()
-            && mode == CapabilityLoadingMode::StickyFallback
-        {
-            // The existing read-only control gateway loads only this bounded
-            // catalog. Never force a named delegation tool or expose a shell.
-            bounded.retain(|schema| {
-                bamboo_domain::ClassifiedToolSchema::new(schema.clone()).is_some_and(|entry| {
-                    entry.loading_class() == bamboo_domain::CapabilityLoadingClass::Core
-                })
-            });
-            bounded.push(bamboo_domain::discovery_control_fallback_schema());
-        }
-        return Cow::Owned(bounded);
-    }
-    if mode == CapabilityLoadingMode::LegacyFullCatalog {
-        // Legacy providers keep every other Deferred function unchanged. Only
-        // the shared browser is replaced with a small discovery gateway until
-        // this chat has a validated browser definition in its own history.
-        if !crate::runtime::runner::loop_execution::legacy_browser_needs_discovery(
-            session,
-            tool_schemas,
-            required_tool,
-        ) {
-            return Cow::Borrowed(tool_schemas);
-        }
-
-        let mut projected = tool_schemas
-            .iter()
-            .filter(|schema| schema.function.name != "browser")
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut discovery = bamboo_domain::discovery_control_fallback_schema();
-        discovery.function.description = "Search for and load the browser page shared with this chat. Use query `browser`; its full action schema becomes available after discovery.".into();
-        discovery.function.parameters = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {"query": {"type": "string", "enum": ["browser"]}},
-            "required": ["query"]
-        });
-        projected.push(discovery);
-        return Cow::Owned(projected);
-    }
-
     if !uses_sticky_fallback(mode) {
         return Cow::Borrowed(tool_schemas);
     }
 
+    let loaded =
+        crate::runtime::runner::loop_execution::validated_sticky_fallback_loaded_tool_names(
+            session,
+        );
     let mut projected = tool_schemas
         .iter()
-        .cloned()
-        .filter_map(bamboo_domain::ClassifiedToolSchema::new)
-        .filter(|entry| {
-            // Standard Root can delegate immediately. Native Skill guidance
-            // also names the finite Source controls when they are available.
-            entry.is_initially_visible()
-                || (mode == CapabilityLoadingMode::StickyFallbackForRootChat
-                    && matches!(
-                        entry.execution_name(),
-                        "SubAgent" | "skills_list" | "skills_read"
-                    ))
+        .filter(|schema| {
+            let name = &schema.function.name;
+            fallback_tool_is_resident(session, name) || loaded.contains(name)
         })
-        .map(bamboo_domain::ClassifiedToolSchema::into_schema)
+        .cloned()
         .collect::<Vec<_>>();
-    projected.push(bamboo_domain::discovery_control_fallback_schema());
+    // The gateway remains available for new queries after an earlier lookup.
+    if tool_schemas
+        .iter()
+        .any(|schema| !fallback_tool_is_resident(session, &schema.function.name))
+    {
+        projected.push(bamboo_domain::discovery_control_fallback_schema());
+    }
     Cow::Owned(projected)
 }
 
-/// Resolve the exact top-level tool catalog for one provider request.
-///
-/// Overflow recovery must account against the same capability-loading shape
-/// as the request that overflowed. Keeping this selection in one helper avoids
-/// accidentally projecting the full deferred catalog for StickyFallback.
+#[cfg(test)]
 pub(crate) async fn request_tool_schemas_for_session<'a>(
     session: &Session,
     llm: &Arc<dyn LLMProvider>,
     model_name: &str,
     tool_schemas: &'a [ToolSchema],
-) -> Cow<'a, [ToolSchema]> {
+) -> Vec<ToolSchema> {
     let required_tool = required_tool_for_session(session);
-    let capability_loading_mode =
-        capability_loading_mode_for_session(session, llm.as_ref(), model_name, required_tool).await;
-    request_tool_schemas_for_loading_mode(
-        session,
-        tool_schemas,
-        capability_loading_mode,
-        required_tool,
-    )
+    let (mode, selection) = request_tool_policy(llm.as_ref(), model_name, required_tool)
+        .await
+        .unwrap();
+    let eligible = select_request_tool_schemas(session, tool_schemas, &selection).unwrap();
+    request_tool_schemas_for_loading_mode(session, eligible.as_ref(), mode).into_owned()
 }
 
-/// Keep the complete approved Supervisor catalog for host observations and
-/// validated loading state. Its provider wire projection is applied later,
-/// identically for footprint measurement and actual dispatch.
-pub(crate) async fn context_tool_schemas_for_session<'a>(
-    session: &Session,
-    llm: &Arc<dyn LLMProvider>,
-    model_name: &str,
-    tool_schemas: &'a [ToolSchema],
-) -> Cow<'a, [ToolSchema]> {
-    if session.supervisor_incarnation_id().is_some() {
-        return Cow::Owned(
-            tool_schemas
-                .iter()
-                .filter(|schema| {
-                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
-                        |entry| session.allows_model_tool_execution(entry.execution_name()),
-                    )
-                })
-                .cloned()
-                .collect(),
-        );
-    }
-    request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await
+pub(super) struct RoundToolDispatch {
+    pub mode: CapabilityLoadingMode,
+    pub catalog: Vec<ToolSchema>,
+    pub fallback_discovery: bool,
+    pub selection: RequestToolSelection,
 }
 
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
+    pub(super) tool_dispatch: RoundToolDispatch,
     pub standalone_supervisor_spawn: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -352,9 +344,6 @@ pub(crate) async fn execute_llm_round(
     // Scope prepared image descriptions to this request. A configuration reused
     // across rounds must never serve a description produced for another request.
     config.vision_description_reuse.clear();
-    let request_tool_schemas =
-        context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
-    let tool_schemas = request_tool_schemas.as_ref();
     let is_recovery = output_limit_recovery.is_some_and(|policy| policy.retry.is_some());
     let prepared = if is_recovery {
         context_preparation::prepare_output_limit_recovery_context(
@@ -408,13 +397,13 @@ pub(crate) async fn execute_llm_round(
         tool_schemas,
         &frame,
     );
-    let (stream_output, llm_duration, prompt_tokens, completion) = match host_gold_attempt.as_ref()
-    {
-        Some(attempt) => {
-            bamboo_llm::provider::scope_main_dispatch(attempt.observer(), execution).await?
-        }
-        None => execution.await?,
-    };
+    let (stream_output, llm_duration, prompt_tokens, completion, tool_dispatch) =
+        match host_gold_attempt.as_ref() {
+            Some(attempt) => {
+                bamboo_llm::provider::scope_main_dispatch(attempt.observer(), execution).await?
+            }
+            None => execution.await?,
+        };
 
     // This is a terminal validation error, but the completed stream was still
     // billed. Return it alongside the canonical attempt usage so the runner can
@@ -443,7 +432,17 @@ pub(crate) async fn execute_llm_round(
                     | ProviderTranscriptItemKind::AnthropicRedactedThinking
             )
         });
-    let terminal_validation_error = if reasoning_repeated {
+    let terminal_validation_error = if stream_output
+        .tool_calls
+        .iter()
+        .any(|call| !tool_dispatch.selection.allows(&call.function.name))
+        || (openai_client_search_boundary
+            && tool_dispatch.mode != CapabilityLoadingMode::Progressive)
+    {
+        Some(AgentError::LLMNonRetryable(
+            "provider returned a tool call outside the current request's tool selection".into(),
+        ))
+    } else if reasoning_repeated {
         Some(AgentError::ReasoningRepetition {
             response_id: stream_output.response_id.clone(),
         })
@@ -453,6 +452,10 @@ pub(crate) async fn execute_llm_round(
             response_id: stream_output.response_id.clone(),
             reasoning_only,
         })
+    } else if tool_dispatch.selection.requires_call() && stream_output.tool_calls.is_empty() {
+        Some(AgentError::LLMNonRetryable(
+            "provider completed without the tool call required by this request".into(),
+        ))
     } else if is_recovery && !completion.has_recovery_completion() {
         Some(AgentError::LLMNonRetryable(
             "output-limit recovery ended without a successful provider completion".into(),
@@ -549,8 +552,9 @@ pub(crate) async fn execute_llm_round(
         standalone_supervisor_spawn:
             super::session_setup::tool_schemas::offers_standalone_supervisor_spawn(
                 session,
-                tool_schemas,
+                &tool_dispatch.catalog,
             ),
+        tool_dispatch,
         prompt_tokens,
         completion_tokens,
         attempt_usage,
@@ -603,9 +607,9 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
 #[cfg(test)]
 mod tests {
     use super::{
-        capability_loading_mode_for_session, execute_llm_round,
-        is_openai_client_tool_search_boundary, request_tool_schemas_for_loading_mode,
-        request_tool_schemas_for_session,
+        execute_llm_round, is_openai_client_tool_search_boundary, request_tool_policy,
+        request_tool_schemas_for_loading_mode, request_tool_schemas_for_session,
+        select_request_tool_schemas, RequestToolSelection,
     };
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -702,133 +706,39 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_delegation_first_provider_projection_keeps_only_bounded_tools_and_readonly_loading(
-    ) {
-        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
-        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
-            incarnation_id: uuid::Uuid::new_v4(),
-        };
-        let schemas = [
-            "Read",
-            "SubAgent",
-            "session_control",
-            "session_history",
-            "browser",
-            "exec_command",
-            "discover_capabilities",
-        ]
-        .into_iter()
-        .map(schema)
-        .collect::<Vec<_>>();
-        for ultra in [false, true] {
-            supervisor.set_root_orchestration_only(ultra).unwrap();
-            for mode in [
-                CapabilityLoadingMode::LegacyFullCatalog,
-                CapabilityLoadingMode::StickyFallback,
-                CapabilityLoadingMode::Progressive,
-            ] {
-                let offered =
-                    request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
-                let expected = if mode == CapabilityLoadingMode::StickyFallback {
-                    vec!["discover_capabilities"]
-                } else {
-                    vec!["SubAgent", "session_control", "session_history"]
-                };
-                assert_eq!(
-                    offered
+    fn named_selection_declares_only_exact_eligible_tools() {
+        let mut ultra = Session::new("forced-ultra", "model");
+        ultra.set_root_orchestration_only(true).unwrap();
+        let tools = ["Read", "Glob", "browser", "load_skill", "Workspace"].map(schema);
+        for (session, names, expected) in [
+            (&ultra, vec!["Glob"], Some(vec!["Glob"])),
+            (&ultra, vec!["Read", "Glob"], Some(vec!["Read", "Glob"])),
+            (&ultra, vec!["Read", "browser"], None),
+            (&ultra, vec!["load_skill"], None),
+            (&ultra, vec!["Workspace"], None),
+            (&ultra, vec!["read_file"], None),
+        ] {
+            let selection = RequestToolSelection::Named {
+                names: names.into_iter().map(str::to_owned).collect(),
+                required: false,
+            };
+            let selected = select_request_tool_schemas(session, &tools, &selection);
+            match expected {
+                Some(names) => assert_eq!(
+                    selected
+                        .unwrap()
                         .iter()
-                        .map(|s| s.function.name.as_str())
+                        .map(|tool| tool.function.name.as_str())
                         .collect::<Vec<_>>(),
-                    expected
-                );
+                    names,
+                ),
+                None => assert!(selected.is_err()),
             }
         }
-    }
-
-    #[test]
-    fn legacy_browser_projection_is_browser_only_and_explicit_required_tool_bypasses_it() {
-        let session = Session::new("legacy-browser", "chat-model");
-        let mut browser = schema("browser");
-        browser.function.parameters = json!({
-            "type":"object",
-            "properties":{
-                "action":{"type":"string","enum":["navigate","snapshot","click","fill","press","scroll","screenshot"]},
-                "url":{"type":"string"},
-                "selector":{"type":"string"},
-                "text":{"type":"string"},
-                "expected_epoch":{"type":"integer"}
-            },
-            "required":["action"],
-            "additionalProperties":false
-        });
-        let tools = vec![schema("Read"), schema("Glob"), browser];
-        let initial = request_tool_schemas_for_loading_mode(
-            &session,
-            &tools,
-            CapabilityLoadingMode::LegacyFullCatalog,
-            None,
-        );
-        let names = initial
-            .iter()
-            .map(|tool| tool.function.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Read", "Glob", "discover_capabilities"]);
-        assert_eq!(
-            serde_json::to_value(&initial[1]).unwrap(),
-            serde_json::to_value(&tools[1]).unwrap(),
-            "other Deferred tools stay unchanged"
-        );
-        assert!(initial[2].function.description.contains("browser page"));
-        assert_eq!(
-            initial[2].function.parameters["properties"]["query"]["enum"],
-            json!(["browser"])
-        );
-
-        let explicit = request_tool_schemas_for_loading_mode(
-            &session,
-            &tools,
-            CapabilityLoadingMode::LegacyFullCatalog,
-            Some("browser"),
-        );
-        assert_eq!(
-            serde_json::to_value(explicit.as_ref()).unwrap(),
-            serde_json::to_value(&tools).unwrap()
-        );
-        let other_required = request_tool_schemas_for_loading_mode(
-            &session,
-            &tools,
-            CapabilityLoadingMode::LegacyFullCatalog,
-            Some("load_skill"),
-        );
-        assert!(other_required
-            .iter()
-            .all(|tool| tool.function.name != "browser"));
-        let native = request_tool_schemas_for_loading_mode(
-            &session,
-            &tools,
-            CapabilityLoadingMode::Progressive,
-            None,
-        );
-        assert_eq!(
-            serde_json::to_value(native.as_ref()).unwrap(),
-            serde_json::to_value(&tools).unwrap()
-        );
-        assert_eq!(
-            bamboo_domain::ClassifiedToolSchema::new(tools[2].clone())
+        assert!(
+            select_request_tool_schemas(&ultra, &tools, &RequestToolSelection::Disabled)
                 .unwrap()
-                .loading_class(),
-            bamboo_domain::CapabilityLoadingClass::Deferred
-        );
-        let no_browser = request_tool_schemas_for_loading_mode(
-            &session,
-            &tools[..2],
-            CapabilityLoadingMode::LegacyFullCatalog,
-            None,
-        );
-        assert_eq!(
-            serde_json::to_value(no_browser.as_ref()).unwrap(),
-            serde_json::to_value(&tools[..2]).unwrap()
+                .is_empty()
         );
     }
 
@@ -863,8 +773,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_sticky_loading_preserves_root_controls_and_specialized_catalogs() {
+    async fn compatibility_providers_load_by_role_for_every_session_kind() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+
         let root = Session::new("chat-root", "chat-model");
         let child = Session::new_child_of("worker", &root, "chat-model", "read files");
         let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "chat-model");
@@ -878,49 +789,86 @@ mod tests {
             crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
             "assignment".into(),
         );
-        let default = StickyCapturingProvider {
-            mode: CapabilityLoadingMode::StickyFallbackForRootChat,
-            requests: Mutex::new(Vec::new()),
-        };
-        let explicit = StickyCapturingProvider {
-            mode: CapabilityLoadingMode::StickyFallback,
-            requests: Mutex::new(Vec::new()),
-        };
-        for session in [&child, &supervisor, &ultra, &ticket] {
-            assert_eq!(
-                capability_loading_mode_for_session(session, &default, "chat-model", None).await,
-                CapabilityLoadingMode::LegacyFullCatalog,
-            );
-            assert_eq!(
-                capability_loading_mode_for_session(session, &explicit, "chat-model", None).await,
-                CapabilityLoadingMode::StickyFallback,
-            );
+        let schemas = [
+            "Read",
+            "SubAgent",
+            "skills_list",
+            "skills_read",
+            "Glob",
+            "work_overview",
+            "session_control",
+            "Task",
+            "Workspace",
+        ]
+        .map(schema);
+        for provider_mode in [
+            CapabilityLoadingMode::StickyFallback,
+            CapabilityLoadingMode::StickyFallbackForRootChat,
+        ] {
+            let provider = StickyCapturingProvider {
+                mode: provider_mode,
+                requests: Mutex::new(Vec::new()),
+            };
+            for (session, expected) in [
+                (
+                    &root,
+                    vec![
+                        "Read",
+                        "SubAgent",
+                        "skills_list",
+                        "skills_read",
+                        "Task",
+                        "discover_capabilities",
+                    ],
+                ),
+                (
+                    &child,
+                    vec!["Read", "SubAgent", "Task", "discover_capabilities"],
+                ),
+                (
+                    &ticket,
+                    vec![
+                        "Read",
+                        "SubAgent",
+                        "skills_list",
+                        "skills_read",
+                        "Task",
+                        "discover_capabilities",
+                    ],
+                ),
+                (
+                    &ultra,
+                    vec!["Read", "SubAgent", "Task", "discover_capabilities"],
+                ),
+                (
+                    &supervisor,
+                    vec!["work_overview", "Task", "discover_capabilities"],
+                ),
+            ] {
+                let (mode, selection) = request_tool_policy(&provider, "chat-model", None)
+                    .await
+                    .unwrap();
+                assert_eq!(mode, CapabilityLoadingMode::StickyFallback);
+                let eligible = select_request_tool_schemas(session, &schemas, &selection).unwrap();
+                let projected = request_tool_schemas_for_loading_mode(session, &eligible, mode);
+                assert_eq!(
+                    projected
+                        .iter()
+                        .map(|tool| tool.function.name.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                let callable =
+                    crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                        session, &eligible, mode,
+                    );
+                assert!(!callable.contains_execution_name("Glob"));
+                assert_eq!(
+                    callable.contains_execution_name("work_overview"),
+                    session.supervisor_incarnation_id().is_some()
+                );
+            }
         }
-
-        let schemas = ["Read", "SubAgent", "skills_list", "skills_read", "Glob"].map(schema);
-        let mode = capability_loading_mode_for_session(&root, &default, "chat-model", None).await;
-        assert_eq!(mode, CapabilityLoadingMode::StickyFallbackForRootChat);
-        let projected = request_tool_schemas_for_loading_mode(&root, &schemas, mode, None);
-        assert_eq!(
-            projected
-                .iter()
-                .map(|tool| tool.function.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "Read",
-                "SubAgent",
-                "skills_list",
-                "skills_read",
-                "discover_capabilities"
-            ],
-        );
-        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
-            &root, &schemas, mode,
-        );
-        for name in ["Read", "SubAgent", "skills_list", "skills_read"] {
-            assert!(callable.contains_execution_name(name), "{name}");
-        }
-        assert!(!callable.contains_execution_name("Glob"));
     }
 
     #[tokio::test]
@@ -982,7 +930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sticky_first_and_next_round_use_byte_identical_core_plus_discovery_tools() {
+    async fn sticky_next_round_declares_only_the_newly_discovered_function() {
         let provider = Arc::new(StickyCapturingProvider {
             mode: CapabilityLoadingMode::StickyFallback,
             requests: Mutex::new(Vec::new()),
@@ -1070,9 +1018,16 @@ mod tests {
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            serde_json::to_vec(&requests[0]).unwrap(),
-            serde_json::to_vec(&requests[1]).unwrap(),
-            "loaded history must not rewrite the sticky top-level tools array"
+            requests[1]
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Read",
+                "ReadArchive",
+                "exec_command",
+                "discover_capabilities"
+            ]
         );
         assert_eq!(
             requests[0]

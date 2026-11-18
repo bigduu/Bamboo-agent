@@ -53,6 +53,13 @@ impl LLMProvider for ModelVisionProvider {
     ) -> CapabilityLoadingMode {
         self.inner.capability_loading_mode(model, required).await
     }
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> crate::provider::Result<crate::provider::RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,

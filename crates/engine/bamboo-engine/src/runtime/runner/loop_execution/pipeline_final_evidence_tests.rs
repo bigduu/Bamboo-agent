@@ -67,6 +67,18 @@ fn native_item(
 
 #[async_trait::async_trait]
 impl LLMProvider for FinalProvider {
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        if matches!(self.verdict, Verdict::NativeSearch(_)) {
+            bamboo_domain::CapabilityLoadingMode::Progressive
+        } else {
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        }
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
