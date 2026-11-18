@@ -239,18 +239,19 @@ impl SupervisedRootCreator {
             fingerprint = payload_fingerprint(&(&fingerprint, &managed.dispatch))
                 .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
         }
-        let state_revision = match authority.validate_request(self, &request).await {
-            Ok(revision) => revision,
-            Err(error) => {
-                return Ok(blocked(
-                    operation_id,
-                    None,
-                    "authorization",
-                    error.code,
-                    error.message,
-                ))
-            }
-        };
+        let (state_revision, supervisor_mode) =
+            match authority.validate_request(self, &request).await {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Ok(blocked(
+                        operation_id,
+                        None,
+                        "authorization",
+                        error.code,
+                        error.message,
+                    ))
+                }
+            };
         let _claim = self.operations.lock(&digest).await.map_err(|error| {
             ToolError::Execution(format!("creation claim unavailable: {error}"))
         })?;
@@ -340,10 +341,8 @@ impl SupervisedRootCreator {
         let mut operation = existing.unwrap_or_else(|| {
             let mut operation =
                 SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id);
-            if !authority.is_host() && managed.is_none() {
-                operation.supervisor_execution_permission_mode = Some(
-                    bamboo_orchestration::managed_session::DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
-                );
+            if managed.is_none() {
+                operation.supervisor_execution_permission_mode = supervisor_mode;
             }
             operation
         });

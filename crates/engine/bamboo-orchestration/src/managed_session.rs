@@ -14,9 +14,20 @@ pub use handoff::{
     DISPATCH_CONFIRMATION, SUPERVISOR_HANDOFF_GUIDANCE,
 };
 
-/// New independent execution Sessions keep explicit confirmation policies.
+/// The default permission mode for new independent execution Sessions.
 pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
+
+/// A verified Supervisor's explicit Auto selection applies to new dispatches.
+/// Other Supervisor modes keep the existing Bypass confirmation policy.
+pub fn supervisor_execution_permission_mode(
+    requested: SessionPermissionMode,
+) -> SessionPermissionMode {
+    match requested {
+        SessionPermissionMode::Auto => SessionPermissionMode::Auto,
+        _ => DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
+    }
+}
 
 pub const SUPERVISOR_STANDALONE_SPAWN_GUIDANCE: &str = concat!(
     "Start one independent execution Session in its own workspace, with no Project. ",
