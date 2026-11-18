@@ -45,7 +45,7 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     tool_search_execution: Option<ResponsesToolSearchExecution>,
-    chat_completions_loading_mode: CapabilityLoadingMode,
+    fallback_loading_mode: CapabilityLoadingMode,
     default_reasoning_effort: Option<ReasoningEffort>,
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
@@ -76,7 +76,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             tool_search_execution: None,
-            chat_completions_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
+            fallback_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
             default_reasoning_effort: None,
             explicit_prompt_cache: true,
             request_overrides: None,
@@ -117,10 +117,10 @@ impl OpenAIProvider {
         self
     }
 
-    /// Enable Bamboo's sticky conversation-history fallback on Chat-compatible
-    /// routes that do not use native Responses tool search.
+    /// Enable Bamboo's sticky conversation-history fallback on routes that do
+    /// not use native Responses tool search, including compatible Responses.
     pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
-        self.chat_completions_loading_mode = if enabled {
+        self.fallback_loading_mode = if enabled {
             CapabilityLoadingMode::StickyFallback
         } else {
             CapabilityLoadingMode::LegacyFullCatalog
@@ -129,7 +129,7 @@ impl OpenAIProvider {
     }
 
     pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
-        self.chat_completions_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+        self.fallback_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
         self
     }
 
@@ -239,33 +239,49 @@ impl OpenAIProvider {
             .any(|p| Self::matches_model_pattern(p, model))
     }
 
-    fn chat_completions_selects_named_tools(&self, model: &str) -> bool {
+    fn request_selects_named_tools(&self, model: &str) -> bool {
         let Some(overrides) = self.request_overrides.as_ref() else {
             return false;
         };
-        let mut body = json!({});
-        request_overrides::apply_overrides_to_body(
-            &mut body,
-            Some(overrides),
-            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-            Some(model),
-        );
-        let choice = &body["tool_choice"];
-        let has_name = |path| {
-            choice
-                .pointer(path)
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
+        // A Chat request can retry on Responses after a protocol rejection.
+        // Retain declarations required by either possible wire endpoint.
+        let endpoints: &[&str] = if self.uses_responses_api(model) {
+            &[request_overrides::ENDPOINT_RESPONSES]
+        } else {
+            &[
+                request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+                request_overrides::ENDPOINT_RESPONSES,
+            ]
         };
-        match choice["type"].as_str() {
-            Some("function") => has_name("/function/name"),
-            Some("custom") => has_name("/custom/name"),
-            Some("allowed_tools") => choice
-                .pointer("/allowed_tools/tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| !tools.is_empty()),
-            _ => false,
-        }
+        endpoints.iter().any(|endpoint| {
+            let mut body = json!({});
+            request_overrides::apply_overrides_to_body(
+                &mut body,
+                Some(overrides),
+                endpoint,
+                Some(model),
+            );
+            let choice = &body["tool_choice"];
+            if choice.as_str() == Some("required") {
+                return true;
+            }
+            let has_name = |path| {
+                choice
+                    .pointer(path)
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+            };
+            match choice["type"].as_str() {
+                Some("function") => has_name("/function/name") || has_name("/name"),
+                Some("custom") => has_name("/custom/name") || has_name("/name"),
+                Some("allowed_tools") => choice
+                    .pointer("/allowed_tools/tools")
+                    .or_else(|| choice.get("tools"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty()),
+                _ => false,
+            }
+        })
     }
 
     fn is_official_base_url(&self) -> bool {
@@ -546,17 +562,17 @@ impl LLMProvider for OpenAIProvider {
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
         if required_tool.is_none()
+            && !self.request_selects_named_tools(model)
             && self.tool_search_execution.is_some()
             && self.is_official_base_url()
             && self.uses_responses_api(model)
         {
             CapabilityLoadingMode::Progressive
         } else if required_tool.is_none()
-            && self.chat_completions_loading_mode != CapabilityLoadingMode::LegacyFullCatalog
-            && !self.uses_responses_api(model)
-            && !self.chat_completions_selects_named_tools(model)
+            && self.fallback_loading_mode != CapabilityLoadingMode::LegacyFullCatalog
+            && !self.request_selects_named_tools(model)
         {
-            self.chat_completions_loading_mode
+            self.fallback_loading_mode
         } else {
             CapabilityLoadingMode::LegacyFullCatalog
         }
@@ -1490,7 +1506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sticky_loading_is_explicit_chat_only_and_native_responses_search_wins() {
+    async fn sticky_loading_covers_responses_and_native_search_wins() {
         let unset = OpenAIProvider::new("k");
         assert_eq!(
             unset.capability_loading_mode("gpt-4o-mini", None).await,
@@ -1520,8 +1536,8 @@ mod tests {
             responses_without_native
                 .capability_loading_mode("gpt-5.6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog,
-            "sticky fallback must not replace native Responses search"
+            CapabilityLoadingMode::StickyFallback,
+            "Responses without native search uses the configured fallback"
         );
         let native = responses_without_native
             .with_tool_search_execution(ResponsesToolSearchExecution::Client);
@@ -1583,6 +1599,44 @@ mod tests {
                 provider.capability_loading_mode(model, None).await,
                 expected,
                 "model={model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_responses_preserves_effective_named_tool_overrides() {
+        for choice in [
+            json!("required"),
+            json!({"type": "function", "name": "Glob"}),
+            json!({"type": "custom", "name": "Glob"}),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "Glob"}]}),
+        ] {
+            let overrides: RequestOverridesConfig = serde_json::from_value(json!({
+                "rules": [{"model_pattern": "fixture", "endpoint": "responses", "scope": {
+                    "body_patch": [{"path": "/tool_choice", "value": choice}]
+                }}]
+            }))
+            .unwrap();
+            let provider = OpenAIProvider::new("fixture")
+                .with_default_sticky_tool_loading()
+                .with_responses_only_models(vec!["fixture".into()])
+                .with_request_overrides(Some(overrides.clone()));
+            assert_eq!(
+                provider.capability_loading_mode("fixture", None).await,
+                CapabilityLoadingMode::LegacyFullCatalog
+            );
+            let chat_primary = OpenAIProvider::new("fixture")
+                .with_default_sticky_tool_loading()
+                .with_request_overrides(Some(overrides));
+            assert_eq!(
+                chat_primary.capability_loading_mode("fixture", None).await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                "Responses fallback must retain its forced tool declarations"
+            );
+            let native = provider.with_tool_search_execution(ResponsesToolSearchExecution::Client);
+            assert_eq!(
+                native.capability_loading_mode("fixture", None).await,
+                CapabilityLoadingMode::LegacyFullCatalog
             );
         }
     }

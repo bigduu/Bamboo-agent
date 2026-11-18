@@ -924,6 +924,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_provider_defaults_select_root_discovery_and_resume_loaded_authority() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let model = "fixture-model";
+        for (provider_type, responses) in [
+            ("openai", false),
+            ("openai", true),
+            ("anthropic", false),
+            ("gemini", false),
+            ("bodhi", false),
+        ] {
+            let mut value = json!({
+                "provider_type": provider_type,
+                "api_key": "fixture-only",
+                "base_url": "http://127.0.0.1:1",
+                "enabled": true,
+                "responses_only_models": if responses { vec![model] } else { vec![] }
+            });
+            let instance = serde_json::from_value(value.clone()).unwrap();
+            let llm = bamboo_llm::provider_factory::create_provider_from_instance(
+                &bamboo_config::Config::default(),
+                &instance,
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+            let mut root = Session::new("factory-root", model);
+            let schemas = [
+                "Read",
+                "SubAgent",
+                "skills_list",
+                "skills_read",
+                "ReadArchive",
+            ]
+            .map(schema);
+            let mode = capability_loading_mode_for_session(&root, llm.as_ref(), model, None).await;
+            assert_eq!(
+                mode,
+                CapabilityLoadingMode::StickyFallbackForRootChat,
+                "{provider_type}/{responses}"
+            );
+            let initial = request_tool_schemas_for_loading_mode(&root, &schemas, mode, None);
+            assert_eq!(
+                initial
+                    .iter()
+                    .map(|tool| tool.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Read",
+                    "SubAgent",
+                    "skills_list",
+                    "skills_read",
+                    "discover_capabilities"
+                ]
+            );
+            let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                &root, &schemas, mode,
+            );
+            assert!(!callable.contains_execution_name("ReadArchive"));
+
+            let child = Session::new_child_of("factory-child", &root, model, "read");
+            let mut ultra = root.clone();
+            ultra.set_root_orchestration_only(true).unwrap();
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, model);
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            let mut ticket = root.clone();
+            ticket.metadata.insert(
+                crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
+                "assignment".into(),
+            );
+            for scoped in [&child, &ultra, &supervisor, &ticket] {
+                assert_eq!(
+                    capability_loading_mode_for_session(scoped, llm.as_ref(), model, None).await,
+                    CapabilityLoadingMode::LegacyFullCatalog
+                );
+            }
+            assert_eq!(
+                capability_loading_mode_for_session(
+                    &root,
+                    llm.as_ref(),
+                    model,
+                    Some("ReadArchive")
+                )
+                .await,
+                CapabilityLoadingMode::LegacyFullCatalog
+            );
+
+            // Rehydrate a trusted discovery result using the same canonical
+            // envelope as the discovery executor. This verifies membership and
+            // projection, not a provider request or the discovery executor itself.
+            root.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "factory-discovery".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.into(),
+                        arguments: r#"{"query":"archive","limit":1}"#.into(),
+                    },
+                }]),
+            ));
+            let payload = serde_json::to_string(&json!({"tools":[schemas[4].clone()]})).unwrap();
+            let mut result = Message::tool_result_with_status(
+                "factory-discovery",
+                format!("<loaded_tools>{payload}</loaded_tools>"),
+                true,
+            );
+            result.never_compress = true;
+            result.metadata = Some(
+                json!({"runtime_kind":"sticky_capability_discovery", "version":1, "canonical_new_names":["ReadArchive"]}),
+            );
+            root.add_message(result);
+            let resumed: Session =
+                serde_json::from_value(serde_json::to_value(&root).unwrap()).unwrap();
+            let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                &resumed, &schemas, mode,
+            );
+            assert!(callable.contains_execution_name("ReadArchive"));
+            let next = request_tool_schemas_for_loading_mode(&resumed, &schemas, mode, None);
+            assert_eq!(
+                serde_json::to_value(initial.as_ref()).unwrap(),
+                serde_json::to_value(next.as_ref()).unwrap()
+            );
+            let removed = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                &resumed,
+                &schemas[..4],
+                mode,
+            );
+            assert!(
+                !removed.contains_execution_name("ReadArchive"),
+                "history must not restore a removed tool"
+            );
+
+            value["sticky_tool_loading"] = json!(false);
+            let instance = serde_json::from_value(value).unwrap();
+            let eager = bamboo_llm::provider_factory::create_provider_from_instance(
+                &bamboo_config::Config::default(),
+                &instance,
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+            let mode =
+                capability_loading_mode_for_session(&root, eager.as_ref(), model, None).await;
+            assert_eq!(mode, CapabilityLoadingMode::LegacyFullCatalog);
+            let eager_tools = request_tool_schemas_for_loading_mode(&root, &schemas, mode, None);
+            assert!(eager_tools
+                .iter()
+                .any(|tool| tool.function.name == "ReadArchive"));
+        }
+    }
+
+    #[tokio::test]
     async fn selected_root_can_call_its_advertised_tools_in_sticky_mode() {
         let provider = Arc::new(StickyCapturingProvider {
             mode: CapabilityLoadingMode::StickyFallback,
