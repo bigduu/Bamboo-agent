@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedMutexGuard, RwLock};
@@ -266,6 +266,17 @@ pub trait ExternalChildRunner: Send + Sync {
             })
     }
 
+    /// Point-in-time activity for a bounded shell wait owned by this exact run.
+    fn shell_wait_activity_at(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: DateTime<Utc>,
+        _now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        None
+    }
+
     /// Capability of the actually assembled backend, independent of hot config.
     /// Only the in-process backend consumes canonical Ticket request ceilings.
     fn supports_native_ticket_budget(&self) -> bool {
@@ -473,6 +484,18 @@ pub struct SpawnScheduler {
 }
 
 impl SpawnScheduler {
+    pub(crate) fn shell_wait_activity_at(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.ctx
+            .external_child_runner
+            .shell_wait_activity_at(session_id, run_id, child_birth, now)
+    }
+
     pub(crate) async fn owns_current_native_work(
         &self,
         session_id: &str,
@@ -1182,7 +1205,8 @@ pub(crate) async fn watch_child_liveness(
                     return;
                 }
 
-                let last_activity_at = runner.last_activity_at().unwrap_or(runner.started_at);
+                let shell_wait = runtime.shell_wait_activity_at(&child_session_id, &run_id, child_birth, now);
+                let last_activity_at = runner.last_activity_at().max(shell_wait).unwrap_or(runner.started_at);
                 let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
                 if idle_secs >= policy.max_idle_secs {
                     let reason = format!(
