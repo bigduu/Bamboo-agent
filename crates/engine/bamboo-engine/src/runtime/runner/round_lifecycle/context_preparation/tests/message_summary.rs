@@ -480,6 +480,103 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
 }
 
 #[tokio::test]
+async fn chat_message_summary_recovers_when_reasoning_exhausts_the_output_limit() {
+    for unlimited_output in [true, false] {
+        for effort in [None, Some(bamboo_domain::ReasoningEffort::High)] {
+            assert_chat_reasoning_cutoff_recovers(unlimited_output, effort).await;
+        }
+    }
+}
+
+async fn assert_chat_reasoning_cutoff_recovers(
+    unlimited_output: bool,
+    effort: Option<bamboo_domain::ReasoningEffort>,
+) {
+    const MODEL_OUTPUT_LIMIT: u64 = 1_000;
+    const SUMMARY: &str = "The chosen design is recorded.";
+    const REASONING: &str = "Private fixture reasoning";
+    let model = "summary-secondary";
+    let limit_field = if effort.is_some() {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "max_input_tokens": 16_000, "max_output_tokens": MODEL_OUTPUT_LIMIT}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            if body[limit_field].as_u64() == Some(MODEL_OUTPUT_LIMIT) {
+                return chat_summary_stream(SUMMARY);
+            }
+            chat_completion_stream(
+                serde_json::json!({"reasoning_content": REASONING}),
+                "length",
+            )
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        directory.path().join("model_limits.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "model_pattern": "",
+            "max_context_tokens": 262_144,
+            "unlimited_output": unlimited_output,
+        }]))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let provider = bamboo_llm::OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+    let mut target = bamboo_domain::ProviderModelRef::new("openai", model);
+    target.reasoning_effort = effort;
+    let resolved = bamboo_llm::ResolvedModel::from_ref(Arc::new(provider), &target);
+    let mut config = message_summary_config(resolved.provider);
+    config.app_data_dir = Some(directory.path().to_path_buf());
+    config.summarization_model_name = Some(resolved.model_name);
+    let mut session = message_summary_session();
+    assert!(run_message_summary(&mut session, &config).await.unwrap());
+    assert_eq!(session.compression_events.len(), 1);
+    assert_eq!(session.conversation_summary.unwrap().content, SUMMARY);
+
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .map(|request| request.body_json::<serde_json::Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies.len(),
+        4,
+        "one retry for each of map and final reduce"
+    );
+    let expected_effort = effort.map(|value| serde_json::json!(value.as_str()));
+    for pair in bodies.chunks_exact(2) {
+        let first_limit = pair[0][limit_field].as_u64().unwrap();
+        assert!((1..MODEL_OUTPUT_LIMIT).contains(&first_limit));
+        assert_eq!(pair[0].get("reasoning_effort"), expected_effort.as_ref());
+        let mut expected_retry = pair[0].clone();
+        expected_retry[limit_field] = MODEL_OUTPUT_LIMIT.into();
+        assert_eq!(pair[1], expected_retry);
+        assert!(!pair[1].to_string().contains(REASONING));
+    }
+}
+
+#[tokio::test]
 async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
     for effort in [None, Some(bamboo_domain::ReasoningEffort::Low)] {
         assert_chat_empty_reduce_preserves_history(effort).await;
@@ -518,7 +615,10 @@ async fn assert_chat_empty_reduce_preserves_history(
         .respond_with(
             move |_: &Request| match calls.fetch_add(1, Ordering::Relaxed) {
                 0 => chat_summary_stream("The chosen design is recorded."),
-                1 => chat_summary_stream(""),
+                1 => chat_completion_stream(
+                    serde_json::json!({"reasoning_content": "Reasoning without a summary"}),
+                    "stop",
+                ),
                 _ => ResponseTemplate::new(400)
                     .set_body_string("Unexpected retry after the model returned an empty summary"),
             },
@@ -611,8 +711,12 @@ async fn assert_chat_empty_reduce_preserves_history(
 }
 
 fn chat_summary_stream(text: &str) -> ResponseTemplate {
+    chat_completion_stream(serde_json::json!({"content": text}), "stop")
+}
+
+fn chat_completion_stream(delta: serde_json::Value, finish_reason: &str) -> ResponseTemplate {
     let chunk = serde_json::json!({
-        "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+        "choices": [{"delta": delta, "finish_reason": finish_reason}],
     });
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
