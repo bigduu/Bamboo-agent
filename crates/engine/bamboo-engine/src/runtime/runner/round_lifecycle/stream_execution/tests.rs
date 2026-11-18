@@ -729,7 +729,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let llm = mock_llm(vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -1541,7 +1541,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         })
         .collect::<Vec<_>>();
 
-    let (stream_output, _, _, _completion) = execute_llm_stream(
+    let (stream_output, _, _, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -2068,7 +2068,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -2261,7 +2261,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
     let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4458,7 +4458,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4625,7 +4625,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4724,7 +4724,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4814,7 +4814,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4918,7 +4918,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -5031,7 +5031,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens, _completion) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -5289,8 +5289,8 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     let before_tools = super::super::request_tool_schemas_for_loading_mode(
         &before_session,
         std::slice::from_ref(&browser),
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-        None,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     let before_prepared = browser_history_prepared(&before_session);
     let before = super::build_request_envelope_reconciled_for_loading_mode(
@@ -5299,7 +5299,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &config,
         before_tools.as_ref(),
         "test-model",
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
@@ -5312,15 +5312,10 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     let loaded_tools = super::super::request_tool_schemas_for_loading_mode(
         &session,
         std::slice::from_ref(&browser),
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-        None,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     assert_eq!(loaded_tools[0].function.name, "browser");
-    assert_eq!(
-        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(&session)
-            .len(),
-        1
-    );
     let prepared = browser_history_prepared(&session);
     let persisted_messages = session.messages.clone();
     let mut duplicate_session = session.clone();
@@ -5360,7 +5355,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     }))
     .unwrap();
     assert_eq!(
-        serde_json::to_value(loaded_tools.as_ref()).unwrap(),
+        serde_json::to_value(&loaded_tools[0..1]).unwrap(),
         serde_json::json!([browser])
     );
     assert!(!after_wire.contains("<loaded_tools>"));
@@ -5409,7 +5404,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         .ir
         .flatten()
         .iter()
-        .any(|message| message.content == full_result));
+        .all(|message| message.content != full_result));
     assert!(duplicate
         .ir
         .flatten()
@@ -5428,7 +5423,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         .ir
         .flatten()
         .iter()
-        .any(|message| message.content == full_result));
+        .all(|message| message.content != full_result));
 }
 
 #[test]
@@ -5454,7 +5449,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
 }
 
 #[test]
-fn legacy_browser_history_projection_preserves_other_discovery_results() {
+fn discovery_history_projection_omits_removed_tool_definitions() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let (mut session, browser, _) = browser_history_fixture();
     let other = provider_visible_schema(
@@ -5503,7 +5498,7 @@ fn legacy_browser_history_projection_preserves_other_discovery_results() {
     }));
     assert!(transcript.iter().any(|message| {
         message.tool_call_id.as_deref() == Some("other-discovery")
-            && message.content == other_result
+            && message.content != other_result
     }));
 }
 
@@ -5531,7 +5526,7 @@ async fn legacy_browser_usage_projection_counts_compact_provider_history() {
         super::project_request_usage(&session, &prepared, &config, &[], "test-model", &provider)
             .await
             .unwrap();
-    assert_eq!(disabled.prepared_message_input_tokens, unprojected);
+    assert!(disabled.prepared_message_input_tokens < unprojected);
     let non_browser = provider_visible_schema(
         "ReadArchive",
         "Read archived repository files",
@@ -5547,10 +5542,7 @@ async fn legacy_browser_usage_projection_counts_compact_provider_history() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        non_browser_projected.prepared_message_input_tokens,
-        unprojected
-    );
+    assert!(non_browser_projected.prepared_message_input_tokens < unprojected);
 }
 
 #[tokio::test]

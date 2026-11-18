@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::provider::{
     current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, ProviderModelInfo,
-    Result, OUTPUT_LIMIT_CONVERGENCE_HINT,
+    RequestToolSelection, Result, OUTPUT_LIMIT_CONVERGENCE_HINT,
 };
 use bamboo_config::{
     BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
@@ -112,6 +112,185 @@ pub fn apply_overrides_to_body(
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
 }
 
+/// Operator overrides can select functions from the request's eligible
+/// catalog. The model-facing declarations and native transcript are owned by
+/// the agent, since either can otherwise introduce provider-side tools.
+pub(crate) fn configured_tool_selection(
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &str,
+    model: &str,
+) -> Result<RequestToolSelection> {
+    let Some(overrides) = overrides else {
+        return Ok(RequestToolSelection::Automatic);
+    };
+    let scope = resolve_scope(overrides, endpoint, Some(model));
+    if scope.body_patch.iter().any(|patch| {
+        !matches!(
+            parse_path(&patch.path).first(),
+            Some(PathSegment::Key(key)) if !matches!(
+                key.as_str(),
+                "tools" | "functions" | "function_call" | "mcp_servers" | "mcpServers"
+                    | "input" | "messages" | "contents" | "conversation" | "previous_response_id"
+                    | "prompt" | "cachedContent" | "cached_content"
+            )
+        )
+    }) {
+        return Err(LLMError::RequestFailed(
+            "Agent request overrides cannot replace tool declarations or conversation input".into(),
+        ));
+    }
+    let mut body = serde_json::json!({});
+    apply_overrides_to_body(&mut body, Some(overrides), endpoint, Some(model));
+    if [
+        "tools",
+        "functions",
+        "function_call",
+        "tool_choice",
+        "toolConfig",
+        "tool_config",
+        "mcp_servers",
+        "input",
+        "messages",
+        "contents",
+        "conversation",
+        "previous_response_id",
+    ]
+    .iter()
+    .any(|key| body["extra_body"].get(key).is_some())
+    {
+        return Err(LLMError::RequestFailed(
+            "Agent tool selection must use the generation endpoint's own tool choice field".into(),
+        ));
+    }
+    parse_tool_selection(&body, endpoint)
+}
+
+fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelection> {
+    use RequestToolSelection::{Automatic, Disabled, Forced, Named, Required};
+
+    let invalid = || LLMError::RequestFailed("Invalid or unsupported agent tool choice".into());
+    let named = |mut names: Vec<&str>, required: bool| {
+        if names.is_empty() || names.iter().any(|name| name.is_empty()) {
+            return Err(invalid());
+        }
+        names.sort_unstable();
+        names.dedup();
+        Ok(Named {
+            names: names.into_iter().map(str::to_owned).collect(),
+            required,
+        })
+    };
+    let forced = |name: &Value, exactly_one: bool| {
+        name.as_str()
+            .filter(|name| !name.is_empty())
+            .map(|name| Forced {
+                name: name.to_owned(),
+                exactly_one,
+            })
+            .ok_or_else(invalid)
+    };
+    if endpoint == ENDPOINT_STREAM_GENERATE_CONTENT {
+        let Some(config) = body
+            .get("toolConfig")
+            .or_else(|| body.get("tool_config"))
+            .and_then(|config| {
+                config
+                    .get("functionCallingConfig")
+                    .or_else(|| config.get("function_calling_config"))
+            })
+        else {
+            return Ok(Automatic);
+        };
+        let mode = config.get("mode").and_then(Value::as_str);
+        if mode == Some("NONE") {
+            return Ok(Disabled);
+        }
+        if let Some(names) = config
+            .get("allowedFunctionNames")
+            .or_else(|| config.get("allowed_function_names"))
+        {
+            let names = names.as_array().ok_or_else(invalid)?;
+            if !names.is_empty() {
+                return named(
+                    names
+                        .iter()
+                        .map(|name| name.as_str().ok_or_else(invalid))
+                        .collect::<Result<Vec<_>>>()?,
+                    mode == Some("ANY"),
+                );
+            }
+        }
+        return Ok(if mode == Some("ANY") {
+            Required
+        } else {
+            Automatic
+        });
+    }
+    let choice = &body["tool_choice"];
+    let kind = choice.as_str().or_else(|| choice["type"].as_str());
+    match kind {
+        None if choice.is_null() || (endpoint == ENDPOINT_MESSAGES && choice.is_object()) => {
+            Ok(Automatic)
+        }
+        Some("auto") => Ok(Automatic),
+        Some("required" | "any") => Ok(Required),
+        Some("none") => Ok(Disabled),
+        Some("tool") if endpoint == ENDPOINT_MESSAGES => forced(
+            &choice["name"],
+            choice["disable_parallel_tool_use"].as_bool() == Some(true),
+        ),
+        Some("function") if endpoint != ENDPOINT_MESSAGES => {
+            let name = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                &choice["function"]["name"]
+            } else {
+                &choice["name"]
+            };
+            forced(name, true)
+        }
+        Some("allowed_tools") if endpoint != ENDPOINT_MESSAGES => {
+            let choice = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                &choice["allowed_tools"]
+            } else {
+                choice
+            };
+            if !matches!(choice["mode"].as_str(), Some("auto" | "required")) {
+                return Err(invalid());
+            }
+            named(
+                choice["tools"]
+                    .as_array()
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .map(|tool| {
+                        if tool["type"] != "function" {
+                            return Err(invalid());
+                        }
+                        if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                            tool["function"]["name"].as_str().ok_or_else(invalid)
+                        } else {
+                            tool["name"].as_str().ok_or_else(invalid)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                choice["mode"] == "required",
+            )
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn wire_declares_tool(body: &Value, endpoint: &str, name: &str) -> bool {
+    body["tools"].as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| match endpoint {
+            ENDPOINT_CHAT_COMPLETIONS => tool["function"]["name"] == name,
+            ENDPOINT_STREAM_GENERATE_CONTENT => tool["functionDeclarations"]
+                .as_array()
+                .is_some_and(|functions| functions.iter().any(|function| function["name"] == name)),
+            _ => tool["name"] == name,
+        })
+    })
+}
+
 /// Gateways can route the same model ID differently under request-specific
 /// headers. Keep catalog IDs but withhold capacities when these scopes differ.
 pub(crate) fn bind_catalog_limits(
@@ -155,6 +334,15 @@ pub(crate) fn mask_and_prepare_agent_request(
     let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
         return Ok(());
     };
+    if parse_tool_selection(body, endpoint)?
+        .names()
+        .iter()
+        .any(|name| !wire_declares_tool(body, endpoint, name))
+    {
+        return Err(LLMError::RequestFailed(
+            "A tool selected by the provider request is missing from its declarations".into(),
+        ));
+    }
     if diagnostics.is_task_split() {
         if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
             tools.retain(|tool| {
@@ -732,6 +920,22 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[test]
+    fn messages_named_choice_respects_its_parallel_setting() {
+        for exactly_one in [false, true] {
+            let body = serde_json::json!({"tool_choice":{
+                "type":"tool","name":"Read","disable_parallel_tool_use":exactly_one
+            }});
+            assert_eq!(
+                parse_tool_selection(&body, ENDPOINT_MESSAGES).unwrap(),
+                RequestToolSelection::Forced {
+                    name: "Read".into(),
+                    exactly_one,
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn messages_reasoning_overrides_are_preserved_on_task_split() {

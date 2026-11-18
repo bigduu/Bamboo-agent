@@ -163,6 +163,29 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )
+    }
+
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        required_tool: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        if required_tool.is_some() {
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        } else {
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        }
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         _ir: &crate::prompt_ir::PromptIR,

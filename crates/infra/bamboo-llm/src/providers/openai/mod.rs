@@ -45,7 +45,6 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     tool_search_execution: Option<ResponsesToolSearchExecution>,
-    chat_completions_loading_mode: CapabilityLoadingMode,
     default_reasoning_effort: Option<ReasoningEffort>,
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
@@ -76,7 +75,6 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             tool_search_execution: None,
-            chat_completions_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
             default_reasoning_effort: None,
             explicit_prompt_cache: true,
             request_overrides: None,
@@ -117,19 +115,9 @@ impl OpenAIProvider {
         self
     }
 
-    /// Enable Bamboo's sticky conversation-history fallback on Chat-compatible
-    /// routes that do not use native Responses tool search.
-    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
-        self.chat_completions_loading_mode = if enabled {
-            CapabilityLoadingMode::StickyFallback
-        } else {
-            CapabilityLoadingMode::LegacyFullCatalog
-        };
-        self
-    }
-
-    pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
-        self.chat_completions_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+    /// Retained for callers using the old setting. Agent requests on
+    /// compatibility routes always use on-demand tool loading.
+    pub fn with_sticky_tool_loading(self, _enabled: bool) -> Self {
         self
     }
 
@@ -239,35 +227,6 @@ impl OpenAIProvider {
             .any(|p| Self::matches_model_pattern(p, model))
     }
 
-    fn chat_completions_selects_named_tools(&self, model: &str) -> bool {
-        let Some(overrides) = self.request_overrides.as_ref() else {
-            return false;
-        };
-        let mut body = json!({});
-        request_overrides::apply_overrides_to_body(
-            &mut body,
-            Some(overrides),
-            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-            Some(model),
-        );
-        let choice = &body["tool_choice"];
-        let has_name = |path| {
-            choice
-                .pointer(path)
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
-        };
-        match choice["type"].as_str() {
-            Some("function") => has_name("/function/name"),
-            Some("custom") => has_name("/custom/name"),
-            Some("allowed_tools") => choice
-                .pointer("/allowed_tools/tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| !tools.is_empty()),
-            _ => false,
-        }
-    }
-
     fn is_official_base_url(&self) -> bool {
         let normalized = self.base_url.trim_end_matches('/');
         normalized.eq_ignore_ascii_case("https://api.openai.com")
@@ -342,6 +301,13 @@ impl OpenAIProvider {
         );
         if let Some(name) = required_tool {
             body["tool_choice"] = json!({"type": "function", "name": name});
+        }
+        if request_purpose == "agent_loop" {
+            super::common::openai_responses::scope_agent_tool_search_history(
+                &mut body,
+                tools,
+                capability_loading_mode,
+            );
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
         request_overrides::mask_and_prepare_agent_request(
@@ -443,6 +409,13 @@ impl OpenAIProvider {
                 if let Some(name) = required_tool {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
+                if request_purpose == "agent_loop" {
+                    super::common::openai_responses::scope_agent_tool_search_history(
+                        &mut fallback_body,
+                        tools,
+                        capability_loading_mode,
+                    );
+                }
                 request_overrides::mask_and_prepare_agent_request(
                     &mut fallback_body,
                     &self.masking_config,
@@ -540,25 +513,39 @@ impl LLMProvider for OpenAIProvider {
         .then_some(DEFAULT_COMPRESSION_REASONING_EFFORT)
     }
 
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        let endpoint = if self.uses_responses_api(model) {
+            request_overrides::ENDPOINT_RESPONSES
+        } else {
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS
+        };
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        )
+    }
+
     async fn capability_loading_mode(
         &self,
         model: &str,
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
-        if required_tool.is_none()
+        let choice = self.request_tool_selection(model).await;
+        if required_tool.is_some() || choice.as_ref().is_ok_and(|choice| choice.restricts_names()) {
+            return CapabilityLoadingMode::LegacyFullCatalog;
+        }
+        if choice.is_ok()
             && self.tool_search_execution.is_some()
             && self.is_official_base_url()
             && self.uses_responses_api(model)
         {
             CapabilityLoadingMode::Progressive
-        } else if required_tool.is_none()
-            && self.chat_completions_loading_mode != CapabilityLoadingMode::LegacyFullCatalog
-            && !self.uses_responses_api(model)
-            && !self.chat_completions_selects_named_tools(model)
-        {
-            self.chat_completions_loading_mode
         } else {
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         }
     }
 
@@ -830,6 +817,19 @@ impl LLMProvider for OpenAIProvider {
                 body,
                 corrected_disable: false,
             } if looks_like_responses_only_error(status, &body) => {
+                let chat_choice = self.request_tool_selection(model).await?;
+                let responses_choice = request_overrides::configured_tool_selection(
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_RESPONSES,
+                    model,
+                )?;
+                if required_tool.map_or(chat_choice != responses_choice, |name| {
+                    !chat_choice.allows(name) || !responses_choice.allows(name)
+                }) {
+                    return Err(LLMError::RequestFailed(
+                        "OpenAI protocol fallback would change the configured tool choice; configure this model for Responses explicitly".into(),
+                    ));
+                }
                 tracing::info!(
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)
@@ -1455,7 +1455,7 @@ mod tests {
             || OpenAIProvider::new("k").with_responses_only_models(vec!["gpt-5*".to_string()]);
         assert_eq!(
             official().capability_loading_mode("gpt-5.6", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog,
+            CapabilityLoadingMode::StickyFallback,
             "progressive loading requires explicit execution opt-in"
         );
         let client = official().with_tool_search_execution(ResponsesToolSearchExecution::Client);
@@ -1471,7 +1471,7 @@ mod tests {
         );
         assert_eq!(
             client.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
         let server = official().with_tool_search_execution(ResponsesToolSearchExecution::Server);
         assert_eq!(
@@ -1485,21 +1485,42 @@ mod tests {
             .with_tool_search_execution(ResponsesToolSearchExecution::Client);
         assert_eq!(
             custom.capability_loading_mode("gpt-5.6", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
     }
 
     #[tokio::test]
-    async fn sticky_loading_is_explicit_chat_only_and_native_responses_search_wins() {
+    async fn unnamed_required_choice_retains_native_responses_tool_search() {
+        let overrides: bamboo_config::RequestOverridesConfig = serde_json::from_value(json!({
+            "endpoints":{"responses":{"body_patch":[{"path":"tool_choice","value":"required"}]}}
+        }))
+        .unwrap();
+        for execution in [
+            ResponsesToolSearchExecution::Client,
+            ResponsesToolSearchExecution::Server,
+        ] {
+            let provider = OpenAIProvider::new("fixture")
+                .with_responses_only_models(vec!["gpt-5*".into()])
+                .with_tool_search_execution(execution)
+                .with_request_overrides(Some(overrides.clone()));
+            assert_eq!(
+                provider.capability_loading_mode("gpt-5.6", None).await,
+                CapabilityLoadingMode::Progressive
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compatibility_routes_default_to_on_demand_and_native_responses_search_wins() {
         let unset = OpenAIProvider::new("k");
         assert_eq!(
             unset.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
         let disabled = unset.with_sticky_tool_loading(false);
         assert_eq!(
             disabled.capability_loading_mode("gpt-4o-mini", None).await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
 
         let sticky = disabled.with_sticky_tool_loading(true);
@@ -1520,7 +1541,7 @@ mod tests {
             responses_without_native
                 .capability_loading_mode("gpt-5.6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog,
+            CapabilityLoadingMode::StickyFallback,
             "sticky fallback must not replace native Responses search"
         );
         let native = responses_without_native
@@ -1563,20 +1584,15 @@ mod tests {
             ]
         }))
         .unwrap();
-        let provider = OpenAIProvider::new("fixture")
-            .with_default_sticky_tool_loading()
-            .with_request_overrides(Some(overrides));
+        let provider = OpenAIProvider::new("fixture").with_request_overrides(Some(overrides));
 
         for (model, expected) in [
             ("fixture-forced", CapabilityLoadingMode::LegacyFullCatalog),
             ("fixture-allowed", CapabilityLoadingMode::LegacyFullCatalog),
-            (
-                "fixture-auto",
-                CapabilityLoadingMode::StickyFallbackForRootChat,
-            ),
+            ("fixture-auto", CapabilityLoadingMode::StickyFallback),
             (
                 "responses-override-only",
-                CapabilityLoadingMode::StickyFallbackForRootChat,
+                CapabilityLoadingMode::StickyFallback,
             ),
         ] {
             assert_eq!(
@@ -1885,6 +1901,94 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
     const SESSION_CACHE_KEY: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn chat_to_responses_fallback_preserves_equivalent_tool_choices() {
+        let chat_read = json!({"type":"function","function":{"name":"Read"}});
+        let responses_read = json!({"type":"function","name":"Read"});
+        let chat_allowed = json!({
+            "type":"allowed_tools","allowed_tools":{"mode":"required","tools":[
+                chat_read.clone(), {"type":"function","function":{"name":"Glob"}}
+            ]}
+        });
+        let responses_allowed = json!({
+            "type":"allowed_tools","mode":"required","tools":[
+                {"type":"function","name":"Glob"}, responses_read.clone()
+            ]
+        });
+        for (chat, responses, retry) in [
+            (json!("required"), json!("required"), true),
+            (json!("none"), json!("none"), true),
+            (chat_read.clone(), responses_read.clone(), true),
+            (chat_allowed, responses_allowed, true),
+            (json!("required"), json!("auto"), false),
+            (
+                chat_read,
+                json!({
+                    "type":"allowed_tools","mode":"required","tools":[responses_read]
+                }),
+                false,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(400).set_body_string("Use the /responses API"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(RESPONSES_SSE_OK),
+                )
+                .expect(u64::from(retry))
+                .mount(&server)
+                .await;
+            let overrides = serde_json::from_value(json!({
+                "endpoints": {
+                    "chat_completions": {"body_patch":[{"path":"tool_choice","value":chat}]},
+                    "responses": {"body_patch":[{"path":"tool_choice","value":responses}]}
+                }
+            }))
+            .unwrap();
+            let provider = OpenAIProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(Client::builder().no_proxy().build().unwrap())
+                .with_request_overrides(Some(overrides));
+            let result = provider
+                .chat_stream(
+                    &[Message::user("Find a file")],
+                    &[footprint_schema("Read"), footprint_schema("Glob")],
+                    Some(1024),
+                    "fixture",
+                )
+                .await;
+            if retry {
+                let mut stream = result.unwrap();
+                while let Some(chunk) = stream.next().await {
+                    chunk.unwrap();
+                }
+            } else {
+                assert!(matches!(result, Err(LLMError::RequestFailed(message))
+                    if message.contains("would change the configured tool choice")));
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1 + usize::from(retry));
+            assert_eq!(
+                requests[0].body_json::<Value>().unwrap()["tool_choice"],
+                chat
+            );
+            if retry {
+                assert_eq!(
+                    requests[1].body_json::<Value>().unwrap()["tool_choice"],
+                    responses
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn max_reasoning_effort_reaches_actual_http_requests_for_model_aliases() {
