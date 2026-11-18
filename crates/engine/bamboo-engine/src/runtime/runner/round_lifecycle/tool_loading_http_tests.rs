@@ -61,22 +61,22 @@ fn record_discovery(session: &mut Session, definitions: &[ToolSchema]) {
 }
 
 async fn send(session: &mut Session, provider: &Arc<dyn LLMProvider>, catalog: &[ToolSchema]) {
-    send_round(session, provider, catalog, None).await;
+    assert!(run_round(session, provider, catalog, None).await.is_err());
 }
 
-async fn send_round(
+async fn run_round(
     session: &mut Session,
     provider: &Arc<dyn LLMProvider>,
     catalog: &[ToolSchema],
     output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
-) {
+) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
     let config = AgentLoopConfig {
         model_name: Some(MODEL.into()),
         ..Default::default()
     };
     let (events, _receiver) = tokio::sync::mpsc::channel(128);
     let session_id = session.id.clone();
-    let result = super::execute_llm_round(
+    super::execute_llm_round(
         session,
         &config,
         provider,
@@ -89,11 +89,7 @@ async fn send_round(
         None,
         output_limit_policy,
     )
-    .await;
-    assert!(
-        result.is_err(),
-        "the fixture rejects every generation request"
-    );
+    .await
 }
 
 async fn capture(server: &MockServer) -> Vec<Value> {
@@ -127,6 +123,10 @@ fn tool_names(body: &Value) -> Vec<&str> {
             }
         })
         .collect()
+}
+
+fn body_override(path: &str, value: Value) -> RequestOverridesConfig {
+    serde_json::from_value(json!({"common":{"body_patch":[{"path":path,"value":value}]}})).unwrap()
 }
 
 #[tokio::test]
@@ -226,7 +226,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
     for provider in &providers {
         let mut session = Session::new("split-wire", MODEL);
         session.add_message(Message::user("Read a file"));
-        send_round(
+        let result = run_round(
             &mut session,
             provider,
             &catalog,
@@ -241,11 +241,72 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
             }),
         )
         .await;
+        assert!(result.is_err(), "the fixture rejects the captured request");
     }
     let bodies = capture(&server).await;
     assert_eq!(bodies.len(), providers.len());
     for body in &bodies {
         assert_eq!(tool_names(body), ["Read"]);
+    }
+}
+
+#[tokio::test]
+async fn forced_openai_function_rejects_multiple_calls_before_dispatch() {
+    let named = json!({"type":"function","function":{"name":"Read"}});
+    let allowlist = json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[
+        {"type":"function","function":{"name":"Read"}}
+    ]}});
+    let catalog = ["Read", "Glob"].map(schema);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (choice, call_count, should_reject) in [
+        (named.clone(), 2, true),
+        (named, 1, false),
+        (allowlist, 2, false),
+    ] {
+        let tool_calls: Vec<_> = (0..call_count)
+            .map(|index| {
+                json!({
+                    "index":index, "id":format!("read-{index}"), "type":"function",
+                    "function":{"name":"Read","arguments":"{}"}
+                })
+            })
+            .collect();
+        let chunk = json!({
+            "id":"forced-tool-response", "object":"chat.completion.chunk",
+            "choices":[{"index":0,"delta":{"tool_calls":tool_calls},"finish_reason":"tool_calls"}]
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            OpenAIProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(client.clone())
+                .with_request_overrides(Some(body_override("tool_choice", choice))),
+        );
+        let mut session = Session::new("force-count-wire", MODEL);
+        session.add_message(Message::user("Read a file"));
+        let output = run_round(&mut session, &provider, &catalog, None)
+            .await
+            .expect("the fixture returns a completed generation");
+        assert_eq!(output.stream_output.tool_calls.len(), call_count);
+        if should_reject {
+            assert!(matches!(
+                output.terminal_validation_error,
+                Some(super::AgentError::LLMNonRetryable(message)) if message.contains("exactly one")
+            ));
+        } else {
+            assert!(output.terminal_validation_error.is_none());
+        }
+        let bodies = capture(&server).await;
+        assert_eq!(tool_names(&bodies[0]), ["Read"]);
     }
 }
 
@@ -258,10 +319,6 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
         .await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let catalog = ["Read", "Glob", "GetFileInfo", "load_skill"].map(schema);
-    let config = |path: &str, value: Value| -> RequestOverridesConfig {
-        serde_json::from_value(json!({"common":{"body_patch":[{"path":path,"value":value}]}}))
-            .unwrap()
-    };
     let named = json!({"type":"function","function":{"name":"Glob"}});
     let allowed = json!({"type":"allowed_tools","mode":"required","tools":[
         {"type":"function","name":"Glob"}, {"type":"function","name":"GetFileInfo"}
@@ -275,7 +332,7 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
                 OpenAIProvider::new("fixture")
                     .with_base_url(server.uri())
                     .with_client(client.clone())
-                    .with_request_overrides(Some(config("tool_choice", named.clone()))),
+                    .with_request_overrides(Some(body_override("tool_choice", named.clone()))),
             ),
             "tool_choice",
             named,
@@ -287,7 +344,7 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
                     .with_base_url(server.uri())
                     .with_client(client.clone())
                     .with_responses_only_models(vec![MODEL.into()])
-                    .with_request_overrides(Some(config("tool_choice", allowed.clone()))),
+                    .with_request_overrides(Some(body_override("tool_choice", allowed.clone()))),
             ),
             "tool_choice",
             allowed,
@@ -298,7 +355,7 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
                 AnthropicProvider::new("fixture")
                     .with_base_url(server.uri())
                     .with_client(client.clone())
-                    .with_request_overrides(Some(config("tool_choice", anth.clone()))),
+                    .with_request_overrides(Some(body_override("tool_choice", anth.clone()))),
             ),
             "tool_choice",
             anth,
@@ -309,7 +366,7 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
                 GeminiProvider::new("fixture")
                     .with_base_url(server.uri())
                     .with_client(client.clone())
-                    .with_request_overrides(Some(config("toolConfig", gemini.clone()))),
+                    .with_request_overrides(Some(body_override("toolConfig", gemini.clone()))),
             ),
             "toolConfig",
             gemini,
@@ -342,7 +399,7 @@ async fn named_and_allowlist_choices_reach_the_wire_only_with_eligible_declarati
         OpenAIProvider::new("fixture")
             .with_base_url(server.uri())
             .with_client(client)
-            .with_request_overrides(Some(config(
+            .with_request_overrides(Some(body_override(
                 "tool_choice",
                 json!({
                     "type":"allowed_tools","allowed_tools":{"mode":"required","tools":[

@@ -725,7 +725,10 @@ pub enum RequestToolSelection {
     Automatic,
     Required,
     Disabled,
-    Forced(String),
+    Forced {
+        name: String,
+        exactly_one: bool,
+    },
     Named {
         names: Vec<String>,
         required: bool,
@@ -734,19 +737,22 @@ pub enum RequestToolSelection {
 
 impl RequestToolSelection {
     pub fn restricts_names(&self) -> bool {
-        matches!(self, Self::Disabled | Self::Forced(_) | Self::Named { .. })
+        matches!(
+            self,
+            Self::Disabled | Self::Forced { .. } | Self::Named { .. }
+        )
     }
 
     pub fn requires_call(&self) -> bool {
         matches!(
             self,
-            Self::Required | Self::Forced(_) | Self::Named { required: true, .. }
+            Self::Required | Self::Forced { .. } | Self::Named { required: true, .. }
         )
     }
 
     pub fn names(&self) -> &[String] {
         match self {
-            Self::Forced(name) => std::slice::from_ref(name),
+            Self::Forced { name, .. } => std::slice::from_ref(name),
             Self::Named { names, .. } => names,
             _ => &[],
         }
@@ -756,7 +762,9 @@ impl RequestToolSelection {
         match self {
             Self::Automatic | Self::Required => true,
             Self::Disabled => false,
-            Self::Forced(candidate) => candidate == name,
+            Self::Forced {
+                name: candidate, ..
+            } => candidate == name,
             Self::Named { names, .. } => names.iter().any(|candidate| candidate == name),
         }
     }

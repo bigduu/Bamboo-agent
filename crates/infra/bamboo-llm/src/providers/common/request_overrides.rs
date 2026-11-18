@@ -180,10 +180,13 @@ fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelec
             required,
         })
     };
-    let forced = |name: &Value| {
+    let forced = |name: &Value, exactly_one: bool| {
         name.as_str()
             .filter(|name| !name.is_empty())
-            .map(|name| Forced(name.to_owned()))
+            .map(|name| Forced {
+                name: name.to_owned(),
+                exactly_one,
+            })
             .ok_or_else(invalid)
     };
     if endpoint == ENDPOINT_STREAM_GENERATE_CONTENT {
@@ -232,14 +235,17 @@ fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelec
         Some("auto") => Ok(Automatic),
         Some("required" | "any") => Ok(Required),
         Some("none") => Ok(Disabled),
-        Some("tool") if endpoint == ENDPOINT_MESSAGES => forced(&choice["name"]),
+        Some("tool") if endpoint == ENDPOINT_MESSAGES => forced(
+            &choice["name"],
+            choice["disable_parallel_tool_use"].as_bool() == Some(true),
+        ),
         Some("function") if endpoint != ENDPOINT_MESSAGES => {
             let name = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
                 &choice["function"]["name"]
             } else {
                 &choice["name"]
             };
-            forced(name)
+            forced(name, true)
         }
         Some("allowed_tools") if endpoint != ENDPOINT_MESSAGES => {
             let choice = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
@@ -914,6 +920,22 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[test]
+    fn messages_named_choice_respects_its_parallel_setting() {
+        for exactly_one in [false, true] {
+            let body = serde_json::json!({"tool_choice":{
+                "type":"tool","name":"Read","disable_parallel_tool_use":exactly_one
+            }});
+            assert_eq!(
+                parse_tool_selection(&body, ENDPOINT_MESSAGES).unwrap(),
+                RequestToolSelection::Forced {
+                    name: "Read".into(),
+                    exactly_one,
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn messages_reasoning_overrides_are_preserved_on_task_split() {

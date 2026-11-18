@@ -507,10 +507,14 @@ mod tests {
             mode: CapabilityLoadingMode::Progressive,
             selection: RequestToolSelection::Automatic,
         });
+        let forced_read = RequestToolSelection::Forced {
+            name: "Read".into(),
+            exactly_one: true,
+        };
         let b: Arc<dyn LLMProvider> = Arc::new(Capture {
             calls: b_calls.clone(),
             mode: CapabilityLoadingMode::LegacyFullCatalog,
-            selection: RequestToolSelection::Forced("Read".into()),
+            selection: forced_read.clone(),
         });
         let inner = Arc::new(RwLock::new(a.clone()));
         let reloadable: Arc<dyn LLMProvider> = Arc::new(ReloadableProvider::new(inner.clone()));
@@ -539,7 +543,7 @@ mod tests {
         );
         assert_eq!(
             replaced.request_tool_selection("synthetic").await.unwrap(),
-            RequestToolSelection::Forced("Read".into()),
+            forced_read,
         );
         let observed = Arc::new(Mutex::new(Vec::new()));
         let receive = observed.clone();

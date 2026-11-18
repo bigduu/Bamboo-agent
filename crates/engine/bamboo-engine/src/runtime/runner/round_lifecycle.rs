@@ -117,7 +117,10 @@ pub(super) async fn request_tool_policy(
                 "required tool '{name}' is excluded by the provider request's tool selection"
             )));
         }
-        RequestToolSelection::Forced(name.to_owned())
+        RequestToolSelection::Forced {
+            name: name.to_owned(),
+            exactly_one: true,
+        }
     } else {
         configured
     };
@@ -470,6 +473,17 @@ pub(crate) async fn execute_llm_round(
             response_id: stream_output.response_id.clone(),
             reasoning_only,
         })
+    } else if matches!(
+        tool_dispatch.selection,
+        RequestToolSelection::Forced {
+            exactly_one: true,
+            ..
+        }
+    ) && stream_output.tool_calls.len() > 1
+    {
+        Some(AgentError::LLMNonRetryable(
+            "provider returned multiple tool calls for a request that requires exactly one".into(),
+        ))
     } else if !tool_choice_requirement_met(
         &tool_dispatch.selection,
         tool_dispatch.mode,
