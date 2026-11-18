@@ -222,6 +222,27 @@ pub struct HeadlessArgs {
     pub timeout_secs: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Text,
+    Json,
+    StreamJson,
+}
+
+impl OutputMode {
+    fn from_stream_json(stream_json: bool) -> Self {
+        if stream_json {
+            Self::StreamJson
+        } else {
+            Self::Text
+        }
+    }
+
+    fn is_machine(self) -> bool {
+        self != Self::Text
+    }
+}
+
 struct StreamResult {
     session_id: Option<String>,
     reply: Option<String>,
@@ -261,7 +282,7 @@ impl StreamResult {
     }
 }
 
-/// Close a headless NDJSON stream when the CLI could not start an execution.
+/// Print the terminal JSON result when the CLI could not start an execution.
 pub fn print_stream_startup_error(error: &str) {
     StreamResult::default().print(Some(error));
 }
@@ -276,6 +297,16 @@ fn validate_timeout_secs(secs: Option<u64>) -> Result<(), String> {
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
+    let output = OutputMode::from_stream_json(args.stream_json);
+    run_with_output(args, output).await
+}
+
+/// Run a headless session and write only its terminal JSON result to stdout.
+pub async fn run_json(args: HeadlessArgs) -> Result<(), String> {
+    run_with_output(args, OutputMode::Json).await
+}
+
+async fn run_with_output(args: HeadlessArgs, output: OutputMode) -> Result<(), String> {
     let state = async {
         // Validate before booting the server or creating a session.
         validate_timeout_secs(args.timeout_secs)?;
@@ -285,9 +316,9 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     }
     .await;
     match state {
-        Ok(state) => run_with_state(args, state).await,
+        Ok(state) => run_with_state_and_output(args, state, output).await,
         Err(error) => {
-            if args.stream_json {
+            if output.is_machine() {
                 print_stream_startup_error(&error);
             }
             Err(error)
@@ -297,11 +328,20 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
 
 // Keep one execution implementation; controlled tests inject an isolated Host
 // through this seam instead of booting real credentials or canonical memory.
+#[cfg(test)]
 async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), String> {
-    let stream_json = args.stream_json;
+    let output = OutputMode::from_stream_json(args.stream_json);
+    run_with_state_and_output(args, state, output).await
+}
+
+async fn run_with_state_and_output(
+    args: HeadlessArgs,
+    state: AppState,
+    output: OutputMode,
+) -> Result<(), String> {
     let mut terminal = StreamResult::default();
-    let exit = run_session(args, state, &mut terminal).await;
-    if stream_json {
+    let exit = run_session(args, state, output, &mut terminal).await;
+    if output.is_machine() {
         terminal.print(exit.as_ref().err().map(String::as_str));
     }
     exit
@@ -310,6 +350,7 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
 async fn run_session(
     args: HeadlessArgs,
     state: AppState,
+    output: OutputMode,
     terminal: &mut StreamResult,
 ) -> Result<(), String> {
     // Admit explicit CLI intent before creating/changing a session. A selected
@@ -603,17 +644,17 @@ async fn run_session(
         }
     }
 
-    if args.stream_json {
-        println!(
+    match output {
+        OutputMode::StreamJson => println!(
             "{}",
             serde_json::json!({
                 "type": "session_started",
                 "session_id": session_id,
                 "resumed": args.session.is_some(),
             })
-        );
-    } else {
-        eprintln!("▶ session {session_id}");
+        ),
+        OutputMode::Text => eprintln!("▶ session {session_id}"),
+        OutputMode::Json => {}
     }
     let data = web::Data::new(state);
     // -p / ExecuteRequest parity (#246 part A): every field `ExecuteRequest`
@@ -661,7 +702,7 @@ async fn run_session(
     }
     // Retain this runner's receipt if a follow-on activation replaces the
     // live runner before the execution tree becomes quiescent.
-    let runner = if args.stream_json {
+    let runner = if output.is_machine() {
         let accepted = body::to_bytes(response.into_body())
             .await
             .ok()
@@ -714,10 +755,10 @@ async fn run_session(
                         Ok(event) => {
                             last_event = Instant::now();
                             if let Ok(value) = serde_json::to_value(&event) {
-                                if args.stream_json {
-                                    println!("{value}");
-                                } else {
-                                    print_server_event(&value, &mut streamed_tokens, &mut reasoning_progress);
+                                match output {
+                                    OutputMode::StreamJson => println!("{value}"),
+                                    OutputMode::Text => print_server_event(&value, &mut streamed_tokens, &mut reasoning_progress),
+                                    OutputMode::Json => {}
                                 }
                                 match value["type"].as_str().unwrap_or("") {
                                     // `need_clarification` also ends this segment: the
@@ -777,9 +818,9 @@ async fn run_session(
             ));
         }
 
-        // Segment quiescent. Stop on error; never prompt in machine (NDJSON) mode.
+        // Segment quiescent. Stop on error or when using machine output.
         // Otherwise resume through a pending question if one is parked, else done.
-        if exit.is_err() || args.stream_json {
+        if exit.is_err() || output.is_machine() {
             break 'run;
         }
         let pending = data
@@ -848,7 +889,7 @@ async fn run_session(
                 .map(|m| m.content.clone())
         });
 
-    if args.stream_json {
+    if output.is_machine() {
         terminal.reply = final_reply;
         terminal.usage = runner.and_then(|runner| runner.terminal_usage());
     } else {

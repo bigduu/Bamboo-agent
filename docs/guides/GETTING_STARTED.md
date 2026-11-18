@@ -74,15 +74,27 @@ bamboo -p "List the files here and tell me what this project does."
 Boots the full runtime (including sub-agent support), runs one turn, prints
 the result, exits. Add `-s <session-id>` on a later call to continue the same
 conversation. Plain mode reports the number of reasoning characters received
-on stderr. Use `--stream-json` for NDJSON events on stdout.
+on stderr.
 
-The full headless command ends its NDJSON stream with one `result` object.
-Startup failures also produce a `result` with `status: "error"` and a null
-`session_id` when no session was opened. For success and failure, `result.usage`
-contains `input_tokens`, `output_tokens` and `total_tokens` from the engine's
-run-budget accounting for the root execution started by this command. The counters
-include accounted retries and can use engine estimates if the provider omits
-usage. Child executions and background services have separate accounting.
+Use `--json` with the full headless command for one terminal `result` object on
+stdout.
+
+```bash
+bamboo -p "Check the build." --json
+printf '%s\n' 'Check the build.' | bamboo -p - --json
+```
+
+Use `--stream-json` (or `--raw`) for an NDJSON event stream that ends with the
+same `result` object. Choose one output flag per invocation. Both modes write
+logs to stderr and preserve the process exit code.
+
+After argument parsing, startup failures also produce a `result` with
+`status: "error"` and a null `session_id` when no session was opened. For success
+and failure, `result.usage` contains `input_tokens`, `output_tokens` and
+`total_tokens` from the engine's run-budget accounting for the root execution
+started by this command. The counters include accounted retries and can use
+engine estimates if the provider omits usage. Child executions and background
+services have separate accounting.
 Known pre-execution failures report zero, and a missing execution snapshot
 reports `usage: null`. Each `-s` invocation reports its own execution.
 

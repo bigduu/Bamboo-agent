@@ -127,6 +127,27 @@ fn ndjson_events(output: &Output) -> Vec<Value> {
     events
 }
 
+fn single_json_result(output: &Output) -> Value {
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "expected one JSON object: {error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(result["type"], "result");
+    result
+}
+
+fn machine_result(output: &Output, output_flag: &str) -> (Value, Option<Vec<Value>>) {
+    if output_flag == "--json" {
+        return (single_json_result(output), None);
+    }
+    let mut events = ndjson_events(output);
+    let result = events.pop().unwrap();
+    (result, Some(events))
+}
+
 fn terminal_usage(input: u64, output: u64) -> Value {
     json!({"input_tokens": input, "output_tokens": output, "total_tokens": input + output})
 }
@@ -169,6 +190,15 @@ fn anthropic_counted_stream(
 
 #[tokio::test]
 async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_resume() {
+    check_headless_result_usage("--stream-json").await;
+}
+
+#[tokio::test]
+async fn headless_json_reports_one_result_with_usage_on_success_and_runtime_error() {
+    check_headless_result_usage("--json").await;
+}
+
+async fn check_headless_result_usage(output_flag: &str) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("bamboo");
     std::fs::create_dir(&data).unwrap();
@@ -224,26 +254,32 @@ async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_
         "anthropic",
         &format!("{}/initial/v1/", server.uri()),
     );
-    let output = run(initial.args([
-        "-p",
-        "Read fixture.txt and answer.",
-        "--stream-json",
-        "--provider",
-        "anthropic",
-        "--permission-mode",
-        "auto",
-        "--timeout",
-        "15",
-    ]))
+    let prompt = dir.path().join("prompt.txt");
+    std::fs::write(&prompt, "Read fixture.txt and answer.\n").unwrap();
+    let output = run(initial
+        .args([
+            "-p",
+            "-",
+            output_flag,
+            "--provider",
+            "anthropic",
+            "--permission-mode",
+            "auto",
+            "--timeout",
+            "15",
+        ])
+        .stdin(File::open(&prompt).unwrap()))
     .await;
-    let events = ndjson_events(&output);
-    let result = events.last().unwrap();
-    assert_eq!(events[0]["type"], "session_started");
+    let (result, events) = machine_result(&output, output_flag);
+    if let Some(events) = events {
+        assert_eq!(events[0]["type"], "session_started");
+        assert_eq!(events[0]["session_id"], result["session_id"]);
+        assert!(events.iter().any(|event| event["type"] == "tool_complete"));
+    }
     assert!(result["session_id"].as_str().is_some());
-    assert_eq!(events[0]["session_id"], result["session_id"]);
-    assert!(events.iter().any(|event| event["type"] == "tool_complete"));
     assert_eq!(result["status"], "finished");
     assert_eq!(result["result"], ANSWER);
+    assert!(result["error"].is_null());
     assert_eq!(result["usage"], terminal_usage(312, 46));
 
     // A saved legacy session can have usage from a previous turn without an
@@ -277,7 +313,7 @@ async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_
         "Continue with a new answer.",
         "-s",
         &session_id,
-        "--stream-json",
+        output_flag,
         "--provider",
         "anthropic",
         "--timeout",
@@ -285,10 +321,12 @@ async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_
     ]))
     .await;
     assert_eq!(output.status.code(), Some(1));
-    let events = ndjson_events(&output);
-    let result = events.last().unwrap();
-    assert_eq!(events[0]["type"], "session_started", "{events:#?}");
-    assert_eq!(events[0]["resumed"], true);
+    let (result, events) = machine_result(&output, output_flag);
+    if let Some(events) = events {
+        assert_eq!(events[0]["type"], "session_started", "{events:#?}");
+        assert_eq!(events[0]["resumed"], true);
+        assert_eq!(events[0]["session_id"], result["session_id"]);
+    }
     assert_eq!(result["session_id"], session_id);
     assert_eq!(result["status"], "error");
     assert!(result["error"]
@@ -310,7 +348,7 @@ async fn headless_stream_result_reports_usage_on_success_and_output_limit_after_
 }
 
 #[tokio::test]
-async fn headless_stream_startup_errors_emit_one_result_without_a_session() {
+async fn headless_machine_startup_errors_emit_one_result_without_a_session() {
     let dir = tempfile::tempdir().unwrap();
     for (args, error_text, exit_code) in [
         (
@@ -325,22 +363,22 @@ async fn headless_stream_startup_errors_emit_one_result_without_a_session() {
             2,
         ),
     ] {
-        let output = run_to_exit(bamboo(dir.path()).arg("--stream-json").args(args)).await;
-        assert_eq!(output.status.code(), Some(exit_code));
-        let events = ndjson_events(&output);
-        assert_eq!(events.len(), 1);
-        let result = &events[0];
-        assert_eq!(result["status"], "error");
-        assert!(result["session_id"].is_null());
-        assert!(result["result"].is_null());
-        assert!(result["error"].as_str().unwrap().contains(error_text));
-        assert_eq!(result["usage"], terminal_usage(0, 0));
-        assert!(String::from_utf8_lossy(&output.stderr).contains(error_text));
+        for output_flag in ["--stream-json", "--json"] {
+            let output = run_to_exit(bamboo(dir.path()).arg(output_flag).args(args)).await;
+            assert_eq!(output.status.code(), Some(exit_code));
+            let result = single_json_result(&output);
+            assert_eq!(result["status"], "error");
+            assert!(result["session_id"].is_null());
+            assert!(result["result"].is_null());
+            assert!(result["error"].as_str().unwrap().contains(error_text));
+            assert_eq!(result["usage"], terminal_usage(0, 0));
+            assert!(String::from_utf8_lossy(&output.stderr).contains(error_text));
+        }
     }
 }
 
 #[tokio::test]
-async fn headless_stream_execute_rejection_closes_an_announced_session() {
+async fn headless_machine_execute_rejection_returns_the_session_result() {
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -363,19 +401,55 @@ async fn headless_stream_execute_rejection_closes_an_announced_session() {
         .to_string(),
     )
     .unwrap();
-    let output = run_to_exit(bamboo(dir.path()).args(["-p", "prompt", "--stream-json"])).await;
-    assert_eq!(output.status.code(), Some(1));
-    let events = ndjson_events(&output);
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["type"], "session_started");
-    assert!(events[0]["session_id"].as_str().is_some());
-    assert_eq!(events[1]["session_id"], events[0]["session_id"]);
-    assert_eq!(events[1]["status"], "error");
-    assert!(events[1]["error"]
-        .as_str()
-        .unwrap()
-        .starts_with("execute rejected: HTTP 400"));
-    assert_eq!(events[1]["usage"], terminal_usage(0, 0));
+    for output_flag in ["--stream-json", "--json"] {
+        let output = run_to_exit(bamboo(dir.path()).args(["-p", "prompt", output_flag])).await;
+        assert_eq!(output.status.code(), Some(1));
+        let (result, events) = machine_result(&output, output_flag);
+        if let Some(events) = events {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["type"], "session_started");
+            assert_eq!(events[0]["session_id"], result["session_id"]);
+        }
+        assert!(result["session_id"].as_str().is_some());
+        assert_eq!(result["status"], "error");
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("execute rejected: HTTP 400"));
+        assert_eq!(result["usage"], terminal_usage(0, 0));
+    }
+}
+
+#[tokio::test]
+async fn headless_json_requires_a_prompt_and_rejects_conflicting_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_to_exit(bamboo(dir.path()).arg("--json")).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--prompt"));
+
+    for (flag, diagnostic_flag) in [
+        ("--stream-json", "--stream-json"),
+        ("--raw", "--stream-json"),
+        ("--echo", "--echo"),
+    ] {
+        let output = run_to_exit(bamboo(dir.path()).args(["-p", "prompt", "--json", flag])).await;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--json") && stderr.contains(diagnostic_flag),
+            "{stderr}"
+        );
+    }
+
+    let output = run_to_exit(bamboo(dir.path()).args(["-p", "prompt", "--json", "config"])).await;
+    assert_eq!(output.status.code(), Some(2));
+    let result = single_json_result(&output);
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["error"], "--json requires a headless -p run");
+    assert!(result["session_id"].is_null());
+    assert_eq!(result["usage"], terminal_usage(0, 0));
 }
 
 #[tokio::test]
