@@ -272,6 +272,15 @@ impl bamboo_llm::LLMProvider for ChildGoldPolicyProvider {
         }
     }
 
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<bamboo_llm::provider::RequestToolSelection> {
+        self.select(&self.model)?
+            .request_tool_selection(model)
+            .await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &bamboo_llm::PromptIR,

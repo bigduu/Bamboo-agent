@@ -46,7 +46,8 @@ use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
 use super::{
-    capability_loading_mode_for_session, PromptMemoryExposureFrame, RoundOutputLimitPolicy,
+    request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
+    PromptMemoryExposureFrame, RoundOutputLimitPolicy, RoundToolDispatch,
 };
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -74,6 +75,7 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+#[cfg(test)]
 const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
     "Browser loaded. Its complete schema is in the tools for this request.";
 
@@ -706,53 +708,18 @@ pub(super) fn build_exec_session_continuation_context_block(
     ))
 }
 
-fn legacy_browser_results_for_projection(
-    session: &Session,
-    tool_schemas: &[ToolSchema],
-    loading_mode: CapabilityLoadingMode,
-) -> Option<BTreeMap<String, String>> {
-    if loading_mode != CapabilityLoadingMode::LegacyFullCatalog
-        || !tool_schemas
-            .iter()
-            .any(|schema| schema.function.name == "browser")
-    {
-        return None;
-    }
-    let results =
-        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(session);
-    (!results.is_empty()).then_some(results)
-}
-
-fn project_legacy_browser_history(messages: &mut [Message], results: &BTreeMap<String, String>) {
+fn project_discovery_history(
+    messages: &mut [Message],
+    results: &BTreeMap<String, (String, String)>,
+) {
     for message in messages {
-        if message.role == Role::Tool
-            && message.content_parts.is_none()
-            && results
-                .get(&message.id)
-                .is_some_and(|original| original == &message.content)
-        {
-            message.content = LOADED_BROWSER_ACKNOWLEDGEMENT.to_string();
+        if message.role == Role::Tool && message.content_parts.is_none() {
+            if let Some((original, projected)) = results.get(&message.id) {
+                if original == &message.content {
+                    message.content.clone_from(projected);
+                }
+            }
         }
-    }
-}
-
-/// The Supervisor host context sees its complete approved logical catalog;
-/// provider measurement and dispatch see exactly the existing wire projection.
-fn provider_tool_schemas<'a>(
-    session: &Session,
-    tool_schemas: &'a [ToolSchema],
-    loading_mode: CapabilityLoadingMode,
-    required_tool: Option<&str>,
-) -> Cow<'a, [ToolSchema]> {
-    if session.supervisor_incarnation_id().is_some() {
-        super::request_tool_schemas_for_loading_mode(
-            session,
-            tool_schemas,
-            loading_mode,
-            required_tool,
-        )
-    } else {
-        Cow::Borrowed(tool_schemas)
     }
 }
 
@@ -770,20 +737,27 @@ pub(super) async fn project_request_usage(
 ) -> Result<ProjectedRequestUsage, AgentError> {
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
-    let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
-    let loading_mode =
-        capability_loading_mode_for_session(&shadow, llm.as_ref(), model, required_tool).await;
-    let browser_results = legacy_browser_results_for_projection(
+    let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
+    let effective_tool_schemas = select_request_tool_schemas(&shadow, tool_schemas, &selection)?;
+    let wire_schemas = request_tool_schemas_for_loading_mode(
         &shadow,
         effective_tool_schemas.as_ref(),
         loading_mode,
+        true,
     );
-    let prepared_message_input_tokens = if let Some(results) = browser_results.as_ref() {
-        let mut projected = prepared_context.messages.clone();
-        project_legacy_browser_history(&mut projected, results);
-        TiktokenTokenCounter::default().count_messages(&projected)
-    } else {
+    let discovery_history =
+        crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
+            &shadow,
+            effective_tool_schemas.as_ref(),
+            wire_schemas.as_ref(),
+            loading_mode,
+        );
+    let prepared_message_input_tokens = if discovery_history.is_empty() {
         TiktokenTokenCounter::default().count_messages(&prepared_context.messages)
+    } else {
+        let mut projected = prepared_context.messages.clone();
+        project_discovery_history(&mut projected, &discovery_history);
+        TiktokenTokenCounter::default().count_messages(&projected)
     };
     let envelope = build_request_envelope_reconciled_for_loading_mode(
         &mut shadow,
@@ -793,12 +767,6 @@ pub(super) async fn project_request_usage(
         model,
         loading_mode,
         None,
-    );
-    let wire_schemas = provider_tool_schemas(
-        &shadow,
-        effective_tool_schemas.as_ref(),
-        loading_mode,
-        required_tool,
     );
     let tool_footprint = llm
         .provider_visible_tool_footprint(&envelope.ir, wire_schemas.as_ref(), model, required_tool)
@@ -1200,16 +1168,21 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         cache: cache_plan,
         continuation: None,
     };
-    if let Some(results) =
-        legacy_browser_results_for_projection(session, tool_schemas, loading_mode)
+    let wire_schemas =
+        request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode, true);
+    let discovery_history =
+        crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
+            session,
+            tool_schemas,
+            wire_schemas.as_ref(),
+            loading_mode,
+        );
+    if let Some(transcript) = ir
+        .segments
+        .iter_mut()
+        .find(|segment| segment.role == SegmentRole::ModelTranscript)
     {
-        if let Some(transcript) = ir
-            .segments
-            .iter_mut()
-            .find(|segment| segment.role == SegmentRole::ModelTranscript)
-        {
-            project_legacy_browser_history(&mut transcript.messages, &results);
-        }
+        project_discovery_history(&mut transcript.messages, &discovery_history);
     }
 
     // Prefix-drift diagnostics must observe only bytes that actually participate
@@ -1485,6 +1458,7 @@ pub(super) async fn execute_llm_stream(
         u128,
         u64,
         CompletionDiagnostics,
+        RoundToolDispatch,
     ),
     AgentError,
 > {
@@ -1502,8 +1476,7 @@ pub(super) async fn execute_llm_stream(
     let llm_started_at = std::time::Instant::now();
     let base_tool_schemas = tool_schemas;
     let mut prepared_context = prepared_context.clone();
-    let mut required_tool = required_tool_for_session(session);
-    let mut effective_schemas = effective_tool_schemas(session, base_tool_schemas);
+
     let task_split = frame
         .output_limit_recovery
         .and_then(|policy| policy.task_split);
@@ -1525,7 +1498,19 @@ pub(super) async fn execute_llm_stream(
             .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT)
     });
     let private_plan = task_split.is_some_and(|split| split.private_plan);
-    let (mut prepared_envelope, previous_response_id, final_usage, loading_mode, window_limit) = loop {
+    let (
+        mut prepared_envelope,
+        previous_response_id,
+        final_usage,
+        window_limit,
+        required_tool,
+        tool_dispatch,
+    ) = loop {
+        let required_tool = required_tool_for_session(session);
+        let (loading_mode, selection) =
+            request_tool_policy(llm.as_ref(), model, required_tool).await?;
+        let effective_schemas =
+            select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
@@ -1536,8 +1521,6 @@ pub(super) async fn execute_llm_stream(
         };
         let previous_model_context_state = session.model_context_state.clone();
         let previous_provider_transcript = session.provider_transcript.clone();
-        let loading_mode =
-            capability_loading_mode_for_session(session, llm.as_ref(), model, required_tool).await;
         let prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
             session,
             &prepared_context,
@@ -1554,8 +1537,12 @@ pub(super) async fn execute_llm_stream(
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
-        let wire_schemas =
-            provider_tool_schemas(session, tool_schemas, loading_mode, required_tool);
+        let wire_schemas = request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            task_split.is_none(),
+        );
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
@@ -1701,8 +1688,6 @@ pub(super) async fn execute_llm_stream(
                     }
                     config.vision_description_reuse.clear();
                 }
-                required_tool = required_tool_for_session(session);
-                effective_schemas = effective_tool_schemas(session, base_tool_schemas);
                 let reprepared = if recovery.is_some() {
                     Box::pin(
                         super::context_preparation::prepare_output_limit_recovery_context(
@@ -1710,7 +1695,7 @@ pub(super) async fn execute_llm_stream(
                             config,
                             model,
                             session_id,
-                            effective_schemas.as_ref(),
+                            base_tool_schemas,
                             llm,
                         ),
                     )
@@ -1733,19 +1718,28 @@ pub(super) async fn execute_llm_stream(
                 continue;
             }
         }
+        let fallback_discovery = wire_schemas
+            .iter()
+            .any(|tool| tool.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME);
         break (
             prepared_envelope,
             previous_response_id,
             final_usage,
-            loading_mode,
             window_limit,
+            required_tool,
+            RoundToolDispatch {
+                mode: loading_mode,
+                catalog: effective_schemas.into_owned(),
+                fallback_discovery,
+                selection,
+            },
         );
     };
-    let wire_schemas = provider_tool_schemas(
+    let wire_schemas = request_tool_schemas_for_loading_mode(
         session,
-        effective_schemas.as_ref(),
-        loading_mode,
-        required_tool,
+        &tool_dispatch.catalog,
+        tool_dispatch.mode,
+        task_split.is_none(),
     );
     let tool_schemas = wire_schemas.as_ref();
     // Freeze the already-reconciled request's Session before the following
@@ -2340,7 +2334,13 @@ pub(super) async fn execute_llm_stream(
         super::token_estimation::estimate_prompt_tokens(&prepared_context.messages)
     };
 
-    Ok((stream_output, llm_duration, prompt_tokens, completion))
+    Ok((
+        stream_output,
+        llm_duration,
+        prompt_tokens,
+        completion,
+        tool_dispatch,
+    ))
 }
 
 #[cfg(test)]

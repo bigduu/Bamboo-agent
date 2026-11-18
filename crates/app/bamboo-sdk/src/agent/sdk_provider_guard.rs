@@ -209,6 +209,13 @@ impl LLMProvider for BoundSdkProvider {
             .await
     }
 
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<bamboo_llm::provider::RequestToolSelection> {
+        self.delegate.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,

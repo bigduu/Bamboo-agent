@@ -2347,7 +2347,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
         match result {
             Ok(()) => {
                 if self.local_tool_history {
-                    let observation = match local_tool_completion(&session) {
+                    let observation = match local_tool_completion(&session, tail_prefix_len) {
                         Ok(observation) => observation,
                         Err(error) => return ChildOutcome::error(error),
                     };
@@ -2363,13 +2363,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     // strict Glob worker retains its original completion if
                     // this optional cache observation cannot be represented;
                     // an owned Host requires it and fails closed when absent.
-                    if let Ok(messages) = session
-                        .messages
-                        .get(tail_prefix_len..)
-                        .unwrap_or_default()
-                        .iter()
-                        .map(serde_json::to_value)
-                        .collect::<Result<Vec<_>, _>>()
+                    if let Ok(messages) = actor_execution_messages(
+                        session.messages.get(tail_prefix_len..).unwrap_or_default(),
+                    )
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
                     {
                         let tail =
                             bamboo_subagent::proto::ReadOnlyActorTranscript::Complete { messages };
@@ -2404,7 +2402,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                                 .all(|name| matches!(name.as_str(), "Read" | "Glob"))
                     })
                 {
-                    if let Ok(observation) = local_tool_completion(&session) {
+                    if let Ok(observation) = local_tool_completion(&session, tail_prefix_len) {
                         tail_events
                             .emit(
                                 serde_json::to_value(observation)
@@ -2420,17 +2418,37 @@ impl ChildExecutor for BambooRuntimeExecutor {
     }
 }
 
+// The Host validates executed tools against their physical events. Lookup
+// control pairs are scoped to the Worker prompt and have no execution events.
+fn actor_execution_messages(messages: &[Message]) -> impl Iterator<Item = &Message> {
+    let mut rows = messages.iter().peekable();
+    std::iter::from_fn(move || loop {
+        let row = rows.next()?;
+        if rows
+            .next_if(|result| bamboo_domain::is_sticky_discovery_pair(row, result))
+            .is_none()
+        {
+            return Some(row);
+        }
+    })
+}
+
 fn local_tool_completion(
     session: &Session,
+    prefix_len: usize,
 ) -> Result<bamboo_subagent::proto::LocalToolMessages, &'static str> {
     if !session.provider_transcript.groups().is_empty() {
         return Err("local_tool_history_unsupported");
     }
+    let (prefix, suffix) = session
+        .messages
+        .split_at_checked(prefix_len)
+        .ok_or("local_tool_history_unsupported")?;
     let observation = bamboo_subagent::proto::LocalToolMessages::Complete {
         version: 1,
-        messages: session
-            .messages
+        messages: prefix
             .iter()
+            .chain(actor_execution_messages(suffix))
             .map(serde_json::to_value)
             .collect::<Result<_, _>>()
             .map_err(|_| "local_tool_history_unsupported")?,
@@ -2530,6 +2548,60 @@ mod tests {
     include!("subagent_worker_cold_input_tests.rs");
 
     #[test]
+    fn actor_completion_projects_only_paired_discovery_in_the_new_suffix() {
+        let lookup = |id: &str| {
+            let mut assistant = Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: id.into(),
+                    tool_type: "function".into(),
+                    function: bamboo_domain::FunctionCall {
+                        name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.into(),
+                        arguments: r#"{"query":"Glob"}"#.into(),
+                    },
+                }]),
+            );
+            assistant.never_compress = true;
+            assistant.metadata = Some(serde_json::json!({
+                "runtime_kind": bamboo_domain::STICKY_DISCOVERY_RUNTIME_KIND,
+                "version": bamboo_domain::STICKY_DISCOVERY_RUNTIME_VERSION,
+            }));
+            let mut result = Message::tool_result_with_status(id, "search failed", false);
+            result.never_compress = true;
+            result.metadata = assistant.metadata.clone();
+            result.metadata.as_mut().unwrap()["canonical_new_names"] = serde_json::json!([]);
+            [assistant, result]
+        };
+        let mut session = Session::new("completion-lookup", "model");
+        session.messages.extend(lookup("durable"));
+        let prefix_len = session.messages.len();
+        session.messages.extend(lookup("new-control"));
+        let [assistant, mut result] = lookup("unmatched");
+        result.tool_call_id = Some("different".into());
+        session.messages.extend([assistant, result]);
+        session
+            .messages
+            .push(Message::assistant("actual reply", None));
+        let expected: Vec<_> = session.messages[..prefix_len]
+            .iter()
+            .chain(&session.messages[prefix_len + 2..])
+            .map(|message| &message.id)
+            .collect();
+        let projected = local_tool_completion(&session, prefix_len)
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|message| &message.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(session.messages.len(), prefix_len + 5);
+    }
+
+    #[test]
     fn local_completion_preserves_message_data_and_refuses_provider_state() {
         let mut session = Session::new("local-completion", "model");
         session.add_message(Message::user("full canonical input"));
@@ -2540,7 +2612,7 @@ mod tests {
             Some(reasoning.into()),
         ));
         let before = serde_json::to_value(&session).unwrap();
-        let data = local_tool_completion(&session).unwrap();
+        let data = local_tool_completion(&session, 1).unwrap();
         let messages = data.validate().unwrap();
         assert_eq!(
             messages.last().unwrap().reasoning.as_deref(),
@@ -2556,10 +2628,10 @@ mod tests {
                 serde_json::json!({"type":"tool_search_output","execution":"client","call_id":"search","status":"completed","tools":[]}),
             ).unwrap(),
         ]).unwrap();
-        assert!(local_tool_completion(&session).is_err());
+        assert!(local_tool_completion(&session, 1).is_err());
         session.provider_transcript = Default::default();
         session.messages.last_mut().unwrap().reasoning_signature = Some("opaque".into());
-        assert!(local_tool_completion(&session).is_err());
+        assert!(local_tool_completion(&session, 1).is_err());
         assert_eq!(session.messages[0].content, "full canonical input");
         assert_eq!(
             session.messages.last().unwrap().reasoning.as_deref(),

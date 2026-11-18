@@ -135,6 +135,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // source hash moves with the new helper. No feature declaration, cfg
 // expression, required-features target, owner, additive context or explicit
 // case changes; engine tests are not part of any additive feature owner.
+// Role-scoped tool loading and the provider wire regressions run in the
+// existing default Engine and LLM owners. No feature context changes.
 // #2583 adds compact model catalog and canonical Child selection observations
 // to the existing default Engine, Server Tools and Server owners. No feature
 // declaration, additive context or explicitly selected case changes.
@@ -188,7 +190,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
 // #2831 changes the default Storage save path. Supervisor dispatch consent
 // cases stay in the default Server owners; all 20 additive cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "2cc74e5fc0b1279f3a24a4012cf877ccea6b243ff9d106bf9391bc4c5671dc34";
+const FEATURE_SOURCE_SHA256 = "55611f5e748bb53f8f14eba71acfdabc7547c1961e47755d3a18c1c52cc385d5";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

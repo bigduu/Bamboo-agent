@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    canonical_tool_name, FunctionSchema, ToolSchema, DISCOVER_CAPABILITY_NAME,
+    canonical_tool_name, FunctionSchema, Message, Role, ToolSchema, DISCOVER_CAPABILITY_NAME,
     MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
 };
 
@@ -32,12 +32,11 @@ pub enum CapabilityLoadingMode {
     LegacyFullCatalog,
     Progressive,
     /// Compatibility path for providers without native deferred-tool search.
-    /// The top-level catalog stays fixed at Core plus Bamboo's synthetic
-    /// discovery function while loaded definitions live in conversation
-    /// history.
+    /// Bamboo declares initially available functions and its discovery gateway.
+    /// Validated discovery history supplies further callable definitions.
     StickyFallback,
-    /// Session policy selects sticky loading for ordinary Root Chat.
-    /// An unresolved mode uses the legacy catalog.
+    /// Compatibility value used by older provider adapters. The agent treats
+    /// it as StickyFallback for every session role.
     StickyFallbackForRootChat,
 }
 
@@ -91,6 +90,43 @@ pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
 /// fallback adapter. Native provider search items map to the logical gateway
 /// directly and do not use this function identity.
 pub const DISCOVERY_CONTROL_FALLBACK_TOOL_NAME: &str = "discover_capabilities";
+
+#[doc(hidden)]
+pub const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
+#[doc(hidden)]
+pub const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
+
+/// Recognize a complete internal lookup step when projecting Actor execution
+/// data. Its Worker messages remain available to the model during the run.
+#[doc(hidden)]
+pub fn is_sticky_discovery_pair(assistant: &Message, result: &Message) -> bool {
+    let Some([call]) = assistant.tool_calls.as_deref() else {
+        return false;
+    };
+    let marked = |message: &Message| {
+        message.never_compress
+            && message.metadata.as_ref().is_some_and(|metadata| {
+                metadata["runtime_kind"].as_str() == Some(STICKY_DISCOVERY_RUNTIME_KIND)
+                    && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
+            })
+    };
+    assistant.role == Role::Assistant
+        && assistant.tool_call_id.is_none()
+        && assistant.tool_success.is_none()
+        && call.tool_type == "function"
+        && call.function.name == DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+        && !call.id.trim().is_empty()
+        && marked(assistant)
+        && result.role == Role::Tool
+        && result.tool_calls.is_none()
+        && result.tool_call_id.as_deref() == Some(call.id.as_str())
+        && result.tool_success.is_some()
+        && result
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata["canonical_new_names"].is_array())
+        && marked(result)
+}
 
 /// Complete, bounded function schema used by the compatibility fallback.
 ///
