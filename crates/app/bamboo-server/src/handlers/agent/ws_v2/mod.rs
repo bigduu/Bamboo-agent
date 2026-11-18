@@ -878,7 +878,14 @@ async fn subscribe_with_actor_resume(
                 .and_then(|runner| runner.last_budget_event.clone());
             let critical_events_to_replay: Vec<_> = runner_snapshot
                 .as_ref()
-                .map(|runner| runner.last_critical_events.clone())
+                .map(|runner| {
+                    runner
+                        .running_execution_started()
+                        .into_iter()
+                        .chain(&runner.last_critical_events)
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // The initial snapshot only selects a terminal-replay candidate.
@@ -1488,6 +1495,94 @@ mod tests {
             Some(&crate::app_state::AgentStatus::Running),
             &rx,
         ));
+    }
+
+    #[actix_web::test]
+    async fn agent_subscription_replays_the_published_start_before_live_output() {
+        use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
+        use bamboo_agent_core::{AgentEvent, Message, Session, Storage};
+        use bamboo_engine::execution::reserve_runner_core;
+
+        let dir = tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(dir.path().canonicalize().unwrap())
+                .await
+                .unwrap(),
+        );
+        let mut session = Session::new("late-agent-subscriber", "test-model");
+        session.add_message(Message::user("Run identity fixture"));
+        state.storage.save_session(&session).await.unwrap();
+        let sid = &session.id;
+        let sender = state.get_session_event_sender(sid).await;
+        let mut existing = sender.subscribe();
+        reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            sid,
+            &sender,
+        )
+        .await;
+        let run_id = state.agent_runners.read().await[sid].run_id.clone();
+        let binding = state
+            .agent
+            .persistence()
+            .bind_root_actor_execution(&session, &run_id)
+            .await
+            .unwrap()
+            .expect("Root has its repository-issued execution owner");
+        let (input, events) = mpsc::channel(4);
+        spawn_event_forwarder_with_root_actor(
+            state.clone(),
+            sid.clone(),
+            run_id.clone(),
+            events,
+            sender,
+            None,
+            Some(binding.owner),
+        );
+        let wait = std::time::Duration::from_secs(5);
+        let started = tokio::time::timeout(wait, existing.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&started, AgentEvent::ExecutionStarted { run_id: id, .. } if id == &run_id)
+        );
+        drop(existing);
+
+        let ch = format!("agent.{sid}");
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        subscribe_with_actor_resume(
+            &state,
+            &mut forwarders,
+            &mut queues,
+            0,
+            Encoding::Json,
+            &ch,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let token = AgentEvent::Token {
+            content: "live".into(),
+        };
+        input.send(token.clone()).await.unwrap();
+        for (seq, event) in [(1, started), (2, token)] {
+            let (channel, OutFrame::Text(frame)) = tokio::time::timeout(wait, queues.next())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected an agent JSON frame");
+            };
+            let envelope: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(channel, ch);
+            assert_eq!(envelope["seq"], seq);
+            assert_eq!(envelope["event"], serde_json::to_value(event).unwrap());
+        }
+        forwarders.remove(&ch).unwrap().abort();
     }
 
     #[actix_web::test]

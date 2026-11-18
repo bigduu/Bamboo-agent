@@ -796,8 +796,8 @@ pub(crate) fn spawn_message_forwarder(
 
 /// Spawn an `agent.{sid}` forwarder.
 ///
-/// Mirrors the v1 per-session SSE path: replay cached critical state events
-/// (and the last budget event) first, then live-tail. Reuses the v1
+/// Replays the active run's published identity, cached critical state events,
+/// and the last budget event before live-tailing. Reuses the v1
 /// [`Coalescer`] for token batching when `batch_ms > 0` (default 0 = no
 /// coalescing). On any terminal event it emits a `terminal` control frame.
 ///
@@ -828,8 +828,8 @@ pub(crate) fn spawn_agent_forwarder(
             &session_id,
         );
 
-        // Replay cached critical state events first (task list, sub-sessions, …),
-        // then the last budget event — mirroring the v1 SSE replay order.
+        // The snapshot orders the published run identity before cached state.
+        // Replay the last budget event after both.
         for event in critical_events_to_replay {
             if !emit_agent_event(&out, encoding, &ch, &seq, event, &session_id).await {
                 return;
