@@ -118,7 +118,6 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             ),
             2 => discover("Glob"),
             3 => call("Glob", json!({"pattern":"*.txt","path":probe.workspace})),
-            4 if probe.case == Case::Unknown => discover("Grep"),
             _ => (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop"),
         }
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
@@ -497,7 +496,7 @@ async fn fixture(case: Case) {
         }
         let names = declared_tools(child[0]);
         assert!(names.contains(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
-        assert!(!names.contains("Glob") && !names.contains("Grep"));
+        assert!(!names.contains("Glob"));
         let mut expected_after_discovery = names.clone();
         expected_after_discovery.insert("Glob");
         assert_eq!(declared_tools(child[3]), expected_after_discovery);
@@ -556,8 +555,8 @@ async fn fixture(case: Case) {
                 );
             } else {
                 assert!(
-                    declared_tools(child.last().unwrap()).contains("Grep"),
-                    "the default role can still discover Grep"
+                    names.contains("Grep"),
+                    "the default role retains the resident Grep tool"
                 );
             }
         }

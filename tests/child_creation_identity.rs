@@ -359,9 +359,9 @@ async fn run_fixture() {
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
-        assert!(tools.contains(&"Read"));
+        assert!(tools.contains(&"Read") && tools.contains(&"Grep"));
         assert!(tools.contains(&DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
-        assert!(!tools.contains(&"Glob") && !tools.contains(&"Grep"));
+        assert!(!tools.contains(&"Glob"));
         for denied in bamboo_engine::runtime::guardian_state::read_only_child_disabled_tools() {
             assert!(
                 !tools.contains(&denied.as_str()),
