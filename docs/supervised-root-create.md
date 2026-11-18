@@ -20,12 +20,17 @@ and ownership checks. A native ExecuteCommand permission check describes this
 Project/workspace before the Host service runs. No existing security setting,
 Project binding or permission is automatically changed.
 
-The worker is a new Standard Ordinary Root. Its ordinary global defaults and
-Project context come from the same pure creation use case as `POST /sessions`.
+The worker is a new Ordinary Root. Standard is the default. An observed
+Supervisor can select `thinking_mode: "ultra"` in either `spawn_session` or
+`session_control create`. The first turn uses the ordinary Ultra tool catalog,
+including direct reads and edits and delegation of shell work to SubAgents.
+Keep the selected mode in the exact request when retrying a creation.
+
+The worker uses the same global defaults and Project context as `POST /sessions`.
 When the owner confirms Auto for dispatches on the Supervisor, fresh independent
 execution Sessions start in Auto. The revisioned Supervisor profile stores
 this distinct consent through `supervisor_auto_dispatch: true` together with
-`permission_mode: "auto"`. Standard Auto is scoped to the Supervisor Session.
+`permission_mode: "auto"`. The plain Auto choice applies to the Supervisor Session.
 Bypass is the default for independent execution Sessions. It skips
 ordinary approvals and retains forced confirmations for shell operations such
 as `source` and `sudo`. The initial permission mode is saved with the creation

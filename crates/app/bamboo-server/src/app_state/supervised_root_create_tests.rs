@@ -10,8 +10,8 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_domain::{
     ActorActivationStatus, ActorDirectoryPort, RootModeOperationAction, RootModeOperationRequest,
-    SessionCallerReference, SessionInboxPort, SessionKind, SessionMessageId, SessionPermissionMode,
-    SupervisorReference,
+    RootThinkingMode, SessionCallerReference, SessionInboxPort, SessionKind, SessionMessageId,
+    SessionPermissionMode, SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
@@ -928,6 +928,127 @@ async fn supervisor_creates_and_continues_standalone_roots_without_inheriting_a_
         assert_eq!(
             f.state.session_store.list_index_entries().await.len(),
             count + 1
+        );
+        f.state.shutdown().await;
+    }
+}
+
+struct UltraWorkerProvider(mpsc::UnboundedSender<Vec<String>>);
+
+#[async_trait::async_trait]
+impl LLMProvider for UltraWorkerProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.0
+            .send(
+                tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect(),
+            )
+            .unwrap();
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Ultra assignment checked.".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[actix_web::test]
+async fn supervisor_can_create_an_ordinary_ultra_worker_before_its_first_turn() {
+    for standalone in [false, true] {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("ultra-worker-fixture".into()),
+            ..Default::default()
+        });
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        let (sent, mut calls) = mpsc::unbounded_channel();
+        let provider: Arc<dyn LLMProvider> = Arc::new(UltraWorkerProvider(sent));
+        let f = Fixture::with_provider(false, config, provider.clone()).await;
+        f.state
+            .provider_registry
+            .replace_with(ProviderRegistry::new(
+                std::collections::HashMap::from([("openai".into(), provider)]),
+                "openai".into(),
+            ));
+        let operation = uuid::Uuid::new_v4();
+        let mut request = f.request(operation);
+        request["request"]["thinking_mode"] = json!("ultra");
+        let route = if standalone {
+            f.state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .grant_typed_scoped_session_permission(
+                    &f.supervisor.session_id,
+                    PermissionType::ExecuteCommand,
+                    PermissionMatcher {
+                        id: "standalone-ultra-create".into(),
+                        kind: PermissionMatcherKind::ExactResource,
+                        value: format!("session_control create [unassigned] {operation}"),
+                    },
+                )
+                .unwrap();
+            request = request["request"].clone();
+            request.as_object_mut().unwrap().remove("project_id");
+            request.as_object_mut().unwrap().remove("workspace_path");
+            "spawn_session"
+        } else {
+            "session_control"
+        };
+        let receipt = f.invoke_named(route, request.clone()).await;
+        assert_eq!(receipt["admitted"], true);
+        let id = receipt["target_session_id"].as_str().unwrap();
+        let catalog = timeout(Duration::from_secs(20), calls.recv())
+            .await
+            .expect("the worker's first turn reached the provider")
+            .unwrap();
+        for name in ["Read", "Write", "Edit", "SubAgent"] {
+            assert!(catalog.iter().any(|tool| tool == name), "{catalog:?}");
+        }
+        for name in ["exec_command", "session_control"] {
+            assert!(!catalog.iter().any(|tool| tool == name), "{catalog:?}");
+        }
+        let root = f
+            .state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(root.authority_identity.is_ordinary());
+        assert_eq!(root.root_thinking_mode(), RootThinkingMode::Ultra);
+        assert_eq!(root.root_session_id, id);
+        assert!(root.parent_session_id.is_none());
+        let replay = f.invoke_named(route, request.clone()).await;
+        assert_eq!(replay["target_session_id"], id);
+        assert_eq!(replay["receipt_id"], receipt["receipt_id"]);
+        if standalone {
+            request["thinking_mode"] = json!("standard");
+        } else {
+            request["request"]["thinking_mode"] = json!("standard");
+        }
+        let ToolOutcome::Completed(conflict) =
+            f.dispatch_named(route, request, true).await.unwrap()
+        else {
+            panic!("changing the reserved mode must conflict");
+        };
+        assert!(!conflict.success);
+        let result: Value = serde_json::from_str(&conflict.result).unwrap();
+        assert_eq!(result["code"], "idempotency_conflict");
+        assert_eq!(
+            f.state.session_inbox.inspect(id).await.unwrap().generation,
+            1
         );
         f.state.shutdown().await;
     }
