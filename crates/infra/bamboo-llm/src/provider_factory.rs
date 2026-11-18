@@ -175,6 +175,11 @@ pub async fn create_provider_from_instance(
                 provider = provider.with_max_tokens(max_tokens);
             }
 
+            provider = match instance.extra.get("sticky_tool_loading") {
+                Some(setting) => provider.with_sticky_tool_loading(setting.as_bool() == Some(true)),
+                None => provider.with_default_sticky_tool_loading(),
+            };
+
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_request_overrides(instance.request_overrides.clone());
             provider = provider.with_thinking_replay_always(
@@ -202,6 +207,11 @@ pub async fn create_provider_from_instance(
                 }
             }
 
+            provider = match instance.extra.get("sticky_tool_loading") {
+                Some(setting) => provider.with_sticky_tool_loading(setting.as_bool() == Some(true)),
+                None => provider.with_default_sticky_tool_loading(),
+            };
+
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_request_overrides(instance.request_overrides.clone());
 
@@ -227,6 +237,11 @@ pub async fn create_provider_from_instance(
                     provider = provider.with_base_url(base_url);
                 }
             }
+
+            provider = match instance.extra.get("sticky_tool_loading") {
+                Some(setting) => provider.with_sticky_tool_loading(setting.as_bool() == Some(true)),
+                None => provider.with_default_sticky_tool_loading(),
+            };
 
             provider = provider
                 .with_target_provider(target_provider)
@@ -548,11 +563,11 @@ mod tests {
         for (execution, expected) in [
             (
                 None,
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                bamboo_domain::CapabilityLoadingMode::StickyFallbackForRootChat,
             ),
             (
                 Some("invalid"),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                bamboo_domain::CapabilityLoadingMode::StickyFallbackForRootChat,
             ),
             (
                 Some("client"),
@@ -588,54 +603,66 @@ mod tests {
 
     #[tokio::test]
     async fn openai_sticky_tool_loading_defaults_to_root_chat_and_preserves_native_precedence() {
-        for (configured, expected) in [
-            (
-                None,
-                bamboo_domain::CapabilityLoadingMode::StickyFallbackForRootChat,
-            ),
-            (
-                Some(serde_json::json!(false)),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
-            (
-                Some(serde_json::json!("true")),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
-            (
-                Some(serde_json::Value::Null),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
-            (
-                Some(serde_json::json!(true)),
-                bamboo_domain::CapabilityLoadingMode::StickyFallback,
-            ),
+        for (provider_type, model, responses) in [
+            ("openai", "gpt-4o-mini", false),
+            ("openai", "fixture-responses", true),
+            ("anthropic", "fixture-claude", false),
+            ("gemini", "fixture-gemini", false),
+            ("bodhi", "fixture-proxy", false),
         ] {
-            let mut value = serde_json::json!({
-                "provider_type":"openai",
-                "api_key":"sk-test",
-                "base_url":"https://api.openai.com/v1",
-                "enabled":true
-            });
-            if let Some(configured) = configured {
-                value["sticky_tool_loading"] = configured;
+            for (configured, expected) in [
+                (
+                    None,
+                    bamboo_domain::CapabilityLoadingMode::StickyFallbackForRootChat,
+                ),
+                (
+                    Some(serde_json::json!(false)),
+                    bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                ),
+                (
+                    Some(serde_json::json!("true")),
+                    bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                ),
+                (
+                    Some(serde_json::Value::Null),
+                    bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                ),
+                (
+                    Some(serde_json::json!(true)),
+                    bamboo_domain::CapabilityLoadingMode::StickyFallback,
+                ),
+            ] {
+                let mut value = serde_json::json!({
+                    "provider_type":provider_type,
+                    "api_key":"sk-test",
+                    "base_url":"https://gateway.example/v1",
+                    "responses_only_models": if responses { vec![model] } else { vec![] },
+                    "enabled":true
+                });
+                if let Some(configured) = configured {
+                    value["sticky_tool_loading"] = configured;
+                }
+                let instance: ProviderInstanceConfig = serde_json::from_value(value).unwrap();
+                let provider = create_provider_from_instance(
+                    &Config::default(),
+                    &instance,
+                    std::env::temp_dir(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    provider.capability_loading_mode(model, None).await,
+                    expected,
+                    "sticky_tool_loading={:?}",
+                    instance.extra.get("sticky_tool_loading")
+                );
+                assert_eq!(
+                    provider
+                        .capability_loading_mode(model, Some("load_skill"))
+                        .await,
+                    bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+                );
             }
-            let instance: ProviderInstanceConfig = serde_json::from_value(value).unwrap();
-            let provider =
-                create_provider_from_instance(&Config::default(), &instance, std::env::temp_dir())
-                    .await
-                    .unwrap();
-            assert_eq!(
-                provider.capability_loading_mode("gpt-4o-mini", None).await,
-                expected,
-                "sticky_tool_loading={:?}",
-                instance.extra.get("sticky_tool_loading")
-            );
-            assert_eq!(
-                provider
-                    .capability_loading_mode("gpt-4o-mini", Some("load_skill"))
-                    .await,
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
-            );
         }
 
         let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({

@@ -26,7 +26,7 @@ use crate::providers::common::openai_compat::{
 use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
+use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 
@@ -39,6 +39,7 @@ pub struct BodhiProvider {
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    tool_loading_mode: CapabilityLoadingMode,
 }
 
 impl BodhiProvider {
@@ -52,7 +53,24 @@ impl BodhiProvider {
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            tool_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
         }
+    }
+
+    /// Enable the existing conversation-history loader, or explicitly retain
+    /// the full catalog for endpoints that require every declaration.
+    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
+        self.tool_loading_mode = if enabled {
+            CapabilityLoadingMode::StickyFallback
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        };
+        self
+    }
+
+    pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
+        self.tool_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+        self
     }
 
     /// Configure keyword masking applied as a last-moment scan of every outbound
@@ -85,6 +103,36 @@ impl BodhiProvider {
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
         self
+    }
+
+    fn request_selects_tools(&self, model: &str) -> bool {
+        let endpoint = match self.target_provider.as_str() {
+            "openai" => request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            "anthropic" => request_overrides::ENDPOINT_MESSAGES,
+            "gemini" => request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            _ => return true,
+        };
+        let mut body = json!({});
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            endpoint,
+            Some(model),
+        );
+        if self.target_provider == "gemini" {
+            return super::gemini::has_constrained_tool_choice(&body);
+        }
+        // Keep all eligible declarations for forced/named/allowlisted choices,
+        // including gateway-specific choice shapes we cannot safely narrow.
+        match body.get("tool_choice") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(choice)) => !matches!(choice.as_str(), "auto" | "none"),
+            Some(Value::Object(choice)) if self.target_provider == "anthropic" => !matches!(
+                choice.get("type").and_then(Value::as_str),
+                Some("auto" | "none")
+            ),
+            Some(_) => true,
+        }
     }
 
     fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
@@ -131,6 +179,18 @@ impl BodhiProvider {
 
 #[async_trait]
 impl LLMProvider for BodhiProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_some() || self.request_selects_tools(model) {
+            CapabilityLoadingMode::LegacyFullCatalog
+        } else {
+            self.tool_loading_mode
+        }
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         _ir: &crate::prompt_ir::PromptIR,
@@ -543,6 +603,108 @@ impl BodhiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sticky_loading_preserves_constructor_opt_out_and_required_routes() {
+        let legacy = BodhiProvider::new("fixture");
+        assert_eq!(
+            legacy.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let default = legacy.with_default_sticky_tool_loading();
+        assert_eq!(
+            default.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::StickyFallbackForRootChat
+        );
+        assert_eq!(
+            default
+                .capability_loading_mode("fixture", Some("Glob"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let enabled = default.with_sticky_tool_loading(true);
+        assert_eq!(
+            enabled.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        let disabled = enabled.with_sticky_tool_loading(false);
+        assert_eq!(
+            disabled.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_loading_respects_each_proxy_target_and_override_scope() {
+        for (target, endpoint, path, selected, automatic) in [
+            (
+                "openai",
+                "chat_completions",
+                "tool_choice",
+                json!({"type":"function", "function":{"name":"Glob"}}),
+                json!("auto"),
+            ),
+            (
+                "openai",
+                "chat_completions",
+                "tool_choice",
+                json!("required"),
+                json!("auto"),
+            ),
+            (
+                "anthropic",
+                "messages",
+                "tool_choice",
+                json!({"type":"tool", "name":"Glob"}),
+                json!({"type":"auto"}),
+            ),
+            (
+                "anthropic",
+                "messages",
+                "tool_choice",
+                json!({"type":"any"}),
+                json!({"type":"auto"}),
+            ),
+            (
+                "gemini",
+                "stream_generate_content",
+                "toolConfig.functionCallingConfig",
+                json!({"mode":"ANY", "allowedFunctionNames":["Glob"]}),
+                json!({"mode":"AUTO"}),
+            ),
+        ] {
+            let overrides = serde_json::from_value(json!({
+                "rules":[
+                    {"model_pattern":"fixture-*", "endpoint":endpoint,
+                     "scope":{"body_patch":[{"path":path, "value":selected}]}},
+                    {"model_pattern":"fixture-auto", "endpoint":endpoint,
+                     "scope":{"body_patch":[{"path":path, "value":automatic}]}},
+                    {"model_pattern":"unmatched", "endpoint":"responses",
+                     "scope":{"body_patch":[{"path":path, "value":selected}]}}
+                ]
+            }))
+            .unwrap();
+            let provider = BodhiProvider::new("fixture")
+                .with_target_provider(target)
+                .with_default_sticky_tool_loading()
+                .with_request_overrides(Some(overrides));
+            assert_eq!(
+                provider
+                    .capability_loading_mode("fixture-constrained", None)
+                    .await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                "target={target}"
+            );
+            for model in ["fixture-auto", "unmatched"] {
+                assert_eq!(
+                    provider.capability_loading_mode(model, None).await,
+                    CapabilityLoadingMode::StickyFallbackForRootChat,
+                    "target={target} model={model}"
+                );
+            }
+        }
+    }
+
     use crate::types::LLMChunk;
     use bamboo_domain::FunctionSchema;
     use futures::StreamExt;

@@ -32,8 +32,12 @@ and limits outside 1–5 fail. Rebuilding from the current registry prevents
 removed, disabled and HostOnly tools from being returned or gaining callable
 authority. Historical loaded names still require current registry eligibility.
 
-An OpenAI provider instance with no `sticky_tool_loading` setting uses on-demand
-loading for ordinary Root Chat on Chat Completions. The default request declares
+A configured OpenAI, Anthropic, Gemini or Bodhi provider instance with no
+`sticky_tool_loading` setting uses on-demand loading for ordinary Root Chat
+where native search is not selected. This includes Chat Completions, compatible
+Responses, Anthropic compatibility/older-model routes, Gemini and Bodhi proxy
+routes. Official Anthropic models with native search and explicitly configured
+OpenAI native Responses search keep their native discovery protocols. The default request declares
 Core tools, `discover_capabilities`, and eligible `SubAgent`, `skills_list`, and
 `skills_read` tools. These allow required-child workflows and native Skill access
 to start directly. Discovery carries matching tool definitions into conversation

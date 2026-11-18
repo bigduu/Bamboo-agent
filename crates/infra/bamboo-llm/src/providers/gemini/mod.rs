@@ -22,8 +22,19 @@ use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::{CapabilityLoadingMode, Message};
+
+/// A forced call or named allowlist must keep its declarations visible.
+pub(crate) fn has_constrained_tool_choice(body: &Value) -> bool {
+    let config = &body["toolConfig"]["functionCallingConfig"];
+    config["mode"]
+        .as_str()
+        .is_some_and(|mode| !matches!(mode, "AUTO" | "NONE"))
+        || config["allowedFunctionNames"]
+            .as_array()
+            .is_some_and(|names| !names.is_empty())
+}
 
 pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
     if let Some(name) = required_tool {
@@ -68,6 +79,7 @@ pub struct GeminiProvider {
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    tool_loading_mode: CapabilityLoadingMode,
 }
 
 impl GeminiProvider {
@@ -81,7 +93,24 @@ impl GeminiProvider {
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            tool_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
         }
+    }
+
+    /// Enable the existing conversation-history loader, or explicitly retain
+    /// the full catalog for endpoints that require every declaration.
+    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
+        self.tool_loading_mode = if enabled {
+            CapabilityLoadingMode::StickyFallback
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        };
+        self
+    }
+
+    pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
+        self.tool_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+        self
     }
 
     /// Configure keyword masking applied as a last-moment scan of every outbound
@@ -113,6 +142,17 @@ impl GeminiProvider {
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
         self
+    }
+
+    fn request_selects_tools(&self, model: &str) -> bool {
+        let mut body = json!({});
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            Some(model),
+        );
+        has_constrained_tool_choice(&body)
     }
 
     fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
@@ -163,6 +203,18 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_some() || self.request_selects_tools(model) {
+            CapabilityLoadingMode::LegacyFullCatalog
+        } else {
+            self.tool_loading_mode
+        }
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         _ir: &crate::prompt_ir::PromptIR,
@@ -392,6 +444,68 @@ impl LLMProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sticky_loading_preserves_constructor_opt_out_and_required_routes() {
+        let legacy = GeminiProvider::new("fixture");
+        assert_eq!(
+            legacy.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let default = legacy.with_default_sticky_tool_loading();
+        assert_eq!(
+            default.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::StickyFallbackForRootChat
+        );
+        assert_eq!(
+            default
+                .capability_loading_mode("fixture", Some("Glob"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let enabled = default.with_sticky_tool_loading(true);
+        assert_eq!(
+            enabled.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        let disabled = enabled.with_sticky_tool_loading(false);
+        assert_eq!(
+            disabled.capability_loading_mode("fixture", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_loading_preserves_effective_gemini_tool_selection() {
+        for choice in [
+            json!({"mode":"ANY"}),
+            json!({"mode":"AUTO", "allowedFunctionNames":["Glob"]}),
+        ] {
+            let overrides = serde_json::from_value(json!({
+                "rules":[
+                    {"model_pattern":"fixture-*", "endpoint":"stream_generate_content",
+                     "scope":{"body_patch":[{"path":"toolConfig.functionCallingConfig", "value":choice}]}},
+                    {"model_pattern":"fixture-auto", "endpoint":"stream_generate_content",
+                     "scope":{"body_patch":[{"path":"toolConfig.functionCallingConfig", "value":{"mode":"AUTO"}}]}}
+                ]
+            })).unwrap();
+            let provider = GeminiProvider::new("fixture")
+                .with_default_sticky_tool_loading()
+                .with_request_overrides(Some(overrides));
+            assert_eq!(
+                provider
+                    .capability_loading_mode("fixture-constrained", None)
+                    .await,
+                CapabilityLoadingMode::LegacyFullCatalog
+            );
+            for model in ["fixture-auto", "unmatched"] {
+                assert_eq!(
+                    provider.capability_loading_mode(model, None).await,
+                    CapabilityLoadingMode::StickyFallbackForRootChat
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn tool_footprint_reuses_grouped_gemini_function_declarations() {

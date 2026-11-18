@@ -230,6 +230,7 @@ pub struct AnthropicProvider {
     base_url: String,
     max_tokens: u32,
     max_tokens_configured: bool,
+    fallback_loading_mode: CapabilityLoadingMode,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
@@ -262,6 +263,7 @@ impl AnthropicProvider {
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
             max_tokens_configured: false,
+            fallback_loading_mode: CapabilityLoadingMode::LegacyFullCatalog,
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
@@ -291,6 +293,33 @@ impl AnthropicProvider {
         self.max_tokens = max_tokens;
         self.max_tokens_configured = true;
         self
+    }
+
+    /// Configure Bamboo's history-based discovery fallback when native tool
+    /// search is unavailable. Native search keeps precedence on supported routes.
+    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
+        self.fallback_loading_mode = if enabled {
+            CapabilityLoadingMode::StickyFallback
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        };
+        self
+    }
+
+    pub(crate) fn with_default_sticky_tool_loading(mut self) -> Self {
+        self.fallback_loading_mode = CapabilityLoadingMode::StickyFallbackForRootChat;
+        self
+    }
+
+    fn selects_required_tools(&self, model: &str) -> bool {
+        let mut body = json!({});
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+        );
+        matches!(body["tool_choice"]["type"].as_str(), Some("tool" | "any"))
     }
 
     /// Configure default reasoning effort for requests sent through this provider.
@@ -346,13 +375,14 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
-        if required_tool.is_none()
-            && is_official_anthropic_base_url(&self.base_url)
+        if required_tool.is_some() || self.selects_required_tools(model) {
+            CapabilityLoadingMode::LegacyFullCatalog
+        } else if is_official_anthropic_base_url(&self.base_url)
             && supports_anthropic_tool_search(model)
         {
             CapabilityLoadingMode::Progressive
         } else {
-            CapabilityLoadingMode::LegacyFullCatalog
+            self.fallback_loading_mode
         }
     }
 
@@ -364,7 +394,7 @@ impl LLMProvider for AnthropicProvider {
         required_tool: Option<&str>,
     ) -> Result<ProviderVisibleToolFootprint> {
         let mode = self.capability_loading_mode(model, required_tool).await;
-        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+        if mode != CapabilityLoadingMode::Progressive {
             let projected = tools_to_anthropic_json(tools, mode);
             if projected.is_empty() {
                 return Ok(ProviderVisibleToolFootprint::default());
@@ -1023,7 +1053,7 @@ fn apply_anthropic_native_groups(
         items: Vec<Value>,
     }
 
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return;
     }
 
@@ -1683,7 +1713,7 @@ pub(crate) fn tools_to_anthropic_json(
     tools: &[ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> Vec<Value> {
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return tools.iter().map(tool_to_anthropic_json).collect();
     }
 
@@ -7491,6 +7521,158 @@ mod anthropic_provider_tests {
             );
         }
         assert_eq!(tools[0].function.parameters, parameters);
+    }
+
+    #[tokio::test]
+    async fn sticky_messages_default_preserves_native_search_and_explicit_opt_out() {
+        let provider = AnthropicProvider::new("fixture").with_default_sticky_tool_loading();
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::Progressive
+        );
+        assert_eq!(
+            provider.capability_loading_mode("legacy-model", None).await,
+            CapabilityLoadingMode::StickyFallbackForRootChat
+        );
+        let provider = provider.with_base_url("https://compatible.example/v1");
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::StickyFallbackForRootChat
+        );
+        assert_eq!(
+            provider
+                .capability_loading_mode("legacy-model", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let disabled = provider.with_sticky_tool_loading(false);
+        assert_eq!(
+            disabled.capability_loading_mode("legacy-model", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        assert_eq!(
+            disabled
+                .with_sticky_tool_loading(true)
+                .capability_loading_mode("legacy-model", None)
+                .await,
+            CapabilityLoadingMode::StickyFallback
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_messages_respects_effective_named_and_required_choice_overrides() {
+        let overrides = serde_json::from_value(json!({
+            "rules": [
+                {"model_pattern":"fixture-*", "endpoint":"messages", "scope":{
+                    "body_patch":[{"path":"tool_choice", "value":{"type":"tool","name":"Glob"}}]
+                }},
+                {"model_pattern":"fixture-auto", "endpoint":"messages", "scope":{
+                    "body_patch":[{"path":"/tool_choice", "value":{"type":"auto"}}]
+                }},
+                {"model_pattern":"fixture-any", "endpoint":"messages", "scope":{
+                    "body_patch":[{"path":"tool_choice", "value":{"type":"any"}}]
+                }},
+                {"model_pattern":"other-endpoint", "endpoint":"responses", "scope":{
+                    "body_patch":[{"path":"tool_choice", "value":{"type":"tool","name":"Glob"}}]
+                }}
+            ]
+        }))
+        .unwrap();
+        let provider = AnthropicProvider::new("fixture")
+            .with_default_sticky_tool_loading()
+            .with_request_overrides(Some(overrides));
+        for (model, expected) in [
+            ("fixture-forced", CapabilityLoadingMode::LegacyFullCatalog),
+            ("fixture-any", CapabilityLoadingMode::LegacyFullCatalog),
+            (
+                "fixture-auto",
+                CapabilityLoadingMode::StickyFallbackForRootChat,
+            ),
+            (
+                "other-endpoint",
+                CapabilityLoadingMode::StickyFallbackForRootChat,
+            ),
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sticky_messages_wire_preserves_selected_discovery_schema_without_native_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_default_sticky_tool_loading();
+        let schema = |name: &str| ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: name.into(),
+                description: "fixture".into(),
+                parameters: json!({"type":"object"}),
+            },
+        };
+        // The engine owns selection. Both sticky modes must lower its selected
+        // definitions verbatim instead of inserting Anthropic-only search tools.
+        let tools = vec![
+            schema("Read"),
+            schema(bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME),
+        ];
+        for mode in [
+            CapabilityLoadingMode::StickyFallback,
+            CapabilityLoadingMode::StickyFallbackForRootChat,
+        ] {
+            let projected = tools_to_anthropic_json(&tools, mode);
+            assert_eq!(projected.len(), 2);
+            assert_eq!(
+                projected[1]["name"],
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+            );
+            assert!(projected
+                .iter()
+                .all(|tool| tool.get("defer_loading").is_none()));
+        }
+        let ir = PromptIR::default();
+        let footprint = provider
+            .provider_visible_tool_footprint(&ir, &tools, "fixture", None)
+            .await
+            .unwrap();
+        assert_eq!(footprint.segments.len(), 1);
+        for selected in [&tools[..], &[load_skill_tool()][..]] {
+            let _stream = provider
+                .chat_stream_ir(&ir, selected, Some(64), "fixture", None)
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.unwrap();
+        let first: Value = requests[0].body_json().unwrap();
+        assert_eq!(first["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            first["tools"][1]["name"],
+            bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+        );
+        let second: Value = requests[1].body_json().unwrap();
+        assert_eq!(second["tools"][0]["name"], "load_skill");
+        for body in [first, second] {
+            assert!(!body.to_string().contains(ANTHROPIC_TOOL_SEARCH_TYPE));
+            assert!(!body.to_string().contains("defer_loading"));
+        }
     }
 
     #[tokio::test]
