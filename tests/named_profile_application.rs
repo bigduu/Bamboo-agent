@@ -1368,16 +1368,25 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
     }
     let root_requests: Vec<_> = requests
         .iter()
-        .filter(|r| r["model"] == "handoff-root" && r["tools"].is_array())
+        .filter(|request| {
+            request["model"] == "handoff-root"
+                && request["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "SubAgent")
+                })
+        })
         .collect();
     assert!(!root_requests.is_empty());
     for request in root_requests {
+        let names: std::collections::BTreeSet<_> = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
         for tool in ["Write", "Edit"] {
-            assert!(request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t["function"]["name"] == tool));
+            assert!(names.contains(tool), "Root {tool} missing from {names:?}");
         }
     }
     handle.stop(true).await;
