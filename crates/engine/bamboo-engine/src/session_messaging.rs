@@ -1548,11 +1548,42 @@ impl SessionMessenger {
         &self,
         admission: &SessionMessengerAdmission,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
-        let activation = match self
-            .activation
-            .request_activation(&admission.target_session_id, admission.delivery.generation)
+        self.activate_prepared_inner(admission, None).await
+    }
+
+    pub(crate) async fn activate_prepared_runtime(
+        &self,
+        admission: &SessionMessengerAdmission,
+        target_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.activate_prepared_inner(admission, Some(target_created_at))
             .await
-        {
+    }
+
+    async fn activate_prepared_inner(
+        &self,
+        admission: &SessionMessengerAdmission,
+        target_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        let result = match target_created_at {
+            Some(target_created_at) => {
+                self.activation
+                    .request_runtime_startup(
+                        &admission.target_session_id,
+                        bamboo_domain::SessionRuntimeStartup {
+                            receipt: admission.delivery.clone(),
+                            target_created_at,
+                        },
+                    )
+                    .await
+            }
+            None => {
+                self.activation
+                    .request_activation(&admission.target_session_id, admission.delivery.generation)
+                    .await
+            }
+        };
+        let activation = match result {
             Ok(disposition) => disposition,
             Err(source) => {
                 self.metrics

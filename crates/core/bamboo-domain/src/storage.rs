@@ -646,6 +646,39 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    async fn root_child_wait_requires_owned_expiry(
+        &self,
+        _session: &Session,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Observe the installed successful attempt for this exact wait run.
+    async fn observe_root_child_wait_expiry_activation(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Retire the exact child wait only while its staged notification is held.
+    /// This control-plane write never grants execution or mutates transcript.
+    async fn expire_root_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        committed: &crate::CommittedChildWaitExpiry,
+        inbox: &dyn crate::SessionInboxPort,
+        now: chrono::DateTime<chrono::Utc>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<bool> {
+        let _ = (expected, committed, inbox, now, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable Root child wait expiry is unsupported",
+        ))
+    }
+
     /// Durable Root-mode CAS and terminal recovery at the storage writer lock.
     /// A backend without this authority protocol fails closed.
     async fn root_mode_operation(

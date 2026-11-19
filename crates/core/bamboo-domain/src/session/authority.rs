@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 /// Reserved location for the default Supervisor. The ID alone grants no authority.
 pub const DEFAULT_SUPERVISOR_SESSION_ID: &str = "bamboo-default-supervisor";
-pub const SUPERVISOR_AUTO_DISPATCH_KEY: &str = "supervisor.auto_dispatch.v1";
 
 /// A snapshot cannot be committed against the durable Session authority.
 /// Persistence publishers must not cache a rejected identity, including when
@@ -33,30 +32,6 @@ impl SessionAuthorityIdentity {
 }
 
 impl super::Session {
-    /// The owner separately opted in to Auto on future independent dispatches.
-    pub fn supervisor_auto_dispatch(&self) -> bool {
-        self.supervisor_incarnation_id().is_some()
-            && self.agent_runtime_state.as_ref().is_some_and(|runtime| {
-                runtime.effective_permission_mode() == super::SessionPermissionMode::Auto
-            })
-            && self
-                .metadata
-                .get(SUPERVISOR_AUTO_DISPATCH_KEY)
-                .is_some_and(|value| value == "true")
-    }
-
-    /// Called by the owner-authorized, revisioned Supervisor profile writer.
-    pub fn set_supervisor_auto_dispatch(&mut self, enabled: bool) -> bool {
-        if enabled {
-            self.metadata
-                .insert(SUPERVISOR_AUTO_DISPATCH_KEY.into(), "true".into())
-                .as_deref()
-                != Some("true")
-        } else {
-            self.metadata.remove(SUPERVISOR_AUTO_DISPATCH_KEY).is_some()
-        }
-    }
-
     /// Identity shape observed from an executing snapshot, never a live grant.
     /// Every management operation must still revalidate canonical storage.
     pub fn supervisor_incarnation_id(&self) -> Option<Uuid> {

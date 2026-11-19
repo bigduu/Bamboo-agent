@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordKind, RecordStatus};
+use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus};
 use bamboo_domain::TaskPriority;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
@@ -42,6 +42,26 @@ pub fn new_record_id() -> String {
         .unwrap_or(0);
     let seq = RECORD_SEQ.fetch_add(1, Ordering::Relaxed) & 0xfff;
     format!("rec_{nanos:x}{seq:03x}")
+}
+
+/// Exact identity for extractor suggestions within one Ledger scope.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct LedgerSuggestionIdentity {
+    title: String,
+    kind: RecordKind,
+    due_at: Option<DateTime<Utc>>,
+    starts_at: Option<DateTime<Utc>>,
+}
+
+impl From<&LedgerRecord> for LedgerSuggestionIdentity {
+    fn from(record: &LedgerRecord) -> Self {
+        Self {
+            title: record.title.trim().to_lowercase(),
+            kind: record.kind.clone(),
+            due_at: record.time.due_at,
+            starts_at: record.time.starts_at,
+        }
+    }
 }
 
 /// Filter for [`LedgerStore::list_records`]. Empty filter = every non-terminal
@@ -170,8 +190,8 @@ fn agenda_item(record: &LedgerRecord) -> AgendaItem {
     }
 }
 
-/// Bucket records into an agenda. Pure so views, the tool, and the prompt
-/// layer all share one definition of "overdue"/"today".
+/// Bucket confirmed commitments into an agenda shared by the views, tool, and
+/// prompt layer. The record list still exposes extractor suggestions for review.
 pub fn build_agenda_snapshot(
     records: &[LedgerRecord],
     now: DateTime<Utc>,
@@ -185,7 +205,10 @@ pub fn build_agenda_snapshot(
     };
 
     for record in records {
-        if record.status.is_terminal() {
+        if record.status.is_terminal()
+            || (record.source.created_by == RecordActor::Extractor
+                && record.tags.iter().any(|tag| tag == "suggested"))
+        {
             continue;
         }
         match record.time_anchor() {
@@ -291,9 +314,49 @@ impl LedgerStore {
     /// always bumps `updated_at`.
     pub async fn write_record(
         &self,
-        mut record: LedgerRecord,
+        record: LedgerRecord,
         body: Option<String>,
     ) -> io::Result<LedgerRecordDocument> {
+        let path = self.validated_record_path(&record)?;
+        let lock = self.scope_lock(record.scope, record.project_key.as_deref());
+        let _guard = lock.lock().await;
+        let existing = self.load_record_at(&path).await?;
+        self.write_record_locked(record, body, path, existing).await
+    }
+
+    /// Insert a suggestion only once in this scope. The caller assigns an
+    /// exact source id so that retries still recognize a terminal or edited
+    /// record. Distinct source ids compete only with nonterminal matches.
+    pub async fn insert_extracted_suggestion(&self, record: LedgerRecord) -> io::Result<bool> {
+        let path = self.validated_record_path(&record)?;
+        let scope = record.scope;
+        let project_key = record.project_key.as_deref();
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
+        if self.load_record_at(&path).await?.is_some() {
+            // The original write may have committed the record before a
+            // refresh failed. Repair derived artifacts without rewriting it.
+            self.refresh_scope_artifacts(scope, project_key).await?;
+            return Ok(false);
+        }
+
+        let identity = LedgerSuggestionIdentity::from(&record);
+        let duplicate = self
+            .load_scope_records(scope, project_key)
+            .await?
+            .iter()
+            .any(|existing| {
+                !existing.record.status.is_terminal()
+                    && LedgerSuggestionIdentity::from(&existing.record) == identity
+            });
+        if duplicate {
+            return Ok(false);
+        }
+        self.write_record_locked(record, None, path, None).await?;
+        Ok(true)
+    }
+
+    fn validated_record_path(&self, record: &LedgerRecord) -> io::Result<PathBuf> {
         validate_record_id(&record.id)?;
         validate_record_title(&record.title)?;
         if record.scope == LedgerScope::Project && record.project_key.is_none() {
@@ -302,16 +365,20 @@ impl LedgerStore {
                 "project-scoped records require a project_key",
             ));
         }
-
-        let scope = record.scope;
-        let project_key = record.project_key.clone();
-        let lock = self.scope_lock(scope, project_key.as_deref());
-        let _guard = lock.lock().await;
-
-        let path = self
+        Ok(self
             .resolver
-            .record_path(scope, project_key.as_deref(), &record.id);
-        let existing = self.load_record_at(&path).await?;
+            .record_path(record.scope, record.project_key.as_deref(), &record.id))
+    }
+
+    async fn write_record_locked(
+        &self,
+        mut record: LedgerRecord,
+        body: Option<String>,
+        path: PathBuf,
+        existing: Option<LedgerRecordDocument>,
+    ) -> io::Result<LedgerRecordDocument> {
+        let scope = record.scope;
+        let project_key = record.project_key.as_deref();
         let action = if existing.is_some() {
             "update"
         } else {
@@ -329,16 +396,9 @@ impl LedgerStore {
 
         let rendered = render_record_document(&record, &body)?;
         atomic_write(&path, rendered.as_bytes()).await?;
-        self.refresh_scope_artifacts(scope, project_key.as_deref())
+        self.refresh_scope_artifacts(scope, project_key).await?;
+        self.append_audit(scope, project_key, &record.id, action, &record.title)
             .await?;
-        self.append_audit(
-            scope,
-            project_key.as_deref(),
-            &record.id,
-            action,
-            &record.title,
-        )
-        .await?;
 
         Ok(LedgerRecordDocument { record, body, path })
     }
@@ -685,6 +745,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_suggestions_share_one_scope_admission() {
+        let dir = tempdir().unwrap();
+        let first_writer = LedgerStore::new(dir.path());
+        let second_writer = LedgerStore::new(dir.path());
+        let suggestion = |id: &str, title: &str| {
+            let mut record = todo(id, title, Some(utc(2026, 8, 1, 9)));
+            record.scope = LedgerScope::Project;
+            record.project_key = Some("project-fixture".into());
+            record.source.created_by = bamboo_domain::ledger::RecordActor::Extractor;
+            record.tags = vec!["suggested".into()];
+            record
+        };
+        let first = suggestion("rec_source_a", "Check the schedule");
+        let second = suggestion("rec_source_b", "  CHECK the schedule  ");
+        let (a, b) = tokio::join!(
+            first_writer.insert_extracted_suggestion(first),
+            second_writer.insert_extracted_suggestion(second)
+        );
+        assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1);
+        let records = first_writer
+            .list_records(
+                LedgerScope::Project,
+                Some("project-fixture"),
+                &RecordFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
     async fn update_preserves_created_at_and_body() {
         let dir = tempdir().unwrap();
         let store = LedgerStore::new(dir.path());
@@ -868,6 +959,45 @@ mod tests {
         assert!(markdown.contains("## Overdue"));
         assert!(markdown.contains("rec_today"));
         assert!(!markdown.contains("rec_far"));
+    }
+
+    #[tokio::test]
+    async fn agenda_excludes_pending_extractions_until_confirmed() {
+        let dir = tempdir().unwrap();
+        let store = LedgerStore::new(dir.path());
+        let now = utc(2026, 7, 13, 12);
+        let overdue = Some(utc(2026, 7, 12, 9));
+        let scopes = [(LedgerScope::Global, None)];
+
+        let manual = todo("rec_manual", "Renew membership", overdue);
+        store.write_record(manual, None).await.unwrap();
+        let mut pending = todo("rec_pending", "Review a suggested appointment", overdue);
+        pending.source.created_by = RecordActor::Extractor;
+        pending.tags.push("suggested".to_string());
+        store.write_record(pending.clone(), None).await.unwrap();
+
+        let agenda = store.agenda(&scopes, now, 7).await.unwrap();
+        let overdue_ids: Vec<_> = agenda.overdue.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(overdue_ids, ["rec_manual"]);
+        let suggestions = store
+            .list_records(
+                LedgerScope::Global,
+                None,
+                &RecordFilter {
+                    tags: vec!["suggested".to_string()],
+                    ..RecordFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].record.id, "rec_pending");
+
+        pending.tags.clear();
+        store.write_record(pending, None).await.unwrap();
+        let agenda = store.agenda(&scopes, now, 7).await.unwrap();
+        let overdue_ids: Vec<_> = agenda.overdue.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(overdue_ids, ["rec_manual", "rec_pending"]);
     }
 
     #[test]

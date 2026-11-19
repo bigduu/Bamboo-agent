@@ -851,6 +851,10 @@ impl SessionStoreV2 {
             }
         }
         let mut candidate = incoming.clone();
+        // A runtime owner may have prepared its snapshot before a concurrent
+        // Host command changed the loop. Use the current sidecar while the
+        // physical Session writer is held, independent of presentation revision.
+        crate::session_merge::preserve_paced_loop(&mut candidate, latest.as_ref());
         if let Some(latest) = latest.as_ref().filter(|latest| {
             latest.host_run_id().is_some() && latest.host_run_id() == candidate.host_run_id()
         }) {
