@@ -1059,6 +1059,16 @@ impl SessionInboxAdmissionState {
         self.admitted.iter().any(|entry| entry.id.as_str() == id)
     }
 
+    pub fn receipt_for(&self, id: &str) -> Option<SessionInboxReceipt> {
+        self.admitted
+            .iter()
+            .find(|entry| entry.id.as_str() == id && entry.sequence != 0)
+            .map(|entry| SessionInboxReceipt {
+                id: entry.id.clone(),
+                generation: entry.sequence,
+            })
+    }
+
     pub fn record(&mut self, id: SessionMessageId, sequence: u64) -> bool {
         self.last_observed_sequence = self.last_observed_sequence.max(sequence);
         if self.contains(&id) {

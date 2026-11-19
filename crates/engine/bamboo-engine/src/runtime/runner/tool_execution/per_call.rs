@@ -45,6 +45,7 @@ fn parse_warning_log_details<'a>(
         || execution_name.eq_ignore_ascii_case("browser_eval")
         || execution_name.eq_ignore_ascii_case("session_message")
         || [
+            "session_loop",
             "spawn_session",
             "work_overview",
             "work_search",
@@ -552,8 +553,17 @@ async fn execute_tool_call_only_with_execution_name_inner(
 
     // ── ToolEmitter: track lifecycle events ─────────────────────────────
     let tool_name = ctx.tool_call.function.name.trim();
-    let is_mutating = bamboo_tools::orchestrator::classify_tool(tool_name)
-        == bamboo_tools::orchestrator::ToolMutability::Mutating;
+    let selected_session_loop = execution_name
+        == bamboo_agent_core::tools::context::SESSION_LOOP_TOOL_NAME
+        && super::super::session_setup::tool_schemas::registered_session_loop_tool(
+            ctx.tools.as_ref(),
+        )
+        .is_some();
+    let loop_status = selected_session_loop
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("status");
+    let is_mutating = !loop_status
+        && bamboo_tools::orchestrator::classify_tool(tool_name)
+            == bamboo_tools::orchestrator::ToolMutability::Mutating;
     let mut emitter =
         bamboo_tools::events::ToolEmitter::new(&ctx.tool_call.id, tool_name, is_mutating);
     emitter.set_auto_approved(!is_mutating);
@@ -652,6 +662,22 @@ async fn execute_tool_call_only_with_execution_name_inner(
                 );
                 if ctx.session_flags.auto_approve_permissions {
                     permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
+                } else if selected_session_loop
+                    && bamboo_tools::session_loop_permission::is_session_loop_mutation(&args)
+                {
+                    let reason = "A tool hook requires approval. Use explicit /loop controls to manage this session loop.".to_string();
+                    let end_event = emitter.error(reason.clone()).clone();
+                    let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
+                    return Ok(ToolExecutionOutcome {
+                        output_cap: None,
+                        permission_replay_origin: None,
+                        result: Err(reason),
+                        needs_human: None,
+                        portable_tool: None,
+                        post_tool_hook_eligible: false,
+                        managed_running_violation: false,
+                        tool_duration: tool_timer.elapsed(),
+                    });
                 } else if let Some(outcome) = hook_ask_outcome(
                     ctx.tool_call,
                     execution_name,
@@ -756,6 +782,15 @@ async fn execute_tool_call_only_with_execution_name_inner(
     let dispatch =
         ctx.tools
             .execute_exact_with_context_outcome(ctx.tool_call, execution_name, tool_ctx);
+    let human_receipt = if selected_session_loop && !ctx.session_flags.plan_read_only {
+        ctx.hook_session.as_deref().and_then(|session| {
+            crate::runtime::managers::lifecycle::root_human_input_receipt(ctx.config, session)
+        })
+    } else {
+        None
+    };
+    let dispatch =
+        bamboo_agent_core::tools::context::with_root_human_tool_input(human_receipt, dispatch);
     let dispatch = bamboo_agent_core::tools::context::with_root_actor_tool_writer(
         ctx.config
             .persistence
@@ -4782,6 +4817,10 @@ mod hook_tests {
             (
                 "SESSION_MESSAGE",
                 r#"{"action":"reply","message":"private peer reply"#,
+            ),
+            (
+                "session_loop",
+                r#"{"action":"start","prompt":"private loop prompt"#,
             ),
             (
                 "work_update",

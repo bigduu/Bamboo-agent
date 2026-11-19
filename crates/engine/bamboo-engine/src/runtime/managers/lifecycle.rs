@@ -235,6 +235,76 @@ tokio::task_local! {
     static INPUT_REQUEST_DATA: Option<BoundedInputRequestBatch>;
 }
 
+/// The live provider round has already checked this batch against its exact
+/// execution. Couple its newest checked Human input to the same Root writer
+/// and to the receipt captured by the current transcript checkpoint.
+pub(crate) fn root_human_input_receipt(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> Option<bamboo_domain::SessionInboxReceipt> {
+    use bamboo_agent_core::tools::ToolExecutionSessionFlags;
+    use bamboo_domain::{SessionKind, SessionMessageKind, SessionMessageSource};
+
+    if session.kind != SessionKind::Root
+        || !session.authority_identity.is_ordinary()
+        || session.id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        || session.root_session_id != session.id
+        || session.parent_session_id.is_some()
+        || session.spawn_depth != 0
+        || session.root_thinking_mode() != bamboo_domain::RootThinkingMode::Standard
+        || crate::ticket_runtime::is_managed_work_root(session)
+        || ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        )
+        .plan_read_only
+    {
+        return None;
+    }
+    let persistence = config.persistence.as_ref()?;
+    let writer = persistence.root_actor_writer()?;
+    if writer.fence.actor_id != session.id
+        || writer.created_at != session.created_at
+        || writer
+            .conversation_generation
+            .check_canonical(session)
+            .is_err()
+    {
+        return None;
+    }
+    INPUT_REQUEST_DATA
+        .try_with(|batch| {
+            let batch = batch
+                .as_ref()
+                .filter(|batch| batch.session_id == session.id)?;
+            let current = batch.records.last()?;
+            match (&current.source, current.kind, current.wrapper.as_deref()) {
+                (SessionMessageSource::User, SessionMessageKind::UserInput, None) => {}
+                (
+                    SessionMessageSource::Runtime { subsystem },
+                    SessionMessageKind::RuntimeInstruction,
+                    Some("root_chat_turn_v1"),
+                ) if subsystem == "chat" => {}
+                _ => return None,
+            }
+            let receipt = session
+                .session_inbox_admission()?
+                .receipt_for(&current.input_id)?;
+            // If the run has an exact selector, a later Human input cannot
+            // lend it authority. This also rejects the paced-loop selector
+            // even when a real Human sends a message during that iteration.
+            if persistence
+                .root_inbox_receipt()
+                .is_some_and(|selected| *selected != receipt)
+            {
+                return None;
+            }
+            Some(receipt)
+        })
+        .ok()
+        .flatten()
+}
+
 /// Lend one existing, uniquely owned input-data batch during a future's polls.
 ///
 /// The optional batch is moved, never cloned or persisted. A synchronous reader
@@ -501,6 +571,114 @@ mod input_request_scope_tests {
         with_scoped_input_request_data(session, execution, |batch| {
             batch.records().as_ptr() as usize
         })
+    }
+
+    struct RootInputPersistence {
+        writer: bamboo_domain::RootActorRuntimeWrite,
+        selected: Option<bamboo_domain::SessionInboxReceipt>,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for RootInputPersistence {
+        fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+            Some(self.writer.clone())
+        }
+
+        fn root_inbox_receipt(&self) -> Option<&bamboo_domain::SessionInboxReceipt> {
+            self.selected.as_ref()
+        }
+
+        async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn root_human_tool_scope_requires_fresh_checked_input_and_the_exact_selected_receipt() {
+        use bamboo_domain::{ActorActivationFence, PermissionMode, SessionInboxReceipt};
+
+        let mut session = Session::new("root", "model");
+        let human = SessionInboxReceipt {
+            id: bamboo_domain::SessionMessageId::parse("human").unwrap(),
+            generation: 1,
+        };
+        let paced = SessionInboxReceipt {
+            id: bamboo_domain::SessionMessageId::parse("paced").unwrap(),
+            generation: 2,
+        };
+        session
+            .session_inbox_admission_mut()
+            .record(human.id.clone(), human.generation);
+        session
+            .session_inbox_admission_mut()
+            .record(paced.id.clone(), paced.generation);
+        let writer = bamboo_domain::RootActorRuntimeWrite {
+            fence: ActorActivationFence {
+                schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+                actor_id: session.id.clone(),
+                activation_id: "activation".into(),
+                attempt: 1,
+                run_id: "run".into(),
+                lease_owner: "worker".into(),
+                lease_epoch: 1,
+            },
+            created_at: session.created_at,
+            conversation_generation: session.conversation_generation_observation(),
+        };
+        let mut config = AgentLoopConfig::default();
+        for (selected, expected) in [
+            (None, Some(human.clone())),
+            (Some(human.clone()), Some(human.clone())),
+            (Some(paced), None),
+        ] {
+            config.persistence = Some(Arc::new(RootInputPersistence {
+                writer: writer.clone(),
+                selected,
+            }));
+            assert!(root_human_input_receipt(&config, &session).is_none());
+            scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+                assert_eq!(root_human_input_receipt(&config, &session), expected);
+            })
+            .await;
+        }
+
+        config.persistence = Some(Arc::new(RootInputPersistence {
+            writer,
+            selected: Some(human),
+        }));
+        config.additional_tool_schemas = [
+            "session_loop",
+            "default::SESSION_LOOP",
+            "mcp__test__session_loop",
+        ]
+        .into_iter()
+        .map(|name| ToolSchema {
+            schema_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.into(),
+                description: "Custom tool".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        })
+        .collect();
+        let tools = DataExecutor {
+            entered: tokio::sync::Barrier::new(1),
+        };
+        scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+            assert!(root_human_input_receipt(&config, &session).is_some());
+            let catalog = crate::runtime::runner::session_setup::tool_schemas::resolve_classified_tool_catalog_for_session(
+                &config, &tools, &session,
+            );
+            assert_eq!(catalog.len(), 1);
+            assert_eq!(catalog[0].execution_name(), "mcp__test__session_loop");
+        })
+        .await;
+
+        config.permission_mode = Some(PermissionMode::Plan);
+        scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+            assert!(root_human_input_receipt(&config, &session).is_none());
+        })
+        .await;
     }
 
     #[tokio::test]

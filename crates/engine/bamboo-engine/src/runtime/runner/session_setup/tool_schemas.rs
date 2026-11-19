@@ -1,11 +1,11 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{
-    FrameworkSessionToolKind as SessionToolKind, ToolExecutor, ToolSchema,
+    FrameworkSessionToolKind as SessionToolKind, Tool, ToolExecutor, ToolSchema,
 };
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_disabled_tool_reference_name, CapabilityLoadingMode, ClassifiedToolSchema,
-    EffectiveCallableSet, SessionKind,
+    EffectiveCallableSet, SessionKind, SESSION_LOOP_TOOL_NAME,
 };
 #[cfg(test)]
 use bamboo_skills::runtime_metadata::{
@@ -16,6 +16,20 @@ use bamboo_tools::exposure::activated_discoverable_tools;
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
 const PHYSICAL_SUBAGENT_TOOLS: [&str; 3] = ["ask_agent", "deploy_agent", "cluster"];
+
+pub(crate) fn registered_session_loop_tool(
+    tools: &dyn ToolExecutor,
+) -> Option<std::sync::Arc<dyn Tool>> {
+    let owner = tools.exact_tool_owner(SESSION_LOOP_TOOL_NAME)?;
+    if owner.local_execution_contract(SESSION_LOOP_TOOL_NAME)
+        != Some(bamboo_tools::session_loop_permission::SESSION_LOOP_EXECUTION_CONTRACT)
+    {
+        return None;
+    }
+    owner
+        .local_tool_instance(SESSION_LOOP_TOOL_NAME)
+        .filter(|tool| tool.name() == SESSION_LOOP_TOOL_NAME)
+}
 
 pub(crate) fn effective_guide_activation(
     config: &AgentLoopConfig,
@@ -166,6 +180,16 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
         {
             schema.function.description = "Update only this Assignment's private Steps. Include question:{prompt} with tasks to durably ask a User question and end this one-shot run. Answers arrive in a fresh Assignment's versioned context; a question never confers approval.".into();
             schema.function.parameters["properties"]["question"] = serde_json::json!({"type":"object","additionalProperties":false,"required":["prompt"],"properties":{"prompt":{"type":"string","minLength":1,"maxLength":2048}}});
+        }
+    }
+    // A registry or MCP schema cannot supply this reserved Host identity.
+    // Project the schema from the concrete local execution owner only.
+    tool_schemas.retain(|schema| {
+        bamboo_domain::canonical_tool_name(&schema.function.name) != SESSION_LOOP_TOOL_NAME
+    });
+    if crate::runtime::managers::lifecycle::root_human_input_receipt(config, session).is_some() {
+        if let Some(tool) = registered_session_loop_tool(tools) {
+            tool_schemas.push(tool.to_schema());
         }
     }
     // Resolve the disabled set LIVE each round (#136): when a resolver is wired

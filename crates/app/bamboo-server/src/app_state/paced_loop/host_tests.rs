@@ -5,7 +5,7 @@ use super::{
 };
 use crate::app_state::{AgentStatus, AppState};
 use actix_web::{test, web, App};
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
 use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
@@ -25,6 +25,10 @@ const CONTEXT: &str = "original context already in this Session";
 const PROMPT: &str = "inspect the synthetic build status";
 const HUMAN: &str = "a regular follow-up from the user";
 const SUCCESS: &str = "synthetic build check complete";
+const ASK_START: &str = "每隔五分钟检查构建状态，有变化再告诉我。";
+const ASK_STATUS: &str = "这个循环下次什么时候运行？";
+const ASK_STOP: &str = "停止这个循环。";
+const ASK_UNGROUNDED_STOP: &str = "请汇报最新构建状态。";
 
 fn saved_outcome(session: &Session) -> Value {
     serde_json::from_str(&session.metadata[PACED_LOOP_OUTCOME_METADATA_KEY]).unwrap()
@@ -33,6 +37,7 @@ fn saved_outcome(session: &Session) -> Value {
 #[derive(Default)]
 struct Probe {
     requests: Mutex<Vec<Vec<Message>>>,
+    scripted_loop: bool,
     first_entered: Notify,
     release_first: Notify,
 }
@@ -42,7 +47,7 @@ impl LLMProvider for Probe {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolSchema],
+        tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
@@ -52,11 +57,63 @@ impl LLMProvider for Probe {
             requests.push(messages.to_vec());
             requests.len()
         };
-        if ordinal == 1
-            && messages.iter().any(|message| {
-                message.role == Role::System && message.content.contains(SYSTEM_GUIDANCE)
-            })
-        {
+        let paced = messages.iter().any(|message| {
+            message.role == Role::System && message.content.contains(SYSTEM_GUIDANCE)
+        });
+        if self.scripted_loop {
+            let latest = messages.iter().rev().find(|message| {
+                message.role == Role::User
+                    && matches!(
+                        message.content.as_str(),
+                        ASK_START | ASK_STATUS | ASK_STOP | ASK_UNGROUNDED_STOP
+                    )
+            });
+            let schema = tools
+                .iter()
+                .find(|tool| tool.function.name == "session_loop");
+            if paced {
+                assert!(schema.is_none(), "scheduled turns cannot control the timer");
+            } else if let Some(latest) = latest {
+                let schema = schema.expect("native human turn should advertise session_loop");
+                assert!(schema.function.description.contains("current chat"));
+                let (id, args) = match latest.content.as_str() {
+                    ASK_START => (
+                        "natural-start",
+                        json!({
+                            "action": "start",
+                            "interval_seconds": 300,
+                            "user_quote": "每隔五分钟检查构建状态"
+                        }),
+                    ),
+                    ASK_STATUS => ("natural-status", json!({"action": "status"})),
+                    ASK_STOP => (
+                        "natural-stop",
+                        json!({"action": "stop", "user_quote": ASK_STOP}),
+                    ),
+                    _ => (
+                        "ungrounded-stop",
+                        json!({"action": "stop", "user_quote": ASK_UNGROUNDED_STOP}),
+                    ),
+                };
+                if messages
+                    .iter()
+                    .all(|message| message.tool_call_id.as_deref() != Some(id))
+                {
+                    return Ok(Box::pin(futures::stream::iter([
+                        Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                            id: id.into(),
+                            tool_type: "function".into(),
+                            function: FunctionCall {
+                                name: "session_loop".into(),
+                                arguments: args.to_string(),
+                            },
+                        }])),
+                        Ok(LLMChunk::Done),
+                    ])));
+                }
+            }
+        }
+        if ordinal == 1 && paced {
             self.first_entered.notify_one();
             self.release_first.notified().await;
             // RequestFailed is terminal for this turn. Only the next due
@@ -78,8 +135,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_probe(Probe::default()).await
+    }
+
+    async fn with_probe(probe: Probe) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let probe = Arc::new(Probe::default());
+        let probe = Arc::new(probe);
         let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
         config.provider = PROVIDER.into();
         config
@@ -228,6 +289,48 @@ impl Fixture {
             String::from_utf8_lossy(&body)
         );
     }
+}
+
+#[actix_web::test]
+async fn host_paced_loop_accepts_only_the_current_natural_language_turn() {
+    let fixture = Fixture::with_probe(Probe {
+        scripted_loop: true,
+        ..Probe::default()
+    })
+    .await;
+    fixture.human_turn(ASK_START, true).await;
+    let started = fixture.settled(2).await;
+    let state = PacedLoopState::read(&started).unwrap().unwrap();
+    assert_eq!(state.interval_seconds, 300);
+    assert_eq!(state.prompt, ASK_START);
+    assert!(!state.stopped);
+    let result = |session: &Session, id: &str| {
+        session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("missing tool result {id}"))
+            .clone()
+    };
+    assert_eq!(result(&started, "natural-start").tool_success, Some(true));
+
+    fixture.state.paced_loops.tick(state.next_fire_at).await;
+    fixture.settled(3).await;
+    fixture.human_turn(ASK_UNGROUNDED_STOP, false).await;
+    let ungrounded = fixture.settled(5).await;
+    assert_eq!(
+        result(&ungrounded, "ungrounded-stop").tool_success,
+        Some(false)
+    );
+    assert!(!PacedLoopState::read(&ungrounded).unwrap().unwrap().stopped);
+
+    fixture.human_turn(ASK_STATUS, false).await;
+    let status = fixture.settled(7).await;
+    assert_eq!(result(&status, "natural-status").tool_success, Some(true));
+    fixture.human_turn(ASK_STOP, false).await;
+    let stopped = fixture.settled(9).await;
+    assert_eq!(result(&stopped, "natural-stop").tool_success, Some(true));
+    assert!(PacedLoopState::read(&stopped).unwrap().unwrap().stopped);
 }
 
 #[actix_web::test]

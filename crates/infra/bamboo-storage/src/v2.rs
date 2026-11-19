@@ -6481,6 +6481,17 @@ impl SessionStoreV2 {
         expected: &Session,
         value: String,
     ) -> io::Result<Session> {
+        self.save_paced_loop_metadata_with_owner(expected, value, None)
+            .await
+    }
+
+    /// Apply a model-initiated loop change under its executing Root writer.
+    pub async fn save_paced_loop_metadata_with_owner(
+        &self,
+        expected: &Session,
+        value: String,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> io::Result<Session> {
         use bamboo_domain::session::{SessionCallerReference, PACED_LOOP_METADATA_KEY};
 
         let caller = SessionCallerReference::from(expected);
@@ -6500,8 +6511,12 @@ impl SessionStoreV2 {
         }
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self.acquire_session_write_lock(id, SaveKind::Full).await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, task, session_write);
         let directory = self.sessions_dir.join(id);
+        let proof = owner.map(|owner| {
+            root_actor_runtime::RootActorWriteProof::new(directory.clone(), owner.clone())
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
         let current = self
             .load_session_from_dir_strict(&directory, id, SessionKind::Root, id)
             .await?

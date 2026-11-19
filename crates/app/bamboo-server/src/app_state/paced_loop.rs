@@ -11,13 +11,17 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod model_tool;
+mod natural_request;
+pub(super) use model_tool::SessionLoopTool;
+
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const LIFETIME: TimeDelta = TimeDelta::days(7);
 const RETRY_DELAY: TimeDelta = TimeDelta::seconds(5);
 const MAX_ATTEMPTS_PER_TICK: usize = 4;
 const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-const SYSTEM_GUIDANCE: &str = "This turn was triggered by the user's fixed-interval Bamboo loop. Work on the scheduled request for this iteration, using relevant context from this session. Re-check the current state before repeating work with side effects. Use the normal tool and permission policy. If an action fails or requires input, briefly report what happened and what remains. Avoid repeatedly retrying an unavailable action within this turn. Finish the turn normally: Bamboo owns the timer and will attempt later iterations, including after errors. Do not wait for the next tick in this turn or create another schedule to continue this loop.";
+const SYSTEM_GUIDANCE: &str = "This turn was triggered by the user's fixed-interval Bamboo loop. Carry out one occurrence of the scheduled task now. Any timing language in the request is the cadence Bamboo already manages. Use relevant context from this session. Re-check the current state before repeating work with side effects. Use the normal tool and permission policy. If an action fails or requires input, briefly report what happened and what remains. Avoid repeatedly retrying an unavailable action within this turn. Finish the turn normally: Bamboo owns the timer and will attempt later iterations, including after errors. Do not wait for the next tick in this turn or create another schedule to continue this loop.";
 
 pub(crate) enum PacedLoopCommand {
     Status,
@@ -189,7 +193,7 @@ fn validate_start(interval_seconds: u64, prompt: &str) -> Result<(), PacedLoopEr
     Ok(())
 }
 
-fn supported_root(session: &Session) -> bool {
+pub(crate) fn supported_root(session: &Session) -> bool {
     session.kind == SessionKind::Root
         && session.authority_identity.is_ordinary()
         && session.parent_session_id.is_none()
@@ -199,7 +203,7 @@ fn supported_root(session: &Session) -> bool {
             .contains_key(bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY)
 }
 
-fn waiting_for_existing_work(session: &Session) -> bool {
+pub(crate) fn waiting_for_existing_work(session: &Session) -> bool {
     session.has_pending_question()
         || session.metadata.contains_key("runtime.suspend_reason")
         || session
@@ -275,10 +279,11 @@ impl PacedLoops {
         &self,
         session: &Session,
         state: &PacedLoopState,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
     ) -> Result<Session, PacedLoopError> {
         let value = serde_json::to_string(state)
             .map_err(|_| PacedLoopError::Internal("Could not serialize session loop".into()))?;
-        let saved = self.store.save_paced_loop_metadata(session, value).await.map_err(|error| {
+        let saved = self.store.save_paced_loop_metadata_with_owner(session, value, owner).await.map_err(|error| {
             match error.kind() {
                 std::io::ErrorKind::NotFound => PacedLoopError::NotFound,
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists => {
@@ -315,6 +320,28 @@ impl PacedLoops {
     ) -> Result<Option<PacedLoopRecord>, PacedLoopError> {
         let _guard = self.persistence.acquire_lock(id).await;
         let session = self.load(id).await?;
+        self.apply_to_session(session, command, None).await
+    }
+
+    async fn apply_from_model(
+        &self,
+        id: &str,
+        input: model_tool::HumanInput<'_>,
+    ) -> Result<Option<PacedLoopRecord>, PacedLoopError> {
+        let _guard = self.persistence.acquire_lock(id).await;
+        let session = self.load(id).await?;
+        let owner = input.owner;
+        let command = input.command(&session)?;
+        self.apply_to_session(session, command, Some(owner)).await
+    }
+
+    async fn apply_to_session(
+        &self,
+        session: Session,
+        command: PacedLoopCommand,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> Result<Option<PacedLoopRecord>, PacedLoopError> {
+        let id = session.id.as_str();
         let now = Utc::now();
         let previous = PacedLoopState::read(&session)?;
         let state = match command {
@@ -392,7 +419,7 @@ impl PacedLoops {
         if matches!(state.status(self.host_instance, now), LoopStatus::Scheduled) {
             self.schedule(id, &state, now);
         }
-        let saved = self.commit(&session, &state).await?;
+        let saved = self.commit(&session, &state, owner).await?;
         self.schedule(id, &state, now);
         Ok(Some(state.project(&saved, self.host_instance, now)))
     }
@@ -557,7 +584,7 @@ impl PacedLoops {
         state.advance(now);
         state.last_run_id = Some(reservation.run_id().to_owned());
         state.dispatch_failed = false;
-        let saved = self.commit(&session, &state).await?;
+        let saved = self.commit(&session, &state, None).await?;
         self.schedule(id, &state, now);
         let guidance = format!(
             "{SYSTEM_GUIDANCE}\n\nScheduled iteration {}. Previous scheduled turn status: {previous}.",
@@ -577,7 +604,7 @@ impl PacedLoops {
         {
             tracing::warn!(session_id = id, %error, "session loop dispatch failed; future iterations stay scheduled");
             state.dispatch_failed = true;
-            self.commit(&saved, &state).await?;
+            self.commit(&saved, &state, None).await?;
         }
         Ok(false)
     }

@@ -9,7 +9,7 @@ use crate::app_state::{
     paced_loop::{PacedLoopCommand, PacedLoopError, PacedLoopRecord},
     AppState,
 };
-use crate::error::json_error;
+use crate::error::{json_error, ResponseResult};
 
 use super::chat::ChatRequest;
 use super::tickets::{require_supervisor_owner, TicketHttpError};
@@ -114,9 +114,14 @@ fn error_response(error: PacedLoopError) -> HttpResponse {
     }
 }
 
-/// Recognize only a standalone slash-command name, with an explicit interval
-/// and prompt for starts. Prefix matches stay on the ordinary chat path.
-pub(crate) fn parse_chat_command(message: &str) -> Option<Result<PacedLoopCommand, &'static str>> {
+pub(crate) enum LoopChatInput {
+    Control(Result<PacedLoopCommand, &'static str>),
+    Natural,
+}
+
+/// Parse explicit controls, reserving malformed fixed syntax. Other phrases
+/// use ordinary chat admission with their original text.
+pub(crate) fn parse_chat_command(message: &str) -> Option<LoopChatInput> {
     let message = message.trim();
     let name_end = message.find(char::is_whitespace).unwrap_or(message.len());
     if !message[..name_end].eq_ignore_ascii_case("/loop") {
@@ -127,23 +132,39 @@ pub(crate) fn parse_chat_command(message: &str) -> Option<Result<PacedLoopComman
     let arg_end = args.find(char::is_whitespace).unwrap_or(args.len());
     let (action, prompt) = args.split_at(arg_end);
     let prompt = prompt.trim_start();
-    if prompt.is_empty() {
-        return Some(match action.to_ascii_lowercase().as_str() {
-            "status" => Ok(PacedLoopCommand::Status),
-            "stop" => Ok(PacedLoopCommand::Stop),
-            "resume" => Ok(PacedLoopCommand::Resume),
-            _ => Err(CHAT_USAGE),
-        });
+    let control = match action.to_ascii_lowercase().as_str() {
+        "status" => Some(PacedLoopCommand::Status),
+        "stop" => Some(PacedLoopCommand::Stop),
+        "resume" => Some(PacedLoopCommand::Resume),
+        _ => None,
+    };
+    if let Some(control) = control {
+        return Some(LoopChatInput::Control(
+            prompt.is_empty().then_some(control).ok_or(CHAT_USAGE),
+        ));
     }
-
-    Some(
-        parse_interval_seconds(action)
+    if action.is_empty() || looks_like_fixed_interval(action) {
+        let command = parse_interval_seconds(action)
+            .filter(|_| !prompt.is_empty())
             .map(|interval_seconds| PacedLoopCommand::Start {
                 interval_seconds,
                 prompt: prompt.into(),
             })
-            .ok_or(CHAT_USAGE),
-    )
+            .ok_or(CHAT_USAGE);
+        return Some(LoopChatInput::Control(command));
+    }
+    Some(LoopChatInput::Natural)
+}
+
+fn looks_like_fixed_interval(token: &str) -> bool {
+    let digits_or_period = |byte: &u8| byte.is_ascii_digit() || *byte == b'.';
+    let unit = |byte: &u8| matches!(byte.to_ascii_lowercase(), b's' | b'm' | b'h' | b'd');
+    let unsigned = token.strip_prefix(['+', '-']).unwrap_or(token).as_bytes();
+    unsigned.first().is_some_and(digits_or_period)
+        && unsigned.last().is_some_and(unit)
+        && unsigned
+            .iter()
+            .all(|byte| digits_or_period(byte) || unit(byte))
 }
 
 fn parse_interval_seconds(token: &str) -> Option<u64> {
@@ -166,28 +187,10 @@ pub(crate) async fn handle_chat_command(
     request: &ChatRequest,
     command: Result<PacedLoopCommand, &'static str>,
 ) -> HttpResponse {
-    let Some(session_id) = request
-        .session_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    else {
-        return json_error(StatusCode::BAD_REQUEST, "Open a Session before using /loop");
+    let session_id = match validate_chat_request(request) {
+        Ok(session_id) => session_id,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     };
-    if request
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-        || request
-            .selected_skill_ids
-            .as_ref()
-            .is_some_and(|skills| !skills.is_empty())
-        || request.workflow_selection.is_some()
-    {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "Send /loop without images, skills, or workflow selections",
-        );
-    }
     let command = match command {
         Ok(command) => command,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
@@ -216,6 +219,50 @@ pub(crate) async fn handle_chat_command(
     }
 }
 
+pub(crate) fn validate_chat_request(request: &ChatRequest) -> Result<&str, &'static str> {
+    let Some(session_id) = request
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Err("Open a Session before using /loop");
+    };
+    if request
+        .images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty())
+        || request
+            .selected_skill_ids
+            .as_ref()
+            .is_some_and(|skills| !skills.is_empty())
+        || request.workflow_selection.is_some()
+    {
+        return Err("Send /loop without images, skills, or workflow selections");
+    }
+    Ok(session_id)
+}
+
+pub(crate) fn busy_chat_response() -> HttpResponse {
+    json_error(
+        StatusCode::CONFLICT,
+        "Wait for the current Session turn to finish before sending the loop request",
+    )
+}
+
+pub(crate) fn validate_natural_session(session: &bamboo_domain::Session) -> ResponseResult<()> {
+    if !crate::app_state::paced_loop::supported_root(session) {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "Loop prompts require a Standard ordinary Root Session",
+        )
+        .into());
+    }
+    if crate::app_state::paced_loop::waiting_for_existing_work(session) {
+        return Err(busy_chat_response().into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,24 +274,24 @@ mod tests {
         }
         assert!(matches!(
             parse_chat_command("  /LOOP STATUS\n"),
-            Some(Ok(PacedLoopCommand::Status))
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Status)))
         ));
         assert!(matches!(
             parse_chat_command("/loop stop"),
-            Some(Ok(PacedLoopCommand::Stop))
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Stop)))
         ));
         assert!(matches!(
             parse_chat_command("/loop resume"),
-            Some(Ok(PacedLoopCommand::Resume))
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Resume)))
         ));
     }
 
     #[test]
     fn chat_parses_an_interval_and_preserves_prompt_contents() {
-        let Some(Ok(PacedLoopCommand::Start {
+        let Some(LoopChatInput::Control(Ok(PacedLoopCommand::Start {
             interval_seconds,
             prompt,
-        })) = parse_chat_command("  /loop 5m\t检查部署\nKeep  spacing  ")
+        }))) = parse_chat_command("  /loop 5m\t检查部署\nKeep  spacing  ")
         else {
             panic!("expected a fixed-interval start");
         };
@@ -259,17 +306,36 @@ mod tests {
     fn chat_rejects_missing_malformed_and_overflowing_arguments() {
         for text in [
             "/loop",
-            "/loop check the build",
             "/loop 5m",
             "/loop 0m check",
             "/loop +5m check",
             "/loop -5m check",
             "/loop 1.5h check",
-            "/loop ５ｍ check",
+            "/loop 1h30m check",
             "/loop 18446744073709551615m check",
             "/loop stop extra",
         ] {
-            assert!(matches!(parse_chat_command(text), Some(Err(_))), "{text}");
+            assert!(
+                matches!(
+                    parse_chat_command(text),
+                    Some(LoopChatInput::Control(Err(_)))
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn natural_loop_phrases_use_ordinary_chat() {
+        for text in [
+            "/loop 每隔五分钟检查构建",
+            "/loop check the build every 5 minutes",
+            "/loop 5 minutes between build checks",
+        ] {
+            assert!(
+                matches!(parse_chat_command(text), Some(LoopChatInput::Natural)),
+                "{text}"
+            );
         }
     }
 
@@ -284,6 +350,88 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<LoopMutationRequest>(payload).is_err());
         }
+    }
+
+    #[actix_web::test]
+    async fn natural_loop_uses_native_user_input_only_when_the_session_is_idle() {
+        use actix_web::{test, App};
+        use bamboo_agent_core::Session;
+        use serde_json::Value;
+
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let session_id = "natural-loop-http";
+        let prompt = "/loop 每隔五分钟检查构建";
+        let mut session = Session::new(session_id, "test-model");
+        session.title_generated = true;
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::agent_routes),
+        )
+        .await;
+        let request = |payload| {
+            test::TestRequest::post()
+                .peer_addr("127.0.0.1:5700".parse().unwrap())
+                .uri("/api/v1/chat")
+                .set_json(payload)
+                .to_request()
+        };
+        let turn = json!({
+            "session_id": session_id, "message": prompt, "model": "test-model",
+            "message_id": "natural-loop-probe",
+        });
+        let mut runner = bamboo_engine::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Running;
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.into(), runner);
+        let busy = test::call_service(&app, request(turn.clone())).await;
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(session_id)
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
+        state.agent_runners.write().await.remove(session_id);
+
+        let mut attached = turn.clone();
+        attached["selected_skill_ids"] = json!(["some-skill"]);
+        let invalid = test::call_service(&app, request(attached)).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(session_id)
+                .await
+                .unwrap()
+                .pending,
+            0
+        );
+
+        let accepted = test::call_service(&app, request(turn)).await;
+        let status = accepted.status();
+        let body: Value = test::read_body_json(accepted).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.get("loop_command").is_none());
+        assert_eq!(body["message_id"], "natural-loop-probe");
+        let claims = state.session_inbox.claim(session_id, 128).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].envelope.source,
+            bamboo_domain::SessionMessageSource::User
+        );
+        assert_eq!(
+            claims[0].envelope.to_provider_message().unwrap().content,
+            prompt
+        );
     }
 
     #[actix_web::test]

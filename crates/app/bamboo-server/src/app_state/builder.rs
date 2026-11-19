@@ -1296,6 +1296,20 @@ impl AppState {
                 tools,
                 Arc::new(crate::tools::BrowserEvalTool::new(browser.clone())),
             ));
+        let paced_loops = Arc::new(super::paced_loop::PacedLoops::new(
+            session_store.clone(),
+            persistence.clone(),
+            sessions.clone(),
+            session_inbox.clone(),
+            child_completion_coordinator.clone(),
+        ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(super::paced_loop::SessionLoopTool::new(Arc::downgrade(
+                    &paced_loops,
+                ))),
+            ));
 
         child_completion_coordinator
             .set_root_tools(tools.clone())
@@ -1377,13 +1391,6 @@ impl AppState {
                 spawn_scheduler.supports_native_ticket_budget(),
             ),
         );
-        let paced_loops = Arc::new(super::paced_loop::PacedLoops::new(
-            session_store.clone(),
-            persistence.clone(),
-            sessions.clone(),
-            session_inbox.clone(),
-            child_completion_coordinator.clone(),
-        ));
         if start_inbox_reconciler {
             observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;

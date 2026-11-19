@@ -40,11 +40,18 @@ starting an unwanted execution.
 
 ## Run a prompt on an interval
 
-Use `/loop 5m Check the build and report changes` in an existing Standard
-chat. The first run is due after one interval. Each run uses the same session,
-model, workspace, and permissions. If the session is busy or waiting for input,
-one scheduled run becomes due when the session is free. Missed intervals do
-not accumulate.
+In an existing Standard chat, say “Check the build every five minutes and
+only tell me if it changes,” or “每隔五分钟检查构建状态，有变化再告诉我”.
+Give the task and its fixed interval in one message. Conversational intervals
+accept common Chinese and English wording. You can also enter
+`/loop 5m Check the build and report changes`. The first run is due after
+one interval. Each run uses the session's current model, workspace, and
+permissions. If the session is
+busy or waiting for input, one scheduled run becomes due when the session
+is free. Missed intervals do not accumulate.
+
+Ask “When will the loop run next?”, “Stop this loop”, or “Resume this loop”
+to manage it conversationally. The commands below do the same directly.
 
 - `/loop status` shows the next due time and the most recent known run state.
 - `/loop stop` stops scheduling future runs. Use the chat's normal cancel
