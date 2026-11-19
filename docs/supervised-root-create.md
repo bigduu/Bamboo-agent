@@ -28,8 +28,8 @@ Keep the selected mode in the exact request when retrying a creation.
 
 The worker uses the same global defaults and Project context as `POST /sessions`.
 A new independent execution Session inherits the dispatching Supervisor's
-current permission mode, whether Default, Bypass or Auto. The normal
-`permission_mode` update changes the setting used for subsequent dispatches.
+current permission mode, whether Default, Bypass or Auto. The owner updates
+`permission_mode` to change the setting used for subsequent dispatches.
 Supervisor summaries advertise this behavior with
 `supervisor_dispatch_inherits_permission_mode: true`. Clients can send
 `expected_supervisor_dispatch_inheritance` with the current ETag to verify

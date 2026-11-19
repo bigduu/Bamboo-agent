@@ -175,6 +175,7 @@ pub struct SessionSummary {
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
     /// Independent Sessions dispatched by this Supervisor inherit its mode.
+    /// List entries are hints; detail confirms the durable Supervisor identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_dispatch_inherits_permission_mode: Option<bool>,
     /// An index hint to refresh the Supervisor's permission detail. Use the
@@ -224,6 +225,10 @@ impl SessionSummary {
         } else {
             entry.permission_mode
         };
+        let supervisor_dispatch_inherits_permission_mode = (entry.kind
+            == bamboo_domain::SessionKind::Root
+            && entry.id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+            .then_some(true);
         Self {
             id: entry.id,
             execution_compatibility: None,
@@ -269,9 +274,7 @@ impl SessionSummary {
             bypass_permissions: entry.bypass_permissions
                 || permission_mode != bamboo_domain::SessionPermissionMode::Default,
             permission_mode,
-            supervisor_dispatch_inherits_permission_mode: entry
-                .supervisor_profile_revision
-                .map(|_| true),
+            supervisor_dispatch_inherits_permission_mode,
             supervisor_permission_etag: entry
                 .supervisor_profile_revision
                 .map(|revision| format!("\"{revision}\"")),

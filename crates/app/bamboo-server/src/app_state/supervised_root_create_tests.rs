@@ -371,8 +371,23 @@ const PERMISSION_PROBES: [(&str, &str); 4] = [
 const SHELL_PROBES_DONE: &str = "Worker permission checks finished.";
 
 #[actix_web::test]
-async fn permission_change_rechecks_supervisor_scope_even_at_matching_revision() {
+async fn supervisor_permission_change_checks_owner_and_scope_at_matching_revision() {
     let f = Fixture::new(false).await;
+    let mut legacy_index_row = f
+        .state
+        .session_store
+        .get_index_entry(&f.supervisor.session_id)
+        .await
+        .unwrap();
+    legacy_index_row.supervisor_profile_revision = None;
+    let legacy_summary =
+        crate::handlers::agent::sessions::SessionSummary::from_entry(legacy_index_row, false);
+    assert_eq!(
+        legacy_summary.supervisor_dispatch_inherits_permission_mode,
+        Some(true)
+    );
+    assert_eq!(legacy_summary.supervisor_permission_etag, None);
+
     let source = f
         .state
         .storage
@@ -386,22 +401,38 @@ async fn permission_change_rechecks_supervisor_scope_even_at_matching_revision()
             .configure(crate::routes::configure_routes),
     )
     .await;
-    for (expected_scope, expected_status) in [
-        (false, StatusCode::PRECONDITION_FAILED),
-        (true, StatusCode::OK),
+    for (peer, update, expected_status) in [
+        (
+            "192.0.2.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": true}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "192.0.2.1:12345",
+            json!({"bypass_permissions": true}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "127.0.0.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": false}),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            "127.0.0.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": true}),
+            StatusCode::OK,
+        ),
     ] {
         let response = test::call_service(
             &app,
             test::TestRequest::patch()
                 .uri(&format!("/api/v1/sessions/{}", source.id))
+                .peer_addr(peer.parse().unwrap())
                 .insert_header((
                     actix_web::http::header::IF_MATCH,
                     format!("\"{}\"", source.metadata_version),
                 ))
-                .set_json(json!({
-                    "permission_mode": "auto",
-                    "expected_supervisor_dispatch_inheritance": expected_scope,
-                }))
+                .set_json(update)
                 .to_request(),
         )
         .await;

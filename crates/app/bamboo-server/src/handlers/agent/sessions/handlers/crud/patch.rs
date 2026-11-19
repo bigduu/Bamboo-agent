@@ -257,6 +257,14 @@ pub async fn patch_session(
             }
         })
     });
+    // The canonical Supervisor's mode also governs its future dispatches.
+    if session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        && requested_permission_mode.is_some()
+    {
+        crate::handlers::agent::tickets::user(&state, &http_req)
+            .await
+            .map_err(|failure| crate::error::AppError::Forbidden(failure.to_string()))?;
+    }
     // When present, carry the exact version produced by each preceding field
     // through the whole PATCH. Every authoritative step validates it under the
     // session lock and advances it only when that step actually changed data.
