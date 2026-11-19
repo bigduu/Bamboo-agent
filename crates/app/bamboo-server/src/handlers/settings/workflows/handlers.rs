@@ -1264,17 +1264,16 @@ pub async fn save_workflow(
 
     // The legacy source remains a Workflow. Reload discovers it through the
     // read-only adapter; saving must never materialize or overwrite a Skill.
-    app_state
+    let catalog_revision = app_state
         .skill_manager
         .store()
-        .reload_global_workflow_views()
-        .await
-        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+        .refresh_legacy_workflow_views_after_commit()
+        .await;
 
     Ok(legacy_response().json(serde_json::json!({
         "success": true,
         "path": file_path.to_string_lossy(),
-        "catalog_revision": app_state.skill_manager.store().workflow_catalog_snapshot().await.revision,
+        "catalog_revision": catalog_revision,
     })))
 }
 
@@ -1314,13 +1313,6 @@ pub async fn delete_workflow(
     if !removed {
         return Err(AppError::NotFound(format!("Workflow '{name}'")));
     }
-    app_state
-        .skill_manager
-        .store()
-        .reload_global_workflow_views()
-        .await
-        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
-
     Ok(legacy_response().json(serde_json::json!({ "success": true })))
 }
 

@@ -1773,7 +1773,7 @@ impl PermissionConfig {
     /// grants are intentionally evaluated only after hard-dangerous and
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
-        self.evaluate_with_additional_restrictions(input, None, None)
+        self.evaluate_with_additional_restrictions(input, None, None, false)
     }
 
     /// The installed framework Root owner retains legacy create restrictions,
@@ -1785,6 +1785,7 @@ impl PermissionConfig {
             input,
             Some(("session_control", &legacy_args)),
             None,
+            false,
         )
     }
 
@@ -1816,7 +1817,32 @@ impl PermissionConfig {
             input,
             Some(("session_control", &legacy_args)),
             Some(&restricting_input),
+            false,
         )
+    }
+
+    /// Current-session loop control for the exact framework tool. Its Host
+    /// adapter still verifies the current Human input before any mutation.
+    /// Honor hard policy and existing Ask rules; a persisted approval cannot
+    /// replay the original Human input authority.
+    pub fn evaluate_current_session_loop(
+        &self,
+        mut input: PermissionEvaluation,
+    ) -> PermissionOutcome {
+        let classified =
+            crate::tool_permissions::check_permissions("session_loop", &input.tool_args);
+        let valid = input.tool_name == "session_loop"
+            && !input.session_id.trim().is_empty()
+            && classified.ok().flatten().is_some_and(|contexts| {
+                matches!(contexts.as_slice(), [context] if input.permission_type == context.permission_type
+                    && input.resource == context.resource
+                    && input.risk_level == context.risk_level())
+            });
+        if !valid {
+            input.platform_hard_deny = Some("current-session loop permission unavailable".into());
+        }
+        input.consume_once = false;
+        self.evaluate_with_additional_restrictions(input, None, None, true)
     }
 
     fn evaluate_with_additional_restrictions(
@@ -1824,6 +1850,7 @@ impl PermissionConfig {
         input: PermissionEvaluation,
         additional_rule_context: Option<(&str, &serde_json::Value)>,
         restricting_input: Option<&PermissionEvaluation>,
+        current_session_loop: bool,
     ) -> PermissionOutcome {
         let configured_mode = self.mode();
         // Normalize legacy callers that accidentally supplied both booleans:
@@ -1969,15 +1996,22 @@ impl PermissionConfig {
             } else {
                 PermissionReasonCode::ConfiguredAlwaysAsk
             };
+            let matched_rule = typed_always_ask.or_else(|| {
+                configured_always_ask
+                    .then(|| legacy_rule_ref("legacy-always-ask", PermissionRuleEffect::AlwaysAsk))
+            });
+            if current_session_loop {
+                return deny(
+                    reason_code,
+                    "The existing approval policy requires using explicit /loop controls".into(),
+                    matched_rule,
+                );
+            }
             return PermissionOutcome::Ask(self.build_request(
                 &input,
                 effective_mode,
                 reason_code,
-                typed_always_ask.or_else(|| {
-                    configured_always_ask.then(|| {
-                        legacy_rule_ref("legacy-always-ask", PermissionRuleEffect::AlwaysAsk)
-                    })
-                }),
+                matched_rule,
                 true,
             ));
         }
@@ -2042,7 +2076,12 @@ impl PermissionConfig {
             _ => {}
         }
 
-        if input.risk_level < self.confirm_threshold() {
+        if current_session_loop {
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Mode,
+                effective_policy,
+            }
+        } else if input.risk_level < self.confirm_threshold() {
             PermissionOutcome::Allow {
                 source: PermissionDecisionSource::BelowRiskThreshold,
                 effective_policy,
@@ -3926,6 +3965,69 @@ mod integration_tests {
             consume_once: true,
             supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
         }
+    }
+
+    #[test]
+    fn current_session_loop_allows_default_without_replaying_explicit_approval() {
+        let config = PermissionConfig::new();
+        let mut input = evaluation("root", "loop-call", "session_loop start", false);
+        input.tool_name = "session_loop".to_string();
+        input.tool_args = serde_json::json!({"action":"start","interval_seconds":300,"user_quote":"private cadence"});
+        input.permission_type = PermissionType::WriteFile;
+        input.risk_level = RiskLevel::Medium;
+
+        assert!(matches!(
+            config.evaluate(input.clone()),
+            PermissionOutcome::Ask(_)
+        ));
+        assert!(matches!(
+            config.evaluate_current_session_loop(input.clone()),
+            PermissionOutcome::Allow { .. }
+        ));
+
+        config.set_ask_rules(["session_loop".to_string()]);
+        let PermissionOutcome::Deny { reason, .. } =
+            config.evaluate_current_session_loop(input.clone())
+        else {
+            panic!("a loop mutation must never enter approval replay");
+        };
+        assert_eq!(reason.code, PermissionReasonCode::ConfiguredAlwaysAsk);
+        assert!(reason.message.contains("/loop"));
+
+        config.set_mode(PermissionMode::Plan);
+        assert!(matches!(
+            config.evaluate_current_session_loop(input.clone()),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ModeDenied,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        config.set_mode(PermissionMode::Auto);
+        config
+            .deny_typed_scoped_session_permission(
+                "root",
+                PermissionType::WriteFile,
+                PermissionMatcher {
+                    id: "loop-start".into(),
+                    kind: crate::policy::PermissionMatcherKind::ToolAction,
+                    value: input.resource.clone(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            config.evaluate_current_session_loop(input),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ExplicitDeny,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
