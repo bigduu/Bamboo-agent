@@ -731,8 +731,7 @@ impl SessionStoreV2 {
         &self,
         incoming: &Session,
     ) -> io::Result<()> {
-        self.validate_root_context_for_write(incoming, false, false)
-            .await
+        self.validate_root_context_for_write(incoming, false).await
     }
 
     /// A full save may finish an interrupted create, or restore a missing main
@@ -741,17 +740,14 @@ impl SessionStoreV2 {
     pub(super) async fn validate_root_context_for_full_save(
         &self,
         incoming: &Session,
-        writes_supervisor_execution_profile: bool,
     ) -> io::Result<()> {
-        self.validate_root_context_for_write(incoming, true, writes_supervisor_execution_profile)
-            .await
+        self.validate_root_context_for_write(incoming, true).await
     }
 
     async fn validate_root_context_for_write(
         &self,
         incoming: &Session,
         full: bool,
-        writes_supervisor_execution_profile: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
         incoming
@@ -855,20 +851,6 @@ impl SessionStoreV2 {
         if incoming.metadata_version < current.metadata_version {
             return Err(conflict(
                 "metadata revision regressed; reload before saving",
-            ));
-        }
-        if current.supervisor_incarnation_id().is_some()
-            && incoming
-                .metadata
-                .get(bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY)
-                != current
-                    .metadata
-                    .get(bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY)
-            && (!writes_supervisor_execution_profile
-                || current.metadata_version.checked_add(1) != Some(incoming.metadata_version))
-        {
-            return Err(conflict(
-                "Supervisor dispatch consent requires the current profile writer",
             ));
         }
         if incoming.root_mode_operations.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {

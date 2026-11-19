@@ -665,6 +665,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     // `ledger_scope`'s doc comment.
     scope = scope.service(ledger_scope());
 
+    scope = scope.service(
+        web::resource("/sessions/{session_id}/loop")
+            .route(web::get().to(agent::paced_loop::status))
+            .route(web::post().to(agent::paced_loop::mutate)),
+    );
+
     // Dev-only endpoints are a greenfield wipe of ALL sessions (`dev_reset`) with
     // no auth. Register them ONLY when explicitly enabled, so a production/Docker
     // deployment (release build, no env) never exposes an unauthenticated

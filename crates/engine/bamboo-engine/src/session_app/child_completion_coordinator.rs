@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use std::time::Duration;
 
 use bamboo_domain::poison::PoisonRecover;
+use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
+use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
 use bamboo_domain::{
     AgentHookPoint, HookPayload, HookToolOutcome, SessionActivationPolicy, SessionChildOutcome,
     SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
@@ -18,14 +20,15 @@ use bamboo_domain::{
 use crate::execution::{
     reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
     AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
-    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
-    SpawnScheduler,
+    SessionCompletionHook, SessionExecutionArgs, SessionExecutionReservation,
+    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
 };
+use crate::runtime::paced_loop_wakeup::PacedLoopTurn;
 use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
@@ -63,6 +66,36 @@ const RUNTIME_RESUME_MESSAGE_KIND_KEY: &str = "runtime_kind";
 const CHILD_COMPLETION_INLINE_FIELD_BYTES: usize = 48 * 1024;
 const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
 
+enum ResumeOrigin {
+    Legacy,
+    Configured,
+    PacedLoop(PacedLoopTurn),
+    RuntimeInbox(bamboo_domain::SessionRuntimeStartup),
+}
+
+fn record_paced_loop_outcome(run_id: String, adaptive_wakeup: bool) -> SessionCompletionHook {
+    Box::new(move |outcome, session| {
+        Box::pin(async move {
+            let status = if outcome.cancelled {
+                "cancelled"
+            } else if !outcome.success {
+                "failed"
+            } else if session.last_run_status().as_deref() == Some("suspended") {
+                "suspended"
+            } else {
+                "completed"
+            };
+            let mut record = serde_json::json!({ "run_id": run_id, "status": status });
+            if adaptive_wakeup {
+                record["finished_at"] = serde_json::json!(Utc::now());
+            }
+            session
+                .metadata
+                .insert(PACED_LOOP_OUTCOME_METADATA_KEY.into(), record.to_string());
+        })
+    })
+}
+
 fn read_runtime_state(session: &Session) -> AgentRuntimeState {
     session
         .agent_runtime_state
@@ -94,6 +127,7 @@ async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
     interrupt_specific_wait: bool,
+    expected_birth: Option<chrono::DateTime<Utc>>,
 ) -> std::io::Result<Option<(Session, bool)>> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ready_for_mutation = ready.clone();
@@ -102,7 +136,9 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if latest.has_pending_question()
+            if expected_birth.is_some_and(|birth| {
+                latest.created_at != birth || crate::ticket_runtime::is_managed_work_root(latest)
+            }) || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
@@ -110,6 +146,18 @@ async fn prepare_session_inbox_activation(
                 return;
             }
             let mut runtime_state = read_runtime_state(latest);
+            // A deferred Runtime receipt has no authority to clear a wait
+            // owned by another path. A matching legacy Bash completion may
+            // already have cleared its wait and left only a bare status.
+            if expected_birth.is_some()
+                && (latest.metadata.contains_key("runtime.suspend_reason")
+                    || runtime_state.suspension.is_some()
+                    || runtime_state.plan_mode.as_ref().is_some_and(|plan| {
+                        plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval
+                    }))
+            {
+                return;
+            }
             let specifically_waiting = runtime_state.waiting_for_children.is_some()
                 || runtime_state.waiting_for_bash.is_some();
             if specifically_waiting && !interrupt_specific_wait {
@@ -965,6 +1013,125 @@ impl ChildCompletionCoordinator {
         )
     }
 
+    /// Compete for the ordinary Session execution slot without publishing any
+    /// scheduled input. A busy Session will retain its single due occurrence.
+    pub async fn reserve_paced_loop_turn(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionExecutionReservation> {
+        let event_sender = ResumeExecutionPort::get_or_create_event_sender(self, session_id).await;
+        match crate::execution::agent_spawn::reserve_selected_input_execution(
+            &self.agent,
+            &self.agent_runners,
+            &self.session_event_senders,
+            session_id,
+            &event_sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => Some(reservation),
+            SessionExecutionReserveOutcome::AlreadyRunning { .. } => None,
+        }
+    }
+
+    /// Bind the reserved turn's actual Root writer and logical lifetime before
+    /// accepting a prompt that must never be forwarded to a later owner.
+    pub async fn prepare_paced_loop_turn(
+        &self,
+        reservation: &mut SessionExecutionReservation,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        if session.kind != SessionKind::Root
+            || !session.authority_identity.is_ordinary()
+            || crate::ticket_runtime::is_managed_work_root(session)
+            || self.root_account_sink.is_none()
+            || self.root_tools.read().await.is_none()
+        {
+            return Err(std::io::Error::other(
+                "scheduled turn requires an ordinary Root execution surface",
+            ));
+        }
+        reservation
+            .bind_reserved_session_lifetime(&self.agent, session)
+            .await?;
+        reservation.bind_root_actor(&self.agent, session).await
+    }
+
+    /// Publish and hand off this exact reserved turn. Success records Inbox
+    /// admission and dispatch only. Runtime events report the final outcome.
+    pub async fn dispatch_paced_loop_turn(
+        &self,
+        mut reservation: SessionExecutionReservation,
+        session: Session,
+        prompt: String,
+        generation: uuid::Uuid,
+        occurrence: u64,
+        system_guidance: Option<String>,
+        adaptive_wakeup: bool,
+    ) -> std::io::Result<()> {
+        let writer = reservation
+            .root_actor_writer()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no bound Root writer"))?;
+        let router = self
+            .agent
+            .activation_router()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no activation router"))?;
+        let inbox = self
+            .agent
+            .session_inbox()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no Inbox"))?;
+        let source = serde_json::json!({
+            "generation": generation,
+            "occurrence": occurrence,
+            "run_id": reservation.run_id(),
+        });
+        let envelope = SessionMessageEnvelope {
+            id: SessionMessageId::stable(PACED_LOOP_INSTRUCTION, &source),
+            source: SessionMessageSource::Runtime {
+                subsystem: PACED_LOOP_SUBSYSTEM.into(),
+            },
+            target_session_id: session.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(
+                bamboo_domain::SessionRuntimeInstruction {
+                    instruction: PACED_LOOP_INSTRUCTION.into(),
+                    content: Some(SessionMessageContent::text(prompt)),
+                    data: Some(source),
+                    provider_message: None,
+                },
+            ),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        let config_snapshot = self.config.read().await.clone();
+        let config = self.build_resume_config(&session, &config_snapshot);
+        let event_sender = ResumeExecutionPort::get_or_create_event_sender(self, &session.id).await;
+        let receipt = inbox
+            .deliver_paced_loop_for_run(&envelope, &writer, router.clone())
+            .await
+            .map_err(std::io::Error::other)?;
+        reservation.bind_paced_loop_inbox_receipt(receipt)?;
+        let request = ResumeSpawnRequest {
+            session_id: session.id.clone(),
+            session,
+            execution_reservation: reservation,
+            event_sender,
+            config,
+        };
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let origin = ResumeOrigin::PacedLoop(PacedLoopTurn {
+                system_guidance: system_guidance.map(Arc::from),
+                adaptive_wakeup,
+            });
+            coordinator.spawn_resume_with_origin(request, origin).await;
+        });
+        Ok(())
+    }
+
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
     /// can distinguish a successful spawn (`Started`) from a gate-blocked
     /// attempt (`Completed`). The bash self-resume poll task uses this to
@@ -1137,6 +1304,10 @@ impl ChildCompletionCoordinator {
 
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
+    fn child_completion_account_sink(&self) -> Option<&Arc<crate::events::AccountEventSink>> {
+        self.root_account_sink.as_ref()
+    }
+
     async fn on_child_completed(&self, completion: ChildCompletion) {
         // Terminality guard: a child that reports a NON-terminal status (e.g.
         // "suspended" — awaiting parent approval, its own bash wait, or its own
@@ -2073,16 +2244,18 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
     }
 
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, false).await;
+        self.spawn_resume_with_origin(request, ResumeOrigin::Legacy)
+            .await;
     }
 
     async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, true).await;
+        self.spawn_resume_with_origin(request, ResumeOrigin::Configured)
+            .await;
     }
 }
 
 impl ChildCompletionCoordinator {
-    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, origin: ResumeOrigin) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -2090,6 +2263,18 @@ impl ChildCompletionCoordinator {
             event_sender,
             config,
         } = request;
+        let (from_config, paced_loop_turn, on_complete, runtime_startup) = match origin {
+            ResumeOrigin::Legacy => (false, None, None, None),
+            ResumeOrigin::Configured => (true, None, None, None),
+            ResumeOrigin::RuntimeInbox(startup) => (true, None, None, Some(startup)),
+            ResumeOrigin::PacedLoop(turn) => {
+                let completion = record_paced_loop_outcome(
+                    execution_reservation.run_id().to_owned(),
+                    turn.adaptive_wakeup,
+                );
+                (true, Some(turn), Some(completion), None)
+            }
+        };
         if let Err(error) = execution_reservation.ensure_registered().await {
             tracing::warn!(
                 %session_id,
@@ -2118,6 +2303,36 @@ impl ChildCompletionCoordinator {
             execution_reservation.abandon().await;
             return;
         }
+        let startup_message = if let Some(startup) = runtime_startup {
+            let admission = match (
+                execution_reservation.execution_persistence(),
+                self.agent.session_inbox(),
+            ) {
+                (Some(persistence), Some(inbox)) => {
+                    persistence
+                        .admit_root_runtime_startup(
+                            &mut session,
+                            inbox.clone(),
+                            &startup,
+                            execution_reservation.run_id(),
+                        )
+                        .await
+                }
+                _ => Err(std::io::Error::other(
+                    "Runtime Inbox startup is unavailable",
+                )),
+            };
+            match admission {
+                Ok(message) => Some(message),
+                Err(error) => {
+                    tracing::debug!(%session_id, %error, "selected Runtime Inbox startup was not admitted");
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let root_publication = execution_reservation.root_actor_writer().map(|owner| {
             crate::events::RootActorEventPublication::new(
                 self.storage.clone(),
@@ -2259,6 +2474,11 @@ impl ChildCompletionCoordinator {
         };
         let agent =
             Arc::new(agent.with_legacy_vision_provider_source(legacy_vision_provider_source));
+        let agent = if let Some(turn) = paced_loop_turn {
+            Arc::new(agent.with_paced_loop_turn(turn))
+        } else {
+            agent
+        };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
             &resolved_provider_name,
@@ -2280,7 +2500,7 @@ impl ChildCompletionCoordinator {
         )
         .or(config.gold_config.clone());
 
-        let (mpsc_tx, _forwarder, history_commit_barrier) =
+        let (mpsc_tx, _forwarder, mut history_commit_barrier) =
             crate::execution::create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
@@ -2289,6 +2509,23 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
                 root_publication,
             );
+        if let Some(message) = startup_message {
+            // The Message and its ACK are durable, so the round prelude
+            // cannot rediscover it. Confirm publication before model startup.
+            let queued = mpsc_tx
+                .send(AgentEvent::message_appended(&session_id, &message))
+                .await
+                .is_ok();
+            if !queued
+                || !history_commit_barrier
+                    .send_and_wait(&mpsc_tx, session_id.clone())
+                    .await
+            {
+                tracing::warn!(%session_id, "Root Runtime input publication was not confirmed");
+                execution_reservation.abandon().await;
+                return;
+            }
+        }
 
         let auxiliary_model_resolver = make_resume_auxiliary_model_resolver(
             self.config.clone(),
@@ -2359,7 +2596,7 @@ impl ChildCompletionCoordinator {
             run_budget: None,
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
-            on_complete: None,
+            on_complete,
             // A resumed session that is itself a CHILD (nested sub-agents)
             // must publish its terminal completion so ITS parent is woken
             // in turn (issue #546).
@@ -2379,6 +2616,25 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         target_session_id: &str,
         _inbox_generation: u64,
     ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        self.reserve_inbox_activation(target_session_id, None).await
+    }
+
+    async fn reserve_runtime_activation(
+        &self,
+        target_session_id: &str,
+        startup: bamboo_domain::SessionRuntimeStartup,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        self.reserve_inbox_activation(target_session_id, Some(startup))
+            .await
+    }
+}
+
+impl ChildCompletionCoordinator {
+    async fn reserve_inbox_activation(
+        &self,
+        target_session_id: &str,
+        runtime_startup: Option<bamboo_domain::SessionRuntimeStartup>,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
         let Some(inbox) = self.agent.session_inbox() else {
             return Err(bamboo_domain::SessionActivationError::Internal(
                 "agent runtime has no SessionInbox".to_string(),
@@ -2396,7 +2652,10 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         let prepared = prepare_session_inbox_activation(
             &self.persistence,
             target_session_id,
-            backlog.interrupt_pending(),
+            runtime_startup.is_none() && backlog.interrupt_pending(),
+            runtime_startup
+                .as_ref()
+                .map(|startup| startup.target_created_at),
         )
         .await
         .map_err(|error| {
@@ -2412,6 +2671,14 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                 session_id = target_session_id,
                 "SessionInbox backlog is activation-eligible but a specific durable wait remains armed"
             );
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
+        if runtime_startup.is_some()
+            && !self
+                .agent
+                .persistence()
+                .root_actor_execution_required(&session)
+        {
             return Ok(SessionActivationReserveOutcome::NoWork);
         }
         if crate::ticket_runtime::is_managed_work_root(&session)
@@ -2617,12 +2884,10 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             event_sender,
                             config: *config,
                         };
+                        let origin = runtime_startup
+                            .map_or(ResumeOrigin::Configured, ResumeOrigin::RuntimeInbox);
                         tokio::spawn(async move {
-                            ResumeExecutionPort::spawn_configured_resume_execution(
-                                &coordinator,
-                                request,
-                            )
-                            .await;
+                            coordinator.spawn_resume_with_origin(request, origin).await;
                         });
                     },
                     move || async move {
@@ -3573,7 +3838,19 @@ impl ChildCompletionCoordinator {
             }
             return;
         };
-        match messenger.activate_prepared(&admission).await {
+        let activation = if kind == ShellCompletionKind::Exec
+            && self
+                .agent
+                .persistence()
+                .root_actor_execution_required(&session)
+        {
+            messenger
+                .activate_prepared_runtime(&admission, session.created_at)
+                .await
+        } else {
+            messenger.activate_prepared(&admission).await
+        };
+        match activation {
             Ok(receipt) => tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
@@ -3679,6 +3956,13 @@ fn child_wait_lease_expired_message(child_ids: &[String]) -> Message {
     ))
 }
 
+#[derive(PartialEq, Eq)]
+struct ChildWaitRegistration {
+    session_created_at: chrono::DateTime<Utc>,
+    run_id: String,
+    registered_at: chrono::DateTime<Utc>,
+}
+
 /// Child-wait watchdog (issue #546): the heartbeat backstop for parents
 /// suspended on `waiting_for_children`.
 ///
@@ -3714,9 +3998,10 @@ impl ChildCompletionCoordinator {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate tick (boot reconciliation just ran).
             ticker.tick().await;
+            let mut rejected_waits = HashMap::new();
             loop {
                 ticker.tick().await;
-                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits())
+                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits(&mut rejected_waits))
                     .catch_unwind()
                     .await
                     .is_err()
@@ -3831,7 +4116,7 @@ impl ChildCompletionCoordinator {
     /// One sweep: inspect every session whose index status is `suspended`.
     /// Cheap in the common case — the candidate list is small and each check is
     /// a sidecar (control-plane) load.
-    async fn sweep_child_waits(&self) {
+    async fn sweep_child_waits(&self, rejected_waits: &mut HashMap<String, ChildWaitRegistration>) {
         let suspended = match self.storage.list_sessions_by_run_status("suspended").await {
             Ok(entries) => entries,
             Err(error) => {
@@ -3839,20 +4124,29 @@ impl ChildCompletionCoordinator {
                 return;
             }
         };
+        let mut previous = std::mem::take(rejected_waits);
         for (session_id, _) in suspended {
-            self.sweep_one_suspended_session(&session_id).await;
+            let rejected = previous.remove(&session_id);
+            if let Some(registration) = self
+                .sweep_one_suspended_session(&session_id, rejected)
+                .await
+            {
+                rejected_waits.insert(session_id, registration);
+            }
         }
     }
 
-    async fn sweep_one_suspended_session(&self, session_id: &str) {
+    async fn sweep_one_suspended_session(
+        &self,
+        session_id: &str,
+        rejected: Option<ChildWaitRegistration>,
+    ) -> Option<ChildWaitRegistration> {
         // A live runner means the session already resumed (the index status
         // only advances at its next terminal) — nothing to do.
         if self.runner_is_running(session_id).await {
-            return;
+            return None;
         }
-        let Some(session) = self.load_control_plane(session_id).await else {
-            return;
-        };
+        let session = self.load_control_plane(session_id).await?;
         let runtime_state = read_runtime_state(&session);
         let suspend_reason = session
             .metadata
@@ -3867,14 +4161,38 @@ impl ChildCompletionCoordinator {
             // Human-gated or bash-owned waits: not ours to time out.
             ("waiting_for_bash", _)
             | ("awaiting_clarification", _)
-            | ("awaiting_parent_approval", _) => {}
-            (_, Some(wait)) => self.sweep_child_wait(session_id, wait).await,
+            | ("awaiting_parent_approval", _) => None,
+            (_, Some(wait)) => {
+                let registration = ChildWaitRegistration {
+                    session_created_at: session.created_at,
+                    run_id: runtime_state.run_id,
+                    registered_at: wait.registered_at,
+                };
+                let already_rejected = rejected.as_ref() == Some(&registration);
+                let rejected_now = self
+                    .sweep_child_wait(session_id, wait, !already_rejected)
+                    .await;
+                (already_rejected || rejected_now).then_some(registration)
+            }
             // Suspended with NO armed wait: either the coordinator cleared the
             // wait but its resume never spawned, or state is half-cleared.
             ("waiting_for_children", None) | ("", None) => {
-                self.rescue_stranded_resume(session_id).await;
+                if let Some(expiry) =
+                    bamboo_domain::CommittedChildWaitExpiry::from_session(&session)
+                        .filter(|expiry| expiry.expiry.run_id == runtime_state.run_id)
+                {
+                    if let Err(error) = self
+                        .request_expired_child_wait_startup(&session, &expiry)
+                        .await
+                    {
+                        tracing::debug!(%session_id, %error, "committed child wait expiry remains pending");
+                    }
+                } else {
+                    self.rescue_stranded_resume(session_id).await;
+                }
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -3888,43 +4206,76 @@ impl ChildCompletionCoordinator {
         parent_session_id: &str,
         wait: WaitingForChildrenState,
     ) {
-        self.sweep_child_wait(parent_session_id, wait).await;
+        self.sweep_child_wait(parent_session_id, wait, true).await;
     }
 
-    async fn sweep_child_wait(&self, parent_session_id: &str, wait: WaitingForChildrenState) {
+    /// Report a deterministic rejection of the unfenced force-resume path.
+    async fn sweep_child_wait(
+        &self,
+        parent_session_id: &str,
+        wait: WaitingForChildrenState,
+        allow_force_resume: bool,
+    ) -> bool {
         let now = Utc::now();
-
-        if wait.child_session_ids.is_empty() {
-            tracing::warn!(
-                %parent_session_id,
-                "child-wait watchdog: wait armed over an empty child set; force-resuming"
-            );
-            self.force_resume_child_wait(parent_session_id, empty_child_wait_message())
-                .await;
-            return;
-        }
 
         // The 6h lease (previously written but never read). Expiry does not
         // kill children — child runners own child liveness; the parent is
         // resumed with a verify-don't-assume note.
-        if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
-            tracing::warn!(
-                %parent_session_id,
-                "child-wait watchdog: wait lease expired; force-resuming parent"
-            );
-            self.force_resume_child_wait(
-                parent_session_id,
-                child_wait_lease_expired_message(&wait.child_session_ids),
-            )
-            .await;
-            return;
+        if allow_force_resume {
+            let forced_resume = if wait.child_session_ids.is_empty() {
+                Some(empty_child_wait_message())
+            } else if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
+                Some(child_wait_lease_expired_message(&wait.child_session_ids))
+            } else {
+                None
+            };
+            if let Some(message) = forced_resume {
+                let Some(parent) = self.load_control_plane(parent_session_id).await else {
+                    return false;
+                };
+                match self
+                    .storage
+                    .root_child_wait_requires_owned_expiry(&parent)
+                    .await
+                {
+                    Ok(true) => {
+                        match self.expire_owned_root_child_wait(&parent, &wait, now).await {
+                            Ok(true) => return false,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::debug!(%parent_session_id, %error, "owned child wait expiry remains pending");
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        let Err(error) = self
+                            .force_resume_child_wait(parent_session_id, &wait, message)
+                            .await
+                        else {
+                            return false;
+                        };
+                        let authority_rejected = error.kind() == std::io::ErrorKind::Unsupported
+                            && error.get_ref().is_some_and(|cause| {
+                                cause.is::<bamboo_domain::SessionAuthorityConflict>()
+                            });
+                        tracing::warn!(%parent_session_id, %error, authority_rejected,
+                            "child-wait watchdog: force-resume could not persist; durable wait retained");
+                        return authority_rejected;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%parent_session_id, %error, "child wait authority could not be verified");
+                    }
+                }
+            }
         }
 
+        // When unfenced recovery was rejected, continue observing genuine
+        // child completions through their normal owned Inbox path.
         // Yield to the event-driven push on fresh waits.
         if now.signed_duration_since(wait.registered_at).num_seconds()
             < CHILD_WAIT_REGISTRATION_GRACE_SECS
         {
-            return;
+            return false;
         }
 
         let statuses: HashMap<String, Option<String>> = self
@@ -4109,7 +4460,7 @@ impl ChildCompletionCoordinator {
                 }
             }
             // The publishes above re-evaluate the wait policy themselves.
-            return;
+            return false;
         }
 
         // A lost callback must not hide one ready result behind an unfinished
@@ -4118,11 +4469,6 @@ impl ChildCompletionCoordinator {
         // Error-like outcomes go first so FirstError releases promptly.
         terminal.sort_by_key(|(_, status)| !is_error_like(status));
         for (child_id, status) in terminal {
-            tracing::debug!(
-                %parent_session_id,
-                child_session_id = %child_id,
-                "child-wait watchdog: replaying terminal child outcome"
-            );
             let control_plane = self.load_control_plane(&child_id).await;
             let mut completion = ChildCompletion {
                 parent_session_id: parent_session_id.into(),
@@ -4153,8 +4499,25 @@ impl ChildCompletionCoordinator {
                 }
                 completion.completed_at = child.updated_at;
             }
+            if let Some(source) = &completion.source {
+                if self
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&child_id)
+                    .is_some_and(|runner| runner.child_completion_publication_is_live(source))
+                {
+                    continue;
+                }
+            }
+            tracing::debug!(
+                %parent_session_id,
+                child_session_id = %child_id,
+                "child-wait watchdog: replaying terminal child outcome"
+            );
             self.publish_completion(completion).await;
         }
+        false
     }
 
     /// Repair only the selected Child's logical state. The caller's requested
@@ -4217,7 +4580,10 @@ impl ChildCompletionCoordinator {
             crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
                 self.agent_runners.clone(),
                 self.session_event_senders.clone(),
-                self.account_feed_inbox.clone(),
+                crate::runtime::execution::event_forwarder::SessionAccountFeed::for_host(
+                    self.account_feed_inbox.clone(),
+                    self.root_account_sink.as_ref(),
+                ),
             );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
         crate::runtime::execution::spawn::publish_child_completion(
@@ -4226,6 +4592,105 @@ impl ChildCompletionCoordinator {
             completion,
         )
         .await;
+    }
+
+    async fn expire_owned_root_child_wait(
+        &self,
+        parent: &Session,
+        wait: &WaitingForChildrenState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if crate::ticket_runtime::is_managed_work_root(parent) || parent.has_pending_question() {
+            return Ok(false);
+        }
+        let runtime = read_runtime_state(parent);
+        if runtime.waiting_for_children.as_ref() != Some(wait) || runtime.waiting_for_bash.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(messenger) = self.agent.session_messenger() else {
+            return Ok(false);
+        };
+        let Some(actor_activation_id) = self
+            .storage
+            .observe_root_child_wait_expiry_activation(parent, &runtime.run_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let expiry = bamboo_domain::ChildWaitExpiry::observe(
+            parent,
+            &runtime,
+            actor_activation_id,
+            wait.clone(),
+        )?;
+        let admission = messenger
+            .admit_runtime_for_target(expiry.envelope(&parent.id)?, parent.created_at)
+            .await?;
+        let expiry = bamboo_domain::CommittedChildWaitExpiry::new(expiry, &admission.delivery);
+        let cache = self.sessions.clone();
+        let committed = self
+            .storage
+            .expire_root_child_wait_control_plane(
+                parent,
+                &expiry,
+                messenger.inbox().as_ref(),
+                now,
+                Arc::new(move |saved| {
+                    cache.insert(
+                        saved.id.clone(),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                    );
+                }),
+            )
+            .await?;
+        if !committed {
+            return Ok(false);
+        }
+        if let Err(error) = self
+            .request_expired_child_wait_startup(parent, &expiry)
+            .await
+        {
+            tracing::debug!(session_id = %parent.id, %error, "committed child wait expiry remains pending");
+        }
+        Ok(true)
+    }
+
+    async fn request_expired_child_wait_startup(
+        &self,
+        parent: &Session,
+        expiry: &bamboo_domain::CommittedChildWaitExpiry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (Some(messenger), Some(inbox)) =
+            (self.agent.session_messenger(), self.agent.session_inbox())
+        else {
+            return Ok(());
+        };
+        let delivery = expiry.receipt();
+        let admission = crate::session_messaging::SessionMessengerAdmission {
+            envelope_id: delivery.id.as_str().to_owned(),
+            target_session_id: parent.id.clone(),
+            delivery,
+        };
+        messenger
+            .prepare_message_activation(&admission, SessionActivationPolicy::RespectSpecificWait)
+            .await?;
+        let ready = inbox
+            .inspect_wake_readiness(&parent.id, Utc::now())
+            .await?
+            .ready;
+        if ready
+            .and_then(|candidate| candidate.runtime_startup())
+            .is_some_and(|startup| {
+                startup.receipt == admission.delivery
+                    && startup.target_created_at == expiry.expiry.target_birth
+            })
+        {
+            messenger
+                .activate_prepared_runtime(&admission, expiry.expiry.target_birth)
+                .await?;
+        }
+        Ok(())
     }
 
     /// A parent whose wait was already cleared (resume message appended) but
@@ -4260,7 +4725,12 @@ impl ChildCompletionCoordinator {
     /// [`Self::perform_bash_resume`]: a suspending runner's one-shot finalize
     /// save can land after ours and revert the wait while dropping the
     /// message; we detect the re-armed wait and re-clear.
-    async fn force_resume_child_wait(&self, session_id: &str, resume_message: Message) {
+    async fn force_resume_child_wait(
+        &self,
+        session_id: &str,
+        expected_wait: &WaitingForChildrenState,
+        resume_message: Message,
+    ) -> std::io::Result<()> {
         const MAX_ATTEMPTS: u8 = 5;
         let lock = session_resume_lock(session_id);
         for attempt in 0..MAX_ATTEMPTS {
@@ -4270,12 +4740,14 @@ impl ChildCompletionCoordinator {
             {
                 let _held = lock.lock().await;
                 let Some(mut session) = self.load_session(session_id).await else {
-                    return;
+                    return Ok(());
                 };
                 let mut runtime_state = read_runtime_state(&session);
-                if runtime_state.waiting_for_children.is_none() {
-                    // Another source already resumed this parent.
-                    return;
+                if runtime_state.waiting_for_children.as_ref() != Some(expected_wait)
+                    || session.has_pending_question()
+                {
+                    // A newer wait or human gate owns the Session now.
+                    return Ok(());
                 }
                 runtime_state.waiting_for_children = None;
                 runtime_state.status = AgentStatusState::Idle;
@@ -4284,11 +4756,20 @@ impl ChildCompletionCoordinator {
                 session.metadata.remove("runtime.suspend_reason");
                 session.add_message(resume_message.clone());
                 session.updated_at = Utc::now();
-                self.save_and_cache(&mut session).await;
+                self.persistence
+                    .merge_save_runtime_and_publish(&mut session, |saved, committed| {
+                        if committed {
+                            self.sessions.insert(
+                                saved.id.clone(),
+                                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                            );
+                        }
+                    })
+                    .await?;
             }
             let outcome = self.resume_parent(session_id.to_string()).await;
             match outcome {
-                ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => return,
+                ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => return Ok(()),
                 ResumeOutcome::Completed | ResumeOutcome::AlreadyRunning { .. } => {
                     // Only retry when the persisted wait was clobbered back to
                     // armed; if it stayed cleared with the message intact, the
@@ -4299,7 +4780,7 @@ impl ChildCompletionCoordinator {
                         .map(|session| read_runtime_state(&session).waiting_for_children.is_some())
                         .unwrap_or(false);
                     if !clobbered {
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -4308,6 +4789,7 @@ impl ChildCompletionCoordinator {
             %session_id,
             "child-wait watchdog: force-resume exhausted its clobber-retry budget"
         );
+        Ok(())
     }
 }
 
@@ -4599,11 +5081,26 @@ mod tests {
 
     struct FailingRuntimeSaveStorage {
         inner: Arc<bamboo_storage::SessionStoreV2>,
+        authority_rejections: Option<Arc<AtomicUsize>>,
+    }
+
+    impl FailingRuntimeSaveStorage {
+        fn reject_unfenced_write(&self) -> std::io::Result<()> {
+            if let Some(rejections) = &self.authority_rejections {
+                rejections.fetch_add(1, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    bamboo_domain::SessionAuthorityConflict("unfenced write rejected".into()),
+                ));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
     impl Storage for FailingRuntimeSaveStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.reject_unfenced_write()?;
             self.inner.save_session(session).await
         }
 
@@ -4620,6 +5117,7 @@ mod tests {
         }
 
         async fn save_runtime_state(&self, _session: &Session) -> std::io::Result<()> {
+            self.reject_unfenced_write()?;
             Err(std::io::Error::other("injected sidecar save failure"))
         }
     }
@@ -5615,8 +6113,10 @@ mod tests {
                     // No callbacks or cached Session snapshots precede this disk-only sweep.
                     let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
                     wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
-                    coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
-                    coordinator.sweep_child_wait(&parent.id, wait).await;
+                    coordinator
+                        .sweep_child_wait(&parent.id, wait.clone(), true)
+                        .await;
+                    coordinator.sweep_child_wait(&parent.id, wait, true).await;
                 } else {
                     // The terminal index is ahead of the second sibling's callback.
                     coordinator.on_child_completed(completions[0].clone()).await;
@@ -6094,7 +6594,9 @@ mod tests {
         save_completion_test_child(&store, parent_id, "cold-slow", "running").await;
 
         let wait = runtime.waiting_for_children.unwrap();
-        coordinator.sweep_child_wait(parent_id, wait.clone()).await;
+        coordinator
+            .sweep_child_wait(parent_id, wait.clone(), true)
+            .await;
         let reopened = bamboo_storage::FileSessionInbox::new(store.clone(), Default::default());
         let backlog = reopened.inspect(parent_id).await.unwrap();
         assert_eq!(backlog.pending, 2);
@@ -6106,7 +6608,7 @@ mod tests {
         for claim in &claims {
             reopened.ack(parent_id, claim).await.unwrap();
         }
-        coordinator.sweep_child_wait(parent_id, wait).await;
+        coordinator.sweep_child_wait(parent_id, wait, true).await;
         assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
         assert!(
             read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
@@ -6220,6 +6722,7 @@ mod tests {
             &coordinator.persistence,
             parent_id,
             backlog.interrupt_pending(),
+            None,
         )
         .await
         .unwrap()
@@ -6840,7 +7343,9 @@ mod tests {
             let parent = store.load_session("replay-parent").await.unwrap().unwrap();
             let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
             wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
-            coordinator.sweep_child_wait("replay-parent", wait).await;
+            coordinator
+                .sweep_child_wait("replay-parent", wait, true)
+                .await;
             let claims = inbox.claim("replay-parent", 1).await.unwrap();
             if !valid {
                 assert!(claims.is_empty());
@@ -7468,6 +7973,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_rejects_unfenced_resume_once_per_child_wait_registration() {
+        let (_temp, store, _, mut coordinator, _, launches) = completion_inbox_fixture().await;
+        let id = "watchdog-authority-rejection";
+        save_waiting_test_parent(&store, id, Vec::new(), ChildWaitPolicy::All).await;
+        let mut parent = store.load_session(id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&parent);
+        let rejections = Arc::new(AtomicUsize::new(0));
+        Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
+            Arc::new(FailingRuntimeSaveStorage {
+                inner: store.clone(),
+                authority_rejections: Some(rejections.clone()),
+            }),
+        ));
+
+        let rejected = coordinator.sweep_one_suspended_session(id, None).await;
+        assert!(rejected.is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 1);
+        let rejected = coordinator.sweep_one_suspended_session(id, rejected).await;
+        assert!(rejected.is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 1);
+        let persisted = store.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            read_runtime_state(&persisted).waiting_for_children,
+            runtime.waiting_for_children
+        );
+        assert_eq!(
+            serde_json::to_value(&persisted.messages).unwrap(),
+            serde_json::to_value(&parent.messages).unwrap()
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+        runtime.waiting_for_children.as_mut().unwrap().registered_at +=
+            chrono::Duration::seconds(1);
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        assert!(coordinator
+            .sweep_one_suspended_session(id, rejected)
+            .await
+            .is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn failed_child_wait_sidecar_save_keeps_cache_wait_and_transcript() {
         let (_temp, store, inbox, mut coordinator, reservations, launches) =
             completion_inbox_fixture().await;
@@ -7502,6 +8050,7 @@ mod tests {
         Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
             Arc::new(FailingRuntimeSaveStorage {
                 inner: store.clone(),
+                authority_rejections: None,
             }),
         ));
 
@@ -7702,7 +8251,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (prepared, ready) = prepare_session_inbox_activation(&locked, &session.id, false)
+        let (prepared, ready) = prepare_session_inbox_activation(&locked, &session.id, false, None)
             .await
             .unwrap()
             .unwrap();

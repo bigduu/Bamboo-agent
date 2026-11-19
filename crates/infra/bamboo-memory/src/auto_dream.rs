@@ -392,6 +392,7 @@ pub fn build_extraction_prompt(candidates: &[DreamCandidateInfo]) -> String {
     prompt.push_str("- Each candidate must capture exactly ONE atomic fact/decision/preference. Never combine unrelated facts into a single candidate.\n");
     prompt.push_str("- The title must concisely summarize THAT candidate's own content so it can be found later by keyword search; never use a generic title that does not match the content.\n");
     prompt.push_str("- Confidence is only your extraction self-rating, never user or host confirmation. Do not emit confirmation flags or source ranges. Project sources must stay Project-scoped; do not broaden them into Global.\n");
+    prompt.push_str("- Use the project type only for Project-scoped facts. Omit a project fact when no Project is assigned.\n");
     prompt.push_str("- Skip transient scratch state, code/project structure derivable from tools, and anything low-confidence or secret-like.\n");
     prompt.push_str("- Prefer project scope when the session clearly belongs to a project workspace; otherwise use global.\n\n");
     prompt.push_str("Ledger candidates (in the SAME JSON object, as a second top-level array):\n");
