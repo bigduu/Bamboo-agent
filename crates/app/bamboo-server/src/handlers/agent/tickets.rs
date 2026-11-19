@@ -95,6 +95,42 @@ pub async fn overview(
     Ok(HttpResponse::Ok().json(service.work_overview(&authority)?))
 }
 
+pub async fn inspect_ingress(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    message_id: web::Path<String>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
+    let resolution = service.message_resolution(&authority, &message_id)?;
+    let ingress = resolution
+        .ingress
+        .ok_or_else(|| Error::ScopeDenied("canonical Host Human ingress missing".into()))?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message_id": resolution.message_id,
+        "text": ingress.text,
+        "proposal_saved": resolution.proposal.is_some(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DismissIngressRequest {
+    binding: ScopeBinding,
+}
+
+pub async fn dismiss_ingress(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    message_id: web::Path<String>,
+    body: web::Json<DismissIngressRequest>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    state
+        .tickets
+        .dismiss_ingress(user(&state, &req).await?, &body.binding, &message_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({"message_id":message_id.into_inner()})))
+}
+
 pub async fn project_board(
     state: web::Data<AppState>,
     req: HttpRequest,

@@ -2,6 +2,161 @@ use actix_web::{http::StatusCode, web};
 use bamboo_server::AppState;
 
 #[actix_web::test]
+async fn owner_can_inspect_and_dismiss_an_exact_chat_without_replacing_saved_work() {
+    use actix_web::{http::Method, test, App};
+    use bamboo_server::app_state::ticket_application::TicketApplication;
+    use bamboo_tickets::{HumanIngressRecord, Principal, VerifiedUserIngress};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut state = AppState::new_with_memory_store(
+        root.path().to_path_buf(),
+        bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+    )
+    .await
+    .unwrap();
+    *state.config.write().await = serde_json::from_value(json!({
+        "provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
+        "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}
+    }))
+    .unwrap();
+    state.tickets = Arc::new(
+        TicketApplication::open(root.path(), state.storage.clone(), state.config.clone()).await,
+    );
+    let (service, owner) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    for (seq, id, text) in [(1, "hello", "Hello there"), (2, "draft", "Create a draft")] {
+        let input = VerifiedUserIngress::from_verified_host(
+            id.into(),
+            HumanIngressRecord {
+                user_id: "host-owner".into(),
+                source_ingress_seq: seq,
+                text: text.into(),
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        service.register_user_ingress(&owner, &input).unwrap();
+    }
+    let proposal = serde_json::from_value(json!({"groups":[{
+        "group_id":"create","item_ids":["report"],"source_quote":"Create a draft",
+        "clarification":null,"operations":[{"op":"create","temp_id":"report","kind":"work",
+            "parent":null,"depends_on":[],"contract":{"title":"Report","objective":"A short report",
+            "constraints":[],"acceptance":["Report included"],"user_acceptance_required":true,
+            "allowed_tools":["Task"]}}]
+    }]}))
+    .unwrap();
+    service
+        .save_message_proposal(&owner, "draft", &proposal)
+        .unwrap();
+    let before = service.published().unwrap();
+    let binding = before.1.binding;
+    let body = json!({"binding":binding});
+    let state = web::Data::new(state);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let request = |method, uri: &str, local, body: Option<&Value>| {
+        let peer = if local {
+            "127.0.0.1:5700"
+        } else {
+            "203.0.113.1:5700"
+        };
+        let request = test::TestRequest::default()
+            .method(method)
+            .uri(uri)
+            .peer_addr(peer.parse().unwrap());
+        match body {
+            Some(body) => request.set_json(body).to_request(),
+            None => request.to_request(),
+        }
+    };
+    let scope = "/api/v1/tickets/scope";
+    let preview = "/api/v1/tickets/ingress/hello";
+    let dismiss = "/api/v1/tickets/ingress/hello/dismiss";
+    let status: Value =
+        test::call_and_read_body_json(&app, request(Method::GET, scope, true, None)).await;
+    assert_eq!(status["mutation_enabled"], true);
+    assert_eq!(status["dispatch_enabled"], true);
+    assert_eq!(status["health"], "writable");
+    assert_eq!(
+        status["overview"]["data"]["pending_ingress"],
+        json!({"count":2,"oldest":{"message_id":"hello","proposal_saved":false}})
+    );
+    assert!(!status.to_string().contains("Hello there"));
+    let denied_preview = test::call_service(&app, request(Method::GET, preview, false, None)).await;
+    let denied_dismiss =
+        test::call_service(&app, request(Method::POST, dismiss, false, Some(&body))).await;
+    assert_eq!(denied_preview.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied_dismiss.status(), StatusCode::FORBIDDEN);
+    let message: Value =
+        test::call_and_read_body_json(&app, request(Method::GET, preview, true, None)).await;
+    assert_eq!(
+        message,
+        json!({"message_id":"hello","text":"Hello there","proposal_saved":false})
+    );
+
+    let mut stale = body.clone();
+    stale["binding"]["binding_revision"] = (binding.binding_revision + 1).into();
+    let stale = test::call_service(&app, request(Method::POST, dismiss, true, Some(&stale))).await;
+    assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+    let saved = test::call_service(
+        &app,
+        request(
+            Method::POST,
+            "/api/v1/tickets/ingress/draft/dismiss",
+            true,
+            Some(&body),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::CONFLICT);
+    assert_eq!(service.published().unwrap().0, before.0);
+
+    let confirmed: Value =
+        test::call_and_read_body_json(&app, request(Method::POST, dismiss, true, Some(&body)))
+            .await;
+    assert_eq!(confirmed, json!({"message_id":"hello"}));
+    let after = service.published().unwrap();
+    assert_eq!(
+        after.1.resolutions["hello"]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .groups
+            .len(),
+        0
+    );
+    assert_eq!(
+        after.1.resolutions["draft"].proposal_hash,
+        before.1.resolutions["draft"].proposal_hash
+    );
+    assert!(after.1.tickets.is_empty());
+    let replay: Value =
+        test::call_and_read_body_json(&app, request(Method::POST, dismiss, true, Some(&body)))
+            .await;
+    assert_eq!(replay, confirmed);
+    assert_eq!(service.published().unwrap().0, after.0);
+    let status: Value =
+        test::call_and_read_body_json(&app, request(Method::GET, scope, true, None)).await;
+    assert_eq!(
+        status["overview"]["data"]["pending_ingress"],
+        json!({"count":1,"oldest":{"message_id":"draft","proposal_saved":true}})
+    );
+}
+
+#[actix_web::test]
 async fn review_semantic_project_preflight_precedes_intent_and_membership_publication() {
     use bamboo_domain::WorkspaceBinding;
     use bamboo_tickets::*;

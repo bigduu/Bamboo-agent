@@ -326,6 +326,7 @@ async fn builtin_manual_reads_without_repository_via_existing_paginated_reader()
         "references/config-keys.json",
         "references/memory.md",
         "references/hooks.md",
+        "references/work.md",
         "references/troubleshooting.md",
     ] {
         let selected = store

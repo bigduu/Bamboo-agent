@@ -114,6 +114,12 @@ pub fn entries() -> Vec<Entry> {
         default_root => ("option<string>", "example-worktrees", "Optional default root for user-created worktrees, not a runtime path observation.", []),
         project_roots => ("map<string,string>", json!({"example-project":"example-worktrees"}), "Per-project worktree root overrides; dynamic map keys are project identifiers, not config-field names.", []),
     ], []);
+    entries.push(Entry { key: "features.ticket_mutation", kind: "bool", example: json!(true),
+        meaning: "Allow Work scope initialization and record changes for the canonical Supervisor. Existing readable scopes can still be inspected when disabled.",
+        aliases: &[], read: |c| json!(c.features.ticket_mutation), required_when: None });
+    entries.push(Entry { key: "features.ticket_dispatch", kind: "bool", example: json!(true),
+        meaning: "Allow fresh Work execution admission. Work record changes and scope initialization use features.ticket_mutation.",
+        aliases: &[], read: |c| json!(c.features.ticket_dispatch), required_when: None });
     entries.push(Entry { key: "lifecycle_hooks.enabled", kind: "bool", example: json!(true),
         meaning: "Native lifecycle-hook switch; handler configuration and authorization remain separate.",
         aliases: &[], read: |c| json!(c.lifecycle_hooks.enabled), required_when: None });

@@ -76,6 +76,46 @@ pub struct Overview {
     pub open_questions: usize,
     pub open_approvals: usize,
     pub needs_acceptance: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_ingress: Option<PendingIngress>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingIngress {
+    pub count: usize,
+    pub oldest: Option<PendingIngressMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingIngressMessage {
+    pub message_id: String,
+    pub proposal_saved: bool,
+}
+
+impl PendingIngress {
+    fn from_snapshot(snapshot: &Snapshot, authority: &Authority) -> Self {
+        let mut count = 0;
+        let oldest = snapshot
+            .resolutions
+            .values()
+            .filter(|record| {
+                record.is_pending_human()
+                    && match authority.principal() {
+                        Principal::User { user_id } => record
+                            .ingress
+                            .as_ref()
+                            .is_some_and(|r| &r.user_id == user_id),
+                        _ => true,
+                    }
+            })
+            .inspect(|_| count += 1)
+            .min_by_key(|record| record.ingress_seq)
+            .map(|record| PendingIngressMessage {
+                message_id: record.message_id.clone(),
+                proposal_saved: record.proposal.is_some(),
+            });
+        Self { count, oldest }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -280,6 +320,11 @@ impl TicketService {
                 .values()
                 .filter(|t| refs.contains(&t.id) && t.state == WorkState::Submitted)
                 .count(),
+            pending_ingress: matches!(
+                authority.principal(),
+                Principal::Supervisor { .. } | Principal::User { .. }
+            )
+            .then(|| PendingIngress::from_snapshot(&snapshot, authority)),
         };
         Ok(envelope(commit, &snapshot, authority, data, 0, None))
     }

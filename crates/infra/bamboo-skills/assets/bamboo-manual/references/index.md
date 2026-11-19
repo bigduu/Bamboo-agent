@@ -13,6 +13,7 @@ to retrieve the bytes. Answer generation can still use a configured model.
 | Memory, Jiandu, Session/Project/Global, lexical, rerank, Dream, 记忆 | `references/memory.md` |
 | Hook, lifecycle_hooks, command, script, timeout, portable plugin, 钩子 | `references/hooks.md` |
 | Provider, model, MCP, desired/applied revision, live-health | `references/providers-mcp.md` |
+| Supervisor Work, tickets, dispatch, pending messages, chat-only resolution | `references/work.md` |
 | Missing recall, setting did not apply, unavailable skill, diagnosis, 排障 | `references/troubleshooting.md` |
 
 This small chapter index is curated lookup, not a new full-text search engine.

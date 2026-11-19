@@ -376,6 +376,17 @@ pub struct MessageResolution {
     pub updated_seq: Option<u64>,
 }
 
+impl MessageResolution {
+    pub fn is_pending_human(&self) -> bool {
+        self.ingress.is_some()
+            && (self.proposal.is_none()
+                || self
+                    .groups
+                    .iter()
+                    .any(|g| g.status == ResolutionStatus::Proposed))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResolutionGroup {
     pub operation_id: String,

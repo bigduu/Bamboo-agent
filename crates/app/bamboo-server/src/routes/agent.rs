@@ -150,6 +150,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
+                .route(
+                    "/ingress/{message_id}",
+                    web::get().to(agent::tickets::inspect_ingress),
+                )
+                .route(
+                    "/ingress/{message_id}/dismiss",
+                    web::post().to(agent::tickets::dismiss_ingress),
+                )
                 .route("/search", web::post().to(agent::tickets::search))
                 .route(
                     "/project-board",
