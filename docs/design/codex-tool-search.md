@@ -73,7 +73,14 @@ request. Provider-native replay checks the active catalog before re-exposing
 discovered definitions. The host BM25 implementation applies to OpenAI client
 search and the compatibility gateway.
 
-An adjacent admission gap remains outside this search slice: a changed schema
-retaining the same execution name can inherit previous loaded membership.
-Same-name definition invalidation requires a separate replay/admission change;
-this slice does not create another loaded-state authority.
+Compatibility discovery derives ordinary Tool membership from the latest
+validated definition stored in the session's discovery results. A definition
+that still matches stays loaded after resume. A changed definition must be
+discovered again before it is declared or callable. The provider-visible
+history drops obsolete definitions while preserving call/result pairing and
+durable history. Scoped legacy Skill and Workflow gateways retain their
+bounded result definitions and existing eligibility checks.
+
+Native search loaders have separate replay contracts. Historical provider
+references that carry only a name cannot establish same-name schema
+continuity.
