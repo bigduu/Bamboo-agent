@@ -2877,8 +2877,23 @@ async fn verify_ledger_source_scopes(
     Ok(verified)
 }
 
-fn normalized_ledger_title(title: &str) -> String {
-    title.trim().to_lowercase()
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct LedgerCandidateIdentity {
+    title: String,
+    kind: RecordKind,
+    due_at: Option<DateTime<Utc>>,
+    starts_at: Option<DateTime<Utc>>,
+}
+
+impl From<&LedgerRecord> for LedgerCandidateIdentity {
+    fn from(record: &LedgerRecord) -> Self {
+        Self {
+            title: record.title.trim().to_lowercase(),
+            kind: record.kind.clone(),
+            due_at: record.time.due_at,
+            starts_at: record.time.starts_at,
+        }
+    }
 }
 
 fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
@@ -2895,9 +2910,9 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// - only `high`/`medium` confidence candidates are written; `low` (or
 ///   missing) confidence is skipped;
 /// - empty or over-long titles are skipped;
-/// - a candidate whose normalized (case-insensitive, trimmed) title matches an
-///   existing open record in that scope, or an earlier candidate there,
-///   is skipped (dedup guard);
+/// - a candidate is skipped if an existing nonterminal record or an earlier
+///   candidate in the same scope has the same trimmed, case-insensitive
+///   title, kind, deadline and start time;
 /// - records are created `Open`, tagged `suggested`, attributed to
 ///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
 ///   reminders are created for suggested records (no schedule-bridge
@@ -2907,7 +2922,8 @@ async fn persist_ledger_candidates(
     candidates: Vec<LedgerExtractionCandidate>,
     verified_sources: &HashMap<String, Option<String>>,
 ) -> Result<usize, String> {
-    let mut seen_by_scope: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+    let mut seen_by_scope: HashMap<Option<String>, HashSet<LedgerCandidateIdentity>> =
+        HashMap::new();
     let mut writes = 0usize;
     for candidate in candidates {
         let Some(session_id) = ledger_candidate_session_id(&candidate) else {
@@ -2934,7 +2950,12 @@ async fn persist_ledger_candidates(
         } else {
             LedgerScope::Global
         };
-        let seen_titles = match seen_by_scope.entry(project_key.clone()) {
+        let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
+        let mut record = LedgerRecord::new(new_record_id(), kind, title);
+        record.time.due_at = parse_candidate_timestamp(candidate.due_at.as_deref());
+        record.time.starts_at = parse_candidate_timestamp(candidate.starts_at.as_deref());
+
+        let seen = match seen_by_scope.entry(project_key.clone()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let existing = ledger
@@ -2944,17 +2965,15 @@ async fn persist_ledger_candidates(
                 entry.insert(
                     existing
                         .iter()
-                        .map(|doc| normalized_ledger_title(&doc.record.title))
+                        .map(|doc| LedgerCandidateIdentity::from(&doc.record))
                         .collect(),
                 )
             }
         };
-        if !seen_titles.insert(normalized_ledger_title(&title)) {
+        if !seen.insert(LedgerCandidateIdentity::from(&record)) {
             continue;
         }
 
-        let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
-        let mut record = LedgerRecord::new(new_record_id(), kind, title);
         record.scope = scope;
         record.project_key = project_key.clone();
         record.source.session_id = Some(session_id.to_string());
@@ -2966,9 +2985,6 @@ async fn persist_ledger_candidates(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
         record.tags = vec!["suggested".to_string()];
-        record.time.due_at = parse_candidate_timestamp(candidate.due_at.as_deref());
-        record.time.starts_at = parse_candidate_timestamp(candidate.starts_at.as_deref());
-
         let title_for_error = record.title.clone();
         ledger.write_record(record, None).await.map_err(|error| {
             format!("failed to persist ledger candidate '{title_for_error}': {error}")
@@ -7274,8 +7290,14 @@ mod tests {
             candidate("   ", "todo", None, None, Some("high")),
             // Skipped: title longer than the record title cap.
             candidate(&long_title, "todo", None, None, Some("high")),
-            // Skipped: in-batch duplicate (case-insensitive, trimmed).
-            candidate("  RENEW PASSPORT  ", "todo", None, None, Some("high")),
+            // Skipped: same kind, normalized title, and UTC deadline.
+            candidate(
+                "  RENEW PASSPORT  ",
+                "todo",
+                Some("2026-08-01T02:00:00+02:00"),
+                None,
+                Some("high"),
+            ),
             // Written despite malformed timestamps (they parse to None).
             candidate(
                 "Call the bank",
@@ -7349,11 +7371,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_ledger_candidates_preserves_distinct_deadlines_kinds_and_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = LedgerStore::new(dir.path());
+        let first_due = "2026-08-01T00:00:00Z";
+        let later_due = "2026-09-01T00:00:00Z";
+        let starts_at = "2026-07-31T22:00:00Z";
+        let mut existing = LedgerRecord::new("rec_confirmed", RecordKind::Todo, "Renew membership");
+        existing.time.due_at = parse_candidate_timestamp(Some(first_due));
+        existing.status = bamboo_domain::ledger::RecordStatus::InProgress;
+        ledger
+            .write_record(existing.clone(), Some("Confirmed details".into()))
+            .await
+            .unwrap();
+        let candidate = |scope_source: &str, kind: &str, due_at: &str, start: Option<&str>| {
+            LedgerExtractionCandidate {
+                title: "  RENEW membership  ".into(),
+                kind: kind.into(),
+                due_at: Some(due_at.into()),
+                starts_at: start.map(ToOwned::to_owned),
+                session_id: Some(scope_source.into()),
+                confidence: Some("high".into()),
+                ..Default::default()
+            }
+        };
+        let candidates = vec![
+            candidate("global-source", "todo", "2026-08-01T03:00:00+03:00", None),
+            candidate("global-source", "todo", later_due, None),
+            candidate("global-source", "todo", "2026-08-31T20:00:00-04:00", None),
+            candidate("global-source", "reminder", first_due, None),
+            candidate("global-source", "todo", first_due, Some(starts_at)),
+            candidate("project-source", "todo", first_due, None),
+        ];
+        let sources = HashMap::from([
+            ("global-source".into(), None),
+            ("project-source".into(), Some("project-fixture".into())),
+        ]);
+        assert_eq!(
+            persist_ledger_candidates(&ledger, candidates.clone(), &sources)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            persist_ledger_candidates(&ledger, candidates, &sources)
+                .await
+                .unwrap(),
+            0
+        );
+        let global = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(global.len(), 4);
+        let confirmed = global
+            .iter()
+            .find(|doc| doc.record.id == existing.id)
+            .unwrap();
+        assert_eq!(confirmed.record.status, existing.status);
+        assert_eq!(confirmed.body, "Confirmed details");
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Todo
+                && doc.record.time.due_at == parse_candidate_timestamp(Some(later_due))
+        }));
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Reminder
+                && doc.record.time.due_at == existing.time.due_at
+        }));
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Todo
+                && doc.record.time.due_at == existing.time.due_at
+                && doc.record.time.starts_at == parse_candidate_timestamp(Some(starts_at))
+        }));
+        let project = ledger
+            .list_records(
+                LedgerScope::Project,
+                Some("project-fixture"),
+                &RecordFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].record.tags, vec!["suggested".to_string()]);
+    }
+
+    #[tokio::test]
     async fn persist_ledger_candidates_dedups_against_existing_open_records() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let ledger = LedgerStore::new(temp_dir.path());
 
-        // Pre-existing OPEN record with the same normalized title → skip.
+        // Pre-existing open record with the same untimed identity → skip.
         ledger
             .write_record(
                 LedgerRecord::new(new_record_id(), RecordKind::Todo, "Renew passport"),
