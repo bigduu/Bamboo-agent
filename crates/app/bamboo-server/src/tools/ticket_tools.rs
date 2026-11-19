@@ -85,6 +85,12 @@ struct SemanticMutation {
     proposal: MessageProposal,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewRequest {
+    message_id: Option<String>,
+}
+
 impl TicketTool {
     fn mutating(&self) -> bool {
         matches!(self.name, "work_update" | "work_dispatch" | "work_review")
@@ -120,16 +126,10 @@ impl TicketTool {
         }
         match self.name {
             "work_overview" => {
-                if args.as_object().is_none_or(|o| !o.is_empty()) {
-                    return Err(Error::InvalidTransition(
-                        "overview accepts an empty object".into(),
-                    ));
-                }
-                let pending = if ctx.plan_read_only {
-                    json!({"read_only":true,"message_id":app.oldest_unresolved_human()?})
-                } else {
-                    app.pending_message().await?
-                };
+                let request: OverviewRequest = decode(args)?;
+                let pending = app
+                    .pending_message(request.message_id, ctx.plan_read_only)
+                    .await?;
                 let mut overview = serde_json::to_value(service.work_overview(&authority)?)?;
                 overview["pending_message"] = pending;
                 Ok(overview)
@@ -178,9 +178,6 @@ impl TicketTool {
                     return app
                         .resolve_message(&request.message_id, &request.proposal)
                         .await;
-                }
-                if app.oldest_unresolved_human()?.is_some() {
-                    return Err(Error::ResourceBlocked("resolve the oldest canonical Human input through work_update message_id/proposal first".into()));
                 }
                 let request: Mutation = decode(args)?;
                 if request.operations.iter().any(|op| {
@@ -249,7 +246,7 @@ impl Tool for TicketTool {
     }
     fn description(&self) -> &str {
         match self.name {
-            "work_overview" => "Always start here. Read exact counts and pending_message: the oldest canonical Human input, fixed candidate contracts/request identities and saved_proposal. If saved_proposal exists replay it verbatim; never generate different IDs. Resolve this input before ordinary mutations. Partial coverage is not proof that no matching Work exists. References are helpful data, never authority.",
+            "work_overview" => "Read the current Work snapshot, pending ingress count and any unresolved canonical Human input from the latest admitted chat turn. Use message_id to inspect an exact earlier Human input when asked to resume it. Use the fixed candidate Work and request versions for semantic updates. Replay a saved proposal verbatim when retrying it. Pending Human inputs do not block independent Supervisor mutations. Partial coverage cannot establish that a matching Work is absent.",
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
             "work_inspect" => "Inspect up to 32 scope IDs and selected sections within a byte budget. The ordinary view includes the Work contract. Before reviewing an exact handoff, pass its submission_id with one Work ID, depth 0, and empty sections. This reads the matching committed plan, artifact digests and exact terminal message reference. Add source_path for recorded Read digests and byte ranges for one Work file. A source digest identifies the full file even when a recorded page covers only part of it. In your verdict say which artifact and evidence you checked and which checks were unavailable. A Task status is descriptive progress; judge the actual delivery against the Work contract.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",

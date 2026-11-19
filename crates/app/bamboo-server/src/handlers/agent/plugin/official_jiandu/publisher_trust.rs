@@ -214,7 +214,7 @@ pub async fn trust_official_jiandu(
             "reviewed Jiandu publisher identity changed; refresh setup".into(),
         ));
     }
-    let report = match setup(&state, Host::detect(), accepted_release()).await {
+    let report = match setup(&state, Host::detect(), &accepted_catalog()).await {
         Ok(report) => report,
         Err(error) => return Ok(plugin_error_response(&error)),
     };

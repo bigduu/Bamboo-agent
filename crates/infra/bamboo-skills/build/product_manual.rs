@@ -15,6 +15,7 @@ pub const RESOURCES: &[&str] = &[
     "references/memory.md",
     "references/hooks.md",
     "references/providers-mcp.md",
+    "references/work.md",
     "references/troubleshooting.md",
 ];
 

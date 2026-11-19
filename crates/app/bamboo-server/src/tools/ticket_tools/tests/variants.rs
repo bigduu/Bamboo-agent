@@ -125,7 +125,6 @@ async fn supervisor_without_pending_human_can_reject_but_not_accept_user_require
         .unwrap();
     let submitted = service.execute(&worker, &submit).unwrap();
     let submission = submitted.ids["s"].clone();
-    assert!(f.app.oldest_unresolved_human().unwrap().is_none());
     let before = service.published().unwrap().1;
     let tool = f.tool("work_update");
     let forged_human = invoke(

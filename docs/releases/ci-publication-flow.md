@@ -67,6 +67,11 @@ has advanced. It does not build or test the controller revision. The allocator
 chooses the release version; use the resulting tag and original artifacts for
 promotion.
 
+The frozen publisher fills the GitHub Release body with change subjects and
+linked commit SHAs. It compares the accepted source with the previous published
+stable ancestor and links the full Git history. The existing signed provenance
+block continues to supply the machine-readable receipt.
+
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
 If infrastructure fails, retain successful outputs and retry only the missing
@@ -142,6 +147,31 @@ of that publisher after the recovery completes. Its finalizer uses the
 attempt-1 native outputs and publishes the v3 manifest for the same tag and
 source. The procedure requires the original retained transports and their
 unexpired identities.
+
+### Fixed v2026.11.31 crate recovery
+
+Issue #2840 binds draft 450766353 and source
+`1387680f8ce96d808ba48b7b570fba5dded4e021` to [publisher 44437436231](https://github.com/bigduu/Bamboo-agent/actions/runs/44437436231).
+The attempt-1 registry read terminated with an incomplete HTTP response body.
+The original publisher retains the crate archive and signs its checksum before
+it reads the registry again. The signed prefix ends at `bamboo-sdk`. The fixed
+controller binds that failure, the 26 original crate checksums, the sealed
+frontend and five original native transports. It retries bounded registry reads
+through full body consumption and verifies the exact Cargo download path.
+The four crates starting with `bamboo-server` use the existing signed
+first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev:
+
+```bash
+gh workflow run recover-crate-2026-11-31.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Verify signed readback of `recovery20261131.completed=true` with no pending
+compilation, `receipt.completed=false` and `publisherRunId=44437436231`. Retry
+only the original run's failed jobs. The original pipeline publishes its
+retained v3 executables with the existing draft, source and tag.
 
 ## Main and consumers
 

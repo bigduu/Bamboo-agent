@@ -5,7 +5,7 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { test } = require('node:test')
 const { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
-  plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
+  plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt, releaseNotes,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
@@ -371,6 +371,62 @@ test('date sequence advances beyond crate versions, tags and draft reservations 
   for (const value of ['', '0.0.0', 'latest', '2026.10.8\nX=secret', '2026.10.8;false']) {
     assert.throws(() => assertVersion(value))
   }
+})
+
+test('GitHub notes use the previous published ancestor and preserve the signed receipt', () => {
+  const base = '1'.repeat(40), unrelated = '2'.repeat(40), draft = '3'.repeat(40)
+  const stable = { id: 10, tag_name: 'v2026.11.29', target_commitish: base, draft: false, prerelease: false,
+    published_at: '2026-11-18T14:00:00Z' }
+  const routes = []
+  const commits = [
+    { sha: '4'.repeat(40), parents: [{}], commit: { message: 'feat: add \x40team <tools>\nlast details' } },
+    { sha: '5'.repeat(40), parents: [{}], commit: { message: 'fix(release): preserve checksums' } },
+    { sha: '6'.repeat(40), parents: [{}, {}], commit: { message: 'Merge pull request' } },
+  ]
+  const notes = releaseNotes(identity.repository, sourceRevision, 13, [stable,
+    { ...stable, id: 11, draft: true, target_commitish: draft, tag_name: 'v2026.11.30' },
+    { ...stable, id: 14, prerelease: true, target_commitish: draft, published_at: '2026-11-18T17:00:00Z' },
+    { ...stable, id: 12, target_commitish: unrelated, published_at: '2026-11-18T15:00:00Z' },
+    { ...stable, id: 13, target_commitish: sourceRevision, published_at: '2026-11-18T16:00:00Z' },
+  ], route => {
+    routes.push(route)
+    return route.includes(unrelated)
+      ? { behind_by: 1, merge_base_commit: { sha: '7'.repeat(40) } }
+      : { behind_by: 0, merge_base_commit: { sha: base }, commits, total_commits: commits.length }
+  })
+  assert.deepEqual(routes, [unrelated, base].map(sha => `compare/${sha}...${sourceRevision}?per_page=100`))
+  assert.match(notes, /改了什么/)
+  assert.match(notes, /add &#64;team &lt;tools&gt;/)
+  assert.ok(notes.includes(`/commit/${commits[0].sha}`))
+  assert.ok(notes.includes(`/compare/${base}...${sourceRevision}`))
+  assert.doesNotMatch(notes, /last details|Merge pull request/)
+  const receipt = makeReceipt({ completed: true })
+  signReceipt(receipt, signingKey)
+  const body = receiptBody(receipt, notes)
+  assert.ok(body.endsWith(receiptBody(receipt)))
+  assert.deepEqual(readBodyReceipt({ body }), receipt)
+  assert.deepEqual(authenticateReceipt(readBodyReceipt({ body }), signingKey), receipt)
+})
+
+test('GitHub notes bound the preview and link the complete history for the first release', () => {
+  const notes = releaseNotes(identity.repository, sourceRevision, 10, [], route => {
+    assert.equal(route, `commits?sha=${sourceRevision}&per_page=100`)
+    return Array.from({ length: 100 }, (_, i) => ({ sha: i.toString(16).padStart(40, '0'),
+      parents: [], commit: { message: 'chore: document setup' } }))
+  })
+  assert.match(notes, /See the full history for additional commits/)
+  assert.ok(notes.includes(`/commits/${sourceRevision}`))
+  assert.equal(notes.match(/\/commit\//g).length, 100)
+})
+
+test('GitHub notes describe a release made from the same source as the last stable release', () => {
+  const previous = { id: 9, tag_name: 'v2026.11.29', target_commitish: sourceRevision, draft: false, prerelease: false,
+    published_at: '2026-11-18T14:00:00Z' }
+  const notes = releaseNotes(identity.repository, sourceRevision, 10, [previous], () => ({
+    behind_by: 0, merge_base_commit: { sha: sourceRevision }, commits: [], total_commits: 0,
+  }))
+  assert.match(notes, /uses the same source/)
+  assert.match(notes, /Full Git history/)
 })
 
 test('automatic counters preserve the full Cargo u64 range and stop before reserving an exhausted month', async () => {
@@ -1944,6 +2000,47 @@ test('frozen recovery retries transient registry GET responses with a bounded de
     assert.equal(closed, expectedWaits.length)
     assert.deepEqual(waits, expectedWaits)
   }
+})
+
+test('2840 retries a truncated registry body and returns the complete verified download', async () => {
+  const { retryRegistryRead } = require('./frozen-crate-recovery-controller.cjs')
+  const incomplete = new TypeError('terminated', { cause: { code: 'UND_ERR_RES_CONTENT_LENGTH_MISMATCH' } })
+  const truncated = { ok: true, status: 200, body: {}, arrayBuffer: async () => { throw incomplete } }
+  const calls = []
+  let reads = 0
+  const result = await retryRegistryRead(async () => {
+    reads++
+    return reads === 1 ? truncated : new Response('complete archive')
+  }, async delay => { calls.push(delay) }, true)
+  assert.equal(await result.text(), 'complete archive')
+  assert.equal(reads, 2)
+  assert.deepEqual(calls, [2000])
+
+  reads = 0
+  calls.length = 0
+  await assert.rejects(retryRegistryRead(async () => {
+    reads++
+    return truncated
+  }, async delay => { calls.push(delay) }, true), error => error === incomplete)
+  assert.equal(reads, 5)
+  assert.deepEqual(calls, [2000, 4000, 8000, 16000])
+})
+
+test('2840 binds the failed execution, exact unstarted tail and retained native transports', () => {
+  const recovery = require('./crate-release-2026-11-31-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const now = Date.parse('2026-11-19T03:00:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-22T02:00:00Z')
+  assert.equal(recovery.originalEvidence(read, now).id, 44437436231)
+  assert.deepEqual(TAIL, ['bamboo-server', 'bamboo-client-core', 'bamboo-tui', 'bamboo-agent'])
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  const receipt = { crates: [...Array.from({ length: 25 }, (_, index) => 'retained-' + index), 'bamboo-sdk', ...TAIL] }
+  assert.throws(() => recovery.verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, null), /published prefix disappeared/)
+  assert.equal(recovery.verifyRegistryMetadata(receipt, 'bamboo-server', TARGET.version, null), null)
+  const artifact = routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts.at(-1)
+  const expected = artifact.digest
+  artifact.digest = 'sha256:' + '0'.repeat(64)
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION', actual: artifact.digest, expected })
 })
 
 const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')

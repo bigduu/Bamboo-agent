@@ -44,6 +44,24 @@
       "aliases": [],
       "default": false,
       "example": true,
+      "key": "features.ticket_dispatch",
+      "meaning": "Allow fresh Work execution admission. Work record changes and scope initialization use features.ticket_mutation.",
+      "section": "providers",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": false,
+      "example": true,
+      "key": "features.ticket_mutation",
+      "meaning": "Allow Work scope initialization and record changes for the canonical Supervisor. Existing readable scopes can still be inspected when disabled.",
+      "section": "providers",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": false,
+      "example": true,
       "key": "lifecycle_hooks.enabled",
       "meaning": "Native lifecycle-hook switch; handler configuration and authorization remain separate.",
       "section": "hooks",
@@ -528,8 +546,8 @@
       "section": "core"
     },
     {
-      "coverage": "not_documented",
-      "documented_entries": 0,
+      "coverage": "selected_fields",
+      "documented_entries": 2,
       "kind": "compatibility_dto_field",
       "root": "features",
       "section": "providers"

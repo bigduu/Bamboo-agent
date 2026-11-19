@@ -16,7 +16,11 @@ pub fn parameters(name: &str) -> Value {
     let cursor = json!({"anyOf":[{"type":"null"},object(json!({"commit":id,"query_hash":id,"offset":{"type":"integer","minimum":0}}), &["commit","query_hash","offset"])]});
     let limit = json!({"type":"integer", "minimum":1, "maximum":100});
     match name {
-        "work_overview" => object(json!({}), &[]),
+        "work_overview" => object(
+            json!({"message_id":{"type":"string","minLength":1,"maxLength":128,
+                "description":"Select an exact earlier canonical Human input. Omit to inspect the latest admitted Human turn."}}),
+            &[],
+        ),
         "work_search" => object(
             json!({"filter":object(json!({
             "query":{"type":"string","maxLength":512}, "kind":{"type":["string","null"],"enum":["goal","work","step",null]},

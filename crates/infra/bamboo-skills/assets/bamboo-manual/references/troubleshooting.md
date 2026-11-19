@@ -5,6 +5,12 @@ the smallest authorized observation. Keep product knowledge separate from
 instance evidence. If time, scope, revision or coverage is missing, say what is
 unknown. This chapter does not collect diagnostic data automatically.
 
+## Supervisor Work
+
+Check `GET /api/v1/tickets/scope` for the scope's availability, storage health and
+the Work feature flags. The Work chapter explains setup and pending message
+review. See [Supervisor Work](work.md).
+
 ## A setting did not take effect
 
 Check whether the key refers to the compatibility view or the typed section
