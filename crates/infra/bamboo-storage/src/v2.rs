@@ -3963,6 +3963,24 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    /// Scheduling hint read by the Inbox under its retained lifecycle scope.
+    /// It must not acquire Task or Session guards in reverse Inbox order.
+    pub(crate) async fn actor_inbox_target_birth_under_lifecycle(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<DateTime<Utc>>> {
+        let Some(session) = self
+            .load_runtime_control_plane_unchecked(session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .root_actor_input_required(&session)
+            .await?
+            .then_some(session.created_at))
+    }
+
     async fn load_runtime_control_plane_unchecked(
         &self,
         session_id: &str,
@@ -8040,8 +8058,11 @@ impl SessionStoreV2 {
             })?;
             let mut outcomes = if let Some(input) = guards.input.clone() {
                 let durable = durable.clone();
-                Self::default_writer_job(guards, move || input.outcomes_after_input(&durable))
-                    .await?
+                let runtime = previous_sidecar.clone();
+                Self::default_writer_job(guards, move || {
+                    input.outcomes_after_input(&durable, runtime.as_ref())
+                })
+                .await?
             } else {
                 durable_outcomes.cloned()
             };

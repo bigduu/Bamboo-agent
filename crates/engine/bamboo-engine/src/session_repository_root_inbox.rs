@@ -1,8 +1,9 @@
 //! A bounded provider-boundary consumer for ordinary Root inputs.
 use super::*;
 use bamboo_domain::{
-    ActorActivationStatus, RootActorRuntimeWrite, RootInboxAdmission, SessionInboxConsumerId,
-    SessionInboxError, SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
+    ActorActivationStatus, RootActorRuntimeWrite, RootInboxAdmission, SessionActivationPolicy,
+    SessionInboxConsumerId, SessionInboxError, SessionInboxLeaseRequest, SessionInboxOwnedClaim,
+    SessionInboxPort, SessionInboxReceipt, SessionRuntimeStartup,
 };
 use std::io;
 
@@ -62,6 +63,24 @@ enum InputAdmission {
     New(Box<bamboo_domain::Message>),
 }
 
+#[derive(Clone, Copy)]
+enum RootInputSelection<'a> {
+    Any,
+    Bound(&'a RootInboxSelection),
+    Work(&'a bamboo_domain::SessionMessageId),
+    Runtime(&'a SessionInboxReceipt),
+}
+
+impl RootInputSelection<'_> {
+    fn receipt(&self) -> Option<&SessionInboxReceipt> {
+        match self {
+            Self::Bound(selection) => Some(selection.receipt()),
+            Self::Runtime(receipt) => Some(receipt),
+            Self::Any | Self::Work(_) => None,
+        }
+    }
+}
+
 impl SessionRepository {
     pub(super) async fn admit_owned_root_inbox(
         &self,
@@ -75,6 +94,9 @@ impl SessionRepository {
         };
         if session.id != owner.fence.actor_id
             || expected_work_input.is_some() && active_run_id != Some(owner.fence.run_id.as_str())
+            || expected_work_input
+                .zip(self.root_inbox_receipt.as_ref())
+                .is_some_and(|(expected, selection)| expected != &selection.receipt().id)
         {
             return Err(io::Error::other("Root Inbox execution target mismatch"));
         }
@@ -82,10 +104,15 @@ impl SessionRepository {
         let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
         let consumer = SessionInboxConsumerId::new();
         let mut admission = RootInboxAdmission::default();
-        let limit = if self.root_inbox_receipt.is_some() || expected_work_input.is_some() {
-            1
-        } else {
+        let selection = match (self.root_inbox_receipt.as_ref(), expected_work_input) {
+            (Some(selection), _) => RootInputSelection::Bound(selection),
+            (None, Some(id)) => RootInputSelection::Work(id),
+            (None, None) => RootInputSelection::Any,
+        };
+        let limit = if matches!(selection, RootInputSelection::Any) {
             128
+        } else {
+            1
         };
         for _ in 0..limit {
             match self
@@ -96,7 +123,7 @@ impl SessionRepository {
                     directory.as_ref(),
                     owner,
                     &consumer,
-                    expected_work_input,
+                    selection,
                 )
                 .await
             {
@@ -114,6 +141,67 @@ impl SessionRepository {
         }
         Ok(Some(admission))
     }
+    pub(super) async fn admit_owned_root_runtime_startup(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn SessionInboxPort>,
+        startup: &SessionRuntimeStartup,
+        run_id: &str,
+    ) -> io::Result<bamboo_domain::Message> {
+        let (directory, owner) = self
+            .root_actor_owner
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Runtime Inbox startup requires an owned Root"))?;
+        if self.root_inbox_receipt.is_some()
+            || owner.fence.run_id != run_id
+            || owner.fence.actor_id != session.id
+            || startup.target_created_at != owner.created_at
+            || session.created_at != owner.created_at
+        {
+            return Err(io::Error::other("Runtime Inbox startup target changed"));
+        }
+        let latest = self
+            .storage
+            .load_session(&session.id)
+            .await?
+            .ok_or_else(|| io::Error::other("Runtime Inbox startup target disappeared"))?;
+        if latest.created_at != owner.created_at
+            || crate::ticket_runtime::is_managed_work_root(&latest)
+            || session.check_conversation_generation(&latest).is_err()
+            || latest.has_pending_question()
+            || latest
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            || latest.has_runtime_wait()
+        {
+            return Err(io::Error::other(
+                "Runtime Inbox startup target has a conflicting gate",
+            ));
+        }
+        let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
+        let mut selected = latest;
+        match self
+            .admit_one_root_input(
+                &mut selected,
+                inbox,
+                Some(run_id),
+                directory.as_ref(),
+                owner,
+                &SessionInboxConsumerId::new(),
+                RootInputSelection::Runtime(&startup.receipt),
+            )
+            .await?
+        {
+            InputAdmission::New(message) => {
+                *session = selected;
+                Ok(*message)
+            }
+            InputAdmission::Empty | InputAdmission::Recovered => Err(io::Error::other(
+                "selected Runtime Inbox startup receipt is no longer pending",
+            )),
+        }
+    }
+
     async fn admit_one_root_input(
         &self,
         session: &mut Session,
@@ -122,25 +210,19 @@ impl SessionRepository {
         directory: &dyn bamboo_domain::ActorDirectoryPort,
         owner: &RootActorRuntimeWrite,
         consumer: &SessionInboxConsumerId,
-        expected_work_input: Option<&bamboo_domain::SessionMessageId>,
+        selection: RootInputSelection<'_>,
     ) -> io::Result<InputAdmission> {
-        let claim_once =
-            async |request: &SessionInboxLeaseRequest| match self.root_inbox_receipt.as_ref() {
-                Some(selection) => {
-                    inbox
-                        .claim_owned_receipt(
-                            &session.id,
-                            selection.receipt(),
-                            Some(&owner.fence.run_id),
-                            request,
-                        )
-                        .await
-                }
-                None => inbox
-                    .claim_owned(&session.id, 1, active_run_id, request)
+        let claim_once = async |request: &SessionInboxLeaseRequest| match selection.receipt() {
+            Some(receipt) => {
+                inbox
+                    .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), request)
                     .await
-                    .map(|claims| claims.into_iter().next()),
-            };
+            }
+            None => inbox
+                .claim_owned(&session.id, 1, active_run_id, request)
+                .await
+                .map(|claims| claims.into_iter().next()),
+        };
         let request = lease_request(directory, owner, consumer).await?;
         let claim = match claim_once(&request).await {
             // This error comes from before the queue was touched. Refresh the
@@ -171,13 +253,13 @@ impl SessionRepository {
             .map_err(io::Error::other)?;
         pending.claim = Some(claim.clone());
         let envelope = &claim.claim.envelope;
-        if expected_work_input.is_some_and(|expected| &envelope.id != expected) {
-            return Err(io::Error::other(
-                "Root input differs from the reserved Work dispatch",
-            ));
-        }
-        match self.root_inbox_receipt.as_ref() {
-            Some(RootInboxSelection::Human(_))
+        match selection {
+            RootInputSelection::Work(expected) if &envelope.id != expected => {
+                return Err(io::Error::other(
+                    "Root input differs from the reserved Work dispatch",
+                ));
+            }
+            RootInputSelection::Bound(RootInboxSelection::Human(_))
                 if envelope.source != bamboo_domain::SessionMessageSource::User
                     || envelope.kind != bamboo_domain::SessionMessageKind::UserInput =>
             {
@@ -185,11 +267,20 @@ impl SessionRepository {
                     "Selected Root receipt is not an ordinary User input",
                 ));
             }
-            Some(RootInboxSelection::PacedLoop(_))
+            RootInputSelection::Bound(RootInboxSelection::PacedLoop(_))
                 if envelope.paced_loop_run_id() != Some(owner.fence.run_id.as_str()) =>
             {
                 return Err(io::Error::other(
                     "Selected paced Loop receipt does not belong to this Root turn",
+                ));
+            }
+            RootInputSelection::Runtime(_)
+                if envelope.background_exec_completion_handle().is_none()
+                    || claim.claim.activation_policy
+                        != SessionActivationPolicy::RespectSpecificWait =>
+            {
+                return Err(io::Error::other(
+                    "selected Runtime Inbox receipt is not an eligible command completion",
                 ));
             }
             _ => {}

@@ -112,6 +112,7 @@ impl RootActorInputProof {
     pub(super) fn outcomes_after_input(
         &self,
         durable: &Session,
+        runtime: Option<&Session>,
     ) -> io::Result<Option<bamboo_domain::SupervisedRootOutcomes>> {
         self.root.validate_deadline(self.claim.lease.expires_at)?;
         let (envelope, intent, message_policy) = self
@@ -124,6 +125,20 @@ impl RootActorInputProof {
                 false,
             )
             .map_err(conflict)?;
+        if intent.is_none()
+            && message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
+            && envelope.background_exec_completion_handle().is_some()
+            && std::iter::once(durable).chain(runtime).any(|source| {
+                source.has_pending_question()
+                    || source
+                        .metadata
+                        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            })
+        {
+            return Err(conflict(
+                "background command completion has a newer Human gate",
+            ));
+        }
         let origin = intent
             .as_ref()
             .and_then(bamboo_domain::SessionInboxActivationIntent::supervised_root_origin)

@@ -2095,6 +2095,84 @@ impl FileSessionInbox {
         Ok(result)
     }
 
+    fn wake_envelope(
+        wrapper: &InboxMessage,
+        target: &str,
+    ) -> Result<SessionMessageEnvelope, SessionInboxError> {
+        let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        envelope
+            .validate()
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        if envelope.target_session_id != target {
+            return Err(invalid("Inbox target mismatch"));
+        }
+        Ok(envelope)
+    }
+
+    /// The caller retains Inbox and lifecycle authority. This is only a
+    /// nomination: admission still checks the exact receipt against the Actor.
+    async fn runtime_startup_target_birth(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        original_intent: Option<&SessionInboxActivationIntent>,
+        coordinator_policy: Option<SessionActivationPolicy>,
+    ) -> Result<Option<DateTime<Utc>>, SessionInboxError> {
+        if original_intent.is_some()
+            || coordinator_policy != Some(SessionActivationPolicy::RespectSpecificWait)
+            || envelope.background_exec_completion_handle().is_none()
+        {
+            return Ok(None);
+        }
+        self.sessions
+            .actor_inbox_target_birth_under_lifecycle(&envelope.target_session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))
+    }
+
+    pub(super) async fn inspect_runtime_startup_impl(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<Option<bamboo_domain::SessionRuntimeStartup>, SessionInboxError> {
+        if generation == 0 {
+            return Ok(None);
+        }
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
+        let mut matches = entries
+            .into_iter()
+            .filter(|(found, _, _)| *found == generation);
+        let Some((_, _, path)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(invalid("ambiguous Inbox startup generation"));
+        }
+        let (wrapper, _) = self.read_owned_transport(&path).await?;
+        let envelope = Self::wake_envelope(&wrapper, target)?;
+        let original_intent = Self::activation_intent(&wrapper.body)?;
+        let coordinator_policy =
+            Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                .map(|intent| intent.policy())
+                .transpose()?;
+        // Identity is independent of which candidate is ready, lease expiry,
+        // and whether a permanent ACK still needs to remove its transport.
+        let target_created_at = self
+            .runtime_startup_target_birth(&envelope, original_intent.as_ref(), coordinator_policy)
+            .await?;
+        Ok(
+            target_created_at.map(|target_created_at| bamboo_domain::SessionRuntimeStartup {
+                receipt: SessionInboxReceipt {
+                    id: envelope.id,
+                    generation,
+                },
+                target_created_at,
+            }),
+        )
+    }
+
     /// Read the first item that a fresh consumer could claim now, or the
     /// earliest eligible lease transition. This holds the same lifecycle,
     /// process and cross-process Inbox locks as `claim_owned_impl` throughout
@@ -2130,14 +2208,7 @@ impl FileSessionInbox {
             if !Self::wake_eligible(generation, prefix, activation.clone()) {
                 continue;
             }
-            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            envelope
-                .validate()
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            if envelope.target_session_id != target {
-                return Err(invalid("Inbox target mismatch"));
-            }
+            let envelope = Self::wake_envelope(&wrapper, target)?;
             if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
                 if receipt.delivery.generation != generation
                     || receipt.intent != intent
@@ -2174,17 +2245,28 @@ impl FileSessionInbox {
                 result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
                 continue;
             }
+            let coordinator_message_policy =
+                Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                    .map(|intent| intent.policy())
+                    .transpose()?;
+            let runtime_startup_target_birth =
+                if policy == SessionActivationPolicy::RespectSpecificWait {
+                    self.runtime_startup_target_birth(
+                        &envelope,
+                        intent.as_ref(),
+                        coordinator_message_policy,
+                    )
+                    .await?
+                } else {
+                    None
+                };
             let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,
                 activation_policy: policy,
                 coordinator_generation: prefix,
-                coordinator_message_policy: Self::activation_intent_field(
-                    &wrapper.body,
-                    COORDINATOR_INTENT_KEY,
-                )?
-                .map(|intent| intent.policy())
-                .transpose()?,
+                coordinator_message_policy,
+                runtime_startup_target_birth,
                 lease_epoch,
                 ready_after,
             };

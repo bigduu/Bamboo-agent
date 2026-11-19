@@ -12,7 +12,7 @@ use super::{
     ActorActivationFence, Message, MessagePhase, ResponseOccurrence, Role, Session,
     SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxReceipt, SessionKind,
     SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
-    SessionMessageSource, SupervisorReference,
+    SupervisorReference,
 };
 use crate::SupervisorCurrentUserTarget;
 
@@ -824,31 +824,6 @@ fn fact_matches_fence(fact: &SupervisedRootOutcomeFact, fence: &ActorActivationF
         && fact.lease_owner_sha256 == lease_owner_digest(&fence.lease_owner)
 }
 
-fn background_exec_completion_handle(completion: &SessionMessageEnvelope) -> Option<&str> {
-    if completion.kind != SessionMessageKind::RuntimeInstruction
-        || !matches!(&completion.source, SessionMessageSource::Runtime { subsystem }
-            if subsystem == "background_exec")
-    {
-        return None;
-    }
-    let SessionMessageBody::RuntimeInstruction(instruction) = &completion.body else {
-        return None;
-    };
-    let data = instruction.data.as_ref()?;
-    let handle = data["exec_session_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())?;
-    (instruction.instruction == "background_exec_completed"
-        && data["session_id"].as_str() == Some(completion.target_session_id.as_str())
-        && completion.correlation_id.as_deref() == Some(handle)
-        && matches!(
-            data["status"].as_str(),
-            Some("completed" | "killed" | "error")
-        )
-        && completion.id == SessionMessageId::stable("background_exec_completion", data))
-    .then_some(handle)
-}
-
 // Projection-only decoding of the existing Actor input checkpoint metadata.
 // Message metadata is already a Value, so duplicate raw JSON keys may have
 // been folded before this check. The physical Actor/Inbox proof and strict raw
@@ -1459,7 +1434,7 @@ impl SupervisedRootOutcomes {
         {
             return Ok(false);
         }
-        let Some(handle) = background_exec_completion_handle(completion) else {
+        let Some(handle) = completion.background_exec_completion_handle() else {
             return Ok(false);
         };
         let Some(wait) = durable
@@ -1720,7 +1695,7 @@ impl SupervisedRootOutcomes {
                     SessionMessageKind::UserInput | SessionMessageKind::PeerMessage
                 ) && matches!(&envelope.body, SessionMessageBody::Content(content) if content.parts.is_empty() && !content.text.trim().is_empty());
                 let owned_exec_completion = input.supervisor_origin.is_none()
-                    && background_exec_completion_handle(&envelope).is_some()
+                    && envelope.background_exec_completion_handle().is_some()
                     && main.session_inbox_admission().is_some_and(|cursor| {
                         cursor.contains_at_sequence(&input.receipt_id, input.generation)
                     });
@@ -1970,6 +1945,7 @@ impl SupervisedRootOutcomes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionMessageSource;
 
     fn occurrence(id: &str) -> ResponseOccurrence {
         ResponseOccurrence {
