@@ -301,6 +301,15 @@ impl SkillManager {
         Self::with_config_and_reuse_drafts(config, ReuseDraftConfig::default())
     }
 
+    #[cfg(feature = "test-utils")]
+    pub fn with_snapshot_budget_for_test(config: SkillStoreConfig, bytes: usize) -> Self {
+        let mut manager = Self::with_config(config);
+        Arc::get_mut(&mut manager.store)
+            .expect("new SkillStore is exclusively owned")
+            .set_snapshot_budget_for_test(bytes);
+        manager
+    }
+
     /// Create a manager with an explicit repeated-trace draft policy.
     pub fn with_config_and_reuse_drafts(
         config: SkillStoreConfig,
