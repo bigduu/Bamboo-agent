@@ -203,7 +203,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2851 keeps paced Loop host/HTTP tests in default server-app-state and
 // server-handlers. The #2875 Runtime append and wait regressions belong
 // to the existing Engine packages-3 owner.
-const FEATURE_SOURCE_SHA256 = "c1bdfa876a4a6c515e1f38b8b193a96baed27c5e80c3b32411d27fe294c18eb8";
+// #2882 changes live external-memory projection in the feature-sensitive
+// stream runner. Its wire regression stays in the existing Engine owner.
+const FEATURE_SOURCE_SHA256 = "f1d046589e0628f5929c2b8b66b1d9b96715e647b15d8b77981d38454d9a943a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
