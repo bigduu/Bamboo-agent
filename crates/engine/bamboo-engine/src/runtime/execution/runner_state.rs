@@ -352,6 +352,7 @@ mod tests {
         AgentEvent::SubAgentCompleted {
             parent_session_id: "parent".to_string(),
             child_session_id: child_session_id.to_string(),
+            completion_id: None,
             status: status.to_string(),
             error: None,
         }

@@ -453,6 +453,9 @@ pub enum AgentEvent {
     SubAgentCompleted {
         parent_session_id: String,
         child_session_id: String,
+        /// Stable identity of a source-backed terminal result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_id: Option<String>,
         /// One of: "completed" | "cancelled" | "error" | "skipped"
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1824,6 +1827,7 @@ mod tests {
         assert!(AgentEvent::SubAgentCompleted {
             parent_session_id: "parent".to_string(),
             child_session_id: "child".to_string(),
+            completion_id: None,
             status: "completed".to_string(),
             error: None,
         }

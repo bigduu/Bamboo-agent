@@ -985,6 +985,7 @@ async fn agent_terminal_with_running_child_holds_open_then_closes() {
                 .send(AgentEvent::SubAgentCompleted {
                     parent_session_id: root_id.into(),
                     child_session_id: child_id.into(),
+                    completion_id: None,
                     status: "completed".into(),
                     error: None,
                 })

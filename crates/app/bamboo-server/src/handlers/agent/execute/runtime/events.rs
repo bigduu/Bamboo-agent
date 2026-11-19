@@ -967,6 +967,7 @@ mod tests {
         let event = AgentEvent::SubAgentCompleted {
             parent_session_id: "parent".into(),
             child_session_id: "child-1".into(),
+            completion_id: None,
             status: "completed".into(),
             error: None,
         };

@@ -568,6 +568,7 @@ impl ChildSessionAdapter {
                     AgentEvent::SubAgentCompleted {
                         parent_session_id: parent_session_id.to_string(),
                         child_session_id: child_id.to_string(),
+                        completion_id: None,
                         status: "cancelled".to_string(),
                         error: Some("Child session deleted while running".to_string()),
                     },

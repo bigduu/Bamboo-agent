@@ -812,6 +812,7 @@ async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
         runner.push_critical_event(bamboo_agent_core::AgentEvent::SubAgentCompleted {
             parent_session_id: id.into(),
             child_session_id: "synthetic-retained-child".into(),
+            completion_id: None,
             status: "completed".into(),
             error: None,
         });

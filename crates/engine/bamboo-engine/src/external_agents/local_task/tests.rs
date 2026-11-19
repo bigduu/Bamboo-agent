@@ -398,6 +398,7 @@ impl Harness {
                         child_session_id,
                         status,
                         error,
+                        ..
                     } => {
                         assert_eq!(parent_session_id, self.parent.id);
                         return (child_session_id, status, error);

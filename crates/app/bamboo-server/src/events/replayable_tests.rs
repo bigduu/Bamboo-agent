@@ -54,6 +54,7 @@ fn child_completed(session_id: &str) -> AgentEvent {
     AgentEvent::SubAgentCompleted {
         parent_session_id: session_id.to_string(),
         child_session_id: "resident-child".to_string(),
+        completion_id: None,
         status: "completed".to_string(),
         error: None,
     }

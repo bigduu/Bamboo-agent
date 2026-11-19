@@ -1078,12 +1078,22 @@ pub(crate) async fn publish_child_completion(
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
 ) {
+    let completion_id = completion
+        .source
+        .as_ref()
+        .filter(|source| source.matches_completion(&completion))
+        .and_then(|source| serde_json::to_value(source).ok())
+        .map(|source| {
+            bamboo_domain::SessionMessageId::stable("child_completion_notification", &source)
+                .to_string()
+        });
     publisher
         .publish(
             &completion.parent_session_id,
             AgentEvent::SubAgentCompleted {
                 parent_session_id: completion.parent_session_id.clone(),
                 child_session_id: completion.child_session_id.clone(),
+                completion_id,
                 status: completion.status.clone(),
                 error: completion.error.clone(),
             },

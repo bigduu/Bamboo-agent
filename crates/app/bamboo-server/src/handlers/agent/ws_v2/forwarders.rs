@@ -2310,6 +2310,7 @@ mod tests {
         let _ = tx.send(AgentEvent::SubAgentCompleted {
             parent_session_id: "lag-parent".to_string(),
             child_session_id: "lag-child".to_string(),
+            completion_id: None,
             status: "completed".to_string(),
             error: None,
         });

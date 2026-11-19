@@ -315,6 +315,10 @@ fn lifecycle_event_id(event: &AgentEvent) -> Option<String> {
         AgentEvent::SessionCreated { session_id, .. } => {
             Some(format!("session-created:{session_id}"))
         }
+        AgentEvent::SubAgentCompleted {
+            completion_id: Some(id),
+            ..
+        } => Some(format!("child-completed:{id}")),
         _ => None,
     }
 }
@@ -796,6 +800,40 @@ mod tests {
                 .is_err()
         );
         assert_eq!(restarted.latest_seq(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_completion_notification_retry_preserves_distinct_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let completion = |id: &str| AgentEvent::SubAgentCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "resident-child".into(),
+            completion_id: Some(id.into()),
+            status: "completed".into(),
+            error: None,
+        };
+        let first = completion("first-terminal-source");
+        let later = completion("later-terminal-source");
+        let sink = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert!(sink.record_confirmed(None, &first).await);
+        assert!(sink.record_confirmed(None, &first).await);
+        drop(sink);
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert!(restarted.record_confirmed(None, &first).await);
+        assert!(restarted.record_confirmed(None, &later).await);
+        let changes = journal::read_since(restarted.events_dir(), 0).unwrap();
+        let ids: Vec<_> = changes
+            .iter()
+            .map(|change| lifecycle_event_id(&change.event).unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "child-completed:first-terminal-source",
+                "child-completed:later-terminal-source",
+            ]
+        );
     }
 
     #[tokio::test]
