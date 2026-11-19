@@ -66,6 +66,18 @@ impl OverlayToolExecutor {
                 base_check,
             )
             .await?
+        } else if self.overlay.name() == "session_loop"
+            && selected_contract
+                == Some(bamboo_tools::session_loop_permission::SESSION_LOOP_EXECUTION_CONTRACT)
+            && bamboo_tools::session_loop_permission::is_session_loop_mutation(args)
+        {
+            bamboo_tools::session_loop_permission::with_framework_session_loop_permission(
+                call,
+                args,
+                selected_contract,
+                base_check,
+            )
+            .await?
         } else {
             base_check.await?
         };
@@ -102,6 +114,7 @@ impl OverlayToolExecutor {
                 "browser",
                 "browser_eval",
                 "session_message",
+                "session_loop",
                 "spawn_session",
                 "work_overview",
                 "work_search",

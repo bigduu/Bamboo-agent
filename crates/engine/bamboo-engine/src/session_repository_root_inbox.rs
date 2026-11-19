@@ -66,7 +66,7 @@ enum InputAdmission {
 #[derive(Clone, Copy)]
 enum RootInputSelection<'a> {
     Any,
-    Native(&'a SessionInboxReceipt),
+    Bound(&'a RootInboxSelection),
     Work(&'a bamboo_domain::SessionMessageId),
     Runtime(&'a SessionInboxReceipt),
 }
@@ -74,7 +74,8 @@ enum RootInputSelection<'a> {
 impl RootInputSelection<'_> {
     fn receipt(&self) -> Option<&SessionInboxReceipt> {
         match self {
-            Self::Native(receipt) | Self::Runtime(receipt) => Some(receipt),
+            Self::Bound(selection) => Some(selection.receipt()),
+            Self::Runtime(receipt) => Some(receipt),
             Self::Any | Self::Work(_) => None,
         }
     }
@@ -95,7 +96,7 @@ impl SessionRepository {
             || expected_work_input.is_some() && active_run_id != Some(owner.fence.run_id.as_str())
             || expected_work_input
                 .zip(self.root_inbox_receipt.as_ref())
-                .is_some_and(|(expected, receipt)| expected != &receipt.id)
+                .is_some_and(|(expected, selection)| expected != &selection.receipt().id)
         {
             return Err(io::Error::other("Root Inbox execution target mismatch"));
         }
@@ -104,7 +105,7 @@ impl SessionRepository {
         let consumer = SessionInboxConsumerId::new();
         let mut admission = RootInboxAdmission::default();
         let selection = match (self.root_inbox_receipt.as_ref(), expected_work_input) {
-            (Some(receipt), _) => RootInputSelection::Native(receipt),
+            (Some(selection), _) => RootInputSelection::Bound(selection),
             (None, Some(id)) => RootInputSelection::Work(id),
             (None, None) => RootInputSelection::Any,
         };
@@ -151,7 +152,8 @@ impl SessionRepository {
             .root_actor_owner
             .as_ref()
             .ok_or_else(|| io::Error::other("Runtime Inbox startup requires an owned Root"))?;
-        if owner.fence.run_id != run_id
+        if self.root_inbox_receipt.is_some()
+            || owner.fence.run_id != run_id
             || owner.fence.actor_id != session.id
             || startup.target_created_at != owner.created_at
             || session.created_at != owner.created_at
@@ -250,26 +252,37 @@ impl SessionRepository {
             .map_err(io::Error::other)?;
         pending.claim = Some(claim.clone());
         let envelope = &claim.claim.envelope;
-        if matches!(selection, RootInputSelection::Work(expected) if &envelope.id != expected) {
-            return Err(io::Error::other(
-                "Root input differs from the reserved Work dispatch",
-            ));
-        }
-        if matches!(selection, RootInputSelection::Native(_))
-            && (envelope.source != bamboo_domain::SessionMessageSource::User
-                || envelope.kind != bamboo_domain::SessionMessageKind::UserInput)
-        {
-            return Err(io::Error::other(
-                "Selected Root receipt is not an ordinary User input",
-            ));
-        }
-        if matches!(selection, RootInputSelection::Runtime(_))
-            && (envelope.background_exec_completion_handle().is_none()
-                || claim.claim.activation_policy != SessionActivationPolicy::RespectSpecificWait)
-        {
-            return Err(io::Error::other(
-                "selected Runtime Inbox receipt is not an eligible command completion",
-            ));
+        match selection {
+            RootInputSelection::Work(expected) if &envelope.id != expected => {
+                return Err(io::Error::other(
+                    "Root input differs from the reserved Work dispatch",
+                ));
+            }
+            RootInputSelection::Bound(RootInboxSelection::Human(_))
+                if envelope.source != bamboo_domain::SessionMessageSource::User
+                    || envelope.kind != bamboo_domain::SessionMessageKind::UserInput =>
+            {
+                return Err(io::Error::other(
+                    "Selected Root receipt is not an ordinary User input",
+                ));
+            }
+            RootInputSelection::Bound(RootInboxSelection::PacedLoop(_))
+                if envelope.paced_loop_run_id() != Some(owner.fence.run_id.as_str()) =>
+            {
+                return Err(io::Error::other(
+                    "Selected paced Loop receipt does not belong to this Root turn",
+                ));
+            }
+            RootInputSelection::Runtime(_)
+                if envelope.background_exec_completion_handle().is_none()
+                    || claim.claim.activation_policy
+                        != SessionActivationPolicy::RespectSpecificWait =>
+            {
+                return Err(io::Error::other(
+                    "selected Runtime Inbox receipt is not an eligible command completion",
+                ));
+            }
+            _ => {}
         }
         let matching = session
             .messages

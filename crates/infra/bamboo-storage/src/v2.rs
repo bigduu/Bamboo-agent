@@ -764,6 +764,10 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     snapshot
         .metadata
         .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    // A paced outcome must commit with its final transcript in Main.
+    snapshot
+        .metadata
+        .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
     // Native transcript groups are committed atomically with the ordinary
     // message that anchors them. Never let runtime.json expose a load/search
     // item without the corresponding session.json history boundary.
@@ -792,6 +796,16 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
         Some(mut side) => {
             side.observe_main_session_version(main.session_version);
             crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+            let paced_outcome_key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
+            match main.metadata.get(paced_outcome_key) {
+                Some(outcome) => {
+                    side.metadata
+                        .insert(paced_outcome_key.into(), outcome.clone());
+                }
+                None => {
+                    side.metadata.remove(paced_outcome_key);
+                }
+            }
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1870,6 +1884,8 @@ pub struct SessionStoreV2 {
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
+    bamboo_domain::session::PACED_LOOP_METADATA_KEY,
+    bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY,
     "runtime.host_run_id",
     "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
@@ -6492,6 +6508,77 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Compare and set only the paced-loop record of an existing ordinary Root.
+    /// Reload under the same writer locks as normal Session saves so another
+    /// Host cannot replace the record or change the Session before publication.
+    pub async fn save_paced_loop_metadata(
+        &self,
+        expected: &Session,
+        value: String,
+    ) -> io::Result<Session> {
+        self.save_paced_loop_metadata_with_owner(expected, value, None)
+            .await
+    }
+
+    /// Apply a model-initiated loop change under its executing Root writer.
+    pub async fn save_paced_loop_metadata_with_owner(
+        &self,
+        expected: &Session,
+        value: String,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> io::Result<Session> {
+        use bamboo_domain::session::{SessionCallerReference, PACED_LOOP_METADATA_KEY};
+
+        let caller = SessionCallerReference::from(expected);
+        if !caller.is_ordinary_root() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "paced loop requires an ordinary Root",
+            ));
+        }
+        let id = &expected.id;
+        validate_session_id(id)?;
+        let missing = || io::Error::new(io::ErrorKind::NotFound, "paced loop Session not found");
+        let started = Instant::now();
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        if !self.root_has_birth_files(id).await? {
+            return Err(missing());
+        }
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self.acquire_session_write_lock(id, SaveKind::Full).await?;
+        let directory = self.sessions_dir.join(id);
+        let proof = owner.map(|owner| {
+            root_actor_runtime::RootActorWriteProof::new(directory.clone(), owner.clone())
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        let current = self
+            .load_session_from_dir_strict(&directory, id, SessionKind::Root, id)
+            .await?
+            .ok_or_else(missing)?;
+        if !caller.matches_session(&current)
+            || current.project_id_meta() != expected.project_id_meta()
+            || current.metadata.get(PACED_LOOP_METADATA_KEY)
+                != expected.metadata.get(PACED_LOOP_METADATA_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "paced loop Session authority or record changed",
+            ));
+        }
+        self.save_session_after_lock_with_presentation_intent(
+            &current,
+            started,
+            &guards,
+            None,
+            None,
+            Some(value),
+        )
+        .await?;
+        self.load_session_from_dir_strict(&directory, id, SessionKind::Root, id)
+            .await?
+            .ok_or_else(missing)
+    }
+
     pub async fn clear_session(&self, session_id: &str) -> io::Result<bool> {
         validate_session_id(session_id)?;
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
@@ -6555,6 +6642,13 @@ impl SessionStoreV2 {
         // Clearing history invalidates derived context state.
         session.token_usage = None;
         session.conversation_summary = None;
+        // A scheduled prompt belongs to the conversation that authorized it.
+        session
+            .metadata
+            .remove(bamboo_domain::session::PACED_LOOP_METADATA_KEY);
+        session
+            .metadata
+            .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
         session.updated_at = Utc::now();
 
         // One started job owns cleanup and the resulting canonical files.
@@ -7764,6 +7858,7 @@ impl SessionStoreV2 {
             guards,
             answer_permit,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -7776,6 +7871,7 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
         mutation: Option<SessionPresentationMutation>,
+        paced_loop: Option<String>,
     ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
@@ -7790,9 +7886,15 @@ impl SessionStoreV2 {
 
         self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
-        let normalized = self
+        let mut normalized = self
             .normalize_terminal_runtime_write(session, &intended_rel, guards)
             .await?;
+        if let Some(value) = paced_loop {
+            normalized.metadata.insert(
+                bamboo_domain::session::PACED_LOOP_METADATA_KEY.into(),
+                value,
+            );
+        }
         let session = &normalized;
         self.check_default_or_root_actor_context(
             session,
@@ -7870,6 +7972,31 @@ impl SessionStoreV2 {
             }
             Err(error) => return Err(error),
         };
+
+        if let Some(previous) = previous_main.as_ref() {
+            let key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
+            let owns_paced_outcome = guards.root_outcome_finalized
+                && guards.root_actor.as_ref().is_some_and(|actor| {
+                    normalized
+                        .metadata
+                        .get(key)
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|outcome| {
+                            outcome["run_id"].as_str() == Some(actor.owner().fence.run_id.as_str())
+                        })
+                });
+            if !owns_paced_outcome {
+                match previous.metadata.get(key) {
+                    Some(outcome) => {
+                        normalized.metadata.insert(key.into(), outcome.clone());
+                    }
+                    None => {
+                        normalized.metadata.remove(key);
+                    }
+                }
+            }
+        }
+        let session = &normalized;
 
         if let Some(previous) = previous_main.as_ref() {
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
@@ -8376,6 +8503,7 @@ impl Storage for SessionStoreV2 {
                 &guards,
                 None,
                 Some(mutation),
+                None,
             )
             .await?;
         Ok(committed.expect("presentation transaction returns its committed candidate"))
@@ -12230,6 +12358,169 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let entry = storage.get_index_entry("nonexistent").await;
         assert!(entry.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_metadata_cas_preserves_a_live_actor_and_rejects_a_stale_host(
+    ) -> io::Result<()> {
+        use bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+
+        let (storage, home) = create_temp_storage().await?;
+        let mut root = Session::new("paced-loop-live", "test-model");
+        root.add_message(Message::user("existing history"));
+        storage.save_session(&root).await?;
+        let other_host = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let now = Utc::now();
+        let activation = storage
+            .claim_activation(&ActorActivationClaim {
+                actor_id: root.id.clone(),
+                run_id: "live-run".into(),
+                lease_owner: "owner".into(),
+                lease_expires_at: now + chrono::Duration::minutes(5),
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .map_err(io::Error::other)?;
+        storage
+            .start_activation(&activation.fence(), now)
+            .await
+            .map_err(io::Error::other)?;
+
+        let (first, second) = tokio::join!(
+            storage.save_paced_loop_metadata(&root, "first".into()),
+            other_host.save_paced_loop_metadata(&root, "second".into())
+        );
+        let (saved, stale) = match (first, second) {
+            (Ok(saved), Err(stale)) | (Err(stale), Ok(saved)) => (saved, stale),
+            result => panic!("one writer must win the exact compare-and-set: {result:?}"),
+        };
+        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(saved.messages[0].content, "existing history");
+        let stopped = storage
+            .save_paced_loop_metadata(&saved, "stopped".into())
+            .await?;
+        assert_eq!(
+            stopped
+                .metadata
+                .get(PACED_LOOP_METADATA_KEY)
+                .map(String::as_str),
+            Some("stopped")
+        );
+        assert_eq!(stopped.metadata_version, root.metadata_version);
+        // Bypass the process-local merge and submit the older snapshot to a
+        // separate V2 owner. Both physical save paths must keep the stop.
+        other_host.save_session(&saved).await?;
+        other_host.save_runtime_state(&saved).await?;
+        let durable = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(
+            durable.metadata.get(PACED_LOOP_METADATA_KEY),
+            stopped.metadata.get(PACED_LOOP_METADATA_KEY)
+        );
+        let current = storage
+            .inspect_actor(&root.id)
+            .await
+            .map_err(io::Error::other)?;
+        assert_eq!(current.activation.unwrap().fence(), activation.fence());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_outcome_follows_the_main_transcript_checkpoint() -> io::Result<()> {
+        use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY as OUTCOME;
+
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut root = Session::new("paced-loop-main-outcome", "test-model");
+        root.add_message(Message::user("scheduled prompt"));
+        let previous = serde_json::json!({ "run_id": "previous-run", "status": "failed" });
+        root.metadata.insert(OUTCOME.into(), previous.to_string());
+        storage.save_session(&root).await?;
+
+        let completed = serde_json::json!({ "run_id": "scheduled-run", "status": "completed" });
+        root.metadata.insert(OUTCOME.into(), completed.to_string());
+        root.add_message(Message::assistant("scheduled result", None));
+        storage.save_runtime_state(&root).await?;
+
+        let directory = storage.sessions_dir.join(&root.id);
+        let runtime = SessionStoreV2::read_runtime_sidecar_at(
+            &directory.join(RUNTIME_SIDECAR_FILE),
+            &root.id,
+        )
+        .await?
+        .unwrap();
+        assert!(!runtime.metadata.contains_key(OUTCOME));
+        let before_main = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(before_main.metadata[OUTCOME], previous.to_string());
+        assert_eq!(before_main.messages.len(), 1);
+
+        // Cross the existing Main publication boundary without refreshing the
+        // sidecar. Compact Main must carry both the outcome and its transcript.
+        fs::write(
+            directory.join("session.json"),
+            compact_main::serialize_main(&root)?,
+        )
+        .await?;
+        let after_main = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(after_main.metadata[OUTCOME], completed.to_string());
+        assert_eq!(after_main.messages[1].content, "scheduled result");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_is_removed_from_copied_and_cleared_sessions() -> io::Result<()> {
+        use bamboo_domain::session::{PACED_LOOP_METADATA_KEY, PACED_LOOP_OUTCOME_METADATA_KEY};
+
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut source = Session::new("paced-loop-source", "test-model");
+        source.add_message(Message::user("original context"));
+        source.metadata.insert(
+            PACED_LOOP_OUTCOME_METADATA_KEY.into(),
+            serde_json::json!({ "run_id": "scheduled-run", "status": "completed" }).to_string(),
+        );
+        storage.save_session(&source).await?;
+        storage
+            .save_paced_loop_metadata(&source, "registered".into())
+            .await?;
+
+        let copy = storage
+            .copy_session(&source.id, "paced-loop-copy")
+            .await?
+            .unwrap();
+        assert!(!copy.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(!copy.metadata.contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+        let original = storage.load_session(&source.id).await?.unwrap();
+        assert!(original.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(original
+            .metadata
+            .contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+
+        assert!(storage.clear_session(&source.id).await?);
+        let cleared = storage.load_session(&source.id).await?.unwrap();
+        assert!(!cleared.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(!cleared
+            .metadata
+            .contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+        assert_eq!(cleared.metadata_version, original.metadata_version);
+        let stale = storage
+            .save_paced_loop_metadata(&original, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
+
+        assert!(storage.clear_session(&source.id).await?);
+        let cleared_again = storage.load_session(&source.id).await?.unwrap();
+        assert_eq!(cleared_again.metadata_version, cleared.metadata_version);
+
+        assert!(storage.delete_session_recursive(&source.id, true).await?);
+        let deleted = storage
+            .save_paced_loop_metadata(&cleared_again, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(deleted.kind(), io::ErrorKind::NotFound);
+        assert!(storage.load_session(&source.id).await?.is_none());
         Ok(())
     }
 

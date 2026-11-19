@@ -4184,12 +4184,37 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
     disk_audit.write_to(&mut session.metadata);
 }
 
+/// Preserve the Host-owned loop record from the current Session lifetime.
+pub(crate) fn preserve_paced_loop(session: &mut Session, latest: Option<&Session>) {
+    let key = bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+    let record = latest
+        .filter(|current| {
+            current.id == session.id
+                && current.created_at == session.created_at
+                && current.kind == session.kind
+                && current.authority_identity == session.authority_identity
+                && current.conversation_reset == session.conversation_reset
+        })
+        .and_then(|current| current.metadata.get(key));
+    match record {
+        Some(value) => {
+            session.metadata.insert(key.into(), value.clone());
+        }
+        None => {
+            session.metadata.remove(key);
+        }
+    }
+}
+
 /// Pure merge step: given a freshly-loaded on-disk copy, overwrite the
 /// in-memory authoritative metadata group when disk's `metadata_version` is at
 /// least the in-memory one. Split out so callers that have already loaded the
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    // Paced registration has its own compare-and-set under the physical writer
+    // and never advances the title / Project metadata revision.
+    preserve_paced_loop(session, Some(latest));
     if session.host_run_id().is_some() && session.host_run_id() == latest.host_run_id() {
         let key = "runtime.host_prior_activation_fence";
         match latest.metadata.get(key) {
@@ -8456,6 +8481,39 @@ mod tests {
         // And the in-memory copy was corrected by the merge too.
         assert_eq!(stale_snapshot.title, "User Renamed");
         assert_eq!(stale_snapshot.metadata_version, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_save_preserves_paced_loop_registration_and_removal() {
+        use bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+
+        let home = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let store = LockedSessionStore::new(storage.clone());
+        let mut stale = fresh("runtime-paced-loop");
+        storage.save_session(&stale).await.unwrap();
+
+        let registered = storage
+            .save_paced_loop_metadata(&stale, "registered".into())
+            .await
+            .unwrap();
+        store.merge_save_runtime(&mut stale).await.unwrap();
+        assert_eq!(
+            stale.metadata.get(PACED_LOOP_METADATA_KEY),
+            registered.metadata.get(PACED_LOOP_METADATA_KEY)
+        );
+
+        assert!(storage.clear_session(&stale.id).await.unwrap());
+        store.merge_save_runtime(&mut stale).await.unwrap();
+
+        assert!(!stale.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        let saved = storage.load_session(&stale.id).await.unwrap().unwrap();
+        assert!(!saved.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert_eq!(saved.metadata_version, registered.metadata_version);
     }
 
     #[tokio::test]
