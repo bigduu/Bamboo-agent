@@ -67,6 +67,11 @@ has advanced. It does not build or test the controller revision. The allocator
 chooses the release version; use the resulting tag and original artifacts for
 promotion.
 
+The frozen publisher fills the GitHub Release body with change subjects and
+linked commit SHAs. It compares the accepted source with the previous published
+stable ancestor and links the full Git history. The existing signed provenance
+block continues to supply the machine-readable receipt.
+
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
 If infrastructure fails, retain successful outputs and retry only the missing
