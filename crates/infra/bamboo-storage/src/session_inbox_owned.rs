@@ -313,6 +313,46 @@ impl OwnedFilesystem {
         &self.guards.dir
     }
 
+    pub(super) async fn has_staged_child_wait_expiry(
+        &self,
+        dir: &Path,
+        expected: InboxMessage,
+        admitted: PathBuf,
+        max_bytes: usize,
+    ) -> std::io::Result<bool> {
+        let name = FileSessionInbox::pending_transport_name(&expected);
+        let pending = dir.join("new").join(&name);
+        let claimed = dir.join("cur").join(name);
+        self.job(
+            "prove-staged-child-wait-expiry",
+            &pending,
+            move |filesystem, path| {
+                let anchor = filesystem.anchor();
+                let bytes = match anchor.read_existing(path, max_bytes) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => return Ok(false),
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                require_unique_json(&bytes)
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                if serde_json::from_slice::<InboxMessage>(&bytes)? != expected {
+                    return Ok(false);
+                }
+                for path in [&claimed, &admitted] {
+                    match anchor.entry_exists(path) {
+                        Ok(true) => return Ok(false),
+                        Ok(false) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(true)
+            },
+        )
+        .await
+    }
+
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         self.job("mkdir", path, |filesystem, path| {
             filesystem.anchor().create_dir_all(path)
@@ -426,8 +466,7 @@ impl OwnedFilesystem {
             };
             // The same 20-digit time prefix, hidden temp name and implicit
             // queue creation as the Maildir writer.
-            let nanos = wrapper.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
-            let name = format!("{nanos:020}-{}.json", wrapper.id.0);
+            let name = FileSessionInbox::pending_transport_name(&wrapper);
             let queue = dir.join("new");
             let path = queue.join(&name);
             let temp = queue.join(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
@@ -1376,6 +1415,16 @@ impl FileSessionInbox {
             if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
                 continue;
             }
+            if envelope.is_child_wait_expiry_notice()
+                && (receipt.is_none()
+                    || self.root_owner.is_none()
+                    || intent.is_some()
+                    || activation.as_ref().and_then(|intent| intent.policy().ok())
+                        != Some(SessionActivationPolicy::RespectSpecificWait)
+                    || envelope.child_wait_expiry().is_none())
+            {
+                continue;
+            }
             if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only {
                 continue;
             }
@@ -2095,6 +2144,104 @@ impl FileSessionInbox {
         Ok(result)
     }
 
+    fn wake_envelope(
+        wrapper: &InboxMessage,
+        target: &str,
+    ) -> Result<SessionMessageEnvelope, SessionInboxError> {
+        let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        envelope
+            .validate()
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        if envelope.target_session_id != target {
+            return Err(invalid("Inbox target mismatch"));
+        }
+        Ok(envelope)
+    }
+
+    /// The caller retains Inbox and lifecycle authority. This is only a
+    /// nomination: admission still checks the exact receipt against the Actor.
+    async fn runtime_startup_target_birth(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        generation: u64,
+        original_intent: Option<&SessionInboxActivationIntent>,
+        coordinator_policy: Option<SessionActivationPolicy>,
+    ) -> Result<Option<DateTime<Utc>>, SessionInboxError> {
+        if original_intent.is_some()
+            || coordinator_policy != Some(SessionActivationPolicy::RespectSpecificWait)
+        {
+            return Ok(None);
+        }
+        let birth = if envelope.is_child_wait_expiry_notice() {
+            self.sessions
+                .child_wait_expiry_birth_under_lifecycle(envelope, generation)
+                .await
+        } else if envelope.background_exec_completion_handle().is_some() {
+            self.sessions
+                .actor_inbox_target_birth_under_lifecycle(&envelope.target_session_id)
+                .await
+        } else {
+            return Ok(None);
+        };
+        birth.map_err(|error| SessionInboxError::Storage(error.to_string()))
+    }
+
+    pub(super) async fn inspect_runtime_startup_impl(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<Option<bamboo_domain::SessionRuntimeStartup>, SessionInboxError> {
+        if generation == 0 {
+            return Ok(None);
+        }
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
+        let mut matches = entries
+            .into_iter()
+            .filter(|(found, _, _)| *found == generation);
+        let Some((_, _, path)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(invalid("ambiguous Inbox startup generation"));
+        }
+        let (wrapper, _) = self.read_owned_transport(&path).await?;
+        let envelope = Self::wake_envelope(&wrapper, target)?;
+        let original_intent = Self::activation_intent(&wrapper.body)?;
+        let coordinator_policy =
+            Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                .map(|intent| intent.policy())
+                .transpose()?;
+        // Identity is independent of which candidate is ready, lease expiry,
+        // and whether a permanent ACK still needs to remove its transport.
+        let target_created_at = self
+            .runtime_startup_target_birth(
+                &envelope,
+                generation,
+                original_intent.as_ref(),
+                coordinator_policy,
+            )
+            .await?;
+        if target_created_at.is_none() && envelope.is_child_wait_expiry_notice() {
+            // This generation belongs to the expiry protocol even if its
+            // durable disposition is missing or a newer wait superseded it.
+            return Err(invalid(
+                "child wait expiry startup lacks a current disposition",
+            ));
+        }
+        Ok(
+            target_created_at.map(|target_created_at| bamboo_domain::SessionRuntimeStartup {
+                receipt: SessionInboxReceipt {
+                    id: envelope.id,
+                    generation,
+                },
+                target_created_at,
+            }),
+        )
+    }
+
     /// Read the first item that a fresh consumer could claim now, or the
     /// earliest eligible lease transition. This holds the same lifecycle,
     /// process and cross-process Inbox locks as `claim_owned_impl` throughout
@@ -2130,14 +2277,7 @@ impl FileSessionInbox {
             if !Self::wake_eligible(generation, prefix, activation.clone()) {
                 continue;
             }
-            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            envelope
-                .validate()
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            if envelope.target_session_id != target {
-                return Err(invalid("Inbox target mismatch"));
-            }
+            let envelope = Self::wake_envelope(&wrapper, target)?;
             if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
                 if receipt.delivery.generation != generation
                     || receipt.intent != intent
@@ -2174,17 +2314,32 @@ impl FileSessionInbox {
                 result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
                 continue;
             }
+            let coordinator_message_policy =
+                Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                    .map(|intent| intent.policy())
+                    .transpose()?;
+            let runtime_startup_target_birth =
+                if policy == SessionActivationPolicy::RespectSpecificWait {
+                    self.runtime_startup_target_birth(
+                        &envelope,
+                        generation,
+                        intent.as_ref(),
+                        coordinator_message_policy,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            if runtime_startup_target_birth.is_none() && envelope.is_child_wait_expiry_notice() {
+                continue;
+            }
             let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,
                 activation_policy: policy,
                 coordinator_generation: prefix,
-                coordinator_message_policy: Self::activation_intent_field(
-                    &wrapper.body,
-                    COORDINATOR_INTENT_KEY,
-                )?
-                .map(|intent| intent.policy())
-                .transpose()?,
+                coordinator_message_policy,
+                runtime_startup_target_birth,
                 lease_epoch,
                 ready_after,
             };

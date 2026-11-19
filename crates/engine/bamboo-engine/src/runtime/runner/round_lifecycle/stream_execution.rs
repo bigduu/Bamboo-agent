@@ -75,6 +75,7 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+const SESSION_LOOP_CONTROL_GUIDANCE: &str = "Use session_loop when the current user explicitly asks to set a fixed recurring task for this chat or to manage its loop. If the task or interval is unclear, ask the user. Require the current user's own request or confirmation before changing the loop, and confirm a change only after the tool succeeds.";
 #[cfg(test)]
 const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
     "Browser loaded. Its complete schema is in the tools for this request.";
@@ -1015,7 +1016,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if let Some(last) = system_blocks.last_mut() {
         last.cache_anchor = true;
     }
-    let lane_system = system_blocks
+    let mut lane_system = system_blocks
         .iter()
         .map(|b| b.text.as_str())
         .collect::<Vec<_>>()
@@ -1157,6 +1158,37 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                 .collect()
         })
         .unwrap_or_default();
+    // Loop guidance is specific to this request and leaves the durable prompt
+    // and its cache prefix intact when the next turn uses a different surface.
+    let loop_guidance = config
+        .paced_loop_turn
+        .as_ref()
+        .and_then(|turn| turn.system_guidance.as_deref())
+        .or_else(|| {
+            tool_schemas
+                .iter()
+                .any(|schema| {
+                    schema.function.name
+                        == bamboo_agent_core::tools::context::SESSION_LOOP_TOOL_NAME
+                })
+                .then_some(SESSION_LOOP_CONTROL_GUIDANCE)
+        });
+    if let Some(guidance) = loop_guidance {
+        if !lane_system.is_empty() {
+            lane_system.push_str("\n\n");
+        }
+        lane_system.push_str(guidance);
+        if !system_blocks.is_empty() {
+            system_blocks.push(
+                bamboo_domain::PromptBlock::new(
+                    "paced_loop",
+                    ContextBlockType::CoreDirectives,
+                    guidance,
+                )
+                .with_stability(ContextBlockStability::RoundDynamic),
+            );
+        }
+    }
     let mut ir = PromptIR {
         system_text: lane_system,
         system_blocks,

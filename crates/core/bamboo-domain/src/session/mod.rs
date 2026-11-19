@@ -1,11 +1,17 @@
 //! Bamboo session domain — Session, Message, Role, TaskList, and supporting types.
 
+/// Host-owned schedule for repeating a prompt in the current Session.
+pub const PACED_LOOP_METADATA_KEY: &str = "runtime.paced_loop";
+/// Last checkpointed outcome of a specific scheduled Session execution.
+pub const PACED_LOOP_OUTCOME_METADATA_KEY: &str = "runtime.paced_loop_outcome";
+
 pub mod actor;
 pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
 pub mod caller;
+mod child_wait_expiry;
 pub mod compatibility;
 pub mod composition;
 pub mod context_block;
@@ -48,6 +54,7 @@ pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
 pub use caller::*;
+pub use child_wait_expiry::*;
 pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;

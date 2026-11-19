@@ -15,6 +15,7 @@ use super::types::{
 
 mod billing;
 mod resume_markers;
+pub(crate) use resume_markers::is_paced_loop_iteration_message;
 mod sync;
 mod validation;
 

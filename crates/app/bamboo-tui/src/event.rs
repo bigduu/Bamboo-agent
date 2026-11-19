@@ -8,9 +8,10 @@ use crate::api::types::{
     TaskListResponse, ToolInfo,
 };
 use crate::api::{
-    PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
+    ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
+    SessionMutationFailure, VersionedSession,
 };
-use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
+use crate::app::{LoopObservation, OpenedSession, QuestionIdentity, SessionPickerIntent};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -104,6 +105,25 @@ pub enum AppEvent {
         context_id: u64,
         turn_id: String,
         result: Loaded<String>,
+    },
+    LoopChatFinished {
+        context_id: u64,
+        session_id: Option<String>,
+        message: String,
+        result: Loaded<ChatSubmission>,
+    },
+    SessionLoopDiscovered {
+        context_id: u64,
+        session_id: String,
+        token: String,
+        record: LoopChatRecord,
+    },
+    SessionLoopObserved {
+        context_id: u64,
+        session_id: String,
+        watch_token: String,
+        stream_epoch: u64,
+        result: Loaded<LoopObservation>,
     },
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
     /// Since no SSE terminal event will ever arrive for a run that never
