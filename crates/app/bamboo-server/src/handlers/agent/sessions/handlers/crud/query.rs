@@ -86,6 +86,7 @@ pub async fn list_sessions(
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count =
                 running_child_counts.get(&summary.id).copied().unwrap_or(0);
+            summary.refresh_activity();
             summary.subagent_count = subagent_counts.get(&summary.id).copied().unwrap_or(0);
             summary
         })
@@ -133,6 +134,8 @@ pub async fn get_session(
                 .count() as u32;
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count = running_child_count;
+            // The authoritative session is loaded just below, so the detail read
+            // re-derives `activity` from it rather than from the index mirror.
             summary.subagent_count = subagent_count;
 
             // Load the authoritative session once for both its ETag and the
@@ -195,6 +198,7 @@ pub async fn get_session(
                 .supervisor_incarnation_id()
                 .is_some()
                 .then_some(true);
+            summary.adopt_activity_waits(&durable_session);
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
             {

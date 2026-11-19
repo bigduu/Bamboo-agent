@@ -266,9 +266,10 @@ gardener's golden rule — **deterministic prefilter first, LLM only when there 
 - **Commitment extractor** — extend the auto-dream pass (it already walks recent
   sessions with the background model). The extraction prompt additionally proposes
   *ledger candidates* ("user said they must renew the passport before August").
-  Candidates are written as `status: Open` records with `created_by: agent` and
-  `source.excerpt` set, and surfaced in the agenda as `(suggested)` until the user or
-  agent confirms — auto-capture without silent authority.
+  Candidates are written as `status: Open` records with `created_by: extractor`,
+  `source.excerpt`, and the `suggested` tag. The agenda includes them after
+  confirmation removes the tag. Use a Ledger record query with the `suggested`
+  tag to review pending candidates.
 - **Ledger gardener** — a fourth pass in `gardener.rs`:
   - *Expiry:* time-passed events and stale done records → `Expired`/archive (out of
     indexes/views, never deleted — same reversibility contract as memory archiving).
@@ -308,8 +309,8 @@ self-maintaining and product-visible.
 
 ## 12. Open questions
 
-1. **Confirmation policy for extracted records** — `(suggested)` status vs. a
-   notification-driven approve flow? Proposal: start with suggested-in-agenda, revisit.
+1. **Confirmation workflow for extracted records** — a future notification-driven
+   approval flow could replace the current tagged record query and update.
 2. **Scope default** — personal records are `Global`; should a session inside a
    project default work-items to `Project` scope? Proposal: yes, kind-dependent
    (Todo→ambient scope, Event/Reminder→Global).

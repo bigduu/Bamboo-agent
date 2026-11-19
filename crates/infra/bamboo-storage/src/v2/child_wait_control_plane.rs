@@ -148,6 +148,76 @@ mod incremental_wait_tests {
     use bamboo_domain::{AgentStatusState, SuspensionState};
 
     #[tokio::test]
+    async fn runtime_only_child_wait_registration_and_clear_update_the_index() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = SessionStoreV2::new(temp.path().into()).await?;
+        let parent = Session::new("runtime-only-parent", "model");
+        first.save_session(&parent).await?;
+        let main_path = first
+            .sessions_root_dir()
+            .join(&parent.id)
+            .join("session.json");
+        let original_main = fs::read(&main_path).await?;
+        let second = SessionStoreV2::new(temp.path().into()).await?;
+
+        let (registered, count) = first
+            .register_child_wait(
+                &parent,
+                &[("child".into(), Some("wait-call".into()))],
+                ChildWaitPolicy::All,
+                false,
+                Arc::new(|_| {}),
+            )
+            .await?;
+        assert_eq!(count, 1);
+        assert_eq!(
+            runtime(&first.load_session(&parent.id).await?.unwrap())
+                .waiting_for_children
+                .unwrap()
+                .child_session_ids,
+            ["child"]
+        );
+        assert!(
+            first
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+        // This writer opened before registration and its cached row still says no wait.
+        assert!(
+            !second
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+
+        let mut updated = registered.clone();
+        let mut state = runtime(&updated);
+        state.waiting_for_children = None;
+        write_runtime(&mut updated, state)?;
+        assert!(
+            second
+                .compare_exchange_child_wait(&registered, &mut updated, true, Arc::new(|_| {}))
+                .await?
+        );
+        assert!(runtime(&second.load_session(&parent.id).await?.unwrap())
+            .waiting_for_children
+            .is_none());
+        let reopened = SessionStoreV2::new(temp.path().into()).await?;
+        assert!(
+            !reopened
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+        assert_eq!(fs::read(main_path).await?, original_main);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn partial_guardian_verdict_preserves_concurrently_activated_parent() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStoreV2::new(temp.path().into()).await.unwrap();

@@ -78,6 +78,71 @@ async fn pair(home: &Path, id: &str) -> (Vec<u8>, Vec<u8>) {
 }
 
 #[actix_web::test]
+async fn session_activity_http_projects_persisted_waits_without_runtime_details() {
+    use bamboo_domain::{AgentRuntimeState, AgentStatusState, WaitingForBashState};
+
+    let (_home, state, probe) = state().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .route("/sessions", web::get().to(super::super::list_sessions))
+            .route("/sessions/{id}", web::get().to(super::super::get_session)),
+    )
+    .await;
+    for (id, pending_question, status, expected) in [
+        ("command-wait", false, "suspended", "waiting_bash"),
+        ("human-wait", true, "suspended", "waiting_user"),
+        ("settled-wait", false, "completed", "terminal"),
+    ] {
+        let mut session = Session::new(id, "test-model");
+        let mut runtime = AgentRuntimeState::new("fixture-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_bash = Some(WaitingForBashState::for_bash(
+            vec!["private-handle".into()],
+            chrono::Utc::now(),
+        ));
+        session.agent_runtime_state = Some(runtime);
+        session.set_last_run_status(status);
+        if pending_question {
+            session.set_pending_question(
+                "fixture-call".into(),
+                "fixture-tool".into(),
+                "Confirm?".into(),
+                vec![],
+                true,
+            );
+        }
+        state.storage.save_session(&session).await.unwrap();
+
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        let listing: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/sessions").to_request(),
+        )
+        .await;
+        let row = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        for summary in [&detail["session"], row] {
+            assert_eq!(summary["activity"], expected, "{id}");
+            assert_eq!(summary["is_running"], false, "{id}");
+            assert!(summary.get("waiting_for_bash").is_none());
+            assert!(!summary.to_string().contains("private-handle"));
+        }
+    }
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+}
+
+#[actix_web::test]
 async fn session_version_http_future_is_readable_but_chat_and_execute_refuse_without_mutation() {
     for ultra in [false, true] {
         let (home, state, probe) = state().await;

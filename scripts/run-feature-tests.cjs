@@ -190,10 +190,13 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
 // #2850 retires the separate consent check in the default Storage save path.
 // Supervisor inheritance cases use the existing Server test owners.
-// #2868 binds coalesced Runtime startup to its exact Inbox generation.
-// The regression joins the default Engine packages-3 owner. Storage's
-// feature-sensitive Inbox source changes and additive owners stay unchanged.
-const FEATURE_SOURCE_SHA256 = "b6672425296ab864265543c33e175d086ae8e392ab1e649f95c951552c4c95e3";
+// #2447 keeps session activity API cases in server-handlers and runtime-only
+// wait projection and index rebuild cases in the default Storage packages-0
+// owner. No feature declarations or additive catalog entries changed.
+// #2868 binds deferred Runtime startup to its exact Inbox generation.
+// The real Actor regressions use default Engine packages-3. Storage and
+// Domain remain on their existing owners. The additive catalog is unchanged.
+const FEATURE_SOURCE_SHA256 = "4c2d805d35ee1d005ae45a67fbc0c9a7abca18c484810ca1ac4c2af015c4f9ea";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
