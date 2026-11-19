@@ -264,11 +264,11 @@ impl SessionRepository {
             ));
         }
         if matches!(selection, RootInputSelection::Runtime(_))
-            && (envelope.background_exec_completion_handle().is_none()
+            && (!envelope.is_exact_runtime_startup()
                 || claim.claim.activation_policy != SessionActivationPolicy::RespectSpecificWait)
         {
             return Err(io::Error::other(
-                "selected Runtime Inbox receipt is not an eligible command completion",
+                "selected Runtime Inbox receipt is ineligible for startup",
             ));
         }
         let matching = session

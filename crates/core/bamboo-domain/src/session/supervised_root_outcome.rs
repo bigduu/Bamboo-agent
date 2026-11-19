@@ -1694,12 +1694,12 @@ impl SupervisedRootOutcomes {
                     envelope.kind,
                     SessionMessageKind::UserInput | SessionMessageKind::PeerMessage
                 ) && matches!(&envelope.body, SessionMessageBody::Content(content) if content.parts.is_empty() && !content.text.trim().is_empty());
-                let owned_exec_completion = input.supervisor_origin.is_none()
-                    && envelope.background_exec_completion_handle().is_some()
+                let owned_runtime_input = input.supervisor_origin.is_none()
+                    && envelope.is_exact_runtime_startup()
                     && main.session_inbox_admission().is_some_and(|cursor| {
                         cursor.contains_at_sequence(&input.receipt_id, input.generation)
                     });
-                (ordinary_input || owned_exec_completion)
+                (ordinary_input || owned_runtime_input)
                     && crate::is_matching_session_message(message, &envelope)
             };
             if envelope.id != input.receipt_id

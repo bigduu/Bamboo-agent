@@ -705,3 +705,98 @@ async fn background_exec_owned_actor_preserves_native_human_receipt_selection() 
         .unwrap();
     binding.disarm_abandonment();
 }
+
+#[tokio::test]
+async fn owned_child_wait_expiry_survives_commit_before_activation() {
+    use bamboo_domain::{ActorActivationFinish, ChildWaitExpiry, CommittedChildWaitExpiry};
+
+    let (temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    for case in ["committed", "changed_wait", "live_actor", "changed_attempt"] {
+        let now = Utc::now();
+        let mut root = Session::new(format!("expired-wait-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        root.set_last_run_status("suspended");
+        let mut runtime = AgentRuntimeState::new(format!("prior-{case}"));
+        let wait = WaitingForChildrenState::for_children(
+            vec![format!("still-running-{case}")],
+            ChildWaitPolicy::All,
+            now - chrono::Duration::hours(7),
+        );
+        runtime.status = AgentStatusState::Suspended;
+        let mut recorded_wait = wait.clone();
+        if case == "changed_wait" {
+            recorded_wait.child_session_ids.push("new-child".into());
+        }
+        runtime.waiting_for_children = Some(recorded_wait.clone());
+        write_runtime_state(&mut root, &runtime);
+        root.metadata.insert("runtime.suspend_reason".into(), "waiting_for_children".into());
+        store.save_session(&root).await.unwrap();
+        let child_id = format!("still-running-{case}");
+        let mut child = Session::new_child(&child_id, &root.id, "model", "Child");
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        let main = store.sessions_root_dir().join(&root.id).join("session.json");
+        let prior_history = tokio::fs::read(&main).await.unwrap();
+        let mut prior = coordinator
+            .agent
+            .persistence()
+            .bind_root_actor_execution(&root, &runtime.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if case != "live_actor" {
+            prior.directory.finish_activation(
+                &prior.owner.fence, now, ActorActivationFinish::Succeeded,
+            ).await.unwrap();
+            prior.disarm_abandonment();
+        }
+        let activation_id = if case == "changed_attempt" {
+            "older-attempt".into()
+        } else {
+            prior.owner.fence.activation_id.clone()
+        };
+        let expiry = ChildWaitExpiry::observe(&root, &runtime, activation_id, wait.clone()).unwrap();
+        let envelope = expiry.envelope(&root.id).unwrap();
+        let receipt = inbox.deliver_runtime_for_target(&envelope, root.created_at).await.unwrap();
+        inbox.mark_activation_eligible(&root.id, receipt.generation, SessionActivationPolicy::RespectSpecificWait).await.unwrap();
+        assert!(inbox.inspect_wake_readiness(&root.id, now).await.unwrap().ready.is_none());
+        let committed = CommittedChildWaitExpiry::new(expiry, &receipt);
+        assert_eq!(
+            store.expire_root_child_wait_control_plane(&root, &committed, now, Arc::new(|_| {})).await.unwrap(),
+            case == "committed"
+        );
+        assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+
+        let reopened = bamboo_storage::SessionStoreV2::new(temp.path().into()).await.unwrap();
+        let control = reopened.load_runtime_control_plane(&root.id).await.unwrap().unwrap();
+        if case != "committed" {
+            assert_eq!(read_runtime_state(&control).waiting_for_children, Some(recorded_wait));
+            assert!(CommittedChildWaitExpiry::from_session(&control).is_none());
+            assert!(inbox.inspect_wake_readiness(&root.id, now).await.unwrap().ready.is_none());
+            continue;
+        }
+
+        assert!(read_runtime_state(&control).waiting_for_children.is_none());
+        assert_eq!(CommittedChildWaitExpiry::from_session(&control), Some(committed));
+        assert!(inbox.inspect_wake_readiness(&root.id, now).await.unwrap().ready.is_none());
+        assert_eq!(provider.0.lock().unwrap().len(), 0);
+
+        // A crash here would leave the exact receipt staged and the wait
+        // retired. The ordinary watchdog pass performs the recovery.
+        coordinator.sweep_one_suspended_session(&root.id, None).await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+        let saved = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            store.load_session(&child_id).await.unwrap().unwrap().last_run_status().as_deref(),
+            Some("running"),
+        );
+        assert_eq!(saved.messages.iter().filter(|message| {
+            bamboo_domain::is_matching_session_message(message, &envelope)
+        }).count(), 1);
+
+        coordinator.sweep_one_suspended_session(&root.id, None).await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+    }
+}

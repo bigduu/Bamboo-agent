@@ -1855,6 +1855,7 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    bamboo_domain::CHILD_WAIT_EXPIRY_RECEIPT_KEY,
     bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
     "runtime.host_run_id",
     "runtime.root_writer_observation_v1",
@@ -3949,6 +3950,23 @@ impl SessionStoreV2 {
             .root_actor_input_required(&session)
             .await?
             .then_some(session.created_at))
+    }
+
+    pub(crate) async fn child_wait_expiry_birth_under_lifecycle(
+        &self,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+        generation: u64,
+    ) -> io::Result<Option<DateTime<Utc>>> {
+        let Some(session) = self
+            .load_runtime_control_plane_unchecked(&envelope.target_session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            bamboo_domain::CommittedChildWaitExpiry::matches_input(&session, envelope, generation)
+                .then_some(session.created_at),
+        )
     }
 
     async fn load_runtime_control_plane_unchecked(
@@ -9171,6 +9189,29 @@ impl Storage for SessionStoreV2 {
         publish: bamboo_domain::RootActorRuntimePublisher,
     ) -> io::Result<bool> {
         self.compare_exchange_child_wait(expected, updated, runtime_only, publish)
+            .await
+    }
+
+    async fn root_child_wait_requires_owned_expiry(&self, session: &Session) -> io::Result<bool> {
+        self.root_actor_input_required(session).await
+    }
+
+    async fn observe_root_child_wait_expiry_activation(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<String>> {
+        self.child_wait_expiry_activation_id(session, run_id).await
+    }
+
+    async fn expire_root_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        committed: &bamboo_domain::CommittedChildWaitExpiry,
+        now: DateTime<Utc>,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        self.expire_root_child_wait(expected, committed, now, publish)
             .await
     }
 

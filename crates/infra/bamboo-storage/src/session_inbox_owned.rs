@@ -1376,6 +1376,15 @@ impl FileSessionInbox {
             if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
                 continue;
             }
+            if envelope.child_wait_expiry().is_some()
+                && (receipt.is_none()
+                    || self.root_owner.is_none()
+                    || intent.is_some()
+                    || activation.as_ref().and_then(|intent| intent.policy().ok())
+                        != Some(SessionActivationPolicy::RespectSpecificWait))
+            {
+                continue;
+            }
             if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only {
                 continue;
             }
@@ -2181,8 +2190,21 @@ impl FileSessionInbox {
             let requires_runtime_startup = intent.is_none()
                 && coordinator_message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
                 && policy == SessionActivationPolicy::RespectSpecificWait
-                && envelope.background_exec_completion_handle().is_some();
-            let runtime_startup_target_birth = if requires_runtime_startup {
+                && envelope.is_exact_runtime_startup();
+            let runtime_startup_target_birth = if envelope.child_wait_expiry().is_some() {
+                if !requires_runtime_startup {
+                    continue;
+                }
+                let Some(birth) = self
+                    .sessions
+                    .child_wait_expiry_birth_under_lifecycle(&envelope, generation)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+                else {
+                    continue;
+                };
+                Some(birth)
+            } else if requires_runtime_startup {
                 // This is only a nomination. The retained lifecycle scope
                 // prevents a recreated Session from supplying this birth, and
                 // the consumer must still claim under its exact Actor writer.
