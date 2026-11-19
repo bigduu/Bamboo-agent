@@ -86,6 +86,30 @@ impl SessionExecutionReservation {
         &self.cancel_token
     }
 
+    /// Attach the canonical birth to this existing owner before accepting an
+    /// input restricted to its exact run.
+    pub(crate) async fn bind_reserved_session_lifetime(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        let (SessionExecutionActivationOwnership::Registered(registration), Some(router)) =
+            (&self.activation, agent.activation_router())
+        else {
+            return Err(std::io::Error::other(
+                "scheduled turn requires a registered Session owner",
+            ));
+        };
+        if self.cancel_token.is_cancelled()
+            || !router
+                .bind_run_lifetime(&registration.ownership(), session)
+                .await
+        {
+            return Err(std::io::Error::other("scheduled turn owner changed"));
+        }
+        Ok(())
+    }
+
     /// Retain the no-execution cleanup until the exact reservation reaches the
     /// common spawn handoff. Dropping an HTTP future must not strand its bound
     /// Child run, and cleanup must not release a successor's identity.
@@ -255,6 +279,28 @@ impl SessionExecutionReservation {
         &mut self,
         receipt: bamboo_domain::SessionInboxReceipt,
     ) -> std::io::Result<()> {
+        self.bind_selected_root_receipt(receipt, |persistence, receipt| {
+            persistence.bind_root_inbox_receipt(receipt)
+        })
+    }
+
+    pub(crate) fn bind_paced_loop_inbox_receipt(
+        &mut self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<()> {
+        self.bind_selected_root_receipt(receipt, |persistence, receipt| {
+            persistence.bind_paced_loop_inbox_receipt(receipt)
+        })
+    }
+
+    fn bind_selected_root_receipt(
+        &mut self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+        bind: impl FnOnce(
+            &dyn bamboo_domain::RuntimeSessionPersistence,
+            bamboo_domain::SessionInboxReceipt,
+        ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    ) -> std::io::Result<()> {
         if !self.selected_input || self.root_actor.is_none() || self.cancel_token.is_cancelled() {
             return Err(std::io::Error::other(
                 "Root receipt requires a live bound reservation",
@@ -264,7 +310,7 @@ impl SessionExecutionReservation {
             .execution_persistence
             .as_ref()
             .ok_or_else(|| std::io::Error::other("Root execution persistence unavailable"))?;
-        self.execution_persistence = Some(persistence.bind_root_inbox_receipt(receipt)?);
+        self.execution_persistence = Some(bind(persistence.as_ref(), receipt)?);
         Ok(())
     }
 
@@ -2087,7 +2133,10 @@ fn initial_user_message_for_session(session: &Session) -> String {
     session
         .messages
         .last()
-        .filter(|message| matches!(message.role, bamboo_agent_core::Role::User))
+        .filter(|message| {
+            matches!(message.role, bamboo_agent_core::Role::User)
+                && !crate::session_app::execute::is_paced_loop_iteration_message(message)
+        })
         .map(|message| message.content.clone())
         .unwrap_or_default()
 }

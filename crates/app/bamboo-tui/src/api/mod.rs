@@ -7,6 +7,46 @@ use std::fmt;
 
 use types::*;
 
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ChatSubmission {
+    #[serde(flatten)]
+    pub(crate) response: ChatResponse,
+    pub(crate) loop_command: Option<LoopChatAcknowledgment>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct LoopChatAcknowledgment {
+    pub(crate) should_execute: bool,
+    #[serde(rename = "loop")]
+    record: Option<LoopChatRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LoopChatRecord {
+    state: String,
+    next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_run_status: Option<String>,
+}
+
+impl LoopChatAcknowledgment {
+    pub(crate) fn status_text(&self) -> String {
+        let Some(record) = &self.record else {
+            return "No session loop".to_string();
+        };
+        let mut text = format!("Loop {}", record.state);
+        if let Some(next) = record.next_fire_at {
+            let next = next
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S");
+            text.push_str(&format!(" · next {next}"));
+        }
+        if let Some(last) = &record.last_run_status {
+            text.push_str(&format!(" · last run {last}"));
+        }
+        text
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VersionedSession {
     pub summary: SessionSummary,
@@ -292,6 +332,10 @@ impl BambooClient {
     // ── Chat ──
 
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
+        Ok(self.submit_chat(req).await?.response)
+    }
+
+    pub(crate) async fn submit_chat(&self, req: ChatRequest) -> Result<ChatSubmission> {
         let resp = self
             .client
             .post(self.url("/api/v1/chat"))
@@ -303,8 +347,7 @@ impl BambooClient {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("chat failed ({status}): {}", body.trim());
         }
-        let chat_resp = resp.json().await?;
-        Ok(chat_resp)
+        Ok(resp.json().await?)
     }
 
     pub async fn execute(
@@ -1144,6 +1187,30 @@ impl BambooClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_submission_accepts_both_ordinary_and_loop_control_replies() {
+        let mut reply = serde_json::json!({
+            "message_id": "accepted-message",
+            "session_id": "chat",
+            "stream_url": "/api/v1/events/chat",
+            "status": "accepted",
+        });
+        let normal: ChatSubmission = serde_json::from_value(reply.clone()).unwrap();
+        assert_eq!(
+            normal.response.message_id.as_deref(),
+            Some("accepted-message")
+        );
+        assert!(normal.loop_command.is_none());
+
+        reply["loop_command"] = serde_json::json!({
+            "action": "status", "should_execute": false, "loop": null,
+        });
+        let control: ChatSubmission = serde_json::from_value(reply).unwrap();
+        let acknowledgment = control.loop_command.unwrap();
+        assert!(!acknowledgment.should_execute);
+        assert_eq!(acknowledgment.status_text(), "No session loop");
+    }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;

@@ -23,6 +23,7 @@ pub mod messages;
 pub mod metrics;
 pub mod named_agent_catalog;
 pub mod notifications;
+pub(crate) mod paced_loop;
 pub mod plugin;
 pub mod projects;
 pub mod prompt_presets;

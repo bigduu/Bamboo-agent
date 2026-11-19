@@ -37,3 +37,27 @@ Goal commands use the existing chat command handler. `/goal` opens the settings
 for the current session; `/goal <objective>` sets and advances a goal, and control
 commands such as `/goal off` and `/goal clear` follow the server's response without
 starting an unwanted execution.
+
+## Run a prompt on an interval
+
+Use `/loop 5m Check the build and report changes` in an existing Standard
+chat. The first run is due after one interval. Each run uses the same session,
+model, workspace, and permissions. If the session is busy or waiting for input,
+one scheduled run becomes due when the session is free. Missed intervals do
+not accumulate.
+
+- `/loop status` shows the next due time and the most recent known run state.
+- `/loop stop` stops scheduling future runs. Use the chat's normal cancel
+  action to interrupt a run already in progress.
+- `/loop resume` resumes an unexpired loop after a Bamboo restart. Time spent
+  offline is skipped.
+
+A failed run leaves the loop scheduled. The next run gets a system instruction
+to check current state, report any blocker, and finish its turn. Bamboo owns
+the timer. The loop ends after seven days or when its conversation is reset or
+deleted. A session can have one active loop. Intervals range from one minute to
+one day.
+
+Clients can read the same state with `GET /api/v1/sessions/{session_id}/loop`
+and send `start`, `stop`, or `resume` with `POST` on that endpoint. A start
+request includes `interval_seconds` and `prompt`.

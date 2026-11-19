@@ -919,6 +919,7 @@ pub struct AgentLoopConfig {
     /// Host-installed exact Assignment/Run permit; never taken from model args.
     pub(crate) ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     pub(crate) system_prompt: Option<String>,
+    pub(crate) paced_loop_system_guidance: Option<Arc<str>>,
     /// Skill IDs that are disabled globally for this execution.
     pub(crate) disabled_skill_ids: BTreeSet<String>,
     /// Optional explicit skill selection for this execution.
@@ -1182,6 +1183,7 @@ impl Default for AgentLoopConfig {
             freeze_tool_exposure_for_cache: true,
             ticket_worker_plan: None,
             system_prompt: None,
+            paced_loop_system_guidance: None,
             disabled_skill_ids: BTreeSet::new(),
             selected_skill_ids: None,
             selected_skill_mode: None,

@@ -5746,7 +5746,8 @@ impl App {
     fn event_context_target(&self, event: &AppEvent) -> Option<Option<u64>> {
         let session_target = |session_id: &str| self.context_id_for_session(session_id);
         match event {
-            AppEvent::ChatStarted { context_id, .. } => Some(Some(*context_id)),
+            AppEvent::ChatStarted { context_id, .. }
+            | AppEvent::LoopChatFinished { context_id, .. } => Some(Some(*context_id)),
             AppEvent::ExecuteFailed { session_id, .. }
             | AppEvent::StopFinished { session_id, .. }
             | AppEvent::PendingQuestionChecked { session_id, .. }
@@ -6444,17 +6445,7 @@ impl App {
                     return Ok(());
                 }
                 match r {
-                    Ok(session_id) => {
-                        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
-                            self.clear_child_approval_context();
-                        }
-                        self.chat.session_id = Some(session_id.clone());
-                        self.chat.history_loaded = true;
-                        self.chat.observed_activity = None;
-                        self.rebind_command_palette_to_active_session();
-                        self.status_message = "Streaming...".to_string();
-                        self.start_stream_and_execute(session_id, turn_id);
-                    }
+                    Ok(session_id) => self.accept_chat_start(session_id, turn_id),
                     Err(e) => {
                         // The optimistic user turn already reserved a matching
                         // assistant turn id. Preserve that turn with an explicit
@@ -6473,6 +6464,39 @@ impl App {
                         self.finalize_streaming();
                         self.notify(NoticeLevel::Error, format!("Error: {e}"));
                     }
+                }
+            }
+            AppEvent::LoopChatFinished {
+                context_id: _,
+                session_id,
+                message,
+                result,
+            } => {
+                if self.chat.session_id != session_id {
+                    return Ok(());
+                }
+                match result {
+                    Ok(reply) => {
+                        if let Some(acknowledgment) =
+                            reply.loop_command.filter(|command| !command.should_execute)
+                        {
+                            if session_id.as_deref() == Some(reply.response.session_id.as_str()) {
+                                self.notify(NoticeLevel::Info, acknowledgment.status_text());
+                            } else {
+                                self.notify(
+                                    NoticeLevel::Error,
+                                    "Loop response names a different session",
+                                );
+                            }
+                        } else if self.chat.streaming {
+                            self.notify(NoticeLevel::Error, "The server did not acknowledge /loop");
+                        } else {
+                            // An older server accepted this as ordinary chat.
+                            let turn_id = self.begin_chat_turn(message);
+                            self.accept_chat_start(reply.response.session_id, turn_id);
+                        }
+                    }
+                    Err(error) => self.notify(NoticeLevel::Error, error),
                 }
             }
             AppEvent::ExecuteFailed {
@@ -10522,7 +10546,10 @@ impl App {
             Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
-            Some(ActionId::SendMessage) if self.chat.streaming => {
+            Some(ActionId::SendMessage)
+                if self.chat.streaming
+                    && !Self::is_loop_chat_command(&self.chat.textarea.lines().join("\n")) =>
+            {
                 self.status_message = format!(
                     "Run active — draft preserved; {}",
                     self.action_key_phrase(
@@ -10611,6 +10638,64 @@ impl App {
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
+        let model = if self.chat.model.is_empty() {
+            "default".to_string()
+        } else {
+            self.chat.model.clone()
+        };
+        let client = self.client.clone();
+        let context_id = self.chat.context_id;
+        let req = ChatRequest {
+            message_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            correlation_id: None,
+            message: message.clone(),
+            session_id: self.chat.session_id.clone(),
+            project_id: self.chat.project_id.clone(),
+            model: Some(model),
+            provider: self.chat.provider.clone(),
+            reasoning_effort: self.chat.reasoning_effort,
+        };
+        if Self::is_loop_chat_command(&message) {
+            let session_id = req.session_id.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .submit_chat(req)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(AppEvent::LoopChatFinished {
+                    context_id,
+                    session_id,
+                    message,
+                    result,
+                });
+            });
+            return;
+        }
+        let turn_id = self.begin_chat_turn(message);
+        tokio::spawn(async move {
+            let result = client
+                .chat(req)
+                .await
+                .map(|response| response.session_id)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ChatStarted {
+                context_id,
+                turn_id,
+                result,
+            });
+        });
+    }
+
+    fn is_loop_chat_command(message: &str) -> bool {
+        message
+            .split_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("/loop"))
+    }
+
+    fn begin_chat_turn(&mut self, message: String) -> String {
         // A completed parent may leave its transport attached solely to watch
         // background child lifecycle. Supersede that generation before the
         // next optimistic turn so a replayed old Complete can never finalize
@@ -10634,19 +10719,13 @@ impl App {
         self.chat.current_turn_child_ids.clear();
         self.chat.current_execution_started = false;
         self.chat.stop_requested_turn_id = None;
-        let model = if self.chat.model.is_empty() {
-            "default".to_string()
-        } else {
-            self.chat.model.clone()
-        };
-
         // Optimistic UI: show the user's turn and switch to streaming right away.
         let user_message_id = self.chat.allocate_ui_id("user");
         let assistant_turn_id = self.chat.allocate_ui_id("assistant");
         self.chat.messages.push(ChatMessage {
             id: user_message_id,
             role: MessageRole::User,
-            content: message.clone(),
+            content: message,
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
@@ -10664,37 +10743,19 @@ impl App {
         self.chat.current_terminal_status = None;
         self.status_message = "Sending...".to_string();
         self.record_activity(ActivityKind::Run, NoticeLevel::Info, "Run starting");
+        assistant_turn_id
+    }
 
-        let client = self.client.clone();
-        let context_id = self.chat.context_id;
-        let existing_session = self.chat.session_id.clone();
-        let project_id = self.chat.project_id.clone();
-        let provider = self.chat.provider.clone();
-        let reasoning_effort = self.chat.reasoning_effort;
-        tokio::spawn(async move {
-            let req = ChatRequest {
-                message_id: None,
-                thread_id: None,
-                in_reply_to: None,
-                correlation_id: None,
-                message,
-                session_id: existing_session,
-                project_id,
-                model: Some(model),
-                provider,
-                reasoning_effort,
-            };
-            let result = client
-                .chat(req)
-                .await
-                .map(|resp| resp.session_id)
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::ChatStarted {
-                context_id,
-                turn_id: assistant_turn_id,
-                result,
-            });
-        });
+    fn accept_chat_start(&mut self, session_id: String, turn_id: String) {
+        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+            self.clear_child_approval_context();
+        }
+        self.chat.session_id = Some(session_id.clone());
+        self.chat.history_loaded = true;
+        self.chat.observed_activity = None;
+        self.rebind_command_palette_to_active_session();
+        self.status_message = "Streaming...".to_string();
+        self.start_stream_and_execute(session_id, turn_id);
     }
 
     /// Open the SSE stream for `session_id`, wiring `sse_tx`/`sse_rx` so
@@ -15291,6 +15352,21 @@ impl App {
     }
 
     fn activate_command_palette_selection(&mut self) {
+        if let Some(palette) = self.command_palette.as_mut().filter(|palette| {
+            palette.trigger == CommandPaletteTrigger::Slash
+                && palette.search_query().eq_ignore_ascii_case("loop")
+        }) {
+            if !palette.original_composer.still_matches(&self.chat.textarea) {
+                palette.error = Some("Composer changed while selecting; draft preserved".into());
+                return;
+            }
+            let draft = format!("/{}", palette.input.trim());
+            self.install_command_draft(draft);
+            self.close_command_palette();
+            let send = self.action_key_phrase(ActionContext::Chat, ActionId::SendMessage, "sends");
+            self.status_message = format!("Loop command inserted · {send}");
+            return;
+        }
         let Some(entry) = self
             .command_palette
             .as_ref()
@@ -15805,6 +15881,23 @@ mod command_palette_tests {
         app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
         assert!(app.command_palette.is_none());
         assert_eq!(app.chat.textarea.lines(), ["draft text/"]);
+    }
+
+    #[test]
+    fn leading_loop_command_stages_exactly_what_the_user_typed() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Slash,
+            "loop 5m check the build",
+            Vec::new(),
+        );
+
+        app.activate_command_palette_selection();
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.chat.textarea.lines(), ["/loop 5m check the build"]);
+        assert!(!app.chat.streaming);
     }
 
     #[test]
@@ -23950,6 +24043,42 @@ mod question_tests {
         let last = app.notifications.last().expect("notify logged an entry");
         assert!(last.text.contains("connection refused"));
         assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_loop_command_preserves_the_current_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current-session".to_string());
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("current-turn".to_string());
+        app.chat.current_response = "response in progress".to_string();
+        let result = serde_json::from_value(serde_json::json!({
+            "session_id": "current-session",
+            "stream_url": "/api/v1/events/current-session",
+            "status": "accepted",
+            "loop_command": {
+                "action": "stop",
+                "should_execute": false,
+                "loop": {"state": "stopped", "last_run_status": "running"}
+            }
+        }))
+        .unwrap();
+
+        app.handle_event(AppEvent::LoopChatFinished {
+            context_id: app.chat.context_id,
+            session_id: app.chat.session_id.clone(),
+            message: "/loop stop".to_string(),
+            result: Ok(result),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.chat.streaming);
+        assert_eq!(app.chat.current_turn_id.as_deref(), Some("current-turn"));
+        assert_eq!(app.chat.current_response, "response in progress");
+        assert!(app.chat.messages.is_empty());
+        assert!(app.sse_task.is_none());
+        assert_eq!(app.status_message, "Loop stopped · last run running");
     }
 
     #[tokio::test]

@@ -1377,6 +1377,13 @@ impl AppState {
                 spawn_scheduler.supports_native_ticket_budget(),
             ),
         );
+        let paced_loops = Arc::new(super::paced_loop::PacedLoops::new(
+            session_store.clone(),
+            persistence.clone(),
+            sessions.clone(),
+            session_inbox.clone(),
+            child_completion_coordinator.clone(),
+        ));
         if start_inbox_reconciler {
             observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
@@ -1387,6 +1394,7 @@ impl AppState {
                 session_activation_router.clone(),
                 mcp_proxy_shutdown.clone(),
                 observer_subscriptions.clone(),
+                paced_loops.clone(),
                 sessions.clone(),
             )
             .await;
@@ -1589,6 +1597,7 @@ impl AppState {
             external_child_runner: external_runner,
             tickets,
             child_completion_coordinator,
+            paced_loops,
             guardian_spawner,
             bash_resume_hook,
             schedule_store,

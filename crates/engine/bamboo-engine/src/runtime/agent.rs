@@ -606,6 +606,13 @@ impl Agent {
             }))
     }
 
+    /// Only the paced loop's reserved execution receives this system guidance.
+    pub(crate) fn with_paced_loop_system_guidance(&self, guidance: Arc<str>) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.paced_loop_system_guidance = Some(guidance);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]

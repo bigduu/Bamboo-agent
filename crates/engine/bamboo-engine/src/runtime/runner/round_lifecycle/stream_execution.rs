@@ -1015,7 +1015,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if let Some(last) = system_blocks.last_mut() {
         last.cache_anchor = true;
     }
-    let lane_system = system_blocks
+    let mut lane_system = system_blocks
         .iter()
         .map(|b| b.text.as_str())
         .collect::<Vec<_>>()
@@ -1157,6 +1157,25 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                 .collect()
         })
         .unwrap_or_default();
+    // A scheduled turn's system directive is wire-only. In particular it
+    // cannot overwrite the user's system prompt or reset the durable context
+    // epoch when an ordinary turn follows a scheduled turn.
+    if let Some(guidance) = &config.paced_loop_system_guidance {
+        if !lane_system.is_empty() {
+            lane_system.push_str("\n\n");
+        }
+        lane_system.push_str(guidance);
+        if !system_blocks.is_empty() {
+            system_blocks.push(
+                bamboo_domain::PromptBlock::new(
+                    "paced_loop",
+                    ContextBlockType::CoreDirectives,
+                    guidance.as_ref(),
+                )
+                .with_stability(ContextBlockStability::RoundDynamic),
+            );
+        }
+    }
     let mut ir = PromptIR {
         system_text: lane_system,
         system_blocks,

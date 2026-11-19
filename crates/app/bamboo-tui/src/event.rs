@@ -8,7 +8,8 @@ use crate::api::types::{
     TaskListResponse, ToolInfo,
 };
 use crate::api::{
-    PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
+    ChatSubmission, PermissionMutationFailure, RespondFailure, SessionMutationFailure,
+    VersionedSession,
 };
 use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
 
@@ -104,6 +105,12 @@ pub enum AppEvent {
         context_id: u64,
         turn_id: String,
         result: Loaded<String>,
+    },
+    LoopChatFinished {
+        context_id: u64,
+        session_id: Option<String>,
+        message: String,
+        result: Loaded<ChatSubmission>,
     },
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
     /// Since no SSE terminal event will ever arrive for a run that never

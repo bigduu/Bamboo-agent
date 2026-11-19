@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use std::time::Duration;
 
 use bamboo_domain::poison::PoisonRecover;
+use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
+use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
 use bamboo_domain::{
     AgentHookPoint, HookPayload, HookToolOutcome, SessionActivationPolicy, SessionChildOutcome,
     SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
@@ -18,8 +20,8 @@ use bamboo_domain::{
 use crate::execution::{
     reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
     AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
-    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
-    SpawnScheduler,
+    SessionCompletionHook, SessionExecutionArgs, SessionExecutionReservation,
+    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -62,6 +64,32 @@ const RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: &str = "hidden_from_ui";
 const RUNTIME_RESUME_MESSAGE_KIND_KEY: &str = "runtime_kind";
 const CHILD_COMPLETION_INLINE_FIELD_BYTES: usize = 48 * 1024;
 const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
+
+enum ResumeOrigin {
+    Legacy,
+    Configured,
+    PacedLoop { system_guidance: Option<String> },
+}
+
+fn record_paced_loop_outcome(run_id: String) -> SessionCompletionHook {
+    Box::new(move |outcome, session| {
+        Box::pin(async move {
+            let status = if outcome.cancelled {
+                "cancelled"
+            } else if !outcome.success {
+                "failed"
+            } else if session.last_run_status().as_deref() == Some("suspended") {
+                "suspended"
+            } else {
+                "completed"
+            };
+            session.metadata.insert(
+                PACED_LOOP_OUTCOME_METADATA_KEY.into(),
+                serde_json::json!({ "run_id": run_id, "status": status }).to_string(),
+            );
+        })
+    })
+}
 
 fn read_runtime_state(session: &Session) -> AgentRuntimeState {
     session
@@ -963,6 +991,122 @@ impl ChildCompletionCoordinator {
             session,
             None,
         )
+    }
+
+    /// Compete for the ordinary Session execution slot without publishing any
+    /// scheduled input. A busy Session will retain its single due occurrence.
+    pub async fn reserve_paced_loop_turn(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionExecutionReservation> {
+        let event_sender = ResumeExecutionPort::get_or_create_event_sender(self, session_id).await;
+        match crate::execution::agent_spawn::reserve_selected_input_execution(
+            &self.agent,
+            &self.agent_runners,
+            &self.session_event_senders,
+            session_id,
+            &event_sender,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => Some(reservation),
+            SessionExecutionReserveOutcome::AlreadyRunning { .. } => None,
+        }
+    }
+
+    /// Bind the reserved turn's actual Root writer and logical lifetime before
+    /// accepting a prompt that must never be forwarded to a later owner.
+    pub async fn prepare_paced_loop_turn(
+        &self,
+        reservation: &mut SessionExecutionReservation,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        if session.kind != SessionKind::Root
+            || !session.authority_identity.is_ordinary()
+            || crate::ticket_runtime::is_managed_work_root(session)
+            || self.root_account_sink.is_none()
+            || self.root_tools.read().await.is_none()
+        {
+            return Err(std::io::Error::other(
+                "scheduled turn requires an ordinary Root execution surface",
+            ));
+        }
+        reservation
+            .bind_reserved_session_lifetime(&self.agent, session)
+            .await?;
+        reservation.bind_root_actor(&self.agent, session).await
+    }
+
+    /// Publish and hand off this exact reserved turn. Success records Inbox
+    /// admission and dispatch only. Runtime events report the final outcome.
+    pub async fn dispatch_paced_loop_turn(
+        &self,
+        mut reservation: SessionExecutionReservation,
+        session: Session,
+        prompt: String,
+        generation: uuid::Uuid,
+        occurrence: u64,
+        system_guidance: Option<String>,
+    ) -> std::io::Result<()> {
+        let writer = reservation
+            .root_actor_writer()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no bound Root writer"))?;
+        let router = self
+            .agent
+            .activation_router()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no activation router"))?;
+        let inbox = self
+            .agent
+            .session_inbox()
+            .ok_or_else(|| std::io::Error::other("scheduled turn has no Inbox"))?;
+        let source = serde_json::json!({
+            "generation": generation,
+            "occurrence": occurrence,
+            "run_id": reservation.run_id(),
+        });
+        let envelope = SessionMessageEnvelope {
+            id: SessionMessageId::stable(PACED_LOOP_INSTRUCTION, &source),
+            source: SessionMessageSource::Runtime {
+                subsystem: PACED_LOOP_SUBSYSTEM.into(),
+            },
+            target_session_id: session.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(
+                bamboo_domain::SessionRuntimeInstruction {
+                    instruction: PACED_LOOP_INSTRUCTION.into(),
+                    content: Some(SessionMessageContent::text(prompt)),
+                    data: Some(source),
+                    provider_message: None,
+                },
+            ),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        let config_snapshot = self.config.read().await.clone();
+        let config = self.build_resume_config(&session, &config_snapshot);
+        let event_sender = ResumeExecutionPort::get_or_create_event_sender(self, &session.id).await;
+        let receipt = inbox
+            .deliver_paced_loop_for_run(&envelope, &writer, router.clone())
+            .await
+            .map_err(std::io::Error::other)?;
+        reservation.bind_paced_loop_inbox_receipt(receipt)?;
+        let request = ResumeSpawnRequest {
+            session_id: session.id.clone(),
+            session,
+            execution_reservation: reservation,
+            event_sender,
+            config,
+        };
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator
+                .spawn_resume_with_origin(request, ResumeOrigin::PacedLoop { system_guidance })
+                .await;
+        });
+        Ok(())
     }
 
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
@@ -2073,16 +2217,18 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
     }
 
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, false).await;
+        self.spawn_resume_with_origin(request, ResumeOrigin::Legacy)
+            .await;
     }
 
     async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, true).await;
+        self.spawn_resume_with_origin(request, ResumeOrigin::Configured)
+            .await;
     }
 }
 
 impl ChildCompletionCoordinator {
-    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, origin: ResumeOrigin) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -2090,6 +2236,17 @@ impl ChildCompletionCoordinator {
             event_sender,
             config,
         } = request;
+        let (from_config, system_guidance, on_complete) = match origin {
+            ResumeOrigin::Legacy => (false, None, None),
+            ResumeOrigin::Configured => (true, None, None),
+            ResumeOrigin::PacedLoop { system_guidance } => (
+                true,
+                system_guidance,
+                Some(record_paced_loop_outcome(
+                    execution_reservation.run_id().to_owned(),
+                )),
+            ),
+        };
         if let Err(error) = execution_reservation.ensure_registered().await {
             tracing::warn!(
                 %session_id,
@@ -2259,6 +2416,11 @@ impl ChildCompletionCoordinator {
         };
         let agent =
             Arc::new(agent.with_legacy_vision_provider_source(legacy_vision_provider_source));
+        let agent = if let Some(guidance) = system_guidance {
+            Arc::new(agent.with_paced_loop_system_guidance(Arc::from(guidance)))
+        } else {
+            agent
+        };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
             &resolved_provider_name,
@@ -2359,7 +2521,7 @@ impl ChildCompletionCoordinator {
             run_budget: None,
             runners: self.agent_runners.clone(),
             sessions_cache: self.sessions.clone(),
-            on_complete: None,
+            on_complete,
             // A resumed session that is itself a CHILD (nested sub-agents)
             // must publish its terminal completion so ITS parent is woken
             // in turn (issue #546).

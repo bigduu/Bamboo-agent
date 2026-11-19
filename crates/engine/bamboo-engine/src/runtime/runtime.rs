@@ -141,6 +141,7 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     /// Capturing no inherited wait is also immutable for this execution.
     pub(crate) inherited_child_wait_captured: bool,
+    pub(crate) paced_loop_system_guidance: Option<Arc<str>>,
     /// Config-derived fallback is an explicit per-run Host choice.
     pub(crate) legacy_image_from_config: bool,
     pub(crate) legacy_image_provider_source:
@@ -349,6 +350,7 @@ impl AgentRuntimeBuilder {
         }
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
+            paced_loop_system_guidance: None,
             legacy_image_from_config: false,
             legacy_image_provider_source: None,
             sdk_skill_execution_host: None,
@@ -1204,6 +1206,7 @@ impl AgentRuntime {
             ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
             system_prompt,
+            paced_loop_system_guidance: self.paced_loop_system_guidance.clone(),
             // Snapshot the legacy model_limits from the live in-memory config so
             // resolve_token_budget never falls back to a disk-reading Config::new(). #38.
             legacy_model_limits: config.extra.get("model_limits").cloned(),

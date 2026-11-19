@@ -124,20 +124,23 @@ impl SessionRepository {
         consumer: &SessionInboxConsumerId,
         expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<InputAdmission> {
-        let claim_once = async |request: &SessionInboxLeaseRequest| match self
-            .root_inbox_receipt
-            .as_ref()
-        {
-            Some(receipt) => {
-                inbox
-                    .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), request)
+        let claim_once =
+            async |request: &SessionInboxLeaseRequest| match self.root_inbox_receipt.as_ref() {
+                Some(selection) => {
+                    inbox
+                        .claim_owned_receipt(
+                            &session.id,
+                            selection.receipt(),
+                            Some(&owner.fence.run_id),
+                            request,
+                        )
+                        .await
+                }
+                None => inbox
+                    .claim_owned(&session.id, 1, active_run_id, request)
                     .await
-            }
-            None => inbox
-                .claim_owned(&session.id, 1, active_run_id, request)
-                .await
-                .map(|claims| claims.into_iter().next()),
-        };
+                    .map(|claims| claims.into_iter().next()),
+            };
         let request = lease_request(directory, owner, consumer).await?;
         let claim = match claim_once(&request).await {
             // This error comes from before the queue was touched. Refresh the
@@ -173,13 +176,23 @@ impl SessionRepository {
                 "Root input differs from the reserved Work dispatch",
             ));
         }
-        if self.root_inbox_receipt.is_some()
-            && (envelope.source != bamboo_domain::SessionMessageSource::User
-                || envelope.kind != bamboo_domain::SessionMessageKind::UserInput)
-        {
-            return Err(io::Error::other(
-                "Selected Root receipt is not an ordinary User input",
-            ));
+        match self.root_inbox_receipt.as_ref() {
+            Some(RootInboxSelection::Human(_))
+                if envelope.source != bamboo_domain::SessionMessageSource::User
+                    || envelope.kind != bamboo_domain::SessionMessageKind::UserInput =>
+            {
+                return Err(io::Error::other(
+                    "Selected Root receipt is not an ordinary User input",
+                ));
+            }
+            Some(RootInboxSelection::PacedLoop(_))
+                if envelope.paced_loop_run_id() != Some(owner.fence.run_id.as_str()) =>
+            {
+                return Err(io::Error::other(
+                    "Selected paced Loop receipt does not belong to this Root turn",
+                ));
+            }
+            _ => {}
         }
         let matching = session
             .messages

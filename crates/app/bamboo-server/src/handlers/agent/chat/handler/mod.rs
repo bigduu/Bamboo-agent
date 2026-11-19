@@ -281,6 +281,11 @@ async fn handle_chat(
     req: web::Json<ChatRequest>,
     http_request: &HttpRequest,
 ) -> HttpResponse {
+    if let Some(command) = crate::handlers::agent::paced_loop::parse_chat_command(&req.message) {
+        return crate::handlers::agent::paced_loop::handle_chat_command(&state, &req, command)
+            .await;
+    }
+
     let root_mode_selection = match bamboo_domain::RootThinkingMode::resolve_selection(
         req.thinking_mode,
         req.root_orchestration_only,
