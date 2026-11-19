@@ -1768,6 +1768,11 @@ pub(crate) async fn stage_user_context_compaction(
             "Lossy compaction is unavailable for required one-shot context".into(),
         ));
     }
+    // Idle compaction has no round refresh to establish the current Project's
+    // memory. Do not use a saved rendering even for preflight accounting.
+    session
+        .metadata
+        .remove(super::super::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY);
     let id = session.id.clone();
     let budget =
         super::token_budget::resolve_token_budget(session, config, model, provider.as_ref()).await;
@@ -2476,7 +2481,12 @@ async fn maybe_apply_summary_context_compression_with_budget(
     .with_context_blocks(if message_summary {
         Vec::new()
     } else {
+        // Current external memory is counted for normal inference, while
+        // copying it into a durable summary would defeat later withdrawal.
         compression_context_blocks
+            .into_iter()
+            .filter(|block| block.block_type != bamboo_domain::ContextBlockType::ExternalMemory)
+            .collect()
     })
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {

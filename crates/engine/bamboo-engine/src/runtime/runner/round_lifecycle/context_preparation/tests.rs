@@ -2821,6 +2821,65 @@ fn attach_durable_instruction_workflow(session: &mut Session) {
 }
 
 #[tokio::test]
+async fn idle_summary_omits_external_memory_from_the_previous_project() {
+    let mut session = Session::new("idle-summary-fixture", "test-model");
+    session.set_project_id_meta("current-fixture-project");
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.add_message(Message::system("summarize the example conversation"));
+    for index in 0..16 {
+        session.add_message(Message::user(format!(
+            "Ordinary historical user request {index}: {}",
+            "user conversation details ".repeat(140)
+        )));
+        session.add_message(Message::assistant(
+            format!(
+                "Ordinary historical assistant response {index}: {}",
+                "assistant conversation details ".repeat(140)
+            ),
+            None,
+        ));
+    }
+    let obsolete_project_memory = "External memory retained from the previous fixture project.";
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.into(),
+        obsolete_project_memory.into(),
+    );
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".into()),
+        background_model_name: Some("test-model".into()),
+        context_management: ContextManagementConfig {
+            strategy: ContextManagementStrategy::Summary,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (provider, captured) = prompt_capture_llm();
+
+    let applied =
+        super::stage_user_context_compaction(&mut session, &config, "test-model", &[], &provider)
+            .await
+            .expect("idle legacy Summary should complete");
+
+    assert!(applied);
+    assert!(session.conversation_summary.is_some());
+    let captured = captured.lock().unwrap();
+    let sent = captured.iter().flatten().collect::<Vec<_>>();
+    assert!(sent
+        .iter()
+        .any(|message| message.content.contains("Ordinary historical user request")));
+    assert!(
+        sent.iter()
+            .all(|message| !message.content.contains(obsolete_project_memory)),
+        "the dormant session's obsolete Project snapshot reached the summary provider"
+    );
+}
+
+#[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
     activate_plan_mode(&mut session);
@@ -2927,11 +2986,18 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 
     assert!(prompt.contains("## Compression Context Blocks"));
     assert!(prompt.contains("type: task_snapshot"));
-    assert!(prompt.contains("type: external_memory"));
+    assert!(!prompt.contains("type: external_memory"));
     assert!(prompt.contains("type: plan_mode_state"));
     assert!(prompt.contains("type: plan_runtime_state"));
     assert!(prompt.contains("Current Task List"));
-    assert!(prompt.contains("External Memory (Persistent)"));
+    assert!(!prompt.contains("External Memory (Persistent)"));
+    assert!(requests
+        .iter()
+        .flatten()
+        .all(|message| !message.content.contains("Session memory note")));
+    assert!(session
+        .metadata
+        .contains_key(crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY));
     assert!(prompt.contains("Plan Mode State"));
     assert!(prompt.contains("Durable Plan Execution Context"));
     assert!(prompt.contains("## Custom Compression Instructions"));
