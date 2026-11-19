@@ -4,9 +4,17 @@ use bamboo_domain::{
     SessionKind, SupervisedRootOutcomeResult,
 };
 use bamboo_tickets::{
-    AssignmentState, Authority, Command, DispatchIntent, DispatchSpec, Error, ManagedWorkRoot,
-    Operation, OperationReceipt, Principal, Result, RuntimeReceipt, TicketService,
+    AssignmentState, Authority, Command, Contract, DispatchIntent, DispatchSpec, Error,
+    ManagedWorkRoot, Operation, OperationReceipt, Principal, Result, RuntimeReceipt, TicketService,
 };
+
+const PLAN_GUIDANCE: &str = concat!(
+    "Complete the Work contract below in the assigned workspace. ",
+    "Use Task to record and update your plan and progress. "
+);
+const READ_GUIDANCE: &str = "Use absolute paths inside the assigned worktree for Read. ";
+const HANDOFF_GUIDANCE: &str =
+    "Finish with a handoff covering each acceptance item and any open findings for Supervisor review.";
 
 pub fn validate_start(spec: &DispatchSpec) -> Result<()> {
     if spec.workspace.is_none()
@@ -38,20 +46,36 @@ pub fn format_instruction(
     packet: &bamboo_tickets::WorkContextPacket,
     max_bytes: usize,
 ) -> Result<String> {
+    let read_guidance = if packet.contract.allowed_tools.contains("Read") {
+        READ_GUIDANCE
+    } else {
+        ""
+    };
     let message = format!(
-        "{}\n\n{}",
-        concat!(
-            "Complete the Work contract below in the assigned workspace. ",
-            "Use Task to record and update your plan and progress. ",
-            "Use absolute paths inside the assigned worktree for Read. Finish with a handoff ",
-            "covering each acceptance item and any open findings for Supervisor review."
-        ),
+        "{PLAN_GUIDANCE}{read_guidance}{HANDOFF_GUIDANCE}\n\n{}",
         serde_json::to_string(packet)?,
     );
     if message.len() > max_bytes {
         return Err(Error::ContextBudgetExceeded);
     }
     Ok(message)
+}
+
+/// Reconstruct the historical first input for comparison with a stored creation receipt.
+pub fn legacy_task_only_instruction_for_replay(
+    message: &str,
+    contract: &Contract,
+) -> Option<String> {
+    if contract.allowed_tools.len() != 1 || !contract.allowed_tools.contains("Task") {
+        return None;
+    }
+    let packet = message
+        .strip_prefix(PLAN_GUIDANCE)?
+        .strip_prefix(HANDOFF_GUIDANCE)?
+        .strip_prefix("\n\n")?;
+    Some(format!(
+        "{PLAN_GUIDANCE}{READ_GUIDANCE}{HANDOFF_GUIDANCE}\n\n{packet}"
+    ))
 }
 
 pub fn matches_root(target: &ManagedWorkRoot, spec: &DispatchSpec, session: &Session) -> bool {
@@ -361,4 +385,83 @@ fn publish_reply(
         }],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_tickets::{ExecutionWorkspace, ScopeBinding, WorkContextPacket};
+
+    #[test]
+    fn first_instruction_respects_allowed_tools_and_the_byte_budget() {
+        let mut packet = WorkContextPacket {
+            project_context: None,
+            contract_ref: "work-fixture".into(),
+            contract_revision: 1,
+            generation: 1,
+            assignment_id: "assignment-fixture".into(),
+            binding: ScopeBinding {
+                scope_id: "scope-fixture".into(),
+                supervisor_session_id: "supervisor-fixture".into(),
+                binding_revision: 1,
+            },
+            contract: Contract {
+                title: "Fixture".into(),
+                objective: "交付结果".into(),
+                constraints: vec![],
+                acceptance: vec![],
+                user_acceptance_required: false,
+                allowed_tools: ["Task".into()].into(),
+            },
+            workspace: Some(ExecutionWorkspace {
+                repo: "fixture".into(),
+                base_commit: "base".into(),
+                branch: "branch".into(),
+                worktree: "/fixture/worktree".into(),
+                write_roots: vec![],
+                claims: Default::default(),
+            }),
+            inputs: vec![],
+            input_artifacts: vec![],
+            answers: vec![],
+            result_contract: "Handoff".into(),
+        };
+        let task_only_guidance = concat!(
+            "Complete the Work contract below in the assigned workspace. ",
+            "Use Task to record and update your plan and progress. ",
+            "Finish with a handoff covering each acceptance item and any open findings ",
+            "for Supervisor review."
+        );
+        let read_task_guidance = concat!(
+            "Complete the Work contract below in the assigned workspace. ",
+            "Use Task to record and update your plan and progress. ",
+            "Use absolute paths inside the assigned worktree for Read. ",
+            "Finish with a handoff covering each acceptance item and any open findings ",
+            "for Supervisor review."
+        );
+
+        for guidance in [task_only_guidance, read_task_guidance] {
+            let serialized = serde_json::to_string(&packet).unwrap();
+            let expected = format!("{guidance}\n\n{serialized}");
+            assert_eq!(format_instruction(&packet, 4096).unwrap(), expected);
+            assert_eq!(
+                format_instruction(&packet, expected.len()).unwrap(),
+                expected
+            );
+            assert!(matches!(
+                format_instruction(&packet, expected.len() - 1),
+                Err(Error::ContextBudgetExceeded)
+            ));
+            let historical = legacy_task_only_instruction_for_replay(&expected, &packet.contract);
+            if guidance == task_only_guidance {
+                assert_eq!(
+                    historical,
+                    Some(format!("{read_task_guidance}\n\n{serialized}"))
+                );
+            } else {
+                assert!(historical.is_none());
+            }
+            packet.contract.allowed_tools.insert("Read".into());
+        }
+    }
 }

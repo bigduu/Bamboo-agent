@@ -338,13 +338,6 @@ struct RetainedResourceBudget {
     instruction_revisions: Mutex<HashMap<[u8; 32], Weak<u64>>>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("global workflow snapshot budget exceeded ({projected} > {limit} bytes)")]
-struct PublicationBudgetExceeded {
-    projected: usize,
-    limit: usize,
-}
-
 impl RetainedResourceBudget {
     fn next_publication_revision(&self) -> u64 {
         self.publication_revision.fetch_add(1, Ordering::Relaxed) + 1
@@ -495,7 +488,7 @@ impl RetainedResourceBudget {
         definition_bytes: usize,
         resources: &[(usize, usize)],
         limit: usize,
-    ) -> Result<(), PublicationBudgetExceeded> {
+    ) -> SkillResult<()> {
         let mut state = self.state.lock().expect("workflow retained budget lock");
         let old = state.publications.get(&store_token);
         let old_definition_bytes = old.map(|charge| charge.definition_bytes).unwrap_or(0);
@@ -522,7 +515,7 @@ impl RetainedResourceBudget {
             }
         }
         if projected > limit {
-            return Err(PublicationBudgetExceeded { projected, limit });
+            return Err(SkillError::PublicationBudgetExceeded { projected, limit });
         }
         if let Some(old) = state.publications.remove(&store_token) {
             Self::remove_charge(&mut state, old);
@@ -1392,6 +1385,11 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn set_snapshot_budget_for_test(&mut self, bytes: usize) {
+        self.snapshot_limits.max_retained_bytes = bytes;
+    }
+
     fn normalize_mode(raw_mode: Option<&str>) -> Option<String> {
         let raw = raw_mode?.trim();
         if raw.is_empty() {
@@ -2082,7 +2080,7 @@ impl SkillStore {
             self.snapshot_limits.max_retained_bytes,
         ) {
             let Some(owner) = scope_owner else {
-                return Err(SkillError::Storage(error.to_string()));
+                return Err(error);
             };
             // The incoming publication is still private and its captured bytes
             // stay the same on retry. The admission guard prevents cache growth
@@ -2090,7 +2088,7 @@ impl SkillStore {
             if publication_bytes > self.snapshot_limits.max_retained_bytes
                 || !owner.reclaim_one_scoped_store().await
             {
-                return Err(SkillError::Storage(error.to_string()));
+                return Err(error);
             }
         }
         *skills_guard = resolved_skills;
@@ -3843,6 +3841,18 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Refresh derived views after a committed legacy Workflow mutation.
+    /// Return a revision only once the refresh has completed.
+    pub async fn refresh_legacy_workflow_views_after_commit(&self) -> Option<u64> {
+        match self.reload_global_workflow_views().await {
+            Ok(()) => Some(self.workflow_catalog_snapshot().await.revision),
+            Err(error) => {
+                tracing::warn!(%error, "Legacy Workflow committed with a catalog refresh error");
+                None
+            }
+        }
+    }
+
     /// Resolve an isolated catalog view for a specific session workspace without changing the
     /// server-wide snapshot or consulting the server process current directory.
     pub async fn workflow_catalog_for_workspace(
@@ -4258,7 +4268,7 @@ impl SkillStore {
     /// adapter bundle whose metadata confirms ownership by that source.
     /// Same-id ordinary or explicitly migrated Skills are never removed.
     pub async fn remove_legacy_workflow(&self, source: &Path, id: &str) -> SkillResult<bool> {
-        let _reload_guard = self.reload_lock.lock().await;
+        let reload_guard = self.reload_lock.lock().await;
         let removed_bundle =
             crate::legacy::remove_legacy_markdown_bundle(source, &self.config.skills_dir, id)
                 .await?;
@@ -4278,7 +4288,8 @@ impl SkillStore {
             }
             return Err(error.into());
         }
-        self.load_locked(None).await?;
+        drop(reload_guard);
+        let _ = self.refresh_legacy_workflow_views_after_commit().await;
         Ok(true)
     }
 
@@ -7738,6 +7749,10 @@ Use this skill for testing.
             .await
             .err()
             .expect("a held workspace publication still counts against the shared budget");
+        assert!(matches!(
+            error,
+            crate::SkillError::PublicationBudgetExceeded { .. }
+        ));
         assert!(error
             .to_string()
             .contains("global workflow snapshot budget"));

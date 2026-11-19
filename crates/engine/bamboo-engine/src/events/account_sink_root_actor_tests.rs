@@ -5,7 +5,10 @@
 use std::{
     fs::File,
     path::Path,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::Duration,
 };
 
@@ -16,7 +19,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use fs2::FileExt;
 use tokio::sync::{broadcast::error::TryRecvError, oneshot};
 
-use crate::events::{journal, AccountEventSink, ChangeEvent};
+use crate::events::{journal, AccountEventSink, ChangeEvent, RootActorEventPublication};
 
 const ROOT: &str = "queued-root-account-writer";
 const WAIT: Duration = Duration::from_secs(8);
@@ -72,6 +75,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_inbox_capacity(super::INBOX_CAPACITY).await
+    }
+
+    async fn with_inbox_capacity(capacity: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("bamboo");
         let a = Arc::new(SessionStoreV2::new(data.clone()).await.unwrap());
@@ -81,7 +88,8 @@ impl Fixture {
         // The independent Store discovers the existing canonical Root through
         // normal initialization, without manufactured index or authority files.
         let b = Arc::new(SessionStoreV2::new(data).await.unwrap());
-        let sink = AccountEventSink::new(temp.path().join("events")).unwrap();
+        let sink =
+            AccountEventSink::with_inbox_capacity(temp.path().join("events"), capacity).unwrap();
         Self {
             a,
             b,
@@ -146,6 +154,108 @@ async fn confirmed(receipt: oneshot::Receiver<bool>) -> bool {
         .await
         .expect("account writer confirms its final publication")
         .expect("actual writer returns a result rather than dropping the receipt")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_account_queue_revalidates_the_root_before_either_publication() {
+    let fixture = Fixture::with_inbox_capacity(1).await;
+    let a = fixture
+        .running_owner(&fixture.a, "a", Duration::from_secs(2))
+        .await;
+    let mut live = fixture.sink.subscribe();
+    let claim = JournalClaim::acquire(fixture.sink.events_dir());
+    for session_id in ["queued-first", "queued-second"] {
+        tokio::time::timeout(WAIT, fixture.sink.tx.reserve())
+            .await
+            .unwrap()
+            .unwrap()
+            .send(super::QueuedEvent::Legacy((
+                Some(session_id.into()),
+                AgentEvent::SessionHistoryCommitted {
+                    session_id: session_id.into(),
+                },
+            )));
+    }
+    assert_eq!(fixture.sink.tx.capacity(), 0);
+
+    let published_a = Arc::new(AtomicBool::new(false));
+    let called = published_a.clone();
+    let publisher =
+        RootActorEventPublication::new(fixture.a.clone(), fixture.sink.clone(), a.clone());
+    let mut outdated = tokio::spawn(async move {
+        publisher
+            .publish(
+                ROOT,
+                &AgentEvent::SessionHistoryCommitted {
+                    session_id: ROOT.into(),
+                },
+                Box::new(move || {
+                    called.store(true, Ordering::SeqCst);
+                    true
+                }),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut outdated)
+            .await
+            .is_err()
+    );
+    assert!(!published_a.load(Ordering::SeqCst));
+
+    fixture.expire_a(&a).await;
+    let b = fixture
+        .running_owner(&fixture.b, "b", Duration::from_secs(30))
+        .await;
+    assert!(b.fence.lease_epoch > a.fence.lease_epoch);
+    let publisher = RootActorEventPublication::new(fixture.b.clone(), fixture.sink.clone(), b);
+    let published_b = Arc::new(AtomicBool::new(false));
+    let called = published_b.clone();
+    let event = AgentEvent::SessionHistoryCommitted {
+        session_id: ROOT.into(),
+    };
+    let current = publisher.publish(
+        ROOT,
+        &event,
+        Box::new(move || {
+            called.store(true, Ordering::SeqCst);
+            true
+        }),
+    );
+    tokio::pin!(current);
+    assert!(futures::poll!(&mut current).is_pending());
+    assert!(!published_b.load(Ordering::SeqCst));
+    drop(claim);
+
+    let error = tokio::time::timeout(WAIT, outdated)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+    assert!(!published_a.load(Ordering::SeqCst));
+    tokio::time::timeout(WAIT, current).await.unwrap().unwrap();
+    assert!(published_b.load(Ordering::SeqCst));
+    for (index, session_id) in ["queued-first", "queued-second", ROOT]
+        .into_iter()
+        .enumerate()
+    {
+        let frame = tokio::time::timeout(WAIT, live.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.seq, index as u64 + 1);
+        assert_eq!(frame.session_id.as_deref(), Some(session_id));
+    }
+    assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(
+        journal::read_since(fixture.sink.events_dir(), 0)
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -25,7 +25,19 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::change_feed::ChangeEvent;
+
+/// The account writer keeps Child completion identity in the existing journal
+/// row. Public replay projects only the unchanged `ChangeEvent`.
+#[derive(Serialize, Deserialize)]
+pub(super) struct AccountJournalEntry {
+    #[serde(flatten)]
+    pub change: ChangeEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_completion_id: Option<String>,
+}
 
 /// Roll to a new journal file once the current one passes this size.
 pub const ROTATE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
@@ -222,26 +234,37 @@ impl EventJournal {
     /// flushing keeps concurrent `/stream` replays able to read the latest
     /// line without waiting on a timer.
     pub fn append(&mut self, ce: &ChangeEvent) -> io::Result<()> {
-        self.append_inner(ce, false)
+        self.append_inner(ce.seq, ce, false)
     }
 
     /// Append, flush, and sync the journal file before returning. Confirmed
     /// cross-process publications use this while holding the global journal
     /// claim so acknowledgement means the dedupe truth is durable.
     pub(crate) fn append_synced(&mut self, ce: &ChangeEvent) -> io::Result<()> {
-        self.append_inner(ce, true)
+        self.append_inner(ce.seq, ce, true)
     }
 
-    fn append_inner(&mut self, ce: &ChangeEvent, sync: bool) -> io::Result<()> {
+    pub(super) fn append_account_entry_synced(
+        &mut self,
+        entry: &AccountJournalEntry,
+    ) -> io::Result<()> {
+        if entry.child_completion_id.is_some() {
+            self.append_inner(entry.change.seq, entry, true)
+        } else {
+            self.append_synced(&entry.change)
+        }
+    }
+
+    fn append_inner(&mut self, seq: u64, entry: &impl Serialize, sync: bool) -> io::Result<()> {
         let created_file = self.current.is_none();
         if created_file {
-            let path = self.dir.join(file_name_for(ce.seq));
+            let path = self.dir.join(file_name_for(seq));
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
             self.current = Some(BufWriter::new(file));
             self.bytes_written = 0;
         }
 
-        let mut line = serde_json::to_string(ce).map_err(io::Error::other)?;
+        let mut line = serde_json::to_string(entry).map_err(io::Error::other)?;
         line.push('\n');
 
         let writer = self
@@ -284,8 +307,23 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 /// Scans the journal files whose range may contain matching events. Used by the
 /// `/stream` resume path and by delta `/history?since`.
 pub fn read_since(dir: &Path, since: u64) -> io::Result<Vec<ChangeEvent>> {
+    read_since_rows(dir, since, |change: &ChangeEvent| change.seq)
+}
+
+pub(super) fn read_account_entries_since(
+    dir: &Path,
+    since: u64,
+) -> io::Result<Vec<AccountJournalEntry>> {
+    read_since_rows(dir, since, |entry: &AccountJournalEntry| entry.change.seq)
+}
+
+fn read_since_rows<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+    since: u64,
+    seq: impl Fn(&T) -> u64,
+) -> io::Result<Vec<T>> {
     let files = list_journal_files(dir)?;
-    let mut out: Vec<ChangeEvent> = Vec::new();
+    let mut out = Vec::new();
     for (idx, (_start, path)) in files.iter().enumerate() {
         // Skip a file only when the *next* file's start-seq proves this whole
         // file precedes `since` (i.e. every event here is <= since).
@@ -300,9 +338,9 @@ pub fn read_since(dir: &Path, since: u64) -> io::Result<Vec<ChangeEvent>> {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(ce) = serde_json::from_slice::<ChangeEvent>(line) {
-                if ce.seq > since {
-                    out.push(ce);
+            if let Ok(entry) = serde_json::from_slice::<T>(line) {
+                if seq(&entry) > since {
+                    out.push(entry);
                 }
             }
         }

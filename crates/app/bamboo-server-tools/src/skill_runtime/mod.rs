@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use bamboo_llm::Config;
 use bamboo_skills::access_control::{SkillAccessError, SkillSessionPort};
 use bamboo_skills::runtime_metadata::validate_pinned_activation_metadata;
-use bamboo_skills::{SkillManager, SkillStore};
+use bamboo_skills::{SkillError, SkillManager, SkillResult, SkillStore};
 
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
@@ -112,6 +112,10 @@ struct SessionSkillScope {
     project: Option<(ProjectId, PathBuf)>,
 }
 
+fn skill_store_error(error: SkillError) -> ToolError {
+    ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
+}
+
 impl SkillToolAccess {
     pub(super) fn new(
         skill_manager: Arc<SkillManager>,
@@ -143,22 +147,20 @@ impl SkillToolAccess {
         session_id: Option<&str>,
     ) -> Result<Arc<SkillStore>, ToolError> {
         let scope = self.session_skill_scope(session_id).await?;
-        self.store_for_scope(scope).await
+        self.store_for_scope(scope).await.map_err(skill_store_error)
     }
 
     /// Resolve using the same owned Session already validated by the caller.
+    #[cfg(test)]
     pub(super) async fn skill_store_for_session(
         &self,
         session: &Session,
     ) -> Result<Arc<SkillStore>, ToolError> {
         let scope = self.skill_scope_for_session(session)?;
-        self.store_for_scope(scope).await
+        self.store_for_scope(scope).await.map_err(skill_store_error)
     }
 
-    async fn store_for_scope(
-        &self,
-        scope: SessionSkillScope,
-    ) -> Result<Arc<SkillStore>, ToolError> {
+    async fn store_for_scope(&self, scope: SessionSkillScope) -> SkillResult<Arc<SkillStore>> {
         match scope.project {
             Some((project_id, project_home)) => {
                 self.skill_manager
@@ -175,9 +177,6 @@ impl SkillToolAccess {
                     .await
             }
         }
-        .map_err(|error| {
-            ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
-        })
     }
 
     async fn session_skill_scope(

@@ -98,7 +98,7 @@ use crate::metrics::types::{
     ToolCallMetrics,
 };
 
-pub use super::mutations::{MetricsMutation, MAX_METRICS_BATCH_SIZE};
+pub use super::mutations::{MetricsMutation, MetricsWrite, MAX_METRICS_BATCH_SIZE};
 
 mod batch;
 #[cfg(test)]
@@ -261,6 +261,16 @@ pub trait MetricsStorage: Send + Sync {
         Ok(results)
     }
 
+    /// Apply ordered collector writes that can carry the tool's exact round.
+    #[doc(hidden)]
+    async fn apply_collector_batch(
+        &self,
+        writes: Vec<MetricsWrite>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        self.apply_batch(writes.into_iter().map(MetricsWrite::into_legacy).collect())
+            .await
+    }
+
     /// Initializes the storage backend.
     ///
     /// This must be called before any other storage operations.
@@ -401,7 +411,7 @@ pub trait MetricsStorage: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `tool_call_id` - Unique identifier for this tool call
+    /// * `tool_call_id` - Provider identifier for this tool call within its round
     /// * `round_id` - Round this tool call belongs to
     /// * `session_id` - Session this tool call belongs to
     /// * `tool_name` - Name of the tool being invoked
@@ -418,7 +428,8 @@ pub trait MetricsStorage: Send + Sync {
     /// Records the completion of a tool call.
     ///
     /// This updates the tool call record with completion details and
-    /// triggers an update to the parent session's tool call count.
+    /// triggers an update to the parent session's tool call count. This
+    /// unqualified API updates records created through the legacy start API.
     ///
     /// # Arguments
     ///
@@ -1055,7 +1066,15 @@ impl MetricsStorage for SqliteMetricsStorage {
         &self,
         mutations: Vec<MetricsMutation>,
     ) -> MetricsResult<Vec<MetricsResult<()>>> {
-        self.apply_mutations(mutations).await
+        self.apply_mutations(mutations.into_iter().map(MetricsWrite::Ordinary).collect())
+            .await
+    }
+
+    async fn apply_collector_batch(
+        &self,
+        writes: Vec<MetricsWrite>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        self.apply_mutations(writes).await
     }
 
     async fn init(&self) -> MetricsResult<()> {
@@ -1140,19 +1159,6 @@ impl MetricsStorage for SqliteMetricsStorage {
                     CHECK(rendered_chars > 0)
                 );
 
-                CREATE TABLE IF NOT EXISTS tool_call_metrics (
-                    tool_call_id TEXT PRIMARY KEY,
-                    round_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    success INTEGER,
-                    error TEXT,
-                    FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
-                    FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
-                );
-
                 CREATE INDEX IF NOT EXISTS idx_session_started_at ON session_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_session_model ON session_metrics(model);
                 CREATE INDEX IF NOT EXISTS idx_round_session_started_at ON round_metrics(session_id, started_at);
@@ -1162,11 +1168,6 @@ impl MetricsStorage for SqliteMetricsStorage {
                 CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_prompt_memory_project_observed_at ON prompt_memory_round_observations(project_id, observed_at, round_id);
                 CREATE INDEX IF NOT EXISTS idx_prompt_memory_item_memory_round ON prompt_memory_project_exposures(memory_id, round_id);
-                CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
-                CREATE INDEX IF NOT EXISTS idx_tool_round_started_at ON tool_call_metrics(round_id, started_at);
-                CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
-                CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name);
-
                 CREATE TABLE IF NOT EXISTS forward_request_metrics (
                     forward_id TEXT PRIMARY KEY,
                     endpoint TEXT NOT NULL,
@@ -1202,6 +1203,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 CREATE INDEX IF NOT EXISTS idx_execute_sync_mismatch_reason ON execute_sync_mismatch_metrics(reason);
                 "#,
             )?;
+            ensure_tool_call_round_identity(connection)?;
             ensure_integer_column(
                 connection,
                 "session_metrics",
@@ -3063,6 +3065,64 @@ fn build_execute_sync_mismatch_where_clause(
     }
 }
 
+fn ensure_tool_call_round_identity(connection: &Connection) -> MetricsResult<()> {
+    const CREATE_TABLE: &str = r#"
+        CREATE TABLE IF NOT EXISTS tool_call_metrics (
+            tool_call_id TEXT NOT NULL,
+            round_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            success INTEGER,
+            error TEXT,
+            round_scoped INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tool_call_id, round_id),
+            FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
+        );
+    "#;
+    with_immediate_transaction(connection, || {
+        connection.execute_batch(CREATE_TABLE)?;
+        let round_key_position: i64 = connection.query_row(
+            "SELECT pk FROM pragma_table_info('tool_call_metrics') WHERE name = 'round_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if round_key_position == 0 {
+            let definitions = connection
+                .prepare(
+                    "SELECT sql FROM sqlite_schema WHERE tbl_name = 'tool_call_metrics' \
+                     AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            connection.execute_batch(
+                "ALTER TABLE tool_call_metrics RENAME TO tool_call_metrics_legacy",
+            )?;
+            connection.execute_batch(CREATE_TABLE)?;
+            connection.execute_batch(
+                "INSERT INTO tool_call_metrics \
+                 (tool_call_id, round_id, session_id, tool_name, started_at, completed_at, success, error) \
+                 SELECT tool_call_id, round_id, session_id, tool_name, started_at, completed_at, success, error \
+                 FROM tool_call_metrics_legacy; \
+                 DROP TABLE tool_call_metrics_legacy;",
+            )?;
+            for statement in definitions {
+                connection.execute_batch(&statement)?;
+            }
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id); \
+             CREATE INDEX IF NOT EXISTS idx_tool_round_started_at ON tool_call_metrics(round_id, started_at); \
+             CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at); \
+             CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name); \
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_legacy_id ON tool_call_metrics(tool_call_id) WHERE round_scoped = 0;",
+        )?;
+        Ok(())
+    })
+}
+
 fn ensure_integer_column(
     connection: &Connection,
     table: &str,
@@ -3927,8 +3987,13 @@ mod tests {
                 } else {
                     ""
                 };
+                let columns = if *table == "tool_call_metrics" {
+                    "tool_call_id, round_id, session_id, tool_name, started_at, completed_at, success, error"
+                } else {
+                    "*"
+                };
                 let mut statement = connection
-                    .prepare(&format!("SELECT * FROM {table} {filter} ORDER BY 1"))
+                    .prepare(&format!("SELECT {columns} FROM {table} {filter} ORDER BY 1"))
                     .unwrap();
                 let columns = statement.column_count();
                 statement

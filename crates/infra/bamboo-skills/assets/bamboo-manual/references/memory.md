@@ -6,6 +6,8 @@ Session memory carries continuity for the current session. Project memory holds
 durable project facts and decisions. Global memory holds cross-project user
 context. Project identity and permission come from the host; a workspace path
 or an agent-invented project key cannot grant Project memory access.
+Use the `project` type with Project or an assigned Section scope for a new
+write. Global writes support cross-project references and preferences.
 
 Jiandu owns canonical persistence, derived indexes, lexical recall and stored
 Dream snapshot bytes. Bamboo owns prompt selection and budgets, optional

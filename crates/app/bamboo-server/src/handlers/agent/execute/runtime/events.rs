@@ -6,6 +6,9 @@ use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::NativeToolEventDisplay;
 use bamboo_engine::config::GoldConfig;
+use bamboo_engine::events::{
+    account_sink::ReservedAccountEvent, PreparedRootActorEvent, RootActorEventPublication,
+};
 use bamboo_engine::execution::event_forwarder::interrupt_root_on_authority_loss;
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
@@ -27,29 +30,52 @@ fn is_critical_event(event: &AgentEvent) -> bool {
     event.is_replayable_session_state()
 }
 
-async fn publish_root_event(
+enum PreparedSessionEvent {
+    Root(PreparedRootActorEvent),
+    Legacy(Option<ReservedAccountEvent>),
+}
+
+impl PreparedSessionEvent {
+    async fn publish(
+        self,
+        publish: impl FnOnce(Option<ReservedAccountEvent>) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Root(root) => root.publish(Box::new(move || publish(None))).await,
+            Self::Legacy(account) => publish(account)
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other("per-session event publication was retired")),
+        }
+    }
+}
+
+async fn prepare_session_event(
     state: &AppState,
     owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
     session_id: &str,
     event: &AgentEvent,
-    publish: Box<dyn FnOnce() -> bool + Send>,
-) -> std::io::Result<()> {
+) -> std::io::Result<PreparedSessionEvent> {
     if let Some(owner) = owner {
-        bamboo_engine::events::RootActorEventPublication::new(
+        RootActorEventPublication::new(
             state.storage.clone(),
             state.account_sink.clone(),
             owner.clone(),
         )
-        .publish(session_id, event, publish)
+        .prepare(session_id, event)
         .await
+        .map(PreparedSessionEvent::Root)
     } else {
-        state.account_sink.record(Some(session_id), event);
-        if publish() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(
-                "per-session event publication was retired",
-            ))
+        match state
+            .account_sink
+            .reserve_session_event(session_id, event)
+            .await
+        {
+            Ok(account) => Ok(PreparedSessionEvent::Legacy(account)),
+            Err(error) if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) => Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "session event could not enter the account change feed");
+                Ok(PreparedSessionEvent::Legacy(None))
+            }
         }
     }
 }
@@ -126,6 +152,15 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
+            let started = match prepare_session_event(
+                state.get_ref(), root_actor.as_ref(), &session_id, &started_event,
+            ).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::warn!(%session_id, %run_id, %error, "Root start account reservation failed");
+                    return;
+                }
+            };
             let (publication, visible_messages, cancel_token) = {
                 let mut runners = state.agent_runners.clone().write_owned().await;
                 let Some(runner) = runners
@@ -139,13 +174,13 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 let cancel_token = runner.cancel_token.clone();
                 let publish_session = session_id.clone();
                 let publish_tx = session_tx.clone();
-                let account_event = started_event.clone();
-                let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &session_id, &account_event, Box::new(move || {
+                let result = started.publish(move |account| {
                     let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
                     runner.published_execution_started = Some(started_event.clone());
+                    if let Some(account) = account { account.enqueue(); }
                     let _ = publish_tx.send(started_event);
                     true
-                })).await;
+                }).await;
                 if let Err(error) = result {
                     interrupt_root_on_authority_loss(
                         &error, &session_id, &run_id, &state.agent_runners,
@@ -196,97 +231,63 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 }
                 let needs_runner_update = is_critical_event(&event)
                     || matches!(&event, AgentEvent::TokenBudgetUpdated { .. });
-                if needs_runner_update {
-                    let is_history_commit =
-                        matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-                    let mut runners = state.agent_runners.clone().write_owned().await;
-                    if !runners.get(&session_id).is_some_and(|runner| runner.run_id == run_id) { return; }
-                    let publish_session = session_id.clone();
-                    let publish_tx = session_tx.clone();
-                    let account_event = event.clone();
-                    let route = event.session_id().unwrap_or(&session_id).to_owned();
-                    let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &route, &account_event, Box::new(move || {
-                        let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
-                        if is_critical_event(&event) { runner.push_critical_event(event.clone()); }
-                        if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) { runner.last_budget_event = Some(event.clone()); }
-                        let _ = publish_tx.send(event);
-                        true
-                    })).await;
-                    if let Err(error) = result {
-                        tracing::warn!(%session_id, %run_id, %error, "obsolete Root runtime event rejected before publication");
-                        interrupt_root_on_authority_loss(
-                            &error, &session_id, &run_id, &state.agent_runners,
-                            &publication, &visible_messages, &cancel_token,
-                        ).await;
-                        return;
+                let is_history_commit =
+                    matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+                let terminal_reason = visible_terminal_reason(&event);
+                let owner = root_actor.as_ref().filter(|_| {
+                    needs_runner_update || terminal_reason.is_some()
+                        || is_history_commit || event.is_durable_change()
+                });
+                let route = event.session_id().unwrap_or(&session_id);
+                let prepared = prepare_session_event(state.get_ref(), owner, route, &event).await;
+                let publish_tx = session_tx.clone();
+                let result = match prepared {
+                    Err(error) => Err(error),
+                    Ok(prepared) if needs_runner_update => {
+                        let mut runners = state.agent_runners.clone().write_owned().await;
+                        if !runners.get(&session_id).is_some_and(|runner| runner.run_id == run_id) { return; }
+                        let publish_session = session_id.clone();
+                        prepared.publish(move |account| {
+                            let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
+                            if is_critical_event(&event) { runner.push_critical_event(event.clone()); }
+                            if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) { runner.last_budget_event = Some(event.clone()); }
+                            if let Some(account) = account { account.enqueue(); }
+                            let _ = publish_tx.send(event);
+                            true
+                        }).await
                     }
-                    if is_history_commit { history_commit_acknowledger.acknowledge(); }
-                } else {
-                    let is_history_commit =
-                        matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
-                    let visible_token = match &event {
-                        AgentEvent::Token { content } => Some(content.clone()),
-                        _ => None,
-                    };
-                    let round_count = match &event {
-                        AgentEvent::RunnerProgress { round_count, .. } => Some(*round_count),
-                        _ => None,
-                    };
-                    let terminal_reason = visible_terminal_reason(&event);
-                    if (terminal_reason.is_some() || is_history_commit || event.is_durable_change()) && root_actor.is_some() {
-                        let publish_tx = session_tx.clone();
-                        let account_event = event.clone();
-                        let route = event.session_id().unwrap_or(&session_id).to_owned();
+                    Ok(prepared) => {
+                        let visible_token = match &event {
+                            AgentEvent::Token { content } => Some(content.clone()),
+                            _ => None,
+                        };
+                        let round_count = match &event {
+                            AgentEvent::RunnerProgress { round_count, .. } => Some(*round_count),
+                            _ => None,
+                        };
                         let event_publication = publication.clone();
                         let visible = visible_messages.clone();
-                        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let publication_accepted = accepted.clone();
-                        let result = publish_root_event(state.get_ref(), root_actor.as_ref(), &route, &account_event, Box::new(move || {
-                            let published = event_publication.publish(|| {
+                        prepared.publish(move |account| {
+                            event_publication.publish(|| {
                                 if let Some(round_count) = round_count { visible.begin_round(round_count); }
                                 if let Some(content) = visible_token { visible.append(content); }
+                                if let Some(account) = account { account.enqueue(); }
                                 let _ = publish_tx.send(event);
                                 if let Some(reason) = terminal_reason { visible.mark_terminal(reason); }
                                 if is_history_commit { visible.history_committed(); }
-                            });
-                            publication_accepted.store(published, std::sync::atomic::Ordering::Release);
-                            published
-                        })).await;
-                        if let Err(error) = result {
-                            tracing::warn!(%session_id, %run_id, %error, "obsolete Root terminal event rejected before publication");
-                            interrupt_root_on_authority_loss(
-                                &error, &session_id, &run_id, &state.agent_runners,
-                                &publication, &visible_messages, &cancel_token,
-                            ).await;
-                            return;
-                        }
-                        if !accepted.load(std::sync::atomic::Ordering::Acquire) { return; }
-                        if is_history_commit { history_commit_acknowledger.acknowledge(); }
-                    } else {
-                    if !publication.publish(|| {
-                        if let Some(round_count) = round_count {
-                            visible_messages.begin_round(round_count);
-                        }
-                        if let Some(content) = visible_token {
-                            visible_messages.append(content);
-                        }
-                        let route_session_id = event.session_id().unwrap_or(&session_id);
-                        state.account_sink.record(Some(route_session_id), &event);
-                        let _ = session_tx.send(event);
-                        if let Some(reason) = terminal_reason {
-                            visible_messages.mark_terminal(reason);
-                        }
-                        if is_history_commit {
-                            visible_messages.history_committed();
-                        }
-                    }) {
-                        return;
+                            })
+                        }).await
                     }
-                    if is_history_commit {
-                        history_commit_acknowledger.acknowledge();
-                    }
-                    }
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%session_id, %run_id, %error, "runtime session event publication rejected");
+                    interrupt_root_on_authority_loss(
+                        &error, &session_id, &run_id, &state.agent_runners,
+                        &publication, &visible_messages, &cancel_token,
+                    ).await;
+                    return;
                 }
+                if is_history_commit { history_commit_acknowledger.acknowledge(); }
             }
 
             // Gold auto-answer responds to a pending clarification that genuinely

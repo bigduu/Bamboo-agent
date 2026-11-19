@@ -203,9 +203,14 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2851 keeps paced Loop host/HTTP tests in default server-app-state and
 // server-handlers. The #2875 Runtime append and wait regressions belong
 // to the existing Engine packages-3 owner.
+// #2872 runs optional catalog pressure in default SkillStore packages-1 and
+// the Native HTTP regression in server-other. The latter enables the scoped
+// test helper through its dev-dependency. The additive catalog stays at 20.
+// #2871 keeps Workflow authoring pressure in server-settings and retains
+// the existing SkillStore ownership and additive test catalog.
 // #2882 changes live external-memory projection and legacy context fitting.
 // Its wire and preparation regressions stay in the existing Engine owner.
-const FEATURE_SOURCE_SHA256 = "edb4f4b9e9fc1a9c6f78ee70cf8832eef45257788f7eb8cc8be7473cdfed341d";
+const FEATURE_SOURCE_SHA256 = "4bdc379f8d1e454c34745196d842ce67793f25326d4aad4421927362e45123d2";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

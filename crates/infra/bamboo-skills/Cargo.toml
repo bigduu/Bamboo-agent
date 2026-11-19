@@ -6,6 +6,9 @@ rust-version.workspace = true
 description = "Agent skill management (definitions, store, selection, access control) for the Bamboo agent framework"
 license = "MIT AND Apache-2.0"
 
+[features]
+test-utils = []
+
 [dependencies]
 bamboo-domain = { path = "../../core/bamboo-domain" }
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }

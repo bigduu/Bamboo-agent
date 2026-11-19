@@ -15,13 +15,14 @@
 //!    setters that would be a no-op).
 //! 5. Mutate the field, bump `title_version` (for title) and always bump
 //!    `metadata_version`, set `updated_at`.
-//! 6. Title/pinned setters use `save_presentation_metadata_committed` and
+//! 6. Reserve account-event capacity, then use
+//!    `save_presentation_metadata_committed` and
 //!    confirm the committed observations. The backend compares the complete
 //!    canonical Session under its cross-process guards and advances existing
 //!    Root/Actor observations with the admitted presentation-only change.
 //! 7. Refresh the in-memory cache (`state.sessions`).
 //! 8. Build the corresponding [`AgentEvent`] from the **final persisted
-//!    session** and publish via [`publish_replayable_session_event`].
+//!    session** and publish via [`publish_reserved_session_mutation`].
 //!
 //! ## Authority rules
 //!
@@ -41,7 +42,7 @@ use bamboo_domain::SessionPresentationMutation;
 use chrono::Utc;
 
 use crate::app_context::AgentSessionContext;
-use crate::events::publish_replayable_session_event;
+use crate::events::replayable::publish_reserved_session_mutation;
 use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 
 /// Errors returned by [`SessionMetadataService`].
@@ -51,6 +52,8 @@ pub enum MetadataError {
     NotFound(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("session update event queue unavailable: {0}")]
+    EventQueueUnavailable(#[from] std::io::Error),
     /// The caller's `If-Match` precondition (expected `metadata_version`) did
     /// not match the current persisted version — a concurrent write won.
     #[error("version conflict: expected {expected}, current {current}")]
@@ -147,6 +150,7 @@ impl SessionMetadataService {
             .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
+        let event_slot = state.account_sink().reserve_session_mutation().await?;
         session = commit_presentation_metadata(state, &session, SessionPresentationMutation::Title)
             .await?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
@@ -159,7 +163,7 @@ impl SessionMetadataService {
             source: TitleSource::Manual,
             updated_at: session.updated_at,
         };
-        publish_replayable_session_event(state, session_id, event).await;
+        publish_reserved_session_mutation(state, session_id, event, event_slot).await;
 
         Ok(Some((session.title, session.title_version)))
     }
@@ -207,6 +211,7 @@ impl SessionMetadataService {
             .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
+        let event_slot = state.account_sink().reserve_session_mutation().await?;
         session = commit_presentation_metadata(state, &session, SessionPresentationMutation::Title)
             .await?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
@@ -219,7 +224,7 @@ impl SessionMetadataService {
             source,
             updated_at: session.updated_at,
         };
-        publish_replayable_session_event(state, session_id, event).await;
+        publish_reserved_session_mutation(state, session_id, event, event_slot).await;
 
         Ok(Some((session.title, session.title_version)))
     }
@@ -249,6 +254,7 @@ impl SessionMetadataService {
             .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
+        let event_slot = state.account_sink().reserve_session_mutation().await?;
         session =
             commit_presentation_metadata(state, &session, SessionPresentationMutation::Pinned)
                 .await?;
@@ -259,7 +265,7 @@ impl SessionMetadataService {
             pinned: session.pinned,
             updated_at: session.updated_at,
         };
-        publish_replayable_session_event(state, session_id, event).await;
+        publish_reserved_session_mutation(state, session_id, event, event_slot).await;
 
         Ok(Some(pinned))
     }

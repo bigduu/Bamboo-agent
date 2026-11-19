@@ -5,7 +5,7 @@
 //! orchestration layer across all background paths (HTTP execute, spawn, schedule).
 
 use chrono::{DateTime, Utc};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -90,6 +90,7 @@ pub struct AgentRunner {
     // an unqualified finalizer cannot prove which run it finalized.
     pub(super) execution_finalized: CancellationToken,
     pub(super) terminal_usage: Arc<OnceLock<TokenUsage>>,
+    child_completion_publication: Option<(DateTime<Utc>, Weak<()>)>,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
@@ -176,6 +177,30 @@ impl AgentRunner {
     /// This bit is set only by finalization of the matching run ID.
     pub fn exact_execution_finalized(&self) -> bool {
         self.execution_finalized.is_cancelled()
+    }
+
+    /// The exact SDK coordinator owns this marker from before terminal save
+    /// until publication or exit. A leftover runner entry is insufficient.
+    pub(crate) fn retain_child_completion_publication(
+        &mut self,
+        child_created_at: DateTime<Utc>,
+    ) -> Arc<()> {
+        let owner = Arc::new(());
+        self.child_completion_publication = Some((child_created_at, Arc::downgrade(&owner)));
+        owner
+    }
+
+    pub(crate) fn child_completion_publication_is_live(
+        &self,
+        source: &super::child_completion::ChildCompletionSource,
+    ) -> bool {
+        self.run_id == source.activation_run_id
+            && self
+                .child_completion_publication
+                .as_ref()
+                .is_some_and(|(birth, owner)| {
+                    *birth == source.child_created_at && owner.strong_count() != 0
+                })
     }
 
     /// Cumulative loop usage recorded by this exact runner's finalizer.
@@ -269,6 +294,7 @@ impl AgentRunner {
             completed_at: None,
             execution_finalized: CancellationToken::new(),
             terminal_usage: Arc::default(),
+            child_completion_publication: None,
             supervisor_run_target: None,
             supervisor_run_workspace: None,
             published_execution_started: None,
