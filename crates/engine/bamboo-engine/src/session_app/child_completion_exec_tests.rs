@@ -510,6 +510,7 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
 
     for case in [
         "missing",
+        "coalesced-missing",
         "leased-other-run",
         "human-after-reserve",
         "foreign-lifetime",
@@ -546,15 +547,35 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
             receipt: delivery.clone(),
             target_created_at: root.created_at,
         };
-        if case == "missing" {
+        if matches!(case, "missing" | "coalesced-missing") {
             startup.receipt.id = bamboo_domain::SessionMessageId::new();
         } else if case == "foreign-lifetime" {
             startup.target_created_at = root.created_at - chrono::Duration::seconds(1);
         }
+        let previous = if case == "coalesced-missing" {
+            Some(
+                router
+                    .register_session_run(&root, "earlier-logical-owner")
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let target = root.id.clone();
         let act = router.clone();
-        let activating =
-            tokio::spawn(async move { act.request_runtime_startup(&target, startup).await });
+        let activating = tokio::spawn(async move {
+            let outcome = act.request_runtime_startup(&target, startup).await.unwrap();
+            if let Some(previous) = previous {
+                assert_eq!(
+                    outcome,
+                    bamboo_domain::SessionActivationDisposition::ActiveNotified
+                );
+                previous.finish(0).await.unwrap().unwrap()
+            } else {
+                outcome
+            }
+        });
         tokio::time::timeout(Duration::from_secs(8), entered.notified())
             .await
             .unwrap();
@@ -586,7 +607,7 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
             _ => {}
         }
         release.notify_one();
-        let disposition = activating.await.unwrap().unwrap();
+        let disposition = activating.await.unwrap();
         assert_eq!(
             disposition,
             if case == "foreign-lifetime" {
@@ -606,4 +627,81 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
         assert_eq!(saved.messages.len(), 1, "{case}");
         assert_eq!(saved.has_pending_question(), case == "human-after-reserve");
     }
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_preserves_native_human_receipt_selection() {
+    use bamboo_domain::{ActorActivationFinish, SessionRuntimeStartup};
+    let (_temp, store, inbox, coordinator, _) = actor_exec_fixture().await;
+    let mut root = Session::new("exact-native-and-runtime", "model");
+    store.save_session(&root).await.unwrap();
+    let runtime =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let deferred = inbox
+        .deliver_runtime_for_target(&runtime, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &deferred,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let human = bamboo_domain::SessionMessageEnvelope::user_input(&root.id, "Selected Human input");
+    let selected = inbox
+        .deliver_with_activation_intent(
+            &human,
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut binding = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&root, "native-selection-run")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(binding
+        .persistence
+        .admit_root_runtime_startup(
+            &mut root,
+            inbox.clone(),
+            &SessionRuntimeStartup {
+                receipt: deferred,
+                target_created_at: binding.owner.created_at
+            },
+            "other-run",
+        )
+        .await
+        .is_err());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+
+    let exact = binding
+        .persistence
+        .bind_root_inbox_receipt(selected)
+        .unwrap();
+    let admission = exact
+        .admit_root_inbox(&mut root, inbox.clone(), Some("native-selection-run"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admission.admission_error.is_none(), "{admission:?}");
+    assert_eq!(admission.merged, 1);
+    assert!(inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    binding
+        .directory
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    binding.disarm_abandonment();
 }

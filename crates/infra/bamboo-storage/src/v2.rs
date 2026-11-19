@@ -7906,8 +7906,11 @@ impl SessionStoreV2 {
             })?;
             let mut outcomes = if let Some(input) = guards.input.clone() {
                 let durable = durable.clone();
-                Self::default_writer_job(guards, move || input.outcomes_after_input(&durable))
-                    .await?
+                let runtime = previous_sidecar.clone();
+                Self::default_writer_job(guards, move || {
+                    input.outcomes_after_input(&durable, runtime.as_ref())
+                })
+                .await?
             } else {
                 durable_outcomes.cloned()
             };
