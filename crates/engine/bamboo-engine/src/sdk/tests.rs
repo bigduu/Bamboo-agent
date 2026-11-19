@@ -176,6 +176,219 @@ impl ExternalChildRunner for TerminalOnlyRunner {
 }
 
 #[tokio::test]
+async fn normal_child_completion_and_source_replay_share_one_account_row() {
+    use crate::events::{journal, AccountEventSink};
+    use crate::execution::{ChildCompletion, ChildCompletionHandler};
+    use crate::runtime::execution::spawn::publish_child_completion;
+
+    struct Hook {
+        sink: Arc<AccountEventSink>,
+        completion: tokio::sync::mpsc::UnboundedSender<ChildCompletion>,
+    }
+
+    #[async_trait]
+    impl ChildCompletionHandler for Hook {
+        async fn on_child_completed(&self, completion: ChildCompletion) {
+            let _ = self.completion.send(completion);
+        }
+
+        fn child_completion_account_sink(&self) -> Option<&Arc<AccountEventSink>> {
+            Some(&self.sink)
+        }
+    }
+
+    let mut harness = build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+    let sink = AccountEventSink::new(harness.home.join("events")).unwrap();
+    let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+    harness.ctx.account_feed_inbox = Some(sink.inbox());
+    harness.ctx.completion_handler = Some(Arc::new(Hook {
+        sink: sink.clone(),
+        completion: completion_tx,
+    }));
+
+    let scheduler = crate::execution::SpawnScheduler::new(harness.ctx.clone());
+    scheduler
+        .enqueue(SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".into(),
+            disabled_tools: None,
+        })
+        .await
+        .unwrap();
+    let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let source = completion.source.as_ref().expect("real terminal source");
+    assert!(source.matches_completion(&completion));
+    let expected = SessionMessageId::stable(
+        "child_completion_notification",
+        &serde_json::to_value(source).unwrap(),
+    )
+    .to_string();
+    assert_eq!(completion.status, "completed");
+    publish_child_completion(&harness.ctx.replayable_event_publisher(), None, completion).await;
+    assert!(
+        sink.record_confirmed(
+            None,
+            &AgentEvent::ConfigChanged {
+                section: "child-completion-fixture".into(),
+                revision: 1,
+            }
+        )
+        .await
+    );
+    let events = journal::read_since(sink.events_dir(), 0).unwrap();
+    let mut completed = events
+        .iter()
+        .filter(|change| matches!(&change.event, AgentEvent::SubAgentCompleted { .. }));
+    let frame = completed
+        .next()
+        .expect("normal Child completion is journaled");
+    let started = events
+        .iter()
+        .find(|change| matches!(&change.event, AgentEvent::SubAgentStarted { child_session_id, .. } if child_session_id == &harness.child_session_id))
+        .expect("the same account stream contains Child start");
+    let history = events
+        .iter()
+        .rfind(|change| matches!(&change.event, AgentEvent::SessionHistoryCommitted { session_id } if session_id == &harness.child_session_id))
+        .expect("the same account stream contains the Child history barrier");
+    assert!(started.seq < history.seq && history.seq < frame.seq);
+    assert_eq!(
+        frame.session_id.as_deref(),
+        Some(harness.parent_session_id.as_str())
+    );
+    assert!(
+        completed.next().is_none(),
+        "the same verified source replays once"
+    );
+    let contents = std::fs::read_dir(sink.events_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .map(std::fs::read_to_string)
+        .unwrap()
+        .unwrap();
+    let row = contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["seq"] == frame.seq)
+        .unwrap();
+    assert_eq!(row["child_completion_id"], expected);
+}
+
+#[tokio::test]
+async fn watchdog_defers_exact_child_while_normal_history_is_paused() {
+    use crate::events::{journal, AccountEventSink};
+    use crate::execution::ChildCompletionSource;
+
+    let events = tempfile::tempdir().unwrap();
+    let sink = AccountEventSink::new(events.path().to_path_buf()).unwrap();
+    let mut harness = build_terminal_delivery_harness_with_feed(
+        Arc::new(CompletedProvider),
+        None,
+        None,
+        Some(sink.clone()),
+    )
+    .await;
+    let (reached, release) = harness.before_history.take().unwrap();
+    harness.ctx.completion_handler = Some(harness.coordinator.clone());
+    let now = chrono::Utc::now();
+    let wait = WaitingForChildrenState::for_children(
+        vec![harness.child_session_id.clone()],
+        ChildWaitPolicy::All,
+        now - chrono::Duration::minutes(2),
+    );
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut runtime = AgentRuntimeState::new("parent-wait-history-fixture");
+    runtime.status = AgentStatusState::Suspended;
+    runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_children".to_owned(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: None,
+    });
+    runtime.waiting_for_children = Some(wait.clone());
+    parent.agent_runtime_state = Some(runtime);
+    parent.set_last_run_status("suspended");
+    harness.storage.save_session(&parent).await.unwrap();
+
+    harness.release_first_terminal.notify_one();
+    harness.allow_reservation.notify_one();
+    run_child_spawn(
+        harness.ctx.clone(),
+        SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".into(),
+            disabled_tools: None,
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), reached.notified())
+        .await
+        .expect("the real coordinator pauses after canonical save and before history");
+    let child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.last_run_status().as_deref(), Some("completed"));
+    assert!(ChildCompletionSource::from_committed_session(&child).is_some());
+    harness
+        .coordinator
+        .sweep_child_wait_for_test(&harness.parent_session_id, wait)
+        .await;
+    let marker = |revision| AgentEvent::ConfigChanged {
+        section: "watchdog-history-fixture".into(),
+        revision,
+    };
+    assert!(sink.record_confirmed(None, &marker(1)).await);
+    let before_history = journal::read_since(events.path(), 0).unwrap();
+    release.notify_one();
+    assert!(!before_history.iter().any(|change| matches!(
+        &change.event,
+        AgentEvent::SubAgentCompleted { child_session_id, .. } if child_session_id == &harness.child_session_id
+    )), "watchdog must not win publication while the exact SDK coordinator is live");
+
+    assert!(collect_until_completed(&mut harness.parent_rx).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::SubAgentCompleted { child_session_id, .. } if child_session_id == &harness.child_session_id
+    )));
+    assert!(sink.record_confirmed(None, &marker(2)).await);
+    let after_history = journal::read_since(events.path(), 0).unwrap();
+    let frames: Vec<_> = after_history
+        .iter()
+        .filter(|change| match &change.event {
+            AgentEvent::SessionHistoryCommitted { session_id } => {
+                session_id == &harness.child_session_id
+            }
+            AgentEvent::SubAgentCompleted {
+                child_session_id, ..
+            } => child_session_id == &harness.child_session_id,
+            _ => false,
+        })
+        .collect();
+    assert_eq!(frames.len(), 2);
+    assert!(matches!(
+        &frames[0].event,
+        AgentEvent::SessionHistoryCommitted { .. }
+    ));
+    assert!(matches!(
+        &frames[1].event,
+        AgentEvent::SubAgentCompleted { .. }
+    ));
+}
+
+#[tokio::test]
 async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_mirror() {
     for (status, typed) in [
         ("completed", AgentStatusState::Completed),
@@ -929,6 +1142,7 @@ struct TerminalBarrierRunner {
     durable_confirmations: Arc<AtomicUsize>,
     first_execute_returned: Arc<Notify>,
     release_first_terminal: Arc<Notify>,
+    before_history: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 #[async_trait]
@@ -983,6 +1197,10 @@ impl ExternalChildRunner for TerminalBarrierRunner {
             return Err("terminal Child snapshot was not durable before ACK callback".into());
         }
         self.durable_confirmations.fetch_add(1, Ordering::SeqCst);
+        if let Some((reached, release)) = &self.before_history {
+            reached.notify_one();
+            release.notified().await;
+        }
         Ok(())
     }
 }
@@ -1116,6 +1334,7 @@ struct DeliveryHarness {
     allow_reservation: Arc<Notify>,
     reservations: Arc<AtomicUsize>,
     durable_confirmations: Arc<AtomicUsize>,
+    before_history: Option<(Arc<Notify>, Arc<Notify>)>,
     _spawn_scheduler: Arc<crate::runtime::execution::spawn::SpawnScheduler>,
 }
 
@@ -1268,6 +1487,21 @@ async fn build_terminal_delivery_harness(
     legacy_pending: Option<serde_json::Value>,
     fail_first_checkpoint_for: Option<String>,
 ) -> DeliveryHarness {
+    build_terminal_delivery_harness_with_feed(
+        provider,
+        legacy_pending,
+        fail_first_checkpoint_for,
+        None,
+    )
+    .await
+}
+
+async fn build_terminal_delivery_harness_with_feed(
+    provider: Arc<dyn LLMProvider>,
+    legacy_pending: Option<serde_json::Value>,
+    fail_first_checkpoint_for: Option<String>,
+    account_sink: Option<Arc<crate::events::AccountEventSink>>,
+) -> DeliveryHarness {
     let home = temp_dir("bamboo-sdk-terminal-inbox-test");
     tokio::fs::create_dir_all(&home).await.unwrap();
     let store = Arc::new(
@@ -1366,6 +1600,9 @@ async fn build_terminal_delivery_harness(
     let first_execute_returned = Arc::new(Notify::new());
     let release_first_terminal = Arc::new(Notify::new());
     let durable_confirmations = Arc::new(AtomicUsize::new(0));
+    let before_history = account_sink
+        .as_ref()
+        .map(|_| (Arc::new(Notify::new()), Arc::new(Notify::new())));
     let external_child_runner: Arc<dyn ExternalChildRunner> = Arc::new(TerminalBarrierRunner {
         inner: InProcessTestRunner {
             agent: agent.clone(),
@@ -1375,6 +1612,7 @@ async fn build_terminal_delivery_harness(
         durable_confirmations: durable_confirmations.clone(),
         first_execute_returned: first_execute_returned.clone(),
         release_first_terminal: release_first_terminal.clone(),
+        before_history: before_history.clone(),
     });
     let ctx = SpawnContext {
         agent: agent.clone(),
@@ -1387,12 +1625,12 @@ async fn build_terminal_delivery_harness(
         app_data_dir: None,
         completion_handler: None,
         child_run_launch_hook: None,
-        account_feed_inbox: None,
+        account_feed_inbox: account_sink.as_ref().map(|sink| sink.inbox()),
     };
     let reservations = Arc::new(AtomicUsize::new(0));
     let reservation_entered = Arc::new(Notify::new());
     let allow_reservation = Arc::new(Notify::new());
-    let coordinator = Arc::new(crate::ChildCompletionCoordinator::new(
+    let coordinator = crate::ChildCompletionCoordinator::new(
         storage.clone(),
         locked,
         sessions_cache,
@@ -1403,8 +1641,12 @@ async fn build_terminal_delivery_harness(
         provider_registry,
         provider_router,
         home,
-        None,
-    ));
+        ctx.account_feed_inbox.clone(),
+    );
+    let coordinator = Arc::new(match account_sink {
+        Some(sink) => coordinator.with_root_account_sink(sink),
+        None => coordinator,
+    });
     coordinator.set_root_tools(tools).await;
     let spawn_scheduler = Arc::new(crate::runtime::execution::spawn::SpawnScheduler::new(
         ctx.clone(),
@@ -1436,6 +1678,7 @@ async fn build_terminal_delivery_harness(
         allow_reservation,
         reservations,
         durable_confirmations,
+        before_history,
         _spawn_scheduler: spawn_scheduler,
     }
 }

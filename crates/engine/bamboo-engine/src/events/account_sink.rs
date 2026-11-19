@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc};
 
 use super::change_feed::ChangeEvent;
-use super::journal::EventJournal;
+use super::journal::{AccountJournalEntry, EventJournal};
 
 /// Bounded inbox to the writer task. Async session publications reserve
 /// capacity before taking their publication guards.
@@ -50,6 +50,10 @@ pub type PendingEvent = (Option<String>, AgentEvent);
 enum QueuedEvent {
     Legacy(PendingEvent),
     DeletedSessions(Vec<String>),
+    ChildTerminal {
+        pending: PendingEvent,
+        completion_id: String,
+    },
     RootActor {
         storage: Arc<dyn Storage>,
         owner: RootActorRuntimeWrite,
@@ -153,17 +157,19 @@ impl AccountEventSink {
         let (durable_events, max_seq) = load_durable_snapshot(&events_dir)?;
         let delivered_lifecycle_ids = durable_events
             .iter()
-            .filter_map(|change| lifecycle_event_id(&change.event))
+            .filter_map(|entry| {
+                lifecycle_event_id(&entry.change.event, entry.child_completion_id.as_deref())
+            })
             .collect::<HashSet<_>>();
         let mut durable_config_states = HashMap::new();
-        for change in &durable_events {
-            if let Some((key, kind)) = config_event_state(&change.event) {
+        for entry in &durable_events {
+            if let Some((key, kind)) = config_event_state(&entry.change.event) {
                 durable_config_states.insert(key, kind);
             }
         }
         let delivered_changed_ids = durable_events
             .iter()
-            .filter_map(|change| config_event_id(&change.event))
+            .filter_map(|entry| config_event_id(&entry.change.event))
             .collect::<HashSet<_>>();
         let seq = Arc::new(AtomicU64::new(max_seq));
         let (tx, rx) = mpsc::channel(inbox_capacity);
@@ -261,6 +267,34 @@ impl AccountEventSink {
         Ok(ReservedSessionMutation(
             reserve_account_slot(&self.tx).await?,
         ))
+    }
+
+    pub(crate) async fn reserve_child_terminal_event(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+        completion_id: String,
+    ) -> std::io::Result<ReservedAccountEvent> {
+        let routed_session = match event {
+            AgentEvent::SubAgentCompleted {
+                parent_session_id, ..
+            } => parent_session_id.as_str(),
+            AgentEvent::SessionHistoryCommitted { session_id } => session_id.as_str(),
+            _ => "",
+        };
+        if routed_session.is_empty() || routed_session != session_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source-backed terminal event must route to its session",
+            ));
+        }
+        Ok(ReservedAccountEvent {
+            permit: reserve_account_slot(&self.tx).await?,
+            event: Box::new(QueuedEvent::ChildTerminal {
+                pending: (Some(session_id.to_owned()), event.clone()),
+                completion_id,
+            }),
+        })
     }
 
     pub(crate) async fn reserve_root_actor_event(
@@ -417,15 +451,23 @@ impl AccountEventSink {
     }
 }
 
-fn lifecycle_event_id(event: &AgentEvent) -> Option<String> {
+fn lifecycle_event_id(event: &AgentEvent, child_completion_id: Option<&str>) -> Option<String> {
     match event {
         AgentEvent::WorkflowActivated { event_id, .. }
         | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(format!("workflow:{event_id}")),
         AgentEvent::SessionCreated { session_id, .. } => {
             Some(format!("session-created:{session_id}"))
         }
+        AgentEvent::SubAgentCompleted { .. } => {
+            child_completion_id.map(|id| format!("child-completed:{id}"))
+        }
+        AgentEvent::SessionHistoryCommitted { .. } => child_completion_id.map(child_history_id),
         _ => None,
     }
+}
+
+fn child_history_id(completion_id: &str) -> String {
+    format!("child-history:{completion_id}")
 }
 
 fn config_event_id(event: &AgentEvent) -> Option<String> {
@@ -470,7 +512,7 @@ fn config_confirmation_id(event: &AgentEvent) -> Option<String> {
 }
 
 fn event_confirmation_id(event: &AgentEvent) -> Option<String> {
-    config_confirmation_id(event).or_else(|| lifecycle_event_id(event))
+    config_confirmation_id(event).or_else(|| lifecycle_event_id(event, None))
 }
 
 fn complete_confirmation_waiters(waiters: &ConfirmationWaiters, config_id: &str, durable: bool) {
@@ -501,26 +543,29 @@ fn remove_confirmation_waiter(waiters: &ConfirmationWaiters, config_id: &str, wa
 enum GlobalAppend {
     Existing {
         max_seq: u64,
-        observed_events: Vec<ChangeEvent>,
+        observed_events: Vec<AccountJournalEntry>,
     },
     Appended {
-        event: Box<ChangeEvent>,
-        observed_events: Vec<ChangeEvent>,
+        event: Box<AccountJournalEntry>,
+        observed_events: Vec<AccountJournalEntry>,
     },
 }
 
-fn exact_once_event_id(event: &AgentEvent) -> Option<String> {
-    lifecycle_event_id(event).or_else(|| config_event_id(event))
+fn exact_once_event_id(event: &AgentEvent, child_completion_id: Option<&str>) -> Option<String> {
+    lifecycle_event_id(event, child_completion_id).or_else(|| config_event_id(event))
 }
 
 fn duplicate_after_observed_delta(
     event: &AgentEvent,
+    child_completion_id: Option<&str>,
     known_config_state: Option<ConfigEventKind>,
-    observed_events: &[ChangeEvent],
+    observed_events: &[AccountJournalEntry],
 ) -> bool {
-    if let Some(exact_id) = exact_once_event_id(event) {
-        return observed_events.iter().any(|change| {
-            exact_once_event_id(&change.event).as_deref() == Some(exact_id.as_str())
+    if let Some(exact_id) = exact_once_event_id(event, child_completion_id) {
+        return observed_events.iter().any(|entry| {
+            exact_once_event_id(&entry.change.event, entry.child_completion_id.as_deref())
+                .as_deref()
+                == Some(exact_id.as_str())
         });
     }
     let Some((key, desired_kind)) = config_event_state(event) else {
@@ -528,7 +573,7 @@ fn duplicate_after_observed_delta(
     };
     observed_events
         .iter()
-        .filter_map(|change| config_event_state(&change.event))
+        .filter_map(|entry| config_event_state(&entry.change.event))
         .filter_map(|(observed_key, kind)| (observed_key == key).then_some(kind))
         .next_back()
         .or(known_config_state)
@@ -536,7 +581,7 @@ fn duplicate_after_observed_delta(
 }
 
 fn publish_observed_events(
-    observed_events: Vec<ChangeEvent>,
+    observed_events: Vec<AccountJournalEntry>,
     seq: &AtomicU64,
     broadcast: &broadcast::Sender<Arc<ChangeEvent>>,
     delivered_lifecycle_ids: &mut HashSet<String>,
@@ -546,8 +591,12 @@ fn publish_observed_events(
     let mut config_states = latest_config_states
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for change in observed_events {
-        if let Some(id) = lifecycle_event_id(&change.event) {
+    for AccountJournalEntry {
+        change,
+        child_completion_id,
+    } in observed_events
+    {
+        if let Some(id) = lifecycle_event_id(&change.event, child_completion_id.as_deref()) {
             delivered_lifecycle_ids.insert(id);
         }
         if let Some((key, kind)) = config_event_state(&change.event) {
@@ -566,7 +615,9 @@ fn publish_observed_events(
     }
 }
 
-fn load_durable_snapshot(events_dir: &std::path::Path) -> std::io::Result<(Vec<ChangeEvent>, u64)> {
+fn load_durable_snapshot(
+    events_dir: &std::path::Path,
+) -> std::io::Result<(Vec<AccountJournalEntry>, u64)> {
     std::fs::create_dir_all(events_dir)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -582,7 +633,7 @@ fn load_durable_snapshot(events_dir: &std::path::Path) -> std::io::Result<(Vec<C
         // Writable recovery truncates a torn/invalid UTF-8 crash tail before
         // the snapshot reader walks complete durable lines.
         let (_, max_seq) = EventJournal::open_for_locked_append(events_dir.to_path_buf())?;
-        let durable_events = super::journal::read_since(events_dir, 0)?;
+        let durable_events = super::journal::read_account_entries_since(events_dir, 0)?;
         Ok((durable_events, max_seq))
     })();
     let _ = FileExt::unlock(&lock);
@@ -615,40 +666,86 @@ impl Drop for JournalClaim {
 
 /// Reuse the existing global sequence/dedupe/append protocol. The caller owns
 /// the journal claim; Root callers additionally retain physical authority guards.
+struct KnownJournalState {
+    max_seq: u64,
+    config_state: Option<ConfigEventKind>,
+    child_history: bool,
+}
+
 fn append_under_global_claim(
     events_dir: &std::path::Path,
     session_id: Option<String>,
     event: AgentEvent,
-    known_max_seq: u64,
-    known_config_state: Option<ConfigEventKind>,
+    child_completion_id: Option<String>,
+    known: KnownJournalState,
     check_current: &dyn Fn() -> std::io::Result<()>,
 ) -> std::io::Result<GlobalAppend> {
     check_current()?;
     let (mut journal, max_seq) = EventJournal::open_for_locked_append(events_dir.to_path_buf())?;
-    let observed_events = if max_seq > known_max_seq {
-        super::journal::read_since(events_dir, known_max_seq)?
+    let mut observed_events = if max_seq > known.max_seq {
+        super::journal::read_account_entries_since(events_dir, known.max_seq)?
     } else {
         Vec::new()
     };
     // The scan can take time. Validate at the actual append/dedupe boundary.
     check_current()?;
-    if duplicate_after_observed_delta(&event, known_config_state, &observed_events) {
+    if duplicate_after_observed_delta(
+        &event,
+        child_completion_id.as_deref(),
+        known.config_state,
+        &observed_events,
+    ) {
         return Ok(GlobalAppend::Existing {
             max_seq,
             observed_events,
         });
     }
-    let ce = ChangeEvent {
-        seq: max_seq
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("account journal sequence exhausted"))?,
-        ts: Utc::now(),
-        session_id,
-        event,
+    let next_seq = |seq: u64| {
+        seq.checked_add(1)
+            .ok_or_else(|| std::io::Error::other("account journal sequence exhausted"))
     };
-    journal.append_synced(&ce)?;
+    let mut seq = next_seq(max_seq)?;
+    if let (
+        Some(id),
+        AgentEvent::SubAgentCompleted {
+            child_session_id, ..
+        },
+    ) = (child_completion_id.as_deref(), &event)
+    {
+        // The exact source comes only from a committed terminal Child save.
+        // Recovery can therefore invalidate that Child's history before its
+        // completion, including across Hosts whose live owners differ.
+        if !known.child_history && !observed_events.iter().any(|entry| {
+            entry.child_completion_id.as_deref() == Some(id)
+                && matches!(&entry.change.event, AgentEvent::SessionHistoryCommitted { session_id } if session_id == child_session_id)
+        }) {
+            let history = AccountJournalEntry {
+                change: ChangeEvent {
+                    seq,
+                    ts: Utc::now(),
+                    session_id: Some(child_session_id.clone()),
+                    event: AgentEvent::SessionHistoryCommitted { session_id: child_session_id.clone() },
+                },
+                child_completion_id: Some(id.to_owned()),
+            };
+            // A crash before the second append leaves a usable history key.
+            journal.append_account_entry_synced(&history)?;
+            observed_events.push(history);
+            seq = next_seq(seq)?;
+        }
+    }
+    let entry = AccountJournalEntry {
+        change: ChangeEvent {
+            seq,
+            ts: Utc::now(),
+            session_id,
+            event,
+        },
+        child_completion_id,
+    };
+    journal.append_account_entry_synced(&entry)?;
     Ok(GlobalAppend::Appended {
-        event: Box::new(ce),
+        event: Box::new(entry),
         observed_events,
     })
 }
@@ -674,7 +771,7 @@ fn publish_global_append(
         GlobalAppend::Appended {
             event,
             observed_events,
-        } => (event.seq, observed_events, Some(*event)),
+        } => (event.change.seq, observed_events, Some(*event)),
     };
     publish_observed_events(
         observed_events,
@@ -685,22 +782,26 @@ fn publish_global_append(
         &mut state.delivered_changed_ids,
     );
     seq.fetch_max(max_seq, Ordering::SeqCst);
-    if let Some(ce) = appended {
+    if let Some(AccountJournalEntry {
+        change,
+        child_completion_id,
+    }) = appended
+    {
         check_current()?;
-        if let Some(id) = lifecycle_event_id(&ce.event) {
+        if let Some(id) = lifecycle_event_id(&change.event, child_completion_id.as_deref()) {
             state.delivered_lifecycle_ids.insert(id);
         }
-        if let Some((key, kind)) = config_event_state(&ce.event) {
+        if let Some((key, kind)) = config_event_state(&change.event) {
             state
                 .latest_config_states
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(key, kind);
         }
-        if let Some(id) = config_event_id(&ce.event) {
+        if let Some(id) = config_event_id(&change.event) {
             state.delivered_changed_ids.insert(id);
         }
-        let _ = broadcast.send(Arc::new(ce));
+        let _ = broadcast.send(Arc::new(change));
     }
     Ok(())
 }
@@ -725,24 +826,28 @@ async fn writer_loop(
         } else {
             break;
         };
-        let (pending, root) = match queued {
-            QueuedEvent::Legacy(pending) => (pending, None),
+        let (pending, root, child_completion_id) = match queued {
+            QueuedEvent::Legacy(pending) => (pending, None, None),
             QueuedEvent::DeletedSessions(ids) => {
                 deleted_sessions = ids.into_iter();
                 continue;
             }
+            QueuedEvent::ChildTerminal {
+                pending,
+                completion_id,
+            } => (pending, None, Some(completion_id)),
             QueuedEvent::RootActor {
                 storage,
                 owner,
                 pending,
                 receipt,
-            } => (pending, Some((storage, owner, receipt))),
+            } => (pending, Some((storage, owner, receipt)), None),
         };
         let (session_id, event) = pending;
         let confirmation_id = event_confirmation_id(&event);
-        let (known_config_state, already_delivered, waiters) = {
+        let (known_config_state, known_child_history, already_delivered, waiters) = {
             let state = state.lock().unwrap_or_else(|p| p.into_inner());
-            let duplicate = lifecycle_event_id(&event)
+            let duplicate = lifecycle_event_id(&event, child_completion_id.as_deref())
                 .is_some_and(|id| state.delivered_lifecycle_ids.contains(&id))
                 || config_event_id(&event)
                     .is_some_and(|id| state.delivered_changed_ids.contains(&id));
@@ -754,7 +859,17 @@ async fn writer_loop(
                     .get(&key)
                     .copied()
             });
-            (known_config, duplicate, state.confirmation_waiters.clone())
+            let child_history = child_completion_id.as_deref().is_some_and(|id| {
+                state
+                    .delivered_lifecycle_ids
+                    .contains(&child_history_id(id))
+            });
+            (
+                known_config,
+                child_history,
+                duplicate,
+                state.confirmation_waiters.clone(),
+            )
         };
         if root.is_none() && already_delivered {
             if let Some(id) = confirmation_id.as_deref() {
@@ -786,8 +901,12 @@ async fn writer_loop(
                                 &events_dir,
                                 session_id,
                                 event,
-                                seq.load(Ordering::SeqCst),
-                                known_config_state,
+                                child_completion_id,
+                                KnownJournalState {
+                                    max_seq: seq.load(Ordering::SeqCst),
+                                    config_state: known_config_state,
+                                    child_history: known_child_history,
+                                },
                                 check_current,
                             )?
                         };
@@ -899,7 +1018,7 @@ mod tests {
             .expect("first event")
             .expect("broadcast");
         assert_eq!(
-            lifecycle_event_id(&first.event),
+            lifecycle_event_id(&first.event, None),
             Some("workflow:stable-activation-id".to_string())
         );
         assert!(
@@ -920,6 +1039,156 @@ mod tests {
                 .is_err()
         );
         assert_eq!(restarted.latest_seq(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_completion_journal_dedupes_rolling_and_restarted_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        // An old Rust literal and a complete field pattern must both compile.
+        let completion = AgentEvent::SubAgentCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "resident-child".into(),
+            status: "completed".into(),
+            error: None,
+        };
+        let AgentEvent::SubAgentCompleted {
+            parent_session_id,
+            child_session_id,
+            status,
+            error,
+        } = &completion
+        else {
+            unreachable!()
+        };
+        let public_event = serde_json::json!({
+            "type": "sub_agent_completed",
+            "parent_session_id": parent_session_id,
+            "child_session_id": child_session_id,
+            "status": status,
+        });
+        assert!(error.is_none());
+        assert_eq!(serde_json::to_value(&completion).unwrap(), public_event);
+        let session_id = Some(parent_session_id.clone());
+        let (mut legacy_writer, _) = EventJournal::open(dir.path().to_path_buf()).unwrap();
+        legacy_writer
+            .append(&ChangeEvent {
+                seq: 1,
+                ts: Utc::now(),
+                session_id: session_id.clone(),
+                event: completion.clone(),
+            })
+            .unwrap();
+        drop(legacy_writer);
+
+        let a = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let b = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let mut a_live = a.subscribe();
+        let mut b_live = b.subscribe();
+        let enqueue = |sink: Arc<AccountEventSink>, id: &'static str| {
+            let completion = completion.clone();
+            async move {
+                sink.reserve_child_terminal_event("parent", &completion, id.into())
+                    .await
+                    .unwrap()
+                    .enqueue();
+            }
+        };
+        enqueue(a.clone(), "first-terminal-source").await;
+        let first = tokio::time::timeout(Duration::from_secs(5), a_live.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.seq, 2);
+        let history = AgentEvent::SessionHistoryCommitted {
+            session_id: "resident-child".into(),
+        };
+        assert!(
+            matches!(&first.event, AgentEvent::SessionHistoryCommitted { session_id } if session_id == "resident-child")
+        );
+        b.reserve_child_terminal_event("resident-child", &history, "first-terminal-source".into())
+            .await
+            .unwrap()
+            .enqueue();
+        enqueue(b.clone(), "first-terminal-source").await;
+        enqueue(b.clone(), "later-terminal-source").await;
+        // Leave another source with only its fsynced history row, as after an
+        // interrupted recovery between the two appends.
+        b.reserve_child_terminal_event("resident-child", &history, "interrupted-source".into())
+            .await
+            .unwrap()
+            .enqueue();
+        assert!(
+            b.record_confirmed(None, &session_created("rolling-marker"))
+                .await
+        );
+        let observed = tokio::time::timeout(Duration::from_secs(5), b_live.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.seq, first.seq);
+        drop(a);
+        drop(b);
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        enqueue(restarted.clone(), "first-terminal-source").await;
+        enqueue(restarted.clone(), "later-terminal-source").await;
+        enqueue(restarted.clone(), "interrupted-source").await;
+        restarted.record(session_id.as_deref(), &completion);
+        assert!(
+            restarted
+                .record_confirmed(None, &session_created("restart-marker"))
+                .await
+        );
+
+        let entries = journal::read_account_entries_since(restarted.events_dir(), 0).unwrap();
+        let ids: Vec<_> = entries
+            .iter()
+            .filter(|entry| matches!(&entry.change.event, AgentEvent::SubAgentCompleted { .. }))
+            .map(|entry| entry.child_completion_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                None,
+                Some("first-terminal-source"),
+                Some("later-terminal-source"),
+                Some("interrupted-source"),
+                None
+            ]
+        );
+        for id in [
+            "first-terminal-source",
+            "later-terminal-source",
+            "interrupted-source",
+        ] {
+            let rows: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.child_completion_id.as_deref() == Some(id))
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert!(
+                matches!(&rows[0].change.event, AgentEvent::SessionHistoryCommitted { session_id } if session_id == "resident-child")
+            );
+            assert!(matches!(
+                &rows[1].change.event,
+                AgentEvent::SubAgentCompleted { .. }
+            ));
+            assert!(rows[0].change.seq < rows[1].change.seq);
+        }
+        let public = journal::read_since(restarted.events_dir(), 0).unwrap();
+        for change in public
+            .iter()
+            .filter(|change| matches!(change.event, AgentEvent::SubAgentCompleted { .. }))
+        {
+            let wire = serde_json::to_value(change).unwrap();
+            assert_eq!(wire["event"], public_event);
+            assert!(wire.get("child_completion_id").is_none());
+        }
+        assert_eq!(
+            public.len(),
+            entries.len(),
+            "old readers retain every journal row"
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use bamboo_agent_core::AgentEvent;
 
-use super::event_forwarder::{reserve_account_inbox_event, AccountFeedInbox};
+use super::event_forwarder::SessionAccountFeed;
 use super::runner_state::AgentRunner;
 
 /// Default broadcast channel capacity for session event senders.
@@ -55,34 +55,42 @@ pub async fn get_or_create_event_sender(
 pub(crate) struct ReplayableSessionEventPublisher {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-    account_feed_inbox: Option<AccountFeedInbox>,
+    account_feed: SessionAccountFeed,
 }
 
 impl ReplayableSessionEventPublisher {
     pub(crate) fn new(
         runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-        account_feed_inbox: Option<AccountFeedInbox>,
+        account_feed: SessionAccountFeed,
     ) -> Self {
         Self {
             runners,
             senders,
-            account_feed_inbox,
+            account_feed,
         }
     }
 
     pub(crate) async fn publish(&self, session_id: &str, event: AgentEvent) {
+        self.publish_with_completion_id(session_id, event, None)
+            .await;
+    }
+
+    pub(crate) async fn publish_with_completion_id(
+        &self,
+        session_id: &str,
+        event: AgentEvent,
+        completion_id: Option<String>,
+    ) {
         debug_assert!(event.is_replayable_session_state());
-        let account =
-            match reserve_account_inbox_event(self.account_feed_inbox.as_ref(), session_id, &event)
-                .await
-            {
-                Ok(account) => account,
-                Err(error) => {
-                    tracing::warn!(%error, "session event could not enter the account change feed");
-                    None
-                }
-            };
+        let account = self
+            .account_feed
+            .reserve(session_id, &event, completion_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "session event could not enter the account change feed");
+                None
+            });
         // Resolve the sender before the runner lock. The SSE/WS subscription
         // boundary uses the same sender-then-runner lock order.
         let sender = get_or_create_event_sender(&self.senders, session_id).await;
@@ -118,8 +126,11 @@ mod tests {
                 },
             ))
             .unwrap();
-        let publisher =
-            ReplayableSessionEventPublisher::new(runners.clone(), senders, Some(account));
+        let publisher = ReplayableSessionEventPublisher::new(
+            runners.clone(),
+            senders,
+            SessionAccountFeed::Legacy(Some(account)),
+        );
         let publication = publisher.publish(
             "parent",
             AgentEvent::SubAgentStarted {

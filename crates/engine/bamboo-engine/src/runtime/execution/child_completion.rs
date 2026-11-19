@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const TERMINAL_SOURCE_KEY: &str = "runtime.child_completion_source_v1";
 
@@ -303,6 +304,13 @@ impl ChildCompletionSource {
                 == Some(self.error_sha256.clone())
     }
 
+    pub(crate) fn account_event_id(&self) -> Option<String> {
+        serde_json::to_value(self).ok().map(|source| {
+            bamboo_domain::SessionMessageId::stable("child_completion_notification", &source)
+                .to_string()
+        })
+    }
+
     pub(crate) fn matches_parent(&self, child: &Session, parent: &Session) -> bool {
         if child.parent_session_id.as_deref() != Some(parent.id.as_str()) {
             return false;
@@ -367,6 +375,12 @@ pub struct ChildCompletion {
 #[async_trait]
 pub trait ChildCompletionHandler: Send + Sync {
     async fn on_child_completed(&self, completion: ChildCompletion);
+
+    /// Host account publication is independent of the completion callback.
+    #[doc(hidden)]
+    fn child_completion_account_sink(&self) -> Option<&Arc<crate::events::AccountEventSink>> {
+        None
+    }
 }
 
 #[cfg(test)]
