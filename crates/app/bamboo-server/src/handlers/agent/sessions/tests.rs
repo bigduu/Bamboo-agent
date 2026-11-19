@@ -157,7 +157,14 @@ mod activity {
     fn a_terminal_verdict_outranks_a_surviving_wait() {
         // The exact false-positive this field exists to prevent: a wait row that
         // outlived its run must not keep a finished session looking busy.
-        for status in ["completed", "error", "cancelled"] {
+        for status in [
+            "completed",
+            "error",
+            "failed",
+            "timeout",
+            "cancelled",
+            "skipped",
+        ] {
             assert_eq!(
                 SessionActivity::derive(false, false, Some(status), 1, true, true),
                 SessionActivity::Terminal,

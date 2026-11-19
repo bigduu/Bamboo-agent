@@ -59,7 +59,10 @@ impl SessionActivity {
         if has_pending_question {
             return Self::WaitingUser;
         }
-        if matches!(last_run_status, Some("completed" | "error" | "cancelled")) {
+        if matches!(
+            last_run_status,
+            Some("completed" | "error" | "failed" | "timeout" | "cancelled" | "skipped")
+        ) {
             return Self::Terminal;
         }
         // A counted running child is fresher than the persisted wait: it covers
@@ -392,9 +395,7 @@ impl SessionSummary {
         self.last_run_status = session
             .last_run_status()
             .filter(|value| !value.trim().is_empty());
-        let runtime = session.agent_runtime_state.as_ref();
-        self.wait_for_children = runtime.is_some_and(|state| state.waiting_for_children.is_some());
-        self.wait_for_bash = runtime.is_some_and(|state| state.waiting_for_bash.is_some());
+        (self.wait_for_children, self.wait_for_bash) = session.persisted_wait_presence();
         self.refresh_activity();
     }
 }

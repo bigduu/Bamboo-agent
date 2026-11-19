@@ -753,18 +753,6 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
     }
 }
 
-fn wait_presence(session: &Session) -> (bool, bool) {
-    session
-        .agent_runtime_state
-        .as_ref()
-        .map_or((false, false), |state| {
-            (
-                state.waiting_for_children.is_some(),
-                state.waiting_for_bash.is_some(),
-            )
-        })
-}
-
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
@@ -6022,7 +6010,7 @@ impl SessionStoreV2 {
                     .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
             })
         });
-        let (waiting_for_children, waiting_for_bash) = wait_presence(session);
+        let (waiting_for_children, waiting_for_bash) = session.persisted_wait_presence();
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -7668,13 +7656,13 @@ impl SessionStoreV2 {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let waits = wait_presence(&runtime_snapshot);
+        let waits = runtime_snapshot.persisted_wait_presence();
         // A different store may have registered a wait after this store
         // cached its index. Compare the previous durable sidecar too, so a
         // clear still updates the shared row when our cached row says no wait.
         let waits_changed = previous
             .as_ref()
-            .is_none_or(|saved| wait_presence(saved) != waits);
+            .is_none_or(|saved| saved.persisted_wait_presence() != waits);
         let runtime_index_changed = waits_changed
             || self.get_index_entry(&session.id).await.is_none_or(|entry| {
                 entry.workspace_path != workspace_path
@@ -11481,7 +11469,10 @@ mod tests {
             let mut shell_runtime = AgentRuntimeState::new("shell-run");
             shell_runtime.waiting_for_bash =
                 Some(WaitingForBashState::for_bash(vec!["shell".into()], now));
-            shell.agent_runtime_state = Some(shell_runtime);
+            shell.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(&shell_runtime)?,
+            );
             storage.save_runtime_state(&shell).await?;
             assert!(
                 storage
