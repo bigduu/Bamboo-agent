@@ -900,7 +900,9 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       return { status: result.status, output }
     },
     verifyArchive: async (name, receipt, checksum) => {
-      const available = frozen && !recovery ? await waitForCargoArchive(name, receipt.version, readRegistry, context.wait) : undefined
+      const available = frozen && (!recovery || recovery.verifyCargoDownload)
+        ? await waitForCargoArchive(name, receipt.version, readRegistry, context.wait)
+        : undefined
       const { bytes, entry } = await downloadArchive(name, receipt.version, available)
       verifyPackageArchive(bytes, receipt, name, checksum, entry)
     },

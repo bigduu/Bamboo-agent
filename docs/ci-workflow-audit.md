@@ -49,6 +49,7 @@ separately from its future canonical-merge owner.
 | `docs.yml` | Rustdoc site producer and deployment. Its flags differ from CI Rustdoc, and main PR/push can compile again. Issue2321 must unify the documented output and retain the site bytes for deployment. |
 | `codeql.yml` | Distinct security analysis for Actions, JS/TS, Python and Rust, using `build-mode: none`. It invokes no Rust product compiler. Retain the analysis result. |
 | `recover-crate-2026-11-22.yml` | Protected Dev dispatch for the fixed #2762 reservation. Verifies the failed attempt, preserves the original published prefix and completes only the crate tail. The original publisher alone finalizes its release and native outputs. |
+| `recover-crate-2026-11-31.yml` | Protected Dev dispatch for the fixed #2840 reservation. Verifies the original failed registry read and 26 crate originals, completes the four unstarted crates, and retains the five original native transports for the original publisher's finalizer. |
 | `release-cargo-isolation.yml` | Path-scoped dummy-credential/Cargo isolation and real ENOSPC acceptance, plus package-compatibility verification. These exercise the publication boundary, not the full product Unit/E2E suite; keep their distinct inputs explicit. |
 | `release-credentials-check.yml` | Explicit operator credential check; no ordinary feature/release test producer. Retain without adding automatic credential access. |
 | `claude.yml` | Explicitly mentioned issue/PR assistant. Not an automatic product test or release stage. Retain its existing authorization boundary. |

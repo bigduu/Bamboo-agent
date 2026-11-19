@@ -4,19 +4,30 @@ const path = require('node:path')
 const core = require('./crate-release.cjs')
 const source = require('./release-source.cjs')
 
-async function retryRegistryRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
-  let response = await read()
-  for (const delay of [2000, 4000, 8000, 16000]) {
-    if (![502, 503, 504].includes(response.status)) break
-    await response.body?.cancel()
-    await wait(delay)
-    response = await read()
+async function retryRegistryRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms)), verifyBody = false) {
+  const delays = [0, 2000, 4000, 8000, 16000]
+  for (const delay of delays) {
+    if (delay) await wait(delay)
+    const last = delay === delays.at(-1)
+    try {
+      const response = await read()
+      if (!last && [502, 503, 504].includes(response.status)) {
+        await response.body?.cancel()
+        continue
+      }
+      if (!verifyBody || !response.ok || !response.body) return response
+      // Fetch can succeed at the headers while the HTTP stream fails during the body.
+      return new Response(await response.arrayBuffer(), response)
+    } catch (error) {
+      const code = error?.cause?.code ?? error?.code
+      if (last || !verifyBody || !['UND_ERR_RES_CONTENT_LENGTH_MISMATCH', 'UND_ERR_SOCKET', 'ECONNRESET'].includes(code)) throw error
+    }
   }
-  return response
 }
 
-// Both entrypoints bind this controller to a checked-in, single-release profile.
-function createFrozenRecovery({ target: TARGET, tail: TAIL, attempts, artifacts: ARTIFACTS, stateKey, workflow, publishedPrefix, retryRegistry = false }) {
+// Each entrypoint binds this controller to a checked-in, single-release profile.
+function createFrozenRecovery({ target: TARGET, tail: TAIL, attempts, artifacts: ARTIFACTS, stateKey, workflow,
+  publishedPrefix, retryRegistry = false, verifyCargoDownload = false }) {
   const admission = { source: TARGET.source, featurePr: TARGET.featurePr, featureRunId: TARGET.featureRunId, workflow }
 
   const clone = value => JSON.parse(JSON.stringify(value))
@@ -215,7 +226,8 @@ function createFrozenRecovery({ target: TARGET, tail: TAIL, attempts, artifacts:
     const receipt = clone(current.receipt)
     let uploadFailure = 'generic'
     const authority = { receipt, release: current.release,
-      ...(retryRegistry ? { retryRegistryRead } : {}),
+      ...(retryRegistry ? { retryRegistryRead: read => retryRegistryRead(read, undefined, verifyCargoDownload) } : {}),
+      verifyCargoDownload,
       guard() {
         source.frozenRecoveryGuard(validation, env, read, admission); originalEvidence(read)
         const tag = read('git/ref/tags/v' + TARGET.version)

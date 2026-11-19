@@ -190,6 +190,11 @@ authenticated readback of `recovery20261122.completed=true`, the original
 publisher owns finalization. Follow the
 [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261122-crate-recovery).
 
+The fixed `v2026.11.31` recovery in #2840 verifies the original failed registry
+read, 26 signed crate originals and all five successful native transports.
+The four unstarted crates use the same signed first-compilation checkpoint.
+Follow the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261131-crate-recovery).
+
 The Bamboo npm workflow is a consumer of the completed v3 Release. Use its
 exact source, manifest and publisher attempt. The preparation job owns npm
 packing and the publishing job uses that verified tarball. See the
