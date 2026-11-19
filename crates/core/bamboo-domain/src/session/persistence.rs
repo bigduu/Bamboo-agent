@@ -223,6 +223,18 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// A separate Host-only selector for one runtime-owned paced loop input.
+    /// The ordinary selected Human receipt path never admits these inputs.
+    fn bind_paced_loop_inbox_receipt(
+        &self,
+        _receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "paced Loop receipt binding unsupported",
+        ))
+    }
+
     fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
         None
     }
@@ -555,6 +567,22 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// Consume one selected Runtime receipt with this Root's exact writer.
+    /// Return the newly checkpointed message after the owned ACK succeeds.
+    /// A missing, stale or already committed input cannot authorize startup.
+    async fn admit_root_runtime_startup(
+        &self,
+        _session: &mut Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _startup: &crate::SessionRuntimeStartup,
+        _run_id: &str,
+    ) -> io::Result<crate::Message> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact Root Runtime Inbox startup unsupported",
+        ))
+    }
+
     async fn admit_root_inbox(
         &self,
         _session: &mut Session,
@@ -789,6 +817,13 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).bind_root_inbox_receipt(receipt)
     }
 
+    fn bind_paced_loop_inbox_receipt(
+        &self,
+        receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_paced_loop_inbox_receipt(receipt)
+    }
+
     fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
         (**self).root_inbox_receipt()
     }
@@ -970,6 +1005,18 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn load_loop_control_checkpoint(&self, session_id: &str) -> io::Result<Option<Session>> {
         (**self).load_loop_control_checkpoint(session_id).await
+    }
+
+    async fn admit_root_runtime_startup(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        startup: &crate::SessionRuntimeStartup,
+        run_id: &str,
+    ) -> io::Result<crate::Message> {
+        (**self)
+            .admit_root_runtime_startup(session, inbox, startup, run_id)
+            .await
     }
 
     async fn admit_root_inbox(

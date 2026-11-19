@@ -12,7 +12,7 @@ use super::{
     ActorActivationFence, Message, MessagePhase, ResponseOccurrence, Role, Session,
     SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxReceipt, SessionKind,
     SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
-    SessionMessageSource, SupervisorReference,
+    SupervisorReference,
 };
 use crate::SupervisorCurrentUserTarget;
 
@@ -1427,9 +1427,6 @@ impl SupervisedRootOutcomes {
         if durable.id != self.root_session_id
             || durable.created_at != self.root_created_at
             || completion.target_session_id != durable.id
-            || completion.kind != SessionMessageKind::RuntimeInstruction
-            || !matches!(&completion.source, SessionMessageSource::Runtime { subsystem }
-                if subsystem == "background_exec")
             || generation == 0
             || durable
                 .session_inbox_admission()
@@ -1437,26 +1434,9 @@ impl SupervisedRootOutcomes {
         {
             return Ok(false);
         }
-        let SessionMessageBody::RuntimeInstruction(instruction) = &completion.body else {
+        let Some(handle) = completion.background_exec_completion_handle() else {
             return Ok(false);
         };
-        let Some(data) = instruction.data.as_ref() else {
-            return Ok(false);
-        };
-        let Some(handle) = data["exec_session_id"].as_str().filter(|id| !id.is_empty()) else {
-            return Ok(false);
-        };
-        if instruction.instruction != "background_exec_completed"
-            || data["session_id"].as_str() != Some(durable.id.as_str())
-            || completion.correlation_id.as_deref() != Some(handle)
-            || !matches!(
-                data["status"].as_str(),
-                Some("completed" | "killed" | "error")
-            )
-            || completion.id != SessionMessageId::stable("background_exec_completion", data)
-        {
-            return Ok(false);
-        }
         let Some(wait) = durable
             .messages
             .last()
@@ -1665,8 +1645,8 @@ impl SupervisedRootOutcomes {
         // The ordinary Root owned-input port authenticates the original
         // transport intent while creating these protected Main-only facts. It
         // deliberately does not add the Child append port's checkpoint marker.
-        // Validate that real producer here; do not forge a Child checkpoint or
-        // relax the separate Observer/Child projection API.
+        // A background exec completion uses the same owned Root writer and
+        // retains its exact admission receipt in Main.
         if main.id != self.root_session_id
             || main.created_at != self.root_created_at
             || main.kind != SessionKind::Root
@@ -1710,10 +1690,16 @@ impl SupervisedRootOutcomes {
             let matched = if checkpoint.is_some() {
                 matches_projected_input(message, &envelope, input, fact, main)?
             } else {
-                matches!(
+                let ordinary_input = matches!(
                     envelope.kind,
                     SessionMessageKind::UserInput | SessionMessageKind::PeerMessage
-                ) && matches!(&envelope.body, SessionMessageBody::Content(content) if content.parts.is_empty() && !content.text.trim().is_empty())
+                ) && matches!(&envelope.body, SessionMessageBody::Content(content) if content.parts.is_empty() && !content.text.trim().is_empty());
+                let owned_runtime_input = input.supervisor_origin.is_none()
+                    && envelope.is_exact_runtime_startup()
+                    && main.session_inbox_admission().is_some_and(|cursor| {
+                        cursor.contains_at_sequence(&input.receipt_id, input.generation)
+                    });
+                (ordinary_input || owned_runtime_input)
                     && crate::is_matching_session_message(message, &envelope)
             };
             if envelope.id != input.receipt_id
@@ -1959,6 +1945,7 @@ impl SupervisedRootOutcomes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionMessageSource;
 
     fn occurrence(id: &str) -> ResponseOccurrence {
         ResponseOccurrence {
@@ -2087,6 +2074,44 @@ mod tests {
             outcomes.material_inputs(continuation).collect::<Vec<_>>(),
             vec![&subscribed]
         );
+
+        let owner = fence(3);
+        outcomes
+            .record_input(&owner, input(completion.id.as_str(), 2))
+            .unwrap();
+        outcomes
+            .finalize(&owner, SupervisedRootOutcomeResult::Completed)
+            .unwrap();
+        root.session_inbox_admission_mut()
+            .record(completion.id.clone(), 2);
+        root.add_message(completion.to_provider_message().unwrap());
+        root.runtime_metadata
+            .get_or_insert_with(Default::default)
+            .supervised_root_outcomes = Some(outcomes.clone());
+
+        assert_eq!(
+            outcomes.finalized_for_fence(&root, &owner),
+            Ok(Some(SupervisedRootOutcomeResult::Completed))
+        );
+
+        let mut wrong_receipt = root.clone();
+        let cursor = wrong_receipt.session_inbox_admission_mut();
+        *cursor = Default::default();
+        cursor.record(completion.id.clone(), 3);
+        assert!(outcomes
+            .finalized_for_fence(&wrong_receipt, &owner)
+            .is_err());
+
+        let mut wrong_origin = completion.clone();
+        wrong_origin.source = SessionMessageSource::Runtime {
+            subsystem: "other-runtime".into(),
+        };
+        let mut wrong_handle = completion.clone();
+        wrong_handle.correlation_id = Some("other-exec".into());
+        for invalid_completion in [wrong_origin, wrong_handle] {
+            *root.messages.last_mut().unwrap() = invalid_completion.to_provider_message().unwrap();
+            assert!(outcomes.finalized_for_fence(&root, &owner).is_err());
+        }
     }
 
     #[test]

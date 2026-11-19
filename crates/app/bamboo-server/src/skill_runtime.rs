@@ -846,7 +846,8 @@ impl SkillExecutionHost for NativeHost {
                         .render_task_catalog(&ctx)
                         .await;
                     let render = match render {
-                        Ok(render) => render,
+                        Ok(Some(render)) => render,
+                        Ok(None) => return Ok(String::new()),
                         Err(error) => {
                             // Tightening can race the metadata read. Recheck the
                             // complete ordinary scope before omitting revoked

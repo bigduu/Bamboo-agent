@@ -35,6 +35,20 @@ mod admission_tests;
 #[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+#[derive(Clone, PartialEq, Eq)]
+enum RootInboxSelection {
+    Human(bamboo_domain::SessionInboxReceipt),
+    PacedLoop(bamboo_domain::SessionInboxReceipt),
+}
+
+impl RootInboxSelection {
+    fn receipt(&self) -> &bamboo_domain::SessionInboxReceipt {
+        match self {
+            Self::Human(receipt) | Self::PacedLoop(receipt) => receipt,
+        }
+    }
+}
+
 /// Framework-owned coordinator over a session's cache / storage / persistence
 /// tiers. Cheap to clone (all fields are `Arc`).
 #[derive(Clone)]
@@ -47,7 +61,7 @@ pub struct SessionRepository {
         Arc<dyn bamboo_domain::ActorDirectoryPort>,
         Arc<bamboo_domain::RootActorRuntimeWrite>,
     )>,
-    root_inbox_receipt: Option<bamboo_domain::SessionInboxReceipt>,
+    root_inbox_receipt: Option<RootInboxSelection>,
     root_actor_writers:
         Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     // Always present in production builds too; only focused tests set it via
@@ -58,6 +72,26 @@ pub struct SessionRepository {
 }
 
 impl SessionRepository {
+    fn with_root_inbox_selection(
+        &self,
+        selection: RootInboxSelection,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        if self.root_actor_owner.is_none()
+            || selection.receipt().generation == 0
+            || self
+                .root_inbox_receipt
+                .as_ref()
+                .is_some_and(|current| current != &selection)
+        {
+            return Err(root_actor_binding_error(
+                "Root receipt requires its unchanged execution writer and input kind",
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root_inbox_receipt = Some(selection);
+        Ok(Arc::new(bound))
+    }
+
     /// Publish a committed Child repair while its Storage guards are held.
     /// A cache belonging to another birth/run/launch/input is left untouched;
     /// this observation grants neither execution nor parent delivery authority.
@@ -779,24 +813,20 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         &self,
         receipt: bamboo_domain::SessionInboxReceipt,
     ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
-        if self.root_actor_owner.is_none()
-            || receipt.generation == 0
-            || self
-                .root_inbox_receipt
-                .as_ref()
-                .is_some_and(|current| current != &receipt)
-        {
-            return Err(root_actor_binding_error(
-                "Root receipt requires its unchanged execution writer",
-            ));
-        }
-        let mut bound = self.clone();
-        bound.root_inbox_receipt = Some(receipt);
-        Ok(Arc::new(bound))
+        self.with_root_inbox_selection(RootInboxSelection::Human(receipt))
+    }
+
+    fn bind_paced_loop_inbox_receipt(
+        &self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        self.with_root_inbox_selection(RootInboxSelection::PacedLoop(receipt))
     }
 
     fn root_inbox_receipt(&self) -> Option<&bamboo_domain::SessionInboxReceipt> {
-        self.root_inbox_receipt.as_ref()
+        self.root_inbox_receipt
+            .as_ref()
+            .map(RootInboxSelection::receipt)
     }
 
     fn root_actor_execution_required(&self, session: &Session) -> bool {
@@ -1169,6 +1199,17 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     ) -> std::io::Result<Option<Session>> {
         self.storage
             .load_execution_admission_snapshot(session_id)
+            .await
+    }
+
+    async fn admit_root_runtime_startup(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        startup: &bamboo_domain::SessionRuntimeStartup,
+        run_id: &str,
+    ) -> std::io::Result<bamboo_domain::Message> {
+        self.admit_owned_root_runtime_startup(session, inbox, startup, run_id)
             .await
     }
 

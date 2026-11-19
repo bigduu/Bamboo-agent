@@ -235,6 +235,87 @@ tokio::task_local! {
     static INPUT_REQUEST_DATA: Option<BoundedInputRequestBatch>;
 }
 
+pub(crate) fn ordinary_standard_root_writer(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+    use bamboo_agent_core::tools::ToolExecutionSessionFlags;
+    use bamboo_domain::SessionKind;
+
+    if session.kind != SessionKind::Root
+        || !session.authority_identity.is_ordinary()
+        || session.id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        || session.root_session_id != session.id
+        || session.parent_session_id.is_some()
+        || session.spawn_depth != 0
+        || session.root_thinking_mode() != bamboo_domain::RootThinkingMode::Standard
+        || crate::ticket_runtime::is_managed_work_root(session)
+        || ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        )
+        .plan_read_only
+    {
+        return None;
+    }
+    let persistence = config.persistence.as_ref()?;
+    let writer = persistence.root_actor_writer()?;
+    if writer.fence.actor_id != session.id
+        || writer.created_at != session.created_at
+        || writer
+            .conversation_generation
+            .check_canonical(session)
+            .is_err()
+    {
+        return None;
+    }
+    Some(writer)
+}
+
+/// The live provider round has already checked this batch against its exact
+/// execution. Couple its newest checked Human input to the same Root writer
+/// and to the receipt captured by the current transcript checkpoint.
+pub(crate) fn root_human_input_receipt(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> Option<bamboo_domain::SessionInboxReceipt> {
+    use bamboo_domain::{SessionMessageKind, SessionMessageSource};
+
+    ordinary_standard_root_writer(config, session)?;
+    let persistence = config.persistence.as_ref()?;
+    INPUT_REQUEST_DATA
+        .try_with(|batch| {
+            let batch = batch
+                .as_ref()
+                .filter(|batch| batch.session_id == session.id)?;
+            let current = batch.records.last()?;
+            match (&current.source, current.kind, current.wrapper.as_deref()) {
+                (SessionMessageSource::User, SessionMessageKind::UserInput, None) => {}
+                (
+                    SessionMessageSource::Runtime { subsystem },
+                    SessionMessageKind::RuntimeInstruction,
+                    Some("root_chat_turn_v1"),
+                ) if subsystem == "chat" => {}
+                _ => return None,
+            }
+            let receipt = session
+                .session_inbox_admission()?
+                .receipt_for(&current.input_id)?;
+            // If the run has an exact selector, a later Human input cannot
+            // lend it authority. This also rejects the paced-loop selector
+            // even when a real Human sends a message during that iteration.
+            if persistence
+                .root_inbox_receipt()
+                .is_some_and(|selected| *selected != receipt)
+            {
+                return None;
+            }
+            Some(receipt)
+        })
+        .ok()
+        .flatten()
+}
+
 /// Lend one existing, uniquely owned input-data batch during a future's polls.
 ///
 /// The optional batch is moved, never cloned or persisted. A synchronous reader
@@ -501,6 +582,218 @@ mod input_request_scope_tests {
         with_scoped_input_request_data(session, execution, |batch| {
             batch.records().as_ptr() as usize
         })
+    }
+
+    struct RootInputPersistence {
+        writer: bamboo_domain::RootActorRuntimeWrite,
+        selected: Option<bamboo_domain::SessionInboxReceipt>,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for RootInputPersistence {
+        fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+            Some(self.writer.clone())
+        }
+
+        fn root_inbox_receipt(&self) -> Option<&bamboo_domain::SessionInboxReceipt> {
+            self.selected.as_ref()
+        }
+
+        async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn test_root_writer(session: &Session) -> bamboo_domain::RootActorRuntimeWrite {
+        bamboo_domain::RootActorRuntimeWrite {
+            fence: bamboo_domain::ActorActivationFence {
+                schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+                actor_id: session.id.clone(),
+                activation_id: "activation".into(),
+                attempt: 1,
+                run_id: "run".into(),
+                lease_owner: "worker".into(),
+                lease_epoch: 1,
+            },
+            created_at: session.created_at,
+            conversation_generation: session.conversation_generation_observation(),
+        }
+    }
+
+    #[tokio::test]
+    async fn root_human_tool_scope_requires_fresh_checked_input_and_the_exact_selected_receipt() {
+        use bamboo_domain::{PermissionMode, SessionInboxReceipt};
+
+        let mut session = Session::new("root", "model");
+        let human = SessionInboxReceipt {
+            id: bamboo_domain::SessionMessageId::parse("human").unwrap(),
+            generation: 1,
+        };
+        let paced = SessionInboxReceipt {
+            id: bamboo_domain::SessionMessageId::parse("paced").unwrap(),
+            generation: 2,
+        };
+        session
+            .session_inbox_admission_mut()
+            .record(human.id.clone(), human.generation);
+        session
+            .session_inbox_admission_mut()
+            .record(paced.id.clone(), paced.generation);
+        let writer = test_root_writer(&session);
+        let mut config = AgentLoopConfig::default();
+        for (selected, expected) in [
+            (None, Some(human.clone())),
+            (Some(human.clone()), Some(human.clone())),
+            (Some(paced), None),
+        ] {
+            config.persistence = Some(Arc::new(RootInputPersistence {
+                writer: writer.clone(),
+                selected,
+            }));
+            assert!(root_human_input_receipt(&config, &session).is_none());
+            scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+                assert_eq!(root_human_input_receipt(&config, &session), expected);
+            })
+            .await;
+        }
+
+        config.persistence = Some(Arc::new(RootInputPersistence {
+            writer,
+            selected: Some(human),
+        }));
+        config.additional_tool_schemas = [
+            "session_loop",
+            "default::SESSION_LOOP",
+            "mcp__test__session_loop",
+        ]
+        .into_iter()
+        .map(|name| ToolSchema {
+            schema_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.into(),
+                description: "Custom tool".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        })
+        .collect();
+        let tools = DataExecutor {
+            entered: tokio::sync::Barrier::new(1),
+        };
+        scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+            assert!(root_human_input_receipt(&config, &session).is_some());
+            let catalog = crate::runtime::runner::session_setup::tool_schemas::resolve_classified_tool_catalog_for_session(
+                &config, &tools, &session,
+            );
+            assert_eq!(catalog.len(), 1);
+            assert_eq!(catalog[0].execution_name(), "mcp__test__session_loop");
+        })
+        .await;
+
+        config.permission_mode = Some(PermissionMode::Plan);
+        scope_input_request_data(Some(batch(&session.id, "exec", "human")), async {
+            assert!(root_human_input_receipt(&config, &session).is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn paced_loop_wakeup_uses_only_the_selected_adaptive_root_call() {
+        use crate::runtime::paced_loop_wakeup::{
+            paced_loop_wakeup_writer, scope_paced_loop_wakeup_writer,
+            take_paced_loop_wakeup_writer, PacedLoopTurn,
+        };
+        use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
+        use bamboo_domain::{
+            PermissionMode, SessionInboxReceipt, SessionMessageBody, SessionMessageContent,
+            SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+            SessionRuntimeInstruction,
+        };
+
+        let mut session = Session::new("root", "model");
+        let receipt = SessionInboxReceipt {
+            id: SessionMessageId::parse("paced").unwrap(),
+            generation: 1,
+        };
+        let writer = test_root_writer(&session);
+        let envelope = SessionMessageEnvelope {
+            id: receipt.id.clone(),
+            source: SessionMessageSource::Runtime {
+                subsystem: PACED_LOOP_SUBSYSTEM.into(),
+            },
+            target_session_id: session.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+                instruction: PACED_LOOP_INSTRUCTION.into(),
+                content: Some(SessionMessageContent::text("check job")),
+                data: Some(serde_json::json!({
+                    "generation": uuid::Uuid::nil(),
+                    "occurrence": 1,
+                    "run_id": writer.fence.run_id,
+                })),
+                provider_message: None,
+            }),
+            created_at: chrono::Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        let mut config = AgentLoopConfig {
+            persistence: Some(Arc::new(RootInputPersistence {
+                writer: writer.clone(),
+                selected: Some(receipt.clone()),
+            })),
+            paced_loop_turn: Some(PacedLoopTurn {
+                system_guidance: None,
+                adaptive_wakeup: true,
+            }),
+            ..AgentLoopConfig::default()
+        };
+        session
+            .session_inbox_admission_mut()
+            .record(receipt.id.clone(), receipt.generation);
+        assert!(
+            paced_loop_wakeup_writer(&config, &session).is_none(),
+            "a cursor without the admitted input cannot lend its writer"
+        );
+        session.add_message(envelope.to_provider_message().unwrap());
+        let live =
+            paced_loop_wakeup_writer(&config, &session).expect("selected adaptive iteration");
+        assert_eq!(live.fence, writer.fence);
+        assert!(take_paced_loop_wakeup_writer("call").is_none());
+        scope_paced_loop_wakeup_writer(Some(live), "call", async {
+            assert!(take_paced_loop_wakeup_writer("other").is_none());
+            assert!(
+                tokio::spawn(async { take_paced_loop_wakeup_writer("call").is_none() })
+                    .await
+                    .unwrap()
+            );
+            scope_paced_loop_wakeup_writer(None, "call", async {
+                assert!(take_paced_loop_wakeup_writer("call").is_none());
+            })
+            .await;
+            assert_eq!(
+                take_paced_loop_wakeup_writer("call").unwrap().fence,
+                writer.fence
+            );
+            assert!(take_paced_loop_wakeup_writer("call").is_none());
+        })
+        .await;
+
+        config.permission_mode = Some(PermissionMode::Plan);
+        assert!(paced_loop_wakeup_writer(&config, &session).is_none());
+        config.permission_mode = None;
+        config.paced_loop_turn.as_mut().unwrap().adaptive_wakeup = false;
+        assert!(paced_loop_wakeup_writer(&config, &session).is_none());
+        config.paced_loop_turn.as_mut().unwrap().adaptive_wakeup = true;
+        config.persistence = Some(Arc::new(RootInputPersistence {
+            writer,
+            selected: Some(SessionInboxReceipt {
+                generation: 2,
+                ..receipt
+            }),
+        }));
+        assert!(paced_loop_wakeup_writer(&config, &session).is_none());
     }
 
     #[tokio::test]
