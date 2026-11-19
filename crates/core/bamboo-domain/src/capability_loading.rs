@@ -46,7 +46,7 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 15] = [
+pub const CORE_TOOL_NAMES: [&str; 17] = [
     "exec_command",
     "write_stdin",
     "Read",
@@ -55,6 +55,10 @@ pub const CORE_TOOL_NAMES: [&str; 15] = [
     "Edit",
     "Write",
     "session_history_current",
+    // The engine emits this schema only for a current Human-owned Root turn.
+    crate::SESSION_LOOP_TOOL_NAME,
+    // The engine emits this schema only during a selected adaptive iteration.
+    crate::PACED_LOOP_WAKEUP_TOOL_NAME,
     // Host registers these only when the opt-in Supervisor scope exists.
     "work_overview",
     "work_search",
@@ -509,6 +513,8 @@ mod tests {
                 "Edit",
                 "Write",
                 "session_history_current",
+                "session_loop",
+                "schedule_loop_wakeup",
                 "work_overview",
                 "work_search",
                 "work_inspect",

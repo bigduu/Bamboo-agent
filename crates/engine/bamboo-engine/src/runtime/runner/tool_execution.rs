@@ -1,5 +1,6 @@
 //! Tool execution helpers for the agent loop runner.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -223,7 +224,7 @@ async fn execute_and_apply_single_tool_call(
                     admitted_execution_name: admitted_execution_name.as_deref(),
                     tool_call,
                     event_tx,
-                    metrics_collector,
+                    metrics_collector: None,
                     session_id,
                     round_id,
                     round,
@@ -260,6 +261,7 @@ async fn execute_and_apply_single_tool_call(
         })
         .flatten();
     let mut stop_round = false;
+    let tool_start_emitted = AtomicBool::new(false);
     let outcome = match policy_guard.check_before_execution_for_name(
         tool_call,
         reserved_calls,
@@ -295,6 +297,7 @@ async fn execute_and_apply_single_tool_call(
                     tool_call,
                     event_tx,
                     metrics_collector,
+                    tool_start_emitted: Some(&tool_start_emitted),
                     session_id,
                     root_orchestration_only,
                     root_session_id: &root_session_id,
@@ -443,7 +446,8 @@ async fn execute_and_apply_single_tool_call(
             admitted_execution_name: admitted_execution_name.as_deref(),
             tool_call,
             event_tx,
-            metrics_collector,
+            metrics_collector: metrics_collector
+                .filter(|_| tool_start_emitted.load(Ordering::Relaxed)),
             session_id,
             round_id,
             round,
@@ -897,9 +901,11 @@ async fn execute_round_tool_calls_inner(
             let output_cap = session
                 .effective_token_budget()
                 .map(|budget| budget.max_tool_output_tokens);
+            let tool_starts: Vec<_> = batch.iter().map(|_| AtomicBool::new(false)).collect();
+            let calls_with_start = batch.iter().zip(&tool_starts);
             let outcomes = bamboo_infrastructure::telemetry::with_timeout(
                 batch_timeout,
-                join_all(batch.iter().map(|tool_call| {
+                join_all(calls_with_start.map(|(tool_call, started)| {
                     let timeout = per_tool_timeout;
                     async move {
                         bamboo_infrastructure::telemetry::with_timeout(
@@ -914,6 +920,7 @@ async fn execute_round_tool_calls_inner(
                                     tool_call,
                                     event_tx,
                                     metrics_collector,
+                                    tool_start_emitted: Some(started),
                                     session_id,
                                     root_orchestration_only,
                                     root_session_id,
@@ -1062,7 +1069,9 @@ async fn execute_round_tool_calls_inner(
                 }))
                 .await;
 
-            for (batch_call, (outcome, fingerprint)) in batch.iter().zip(compressed) {
+            for ((batch_call, (outcome, fingerprint)), tool_start_emitted) in
+                batch.iter().zip(compressed).zip(tool_starts)
+            {
                 let admitted_execution_name = per_call::resolve_callable_for_session(
                     session.session_version,
                     effective_callable_set,
@@ -1075,7 +1084,8 @@ async fn execute_round_tool_calls_inner(
                         admitted_execution_name: admitted_execution_name.as_deref(),
                         tool_call: batch_call,
                         event_tx,
-                        metrics_collector,
+                        metrics_collector: metrics_collector
+                            .filter(|_| tool_start_emitted.load(Ordering::Relaxed)),
                         session_id,
                         round_id,
                         round,
@@ -1669,6 +1679,7 @@ mod tests {
             calls,
             tool_schemas,
             effective_callable_set,
+            None,
         )
         .await
     }
@@ -1680,6 +1691,7 @@ mod tests {
         calls: &[ToolCall],
         tool_schemas: Vec<ToolSchema>,
         effective_callable_set: EffectiveCallableSet,
+        metrics_collector: Option<&bamboo_metrics::MetricsCollector>,
     ) -> (
         Result<RoundToolExecutionResult, AgentError>,
         Session,
@@ -1702,7 +1714,7 @@ mod tests {
             turn: 0,
             debug_enabled: false,
             event_tx: &event_tx,
-            metrics_collector: None,
+            metrics_collector,
             config: &config,
             llm: &llm,
             tools: &tools,
@@ -2014,8 +2026,55 @@ mod tests {
 
     #[tokio::test]
     async fn progressive_gate_rejects_one_parallel_call_without_aborting_allowed_sibling() {
+        use bamboo_metrics::storage::{MetricsStorage, ToolCallCompletion};
+        use bamboo_metrics::{MetricsCollector, RoundStatus, SqliteMetricsStorage};
+        use chrono::Utc;
+        use std::time::Duration;
+
         let session =
             permission_session("progressive-mixed-parallel", SessionPermissionMode::Auto, 1);
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(SqliteMetricsStorage::new(
+            metrics_dir.path().join("metrics.db"),
+        ));
+        metrics.init().await.unwrap();
+        let timestamp = Utc::now();
+        let session_id = session.id.clone();
+        metrics
+            .upsert_session_start(&session_id, "model", timestamp)
+            .await
+            .unwrap();
+        for round in ["prior-round", "permission-boundary-round"] {
+            metrics
+                .insert_round_start(round, &session_id, "model", timestamp)
+                .await
+                .unwrap();
+        }
+        // A repeated provider call id with no new ToolStart must not overwrite
+        // the completion of a real call in a prior round.
+        metrics
+            .insert_tool_start(
+                "parallel-b",
+                "prior-round",
+                &session_id,
+                "parallel_b",
+                timestamp,
+            )
+            .await
+            .unwrap();
+        metrics
+            .complete_tool_call(
+                "parallel-b",
+                ToolCallCompletion {
+                    completed_at: timestamp,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        let collector = MetricsCollector::spawn(metrics.clone(), 7);
+
         let storage = Arc::new(BoundaryStorage::new(session.clone()));
         let executor = Arc::new(PermissionBoundaryExecutor::new(
             storage.clone(),
@@ -2045,6 +2104,7 @@ mod tests {
             &calls,
             tool_schemas,
             effective_callable_set,
+            Some(&collector),
         )
         .await;
 
@@ -2057,6 +2117,10 @@ mod tests {
         assert!(events.iter().all(
             |event| !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-b")
         ));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolError { tool_call_id, error }
+                if tool_call_id == "parallel-b" && error.contains("not callable"))
+        ));
         assert!(session.messages.iter().any(|message| {
             message.tool_call_id.as_deref() == Some("parallel-a")
                 && message.content.contains("parallel_a complete")
@@ -2067,6 +2131,48 @@ mod tests {
                     .content
                     .contains("not callable at the current conversation position")
         }));
+
+        collector.round_completed(
+            "permission-boundary-round",
+            Utc::now(),
+            RoundStatus::Success,
+            Default::default(),
+            0,
+            0,
+            None,
+        );
+        let detail = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let detail = metrics.session_detail(&session_id).await.unwrap().unwrap();
+                if detail.rounds.iter().any(|round| {
+                    round.round_id == "permission-boundary-round"
+                        && round.status == RoundStatus::Success
+                }) {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("collector persisted the round after its tool outcomes");
+        let prior = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == "prior-round")
+            .unwrap();
+        let current = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == "permission-boundary-round")
+            .unwrap();
+        assert_eq!(
+            prior.tool_calls[0].success,
+            Some(true),
+            "rejected tool rewrote an earlier completion"
+        );
+        assert_eq!(current.tool_calls.len(), 1);
+        assert_eq!(current.tool_calls[0].tool_call_id, "parallel-a");
+        assert_eq!(current.tool_calls[0].success, Some(true));
     }
 
     #[tokio::test]

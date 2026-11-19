@@ -1,7 +1,7 @@
 // Copyright 2025 OpenAI. Licensed under Apache-2.0.
 // Adapted from Codex ext/skills/src/tools/{list.rs,read.rs,mod.rs}, revision
 // 7f892275e31002f0422477c6219189284560e689. See third_party/codex/NOTICE.
-use super::{SkillCatalogCaller, SkillCatalogCallerResolver, SkillToolAccess};
+use super::{skill_store_error, SkillCatalogCaller, SkillCatalogCallerResolver, SkillToolAccess};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_llm::Config;
@@ -12,7 +12,7 @@ use bamboo_skills::{
         SkillCatalogEligibility, SkillCatalogMetadata, SkillCatalogRender,
         SkillCatalogRenderPolicy, SkillCatalogSnapshot,
     },
-    SkillManager, SkillStore,
+    SkillError, SkillManager, SkillStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -269,7 +269,11 @@ impl SkillInputFactory {
             // for pinned activations and cannot authorize a new current input.
             let scope = canonical_input_scope(&self.access, &session)?;
             let expected_scope = (scope.workspace.clone(), scope.project.clone());
-            let store = self.access.store_for_scope(scope).await?;
+            let store = self
+                .access
+                .store_for_scope(scope)
+                .await
+                .map_err(skill_store_error)?;
             let prepared = store
                 .prepare_current_input_store(caller.mode.as_deref())
                 .await
@@ -520,14 +524,36 @@ fn canonical_input_scope(
     Ok(scope)
 }
 
+type SkillScopeIdentity = (Option<String>, Option<String>, bool, u64);
+
 struct SelectedCatalogContext {
     caller: SkillCatalogCaller,
     snapshot: SkillCatalogSnapshot,
     identity: String,
     store: Arc<SkillStore>,
     access: SkillCatalogEligibility,
-    scope: (Option<String>, Option<String>, bool, u64),
+    scope: SkillScopeIdentity,
     automatic_prompt: Option<(Vec<SkillCatalogMetadata>, AutomaticSkillOutcome)>,
+}
+
+enum MetadataError {
+    Tool(ToolError),
+    OptionalCapacity(SkillError),
+}
+
+impl From<ToolError> for MetadataError {
+    fn from(error: ToolError) -> Self {
+        Self::Tool(error)
+    }
+}
+
+impl From<MetadataError> for ToolError {
+    fn from(error: MetadataError) -> Self {
+        match error {
+            MetadataError::Tool(error) => error,
+            MetadataError::OptionalCapacity(error) => skill_store_error(error),
+        }
+    }
 }
 
 /// Keeps the current Skill store alive for a finite host execution. The lease
@@ -556,6 +582,13 @@ impl SkillScopeLease {
             return Err(ToolError::Execution("Skill scope lease has ended".into()));
         }
         state.store = Some(store);
+        Ok(())
+    }
+
+    fn check_open(&self) -> Result<(), ToolError> {
+        if self.state.lock().expect("Skill scope lease lock").closed {
+            return Err(ToolError::Execution("Skill scope lease has ended".into()));
+        }
         Ok(())
     }
 }
@@ -597,34 +630,37 @@ impl SkillsListTool {
     /// Render eligible metadata using the same fresh caller/input projection as
     /// skills_list. This does not install a live Tool or read Skill bodies.
     pub async fn render_catalog(&self, ctx: &ToolCtx) -> Result<SkillCatalogRender, ToolError> {
-        self.render_prompt_catalog(ctx, false).await
+        Ok(Self::render_prepared(self.metadata(ctx, false).await?))
     }
 
     /// Project the current authorized User's task onto the Native prompt.
-    /// Explicit Skill intent continues to use the ordinary catalog renderer.
+    /// An unselected ordinary Root can continue without this optional metadata
+    /// when publishing its effective catalog encounters snapshot budget pressure.
     pub async fn render_task_catalog(
         &self,
         ctx: &ToolCtx,
-    ) -> Result<SkillCatalogRender, ToolError> {
-        self.render_prompt_catalog(ctx, true).await
+    ) -> Result<Option<SkillCatalogRender>, ToolError> {
+        match self.metadata(ctx, true).await {
+            Ok(prepared) => Ok(Some(Self::render_prepared(prepared))),
+            Err(MetadataError::OptionalCapacity(error)) => {
+                tracing::debug!(%error, "Optional Skill catalog deferred under snapshot pressure");
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
-    async fn render_prompt_catalog(
-        &self,
-        ctx: &ToolCtx,
-        match_current_task: bool,
-    ) -> Result<SkillCatalogRender, ToolError> {
-        let prepared = self.metadata(ctx, match_current_task).await?;
+    fn render_prepared(prepared: SelectedCatalogContext) -> SkillCatalogRender {
         let budget = skill_metadata_budget(
             prepared.caller.context_window,
             prepared.caller.metadata_tokens,
         );
         let Some((mut candidates, outcome)) = prepared.automatic_prompt else {
-            return Ok(render_skill_catalog(
+            return render_skill_catalog(
                 &prepared.snapshot.entries,
                 SkillCatalogRenderPolicy::ExtensionCompatible,
                 budget,
-            ));
+            );
         };
         for candidate in &mut candidates {
             candidate.description = bounded_summary(&candidate.description);
@@ -647,14 +683,14 @@ impl SkillsListTool {
             advertised_candidates = rendered.included_count,
             "Native automatic Skill prompt evaluated"
         );
-        Ok(rendered)
+        rendered
     }
 
     async fn metadata(
         &self,
         ctx: &ToolCtx,
         match_current_task: bool,
-    ) -> Result<SelectedCatalogContext, ToolError> {
+    ) -> Result<SelectedCatalogContext, MetadataError> {
         // Await the trusted adapter before any Source publication guard is held.
         let caller = self.resolver.resolve(ctx).await?;
         if ctx.session_id() != Some(caller.session_id.as_str())
@@ -675,7 +711,8 @@ impl SkillsListTool {
         {
             return Err(ToolError::Execution(
                 "Skill caller/input binding is stale or invalid".into(),
-            ));
+            )
+            .into());
         }
         let session = self
             .access
@@ -685,9 +722,7 @@ impl SkillsListTool {
         let Some(input) = session.messages.iter().find(|message| {
             message.id == caller.input_id && message.role == bamboo_agent_core::Role::User
         }) else {
-            return Err(ToolError::Execution(
-                "Accepted Skill input is unavailable".into(),
-            ));
+            return Err(ToolError::Execution("Accepted Skill input is unavailable".into()).into());
         };
         let access = SkillCatalogEligibility {
             ceiling: caller.ceiling.clone(),
@@ -706,28 +741,47 @@ impl SkillsListTool {
                 .collect(),
             deny_all: session.model_orchestration_only_enabled(),
         };
-        let store = self.access.skill_store_for_session(&session).await?;
-        #[cfg(test)]
-        if let Some((entered, release)) = self.store_selection_barrier.as_deref() {
-            entered.notify_one();
-            release.notified().await;
+        let scope = scope_identity(&session);
+        let resolved_scope = self.access.skill_scope_for_session(&session)?;
+        let projection = async {
+            let store = self.access.store_for_scope(resolved_scope).await?;
+            #[cfg(test)]
+            if let Some((entered, release)) = self.store_selection_barrier.as_deref() {
+                entered.notify_one();
+                release.notified().await;
+            }
+            let store = store.retain_mode_store(caller.mode.as_deref()).await?;
+            let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none()
+            {
+                let (snapshot, candidates, outcome) = store
+                    .progressive_automatic_catalog_for_mode(None, &access, &input.content)
+                    .await?;
+                (snapshot, Some((candidates, outcome)))
+            } else {
+                let snapshot = store.progressive_catalog_for_mode(None, &access).await?;
+                (snapshot, None)
+            };
+            Ok::<_, SkillError>((store, snapshot, automatic_prompt))
         }
-        let store = store
-            .retain_mode_store(caller.mode.as_deref())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none() {
-            let (snapshot, candidates, outcome) = store
-                .progressive_automatic_catalog_for_mode(None, &access, &input.content)
-                .await
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-            (snapshot, Some((candidates, outcome)))
-        } else {
-            let snapshot = store
-                .progressive_catalog_for_mode(None, &access)
-                .await
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-            (snapshot, None)
+        .await;
+        let (store, snapshot, automatic_prompt) = match projection {
+            Err(error @ SkillError::PublicationBudgetExceeded { .. })
+                if match_current_task
+                    && caller.invocation.is_none()
+                    && caller.ceiling.is_none()
+                    && !access.deny_all
+                    && bamboo_domain::SessionCallerReference::from(&session).is_ordinary_root() =>
+            {
+                self.recheck_scope(ctx, &caller, &access, &scope).await?;
+                if let Some(lease) = &self.scope_lease {
+                    lease
+                        .upgrade()
+                        .ok_or_else(|| ToolError::Execution("Skill scope lease has ended".into()))?
+                        .check_open()?;
+                }
+                return Err(MetadataError::OptionalCapacity(error));
+            }
+            result => result.map_err(skill_store_error)?,
         };
         let identity = fingerprint(&(
             &snapshot.identity,
@@ -743,7 +797,7 @@ impl SkillsListTool {
             identity,
             store,
             access,
-            scope: scope_identity(&session),
+            scope,
             automatic_prompt,
         };
         self.recheck(ctx, &prepared).await?;
@@ -761,6 +815,17 @@ impl SkillsListTool {
         ctx: &ToolCtx,
         prepared: &SelectedCatalogContext,
     ) -> Result<(), ToolError> {
+        self.recheck_scope(ctx, &prepared.caller, &prepared.access, &prepared.scope)
+            .await
+    }
+
+    async fn recheck_scope(
+        &self,
+        ctx: &ToolCtx,
+        expected: &SkillCatalogCaller,
+        access: &SkillCatalogEligibility,
+        scope: &SkillScopeIdentity,
+    ) -> Result<(), ToolError> {
         // Resolve first: the adapter may await while official Session/config setters run.
         let caller = self.resolver.resolve(ctx).await?;
         // Hold configuration stable before the last Session await. Everything after
@@ -771,12 +836,12 @@ impl SkillsListTool {
             .session_for_context(ctx.session_id())
             .await
             .ok_or_else(|| ToolError::Execution("Skill caller session is unavailable".into()))?;
-        if prepared.scope != scope_identity(&current)
+        if scope != &scope_identity(&current)
             || !current.messages.iter().any(|message| {
                 message.id == caller.input_id && message.role == bamboo_agent_core::Role::User
             })
-            || fingerprint(&caller)? != fingerprint(&prepared.caller)?
-            || prepared.access.disabled != config.disabled_skill_ids().into_iter().collect()
+            || fingerprint(&caller)? != fingerprint(expected)?
+            || access.disabled != config.disabled_skill_ids().into_iter().collect()
         {
             return Err(ToolError::Execution(
                 "Skill host scope/caller changed during projection".into(),
@@ -926,9 +991,7 @@ impl Tool for SkillsListTool {
     }
 }
 
-fn scope_identity(
-    session: &bamboo_agent_core::Session,
-) -> (Option<String>, Option<String>, bool, u64) {
+fn scope_identity(session: &bamboo_agent_core::Session) -> SkillScopeIdentity {
     (
         session.workspace_path_meta(),
         session.project_id_meta(),

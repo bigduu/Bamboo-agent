@@ -163,6 +163,11 @@ pub enum SkillError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error(
+        "Storage error: global workflow snapshot budget exceeded ({projected} > {limit} bytes)"
+    )]
+    PublicationBudgetExceeded { projected: usize, limit: usize },
+
     #[error("Read-only: {0}")]
     ReadOnly(String),
 

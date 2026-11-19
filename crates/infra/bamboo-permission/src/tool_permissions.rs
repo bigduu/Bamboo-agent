@@ -1307,6 +1307,20 @@ pub fn check_permissions(
                 _ => Ok(None),
             }
         }
+        "session_loop" => {
+            let action = required_string_arg(args, "action")?;
+            match action {
+                "status" => Ok(None),
+                "start" | "stop" | "resume" => Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    format!("session_loop {action}"),
+                    format!("Session loop {action}: change the current session's loop"),
+                )])),
+                _ => Err(PermissionError::CheckFailed(
+                    "unsupported session_loop action".into(),
+                )),
+            }
+        }
         "scheduler" => {
             let action = required_string_arg(args, "action")?
                 .trim()
@@ -3124,6 +3138,26 @@ mod tests {
             let args = json!({"action": action, "schedule_id": "s1", "name": "n"});
             let contexts = check_permissions("scheduler", &args).unwrap().unwrap();
             assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+        }
+    }
+
+    #[test]
+    fn session_loop_classifies_only_the_exact_mutations() {
+        assert!(
+            check_permissions("session_loop", &json!({"action":"status"}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(check_permissions("session_loop", &json!({"action":"unknown"})).is_err());
+        assert!(check_permissions("session_loop", &json!({})).is_err());
+
+        for action in ["start", "stop", "resume"] {
+            let args = json!({"action":action, "prompt":"private task"});
+            let contexts = check_permissions("session_loop", &args).unwrap().unwrap();
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+            assert_eq!(contexts[0].resource, format!("session_loop {action}"));
+            assert!(!contexts[0].operation_description.contains("private task"));
         }
     }
 
