@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use crate::auto_dream_privacy::{
     ledger_candidate_is_secret_safe, sanitize_extraction_source, sanitize_extraction_source_pair,
     REDACTED_EXTRACTION_SOURCE,
 };
-use crate::project_context::ProjectContextResolver;
+use crate::project_context::{ProjectContextResolver, SessionProjectIdentity};
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
@@ -60,7 +61,8 @@ const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
 const RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS: usize = 128;
 const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_536;
-const EXTRACTION_CHECKPOINT_VERSION: u32 = 4;
+const EXTRACTION_CHECKPOINT_VERSION: u32 = 5;
+const EXTRACTION_CHECKPOINT_CONTENT_PROOF_VERSION: u32 = 4;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v3";
 const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 1;
 
@@ -222,6 +224,23 @@ struct CandidateSessionContext {
     retrieval_event_key: Option<String>,
     source_message_ids: Vec<String>,
     source_message_fingerprints: BTreeMap<String, String>,
+}
+
+fn canonical_extraction_project(session: &Session) -> Option<Option<String>> {
+    match ProjectContextResolver::session_project_identity(session) {
+        SessionProjectIdentity::Assigned(project) => Some(Some(project.into_string())),
+        SessionProjectIdentity::Unassigned => Some(None),
+        SessionProjectIdentity::Invalid { .. } => None,
+    }
+}
+
+fn extraction_scope_fingerprint(created_at: DateTime<Utc>, project_key: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-extraction-scope-v1\0");
+    digest.update(created_at.to_rfc3339().as_bytes());
+    digest.update(b"\0");
+    digest.update(project_key.unwrap_or_default().as_bytes());
+    hex::encode(digest.finalize())
 }
 
 #[derive(Debug, Clone)]
@@ -893,6 +912,7 @@ async fn collect_candidate_session_contexts_from_sessions(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
+    expected_project_key: Option<&str>,
 ) -> Vec<CandidateSessionContext> {
     let mut out = Vec::new();
     for (entry, _) in sessions {
@@ -925,6 +945,15 @@ async fn collect_candidate_session_contexts_from_sessions(
                 continue;
             }
         };
+        let Some(project_key) = canonical_extraction_project(&session) else {
+            continue;
+        };
+        if session.id != entry.id
+            || session.created_at != entry.created_at
+            || expected_project_key.is_some_and(|key| project_key.as_deref() != Some(key))
+        {
+            continue;
+        }
         let is_retrieval_window = session.conversation_summary.is_none()
             && session
                 .compression_events
@@ -959,8 +988,6 @@ async fn collect_candidate_session_contexts_from_sessions(
             extraction_watermark,
             retrieval_source_acknowledged,
         );
-        let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
-            .map(bamboo_domain::ProjectId::into_string);
         let topics = match memory.read_session_topics_with_content(&entry.id).await {
             Ok(topics) => sanitized_session_topics(topics),
             Err(error) => {
@@ -1061,6 +1088,7 @@ async fn collect_candidate_session_contexts(
         ctx,
         memory,
         collect_candidate_sessions(ctx, since).await,
+        None,
     )
     .await
 }
@@ -1088,6 +1116,8 @@ struct ExtractionCheckpoint {
     version: u32,
     batch_id: String,
     session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_scope_fingerprint: Option<String>,
     source_updated_at: String,
     transaction_id: String,
     batch_index: usize,
@@ -1124,6 +1154,7 @@ struct PendingExtractionBatch {
     source_message_fingerprints: BTreeMap<String, String>,
     prompt: String,
     checkpoint_id: String,
+    source_scope_fingerprint: String,
     transaction_id: String,
     batch_index: usize,
     batch_count: usize,
@@ -1292,8 +1323,12 @@ fn build_pending_extraction_batches(
                         .map(|hash| (id.clone(), hash.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
+            let source_scope_fingerprint = extraction_scope_fingerprint(
+                session.entry.created_at,
+                session.project_key.as_deref(),
+            );
             let checkpoint_input = format!(
-                "{prompt}\0{:?}\0{:?}",
+                "{prompt}\0{source_scope_fingerprint}\0{:?}\0{:?}",
                 source_message_ids, source_message_fingerprints
             );
             let source_updated_at = session.entry.updated_at.to_rfc3339();
@@ -1307,6 +1342,7 @@ fn build_pending_extraction_batches(
                     &source_updated_at,
                     &checkpoint_input,
                 ),
+                source_scope_fingerprint,
                 prompt,
                 transaction_id: String::new(),
                 batch_index: 0,
@@ -1360,6 +1396,8 @@ fn checkpoint_matches_pending_batch(
     pending: &PendingExtractionBatch,
 ) -> bool {
     checkpoint.session_key == extraction_checkpoint_session_key(session_id)
+        && checkpoint.source_scope_fingerprint.as_deref()
+            == Some(pending.source_scope_fingerprint.as_str())
         && checkpoint.source_updated_at == source_updated_at
         && checkpoint.transaction_id == pending.transaction_id
         && checkpoint.batch_id == pending.checkpoint_id
@@ -1530,7 +1568,7 @@ async fn read_extraction_checkpoint(
     };
     let mut checkpoint: ExtractionCheckpoint = serde_json::from_slice(&raw)
         .map_err(|error| format!("failed to parse AutoDream extraction checkpoint: {error}"))?;
-    if !matches!(checkpoint.version, 3 | EXTRACTION_CHECKPOINT_VERSION)
+    if !(3..=EXTRACTION_CHECKPOINT_VERSION).contains(&checkpoint.version)
         || checkpoint.batch_id != checkpoint_id
         || checkpoint.session_key.len() != 64
         || !checkpoint
@@ -1549,6 +1587,18 @@ async fn read_extraction_checkpoint(
         return Err("AutoDream extraction checkpoint identity mismatch".to_string());
     }
     if checkpoint.version < EXTRACTION_CHECKPOINT_VERSION {
+        // An older checkpoint does not establish the captured scope or birth.
+        checkpoint.source_scope_fingerprint = None;
+    } else if !checkpoint
+        .source_scope_fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| {
+            fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("AutoDream checkpoint scope proof is incomplete".to_string());
+    }
+    if checkpoint.version < EXTRACTION_CHECKPOINT_CONTENT_PROOF_VERSION {
         // Old IDs alone cannot prove the content supplied to the model.
         checkpoint.source_message_ids.clear();
         checkpoint.source_message_fingerprints.clear();
@@ -1679,6 +1729,7 @@ async fn load_extraction_checkpoint_transactions(
                 || batch.source_updated_at != first.source_updated_at
                 || batch.batch_count != first.batch_count
                 || batch.topics_fingerprint != first.topics_fingerprint
+                || batch.source_scope_fingerprint != first.source_scope_fingerprint
         }) {
             return Err("AutoDream extraction transaction metadata mismatch".to_string());
         }
@@ -1795,8 +1846,15 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
     }
     let retrieval_event_key = first_retrieval_event_key(&session)
         .ok_or_else(|| "retrieval source lost its first boundary identity".to_string())?;
-    let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
-        .map(bamboo_domain::ProjectId::into_string);
+    let project_key = canonical_extraction_project(&session)
+        .filter(|project| {
+            session.id == template.session_id
+                && session.created_at == template.entry.created_at
+                && project == &template.project_key
+        })
+        .ok_or_else(|| {
+            "retrieval source lifetime or Project changed after checkpoint replay".to_string()
+        })?;
     let topics = sanitized_session_topics(
         ctx.memory
             .read_session_topics_with_content(&template.session_id)
@@ -1929,40 +1987,47 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             })?
             .map(|timestamp| timestamp.with_timezone(&Utc));
 
+        let expected_scope =
+            extraction_scope_fingerprint(context.entry.created_at, context.project_key.as_deref());
         for transaction in transactions {
-            // A completed transaction can outlive messages removed by retry or
-            // user-turn truncation. Validate its whole source before replaying
-            // any sink, and discard stale checkpoints without acknowledging
-            // their watermark so the current canonical input is re-extracted.
-            if transaction
+            // A checkpoint proves what the provider saw at extraction time.
+            // The current Session cannot supply proof on behalf of an older
+            // unchecked checkpoint or one from a different lifetime/scope.
+            let recorded_scope = transaction
                 .batches
-                .iter()
-                .any(|batch| !batch.source_message_ids.is_empty())
-            {
-                let source = ctx
-                    .storage
+                .first()
+                .and_then(|batch| batch.source_scope_fingerprint.as_deref());
+            let source_is_current = if recorded_scope == Some(expected_scope.as_str()) {
+                ctx.storage
                     .load_session(session_id)
                     .await
                     .map_err(|error| {
                         format!(
                             "failed to verify checkpoint replay source for {session_id}: {error}"
                         )
-                    })?;
-                let source_is_current = source.as_ref().is_some_and(|source| {
-                    transaction.batches.iter().all(|batch| {
-                        captured_source_is_current(
-                            source,
-                            &batch.source_message_ids,
-                            &batch.source_message_fingerprints,
-                        )
+                    })?
+                    .is_some_and(|source| {
+                        source.id == *session_id
+                            && canonical_extraction_project(&source).is_some_and(|project| {
+                                extraction_scope_fingerprint(source.created_at, project.as_deref())
+                                    == expected_scope
+                            })
+                            && transaction.batches.iter().all(|batch| {
+                                captured_source_is_current(
+                                    &source,
+                                    &batch.source_message_ids,
+                                    &batch.source_message_fingerprints,
+                                )
+                            })
                     })
-                });
-                if !source_is_current {
-                    for checkpoint in &transaction.batches {
-                        remove_extraction_checkpoint(ctx, session_id, &checkpoint.batch_id).await;
-                    }
-                    continue;
+            } else {
+                false
+            };
+            if !source_is_current {
+                for checkpoint in &transaction.batches {
+                    remove_extraction_checkpoint(ctx, session_id, &checkpoint.batch_id).await;
                 }
+                continue;
             }
             let source_watermark = DateTime::parse_from_rfc3339(&transaction.source_updated_at)
                 .expect("stored checkpoint timestamp was validated while loading")
@@ -2168,6 +2233,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         version: EXTRACTION_CHECKPOINT_VERSION,
                         batch_id: pending.checkpoint_id.clone(),
                         session_key: extraction_checkpoint_session_key(&session.session_id),
+                        source_scope_fingerprint: Some(pending.source_scope_fingerprint.clone()),
                         source_updated_at: source_updated_at.clone(),
                         transaction_id: pending.transaction_id.clone(),
                         batch_index: pending.batch_index,
@@ -2520,18 +2586,6 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     for session in sessions {
         session_project_keys.insert(session.session_id.clone(), session.project_key.clone());
     }
-    let ledger_candidates = ledger_candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate
-                .session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|session_id| !session_id.is_empty())
-                .is_none_or(|session_id| session_project_keys.contains_key(session_id))
-        })
-        .collect();
-
     let mut writes = 0usize;
     type ExtractionFingerprint = (DurableMemoryType, String, String, String);
     let mut existing_by_scope: HashMap<
@@ -2755,12 +2809,72 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             .insert(fingerprint);
     }
 
-    let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
+    let verified_ledger_sources = verify_ledger_source_scopes(
+        ctx,
+        sessions,
+        &ledger_candidates,
+        current_store_is_project_scoped,
+    )
+    .await?;
+    let ledger_writes =
+        persist_ledger_candidates(ledger, ledger_candidates, &verified_ledger_sources).await?;
 
     Ok(ExtractionWrites {
         memory: writes,
         ledger: ledger_writes,
     })
+}
+
+fn ledger_candidate_session_id(candidate: &LedgerExtractionCandidate) -> Option<&str> {
+    candidate
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+async fn verify_ledger_source_scopes(
+    ctx: &AutoDreamContext,
+    sessions: &[CandidateSessionContext],
+    candidates: &[LedgerExtractionCandidate],
+    project_only: bool,
+) -> Result<HashMap<String, Option<String>>, String> {
+    let source_ids: HashSet<_> = candidates
+        .iter()
+        .filter_map(ledger_candidate_session_id)
+        .collect();
+    let mut verified = HashMap::new();
+    for id in source_ids {
+        let mut captured = sessions.iter().filter(|source| source.session_id == id);
+        let Some(source) = captured.next() else {
+            continue;
+        };
+        if captured.any(|other| {
+            other.entry.created_at != source.entry.created_at
+                || other.project_key != source.project_key
+        }) {
+            continue;
+        }
+        let Some(current) = ctx
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|error| format!("failed to verify Ledger candidate source: {error}"))?
+        else {
+            continue;
+        };
+        let Some(project_key) = canonical_extraction_project(&current) else {
+            continue;
+        };
+        if current.id == id
+            && current.created_at == source.entry.created_at
+            && project_key == source.project_key
+            && (!project_only || project_key.is_some())
+        {
+            verified.insert(id.to_string(), project_key);
+        }
+    }
+    Ok(verified)
 }
 
 fn normalized_ledger_title(title: &str) -> String {
@@ -2775,14 +2889,14 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-/// Persist extractor-proposed ledger candidates as `suggested` Global records.
+/// Persist extractor-proposed Ledger candidates in their verified source scope.
 ///
 /// Rules (Phase 6 of the personal-assistant ledger design):
 /// - only `high`/`medium` confidence candidates are written; `low` (or
 ///   missing) confidence is skipped;
 /// - empty or over-long titles are skipped;
 /// - a candidate whose normalized (case-insensitive, trimmed) title matches an
-///   existing open Global record — or an earlier candidate in the same batch —
+///   existing open record in that scope, or an earlier candidate there,
 ///   is skipped (dedup guard);
 /// - records are created `Open`, tagged `suggested`, attributed to
 ///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
@@ -2792,22 +2906,17 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
+    verified_sources: &HashMap<String, Option<String>>,
 ) -> Result<usize, String> {
-    if candidates.is_empty() {
-        return Ok(0);
-    }
-
-    let existing = ledger
-        .list_records(LedgerScope::Global, None, &RecordFilter::default())
-        .await
-        .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
-    let mut seen_titles: HashSet<String> = existing
-        .iter()
-        .map(|doc| normalized_ledger_title(&doc.record.title))
-        .collect();
-
+    let mut seen_by_scope: HashMap<Option<String>, HashSet<String>> = HashMap::new();
     let mut writes = 0usize;
     for candidate in candidates {
+        let Some(session_id) = ledger_candidate_session_id(&candidate) else {
+            continue;
+        };
+        let Some(project_key) = verified_sources.get(session_id) else {
+            continue;
+        };
         let confidence = candidate
             .confidence
             .as_deref()
@@ -2821,19 +2930,35 @@ async fn persist_ledger_candidates(
         if title.is_empty() || title.chars().count() > MAX_RECORD_TITLE_LEN {
             continue;
         }
+        let scope = if project_key.is_some() {
+            LedgerScope::Project
+        } else {
+            LedgerScope::Global
+        };
+        let seen_titles = match seen_by_scope.entry(project_key.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let existing = ledger
+                    .list_records(scope, project_key.as_deref(), &RecordFilter::default())
+                    .await
+                    .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
+                entry.insert(
+                    existing
+                        .iter()
+                        .map(|doc| normalized_ledger_title(&doc.record.title))
+                        .collect(),
+                )
+            }
+        };
         if !seen_titles.insert(normalized_ledger_title(&title)) {
             continue;
         }
 
         let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
         let mut record = LedgerRecord::new(new_record_id(), kind, title);
-        record.scope = LedgerScope::Global;
-        record.source.session_id = candidate
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        record.scope = scope;
+        record.project_key = project_key.clone();
+        record.source.session_id = Some(session_id.to_string());
         record.source.created_by = RecordActor::Extractor;
         record.source.excerpt = candidate
             .excerpt
@@ -3120,8 +3245,13 @@ async fn run_auto_dream_once_for_scope(
     // written first, the Bamboo-owned Ledger second, and only then are source
     // sessions marked extracted. Dream synthesis must observe this completed
     // canonical state, never the pre-extraction MEMORY view.
-    let extraction_sessions =
-        collect_candidate_session_contexts_from_sessions(ctx, memory, sessions.clone()).await;
+    let extraction_sessions = collect_candidate_session_contexts_from_sessions(
+        ctx,
+        memory,
+        sessions.clone(),
+        project_key,
+    )
+    .await;
     let ledger = ledger_store_for_context(ctx);
     let extraction_writes = extract_and_persist_durable_candidates_with_project_resolver(
         ctx,
@@ -5540,6 +5670,7 @@ mod tests {
             version: 3,
             batch_id: id.clone(),
             session_key: "b".repeat(64),
+            source_scope_fingerprint: None,
             source_updated_at: Utc::now().to_rfc3339(),
             transaction_id: "c".repeat(64),
             batch_index: 0,
@@ -5562,6 +5693,7 @@ mod tests {
         assert!(legacy.source_message_ids.is_empty());
         assert!(legacy.source_message_fingerprints.is_empty());
         checkpoint.version = EXTRACTION_CHECKPOINT_VERSION;
+        checkpoint.source_scope_fingerprint = Some("d".repeat(64));
         tokio::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap())
             .await
             .unwrap();
@@ -5804,6 +5936,7 @@ mod tests {
             version: EXTRACTION_CHECKPOINT_VERSION,
             batch_id: checkpoint_id.clone(),
             session_key: extraction_checkpoint_session_key("session-checkpoint-privacy"),
+            source_scope_fingerprint: Some("d".repeat(64)),
             source_updated_at: "2026-09-20T00:00:20Z".to_string(),
             transaction_id: "b".repeat(64),
             batch_index: 0,
@@ -5963,6 +6096,136 @@ mod tests {
                 .as_deref(),
             Some(contexts[0].entry.updated_at.to_rfc3339().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn ledger_replay_reextracts_after_project_change_or_missing_scope_proof() {
+        let response = |title: &str| {
+            serde_json::json!({
+                "candidates": [],
+                "ledger_candidates": [{
+                    "title": title,
+                    "kind": "todo",
+                    "excerpt": title,
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                }],
+                "source_exhausted": true
+            })
+            .to_string()
+        };
+        for (target, legacy_checkpoint) in [
+            (Some("project-replay-other"), false),
+            (None, false),
+            (Some("project-replay-original"), true),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let session_store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let storage: Arc<dyn Storage> = session_store.clone();
+            let mut session = Session::new("scope-replay", "model");
+            session.set_project_id_meta("project-replay-original");
+            session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+                "Old scoped source",
+                1,
+                32,
+            ));
+            storage.save_session(&session).await.unwrap();
+            let first = Arc::new(SequenceProvider::new(vec![response("Old scoped task")]));
+            let first_provider: Arc<dyn LLMProvider> = first.clone();
+            let memory = MemoryStore::new(home.path());
+            let context = AutoDreamContext {
+                session_store,
+                storage: storage.clone(),
+                memory: memory.clone(),
+                provider: first_provider.clone(),
+                config: Arc::new(RwLock::new(Config::default())),
+                provider_registry: test_registry(),
+            };
+            let since = Utc::now() - chrono::Duration::hours(24);
+            let sources = collect_candidate_session_contexts(&context, &memory, since).await;
+            assert_eq!(sources.len(), 1);
+            let blocked_root = home.path().join("blocked-ledger");
+            tokio::fs::write(&blocked_root, b"not a directory")
+                .await
+                .unwrap();
+            extract_and_persist_durable_candidates(
+                &context,
+                &first_provider,
+                &memory,
+                &LedgerStore::new(blocked_root),
+                "fast-model",
+                &sources,
+            )
+            .await
+            .expect_err("failed Ledger sink leaves an unacknowledged checkpoint");
+            assert_eq!(first.recorded_prompts().len(), 1);
+
+            if legacy_checkpoint {
+                let transactions = load_extraction_checkpoint_transactions(&context, &session.id)
+                    .await
+                    .unwrap();
+                let checkpoint = &transactions[0].batches[0];
+                let path = extraction_checkpoint_path(&context, &session.id, &checkpoint.batch_id);
+                let mut encoded = serde_json::to_value(checkpoint).unwrap();
+                encoded["version"] = serde_json::json!(4);
+                encoded
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_scope_fingerprint");
+                tokio::fs::write(path, serde_json::to_vec(&encoded).unwrap())
+                    .await
+                    .unwrap();
+            }
+
+            if session.project_id_meta().as_deref() != target {
+                session.metadata_version += 1;
+            }
+            if let Some(target) = target {
+                session.set_project_id_meta(target);
+            } else {
+                session.clear_project_id_meta();
+            }
+            session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+                "Current scoped source",
+                1,
+                32,
+            ));
+            session.updated_at += chrono::Duration::seconds(1);
+            storage.save_session(&session).await.unwrap();
+            let current = collect_candidate_session_contexts(&context, &memory, since).await;
+            assert_eq!(current[0].project_key.as_deref(), target);
+            let next = Arc::new(SequenceProvider::new(vec![response("Current scoped task")]));
+            let next_provider: Arc<dyn LLMProvider> = next.clone();
+            let good = LedgerStore::new(home.path());
+            extract_and_persist_durable_candidates(
+                &context,
+                &next_provider,
+                &memory,
+                &good,
+                "fast-model",
+                &current,
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.recorded_prompts().len(), 1);
+            let scope = if target.is_some() {
+                LedgerScope::Project
+            } else {
+                LedgerScope::Global
+            };
+            let records = good
+                .list_records(scope, target, &RecordFilter::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|doc| doc.record.title.as_str())
+                    .collect::<Vec<_>>(),
+                ["Current scoped task"],
+                "target={target:?}, legacy={legacy_checkpoint}",
+            );
+        }
     }
 
     #[tokio::test]
@@ -6468,9 +6731,8 @@ mod tests {
                 .expect("session store"),
         );
         let storage: Arc<dyn Storage> = session_store.clone();
-        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"Must not persist\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"MALFORMED PROJECT SESSION MUST NOT WRITE\",\"tags\":[\"secret\"],\"session_id\":\"session-malformed-auto-dream\"}]}".to_string(),
-        ]));
+        let sequence = Arc::new(SequenceProvider::new(Vec::new()));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
         let context = AutoDreamContext {
             session_store,
             storage: storage.clone(),
@@ -6502,7 +6764,7 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 1);
+        assert!(contexts.is_empty());
 
         let writes = extract_and_persist_durable_candidates_with_project_resolver(
             &context,
@@ -6517,6 +6779,7 @@ mod tests {
         .await
         .expect("malformed candidate should be skipped");
         assert_eq!(writes, ExtractionWrites::default());
+        assert!(sequence.recorded_prompts().is_empty());
         let global_count = memory
             .count_scope_memories(MemoryScope::Global, None)
             .await
@@ -7024,7 +7287,8 @@ mod tests {
             ),
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let sources = HashMap::from([("session-ledger".to_string(), None)]);
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
             .await
             .expect("persist should succeed");
         assert_eq!(writes, 3);
@@ -7118,7 +7382,8 @@ mod tests {
             },
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let sources = HashMap::from([("session-dup".to_string(), None)]);
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
             .await
             .expect("persist should succeed");
         assert_eq!(
@@ -7162,7 +7427,28 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
+            serde_json::json!({
+                "candidates": [{
+                    "title": "Project A prefers concise planning",
+                    "type": "project",
+                    "scope": "project",
+                    "content": "Project A plans should stay concise and scoped.",
+                    "tags": ["planning"],
+                    "session_id": "source-session-0001"
+                }],
+                "ledger_candidates": [{
+                    "title": "Review release notes",
+                    "kind": "todo",
+                    "excerpt": "Review release notes",
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                }, {
+                    "title": "Unattributed follow-up",
+                    "kind": "todo",
+                    "excerpt": "Unattributed follow-up",
+                    "confidence": "high"
+                }]
+            }).to_string(),
             "## Current durable context\n- Project A signal only\n\n## Cross-session patterns\n- Focus on project A\n\n## Active threads to remember\n- Ship project A\n\n## Stable constraints and preferences\n- Keep scope isolated\n\n## Open risks or questions\n- None".to_string(),
         ]));
         let config = Arc::new(RwLock::new(config_with_memory(
@@ -7273,6 +7559,27 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(results.matched_count, 1);
         assert_eq!(results.items[0].title, "Project A prefers concise planning");
+
+        let ledger = LedgerStore::new(temp_dir.path());
+        let global = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list Global ledger records");
+        assert!(global.is_empty());
+        let project = ledger
+            .list_records(
+                LedgerScope::Project,
+                Some(&project_key_a),
+                &RecordFilter::default(),
+            )
+            .await
+            .expect("list Project ledger records");
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].record.title, "Review release notes");
+        assert_eq!(
+            project[0].record.source.session_id.as_deref(),
+            Some(session_a.id.as_str())
+        );
     }
 
     #[tokio::test]
