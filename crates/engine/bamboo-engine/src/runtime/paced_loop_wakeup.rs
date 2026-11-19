@@ -23,13 +23,15 @@ tokio::task_local! {
     static WAKEUP_WRITER: RefCell<Option<(String, RootActorRuntimeWrite)>>;
 }
 
-pub(crate) async fn scope_paced_loop_wakeup_writer<F: Future>(
+pub(crate) fn scope_paced_loop_wakeup_writer<F: Future>(
     writer: Option<RootActorRuntimeWrite>,
     tool_call_id: &str,
     dispatch: F,
-) -> F::Output {
+) -> impl Future<Output = F::Output> {
     let selected = writer.map(|writer| (tool_call_id.to_owned(), writer));
-    WAKEUP_WRITER.scope(RefCell::new(selected), dispatch).await
+    // Keep the extra token and its future out of the enclosing dispatch
+    // frames, including when the empty scope shadows a nested invocation.
+    Box::pin(WAKEUP_WRITER.scope(RefCell::new(selected), dispatch))
 }
 
 /// Consume the exact sanctioned adaptive tool call's writer. The Host must

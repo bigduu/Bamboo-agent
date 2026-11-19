@@ -18,14 +18,16 @@ pub(crate) struct ChatSubmission {
 pub(crate) struct LoopChatAcknowledgment {
     pub(crate) should_execute: bool,
     #[serde(rename = "loop")]
-    record: Option<LoopChatRecord>,
+    pub(crate) record: Option<LoopChatRecord>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct LoopChatRecord {
-    state: String,
+pub(crate) struct LoopChatRecord {
+    pub(crate) id: Option<String>,
+    pub(crate) state: String,
     next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
-    last_run_status: Option<String>,
+    pub(crate) last_run_id: Option<String>,
+    pub(crate) last_run_status: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -350,6 +352,14 @@ impl BambooClient {
             .as_deref()
             .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Open a Session before using /loop"))?;
+        self.session_loop_status(session_id).await?;
+        self.submit_chat(req).await
+    }
+
+    pub(crate) async fn session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<LoopChatRecord>> {
         let mut url = reqwest::Url::parse(&self.base_url)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Bamboo base URL cannot contain Session paths"))?
@@ -369,13 +379,13 @@ impl BambooClient {
         let status: SessionLoopStatus = response.json().await?;
         anyhow::ensure!(
             status.session_id == session_id
-                && status.record.is_none_or(|record| matches!(
+                && status.record.as_ref().is_none_or(|record| matches!(
                     record.state.as_str(),
                     "scheduled" | "paused" | "stopped" | "expired"
                 )),
             "Invalid Session loop status"
         );
-        self.submit_chat(req).await
+        Ok(status.record)
     }
 
     async fn submit_chat(&self, req: ChatRequest) -> Result<ChatSubmission> {
