@@ -223,6 +223,18 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// A separate Host-only selector for one runtime-owned paced loop input.
+    /// The ordinary selected Human receipt path never admits these inputs.
+    fn bind_paced_loop_inbox_receipt(
+        &self,
+        _receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "paced Loop receipt binding unsupported",
+        ))
+    }
+
     fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
         None
     }
@@ -787,6 +799,13 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         receipt: crate::SessionInboxReceipt,
     ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
         (**self).bind_root_inbox_receipt(receipt)
+    }
+
+    fn bind_paced_loop_inbox_receipt(
+        &self,
+        receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_paced_loop_inbox_receipt(receipt)
     }
 
     fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {

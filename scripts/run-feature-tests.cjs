@@ -193,7 +193,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2447 keeps session activity API cases in server-handlers and runtime-only
 // wait projection and index rebuild cases in the default Storage packages-0
 // owner. No feature declarations or additive catalog entries changed.
-const FEATURE_SOURCE_SHA256 = "45942edcab7a341e19c77996bb1c62eff1ceb6171de429da7560bd6980dd6c61";
+const FEATURE_SOURCE_SHA256 = "64047f8a69d92cf1cf0a5441b2747c703abc1259d84eef234449648020472034";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
