@@ -17,6 +17,7 @@ pub mod output_manager;
 pub mod parallel;
 mod permission_override;
 pub mod scoped_session_send_permission;
+pub mod session_loop_permission;
 pub use bamboo_permission as permission;
 pub mod slash_commands;
 pub mod tool_search;

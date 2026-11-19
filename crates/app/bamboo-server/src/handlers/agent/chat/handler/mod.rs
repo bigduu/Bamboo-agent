@@ -281,6 +281,22 @@ async fn handle_chat(
     req: web::Json<ChatRequest>,
     http_request: &HttpRequest,
 ) -> HttpResponse {
+    use crate::handlers::agent::paced_loop::{self, LoopChatInput};
+
+    let loop_prompt = match paced_loop::parse_chat_command(&req.message) {
+        Some(LoopChatInput::Control(command)) => {
+            return paced_loop::handle_chat_command(&state, &req, command).await;
+        }
+        Some(LoopChatInput::Natural) => {
+            if let Err(message) = paced_loop::validate_chat_request(&req) {
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": crate::error::error_value(message)}));
+            }
+            true
+        }
+        None => false,
+    };
+
     let root_mode_selection = match bamboo_domain::RootThinkingMode::resolve_selection(
         req.thinking_mode,
         req.root_orchestration_only,
@@ -598,7 +614,7 @@ async fn handle_chat(
     // Reject an already-running session before doing catalog or hook work. A
     // second check immediately before publication below closes the race with a
     // reservation that appears while this request is being prepared.
-    if requested_workflow_selection.is_some() {
+    if requested_workflow_selection.is_some() || loop_prompt {
         let runners = state.agent_runners.read().await;
         let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
         let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
@@ -606,7 +622,11 @@ async fn handle_chat(
             &session_id,
         );
         if runner_is_active || startup_is_active {
-            return workflow_activation_running_conflict_response(&session_id);
+            return if loop_prompt {
+                paced_loop::busy_chat_response()
+            } else {
+                workflow_activation_running_conflict_response(&session_id)
+            };
         }
     }
     let authoritative_session = match state.persistence.storage().load_session(&session_id).await {
@@ -619,6 +639,16 @@ async fn handle_chat(
             );
         }
     };
+    if loop_prompt {
+        let Some(existing) = authoritative_session.as_ref() else {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": crate::error::error_value("Session not found"),
+            }));
+        };
+        if let Err(response) = paced_loop::validate_natural_session(existing) {
+            return *response;
+        }
+    }
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
@@ -999,26 +1029,31 @@ async fn handle_chat(
     // persistence, the final session save and pin handoff. The persistence lock
     // linearizes HTTP execute startup; the runners guard closes reservation
     // races from resume, schedule and connect entry points.
-    let workflow_commit_guard = if staged_workflow_activation.is_some() || retire_workflow {
-        let runners = match source_scope_guard {
-            Some(runners) => runners,
-            None => state.agent_runners.clone().read_owned().await,
-        };
-        let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
-        let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
-            state.as_ref(),
-            &session_id,
-        );
-        if runner_is_active || startup_is_active {
-            if let Some(staging) = staged_workflow_activation.as_mut() {
-                staging.release().await;
+    let workflow_commit_guard =
+        if staged_workflow_activation.is_some() || retire_workflow || loop_prompt {
+            let runners = match source_scope_guard {
+                Some(runners) => runners,
+                None => state.agent_runners.clone().read_owned().await,
+            };
+            let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
+            let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
+                state.as_ref(),
+                &session_id,
+            );
+            if runner_is_active || startup_is_active {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return if loop_prompt {
+                    paced_loop::busy_chat_response()
+                } else {
+                    workflow_activation_running_conflict_response(&session_id)
+                };
             }
-            return workflow_activation_running_conflict_response(&session_id);
-        }
-        Some(runners)
-    } else {
-        source_scope_guard
-    };
+            Some(runners)
+        } else {
+            source_scope_guard
+        };
 
     let native_skills = crate::skill_runtime::registered_main(&session)
         && [

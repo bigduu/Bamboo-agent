@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::{Message, MessagePart, Role, Session};
 
+pub const PACED_LOOP_SUBSYSTEM: &str = "paced_session_loop";
+pub const PACED_LOOP_INSTRUCTION: &str = "paced_session_loop_iteration_v1";
+
 /// Serialize JSON with every object key sorted recursively.
 ///
 /// Stable message ids and durable inbox idempotency receipts must use the same
@@ -516,6 +519,25 @@ impl SessionMessageEnvelope {
             )
     }
 
+    pub fn is_paced_loop_iteration(&self) -> bool {
+        self.kind == SessionMessageKind::RuntimeInstruction
+            && matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == PACED_LOOP_SUBSYSTEM)
+            && matches!(&self.body, SessionMessageBody::RuntimeInstruction(instruction)
+                if instruction.instruction == PACED_LOOP_INSTRUCTION)
+    }
+
+    pub fn paced_loop_run_id(&self) -> Option<&str> {
+        match &self.body {
+            SessionMessageBody::RuntimeInstruction(instruction)
+                if self.is_paced_loop_iteration() =>
+            {
+                instruction.data.as_ref()?.get("run_id")?.as_str()
+            }
+            _ => None,
+        }
+    }
+
     pub fn guidance_waits_for_run(&self, run_id: &str) -> bool {
         self.is_guidance()
             && self
@@ -920,6 +942,10 @@ impl SessionMessageEnvelope {
         message.created_at = self.created_at;
         message.never_compress = never_compress;
         let mut metadata = provider_metadata;
+        if self.is_paced_loop_iteration() {
+            metadata.insert("runtime_kind".into(), "paced_loop_iteration".into());
+            metadata.insert("hidden_from_ui".into(), true.into());
+        }
         metadata.insert(
             "session_message".to_string(),
             serde_json::json!({
@@ -1058,6 +1084,16 @@ impl SessionInboxAdmissionState {
 
     pub fn contains_str(&self, id: &str) -> bool {
         self.admitted.iter().any(|entry| entry.id.as_str() == id)
+    }
+
+    pub fn receipt_for(&self, id: &str) -> Option<SessionInboxReceipt> {
+        self.admitted
+            .iter()
+            .find(|entry| entry.id.as_str() == id && entry.sequence != 0)
+            .map(|entry| SessionInboxReceipt {
+                id: entry.id.clone(),
+                generation: entry.sequence,
+            })
     }
 
     pub(super) fn contains_at_sequence(&self, id: &SessionMessageId, sequence: u64) -> bool {
@@ -1872,6 +1908,19 @@ pub trait SessionInboxPort: Send + Sync {
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         Err(SessionInboxError::InvalidClaim(
             "lifetime-bound Runtime admission is unsupported".into(),
+        ))
+    }
+
+    /// Publish one scheduled prompt to an already reserved Root turn. Its exact
+    /// owner may consume the delivery, but the delivery cannot wake a Session.
+    async fn deliver_paced_loop_for_run(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _owner: &crate::RootActorRuntimeWrite,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "run-bound paced Loop admission is unsupported".into(),
         ))
     }
 

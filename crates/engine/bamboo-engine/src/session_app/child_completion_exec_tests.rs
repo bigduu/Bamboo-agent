@@ -692,6 +692,181 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
 }
 
 #[tokio::test]
+async fn background_exec_owned_actor_preserves_existing_runtime_waits() {
+    use bamboo_domain::{
+        PlanModeState, PlanModeStatus, SessionActivationDisposition, SessionActivationPort,
+        SessionRuntimeStartup, SuspensionState,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    for case in ["legacy-reason", "structured-suspension", "plan-approval"] {
+        let mut root = Session::new(format!("background-gate-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        let mut runtime = AgentRuntimeState::new("previous-run");
+        match case {
+            "legacy-reason" => {
+                runtime.status = AgentStatusState::Suspended;
+                root.metadata.insert(
+                    "runtime.suspend_reason".into(),
+                    "awaiting_parent_approval".into(),
+                );
+            }
+            "structured-suspension" => {
+                runtime.status = AgentStatusState::Suspended;
+                runtime.suspension = Some(SuspensionState {
+                    reason: "unrelated-runtime-hook".into(),
+                    suspended_at: Utc::now(),
+                    resumable: false,
+                    hook_point: None,
+                });
+            }
+            "plan-approval" => {
+                runtime.plan_mode = Some(PlanModeState {
+                    entered_at: Utc::now(),
+                    pre_permission_mode: "default".into(),
+                    plan_file_path: None,
+                    status: PlanModeStatus::AwaitingApproval,
+                });
+            }
+            _ => unreachable!(),
+        }
+        write_runtime_state(&mut root, &runtime);
+        store.save_session(&root).await.unwrap();
+        let before = store.load_session(&root.id).await.unwrap().unwrap();
+        assert!(before.has_runtime_wait(), "{case}");
+        let envelope =
+            shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+        let receipt = inbox
+            .deliver_runtime_for_target(&envelope, root.created_at)
+            .await
+            .unwrap();
+        inbox
+            .mark_message_activation_eligible(
+                &root.id,
+                &receipt,
+                SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            router
+                .request_runtime_startup(
+                    &root.id,
+                    SessionRuntimeStartup {
+                        receipt,
+                        target_created_at: root.created_at,
+                    }
+                )
+                .await
+                .unwrap(),
+            SessionActivationDisposition::ActivationCoalesced,
+            "{case}",
+        );
+        assert!(!router.has_activation_owner_or_reservation(&root.id).await);
+        let latest = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_runtime_state(&latest),
+            read_runtime_state(&before),
+            "{case}"
+        );
+        assert_eq!(
+            latest.metadata.get("runtime.suspend_reason"),
+            before.metadata.get("runtime.suspend_reason"),
+            "{case}",
+        );
+        assert_eq!(latest.messages.len(), 1, "{case}");
+        assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+    }
+    assert!(provider.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_cannot_pre_admit_managed_work_input() {
+    use bamboo_domain::{
+        ActorActivationFinish, SessionActivationDisposition, SessionActivationPort,
+        SessionRuntimeStartup,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    let mut root = Session::new("managed-work-background-fixture", "model");
+    root.add_message(Message::user("prior transcript"));
+    root.metadata.insert(
+        crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+        "{}".into(),
+    );
+    let mut state = AgentRuntimeState::new("prior-work-run");
+    state.status = AgentStatusState::Initializing;
+    write_runtime_state(&mut root, &state);
+    store.save_session(&root).await.unwrap();
+    let envelope =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let receipt = inbox
+        .deliver_runtime_for_target(&envelope, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &receipt,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let startup = SessionRuntimeStartup {
+        receipt,
+        target_created_at: root.created_at,
+    };
+    assert_eq!(
+        router
+            .request_runtime_startup(&root.id, startup.clone())
+            .await
+            .unwrap(),
+        SessionActivationDisposition::ActivationCoalesced,
+    );
+    let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+    assert!(crate::ticket_runtime::is_managed_work_root(&latest));
+    assert!(!latest.has_runtime_wait());
+    assert_eq!(
+        read_runtime_state(&latest).status,
+        AgentStatusState::Initializing
+    );
+
+    // The exact persistence path also enforces the canonical Work identity
+    // before claim, even if a caller reaches it with a bound Root Actor.
+    let run_id = "managed-work-actor-fixture";
+    let mut binding = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&latest, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(binding
+        .persistence
+        .admit_root_runtime_startup(&mut latest, inbox.clone(), &startup, run_id,)
+        .await
+        .is_err());
+    binding
+        .directory
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Cancelled,
+        )
+        .await
+        .unwrap();
+    binding.disarm_abandonment();
+
+    assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+    assert!(provider.0.lock().unwrap().is_empty());
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.messages.len(), 1);
+}
+
+#[tokio::test]
 async fn coalesced_background_startup_never_substitutes_an_earlier_ready_input() {
     use bamboo_domain::{
         ActorActivationFinish, SessionActivationDisposition, SessionInboxConsumerId,
@@ -833,17 +1008,13 @@ async fn background_exec_owned_actor_preserves_native_human_receipt_selection() 
         .unwrap()
         .unwrap();
 
+    let startup = SessionRuntimeStartup {
+        receipt: deferred,
+        target_created_at: binding.owner.created_at,
+    };
     assert!(binding
         .persistence
-        .admit_root_runtime_startup(
-            &mut root,
-            inbox.clone(),
-            &SessionRuntimeStartup {
-                receipt: deferred,
-                target_created_at: binding.owner.created_at
-            },
-            "other-run",
-        )
+        .admit_root_runtime_startup(&mut root, inbox.clone(), &startup, "other-run")
         .await
         .is_err());
     assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
@@ -852,6 +1023,10 @@ async fn background_exec_owned_actor_preserves_native_human_receipt_selection() 
         .persistence
         .bind_root_inbox_receipt(selected)
         .unwrap();
+    assert!(exact
+        .admit_root_runtime_startup(&mut root, inbox.clone(), &startup, "native-selection-run")
+        .await
+        .is_err());
     let admission = exact
         .admit_root_inbox(&mut root, inbox.clone(), Some("native-selection-run"))
         .await

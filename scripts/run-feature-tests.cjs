@@ -200,7 +200,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Its expiry, interruption and rejection coverage belongs to the default
 // Engine packages-3 owner. Storage's feature-sensitive closure changes,
 // while its default owner and the additive cases stay unchanged.
-const FEATURE_SOURCE_SHA256 = "ffddff4c4cc041e75406c3dd31b93b78f1c071f78c050db127509ab9e4042bbf";
+// #2851 keeps paced Loop host/HTTP tests in default server-app-state and
+// server-handlers. The #2875 Runtime append and wait regressions belong
+// to the existing Engine packages-3 owner.
+const FEATURE_SOURCE_SHA256 = "85ddbd30ccd44ade232e69669660164e268d5af4ff13da25af8931f251a932cb";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

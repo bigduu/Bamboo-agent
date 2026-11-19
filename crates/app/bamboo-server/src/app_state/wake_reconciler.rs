@@ -195,6 +195,11 @@ impl WakeSchedule {
     }
 }
 
+struct HostWakeServices {
+    observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
+    paced_loops: Arc<super::paced_loop::PacedLoops>,
+}
+
 /// One task handles exact due times and a paced index sweep. The index is
 /// copied once per cycle; at most 32 Inbox inspections run per second. At
 /// least 16 index slots remain available even under a continuous due backlog,
@@ -208,7 +213,7 @@ fn spawn_periodic(
     shutdown: CancellationToken,
     mut schedule: WakeSchedule,
     initial_ids: Vec<String>,
-    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
+    services: Option<HostWakeServices>,
     terminal: TerminalRecovery,
 ) {
     tokio::spawn(async move {
@@ -224,8 +229,9 @@ fn spawn_periodic(
                 _ = tick.tick() => {}
             }
             let now = Utc::now();
-            if let Some(observers) = &observers {
-                observers.tick(now).await;
+            if let Some(services) = &services {
+                services.observers.tick(now).await;
+                services.paced_loops.tick(now).await;
             }
             if cursor >= ids.len() && tokio::time::Instant::now() >= next_refresh {
                 ids = store
@@ -288,16 +294,27 @@ pub(super) async fn reconcile_startup_with_observers(
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
     observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
+    paced_loops: Arc<super::paced_loop::PacedLoops>,
     cache: bamboo_engine::SessionCache,
 ) -> WakeReport {
-    reconcile_startup_inner(store, activation, shutdown, Some(observers), Some(cache)).await
+    reconcile_startup_inner(
+        store,
+        activation,
+        shutdown,
+        Some(HostWakeServices {
+            observers,
+            paced_loops,
+        }),
+        Some(cache),
+    )
+    .await
 }
 
 async fn reconcile_startup_inner(
     store: Arc<SessionStoreV2>,
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
-    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
+    services: Option<HostWakeServices>,
     cache: Option<bamboo_engine::SessionCache>,
 ) -> WakeReport {
     let terminal = TerminalRecovery {
@@ -336,7 +353,7 @@ async fn reconcile_startup_inner(
     }
     report.queued = queued.len();
     spawn_periodic(
-        store, activation, shutdown, schedule, queued, observers, terminal,
+        store, activation, shutdown, schedule, queued, services, terminal,
     );
     report
 }

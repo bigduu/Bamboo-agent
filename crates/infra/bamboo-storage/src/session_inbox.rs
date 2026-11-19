@@ -422,6 +422,11 @@ struct ExpectedRunAdmission {
     native_census: Option<crate::v2::scoped_transport_expiry::ScopedTransportCensus>,
 }
 
+enum RunDeliveryAuthority<'a> {
+    General(InboxAuthority),
+    PacedLoop(&'a bamboo_domain::RootActorRuntimeWrite),
+}
+
 struct ManagedRootEventSelection<'a> {
     target: &'a bamboo_domain::SupervisorCurrentUserTarget,
     run_id: &'a str,
@@ -3361,7 +3366,31 @@ impl FileSessionInbox {
         intent: Option<SessionInboxActivationIntent>,
         expected: Option<ExpectedRunAdmission>,
     ) -> Result<StoredDeliveryState, SessionInboxError> {
-        let supervisor_guard = GuardedSupervisorRoot::from_authority(&authority);
+        self.deliver_with_run_authority(
+            envelope,
+            RunDeliveryAuthority::General(authority),
+            gate,
+            intent,
+            expected,
+        )
+        .await
+    }
+
+    async fn deliver_with_run_authority(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        authority: RunDeliveryAuthority<'_>,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        intent: Option<SessionInboxActivationIntent>,
+        expected: Option<ExpectedRunAdmission>,
+    ) -> Result<StoredDeliveryState, SessionInboxError> {
+        use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
+
+        let general_authority = match &authority {
+            RunDeliveryAuthority::General(authority) => Some(authority),
+            RunDeliveryAuthority::PacedLoop(_) => None,
+        };
+        let supervisor_guard = general_authority.and_then(GuardedSupervisorRoot::from_authority);
         if let Some(intent) = &intent {
             intent.policy()?;
             if intent.supervised_root_origin().is_some_and(|origin| {
@@ -3379,7 +3408,10 @@ impl FileSessionInbox {
             || matches!(&envelope.body, bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
                 if matches!(instruction.instruction.as_str(), "supervised_root_outcome_v1" | "managed_root_blocker_v1"));
         if root_outcome_notice
-            && !matches!(&authority, InboxAuthority::SupervisedRootOutcome { .. })
+            && !matches!(
+                general_authority,
+                Some(InboxAuthority::SupervisedRootOutcome { .. })
+            )
         {
             return Err(SessionInboxError::InvalidClaim(
                 "Root outcome notice requires its guarded source and receipt".into(),
@@ -3389,7 +3421,7 @@ impl FileSessionInbox {
             SessionMessageSource::Runtime { subsystem } if subsystem == "supervisor_observation")
             || matches!(&envelope.body, bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
                 if matches!(instruction.instruction.as_str(),"observer_view_available_v1"|"observer_subscription_fault_v1"));
-        if observer_notice && !matches!(&authority, InboxAuthority::Observer { .. }) {
+        if observer_notice && !matches!(general_authority, Some(InboxAuthority::Observer { .. })) {
             return Err(SessionInboxError::InvalidClaim(
                 "Observer notice requires canonical integrated admission".into(),
             ));
@@ -3402,6 +3434,16 @@ impl FileSessionInbox {
         {
             return Err(SessionInboxError::InvalidClaim(
                 "typed Loop control requires its dedicated admission port".into(),
+            ));
+        }
+        let paced_marker = matches!(&envelope.source,
+            SessionMessageSource::Runtime { subsystem } if subsystem == PACED_LOOP_SUBSYSTEM)
+            || matches!(&envelope.body,
+                bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
+                    if instruction.instruction == PACED_LOOP_INSTRUCTION);
+        if paced_marker && !matches!(&authority, RunDeliveryAuthority::PacedLoop(_)) {
+            return Err(SessionInboxError::InvalidClaim(
+                "paced Loop input requires its exact reserved Root".into(),
             ));
         }
         if intent.as_ref().and_then(|intent| intent.expected_run_id())
@@ -3430,9 +3472,25 @@ impl FileSessionInbox {
             });
         }
 
-        let (dir, filesystem) = self
-            .delivery_filesystem_with_transport_expiry(&envelope.target_session_id, authority)
-            .await?;
+        let (dir, filesystem) = match authority {
+            RunDeliveryAuthority::General(authority) => {
+                self.delivery_filesystem_with_transport_expiry(
+                    &envelope.target_session_id,
+                    authority,
+                )
+                .await?
+            }
+            RunDeliveryAuthority::PacedLoop(owner) => {
+                let (dir, filesystem) = self
+                    .sessions
+                    .root_owned_inbox_filesystem(self, &envelope.target_session_id, owner)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                self.retire_stale_paced_loop_deliveries(&dir, &filesystem, owner)
+                    .await?;
+                (dir, filesystem)
+            }
+        };
         // Enqueue idempotency is independent from consumer admission dedupe.
         // This closes the legacy-migration crash window (deliver succeeded,
         // source clear did not) without letting deterministic retries fill the
@@ -3937,6 +3995,65 @@ impl FileSessionInbox {
 }
 
 impl FileSessionInbox {
+    /// Remove only previous paced deliveries whose exact run can no longer
+    /// consume them. The successor holds the same physical Root/Inbox fence
+    /// as an owned claim. No cursor or admission receipt is fabricated.
+    async fn retire_stale_paced_loop_deliveries(
+        &self,
+        dir: &Path,
+        filesystem: &OwnedFilesystem,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+    ) -> Result<(), SessionInboxError> {
+        for queue in ["new", "cur"] {
+            for (_, _, path) in Self::owned_queue_entries(dir, queue, filesystem).await? {
+                let bytes = match Self::read_receipt_bytes(
+                    &path,
+                    ReceiptLookupMode::Observe {
+                        max_bytes: self.max_transport_bytes(),
+                    },
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+                };
+                let Ok((wrapper, _)) = Self::decode_owned_wrapper(&bytes) else {
+                    continue;
+                };
+                let Ok(envelope) =
+                    serde_json::from_value::<SessionMessageEnvelope>(wrapper.body.clone())
+                else {
+                    continue;
+                };
+                if !envelope.is_paced_loop_iteration()
+                    || envelope.target_session_id != owner.fence.actor_id
+                {
+                    continue;
+                }
+                let Some(intent) = Self::activation_intent(&wrapper.body)? else {
+                    continue;
+                };
+                if intent.is_queue_only()
+                    && intent.expected_run_id() == envelope.paced_loop_run_id()
+                    && intent
+                        .expected_run_id()
+                        .is_some_and(|run| run != owner.fence.run_id)
+                {
+                    filesystem
+                        .remove(&path)
+                        .await
+                        .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_scoped_checkpoint(
         &self,
         owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
@@ -4527,6 +4644,41 @@ impl SessionInboxPort for FileSessionInbox {
             None,
         )
         .await
+    }
+
+    async fn deliver_paced_loop_for_run(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if envelope.paced_loop_run_id() != Some(owner.fence.run_id.as_str())
+            || envelope.target_session_id != owner.fence.actor_id
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "invalid paced Loop runtime input or Root target".into(),
+            ));
+        }
+        let expected_run_id = &owner.fence.run_id;
+        self.deliver_with_run_authority(
+            envelope,
+            RunDeliveryAuthority::PacedLoop(owner),
+            None,
+            Some(SessionInboxActivationIntent::for_expected_run(
+                expected_run_id,
+            )?),
+            Some(ExpectedRunAdmission {
+                target_session_id: owner.fence.actor_id.clone(),
+                target_created_at: owner.created_at,
+                expected_run_id: expected_run_id.clone(),
+                activation,
+                scoped_loop: None,
+                scoped_loop_stopped: false,
+                native_census: None,
+            }),
+        )
+        .await
+        .map(|state| state.receipt.delivery)
     }
 
     async fn existing_staged_delivery(
