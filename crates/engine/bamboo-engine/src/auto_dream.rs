@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use crate::auto_dream_privacy::{
     ledger_candidate_is_secret_safe, sanitize_extraction_source, sanitize_extraction_source_pair,
     REDACTED_EXTRACTION_SOURCE,
 };
-use crate::project_context::ProjectContextResolver;
+use crate::project_context::{ProjectContextResolver, SessionProjectIdentity};
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
@@ -2520,18 +2521,6 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     for session in sessions {
         session_project_keys.insert(session.session_id.clone(), session.project_key.clone());
     }
-    let ledger_candidates = ledger_candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate
-                .session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|session_id| !session_id.is_empty())
-                .is_none_or(|session_id| session_project_keys.contains_key(session_id))
-        })
-        .collect();
-
     let mut writes = 0usize;
     type ExtractionFingerprint = (DurableMemoryType, String, String, String);
     let mut existing_by_scope: HashMap<
@@ -2755,12 +2744,70 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             .insert(fingerprint);
     }
 
-    let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
+    let verified_ledger_sources = verify_ledger_source_scopes(
+        ctx,
+        sessions,
+        &ledger_candidates,
+        current_store_is_project_scoped,
+    )
+    .await?;
+    let ledger_writes =
+        persist_ledger_candidates(ledger, ledger_candidates, &verified_ledger_sources).await?;
 
     Ok(ExtractionWrites {
         memory: writes,
         ledger: ledger_writes,
     })
+}
+
+fn ledger_candidate_session_id(candidate: &LedgerExtractionCandidate) -> Option<&str> {
+    candidate
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+async fn verify_ledger_source_scopes(
+    ctx: &AutoDreamContext,
+    sessions: &[CandidateSessionContext],
+    candidates: &[LedgerExtractionCandidate],
+    project_only: bool,
+) -> Result<HashMap<String, Option<String>>, String> {
+    let source_ids: HashSet<_> = candidates
+        .iter()
+        .filter_map(ledger_candidate_session_id)
+        .collect();
+    let mut verified = HashMap::new();
+    for id in source_ids {
+        let mut captured = sessions.iter().filter(|source| source.session_id == id);
+        let Some(source) = captured.next() else {
+            continue;
+        };
+        if captured.any(|other| {
+            other.entry.created_at != source.entry.created_at
+                || other.project_key != source.project_key
+        }) {
+            continue;
+        }
+        let Some(current) = ctx
+            .storage
+            .load_session(id)
+            .await
+            .map_err(|error| format!("failed to verify Ledger candidate source: {error}"))?
+        else {
+            continue;
+        };
+        let project_key = match ProjectContextResolver::session_project_identity(&current) {
+            SessionProjectIdentity::Assigned(project) => Some(project.into_string()),
+            SessionProjectIdentity::Unassigned if !project_only => None,
+            _ => continue,
+        };
+        if current.created_at == source.entry.created_at && project_key == source.project_key {
+            verified.insert(id.to_string(), project_key);
+        }
+    }
+    Ok(verified)
 }
 
 fn normalized_ledger_title(title: &str) -> String {
@@ -2775,14 +2822,14 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-/// Persist extractor-proposed ledger candidates as `suggested` Global records.
+/// Persist extractor-proposed Ledger candidates in their verified source scope.
 ///
 /// Rules (Phase 6 of the personal-assistant ledger design):
 /// - only `high`/`medium` confidence candidates are written; `low` (or
 ///   missing) confidence is skipped;
 /// - empty or over-long titles are skipped;
 /// - a candidate whose normalized (case-insensitive, trimmed) title matches an
-///   existing open Global record — or an earlier candidate in the same batch —
+///   existing open record in that scope, or an earlier candidate there,
 ///   is skipped (dedup guard);
 /// - records are created `Open`, tagged `suggested`, attributed to
 ///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
@@ -2791,22 +2838,17 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
+    verified_sources: &HashMap<String, Option<String>>,
 ) -> Result<usize, String> {
-    if candidates.is_empty() {
-        return Ok(0);
-    }
-
-    let existing = ledger
-        .list_records(LedgerScope::Global, None, &RecordFilter::default())
-        .await
-        .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
-    let mut seen_titles: HashSet<String> = existing
-        .iter()
-        .map(|doc| normalized_ledger_title(&doc.record.title))
-        .collect();
-
+    let mut seen_by_scope: HashMap<Option<String>, HashSet<String>> = HashMap::new();
     let mut writes = 0usize;
     for candidate in candidates {
+        let Some(session_id) = ledger_candidate_session_id(&candidate) else {
+            continue;
+        };
+        let Some(project_key) = verified_sources.get(session_id) else {
+            continue;
+        };
         let confidence = candidate
             .confidence
             .as_deref()
@@ -2820,19 +2862,35 @@ async fn persist_ledger_candidates(
         if title.is_empty() || title.chars().count() > MAX_RECORD_TITLE_LEN {
             continue;
         }
+        let scope = if project_key.is_some() {
+            LedgerScope::Project
+        } else {
+            LedgerScope::Global
+        };
+        let seen_titles = match seen_by_scope.entry(project_key.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let existing = ledger
+                    .list_records(scope, project_key.as_deref(), &RecordFilter::default())
+                    .await
+                    .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
+                entry.insert(
+                    existing
+                        .iter()
+                        .map(|doc| normalized_ledger_title(&doc.record.title))
+                        .collect(),
+                )
+            }
+        };
         if !seen_titles.insert(normalized_ledger_title(&title)) {
             continue;
         }
 
         let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
         let mut record = LedgerRecord::new(new_record_id(), kind, title);
-        record.scope = LedgerScope::Global;
-        record.source.session_id = candidate
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        record.scope = scope;
+        record.project_key = project_key.clone();
+        record.source.session_id = Some(session_id.to_string());
         record.source.created_by = RecordActor::Extractor;
         record.source.excerpt = candidate
             .excerpt
@@ -7023,7 +7081,8 @@ mod tests {
             ),
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let sources = HashMap::from([("session-ledger".to_string(), None)]);
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
             .await
             .expect("persist should succeed");
         assert_eq!(writes, 3);
@@ -7117,7 +7176,8 @@ mod tests {
             },
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let sources = HashMap::from([("session-dup".to_string(), None)]);
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
             .await
             .expect("persist should succeed");
         assert_eq!(
@@ -7161,7 +7221,28 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
+            serde_json::json!({
+                "candidates": [{
+                    "title": "Project A prefers concise planning",
+                    "type": "project",
+                    "scope": "project",
+                    "content": "Project A plans should stay concise and scoped.",
+                    "tags": ["planning"],
+                    "session_id": "source-session-0001"
+                }],
+                "ledger_candidates": [{
+                    "title": "Review release notes",
+                    "kind": "todo",
+                    "excerpt": "Review release notes",
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                }, {
+                    "title": "Unattributed follow-up",
+                    "kind": "todo",
+                    "excerpt": "Unattributed follow-up",
+                    "confidence": "high"
+                }]
+            }).to_string(),
             "## Current durable context\n- Project A signal only\n\n## Cross-session patterns\n- Focus on project A\n\n## Active threads to remember\n- Ship project A\n\n## Stable constraints and preferences\n- Keep scope isolated\n\n## Open risks or questions\n- None".to_string(),
         ]));
         let config = Arc::new(RwLock::new(config_with_memory(
@@ -7272,6 +7353,27 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(results.matched_count, 1);
         assert_eq!(results.items[0].title, "Project A prefers concise planning");
+
+        let ledger = LedgerStore::new(temp_dir.path());
+        let global = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list Global ledger records");
+        assert!(global.is_empty());
+        let project = ledger
+            .list_records(
+                LedgerScope::Project,
+                Some(&project_key_a),
+                &RecordFilter::default(),
+            )
+            .await
+            .expect("list Project ledger records");
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].record.title, "Review release notes");
+        assert_eq!(
+            project[0].record.source.session_id.as_deref(),
+            Some(session_a.id.as_str())
+        );
     }
 
     #[tokio::test]
