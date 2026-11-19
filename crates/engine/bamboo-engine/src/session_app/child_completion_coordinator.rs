@@ -3679,6 +3679,13 @@ fn child_wait_lease_expired_message(child_ids: &[String]) -> Message {
     ))
 }
 
+#[derive(PartialEq, Eq)]
+struct ChildWaitRegistration {
+    session_created_at: chrono::DateTime<Utc>,
+    run_id: String,
+    registered_at: chrono::DateTime<Utc>,
+}
+
 /// Child-wait watchdog (issue #546): the heartbeat backstop for parents
 /// suspended on `waiting_for_children`.
 ///
@@ -3714,9 +3721,10 @@ impl ChildCompletionCoordinator {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate tick (boot reconciliation just ran).
             ticker.tick().await;
+            let mut rejected_waits = HashMap::new();
             loop {
                 ticker.tick().await;
-                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits())
+                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits(&mut rejected_waits))
                     .catch_unwind()
                     .await
                     .is_err()
@@ -3831,7 +3839,7 @@ impl ChildCompletionCoordinator {
     /// One sweep: inspect every session whose index status is `suspended`.
     /// Cheap in the common case — the candidate list is small and each check is
     /// a sidecar (control-plane) load.
-    async fn sweep_child_waits(&self) {
+    async fn sweep_child_waits(&self, rejected_waits: &mut HashMap<String, ChildWaitRegistration>) {
         let suspended = match self.storage.list_sessions_by_run_status("suspended").await {
             Ok(entries) => entries,
             Err(error) => {
@@ -3839,20 +3847,29 @@ impl ChildCompletionCoordinator {
                 return;
             }
         };
+        let mut previous = std::mem::take(rejected_waits);
         for (session_id, _) in suspended {
-            self.sweep_one_suspended_session(&session_id).await;
+            let rejected = previous.remove(&session_id);
+            if let Some(registration) = self
+                .sweep_one_suspended_session(&session_id, rejected)
+                .await
+            {
+                rejected_waits.insert(session_id, registration);
+            }
         }
     }
 
-    async fn sweep_one_suspended_session(&self, session_id: &str) {
+    async fn sweep_one_suspended_session(
+        &self,
+        session_id: &str,
+        rejected: Option<ChildWaitRegistration>,
+    ) -> Option<ChildWaitRegistration> {
         // A live runner means the session already resumed (the index status
         // only advances at its next terminal) — nothing to do.
         if self.runner_is_running(session_id).await {
-            return;
+            return None;
         }
-        let Some(session) = self.load_control_plane(session_id).await else {
-            return;
-        };
+        let session = self.load_control_plane(session_id).await?;
         let runtime_state = read_runtime_state(&session);
         let suspend_reason = session
             .metadata
@@ -3867,14 +3884,26 @@ impl ChildCompletionCoordinator {
             // Human-gated or bash-owned waits: not ours to time out.
             ("waiting_for_bash", _)
             | ("awaiting_clarification", _)
-            | ("awaiting_parent_approval", _) => {}
-            (_, Some(wait)) => self.sweep_child_wait(session_id, wait).await,
+            | ("awaiting_parent_approval", _) => None,
+            (_, Some(wait)) => {
+                let registration = ChildWaitRegistration {
+                    session_created_at: session.created_at,
+                    run_id: runtime_state.run_id,
+                    registered_at: wait.registered_at,
+                };
+                let already_rejected = rejected.as_ref() == Some(&registration);
+                let rejected_now = self
+                    .sweep_child_wait(session_id, wait, !already_rejected)
+                    .await;
+                (already_rejected || rejected_now).then_some(registration)
+            }
             // Suspended with NO armed wait: either the coordinator cleared the
             // wait but its resume never spawned, or state is half-cleared.
             ("waiting_for_children", None) | ("", None) => {
                 self.rescue_stranded_resume(session_id).await;
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -3888,43 +3917,57 @@ impl ChildCompletionCoordinator {
         parent_session_id: &str,
         wait: WaitingForChildrenState,
     ) {
-        self.sweep_child_wait(parent_session_id, wait).await;
+        self.sweep_child_wait(parent_session_id, wait, true).await;
     }
 
-    async fn sweep_child_wait(&self, parent_session_id: &str, wait: WaitingForChildrenState) {
+    /// Report a deterministic rejection of the unfenced force-resume path.
+    async fn sweep_child_wait(
+        &self,
+        parent_session_id: &str,
+        wait: WaitingForChildrenState,
+        allow_force_resume: bool,
+    ) -> bool {
         let now = Utc::now();
-
-        if wait.child_session_ids.is_empty() {
-            tracing::warn!(
-                %parent_session_id,
-                "child-wait watchdog: wait armed over an empty child set; force-resuming"
-            );
-            self.force_resume_child_wait(parent_session_id, empty_child_wait_message())
-                .await;
-            return;
-        }
 
         // The 6h lease (previously written but never read). Expiry does not
         // kill children — child runners own child liveness; the parent is
         // resumed with a verify-don't-assume note.
-        if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
-            tracing::warn!(
-                %parent_session_id,
-                "child-wait watchdog: wait lease expired; force-resuming parent"
-            );
-            self.force_resume_child_wait(
-                parent_session_id,
-                child_wait_lease_expired_message(&wait.child_session_ids),
-            )
-            .await;
-            return;
+        if allow_force_resume {
+            let forced_resume = if wait.child_session_ids.is_empty() {
+                Some(empty_child_wait_message())
+            } else if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
+                Some(child_wait_lease_expired_message(&wait.child_session_ids))
+            } else {
+                None
+            };
+            if let Some(message) = forced_resume {
+                let Err(error) = self
+                    .force_resume_child_wait(parent_session_id, &wait, message)
+                    .await
+                else {
+                    return false;
+                };
+                let authority_rejected = error.kind() == std::io::ErrorKind::Unsupported
+                    && error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>());
+                tracing::warn!(
+                    %parent_session_id,
+                    %error,
+                    authority_rejected,
+                    "child-wait watchdog: force-resume could not persist; durable wait retained"
+                );
+                return authority_rejected;
+            }
         }
 
+        // When unfenced recovery was rejected, continue observing genuine
+        // child completions through their normal owned Inbox path.
         // Yield to the event-driven push on fresh waits.
         if now.signed_duration_since(wait.registered_at).num_seconds()
             < CHILD_WAIT_REGISTRATION_GRACE_SECS
         {
-            return;
+            return false;
         }
 
         let statuses: HashMap<String, Option<String>> = self
@@ -4109,7 +4152,7 @@ impl ChildCompletionCoordinator {
                 }
             }
             // The publishes above re-evaluate the wait policy themselves.
-            return;
+            return false;
         }
 
         // A lost callback must not hide one ready result behind an unfinished
@@ -4155,6 +4198,7 @@ impl ChildCompletionCoordinator {
             }
             self.publish_completion(completion).await;
         }
+        false
     }
 
     /// Repair only the selected Child's logical state. The caller's requested
@@ -4260,7 +4304,12 @@ impl ChildCompletionCoordinator {
     /// [`Self::perform_bash_resume`]: a suspending runner's one-shot finalize
     /// save can land after ours and revert the wait while dropping the
     /// message; we detect the re-armed wait and re-clear.
-    async fn force_resume_child_wait(&self, session_id: &str, resume_message: Message) {
+    async fn force_resume_child_wait(
+        &self,
+        session_id: &str,
+        expected_wait: &WaitingForChildrenState,
+        resume_message: Message,
+    ) -> std::io::Result<()> {
         const MAX_ATTEMPTS: u8 = 5;
         let lock = session_resume_lock(session_id);
         for attempt in 0..MAX_ATTEMPTS {
@@ -4270,12 +4319,14 @@ impl ChildCompletionCoordinator {
             {
                 let _held = lock.lock().await;
                 let Some(mut session) = self.load_session(session_id).await else {
-                    return;
+                    return Ok(());
                 };
                 let mut runtime_state = read_runtime_state(&session);
-                if runtime_state.waiting_for_children.is_none() {
-                    // Another source already resumed this parent.
-                    return;
+                if runtime_state.waiting_for_children.as_ref() != Some(expected_wait)
+                    || session.has_pending_question()
+                {
+                    // A newer wait or human gate owns the Session now.
+                    return Ok(());
                 }
                 runtime_state.waiting_for_children = None;
                 runtime_state.status = AgentStatusState::Idle;
@@ -4284,11 +4335,20 @@ impl ChildCompletionCoordinator {
                 session.metadata.remove("runtime.suspend_reason");
                 session.add_message(resume_message.clone());
                 session.updated_at = Utc::now();
-                self.save_and_cache(&mut session).await;
+                self.persistence
+                    .merge_save_runtime_and_publish(&mut session, |saved, committed| {
+                        if committed {
+                            self.sessions.insert(
+                                saved.id.clone(),
+                                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                            );
+                        }
+                    })
+                    .await?;
             }
             let outcome = self.resume_parent(session_id.to_string()).await;
             match outcome {
-                ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => return,
+                ResumeOutcome::Started { .. } | ResumeOutcome::NotFound => return Ok(()),
                 ResumeOutcome::Completed | ResumeOutcome::AlreadyRunning { .. } => {
                     // Only retry when the persisted wait was clobbered back to
                     // armed; if it stayed cleared with the message intact, the
@@ -4299,7 +4359,7 @@ impl ChildCompletionCoordinator {
                         .map(|session| read_runtime_state(&session).waiting_for_children.is_some())
                         .unwrap_or(false);
                     if !clobbered {
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -4308,6 +4368,7 @@ impl ChildCompletionCoordinator {
             %session_id,
             "child-wait watchdog: force-resume exhausted its clobber-retry budget"
         );
+        Ok(())
     }
 }
 
@@ -4599,11 +4660,26 @@ mod tests {
 
     struct FailingRuntimeSaveStorage {
         inner: Arc<bamboo_storage::SessionStoreV2>,
+        authority_rejections: Option<Arc<AtomicUsize>>,
+    }
+
+    impl FailingRuntimeSaveStorage {
+        fn reject_unfenced_write(&self) -> std::io::Result<()> {
+            if let Some(rejections) = &self.authority_rejections {
+                rejections.fetch_add(1, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    bamboo_domain::SessionAuthorityConflict("unfenced write rejected".into()),
+                ));
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
     impl Storage for FailingRuntimeSaveStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.reject_unfenced_write()?;
             self.inner.save_session(session).await
         }
 
@@ -4620,6 +4696,7 @@ mod tests {
         }
 
         async fn save_runtime_state(&self, _session: &Session) -> std::io::Result<()> {
+            self.reject_unfenced_write()?;
             Err(std::io::Error::other("injected sidecar save failure"))
         }
     }
@@ -5615,8 +5692,10 @@ mod tests {
                     // No callbacks or cached Session snapshots precede this disk-only sweep.
                     let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
                     wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
-                    coordinator.sweep_child_wait(&parent.id, wait.clone()).await;
-                    coordinator.sweep_child_wait(&parent.id, wait).await;
+                    coordinator
+                        .sweep_child_wait(&parent.id, wait.clone(), true)
+                        .await;
+                    coordinator.sweep_child_wait(&parent.id, wait, true).await;
                 } else {
                     // The terminal index is ahead of the second sibling's callback.
                     coordinator.on_child_completed(completions[0].clone()).await;
@@ -6094,7 +6173,9 @@ mod tests {
         save_completion_test_child(&store, parent_id, "cold-slow", "running").await;
 
         let wait = runtime.waiting_for_children.unwrap();
-        coordinator.sweep_child_wait(parent_id, wait.clone()).await;
+        coordinator
+            .sweep_child_wait(parent_id, wait.clone(), true)
+            .await;
         let reopened = bamboo_storage::FileSessionInbox::new(store.clone(), Default::default());
         let backlog = reopened.inspect(parent_id).await.unwrap();
         assert_eq!(backlog.pending, 2);
@@ -6106,7 +6187,7 @@ mod tests {
         for claim in &claims {
             reopened.ack(parent_id, claim).await.unwrap();
         }
-        coordinator.sweep_child_wait(parent_id, wait).await;
+        coordinator.sweep_child_wait(parent_id, wait, true).await;
         assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
         assert!(
             read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
@@ -6840,7 +6921,9 @@ mod tests {
             let parent = store.load_session("replay-parent").await.unwrap().unwrap();
             let mut wait = read_runtime_state(&parent).waiting_for_children.unwrap();
             wait.registered_at = Utc::now() - chrono::Duration::seconds(61);
-            coordinator.sweep_child_wait("replay-parent", wait).await;
+            coordinator
+                .sweep_child_wait("replay-parent", wait, true)
+                .await;
             let claims = inbox.claim("replay-parent", 1).await.unwrap();
             if !valid {
                 assert!(claims.is_empty());
@@ -7468,6 +7551,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_rejects_unfenced_resume_once_per_child_wait_registration() {
+        let (_temp, store, _, mut coordinator, _, launches) = completion_inbox_fixture().await;
+        let id = "watchdog-authority-rejection";
+        save_waiting_test_parent(&store, id, Vec::new(), ChildWaitPolicy::All).await;
+        let mut parent = store.load_session(id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&parent);
+        let rejections = Arc::new(AtomicUsize::new(0));
+        Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
+            Arc::new(FailingRuntimeSaveStorage {
+                inner: store.clone(),
+                authority_rejections: Some(rejections.clone()),
+            }),
+        ));
+
+        let rejected = coordinator.sweep_one_suspended_session(id, None).await;
+        assert!(rejected.is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 1);
+        let rejected = coordinator.sweep_one_suspended_session(id, rejected).await;
+        assert!(rejected.is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 1);
+        let persisted = store.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            read_runtime_state(&persisted).waiting_for_children,
+            runtime.waiting_for_children
+        );
+        assert_eq!(
+            serde_json::to_value(&persisted.messages).unwrap(),
+            serde_json::to_value(&parent.messages).unwrap()
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+        runtime.waiting_for_children.as_mut().unwrap().registered_at +=
+            chrono::Duration::seconds(1);
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        assert!(coordinator
+            .sweep_one_suspended_session(id, rejected)
+            .await
+            .is_some());
+        assert_eq!(rejections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn failed_child_wait_sidecar_save_keeps_cache_wait_and_transcript() {
         let (_temp, store, inbox, mut coordinator, reservations, launches) =
             completion_inbox_fixture().await;
@@ -7502,6 +7628,7 @@ mod tests {
         Arc::get_mut(&mut coordinator).unwrap().persistence = Arc::new(LockedSessionStore::new(
             Arc::new(FailingRuntimeSaveStorage {
                 inner: store.clone(),
+                authority_rejections: None,
             }),
         ));
 
