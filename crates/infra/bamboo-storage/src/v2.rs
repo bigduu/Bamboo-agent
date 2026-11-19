@@ -753,6 +753,18 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
     }
 }
 
+fn wait_presence(session: &Session) -> (bool, bool) {
+    session
+        .agent_runtime_state
+        .as_ref()
+        .map_or((false, false), |state| {
+            (
+                state.waiting_for_children.is_some(),
+                state.waiting_for_bash.is_some(),
+            )
+        })
+}
+
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
@@ -6010,6 +6022,7 @@ impl SessionStoreV2 {
                     .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
             })
         });
+        let (waiting_for_children, waiting_for_bash) = wait_presence(session);
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -6038,14 +6051,8 @@ impl SessionStoreV2 {
             has_attachments,
             has_pending_question,
             pending_material_run,
-            waiting_for_children: session
-                .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| state.waiting_for_children.is_some()),
-            waiting_for_bash: session
-                .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| state.waiting_for_bash.is_some()),
+            waiting_for_children,
+            waiting_for_bash,
             last_human_input,
             plan_mode,
             bypass_permissions,
@@ -7655,18 +7662,25 @@ impl SessionStoreV2 {
             .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
-        // Workspace and Project ownership are part of the list/index API
-        // contract. Runtime updates must therefore be reflected without waiting
-        // for a later full session save. Avoid rewriting the global index when
-        // neither normalized value changed.
+        // Reflect runtime-only changes to fields exposed by the list API.
         let workspace_path = session
             .workspace_path_meta()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
-            entry.workspace_path != workspace_path || entry.project_id != project_id
-        });
+        let waits = wait_presence(&runtime_snapshot);
+        // A different store may have registered a wait after this store
+        // cached its index. Compare the previous durable sidecar too, so a
+        // clear still updates the shared row when our cached row says no wait.
+        let waits_changed = previous
+            .as_ref()
+            .is_none_or(|saved| wait_presence(saved) != waits);
+        let runtime_index_changed = waits_changed
+            || self.get_index_entry(&session.id).await.is_none_or(|entry| {
+                entry.workspace_path != workspace_path
+                    || entry.project_id != project_id
+                    || (entry.waiting_for_children, entry.waiting_for_bash) != waits
+            });
         if runtime_index_changed {
             let index_started = Instant::now();
             let index_updated = self
@@ -7674,6 +7688,7 @@ impl SessionStoreV2 {
                     if let Some(entry) = index.sessions.get_mut(&session.id) {
                         entry.workspace_path = workspace_path;
                         entry.project_id = project_id;
+                        (entry.waiting_for_children, entry.waiting_for_bash) = waits;
                         return Ok(true);
                     }
                     Ok(false)
@@ -11462,11 +11477,19 @@ mod tests {
         {
             let storage = SessionStoreV2::new(path.clone()).await?;
             let mut shell = Session::new("shell-wait", "m");
+            storage.save_session(&shell).await?;
             let mut shell_runtime = AgentRuntimeState::new("shell-run");
             shell_runtime.waiting_for_bash =
                 Some(WaitingForBashState::for_bash(vec!["shell".into()], now));
             shell.agent_runtime_state = Some(shell_runtime);
-            storage.save_session(&shell).await?;
+            storage.save_runtime_state(&shell).await?;
+            assert!(
+                storage
+                    .get_index_entry("shell-wait")
+                    .await
+                    .unwrap()
+                    .waiting_for_bash
+            );
 
             let mut parent = Session::new("child-wait", "m");
             let mut parent_runtime = AgentRuntimeState::new("child-run");
