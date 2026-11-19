@@ -1946,6 +1946,47 @@ test('frozen recovery retries transient registry GET responses with a bounded de
   }
 })
 
+test('2840 retries a truncated registry body and returns the complete verified download', async () => {
+  const { retryRegistryRead } = require('./frozen-crate-recovery-controller.cjs')
+  const incomplete = new TypeError('terminated', { cause: { code: 'UND_ERR_RES_CONTENT_LENGTH_MISMATCH' } })
+  const truncated = { ok: true, status: 200, body: {}, arrayBuffer: async () => { throw incomplete } }
+  const calls = []
+  let reads = 0
+  const result = await retryRegistryRead(async () => {
+    reads++
+    return reads === 1 ? truncated : new Response('complete archive')
+  }, async delay => { calls.push(delay) }, true)
+  assert.equal(await result.text(), 'complete archive')
+  assert.equal(reads, 2)
+  assert.deepEqual(calls, [2000])
+
+  reads = 0
+  calls.length = 0
+  await assert.rejects(retryRegistryRead(async () => {
+    reads++
+    return truncated
+  }, async delay => { calls.push(delay) }, true), error => error === incomplete)
+  assert.equal(reads, 5)
+  assert.deepEqual(calls, [2000, 4000, 8000, 16000])
+})
+
+test('2840 binds the failed execution, exact unstarted tail and retained native transports', () => {
+  const recovery = require('./crate-release-2026-11-31-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const now = Date.parse('2026-11-19T03:00:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-22T02:00:00Z')
+  assert.equal(recovery.originalEvidence(read, now).id, 44437436231)
+  assert.deepEqual(TAIL, ['bamboo-server', 'bamboo-client-core', 'bamboo-tui', 'bamboo-agent'])
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  const receipt = { crates: [...Array.from({ length: 25 }, (_, index) => 'retained-' + index), 'bamboo-sdk', ...TAIL] }
+  assert.throws(() => recovery.verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, null), /published prefix disappeared/)
+  assert.equal(recovery.verifyRegistryMetadata(receipt, 'bamboo-server', TARGET.version, null), null)
+  const artifact = routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts.at(-1)
+  const expected = artifact.digest
+  artifact.digest = 'sha256:' + '0'.repeat(64)
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION', actual: artifact.digest, expected })
+})
+
 const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')
 test('2762 binds the failed attempt and all five original native transports', () => {
   const { TARGET, ATTEMPTS, ARTIFACTS } = recovery2762
