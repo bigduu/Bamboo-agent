@@ -4375,6 +4375,14 @@ impl SessionInboxPort for FileSessionInbox {
             .await
     }
 
+    async fn inspect_runtime_startup(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<Option<bamboo_domain::SessionRuntimeStartup>, SessionInboxError> {
+        self.inspect_runtime_startup_impl(target, generation).await
+    }
+
     async fn fail_owned(
         &self,
         target: &str,

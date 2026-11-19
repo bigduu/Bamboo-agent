@@ -1971,12 +1971,9 @@ impl SessionActivationRouter {
                     .clone();
                 match inbox.filter(|inbox| inbox.supports_runtime_target_lifetime()) {
                     Some(inbox) => inbox
-                        .inspect_wake_readiness(target_session_id, Utc::now())
+                        .inspect_runtime_startup(target_session_id, generation)
                         .await
-                        .map_err(inbox_activation_error)?
-                        .ready
-                        .filter(|candidate| candidate.generation == generation)
-                        .and_then(|candidate| candidate.runtime_startup()),
+                        .map_err(inbox_activation_error)?,
                     None => None,
                 }
             }

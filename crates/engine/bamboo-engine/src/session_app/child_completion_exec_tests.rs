@@ -630,6 +630,111 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
 }
 
 #[tokio::test]
+async fn coalesced_background_startup_never_substitutes_an_earlier_ready_input() {
+    use bamboo_domain::{
+        ActorActivationFinish, SessionActivationDisposition, SessionInboxConsumerId,
+        SessionInboxLeaseRequest,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    let mut root = Session::new("coalesced-background-selection", "model");
+    root.add_message(Message::user("prior transcript"));
+    store.save_session(&root).await.unwrap();
+
+    let prior_run = "prior-owner-before-producer-notification";
+    let mut actor = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&root, prior_run)
+        .await
+        .unwrap()
+        .unwrap();
+    actor
+        .directory
+        .finish_activation(
+            &actor.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    actor.disarm_abandonment();
+    let owner = router.register_session_run(&root, prior_run).await.unwrap();
+
+    let human = bamboo_domain::SessionMessageEnvelope::user_input(&root.id, "Earlier ready input");
+    inbox
+        .deliver_with_activation_intent(
+            &human,
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let runtime =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let selected = inbox
+        .deliver_runtime_for_target(&runtime, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &selected,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let lease = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: chrono::Duration::seconds(60),
+    };
+    assert!(inbox
+        .claim_owned_receipt(&root.id, &selected, Some("other-consumer"), &lease)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        inbox.inspect(&root.id).await.unwrap().activation_generation,
+        selected.generation,
+    );
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .unwrap()
+            .id,
+        human.id,
+    );
+
+    // Both permissions are durable, but neither producer signaled the Router.
+    // Terminal handoff must keep the highest generation bound to its own input.
+    assert_eq!(
+        owner.finish(0).await.unwrap(),
+        Some(SessionActivationDisposition::ActivationReserved)
+    );
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert!(!inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.messages.len(), 1);
+
+    // An independent reconcile still selects the ready Human input.
+    router.reconcile_wake(&root.id, Utc::now()).await.unwrap();
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let calls = provider.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].iter().any(|id| id == human.id.as_str()));
+}
+
+#[tokio::test]
 async fn background_exec_owned_actor_preserves_native_human_receipt_selection() {
     use bamboo_domain::{ActorActivationFinish, SessionRuntimeStartup};
     let (_temp, store, inbox, coordinator, _) = actor_exec_fixture().await;
