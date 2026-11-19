@@ -1137,6 +1137,10 @@ impl ChildCompletionCoordinator {
 
 #[async_trait]
 impl ChildCompletionHandler for ChildCompletionCoordinator {
+    fn child_completion_account_sink(&self) -> Option<&Arc<crate::events::AccountEventSink>> {
+        self.root_account_sink.as_ref()
+    }
+
     async fn on_child_completed(&self, completion: ChildCompletion) {
         // Terminality guard: a child that reports a NON-terminal status (e.g.
         // "suspended" — awaiting parent approval, its own bash wait, or its own
@@ -4161,11 +4165,6 @@ impl ChildCompletionCoordinator {
         // Error-like outcomes go first so FirstError releases promptly.
         terminal.sort_by_key(|(_, status)| !is_error_like(status));
         for (child_id, status) in terminal {
-            tracing::debug!(
-                %parent_session_id,
-                child_session_id = %child_id,
-                "child-wait watchdog: replaying terminal child outcome"
-            );
             let control_plane = self.load_control_plane(&child_id).await;
             let mut completion = ChildCompletion {
                 parent_session_id: parent_session_id.into(),
@@ -4196,6 +4195,22 @@ impl ChildCompletionCoordinator {
                 }
                 completion.completed_at = child.updated_at;
             }
+            if let Some(source) = &completion.source {
+                if self
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&child_id)
+                    .is_some_and(|runner| runner.child_completion_publication_is_live(source))
+                {
+                    continue;
+                }
+            }
+            tracing::debug!(
+                %parent_session_id,
+                child_session_id = %child_id,
+                "child-wait watchdog: replaying terminal child outcome"
+            );
             self.publish_completion(completion).await;
         }
         false
@@ -4261,7 +4276,10 @@ impl ChildCompletionCoordinator {
             crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
                 self.agent_runners.clone(),
                 self.session_event_senders.clone(),
-                self.account_feed_inbox.clone(),
+                crate::runtime::execution::event_forwarder::SessionAccountFeed::for_host(
+                    self.account_feed_inbox.clone(),
+                    self.root_account_sink.as_ref(),
+                ),
             );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
         crate::runtime::execution::spawn::publish_child_completion(
