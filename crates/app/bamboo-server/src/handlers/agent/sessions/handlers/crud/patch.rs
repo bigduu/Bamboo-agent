@@ -199,7 +199,7 @@ fn project_context_error_response(
 ///
 /// Title and pinned are routed through [`SessionMetadataService`] so they go
 /// through the canonical pipeline (load → re-check → bump version
-/// → locked save → cache → publish_replayable_session_event). Non-metadata
+/// → reserve account event → locked save → cache → replayable event). Non-metadata
 /// fields (`model_ref`, `reasoning_effort`) use a locked config update. The
 /// Supervisor applies these fields under its shared storage writer lock.
 ///
@@ -645,6 +645,9 @@ pub async fn patch_session(
             Err(MetadataError::VersionConflict { current, .. }) => {
                 return Ok(precondition_failed(&session_id, current));
             }
+            Err(MetadataError::EventQueueUnavailable(error)) => {
+                return Ok(crate::events::session_event_queue_unavailable(error));
+            }
             Err(err) => {
                 return Err(crate::error::json_internal_server_error(err.to_string()));
             }
@@ -668,6 +671,9 @@ pub async fn patch_session(
             }
             Err(MetadataError::VersionConflict { current, .. }) => {
                 return Ok(precondition_failed(&session_id, current));
+            }
+            Err(MetadataError::EventQueueUnavailable(error)) => {
+                return Ok(crate::events::session_event_queue_unavailable(error));
             }
             Err(err) => {
                 return Err(crate::error::json_internal_server_error(err.to_string()));

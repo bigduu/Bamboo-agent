@@ -215,6 +215,110 @@ fn accepted(result: ToolResult) -> Value {
     result
 }
 
+#[test]
+fn historical_managed_work_input_requires_the_entire_receipt_fingerprint() {
+    let supervisor = SupervisorReference {
+        session_id: "supervisor-fixture".into(),
+        incarnation_id: uuid::Uuid::from_u128(1),
+    };
+    let authority = CreationAuthority::legacy_supervisor(supervisor);
+    let dispatch = TicketDispatchBinding {
+        dispatch_key: "dispatch-fixture".into(),
+        spec_hash: "spec-fixture".into(),
+        assignment_id: "assignment-fixture".into(),
+        binding: bamboo_tickets::ScopeBinding {
+            scope_id: "scope-fixture".into(),
+            supervisor_session_id: "supervisor-fixture".into(),
+            binding_revision: 1,
+        },
+        max_rounds: None,
+        receipt: None,
+        receipt_created_at: None,
+    };
+    let mut contract = bamboo_tickets::Contract {
+        title: "Fixture".into(),
+        objective: "Deliver result".into(),
+        constraints: vec![],
+        acceptance: vec![],
+        user_acceptance_required: false,
+        allowed_tools: ["Task".into()].into(),
+    };
+    let message = concat!(
+        "Complete the Work contract below in the assigned workspace. ",
+        "Use Task to record and update your plan and progress. ",
+        "Finish with a handoff covering each acceptance item and any open findings ",
+        "for Supervisor review.\n\n{\"contract\":{\"allowed_tools\":[\"Task\"]}}"
+    );
+    let mut current = SupervisedRootCreateRequest {
+        operation_id: uuid::Uuid::from_u128(2),
+        expected_state_revision: 1,
+        project_id: None,
+        workspace_path: None,
+        message: message.into(),
+        title: Some("Fixture".into()),
+        notify_on_material_event: false,
+        thinking_mode: None,
+    };
+    let old_message = message.replacen(
+        "Finish with a handoff",
+        "Use absolute paths inside the assigned worktree for Read. Finish with a handoff",
+        1,
+    );
+    let (_, _, old_request_fingerprint) = authority
+        .operation_identity(&SupervisedRootCreateRequest {
+            message: old_message.clone(),
+            ..current.clone()
+        })
+        .unwrap();
+    let stored_fingerprint = payload_fingerprint(&(&old_request_fingerprint, &dispatch)).unwrap();
+
+    let foreign_dispatch = TicketDispatchBinding {
+        spec_hash: "different-spec".into(),
+        ..dispatch.clone()
+    };
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &foreign_dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    let mut foreign_request = SupervisedRootCreateRequest {
+        title: Some("Different title".into()),
+        ..current.clone()
+    };
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut foreign_request,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    contract.allowed_tools.insert("Read".into());
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    assert_eq!(current.message, message);
+
+    contract.allowed_tools.remove("Read");
+    assert!(restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    assert_eq!(current.message, old_message);
+}
+
 #[tokio::test]
 async fn concurrent_creation_and_restart_replay_preserve_one_root_link_and_first_input() {
     let f = Fixture::new().await;

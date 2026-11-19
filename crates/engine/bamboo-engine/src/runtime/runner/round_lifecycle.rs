@@ -209,6 +209,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     let loaded =
         crate::runtime::runner::loop_execution::validated_sticky_fallback_loaded_tool_names(
             session,
+            tool_schemas,
         );
     let mut projected = tool_schemas
         .iter()
