@@ -245,6 +245,16 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    /// Claim the same fenced Root writer for direct compaction without
+    /// attributing its writes or completion to a chat run.
+    async fn bind_root_actor_compaction(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        Ok(None)
+    }
+
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
@@ -554,6 +564,21 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    /// Admit only the reserved first Work input through an existing owned
+    /// Root writer. This selector alone does not grant dispatch or tool rights.
+    async fn admit_managed_work_input(
+        &self,
+        _session: &mut Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _run_id: &str,
+        _expected: &crate::SessionMessageId,
+    ) -> io::Result<RootInboxAdmission> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed Work Inbox unsupported",
+        ))
+    }
+
     /// Atomically commit a staged archive transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.
@@ -694,6 +719,8 @@ pub struct RootActorExecutionBinding {
     pub directory: Arc<dyn crate::ActorDirectoryPort>,
     pub owner: crate::RootActorRuntimeWrite,
     pub lease_duration: std::time::Duration,
+    /// Synchronous publication retained by the real terminal storage guards.
+    pub terminal_publisher: Option<crate::storage::RootActorRuntimePublisher>,
     abandon: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
@@ -710,8 +737,17 @@ impl RootActorExecutionBinding {
             directory,
             owner,
             lease_duration,
+            terminal_publisher: None,
             abandon: Some(Box::new(abandon)),
         }
+    }
+
+    pub fn with_terminal_publisher(
+        mut self,
+        publish: crate::storage::RootActorRuntimePublisher,
+    ) -> Self {
+        self.terminal_publisher = Some(publish);
+        self
     }
 
     /// The runtime calls this only after handing finish to an owned detached
@@ -768,6 +804,15 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<Option<RootActorExecutionBinding>> {
         (**self).bind_root_actor_execution(session, run_id).await
     }
+
+    async fn bind_root_actor_compaction(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        (**self).bind_root_actor_compaction(session, run_id).await
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
     }

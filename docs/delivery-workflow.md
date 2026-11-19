@@ -171,6 +171,14 @@ configurations, test selections, artifact names and ownership.
 4. Submit to dev with current review and real Unit/E2E. Failures stay in feature;
    do not waive them into a release. An integration update refreshes affected
    evidence for its actual head/base.
+
+   Keep existing branch protections in force. Develop and review feature PRs in
+   parallel. For each `dev` branch, run final CI one PR at a time in merge order.
+   When a PR reaches its turn, use GitHub's **Update branch** with a merge commit
+   only if the PR is behind the current `dev` tip. Reuse passing checks that are
+   still valid for the current head/base. Merge promptly once all required
+   checks are green and review and branch protection requirements are satisfied.
+
 5. Freeze only an accepted dev cut. Release builds and verifies formal artifacts
    once. Consumers retain exact source/version/hash identities.
 6. Promote only a completed release to main through a read-only metadata/source

@@ -157,11 +157,47 @@ pub struct ChildActorRuntimeSave<'a> {
 /// treats the result as unknown; it cannot use its candidate as committed data.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
+/// Original Supervisor and target observations for a delegated permission
+/// response. The final writer rechecks these and the approval contract while
+/// retaining its canonical authority locks.
+pub struct SupervisorApprovalCommit {
+    pub caller: crate::SessionCallerReference,
+    pub supervisor: SupervisorReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
+    /// Validate the retained source and target snapshots without reentering storage.
+    pub validate: SupervisorApprovalValidator,
+}
+
+pub type SupervisorApprovalValidator =
+    Box<dyn Fn(&Session, &Session) -> std::io::Result<()> + Send + Sync>;
+
+/// Main message metadata written only by the fenced delegated response commit.
+pub const SUPERVISOR_APPROVAL_RESPONSE_KEY: &str = "supervisor_approval_response.v1";
+
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SupervisorApprovalResponseOrigin {
+    pub caller: crate::SessionCallerReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
+    pub occurrence: crate::ResponseOccurrence,
+}
+
 /// The final sink receives a fresh owner check while the physical authority
 /// guards remain owned by the publication job. Check immediately before each
 /// final effect, including after any journal scan performed by the sink.
 pub type RootActorRuntimeEventPublisher =
     Box<dyn FnOnce(&dyn Fn() -> std::io::Result<()>) -> std::io::Result<()> + Send>;
+
+/// Explicit presentation-only intent. This is not authority to change other
+/// Session fields or to refresh an already-stale Actor observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPresentationMutation {
+    Title,
+    Pinned,
+}
 
 /// Trait for session storage backends.
 ///
@@ -170,6 +206,35 @@ pub type RootActorRuntimeEventPublisher =
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Commit one title (manual, automatic or fallback) or pinned mutation.
+    /// Actor-aware backends compare the complete candidate with canonical
+    /// state under their writer guards, require exact revision advances, and
+    /// propagate only already-current observations. Return the exact committed
+    /// snapshot, including backend-owned bookkeeping.
+    async fn save_presentation_metadata_committed(
+        &self,
+        session: &Session,
+        mutation: SessionPresentationMutation,
+    ) -> std::io::Result<Session> {
+        match mutation {
+            SessionPresentationMutation::Title => self.save_manual_title_committed(session).await,
+            SessionPresentationMutation::Pinned => {
+                self.save_session(session).await?;
+                Ok(session.clone())
+            }
+        }
+    }
+
+    /// Confirm committed presentation metadata, including a no-op. The legacy
+    /// title port already validates the complete canonical Session and Actor
+    /// observations, so existing adapters retain their validation behavior.
+    async fn validate_presentation_metadata_observations(
+        &self,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.validate_title_observations(expected).await
+    }
+
     /// Persist an explicit manual-title mutation. Actor-aware backends must
     /// compare it with current canonical state under the full writer guards,
     /// allowing only the title fields and exact version advances. Generic
@@ -177,6 +242,14 @@ pub trait Storage: Send + Sync {
     /// Backends without Actor observations retain their ordinary save behavior.
     async fn save_manual_title(&self, session: &Session) -> std::io::Result<()> {
         self.save_session(session).await
+    }
+
+    /// Return the exact candidate committed by the title transaction, including
+    /// backend-owned bookkeeping. Confirmation must still validate this value.
+    /// Backends which normalize the candidate must override this method.
+    async fn save_manual_title_committed(&self, session: &Session) -> std::io::Result<Session> {
+        self.save_manual_title(session).await?;
+        Ok(session.clone())
     }
 
     /// Validate a manual title before reporting success, including a no-op.
@@ -422,6 +495,53 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Commit a delegated permission answer while the original Supervisor's
+    /// authority and the reserved Root writer are both current.
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        approval: &SupervisorApprovalCommit,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, expected, inherited, approval, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded Supervisor approval response is unsupported",
+        ))
+    }
+
+    /// Reload a committed response under the successor's Root fence and confirm
+    /// Main and runtime are durable before a retry can dispatch its handoff.
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        approval: Option<&SupervisorApprovalCommit>,
+    ) -> std::io::Result<Session> {
+        let _ = (owner, approval);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Root response checkpoint recovery is unsupported",
+        ))
+    }
+
+    /// The exact pending Once handoff is consumed at Main before the first
+    /// tool or provider side effect. A stale or already claimed handoff fails.
+    async fn claim_once_response_handoff(
+        &self,
+        session: &Session,
+        owner: Option<&RootActorRuntimeWrite>,
+        approval: Option<&SupervisorApprovalCommit>,
+    ) -> std::io::Result<()> {
+        let _ = (session, owner, approval);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Once response handoff claim is unsupported",
+        ))
+    }
+
     /// Re-read and reconcile an execution's inherited child wait under the
     /// physical session lock, retain birth/fence checks, then save and publish.
     async fn save_inherited_child_wait_finalized(
@@ -611,6 +731,20 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "host_session_scope_unsupported",
+        ))
+    }
+
+    /// Durable history of one ordinary Session in this application user's data
+    /// domain. Backends must validate the original ordinary Root caller and the
+    /// target together, retaining the absence of an installed finite scope.
+    async fn load_current_user_peer_session(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _target_id: &str,
+    ) -> std::io::Result<Session> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "current_user_peer_history_unsupported",
         ))
     }
 
@@ -908,6 +1042,16 @@ pub trait Storage: Send + Sync {
         self.load_session(session_id).await
     }
 
+    /// Prove a live Root with this birth token has no earlier lifetime.
+    /// Used for legacy Project sidebar assignments saved without a birth token.
+    async fn first_root_lifetime_matches(
+        &self,
+        _session_id: &str,
+        _birth_token: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Recover an interrupted two-session Task control-plane transaction for
     /// this exact, lexically ordered session pair before either snapshot is
     /// read. Backends without a recovery journal have nothing to do.
@@ -1008,6 +1152,61 @@ pub trait Storage: Send + Sync {
     ) -> std::io::Result<Vec<(String, Option<String>)>> {
         let _ = status;
         Ok(Vec::new())
+    }
+
+    /// Bind a reserved Host run before executing it. Implementations with
+    /// durable runtime state must CAS the old Host identity under their physical
+    /// Session lock; ordinary final-save cannot replace this identity.
+    async fn begin_host_run(&self, expected: &Session, run_id: &str) -> std::io::Result<()> {
+        let _ = (expected, run_id);
+        Ok(())
+    }
+
+    /// The owner has not entered Child execution. Close only that reserved
+    /// Host run after startup publication fails, comparing birth, generation
+    /// and the original input/control identity under the physical writer lock.
+    /// A successor or an already executing/finalized run must be left alone.
+    /// The callback is synchronous cache publication, never a Worker stop proof.
+    async fn fail_child_host_startup(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, run_id, error, publish);
+        Ok(None)
+    }
+
+    /// Reconcile a selected Child snapshot under the physical Session/Actor
+    /// locks. Return None when superseded, waiting, still leased or lacking a
+    /// trusted terminal fact. The error describes a newly expired Actor only;
+    /// callers cannot supply a terminal outcome. A terminal return proves
+    /// logical closure, never physical Worker termination.
+    async fn reconcile_child_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error);
+        Ok(None)
+    }
+
+    /// Targeted logical terminal repair. The backend compares the complete
+    /// expected control snapshot and publishes only after a durable repair,
+    /// while the same physical Session/Actor/tree guards are retained. The
+    /// callback must be a synchronous cache publication, never execution or IO.
+    /// Unsupported backends remain unknown. This grants no Worker stop proof.
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error, publish);
+        Ok(None)
     }
 
     /// Append one analysis record — a single JSON line — to the session's

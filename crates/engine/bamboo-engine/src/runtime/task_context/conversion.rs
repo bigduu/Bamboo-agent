@@ -49,8 +49,16 @@ impl TaskLoopContext {
             .map(clone_loop_item_into_task_item)
     }
 
-    /// Create `TaskLoopContext` from the session's task list.
+    /// Create the ordinary session's automatic Task tracker. A Work Child's
+    /// private Task list projects its committed LocalPlan and is read directly
+    /// for display and prompt context.
     pub fn from_session(session: &bamboo_agent_core::Session) -> Option<Self> {
+        if session
+            .metadata
+            .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
+        {
+            return None;
+        }
         session.task_list.as_ref().map(|task_list| {
             // Preserve version from existing task_list metadata if available.
             // This prevents version reset across multiple executions.

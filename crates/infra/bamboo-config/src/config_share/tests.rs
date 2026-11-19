@@ -15,7 +15,6 @@ fn fixture() -> Config {
     config.providers_mut().openai = None;
     config.providers_mut().anthropic = None;
     config.providers_mut().gemini = None;
-    config.providers_mut().copilot = None;
     config.providers_mut().bodhi = None;
     config.provider_instances.insert("work".into(), serde_json::from_value(json!({
         "provider_type":"openai", "label":"Demo provider", "api_key":FAKE_KEY,
@@ -1081,6 +1080,71 @@ fn provider_type_changes_require_skip_or_fresh_rename_without_mutating_snapshots
             assert_eq!(serde_json::to_vec(&target).unwrap(), before);
         }
     }
+}
+
+#[test]
+fn import_requires_a_fresh_name_for_a_retired_provider_id() {
+    let mut target = fixture();
+    target
+        .providers_mut()
+        .retired_provider_aliases
+        .insert("openai".into());
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].id = "openai".into();
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(preview.providers[0].retired_id);
+    assert!(!preview.providers[0].replace_allowed);
+    assert!(preview.providers[0].rename_allowed);
+    let mut decisions = ShareDecisions {
+        providers: BTreeMap::from([("openai".into(), ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    assert_eq!(
+        plan_import(&bundle, &target, &decisions),
+        Err(ShareError::Invalid)
+    );
+    decisions.providers.insert(
+        "openai".into(),
+        ShareConflictChoice::Rename {
+            target: "new-relay".into(),
+        },
+    );
+    assert_eq!(
+        plan_import(&bundle, &target, &decisions).unwrap().providers[0].id,
+        "new-relay"
+    );
+}
+
+#[test]
+fn legacy_bodhi_share_can_update_a_matching_instance_or_be_skipped() {
+    let mut target = fixture();
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].id = "legacy-bodhi".into();
+    bundle.providers[0].provider_type = ShareProviderType::Bodhi;
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(!preview.providers[0].replace_allowed);
+    assert!(!preview.providers[0].rename_allowed);
+    assert_eq!(
+        plan_import(&bundle, &target, &ShareDecisions::default()),
+        Err(ShareError::Invalid)
+    );
+    let mut decisions = ShareDecisions {
+        providers: BTreeMap::from([("legacy-bodhi".into(), ShareConflictChoice::Skip)]),
+        ..Default::default()
+    };
+    assert!(plan_import(&bundle, &target, &decisions)
+        .unwrap()
+        .providers
+        .is_empty());
+    target.provider_instances.insert(
+        "legacy-bodhi".into(),
+        serde_json::from_value(serde_json::json!({"provider_type": "bodhi"})).unwrap(),
+    );
+    assert!(preview_bundle(&bundle, &target).unwrap().providers[0].replace_allowed);
+    decisions
+        .providers
+        .insert("legacy-bodhi".into(), ShareConflictChoice::Replace);
+    assert_eq!(plan_import(&bundle, &target, &decisions).unwrap(), bundle);
 }
 
 #[test]

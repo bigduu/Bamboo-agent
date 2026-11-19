@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// BAMBOO_SHARED_EXECUTABLES_V2
+// BAMBOO_SHARED_EXECUTABLES_V3
 // One standard, complete Bamboo executable is shared by CLI and desktop users.
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
@@ -10,18 +10,25 @@ const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
   validatePreparation, assertAdmissionCompatibility, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
-const MANIFEST = 'bamboo-sidecars-v2.json'
+const CURRENT_CONTRACT = 3
 const HOST_ASSET = 'bamboo-browser-host-v1.tar.gz'
-const PROVENANCE = 'bamboo-executables-provenance-v2.json'
-const PROVENANCE_KIND = 'bamboo-complete-executables/v2'
 const LEGACY_TARGETS = Object.freeze(['aarch64-apple-darwin', 'x86_64-apple-darwin',
   'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
-const TARGETS = Object.freeze(['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
+const V2_TARGETS = Object.freeze(['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
+const TARGETS = Object.freeze(['aarch64-apple-darwin', 'aarch64-pc-windows-msvc', 'aarch64-unknown-linux-gnu',
+  'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
+const SUPPORTED_TARGETS = Object.freeze([...new Set([...LEGACY_TARGETS, ...TARGETS])])
 const CONTRACTS = Object.freeze({
-  1: Object.freeze({ version: 1, targets: LEGACY_TARGETS, manifest: 'bamboo-sidecars-v1.json',
-    provenance: 'bamboo-executables-provenance-v1.json', kind: 'bamboo-complete-executables/v1' }),
-  2: Object.freeze({ version: 2, targets: TARGETS, manifest: MANIFEST, provenance: PROVENANCE, kind: PROVENANCE_KIND }),
+  1: executableContract(1, LEGACY_TARGETS),
+  2: executableContract(2, V2_TARGETS),
+  3: executableContract(3, TARGETS),
 })
+const { manifest: MANIFEST, provenance: PROVENANCE } = CONTRACTS[CURRENT_CONTRACT]
+
+function executableContract(version, targets) {
+  return Object.freeze({ version, targets, manifest: 'bamboo-sidecars-v' + version + '.json',
+    provenance: 'bamboo-executables-provenance-v' + version + '.json', kind: 'bamboo-complete-executables/v' + version })
+}
 const HOST_FILES = Object.freeze(['browser-runtime/host.cjs', 'browser-runtime/package-lock.json',
   'browser-runtime/package.json'])
 const DIGEST = /^[0-9a-f]{64}$/
@@ -30,16 +37,16 @@ const MAX_BINARY = 1024 * 1024 * 1024
 const MAX_HOST = 8 * 1024 * 1024
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const artifactName = (target) => {
-  assert.ok(LEGACY_TARGETS.includes(target), 'Unsupported sidecar target')
+  assert.ok(SUPPORTED_TARGETS.includes(target), 'Unsupported sidecar target')
   return `bamboo-${target}${target.includes('windows') ? '.exe' : ''}`
 }
 const targetOutputKey = (target) => {
-  assert.ok(LEGACY_TARGETS.includes(target))
+  assert.ok(SUPPORTED_TARGETS.includes(target))
   return target.replaceAll('-', '_')
 }
 
-function contractForVersion(version = 2) {
-  assert.ok(version === 1 || version === 2, 'Unsupported executable publication contract')
+function contractForVersion(version = CURRENT_CONTRACT) {
+  assert.ok(Number.isInteger(version) && Object.hasOwn(CONTRACTS, version), 'Unsupported executable publication contract')
   return CONTRACTS[version]
 }
 
@@ -49,29 +56,30 @@ function sourceContractVersion(sourceRoot = process.cwd()) {
   const file = path.join(sourceRoot, 'scripts/sidecar-release.cjs')
   const stat = fs.lstatSync(file)
   assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= 128 * 1024)
-  const markers = [...fs.readFileSync(file, 'utf8').matchAll(/^\/\/ BAMBOO_SHARED_EXECUTABLES_V([0-9]+)$/gm)]
+  const markers = [...fs.readFileSync(file, 'utf8').matchAll(/^\/\/ BAMBOO_SHARED_EXECUTABLES_V([0-9]+)\r?$/gm)]
   assert.equal(markers.length, 1, 'Missing or ambiguous source executable contract')
-  assert.ok(markers[0][1] === '1' || markers[0][1] === '2', 'Unknown source executable contract')
-  return Number(markers[0][1])
+  const version = Number(markers[0][1])
+  assert.ok(String(version) === markers[0][1] && Object.hasOwn(CONTRACTS, version), 'Unknown source executable contract')
+  return version
 }
 
 function boundSourceContract(sourceRoot = process.cwd(), env = process.env) {
   const version = sourceContractVersion(sourceRoot)
   if (env.BAMBOO_EXECUTABLE_CONTRACT_VERSION !== undefined) {
     assert.equal(env.BAMBOO_EXECUTABLE_CONTRACT_VERSION, String(version), 'Job contract differs from accepted source')
-  } else assert.equal(version, 1, 'A v2 source requires its independently bound job contract')
+  } else assert.equal(version, 1, 'The source requires its independently bound job contract')
   return version
 }
 
 function assertContractAssets(assets, contractVersion) {
   const contract = contractForVersion(contractVersion)
+  const foreignBinaries = SUPPORTED_TARGETS.filter(target => !contract.targets.includes(target)).map(artifactName)
   for (const asset of assets) {
     if (/^bamboo-(sidecars|executables-provenance)-v[0-9]+\.json$/.test(asset.name)) {
       assert.ok(asset.name === contract.manifest || asset.name === contract.provenance,
         'Release contains an incompatible executable contract')
     }
-    if (contractVersion === 2) assert.notEqual(asset.name, artifactName('x86_64-apple-darwin'),
-      'Intel assets do not belong to the v2 release contract')
+    assert.ok(!foreignBinaries.includes(asset.name), 'Release contains an executable outside its target contract')
   }
 }
 
@@ -116,7 +124,7 @@ function createBrowserHost({ sourceRoot, outputDirectory }) {
 // This pure function also supports explicitly synthetic cross-repository
 // contract fixtures. Publication separately requires real build provenance.
 function createManifest({ version, sourceRevision, artifacts, browserHost }) {
-  return createManifestForContract({ version, sourceRevision, artifacts, browserHost }, 2)
+  return createManifestForContract({ version, sourceRevision, artifacts, browserHost }, CURRENT_CONTRACT)
 }
 
 function createManifestForContract({ version, sourceRevision, artifacts, browserHost }, contractVersion) {
@@ -148,8 +156,8 @@ function createManifestForContract({ version, sourceRevision, artifacts, browser
         .map(({ path, sha256, sizeBytes }) => ({ path, sha256, sizeBytes })) } }
 }
 
-function manifestBytes(value, contractVersion = 2) {
-  return Buffer.from(`${JSON.stringify(contractVersion === 2 ? createManifest(value) :
+function manifestBytes(value, contractVersion = CURRENT_CONTRACT) {
+  return Buffer.from(`${JSON.stringify(contractVersion === CURRENT_CONTRACT ? createManifest(value) :
     createManifestForContract(value, contractVersion), null, 2)}\n`)
 }
 
@@ -192,16 +200,24 @@ function validateManifestV1(value, identity, builds) {
   return value
 }
 
-// This version also remains independent of the moving manifest constructor.
+// The ordered manifests are validated against their original contracts and
+// signed build receipts without invoking the current manifest constructor.
 function validateManifestV2(value, identity, builds) {
+  return validateOrderedManifest(value, identity, builds, 2, V2_TARGETS)
+}
+
+function validateManifestV3(value, identity, builds) {
+  return validateOrderedManifest(value, identity, builds, 3, TARGETS)
+}
+
+function validateOrderedManifest(value, identity, builds, version, targets) {
   const keys = (object, expected) => assert.deepEqual(Object.keys(object).sort(), [...expected].sort())
   keys(value, ['schemaVersion', 'version', 'sourceRevision', 'artifacts', 'browserHost'])
-  assert.equal(value.schemaVersion, 2)
+  assert.equal(value.schemaVersion, version)
   assert.match(value.version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
   assert.equal(value.version, identity.version)
   assert.match(value.sourceRevision, /^[0-9a-f]{40}$/)
   assert.equal(value.sourceRevision, identity.sourceRevision)
-  const targets = ['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']
   assert.deepEqual(builds?.map(item => item.target), targets)
   assert.ok(Array.isArray(value.artifacts))
   assert.deepEqual(value.artifacts.map(item => item.target), targets)
@@ -231,7 +247,7 @@ function validateManifestV2(value, identity, builds) {
 }
 
 function binaryArchitecture(file, target) {
-  assert.ok(LEGACY_TARGETS.includes(target))
+  assert.ok(SUPPORTED_TARGETS.includes(target))
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
   try {
     const header = Buffer.alloc(64)
@@ -248,12 +264,14 @@ function binaryArchitecture(file, target) {
       const pe = Buffer.alloc(26)
       assert.equal(fs.readSync(fd, pe, 0, pe.length, offset), pe.length)
       assert.equal(pe.readUInt32LE(0), 0x4550, 'Invalid PE signature')
-      assert.equal(pe.readUInt16LE(4), 0x8664, 'Expected PE AMD64')
+      assert.equal(pe.readUInt16LE(4), target.startsWith('aarch64') ? 0xaa64 : 0x8664,
+        'PE architecture differs from the advertised target')
       assert.equal(pe.readUInt16LE(24), 0x20b, 'Expected PE32+')
       assert.ok((pe.readUInt16LE(22) & 0x2002) === 2, 'Expected an executable, not a DLL')
     } else {
       assert.equal(header.subarray(0, 6).toString('hex'), '7f454c460201', 'Expected ELF64 little-endian')
-      assert.equal(header.readUInt16LE(18), 62, 'Expected ELF x86-64')
+      assert.equal(header.readUInt16LE(18), target.startsWith('aarch64') ? 0xb7 : 0x3e,
+        'ELF architecture differs from the advertised target')
       assert.ok([2, 3].includes(header.readUInt16LE(16)), 'Expected an ELF executable or PIE')
     }
     return target
@@ -388,19 +406,19 @@ function validateBuildReceipt(receipt, identity, target) {
   return receipt
 }
 
-function expectedBuildBindings(outputs, contractVersion = 2) {
+function expectedBuildBindings(outputs, contractVersion = CURRENT_CONTRACT) {
   const contract = contractForVersion(contractVersion)
   assert.ok(outputs && typeof outputs === 'object' && !Array.isArray(outputs), 'Require independent build-job outputs')
   outputs = { ...outputs }
-  // GitHub declares the legacy output as well so the same reviewed workflow
-  // can recover v1. The absent v2 Intel job may supply only its empty output.
-  const intel = targetOutputKey('x86_64-apple-darwin')
-  if (contractVersion === 2 && Object.hasOwn(outputs, intel)) {
-    assert.equal(outputs[intel], '', 'A v2 release cannot acquire an Intel build binding')
-    delete outputs[intel]
+  // GitHub may include empty output keys for targets from other contracts.
+  for (const target of SUPPORTED_TARGETS) {
+    const key = targetOutputKey(target)
+    if (contract.targets.includes(target) || !Object.hasOwn(outputs, key)) continue
+    assert.equal(outputs[key], '', 'An inactive target cannot supply a build binding')
+    delete outputs[key]
   }
   assert.deepEqual(Object.keys(outputs).sort(), contract.targets.map(targetOutputKey).sort(),
-    contractVersion === 1 ? 'Require four unique build-job output bindings' : 'Require three unique build-job output bindings')
+    'Require the exact build-job output bindings for the selected contract')
   return new Map(contract.targets.map((target) => {
     assert.equal(typeof outputs[targetOutputKey(target)], 'string')
     const value = JSON.parse(outputs[targetOutputKey(target)])
@@ -412,7 +430,7 @@ function expectedBuildBindings(outputs, contractVersion = 2) {
 }
 
 function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot, frontendBytes, expectedBuilds, signingKey,
-  contractVersion = 2 }) {
+  contractVersion = CURRENT_CONTRACT }) {
   const contract = contractForVersion(contractVersion)
   const bindings = expectedBuildBindings(expectedBuilds, contractVersion)
   assert.deepEqual(fs.readdirSync(inputDirectory).sort(), [...contract.targets].sort(), 'Missing or unexpected platform transport directory')
@@ -456,7 +474,7 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
 // Preserve the authenticated original build run/controller even across a new
 // recovery dispatch. Never adopt unsigned, foreign-source/CI or incomplete assets.
 async function recoverPublishedRelease({ identity, release, outputDirectory, sourceRoot,
-  frontendBytes, signingKey, readAsset, contractVersion = 2 }) {
+  frontendBytes, signingKey, readAsset, contractVersion = CURRENT_CONTRACT }) {
   const contract = contractForVersion(contractVersion)
   assertContractAssets(release.assets, contractVersion)
   const checkpoint = release.assets.find((asset) => asset.name === contract.provenance)
@@ -491,6 +509,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
     originalManifestBytes = Buffer.from(proof.manifestBytesBase64, 'base64')
     assert.equal(originalManifestBytes.toString('base64'), proof.manifestBytesBase64)
   } else {
+    assert.ok(contractVersion < 3, 'The signed checkpoint must include the original manifest bytes')
     const committed = release.assets.find((asset) => asset.name === contract.manifest)
     if (committed) originalManifestBytes = await readAsset(committed, 1024 * 1024)
     else {
@@ -507,8 +526,8 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const manifest = JSON.parse(originalManifestBytes.toString('utf8'))
   // Validate the frozen contract and signed build identities without reserializing
   // the original bytes or running the current controller's archive builder.
-  if (contractVersion === 1) validateManifestV1(manifest, identity, proof.builds)
-  else validateManifestV2(manifest, identity, proof.builds)
+  const validateManifest = { 1: validateManifestV1, 2: validateManifestV2, 3: validateManifestV3 }[contractVersion]
+  validateManifest(manifest, identity, proof.builds)
   const required = [...proof.builds, manifest.browserHost]
   assert.ok(required.every((item) => release.assets.some((asset) => asset.name === item.assetName)),
     'Authenticated checkpoint has missing release assets')
@@ -530,7 +549,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
 
 // Never clobber release assets. An interrupted upload can resume only when the
 // server still has these exact bytes. The manifest is the final commit marker.
-async function publishAssets({ directory, release, readAsset, upload, listAssets, contractVersion = 2 }) {
+async function publishAssets({ directory, release, readAsset, upload, listAssets, contractVersion = CURRENT_CONTRACT }) {
   const contract = contractForVersion(contractVersion)
   const names = [...contract.targets.map(artifactName), HOST_ASSET, contract.provenance, contract.manifest]
   assert.deepEqual(fs.readdirSync(directory).sort(), [...names].sort())
@@ -569,7 +588,10 @@ async function publishAssets({ directory, release, readAsset, upload, listAssets
 // A completed existing signed checkpoint skips the native producers. The finalizer
 // still downloads and checks every original byte through recoverPublishedRelease.
 function completedNativeOriginals(release, identity, signingKey, readAsset = assetBytes) {
-  const contract = contractForVersion(boundSourceContract()), asset = release.assets.find(item => item.name === contract.provenance)
+  const contractVersion = boundSourceContract()
+  const contract = contractForVersion(contractVersion)
+  assertContractAssets(release.assets, contractVersion)
+  const asset = release.assets.find(item => item.name === contract.provenance)
   if (!asset) return false
   const proof = authenticateReceipt(JSON.parse(readAsset(asset, 1024 * 1024)), signingKey)
   assert.equal(proof.schemaVersion, contract.version); assert.equal(proof.kind, contract.kind)
@@ -618,9 +640,9 @@ async function main() {
     contractVersion, targets: contract.targets }))
 }
 
-module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
+module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, SUPPORTED_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   contractForVersion, sourceContractVersion, boundSourceContract,
-  completedNativeOriginals, artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
+  completedNativeOriginals, artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2, validateManifestV3,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, preparedFrontend, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

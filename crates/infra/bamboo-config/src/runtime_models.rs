@@ -61,6 +61,9 @@ fn instance_model_inputs(instance: &ProviderInstanceConfig) -> ModelInputs<'_> {
 // legacy fields relevant to admission are enabled, model selections, and the
 // runtime_models extra field.
 fn legacy_model_inputs<'a>(config: &'a Config, id: &str) -> Option<ModelInputs<'a>> {
+    if config.is_retired_provider_alias(id) {
+        return None;
+    }
     let providers = config.providers();
     match id {
         "openai" => providers.openai.as_ref().map(|entry| ModelInputs {
@@ -79,13 +82,6 @@ fn legacy_model_inputs<'a>(config: &'a Config, id: &str) -> Option<ModelInputs<'
         }),
         "gemini" => providers.gemini.as_ref().map(|entry| ModelInputs {
             enabled: true,
-            model: entry.model.as_deref(),
-            fast_model: entry.fast_model.as_deref(),
-            vision_model: entry.vision_model.as_deref(),
-            extra: &entry.extra,
-        }),
-        "copilot" => providers.copilot.as_ref().map(|entry| ModelInputs {
-            enabled: entry.enabled || config.provider == "copilot",
             model: entry.model.as_deref(),
             fast_model: entry.fast_model.as_deref(),
             vision_model: entry.vision_model.as_deref(),
@@ -157,9 +153,50 @@ pub fn has_any_runtime_model_inputs(config: &Config) -> bool {
         || providers.openai.is_some()
         || providers.anthropic.is_some()
         || providers.gemini.is_some()
-        || providers.copilot.is_some()
         || providers.bodhi.is_some()
         || !providers.extra.is_empty()
+}
+
+/// Return the public JSON Pointer paths whose model defaults name this exact
+/// provider instance. Provider types and runtime aliases are distinct IDs.
+pub fn model_default_reference_paths(defaults: &DefaultsConfig, instance_id: &str) -> Vec<String> {
+    let DefaultsConfig {
+        chat,
+        fast,
+        task_summary,
+        vision,
+        memory_background,
+        planning,
+        search,
+        code_review,
+        work_review,
+        sub_agent,
+        subagent_models,
+    } = defaults;
+    let mut paths: Vec<_> = [
+        ("chat", Some(chat)),
+        ("fast", fast.as_ref()),
+        ("task_summary", task_summary.as_ref()),
+        ("vision", vision.as_ref()),
+        ("memory_background", memory_background.as_ref()),
+        ("planning", planning.as_ref()),
+        ("search", search.as_ref()),
+        ("code_review", code_review.as_ref()),
+        ("work_review", work_review.as_ref()),
+        ("sub_agent", sub_agent.as_ref()),
+    ]
+    .into_iter()
+    .filter(|(_, reference)| reference.is_some_and(|reference| reference.provider == instance_id))
+    .map(|(field, _)| format!("/defaults/{field}"))
+    .collect();
+    for (name, reference) in subagent_models {
+        if reference.provider == instance_id {
+            let escaped = name.replace('~', "~0").replace('/', "~1");
+            paths.push(format!("/defaults/subagent_models/{escaped}"));
+        }
+    }
+    paths.sort_unstable();
+    paths
 }
 
 fn default_refs(
@@ -181,7 +218,8 @@ fn default_refs(
 /// as runtime routing. An explicit instance or legacy alias retains its identity.
 pub fn configured_provider_routing_key(config: &Config, provider: &str) -> String {
     let provider = provider.trim();
-    if config.provider_instances.contains_key(provider)
+    if config.is_retired_provider_alias(provider)
+        || config.provider_instances.contains_key(provider)
         || ((!config.has_provider_instances() || config.effective_default_provider() == provider)
             && legacy_model_inputs(config, provider).is_some())
     {
@@ -229,6 +267,15 @@ fn configured_models_from_inputs(
             {
                 models.insert(reference.model.trim().to_string());
             }
+        }
+        // Work Review resolves the exact saved account. Provider type aliases
+        // must not seed admission under a different account.
+        if let Some(reference) = defaults.work_review.as_ref().filter(|reference| {
+            reference.provider == id
+                && !reference.model.is_empty()
+                && reference.model.trim() == reference.model
+        }) {
+            models.insert(reference.model.clone());
         }
     }
     models.into_iter().collect()
@@ -361,14 +408,13 @@ mod tests {
             "openai": {"api_key":"fixture-openai", "model":"o-chat", "fast_model":"o-fast"},
             "anthropic": {"api_key":"fixture-anthropic", "model":"a-chat", "runtime_models":["a-chat", "custom"]},
             "gemini": {"api_key":"fixture-gemini", "model":"g-chat"},
-            "bodhi": {"api_key":"fixture-bodhi", "runtime_models":["bodhi-model"]},
-            "copilot": {"enabled":true, "model":"c-chat"}
+            "bodhi": {"api_key":"fixture-bodhi", "runtime_models":["bodhi-model"]}
         })).unwrap();
         config.defaults = Some(
             serde_json::from_value(json!({
                 "chat":{"provider":"openai", "model":"o-chat"},
                 "fast":{"provider":"gemini", "model":"role-fast"},
-                "vision":{"provider":"copilot", "model":"role-vision"}
+                "vision":{"provider":"anthropic", "model":"a-chat"}
             }))
             .unwrap(),
         );
@@ -444,28 +490,13 @@ mod tests {
             );
         };
 
-        let mut config = Config::default();
+        let config = Config::default();
         for provider in ["", "  ", "openai", " copilot ", "unknown"] {
             assert_parity(&config, provider);
             assert!(provider_runtime_models(&config, provider)
                 .unwrap()
                 .is_empty());
         }
-
-        config.providers_mut().copilot = Some(
-            serde_json::from_value(json!({"enabled":false, "model":"copilot-model"})).unwrap(),
-        );
-        config.provider = "anthropic".into();
-        assert_parity(&config, " copilot ");
-        assert!(provider_runtime_models(&config, "copilot")
-            .unwrap()
-            .is_empty());
-        config.provider = "copilot".into();
-        assert_parity(&config, " copilot ");
-        assert_eq!(
-            provider_runtime_models(&config, " copilot ").unwrap(),
-            ["copilot-model"]
-        );
 
         let mut config = Config::default();
         for (id, enabled, model) in [
@@ -543,6 +574,38 @@ mod tests {
             provider_runtime_models(&config(), "relay").unwrap(),
             ["chat", "child", "fast", "vision"]
         );
+    }
+
+    #[test]
+    fn work_review_seeds_admission_only_on_its_exact_provider_account() {
+        let mut config = config();
+        config.default_provider_instance = Some("relay".into());
+        config.provider_instances.insert(
+            "other-relay".into(),
+            serde_json::from_value(json!({"provider_type":"openai"})).unwrap(),
+        );
+        let work_model = "private/work-review";
+        config.defaults.as_mut().unwrap().work_review =
+            Some(bamboo_domain::ProviderModelRef::new("openai", work_model));
+        for account in ["relay", "other-relay"] {
+            assert!(!provider_runtime_models(&config, account)
+                .unwrap()
+                .iter()
+                .any(|model| model == work_model));
+        }
+
+        config.defaults.as_mut().unwrap().work_review = Some(bamboo_domain::ProviderModelRef::new(
+            "other-relay",
+            work_model,
+        ));
+        assert_eq!(
+            provider_runtime_models(&config, "other-relay").unwrap(),
+            [work_model]
+        );
+        assert!(!provider_runtime_models(&config, "relay")
+            .unwrap()
+            .iter()
+            .any(|model| model == work_model));
     }
 
     #[test]

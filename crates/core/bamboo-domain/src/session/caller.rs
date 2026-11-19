@@ -49,6 +49,12 @@ impl From<&Session> for SessionCallerReference {
 }
 
 impl SessionCallerReference {
+    pub fn is_ordinary_root(&self) -> bool {
+        self.kind == SessionKind::Root
+            && self.authority_identity.is_ordinary()
+            && self.session_id != super::DEFAULT_SUPERVISOR_SESSION_ID
+    }
+
     pub fn matches_session(&self, session: &Session) -> bool {
         session.validate_conversation_state().is_ok() && self == &Self::from(session)
     }

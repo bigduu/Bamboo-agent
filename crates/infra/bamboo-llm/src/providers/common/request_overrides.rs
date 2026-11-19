@@ -8,10 +8,15 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use bamboo_config::{
-    BodyPatchOp, ModelRequestRule, PatchValue, RequestOverridesConfig, RequestScopeOverride,
-    TemplateExpr, TemplateExprSpec,
+use crate::provider::{
+    current_completion_diagnostics, LLMError, OutputLimitRecoveryControls, ProviderModelInfo,
+    RequestToolSelection, Result, OUTPUT_LIMIT_CONVERGENCE_HINT,
 };
+use bamboo_config::{
+    BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
+    RequestScopeOverride, TemplateExpr, TemplateExprSpec,
+};
+use bamboo_domain::ReasoningEffort;
 
 pub const ENDPOINT_CHAT_COMPLETIONS: &str = "chat_completions";
 pub const ENDPOINT_RESPONSES: &str = "responses";
@@ -105,6 +110,444 @@ pub fn apply_overrides_to_body(
 ) {
     let env_vars = bamboo_config::Config::current_env_vars();
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
+}
+
+/// Operator overrides can select functions from the request's eligible
+/// catalog. The model-facing declarations and native transcript are owned by
+/// the agent, since either can otherwise introduce provider-side tools.
+pub(crate) fn configured_tool_selection(
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &str,
+    model: &str,
+) -> Result<RequestToolSelection> {
+    let Some(overrides) = overrides else {
+        return Ok(RequestToolSelection::Automatic);
+    };
+    let scope = resolve_scope(overrides, endpoint, Some(model));
+    if scope.body_patch.iter().any(|patch| {
+        !matches!(
+            parse_path(&patch.path).first(),
+            Some(PathSegment::Key(key)) if !matches!(
+                key.as_str(),
+                "tools" | "functions" | "function_call" | "mcp_servers" | "mcpServers"
+                    | "input" | "messages" | "contents" | "conversation" | "previous_response_id"
+                    | "prompt" | "cachedContent" | "cached_content"
+            )
+        )
+    }) {
+        return Err(LLMError::RequestFailed(
+            "Agent request overrides cannot replace tool declarations or conversation input".into(),
+        ));
+    }
+    let mut body = serde_json::json!({});
+    apply_overrides_to_body(&mut body, Some(overrides), endpoint, Some(model));
+    if [
+        "tools",
+        "functions",
+        "function_call",
+        "tool_choice",
+        "toolConfig",
+        "tool_config",
+        "mcp_servers",
+        "input",
+        "messages",
+        "contents",
+        "conversation",
+        "previous_response_id",
+    ]
+    .iter()
+    .any(|key| body["extra_body"].get(key).is_some())
+    {
+        return Err(LLMError::RequestFailed(
+            "Agent tool selection must use the generation endpoint's own tool choice field".into(),
+        ));
+    }
+    parse_tool_selection(&body, endpoint)
+}
+
+fn parse_tool_selection(body: &Value, endpoint: &str) -> Result<RequestToolSelection> {
+    use RequestToolSelection::{Automatic, Disabled, Forced, Named, Required};
+
+    let invalid = || LLMError::RequestFailed("Invalid or unsupported agent tool choice".into());
+    let named = |mut names: Vec<&str>, required: bool| {
+        if names.is_empty() || names.iter().any(|name| name.is_empty()) {
+            return Err(invalid());
+        }
+        names.sort_unstable();
+        names.dedup();
+        Ok(Named {
+            names: names.into_iter().map(str::to_owned).collect(),
+            required,
+        })
+    };
+    let forced = |name: &Value, exactly_one: bool| {
+        name.as_str()
+            .filter(|name| !name.is_empty())
+            .map(|name| Forced {
+                name: name.to_owned(),
+                exactly_one,
+            })
+            .ok_or_else(invalid)
+    };
+    if endpoint == ENDPOINT_STREAM_GENERATE_CONTENT {
+        let Some(config) = body
+            .get("toolConfig")
+            .or_else(|| body.get("tool_config"))
+            .and_then(|config| {
+                config
+                    .get("functionCallingConfig")
+                    .or_else(|| config.get("function_calling_config"))
+            })
+        else {
+            return Ok(Automatic);
+        };
+        let mode = config.get("mode").and_then(Value::as_str);
+        if mode == Some("NONE") {
+            return Ok(Disabled);
+        }
+        if let Some(names) = config
+            .get("allowedFunctionNames")
+            .or_else(|| config.get("allowed_function_names"))
+        {
+            let names = names.as_array().ok_or_else(invalid)?;
+            if !names.is_empty() {
+                return named(
+                    names
+                        .iter()
+                        .map(|name| name.as_str().ok_or_else(invalid))
+                        .collect::<Result<Vec<_>>>()?,
+                    mode == Some("ANY"),
+                );
+            }
+        }
+        return Ok(if mode == Some("ANY") {
+            Required
+        } else {
+            Automatic
+        });
+    }
+    let choice = &body["tool_choice"];
+    let kind = choice.as_str().or_else(|| choice["type"].as_str());
+    match kind {
+        None if choice.is_null() || (endpoint == ENDPOINT_MESSAGES && choice.is_object()) => {
+            Ok(Automatic)
+        }
+        Some("auto") => Ok(Automatic),
+        Some("required" | "any") => Ok(Required),
+        Some("none") => Ok(Disabled),
+        Some("tool") if endpoint == ENDPOINT_MESSAGES => forced(
+            &choice["name"],
+            choice["disable_parallel_tool_use"].as_bool() == Some(true),
+        ),
+        Some("function") if endpoint != ENDPOINT_MESSAGES => {
+            let name = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                &choice["function"]["name"]
+            } else {
+                &choice["name"]
+            };
+            forced(name, true)
+        }
+        Some("allowed_tools") if endpoint != ENDPOINT_MESSAGES => {
+            let choice = if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                &choice["allowed_tools"]
+            } else {
+                choice
+            };
+            if !matches!(choice["mode"].as_str(), Some("auto" | "required")) {
+                return Err(invalid());
+            }
+            named(
+                choice["tools"]
+                    .as_array()
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .map(|tool| {
+                        if tool["type"] != "function" {
+                            return Err(invalid());
+                        }
+                        if endpoint == ENDPOINT_CHAT_COMPLETIONS {
+                            tool["function"]["name"].as_str().ok_or_else(invalid)
+                        } else {
+                            tool["name"].as_str().ok_or_else(invalid)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                choice["mode"] == "required",
+            )
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn wire_declares_tool(body: &Value, endpoint: &str, name: &str) -> bool {
+    body["tools"].as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| match endpoint {
+            ENDPOINT_CHAT_COMPLETIONS => tool["function"]["name"] == name,
+            ENDPOINT_STREAM_GENERATE_CONTENT => tool["functionDeclarations"]
+                .as_array()
+                .is_some_and(|functions| functions.iter().any(|function| function["name"] == name)),
+            _ => tool["name"] == name,
+        })
+    })
+}
+
+/// Gateways can route the same model ID differently under request-specific
+/// headers. Keep catalog IDs but withhold capacities when these scopes differ.
+pub(crate) fn bind_catalog_limits(
+    mut models: Vec<ProviderModelInfo>,
+    overrides: Option<&RequestOverridesConfig>,
+    generation_endpoints: impl Fn(&str) -> &'static [&'static str],
+) -> Vec<ProviderModelInfo> {
+    let Some(overrides) = overrides.filter(|overrides| {
+        overrides
+            .endpoints
+            .values()
+            .any(|scope| !scope.headers.is_empty())
+            || overrides
+                .rules
+                .iter()
+                .any(|rule| !rule.scope.headers.is_empty())
+    }) else {
+        return models;
+    };
+    let catalog_headers = resolve_scope(overrides, ENDPOINT_MODELS, None).headers;
+    for model in &mut models {
+        if generation_endpoints(&model.id).iter().any(|endpoint| {
+            resolve_scope(overrides, endpoint, Some(&model.id)).headers != catalog_headers
+        }) {
+            *model = ProviderModelInfo::from_id(std::mem::take(&mut model.id));
+        }
+    }
+    models
+}
+
+/// Inspect the final wire controls after masking and operator body patches.
+/// Keep recovery bound to the observed protocol, effort and output cap.
+pub(crate) fn mask_and_prepare_agent_request(
+    body: &mut Value,
+    masking: &KeywordMaskingConfig,
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &'static str,
+    model: &str,
+) -> Result<()> {
+    crate::masking::mask_outbound_body(body, masking);
+    let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
+        return Ok(());
+    };
+    if parse_tool_selection(body, endpoint)?
+        .names()
+        .iter()
+        .any(|name| !wire_declares_tool(body, endpoint, name))
+    {
+        return Err(LLMError::RequestFailed(
+            "A tool selected by the provider request is missing from its declarations".into(),
+        ));
+    }
+    if diagnostics.is_task_split() {
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    != Some(bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+            });
+        }
+    }
+    let (effort_path, limit_path, low) = match endpoint {
+        ENDPOINT_CHAT_COMPLETIONS => ("/reasoning_effort", "/max_completion_tokens", "low"),
+        ENDPOINT_RESPONSES => ("/reasoning/effort", "/max_output_tokens", "low"),
+        ENDPOINT_MESSAGES => ("/output_config/effort", "/max_tokens", "low"),
+        ENDPOINT_STREAM_GENERATE_CONTENT => (
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "/generationConfig/maxOutputTokens",
+            "LOW",
+        ),
+        _ => return Ok(()),
+    };
+    let legacy_limit_path = (endpoint == ENDPOINT_CHAT_COMPLETIONS).then_some("/max_tokens");
+    if let Some(window_limit) = diagnostics.model_window_limit() {
+        // Gemini addresses the model in the URL. The other adapters must
+        // still address the model whose capacity the runtime resolved.
+        if endpoint != ENDPOINT_STREAM_GENERATE_CONTENT
+            && body.get("model").and_then(Value::as_str) != Some(model)
+        {
+            return Err(LLMError::RequestFailed(
+                "Set the routed model in provider settings when using model windows".into(),
+            ));
+        }
+        let limit_paths = std::iter::once(limit_path).chain(legacy_limit_path);
+        let mut wire_limit = u64::from(window_limit);
+        let mut has_output_control = false;
+        for field in limit_paths.clone().filter_map(|path| body.pointer(path)) {
+            let configured = field.as_u64().filter(|limit| *limit > 0).ok_or_else(|| {
+                LLMError::RequestFailed("Model output limit must be a positive integer".into())
+            })?;
+            wire_limit = wire_limit.min(configured);
+            has_output_control = true;
+        }
+        if !has_output_control
+            && (endpoint == ENDPOINT_MESSAGES || !diagnostics.allows_provider_default_output())
+        {
+            return Err(LLMError::RequestFailed(
+                "Model window requires an output limit on the final request".into(),
+            ));
+        }
+        for path in limit_paths {
+            if let Some(field) = body.pointer_mut(path) {
+                *field = Value::from(wire_limit);
+            }
+        }
+    }
+    let limit = body
+        .pointer(limit_path)
+        .or_else(|| legacy_limit_path.and_then(|path| body.pointer(path)))
+        .and_then(Value::as_u64)
+        .filter(|limit| *limit > 0);
+    let effort = body
+        .pointer(effort_path)
+        .and_then(Value::as_str)
+        .and_then(ReasoningEffort::parse)
+        .filter(|effort| *effort != ReasoningEffort::Disabled);
+    let native_control = match endpoint {
+        ENDPOINT_MESSAGES => {
+            body.pointer("/thinking/type").and_then(Value::as_str) == Some("adaptive")
+        }
+        ENDPOINT_CHAT_COMPLETIONS => {
+            body.get("enable_thinking").is_none() && body.get("thinking").is_none()
+        }
+        ENDPOINT_STREAM_GENERATE_CONTENT => body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .is_none(),
+        _ => true,
+    };
+    let compatible_messages = endpoint == ENDPOINT_MESSAGES && diagnostics.is_compatible_messages();
+    let candidate = limit
+        .filter(|_| {
+            client_tools_only(endpoint, body) && !crate::retry::work_request_budget_active()
+        })
+        .and_then(|output_limit| {
+            let patches = overrides.map(|config| resolve_scope(config, endpoint, Some(model)));
+            let mut patches = patches.iter().flat_map(|scope| &scope.body_patch);
+            let effort_segments = parse_path(effort_path);
+            let control_is_pinned = patches.clone().any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(endpoint, &path)
+                    && !(effort == Some(ReasoningEffort::Low) && path == effort_segments)
+            });
+            // Altering effort and resuming unfinished work have separate
+            // prerequisites. A custom gateway can keep reasoning even when the
+            // operator removes, pins or replaces its reasoning controls.
+            let lowerable_effort = effort.filter(|effort| {
+                native_control
+                    && !control_is_pinned
+                    && (*effort == ReasoningEffort::Low || masking.apply_masking(low) == low)
+            });
+            if !compatible_messages && lowerable_effort.is_none() {
+                return None;
+            }
+            let (prompt_key, candidate_count) = match endpoint {
+                ENDPOINT_CHAT_COMPLETIONS => ("messages", body.get("n")),
+                ENDPOINT_MESSAGES => ("messages", None),
+                ENDPOINT_RESPONSES => ("input", None),
+                _ => ("contents", body.pointer("/generationConfig/candidateCount")),
+            };
+            if candidate_count.is_some_and(|count| count.as_u64() != Some(1)) {
+                return None;
+            }
+            let allows_convergence = !patches.any(|patch| match parse_path(&patch.path).first() {
+                Some(PathSegment::Key(key)) => key == prompt_key || key == "model",
+                _ => true,
+            }) && masking.apply_masking(OUTPUT_LIMIT_CONVERGENCE_HINT)
+                == OUTPUT_LIMIT_CONVERGENCE_HINT;
+            Some(OutputLimitRecoveryControls {
+                endpoint,
+                lowerable_effort,
+                output_limit,
+                allows_convergence,
+                compatible_messages,
+            })
+        });
+    if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
+        *body
+            .pointer_mut(effort_path)
+            .expect("validated wire effort field") = Value::String(low.into());
+    }
+    Ok(())
+}
+
+fn client_tools_only(endpoint: &str, body: &Value) -> bool {
+    if body.get("mcp_servers").is_some() || body.get("mcpServers").is_some() {
+        return false;
+    }
+    body.get("tools").is_none_or(|tools| {
+        tools.as_array().is_some_and(|tools| {
+            tools.iter().all(|tool| match endpoint {
+                ENDPOINT_MESSAGES => {
+                    tool.get("input_schema").is_some()
+                        && tool.get("type").is_none_or(|kind| kind == "custom")
+                }
+                ENDPOINT_STREAM_GENERATE_CONTENT => tool.as_object().is_some_and(|tool| {
+                    tool.len() == 1 && tool.contains_key("functionDeclarations")
+                }),
+                _ => tool["type"] == "function",
+            })
+        })
+    })
+}
+
+fn patches_reasoning_control(endpoint: &str, path: &[PathSegment]) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let key = |index| match path.get(index) {
+        Some(PathSegment::Key(key)) => Some(key.as_str()),
+        _ => None,
+    };
+    match (endpoint, key(0)) {
+        (ENDPOINT_MESSAGES, Some("thinking")) => key(1) != Some("budget_tokens"),
+        (ENDPOINT_MESSAGES, Some("output_config")) => key(1).is_none_or(|key| key == "effort"),
+        (
+            ENDPOINT_CHAT_COMPLETIONS,
+            Some("reasoning_effort" | "reasoning" | "thinking" | "enable_thinking" | "extra_body"),
+        ) => true,
+        (ENDPOINT_RESPONSES, Some("reasoning")) => key(1).is_none_or(|key| key == "effort"),
+        (ENDPOINT_STREAM_GENERATE_CONTENT, Some("generationConfig")) => {
+            key(1).is_none_or(|key| key == "thinkingConfig")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn messages_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_MESSAGES, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_MESSAGES, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if key == "model" || key == "tool_choice")
+            })
+    })
+}
+
+pub(crate) fn chat_completions_controls_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_CHAT_COMPLETIONS, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_CHAT_COMPLETIONS, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if matches!(key.as_str(), "model" | "max_tokens" | "max_completion_tokens"))
+            })
+    })
 }
 
 /// A configured Work budget cannot accept arbitrary wire body patches (which
@@ -205,7 +648,8 @@ fn resolve_scope(
 
 fn merge_scope(dst: &mut RequestScopeOverride, src: &RequestScopeOverride) {
     for (key, value) in &src.headers {
-        dst.headers.insert(key.clone(), value.clone());
+        dst.headers
+            .insert(key.trim().to_ascii_lowercase(), value.clone());
     }
     dst.body_patch.extend(src.body_patch.clone());
 }
@@ -476,6 +920,276 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[test]
+    fn messages_named_choice_respects_its_parallel_setting() {
+        for exactly_one in [false, true] {
+            let body = serde_json::json!({"tool_choice":{
+                "type":"tool","name":"Read","disable_parallel_tool_use":exactly_one
+            }});
+            assert_eq!(
+                parse_tool_selection(&body, ENDPOINT_MESSAGES).unwrap(),
+                RequestToolSelection::Forced {
+                    name: "Read".into(),
+                    exactly_one,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_reasoning_overrides_are_preserved_on_task_split() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (path, op, value) in [
+            ("thinking", "remove", Value::Null),
+            ("thinking", "set", json!({"type":"disabled"})),
+            ("output_config.effort", "set", json!("medium")),
+        ] {
+            let overrides = serde_json::from_value::<RequestOverridesConfig>(json!({
+                "common":{"body_patch":[{"path":path,"op":op,"value":value}]}
+            }))
+            .unwrap();
+            let mut body = json!({
+                "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}
+            });
+            apply_overrides_to_body(
+                &mut body,
+                Some(&overrides),
+                ENDPOINT_MESSAGES,
+                Some("fixture"),
+            );
+            let expected = body.clone();
+            let dispatch = |diagnostics, mut body| {
+                let overrides = &overrides;
+                async move {
+                    scope_completion_diagnostics(diagnostics, async {
+                        mask_and_prepare_agent_request(
+                            &mut body,
+                            &Default::default(),
+                            Some(overrides),
+                            ENDPOINT_MESSAGES,
+                            "fixture",
+                        )
+                        .unwrap();
+                        body
+                    })
+                    .await
+                }
+            };
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            diagnostics.mark_compatible_messages();
+            assert_eq!(dispatch(diagnostics.clone(), body.clone()).await, expected);
+            let split = diagnostics.output_limit_recovery().unwrap();
+            assert!(split.prefers_task_split(), "{path}");
+            let continuation = CompletionDiagnostics::for_agent_round(Some(split.for_task_split()));
+            continuation.mark_compatible_messages();
+            assert_eq!(dispatch(continuation, body).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_effort_only_allows_new_recovery_on_compatible_messages() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (ENDPOINT_MESSAGES, json!({"max_tokens":4096})),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"max_completion_tokens":4096}),
+            ),
+            (ENDPOINT_RESPONSES, json!({"max_output_tokens":4096})),
+            (
+                ENDPOINT_STREAM_GENERATE_CONTENT,
+                json!({"generationConfig":{"maxOutputTokens":4096}}),
+            ),
+        ] {
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "fixture",
+                )
+                .unwrap();
+            })
+            .await;
+            assert!(diagnostics.output_limit_recovery().is_none(), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_a_tighter_window_and_records_the_actual_wire_limit() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"model":"fixture","max_tokens":4096});
+        let initial =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+        initial.mark_compatible_messages();
+        scope_completion_diagnostics(initial.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        let recovery = initial.output_limit_recovery().unwrap().for_task_split();
+        let follow_up =
+            CompletionDiagnostics::for_agent_round(Some(recovery.tighten_output_limit(3900)))
+                .with_model_window_limit(Some(3900));
+        follow_up.mark_compatible_messages();
+        scope_completion_diagnostics(follow_up.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap();
+        })
+        .await;
+        assert_eq!(body["max_tokens"], 3900);
+        assert_eq!(follow_up.output_limit(), Some(3900));
+        assert!(follow_up.output_limit_recovery().is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_window_rejects_a_changed_wire_model_before_observing_the_request() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        for (endpoint, mut body) in [
+            (
+                ENDPOINT_MESSAGES,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_CHAT_COMPLETIONS,
+                json!({"model":"small","max_tokens":4096}),
+            ),
+            (
+                ENDPOINT_RESPONSES,
+                json!({"model":"small","max_output_tokens":4096}),
+            ),
+        ] {
+            let diagnostics =
+                CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4096));
+            let error = scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    endpoint,
+                    "large",
+                )
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, LLMError::RequestFailed(_)), "{endpoint}");
+            assert_eq!(diagnostics.output_limit(), None, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_default_keeps_numeric_overrides_and_required_fields_guarded() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let diagnostics = CompletionDiagnostics::for_agent_round(None)
+            .with_model_window_limit(Some(4_096))
+            .with_provider_default_output(true);
+        scope_completion_diagnostics(diagnostics.clone(), async {
+            let mut body = json!({"model": "fixture", "max_tokens": 6_000});
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_CHAT_COMPLETIONS,
+                "fixture",
+            )
+            .unwrap();
+            assert_eq!(body["max_tokens"], 4_096);
+
+            let error = mask_and_prepare_agent_request(
+                &mut json!({"model": "fixture"}),
+                &Default::default(),
+                None,
+                ENDPOINT_MESSAGES,
+                "fixture",
+            )
+            .unwrap_err();
+            assert!(matches!(error, LLMError::RequestFailed(_)));
+        })
+        .await;
+        assert_eq!(diagnostics.output_limit(), Some(4_096));
+    }
+
+    #[tokio::test]
+    async fn dynamic_chat_window_uses_one_limit_for_both_output_fields() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        use serde_json::json;
+
+        let mut body = json!({"model":"fixture","max_tokens":4096,"max_completion_tokens":5000});
+        let diagnostics =
+            CompletionDiagnostics::for_agent_round(None).with_model_window_limit(Some(4500));
+        scope_completion_diagnostics(diagnostics.clone(), async {
+            mask_and_prepare_agent_request(
+                &mut body,
+                &Default::default(),
+                None,
+                ENDPOINT_CHAT_COMPLETIONS,
+                "fixture",
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert_eq!(diagnostics.output_limit(), Some(4096));
+    }
+
+    #[tokio::test]
+    async fn provider_tools_disable_all_output_limit_recovery() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+        for (field, tools) in [
+            (
+                "tools",
+                serde_json::json!([{"type":"web_search_20250305","name":"web_search"}]),
+            ),
+            (
+                "mcp_servers",
+                serde_json::json!([{"type":"url","name":"remote"}]),
+            ),
+        ] {
+            let diagnostics = CompletionDiagnostics::for_agent_round(None);
+            let mut body = serde_json::json!({
+                "max_tokens":4096,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}
+            });
+            body[field] = tools;
+            scope_completion_diagnostics(diagnostics.clone(), async {
+                mask_and_prepare_agent_request(
+                    &mut body,
+                    &Default::default(),
+                    None,
+                    ENDPOINT_MESSAGES,
+                    "fixture",
+                )
+                .unwrap();
+            })
+            .await;
+            assert!(diagnostics.output_limit_recovery().is_none(), "{field}");
+        }
+    }
 
     #[tokio::test]
     async fn work_budget_rejects_resolved_body_patch_and_keeps_legacy_behavior() {

@@ -1,10 +1,9 @@
 //! Pure helpers for child session management.
 
 use bamboo_domain::{ModelContextResetReason, Session};
-use serde_json::json;
 
 use super::{
-    ChildRunnerInfo, ChildSessionEntry, ChildSessionError, SUBAGENT_DELEGATION_CONTRACT,
+    ChildRunnerInfo, ChildSessionError, SUBAGENT_DELEGATION_CONTRACT,
     SUBAGENT_DELEGATION_CONTRACT_END_MARKER, SUBAGENT_DELEGATION_CONTRACT_START_MARKER,
 };
 
@@ -253,18 +252,6 @@ pub fn truncate_after_last_user(session: &mut Session) -> Result<usize, ChildSes
     };
 
     Ok(truncate_after_index(session, last_user_idx))
-}
-
-pub fn map_child_entry(entry: &ChildSessionEntry) -> serde_json::Value {
-    json!({
-        "child_session_id": entry.child_session_id,
-        "title": entry.title,
-        "pinned": entry.pinned,
-        "message_count": entry.message_count,
-        "updated_at": entry.updated_at,
-        "last_run_status": entry.last_run_status,
-        "last_run_error": entry.last_run_error,
-    })
 }
 
 /// Generate contextual guidance for the root LLM based on child status and runner info.

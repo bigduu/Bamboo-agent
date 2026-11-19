@@ -332,6 +332,7 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 &prepared,
                 &tools,
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &CancellationToken::new(),
                     session_id: "autonomous-goal-payload",
@@ -339,8 +340,8 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                     provider_name: Some("openai"),
                     provider_type: Some("openai"),
                     reasoning_effort: None,
-                    max_context_tokens: 400_000,
-                    max_output_tokens: 128,
+                    output_limit_recovery: None,
+                    budget: &TokenBudget::new(400_000, 128, Default::default()),
                     observation_progress_hint: None,
                     prompt_memory_exposure: None,
                 },
@@ -452,14 +453,14 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 .all(|item| !text(item).contains("BAMBOO_CORE_DIRECTIVES_START")));
             let guide = input[..original]
                 .iter()
-                .find(|item| text(item).contains("prefer available dedicated Git tools"))
+                .find(|item| text(item).contains("start with status and relevant diffs"))
                 .expect("dedicated User tool-guide context before the conversation");
             assert!(text(guide).contains("context_type: tool_guide"));
             let guide_text = text(guide);
             for required in [
-                "merge base, unique commits, and unmerged index",
-                "Supervisor without shell access delegates Git execution to an authorized worker",
-                "cannot redefine the user's goal or grant permissions",
+                "merge base and unmerged index",
+                "preserve user changes and unique commits",
+                "only with user authorization",
             ] {
                 assert!(
                     guide_text.contains(required),
@@ -728,13 +729,14 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let llm = mock_llm(vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-1",
@@ -742,8 +744,8 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -902,6 +904,7 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
                 &prepared_context,
                 &[],
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &cancel,
                     session_id: &session_id,
@@ -909,8 +912,8 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
                     provider_name: None,
                     provider_type: None,
                     reasoning_effort: None,
-                    max_context_tokens: 400_000,
-                    max_output_tokens: 128,
+                    output_limit_recovery: None,
+                    budget: &TokenBudget::new(400_000, 128, Default::default()),
                     observation_progress_hint: None,
                     prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                         round_id: &round_id,
@@ -1027,6 +1030,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1034,8 +1038,8 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
@@ -1080,6 +1084,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1087,8 +1092,8 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
@@ -1170,6 +1175,7 @@ async fn observation_progress_checkpoint_reprepares_from_merged_durable_suffix()
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -1177,8 +1183,8 @@ async fn observation_progress_checkpoint_reprepares_from_merged_durable_suffix()
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: Some("request-only observation advice"),
             prompt_memory_exposure: None,
         },
@@ -1240,7 +1246,10 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
         &baseline,
         &ProviderVisibleToolFootprint::default(),
     );
-    let advice = "request-only observation advice ".repeat(1_000);
+    let advice = format!(
+        "[runtime_progress_feedback_v1]\n{}",
+        "request-only observation advice ".repeat(1_000)
+    );
     let llm = mock_llm(vec![LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -1251,6 +1260,7 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "observation-progress-budget",
@@ -1258,8 +1268,8 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: baseline_usage.input_tokens + 128,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(baseline_usage.input_tokens + 128, 128, Default::default()),
             observation_progress_hint: Some(&advice),
             prompt_memory_exposure: None,
         },
@@ -1283,90 +1293,6 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
     assert_eq!(
         serde_json::to_value(&session.messages).unwrap(),
         serde_json::to_value(&original_messages).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn required_progress_feedback_over_budget_rejects_before_any_provider_dispatch() {
-    let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("required-progress-budget", "test-model");
-    session.add_message(Message::user("original request"));
-    let original_messages = serde_json::to_value(&session.messages).unwrap();
-    let original_context = session.model_context_state.clone();
-    let original_transcript = serde_json::to_value(&session.provider_transcript).unwrap();
-    let config = test_config("system");
-    let prepared_context = PreparedContext {
-        messages: vec![Message::system("system"), session.messages[0].clone()],
-        token_usage: usage(0, 22),
-        truncation_occurred: false,
-        segments_removed: 0,
-        compressed_message_ids: Vec::new(),
-        prompt_cached_tool_outputs: 0,
-        prompt_cached_tool_tokens_saved: 0,
-    };
-    let mut expected = session.clone();
-    let baseline = super::build_request_envelope_reconciled(
-        &mut expected,
-        &prepared_context,
-        &config,
-        &[],
-        "test-model",
-    );
-    let baseline_usage = super::measure_request_usage(
-        &expected,
-        &baseline,
-        &ProviderVisibleToolFootprint::default(),
-    );
-    let feedback = format!(
-        "[runtime_progress_feedback_v1]\n{}",
-        serde_json::json!({
-            "schema":"runtime_progress_feedback_v1", "source":"runtime",
-            "reason":"quiet_command", "evidence":{"last_status":"running", "exit_observed":false},
-            "recovery":{"episode":1,"episode_limit":3,"rounds_remaining":3,"round_limit":4},
-            "guidance":"Use real evidence; this diagnostic grants no permission.",
-        })
-    );
-    let llm = mock_llm(vec![LLMChunk::Done]);
-    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
-    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
-    let result = execute_llm_stream(
-        &mut session,
-        &config,
-        &llm_dyn,
-        &prepared_context,
-        &[],
-        &LlmStreamFrame {
-            event_tx: &event_tx,
-            cancel_token: &CancellationToken::new(),
-            session_id: "required-progress-budget",
-            model: "test-model",
-            provider_name: None,
-            provider_type: None,
-            reasoning_effort: None,
-            max_context_tokens: baseline_usage.input_tokens + 128,
-            max_output_tokens: 128,
-            observation_progress_hint: Some(&feedback),
-            prompt_memory_exposure: None,
-        },
-    )
-    .await;
-    let error = result
-        .err()
-        .expect("required progress facts cannot be silently dropped");
-    assert!(matches!(error, bamboo_agent_core::AgentError::Budget(_)));
-    assert_eq!(
-        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert!(llm.requested_messages.lock().unwrap().is_empty());
-    assert_eq!(session.model_context_state, original_context);
-    assert_eq!(
-        serde_json::to_value(&session.provider_transcript).unwrap(),
-        original_transcript
-    );
-    assert_eq!(
-        serde_json::to_value(&session.messages).unwrap(),
-        original_messages
     );
 }
 
@@ -1506,6 +1432,7 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
                 &prepared_context,
                 &tools,
                 &LlmStreamFrame {
+                    provider_default_output: false,
                     event_tx: &event_tx,
                     cancel_token: &CancellationToken::new(),
                     session_id: "serialized-prefix-session",
@@ -1513,8 +1440,8 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
                     provider_name: Some("compatible-proxy"),
                     provider_type: Some("openai"),
                     reasoning_effort: None,
-                    max_context_tokens: 400_000,
-                    max_output_tokens: 128,
+                    output_limit_recovery: None,
+                    budget: &TokenBudget::new(400_000, 128, Default::default()),
                     observation_progress_hint: None,
                     prompt_memory_exposure: None,
                 },
@@ -1614,13 +1541,14 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         })
         .collect::<Vec<_>>();
 
-    let (stream_output, _, _) = execute_llm_stream(
+    let (stream_output, _, _, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &tool_schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-explicit-guard",
@@ -1628,8 +1556,8 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -2140,13 +2068,14 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-final-budget",
@@ -2154,8 +2083,8 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -2263,6 +2192,7 @@ async fn openai_prompt_budget_omits_unknown_cache_but_keeps_explicit_zero() {
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &CancellationToken::new(),
                 session_id: "session-openai-cache-availability",
@@ -2270,8 +2200,8 @@ async fn openai_prompt_budget_omits_unknown_cache_but_keeps_explicit_zero() {
                 provider_name: None,
                 provider_type: Some("openai"),
                 reasoning_effort: None,
-                max_context_tokens: 400_000,
-                max_output_tokens: 128,
+                output_limit_recovery: None,
+                budget: &TokenBudget::new(400_000, 128, Default::default()),
                 observation_progress_hint: None,
                 prompt_memory_exposure: None,
             },
@@ -2331,13 +2261,14 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
     let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-task",
@@ -2345,8 +2276,8 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -2445,6 +2376,7 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &CancellationToken::new(),
                 session_id,
@@ -2452,8 +2384,8 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
                 provider_name: Some("openai"),
                 provider_type: Some("openai"),
                 reasoning_effort: None,
-                max_context_tokens: 2_000,
-                max_output_tokens: 200,
+                output_limit_recovery: None,
+                budget: &TokenBudget::new(2_000, 200, Default::default()),
                 observation_progress_hint: None,
                 prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                     round_id,
@@ -2527,6 +2459,7 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
         &prepared_context,
         &tools,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id,
@@ -2534,8 +2467,8 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
             provider_name: Some("test"),
             provider_type: Some("test"),
             reasoning_effort: None,
-            max_context_tokens: 1_000,
-            max_output_tokens: 200,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(1_000, 200, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: Some(PromptMemoryExposureFrame {
                 round_id,
@@ -2680,6 +2613,7 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let frame = LlmStreamFrame {
+        provider_default_output: false,
         event_tx: &event_tx,
         cancel_token: &CancellationToken::new(),
         session_id: "session-ledger-reseed-refit",
@@ -2687,8 +2621,8 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         provider_name: Some("openai"),
         provider_type: Some("openai"),
         reasoning_effort: None,
-        max_context_tokens: prepared.budget.max_context_tokens,
-        max_output_tokens: prepared.budget.max_output_tokens,
+        output_limit_recovery: None,
+        budget: &prepared.budget,
         observation_progress_hint: None,
         prompt_memory_exposure: None,
     };
@@ -3122,6 +3056,7 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-lanes",
@@ -3129,8 +3064,8 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -3401,9 +3336,7 @@ fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_on
         .filter(|message| message.content.contains("context_type: root_orchestration"))
         .collect::<Vec<_>>();
     assert_eq!(first_blocks.len(), 1);
-    assert!(first_blocks[0]
-        .content
-        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0].content.contains("read-only explorer role"));
     assert!(first_blocks[0]
         .content
         .contains("Inspect authoritative child progress"));
@@ -4525,13 +4458,14 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2",
@@ -4539,8 +4473,8 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -4691,13 +4625,14 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2a",
@@ -4705,8 +4640,8 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -4789,13 +4724,14 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2plan",
@@ -4803,8 +4739,8 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -4878,13 +4814,14 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-2b",
@@ -4892,8 +4829,8 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -4981,13 +4918,14 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-3",
@@ -4995,8 +4933,8 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             provider_name: Some("copilot"),
             provider_type: Some("copilot"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -5093,13 +5031,14 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _completion, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "session-stream-4",
@@ -5107,8 +5046,8 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
             provider_name: Some("copilot-instance"),
             provider_type: Some("copilot"),
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -5154,83 +5093,131 @@ fn overflow_error_detection_matches_common_provider_messages() {
 #[test]
 fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
     let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("guide-cache", "test-model");
-    session.messages.push(Message::user("start"));
-    let config = test_config("system");
-    let tools = bamboo_tools::BuiltinToolExecutor::new();
-    let schemas =
-        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
-            &config,
-            &tools,
+    struct GuideOnlyTool(&'static str);
+    #[async_trait]
+    impl bamboo_agent_core::Tool for GuideOnlyTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Custom guide activation fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: bamboo_agent_core::ToolCtx,
+        ) -> Result<bamboo_agent_core::ToolOutcome, bamboo_agent_core::ToolError> {
+            panic!("guide fixture must not execute")
+        }
+    }
+    for tool_name in ["Sleep", "default::Sleep", "sub_session_manager"] {
+        let mut session = Session::new("guide-cache", "test-model");
+        session.messages.push(Message::user("start"));
+        let mut config = test_config("system");
+        let registry = bamboo_tools::ToolRegistry::new();
+        registry.register(GuideOnlyTool(tool_name)).unwrap();
+        registry
+            .register_guide_from_json(
+                tool_name,
+                &serde_json::json!({
+                    "tool_name": tool_name,
+                    "when_to_use": "CUSTOM_SLEEP_GUIDANCE",
+                    "when_not_to_use": "",
+                    "examples": [],
+                    "related_tools": [],
+                    "category": "TaskManagement"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        config.tool_registry = Arc::new(registry);
+        let tools = bamboo_tools::BuiltinToolExecutor::new();
+        if tool_name != "Sleep" {
+            tools.register_tool(GuideOnlyTool(tool_name)).unwrap();
+        }
+        let schemas =
+            crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+                &config,
+                &tools,
+                &mut session,
+            );
+        let prepare = |session: &Session| PreparedContext {
+            messages: session.messages.clone(),
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let prepared = prepare(&session);
+        let before = super::build_request_envelope_reconciled(
             &mut session,
-        );
-    let prepare = |session: &Session| PreparedContext {
-        messages: session.messages.clone(),
-        token_usage: usage(0, 22),
-        truncation_occurred: false,
-        segments_removed: 0,
-        compressed_message_ids: Vec::new(),
-        prompt_cached_tool_outputs: 0,
-        prompt_cached_tool_tokens_saved: 0,
-    };
-    let prepared = prepare(&session);
-    let before = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas,
-        "test-model",
-    );
-    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
-    session.messages.push(Message::user("wait briefly"));
-    let schemas_after =
-        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &prepared,
             &config,
-            &tools,
-            &mut session,
+            &schemas,
+            "test-model",
         );
-    let prepared = prepare(&session);
-    let after = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas_after,
-        "test-model",
-    );
-    assert_eq!(
-        serde_json::to_string(&schemas).unwrap(),
-        serde_json::to_string(&schemas_after).unwrap()
-    );
-    let prefix = |envelope: &super::PreparedRequestEnvelope| {
-        envelope
+        assert!(!before
             .ir
-            .run(bamboo_llm::SegmentRole::StablePrefix)
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
             .iter()
-            .map(|m| m.content.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(before.ir.system_text, after.ir.system_text);
-    assert_eq!(prefix(&before), prefix(&after));
-    assert!(after
-        .ir
-        .run(bamboo_llm::SegmentRole::ModelTranscript)
-        .iter()
-        .any(|m| m.content.contains("Activated Tool Guidance") && m.content.contains("Sleep")));
-    assert!(!session
-        .messages
-        .iter()
-        .any(|m| m.content.contains("Activated Tool Guidance")));
-    let third = super::build_request_envelope_reconciled(
-        &mut session,
-        &prepared,
-        &config,
-        &schemas_after,
-        "test-model",
-    );
-    assert_eq!(
-        after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
-        third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
-    );
+            .any(|m| m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
+        bamboo_tools::exposure::activate_discoverable_tools(&mut session, [tool_name]);
+        session.messages.push(Message::user("wait briefly"));
+        let schemas_after =
+            crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+                &config,
+                &tools,
+                &mut session,
+            );
+        let prepared = prepare(&session);
+        let after = super::build_request_envelope_reconciled(
+            &mut session,
+            &prepared,
+            &config,
+            &schemas_after,
+            "test-model",
+        );
+        assert_eq!(
+            serde_json::to_string(&schemas).unwrap(),
+            serde_json::to_string(&schemas_after).unwrap()
+        );
+        let prefix = |envelope: &super::PreparedRequestEnvelope| {
+            envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(before.ir.system_text, after.ir.system_text);
+        assert_eq!(prefix(&before), prefix(&after));
+        assert!(after
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .iter()
+            .any(|m| m.content.contains("Activated Tool Guidance")
+                && m.content.contains("CUSTOM_SLEEP_GUIDANCE")));
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Activated Tool Guidance")));
+        let third = super::build_request_envelope_reconciled(
+            &mut session,
+            &prepared,
+            &config,
+            &schemas_after,
+            "test-model",
+        );
+        assert_eq!(
+            after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
+            third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
+        );
+    }
 }
 
 fn browser_history_fixture() -> (Session, ToolSchema, String) {
@@ -5302,8 +5289,8 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     let before_tools = super::super::request_tool_schemas_for_loading_mode(
         &before_session,
         std::slice::from_ref(&browser),
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-        None,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     let before_prepared = browser_history_prepared(&before_session);
     let before = super::build_request_envelope_reconciled_for_loading_mode(
@@ -5312,7 +5299,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &config,
         before_tools.as_ref(),
         "test-model",
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
@@ -5325,15 +5312,10 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     let loaded_tools = super::super::request_tool_schemas_for_loading_mode(
         &session,
         std::slice::from_ref(&browser),
-        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-        None,
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        true,
     );
     assert_eq!(loaded_tools[0].function.name, "browser");
-    assert_eq!(
-        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(&session)
-            .len(),
-        1
-    );
     let prepared = browser_history_prepared(&session);
     let persisted_messages = session.messages.clone();
     let mut duplicate_session = session.clone();
@@ -5373,7 +5355,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     }))
     .unwrap();
     assert_eq!(
-        serde_json::to_value(loaded_tools.as_ref()).unwrap(),
+        serde_json::to_value(&loaded_tools[0..1]).unwrap(),
         serde_json::json!([browser])
     );
     assert!(!after_wire.contains("<loaded_tools>"));
@@ -5422,7 +5404,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         .ir
         .flatten()
         .iter()
-        .any(|message| message.content == full_result));
+        .all(|message| message.content != full_result));
     assert!(duplicate
         .ir
         .flatten()
@@ -5441,7 +5423,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         .ir
         .flatten()
         .iter()
-        .any(|message| message.content == full_result));
+        .all(|message| message.content != full_result));
 }
 
 #[test]
@@ -5467,7 +5449,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
 }
 
 #[test]
-fn legacy_browser_history_projection_preserves_other_discovery_results() {
+fn discovery_history_projection_omits_removed_tool_definitions() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let (mut session, browser, _) = browser_history_fixture();
     let other = provider_visible_schema(
@@ -5516,7 +5498,7 @@ fn legacy_browser_history_projection_preserves_other_discovery_results() {
     }));
     assert!(transcript.iter().any(|message| {
         message.tool_call_id.as_deref() == Some("other-discovery")
-            && message.content == other_result
+            && message.content != other_result
     }));
 }
 
@@ -5544,7 +5526,7 @@ async fn legacy_browser_usage_projection_counts_compact_provider_history() {
         super::project_request_usage(&session, &prepared, &config, &[], "test-model", &provider)
             .await
             .unwrap();
-    assert_eq!(disabled.prepared_message_input_tokens, unprojected);
+    assert!(disabled.prepared_message_input_tokens < unprojected);
     let non_browser = provider_visible_schema(
         "ReadArchive",
         "Read archived repository files",
@@ -5560,10 +5542,7 @@ async fn legacy_browser_usage_projection_counts_compact_provider_history() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        non_browser_projected.prepared_message_input_tokens,
-        unprojected
-    );
+    assert!(non_browser_projected.prepared_message_input_tokens < unprojected);
 }
 
 #[tokio::test]
@@ -5582,6 +5561,7 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
         &prepared,
         &[browser],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
             session_id: "browser-history",
@@ -5589,8 +5569,8 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -5744,6 +5724,7 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &cancel_token,
                 session_id: "synthetic-body-overflow",
@@ -5751,8 +5732,8 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
                 provider_name: None,
                 provider_type: None,
                 reasoning_effort: None,
-                max_context_tokens: 400_000,
-                max_output_tokens: 128,
+                output_limit_recovery: None,
+                budget: &TokenBudget::new(400_000, 128, Default::default()),
                 observation_progress_hint: None,
                 prompt_memory_exposure: None,
             },
@@ -5823,6 +5804,7 @@ async fn synthetic_provider_api_overflow_stays_recoverable() {
         &prepared_context,
         &[],
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &cancel_token,
             session_id: "synthetic-model-overflow",
@@ -5830,8 +5812,8 @@ async fn synthetic_provider_api_overflow_stays_recoverable() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: 400_000,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(400_000, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -5953,6 +5935,7 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
             &prepared_context,
             &[],
             &LlmStreamFrame {
+                provider_default_output: false,
                 event_tx: &event_tx,
                 cancel_token: &cancel_token,
                 session_id: "synthetic-response-body",
@@ -5960,8 +5943,8 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
                 provider_name: None,
                 provider_type: None,
                 reasoning_effort: None,
-                max_context_tokens: 400_000,
-                max_output_tokens: 128,
+                output_limit_recovery: None,
+                budget: &TokenBudget::new(400_000, 128, Default::default()),
                 observation_progress_hint: None,
                 prompt_memory_exposure: None,
             },
@@ -5987,5 +5970,455 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
     assert!(
         matches!(error, AgentError::LLMNonRetryable(_)),
         "response body failure must stop: {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2513: an unchanged final-request checkpoint must not repeat paid Legacy
+// Vision description requests for the same retained image.
+// ---------------------------------------------------------------------------
+
+/// Counts paid Legacy Vision description requests separately from the main
+/// dispatch, and captures what the main request actually contained.
+struct CountingVisionRoundProvider {
+    vision_calls: Arc<std::sync::atomic::AtomicUsize>,
+    main_requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl LLMProvider for CountingVisionRoundProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        if model == "vision-single" {
+            let call = self
+                .vision_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(format!("VISION_DESCRIPTION_{call}"))),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("main answer".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+        _options: Option<&LLMRequestOptions>,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        self.main_requests
+            .lock()
+            .expect("main requests lock")
+            .push(messages);
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("main answer".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+/// Representative adopting persistence: the default `checkpoint_runtime_session`
+/// path that loads the durable Session, appends missing messages and saves.
+struct AdoptingRoundPersistence {
+    durable: Mutex<Session>,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for AdoptingRoundPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.durable.lock().expect("durable lock") = session.clone();
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+        Ok(Some(self.durable.lock().expect("durable lock").clone()))
+    }
+}
+
+fn retained_image_message(text: &str) -> Message {
+    Message::user_with_parts(
+        text,
+        vec![
+            bamboo_domain::MessagePart::Text {
+                text: text.to_string(),
+            },
+            bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                    detail: None,
+                },
+            },
+        ],
+    )
+}
+
+fn vision_round_config(
+    persistence: Arc<AdoptingRoundPersistence>,
+    provider: &Arc<dyn LLMProvider>,
+) -> crate::runtime::config::AgentLoopConfig {
+    let mut config = test_config("system");
+    config.persistence = Some(persistence);
+    config.image_fallback = Some(crate::runtime::config::ImageFallbackConfig {
+        mode: crate::runtime::config::ImageFallbackMode::Vision,
+        vision_model: None,
+    });
+    let provider = provider.clone();
+    config.legacy_vision_model_resolver = Some(Arc::new(move || {
+        let provider = provider.clone();
+        Box::pin(async move {
+            Ok::<_, AgentError>(bamboo_llm::ResolvedModel::new(provider, "vision-single"))
+        })
+    }));
+    config
+}
+
+async fn run_vision_round(
+    session: &mut Session,
+    config: &crate::runtime::config::AgentLoopConfig,
+    llm: &Arc<dyn LLMProvider>,
+    session_id: &str,
+    hint: Option<&str>,
+) -> Result<(), AgentError> {
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+    super::super::execute_llm_round(
+        session,
+        config,
+        llm,
+        &event_tx,
+        &CancellationToken::new(),
+        session_id,
+        "test-model",
+        &[],
+        hint,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test]
+async fn bookkeeping_only_checkpoint_does_not_repeat_the_vision_description() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-unchanged-checkpoint";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    // The durable Session already equals the live one, so an adopting checkpoint
+    // has nothing to append: it is bookkeeping only.
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(
+        &mut session,
+        &config,
+        &llm_dyn,
+        session_id,
+        Some("request-only observation advice"),
+    )
+    .await
+    .expect("a bookkeeping-only checkpoint must not fail the round");
+
+    assert_eq!(
+        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one retained image must be described once, not once per bookkeeping checkpoint"
+    );
+    assert!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the final request must still be checkpointed before provider dispatch"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_that_adopts_new_input_reprepares_with_one_extra_vision_call() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-adopting-checkpoint";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    // Durable state carries a concurrent message the runner has not seen, so the
+    // checkpoint must adopt it and the request must be rebuilt with it.
+    let concurrent = Message::user("concurrent child completion");
+    let mut durable = session.clone();
+    durable.add_message(concurrent.clone());
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(durable),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect("adopted input must be dispatched");
+
+    let requests = llm.main_requests.lock().expect("main requests lock");
+    let dispatched = requests.last().expect("one dispatched request");
+    let flattened = serde_json::to_string(dispatched).expect("serialize request");
+    assert!(
+        dispatched.iter().any(|message| message.id == concurrent.id),
+        "the adopted concurrent message must reach the provider"
+    );
+    // A changed input genuinely reprepares, so the rebuilt request carries the
+    // description produced for it — and the image is never dropped or reduced to
+    // the legacy "omitted" degradation.
+    assert!(
+        flattened.contains("VISION_DESCRIPTION_2"),
+        "the rebuilt request must carry the description prepared for it; dispatched={flattened}"
+    );
+    assert!(
+        !flattened.contains("omitted (vision failed)"),
+        "the accepted image must not degrade to an omission placeholder"
+    );
+    assert!(
+        !flattened.contains("image_url"),
+        "the raw image URL must not be sent to a non-Vision main model"
+    );
+    assert_eq!(
+        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one initial description plus exactly one reprepare after the adoption"
+    );
+}
+
+/// Persistence whose adopting checkpoint refuses on authority grounds.
+struct RefusingRoundPersistence {
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for RefusingRoundPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+        Ok(None)
+    }
+
+    async fn checkpoint_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("generation moved".to_string()),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn refused_checkpoint_still_rejects_before_dispatch() {
+    // #2513 authority guard: reusing a validated request must never bypass the
+    // authority decision. A checkpoint that refuses still fails the round and
+    // sends nothing, even with an image in flight.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-authority-refused";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(RefusingRoundPersistence {
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    config.image_fallback = Some(crate::runtime::config::ImageFallbackConfig {
+        mode: crate::runtime::config::ImageFallbackMode::Vision,
+        vision_model: None,
+    });
+    let resolver_provider = llm_dyn.clone();
+    config.legacy_vision_model_resolver = Some(Arc::new(move || {
+        let provider = resolver_provider.clone();
+        Box::pin(async move {
+            Ok::<_, AgentError>(bamboo_llm::ResolvedModel::new(provider, "vision-single"))
+        })
+    }));
+
+    let error = run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect_err("a refused checkpoint must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint failed before provider dispatch"),
+        "authority rejection must surface as a checkpoint failure: {error}"
+    );
+    assert!(
+        llm.main_requests
+            .lock()
+            .expect("main requests lock")
+            .is_empty(),
+        "no request may be dispatched after a refused checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_checkpoint_still_persists_the_final_request() {
+    // #2513 durability guard: skipping the rebuild must not skip persistence.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-durability";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect("an unchanged checkpoint must still complete the round");
+
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the reconciled request must be checkpointed exactly once before dispatch"
+    );
+    let durable = persistence.durable.lock().expect("durable lock");
+    assert_eq!(
+        durable.messages.len(),
+        session.messages.len(),
+        "the durable transcript must keep every accepted message"
+    );
+    assert_eq!(
+        serde_json::to_value(&durable.messages).unwrap(),
+        serde_json::to_value(&session.messages).unwrap(),
+        "the durable transcript must equal the live transcript"
+    );
+    assert!(
+        durable.model_context_state.is_some(),
+        "the committed model-context ledger must be durable"
+    );
+}
+
+#[tokio::test]
+async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_dispatch() {
+    // #2513 input-budget guard, deliberately narrow in scope.
+    //
+    // This case supplies an already-built `PreparedContext` straight to
+    // `execute_llm_stream`, so it never enters `execute_llm_round` ->
+    // `prepare_round_context` -> Legacy Vision fallback. It therefore proves
+    // only the main-stream contract for an already-prepared context:
+    //
+    //   1. the final input-budget check still fails closed with
+    //      `AgentError::Budget`;
+    //   2. no checkpoint is taken before that rejection;
+    //   3. the main provider is never dispatched.
+    //
+    // It says nothing about paid Vision calls on the preparation path and must
+    // not be cited for that. Preparation-path Vision coverage lives in
+    // `bookkeeping_only_checkpoint_does_not_repeat_the_vision_description` and
+    // `checkpoint_that_adopts_new_input_reprepares_with_one_extra_vision_call`,
+    // which both go through `execute_llm_round`.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-over-budget";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+    let prepared_context = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let error = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            provider_default_output: false,
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            output_limit_recovery: None,
+            // Deliberately below the rendered request so the pre-dispatch
+            // budget rejection is what stops this round.
+            budget: &bamboo_domain::TokenBudget::with_safety_margin(16, 8, Default::default(), 0),
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .map(|_| ())
+    .expect_err("a request above the ledger-safe input budget must be rejected");
+
+    assert!(
+        matches!(error, AgentError::Budget(_)),
+        "the input-budget contract must still fail closed: {error:?}"
+    );
+    assert!(
+        llm.main_requests
+            .lock()
+            .expect("main requests lock")
+            .is_empty(),
+        "an over-budget prepared request must never reach the provider"
+    );
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an over-budget prepared request must be rejected before any checkpoint"
     );
 }

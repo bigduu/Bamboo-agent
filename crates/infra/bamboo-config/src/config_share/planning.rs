@@ -14,6 +14,8 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
             .iter()
             .map(|p| {
                 let existing = instances.get(&p.id);
+                let reserved = target.is_retired_provider_alias(&p.id);
+                let conflict = existing.is_some() || reserved;
                 let source_origin = safe_origin(p.base_url.as_deref());
                 let target_origin = safe_origin(existing.and_then(|p| p.base_url.as_deref()));
                 let retains_existing_api_key = existing.is_some_and(|target| {
@@ -35,9 +37,20 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
                     target_origin,
                     retains_existing_api_key,
                     credential_origin_risk,
-                    conflict: existing.is_some(),
-                    replace_allowed: existing
-                        .is_none_or(|target| target.provider_type == p.provider_type.as_str()),
+                    conflict,
+                    replace_allowed: if reserved {
+                        false
+                    } else if p.provider_type == ShareProviderType::Bodhi {
+                        target
+                            .provider_instances
+                            .get(&p.id)
+                            .is_some_and(|instance| instance.provider_type == "bodhi")
+                    } else {
+                        existing
+                            .is_none_or(|target| target.provider_type == p.provider_type.as_str())
+                    },
+                    rename_allowed: p.provider_type != ShareProviderType::Bodhi,
+                    retired_id: reserved,
                 }
             })
             .collect(),
@@ -130,12 +143,24 @@ pub fn plan_import(
     for provider in &bundle.providers {
         let id = choose_target(
             &provider.id,
-            existing.contains_key(&provider.id),
+            existing.contains_key(&provider.id) || target.is_retired_provider_alias(&provider.id),
             decisions.providers.get(&provider.id),
         )?;
         let Some(id) = id else {
             continue;
         };
+        if target.is_retired_provider_alias(&id) {
+            return Err(ShareError::Invalid);
+        }
+        if provider.provider_type == ShareProviderType::Bodhi
+            && (id != provider.id
+                || !target
+                    .provider_instances
+                    .get(&id)
+                    .is_some_and(|instance| instance.provider_type == "bodhi"))
+        {
+            return Err(ShareError::Invalid);
+        }
         if id == provider.id
             && existing
                 .get(&id)

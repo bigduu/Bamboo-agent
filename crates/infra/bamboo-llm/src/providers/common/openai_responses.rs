@@ -620,6 +620,84 @@ pub fn retain_provider_transcript_family(
     });
 }
 
+/// A resumed search may reference functions removed from the current agent
+/// catalog. Keep the protocol's call/output pairing while excluding those
+/// definitions from replay, including a request constrained to named tools.
+pub(crate) fn scope_agent_tool_search_history(
+    body: &mut Value,
+    eligible_tools: &[ToolSchema],
+    mode: CapabilityLoadingMode,
+) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let allowed = eligible_tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<HashSet<_>>();
+    input.retain_mut(|item| match item["type"].as_str() {
+        Some("tool_search_call") => mode == CapabilityLoadingMode::Progressive,
+        Some("tool_search_output" | "additional_tools") => {
+            if mode != CapabilityLoadingMode::Progressive {
+                return false;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                tools.retain(|tool| {
+                    tool["type"] == "function"
+                        && tool["name"]
+                            .as_str()
+                            .is_some_and(|name| allowed.contains(name))
+                });
+            }
+            item["type"] != "additional_tools"
+                || item["tools"]
+                    .as_array()
+                    .is_some_and(|tools| !tools.is_empty())
+        }
+        _ => true,
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn replay_preserves_native_pairs_and_filters_search_results_by_exact_identity() {
+    let mut body = json!({"input":[
+        {"type":"tool_search_call","call_id":"search","execution":"server"},
+        {"type":"tool_search_output","call_id":"search","execution":"server","tools":[
+            {"type":"function","name":"Glob"},
+            {"type":"function","name":"browser"},
+            {"type":"function","name":"vendor::Glob"}
+        ]},
+        {"type":"additional_tools","tools":[{"type":"function","name":"browser"}]},
+        {"type":"message","role":"assistant"}
+    ]});
+    let eligible = vec![ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_domain::FunctionSchema {
+            name: "Glob".into(),
+            description: "Find paths".into(),
+            parameters: json!({"type":"object"}),
+        },
+    }];
+    scope_agent_tool_search_history(&mut body, &eligible, CapabilityLoadingMode::Progressive);
+    let retained = body["input"].as_array().unwrap();
+    assert_eq!(retained.len(), 3);
+    assert_eq!(retained[0]["call_id"], retained[1]["call_id"]);
+    assert_eq!(
+        retained[1]["tools"],
+        json!([{"type":"function","name":"Glob"}])
+    );
+    scope_agent_tool_search_history(
+        &mut body,
+        &eligible,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert_eq!(
+        body["input"],
+        json!([{"type":"message","role":"assistant"}])
+    );
+}
+
 /// Build a standard Responses API streaming request body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_responses_body(
@@ -713,9 +791,9 @@ pub fn build_responses_body_with_capability_loading(
     }
 
     let projected_tools = match capability_loading_mode {
-        CapabilityLoadingMode::LegacyFullCatalog | CapabilityLoadingMode::StickyFallback => {
-            tools_to_responses_json(tools)
-        }
+        CapabilityLoadingMode::LegacyFullCatalog
+        | CapabilityLoadingMode::StickyFallback
+        | CapabilityLoadingMode::StickyFallbackForRootChat => tools_to_responses_json(tools),
         CapabilityLoadingMode::Progressive => {
             tools_to_progressive_responses_json(tools, tool_search_execution)
         }
@@ -730,7 +808,7 @@ pub fn build_responses_body_with_capability_loading(
         body["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
 
-    if let Some(max_tokens) = max_output_tokens {
+    if let Some(max_tokens) = crate::provider::optional_protocol_output_limit(max_output_tokens) {
         body["max_output_tokens"] = json!(max_tokens);
     }
 
@@ -1195,6 +1273,7 @@ pub struct ResponsesSseParser {
     logged_summary: bool,
     emitted_response_id: Option<String>,
     retain_protocol_events: bool,
+    collect_output_limit: bool,
     /// Once a protocol terminal is observed, every later frame is ignored.
     ///
     /// Responses usage and `Done` are cumulative terminal data, so accepting a
@@ -1245,6 +1324,8 @@ impl ResponsesSseParser {
             logged_summary: false,
             emitted_response_id: None,
             retain_protocol_events: false,
+            collect_output_limit: crate::provider::current_completion_diagnostics()
+                .is_some_and(|diagnostics| diagnostics.is_agent_round()),
             terminal_seen: false,
         }
     }
@@ -2336,21 +2417,35 @@ impl ResponsesSseParser {
             return Ok(Vec::new());
         }
 
-        let response_status = v
-            .get("response")
-            .and_then(|response| response.get("status"))
-            .and_then(Value::as_str);
+        let response = v.get("response").unwrap_or(&v);
+        let response_status = response.get("status").and_then(Value::as_str);
         let top_level_error = v.get("error").is_some_and(super::sse::sse_error_is_present);
-        if top_level_error
-            || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
-            || matches!(
-                event_type.as_str(),
-                "response.failed"
-                    | "response.incomplete"
-                    | "response.cancelled"
-                    | "response.error"
-                    | "error"
+        let output_limited = self.collect_output_limit
+            && !self.retain_protocol_events
+            && !top_level_error
+            && !response
+                .get("error")
+                .is_some_and(super::sse::sse_error_is_present)
+            && matches!(
+                (event_type.as_str(), response_status),
+                ("response.incomplete", None | Some("incomplete"))
+                    | ("response.completed", Some("incomplete"))
             )
+            && response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens");
+        if !output_limited
+            && (top_level_error
+                || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
+                || matches!(
+                    event_type.as_str(),
+                    "response.failed"
+                        | "response.incomplete"
+                        | "response.cancelled"
+                        | "response.error"
+                        | "error"
+                ))
         {
             self.terminal_seen = true;
             let terminal_type = if event_type.is_empty() {
@@ -2371,11 +2466,16 @@ impl ResponsesSseParser {
                 data: Box::new(v.clone()),
             });
         }
-        if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
+        let id_event = if output_limited {
+            "response.completed"
+        } else {
+            event_type.as_str()
+        };
+        if let Some(chunk) = self.maybe_emit_response_id(id_event, &v) {
             chunks.push(chunk);
         }
 
-        if event_type == "response.completed" {
+        if output_limited || event_type == "response.completed" {
             self.terminal_seen = true;
             chunks.extend(self.completed_provider_transcript_items(&v));
             chunks.extend(self.completed_output_chunks(&v));

@@ -113,11 +113,10 @@ impl WebService {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         self.port = port;
 
-        let app_state = web::Data::new(
-            AppState::new(self.bamboo_home_dir.clone())
-                .await
-                .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-        );
+        let app_state = AppState::new(self.bamboo_home_dir.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize app state: {e}"))?
+            .into_http_data();
         // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
         self.app_state = Some(app_state.clone());
         let bind_addr = bind.to_string();
@@ -212,11 +211,10 @@ impl WebService {
             ));
         }
 
-        let app_state = web::Data::new(
-            AppState::new(self.bamboo_home_dir.clone())
-                .await
-                .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-        );
+        let app_state = AppState::new(self.bamboo_home_dir.clone())
+            .await
+            .map_err(|e| format!("Failed to initialize app state: {e}"))?
+            .into_http_data();
         // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
         self.app_state = Some(app_state.clone());
         // Per-IP rate limiter for the network-exposed production server (#13).

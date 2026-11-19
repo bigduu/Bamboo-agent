@@ -7,6 +7,7 @@ use bamboo_domain::{
 };
 
 pub(crate) struct CurrentUserTargetGuard {
+    pub(crate) lock_wait: SessionLockWait,
     pub(crate) source: Session,
     pub(crate) target: Session,
     pub(crate) inbox_dir: PathBuf,
@@ -38,6 +39,72 @@ impl SessionStoreV2 {
         T: Send + 'static,
         F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
     {
+        let authority = self
+            .lock_unscoped_supervisor_root(caller, supervisor, target)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let workspace_path = authority.target.workspace_path_meta();
+            let result = effect(workspace_path.as_deref());
+            // Keep the physical locks alive for the complete blocking effect.
+            drop(authority);
+            result
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+    }
+
+    /// Read both canonical Main sessions under the original Supervisor,
+    /// target and finite-scope fences. The callback must not reenter storage.
+    pub async fn with_unscoped_supervisor_root_state<T, F>(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+        effect: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Session, &Session) -> io::Result<T> + Send + 'static,
+    {
+        let (authority, source, current) = self
+            .lock_supervisor_approval(caller, supervisor, target)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let result = effect(&source, &current);
+            drop(authority);
+            result
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Root approval job failed: {error}")))?
+    }
+
+    pub(crate) async fn lock_supervisor_approval(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+    ) -> io::Result<(CurrentUserTargetGuard, Session, Session)> {
+        let authority = self
+            .lock_unscoped_supervisor_root(caller, supervisor, target)
+            .await?;
+        let source = self
+            .peer_delivery_session(&caller.session_id, &caller.session_id)
+            .await?;
+        let current = self
+            .peer_delivery_session(&target.session_id, &target.session_id)
+            .await?;
+        if !caller.matches_session(&source) || !target.matches(&current) {
+            return Err(denied("Managed approval authority changed"));
+        }
+        Ok((authority, source, current))
+    }
+
+    pub(crate) async fn lock_unscoped_supervisor_root(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+    ) -> io::Result<CurrentUserTargetGuard> {
         if caller.session_id != supervisor.session_id
             || caller.authority_identity
                 != (SessionAuthorityIdentity::Supervisor {
@@ -54,20 +121,16 @@ impl SessionStoreV2 {
             .host_scope_registry
             .retain_never_installed(&caller.session_id)
             .await?;
-        let authority = self
+        let mut authority = self
             .lock_current_user_target(supervisor, &target.session_id)
             .await?;
         if !caller.matches_session(&authority.source) || *target != authority.reference {
             return Err(denied("Supervisor caller or Root target changed"));
         }
-        tokio::task::spawn_blocking(move || {
-            let _scope = scope;
-            let _authority = authority;
-            let workspace_path = _authority.target.workspace_path_meta();
-            effect(workspace_path.as_deref())
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+        authority._send_scope = Some(
+            super::host_session_scope::CurrentUserSendScope::NeverInstalled { _absence: scope },
+        );
+        Ok(authority)
     }
 
     pub(crate) async fn current_user_supervisor_scope(
@@ -88,11 +151,15 @@ impl SessionStoreV2 {
     async fn current_user_target_source(
         &self,
         target_id: &str,
+        wait: SessionLockWait,
     ) -> io::Result<Option<(Session, HostScopeSessionObservation)>> {
         target_id_is_valid(target_id)?;
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
-        let _target = self.acquire_session_maintenance_lock(target_id).await?;
+        let _target = match wait {
+            SessionLockWait::Wait => self.acquire_session_maintenance_lock(target_id).await?,
+            SessionLockWait::Try => self.try_acquire_session_maintenance_lock(target_id).await?,
+        };
         let (relative, _) = self
             .actor_authority_location(target_id)
             .await
@@ -125,10 +192,69 @@ impl SessionStoreV2 {
         Ok(Some((target, observation)))
     }
 
+    pub(in crate::v2) async fn current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        if !caller.is_ordinary_root() {
+            return Err(denied(
+                "current-user peer history requires an ordinary Root",
+            ));
+        }
+        let _scope = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let wait = SessionLockWait::Wait;
+        let (source, source_observation) = self
+            .current_user_target_source(&caller.session_id, wait)
+            .await?
+            .ok_or_else(|| denied("current-user history caller is unavailable"))?;
+        validate_peer_history_caller(caller, &source)?;
+        let (_, target) = self
+            .current_user_target_source(target_id, wait)
+            .await?
+            .ok_or_else(|| denied("current-user history target is unavailable"))?;
+        let target_root = target.identity.root_session_id.clone();
+        let _guards = self
+            .lock_host_scope_control_observations(&[source_observation, target], wait)
+            .await?;
+        for root_id in [&caller.root_session_id, &target_root] {
+            self.load_root_authority_unchecked(root_id)
+                .await?
+                .ok_or_else(|| denied("current-user history Root is unavailable"))?;
+        }
+        let current = self
+            .peer_delivery_control_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        validate_peer_history_caller(caller, &current)?;
+        self.peer_delivery_session(target_id, &target_root).await
+    }
+
     pub(crate) async fn lock_current_user_target(
         &self,
         reference: &SupervisorReference,
         target_id: &str,
+    ) -> io::Result<CurrentUserTargetGuard> {
+        self.lock_current_user_target_with_wait(reference, target_id, super::SessionLockWait::Wait)
+            .await
+    }
+
+    pub(crate) async fn try_lock_current_user_target(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<CurrentUserTargetGuard> {
+        self.lock_current_user_target_with_wait(reference, target_id, super::SessionLockWait::Try)
+            .await
+    }
+
+    async fn lock_current_user_target_with_wait(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+        wait: super::SessionLockWait,
     ) -> io::Result<CurrentUserTargetGuard> {
         reference_is_valid(reference)?;
         target_id_is_valid(target_id)?;
@@ -154,7 +280,7 @@ impl SessionStoreV2 {
         let caller = HostScopeSessionObservation::capture(&source, vec![])
             .map_err(|error| denied(&error.to_string()))?;
         let (_, target) = self
-            .current_user_target_source(target_id)
+            .current_user_target_source(target_id, wait)
             .await?
             .ok_or_else(|| {
                 io::Error::new(
@@ -163,7 +289,7 @@ impl SessionStoreV2 {
                 )
             })?;
         let authority = self
-            .lock_host_scope_control_observations(&[caller, target.clone()])
+            .lock_host_scope_control_observations(&[caller, target.clone()], wait)
             .await?;
         // Re-read protected proof while the same source/target/ancestry guards
         // are held. Copying serialized observations never creates authority.
@@ -194,6 +320,7 @@ impl SessionStoreV2 {
             Self::child_rel_path(&current.root_session_id, target_id)
         };
         Ok(CurrentUserTargetGuard {
+            lock_wait: wait,
             source,
             target: current,
             inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),
@@ -405,6 +532,24 @@ impl SessionStoreV2 {
             next_after,
         })
     }
+}
+
+fn validate_peer_history_caller(
+    caller: &bamboo_domain::SessionCallerReference,
+    source: &Session,
+) -> io::Result<()> {
+    if !caller.matches_session(source) {
+        return Err(denied("current-user history caller changed"));
+    }
+    if source
+        .metadata
+        .contains_key(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+    {
+        return Err(denied(
+            "current-user peer history is unavailable to a Connect chat",
+        ));
+    }
+    Ok(())
 }
 
 fn current_user_scope(

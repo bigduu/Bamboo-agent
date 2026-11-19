@@ -733,6 +733,11 @@ async fn run_config_snapshot(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+    let compatibility_match_limit = if crate::shell_compatibility::foreground_bash_hook(payload) {
+        1
+    } else {
+        legacy_inputs.len()
+    };
     let stop_active = input["stop_hook_active"].as_bool().unwrap_or(false);
     let mut report = PortableReport::default();
     if let Some(groups) = config.hooks.get(&event) {
@@ -758,6 +763,7 @@ async fn run_config_snapshot(
                 legacy_inputs
                     .iter()
                     .filter(|legacy| matches(legacy))
+                    .take(compatibility_match_limit)
                     .collect()
             };
             for selected_input in selected_inputs {

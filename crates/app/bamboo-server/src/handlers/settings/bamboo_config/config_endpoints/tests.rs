@@ -724,10 +724,16 @@ async fn defaults_patch_repairs_unknown_refs_without_persisting_live_core_drift(
     let model_limits_before =
         std::fs::read(&model_limits_path).expect("model limits section exists");
 
+    let saved_work_review = serde_json::json!({
+        "provider": instance_id,
+        "model": "gpt-seed",
+        "reasoning_effort": "high"
+    });
     let invalid_defaults: bamboo_config::DefaultsConfig =
         serde_json::from_value(serde_json::json!({
             "chat": {"provider": "missing-provider", "model": "missing-chat"},
             "fast": {"provider": "missing-provider", "model": "missing-fast"},
+            "work_review": saved_work_review,
             "subagent_models": {
                 "researcher": {"provider": "missing-provider", "model": "missing-research"}
             }
@@ -766,8 +772,8 @@ async fn defaults_patch_repairs_unknown_refs_without_persisting_live_core_drift(
     )
     .await;
 
-    // This matches Lotus Next's write shape: it carries an unchanged
-    // model-limits sidecar while replacing every invalid defaults reference.
+    // The existing Lotus editor omits work_review when repairing other roles.
+    // Its patch must preserve the already configured role and model limits.
     let repaired_defaults = serde_json::json!({
         "chat": {"provider": instance_id, "model": "gpt-repaired-chat"},
         "fast": {"provider": instance_id, "model": "gpt-repaired-fast"},
@@ -805,6 +811,7 @@ async fn defaults_patch_repairs_unknown_refs_without_persisting_live_core_drift(
     let response_json: serde_json::Value =
         serde_json::from_str(&response_text).expect("valid response JSON");
     assert_eq!(response_json["defaults"]["chat"]["provider"], instance_id);
+    assert_eq!(response_json["defaults"]["work_review"], saved_work_review);
     assert_eq!(
         response_json["defaults"]["subagent_models"]["researcher"]["model"],
         "gpt-repaired-research"
@@ -951,14 +958,14 @@ async fn defaults_patch_repairs_unknown_refs_without_persisting_live_core_drift(
         .await
         .expect("repaired configuration should restart");
     let restarted_config = restarted.config.read().await;
+    let restarted_defaults = restarted_config
+        .defaults
+        .as_ref()
+        .expect("repaired defaults survive restart");
+    assert_eq!(restarted_defaults.chat.model, "gpt-repaired-chat");
     assert_eq!(
-        restarted_config
-            .defaults
-            .as_ref()
-            .expect("repaired defaults survive restart")
-            .chat
-            .model,
-        "gpt-repaired-chat"
+        serde_json::to_value(&restarted_defaults.work_review).unwrap(),
+        saved_work_review
     );
     assert_eq!(
         restarted_config.provider_instances[&instance_id]

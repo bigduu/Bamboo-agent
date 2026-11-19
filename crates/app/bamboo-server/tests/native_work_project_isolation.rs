@@ -1,12 +1,14 @@
 //! Two real Project workers and an isolated denied-read probe over existing Host ports.
-use actix_web::{http::StatusCode, test, web, App};
+use actix_web::{body::MessageBody, http::StatusCode, test, web, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_domain::{ProjectId, Role, WorkspaceBinding};
+use bamboo_agent_core::AgentEvent;
+use bamboo_domain::{ProjectId, Role, Session, TaskItemStatus, WorkspaceBinding};
+use bamboo_engine::ticket_worker_plan::{TicketWorkerPlan, WorkerLocalPlan};
 use bamboo_llm::LLMChunk;
 use bamboo_server::AppState;
 use bamboo_tickets::{
     canonical_bytes, Contract, ExecutionWorkspace, Operation, Principal, ProjectContextSnapshot,
-    Submission, TicketKind, WorkState,
+    StepStatus, Submission, TicketKind, WorkState,
 };
 use serde_json::{json, Value};
 use std::{
@@ -91,7 +93,11 @@ macro_rules! prepare_work {
                             project_id: $project.id.clone(),
                             project_revision: $project.revision,
                             resource_revision: $project.resource_revision,
-                            workspace_binding: $project.workspace_bindings[0].clone(),
+                            workspace_binding: WorkspaceBinding {
+                                path: $workspace.repo.clone(),
+                                label: None,
+                                git_common_dir: None,
+                            },
                             contract_revision: snap.tickets[&id].contract_revision,
                             contract,
                             sources: BTreeMap::new(),
@@ -175,12 +181,122 @@ fn reply<'a>(request: &'a ModelRequest, id: &str) -> &'a bamboo_domain::Message 
 }
 
 async fn complete_own_work(
+    state: &AppState,
+    assignment: &str,
     requests: &mut mpsc::UnboundedReceiver<ModelRequest>,
     work: &Work,
     other: &Work,
     label: &str,
-) {
+) -> (TicketWorkerPlan, Session) {
     let first = next(requests).await;
+    let service = state.tickets.service().unwrap();
+    let snapshot = service.published().unwrap().1;
+    let receipt = snapshot.assignments[assignment].runtime.as_ref().unwrap();
+    let mut child = state
+        .storage
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        child.project_id_meta().is_none(),
+        "Work must retain its global Supervisor's tree Project"
+    );
+    assert_eq!(
+        child.root_session_id,
+        snapshot.binding.supervisor_session_id
+    );
+    // Mirror Runtime::execute's readonly caller projection, using the native
+    // receipt that already reached this provider gate. Never persist test inputs.
+    child
+        .agent_runtime_state
+        .get_or_insert_with(Default::default)
+        .run_id = receipt.run_id.clone();
+    let plan = TicketWorkerPlan::from_runtime_receipt(service, assignment).unwrap();
+    let path = Some(std::path::Path::new(&work.workspace.worktree));
+    assert!(
+        plan.workspace_project_context(&child, path).is_err(),
+        "unbound capability grants no workspace"
+    );
+    plan.bind_session(&mut child).unwrap();
+    assert_eq!(
+        plan.workspace_project_context(&child, path)
+            .unwrap()
+            .unwrap()
+            .project_id,
+        work.project
+    );
+    let display = bamboo_config::paths::path_to_display_string(std::path::Path::new(
+        &work.workspace.worktree,
+    ));
+    let nested = std::path::Path::new(&display).join("display-form");
+    std::fs::create_dir(&nested).unwrap();
+    let alias = nested.join("..");
+    assert_ne!(alias, std::path::Path::new(&work.workspace.worktree));
+    assert_eq!(
+        alias.canonicalize().unwrap(),
+        std::path::Path::new(&work.workspace.worktree)
+    );
+    let mut displayed = child.clone();
+    displayed.set_workspace_path_meta(alias.to_string_lossy());
+    assert_eq!(
+        plan.workspace_project_context(&displayed, Some(&alias))
+            .unwrap()
+            .unwrap()
+            .project_id,
+        work.project,
+        "a valid Host display spelling retains only the same physical workspace grant"
+    );
+    displayed.set_workspace_path_meta(&other.workspace.worktree);
+    assert!(plan.workspace_project_context(&displayed, path).is_err());
+    displayed.set_workspace_path_meta(nested.join("missing").to_string_lossy());
+    assert!(plan.workspace_project_context(&displayed, path).is_err());
+    #[cfg(unix)]
+    {
+        let selected = std::path::Path::new(&work.workspace.worktree);
+        let retained = selected.with_extension("retained");
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::rename(selected, &retained).unwrap();
+        std::os::unix::fs::symlink(foreign.path(), selected).unwrap();
+        let result = plan.workspace_project_context(&child, path);
+        std::fs::remove_file(selected).unwrap();
+        std::fs::rename(&retained, selected).unwrap();
+        assert!(
+            result.is_err(),
+            "a replaced frozen directory cannot be re-canonicalized into a new grant"
+        );
+    }
+    assert!(plan
+        .workspace_project_context(
+            &child,
+            Some(std::path::Path::new(&other.workspace.worktree))
+        )
+        .is_err());
+    let mut wrong = child.clone();
+    wrong.created_at += chrono::Duration::seconds(1);
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.parent_created_at = None;
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.root_session_id = "foreign-root".into();
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.agent_runtime_state.as_mut().unwrap().run_id = "foreign-run".into();
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.set_project_id_meta(other.project.to_string());
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    let mut dispatch = bamboo_engine::ticket_runtime::read_dispatch(&wrong)
+        .unwrap()
+        .unwrap();
+    dispatch.spec_hash = "foreign-spec".into();
+    wrong.metadata.insert(
+        bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+        serde_json::to_string(&dispatch).unwrap(),
+    );
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
     let messages = serde_json::to_string(&first.messages).unwrap();
     assert!(messages.contains(work.marker));
     assert!(
@@ -220,6 +336,7 @@ async fn complete_own_work(
             work.marker
         )))
         .unwrap();
+    (plan, child)
 }
 
 async fn submitted(state: &AppState, work: &Work, assignment: &str) -> Submission {
@@ -251,6 +368,225 @@ async fn submitted(state: &AppState, work: &Work, assignment: &str) -> Submissio
 }
 
 #[actix_web::test]
+async fn native_work_read_activity_cannot_advance_the_committed_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let physical = root.path().canonicalize().unwrap();
+    let marker = "WORK_READ_ACTIVITY";
+    let workspace = execution_workspace_at(&physical, "activity", marker);
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 4,
+    });
+    let state = web::Data::new(host(&physical, provider.clone()).await);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let project = state
+        .project_store
+        .create_with_project_path("Work activity", None, &workspace.repo, Vec::new())
+        .unwrap();
+    let work = prepare_work!(app, state, workspace, project, "activity", marker);
+    let assignment = start_work!(app, state, work, "activity");
+    let first = next(&mut requests).await;
+    let service = state.tickets.service().unwrap();
+    let child_id = service.published().unwrap().1.assignments[&assignment]
+        .runtime
+        .as_ref()
+        .unwrap()
+        .session_id
+        .clone();
+    let mut events = state.get_session_event_sender(&child_id).await.subscribe();
+    let task = |status| {
+        json!({"tasks":[{
+            "id":"read-step",
+            "content":"Read the assigned fixture and record evidence",
+            "status":status,
+            "completionCriteria":["Read the scoped source bytes"]
+        }]})
+    };
+    reply_call(first, "plan-start", "Task", task("in_progress"));
+    let read_round = next(&mut requests).await;
+    assert_eq!(reply(&read_round, "plan-start").tool_success, Some(true));
+    // The forwarder caches each committed plan before broadcasting it. Seeing
+    // this event on the original connection fences the later replay check.
+    let initial_plan = tokio::time::timeout(WAIT, async {
+        loop {
+            if let AgentEvent::TaskListUpdated { task_list, version } = events.recv().await.unwrap()
+            {
+                assert_eq!(task_list.session_id, child_id);
+                break (version, task_list.items[0].status.clone());
+            }
+        }
+    })
+    .await
+    .expect("original connection receives the first committed plan");
+    let reads = (0..4)
+        .map(|index| ToolCall {
+            id: format!("read-activity-{index}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: json!({"file_path":work.path()}).to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let read_ids = reads
+        .iter()
+        .map(|call| call.id.clone())
+        .collect::<BTreeSet<_>>();
+    read_round.reply.send(LLMChunk::ToolCalls(reads)).unwrap();
+    let finish_plan = next(&mut requests).await;
+    for id in &read_ids {
+        let result = reply(&finish_plan, id);
+        assert_eq!(result.tool_success, Some(true));
+        assert!(result.content.contains(marker));
+    }
+    let before = service.published().unwrap().1;
+    let plan = &before.assignments[&assignment].plan;
+    assert_eq!(plan.plan_revision, 1);
+    assert_eq!(plan.steps[0].status, Some(StepStatus::InProgress));
+    let child = state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.task_list_version_meta().as_deref(), Some("1"));
+    assert_eq!(
+        child.task_list.as_ref().unwrap().items[0].status,
+        TaskItemStatus::InProgress
+    );
+
+    // Start a second client after the tool activity, while the real provider
+    // is still held before the explicit completion. It must replay v1.
+    let reconnect = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/events/{child_id}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(reconnect.status(), StatusCode::OK);
+    let mut reconnect = Box::pin(reconnect.into_body());
+    let (version, list) = tokio::time::timeout(WAIT, async {
+        loop {
+            let bytes = std::future::poll_fn(|cx| reconnect.as_mut().poll_next(cx))
+                .await
+                .expect("reconnect closed before replay")
+                .expect("SSE body frame");
+            let frame = std::str::from_utf8(&bytes).unwrap();
+            for payload in frame.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                match serde_json::from_str::<AgentEvent>(payload) {
+                    Ok(AgentEvent::TaskListUpdated { version, task_list }) => {
+                        return (version, task_list);
+                    }
+                    Ok(AgentEvent::TaskListItemProgress { .. }) => {
+                        panic!("reconnect must not replay speculative progress");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("late subscriber receives the committed native Work plan");
+    assert_eq!(version, Some(1));
+    assert_eq!(list.session_id, child_id);
+    assert_eq!(list.items[0].id, "read-step");
+    assert_eq!(list.items[0].status, TaskItemStatus::InProgress);
+    drop(reconnect);
+
+    reply_call(finish_plan, "plan-finish", "Task", task("completed"));
+    let finish_run = next(&mut requests).await;
+    assert_eq!(reply(&finish_run, "plan-finish").tool_success, Some(true));
+    let mut observed_reads = BTreeSet::new();
+    let mut observed_plans = vec![initial_plan];
+    let mut speculative = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match events.recv().await.unwrap() {
+                AgentEvent::TaskListUpdated { task_list, version } => {
+                    assert_eq!(task_list.session_id, child_id);
+                    observed_plans.push((version, task_list.items[0].status.clone()));
+                    if version == Some(2) {
+                        break;
+                    }
+                }
+                AgentEvent::TaskListItemProgress {
+                    version, status, ..
+                } => {
+                    speculative.push((version, status));
+                }
+                AgentEvent::ToolComplete {
+                    tool_call_id,
+                    result,
+                } if read_ids.contains(&tool_call_id) => {
+                    assert!(result.success);
+                    observed_reads.insert(tool_call_id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("observe both real Task commits and the intervening tool activity");
+    assert_eq!(observed_reads, read_ids);
+    assert_eq!(
+        observed_plans,
+        [
+            (Some(1), TaskItemStatus::InProgress),
+            (Some(2), TaskItemStatus::Completed)
+        ],
+    );
+    for path in [
+        format!("/api/v1/sessions/{child_id}/task"),
+        format!("/api/v1/task/{child_id}"),
+    ] {
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&path).to_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan: Value = test::read_body_json(response).await;
+        assert_eq!(plan["session_id"], child_id);
+        assert_eq!(plan["version"], 2);
+        assert_eq!(plan["items"][0]["status"], "completed");
+    }
+    finish_run
+        .reply
+        .send(LLMChunk::Token(format!(
+            "Read the scoped evidence: {marker}"
+        )))
+        .unwrap();
+    submitted(&state, &work, &assignment).await;
+    let stopped = service.published().unwrap().1;
+    assert_eq!(stopped.assignments[&assignment].plan.plan_revision, 2);
+    assert_eq!(
+        stopped.assignments[&assignment].plan.steps[0].status,
+        Some(StepStatus::Completed)
+    );
+    let child = state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.task_list_version_meta().as_deref(), Some("2"));
+    assert_eq!(
+        child.task_list.as_ref().unwrap().items[0].status,
+        TaskItemStatus::Completed
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+    assert!(
+        speculative.is_empty(),
+        "tool activity cannot publish uncommitted Work Task status: {speculative:?}"
+    );
+}
+
+#[actix_web::test]
 async fn two_project_native_results_and_denied_reads_survive_host_restart() {
     let root = tempfile::tempdir().unwrap();
     let physical = root.path().canonicalize().unwrap();
@@ -273,41 +609,67 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
                 .configure(bamboo_server::configure_routes),
         )
         .await;
-        let pa = state.project_store.create("Project A", None).unwrap();
+        let pa = state
+            .project_store
+            .create_with_project_path("Project A", None, &wa.repo, Vec::new())
+            .unwrap();
         let pa = state
             .project_store
             .bind_workspace(
                 &pa.id,
                 pa.revision,
                 WorkspaceBinding {
-                    path: wa.repo.clone(),
+                    path: wa.worktree.clone(),
                     label: None,
                     git_common_dir: None,
                 },
             )
             .unwrap();
-        let pb = state.project_store.create("Project B", None).unwrap();
+        let pb = state
+            .project_store
+            .create_with_project_path("Project B", None, &wb.repo, Vec::new())
+            .unwrap();
         let pb = state
             .project_store
             .bind_workspace(
                 &pb.id,
                 pb.revision,
                 WorkspaceBinding {
-                    path: wb.repo.clone(),
+                    path: wb.worktree.clone(),
                     label: None,
                     git_common_dir: None,
                 },
             )
             .unwrap();
         assert_ne!(pa.id, pb.id);
+        for (workspace, project) in [(&wa, &pa), (&wb, &pb)] {
+            assert_eq!(
+                state
+                    .project_store
+                    .find_workspace_owner_for_path(&workspace.worktree)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                project.id
+            );
+        }
         let a = prepare_work!(app, state, wa, pa, "a", marker_a);
         let b = prepare_work!(app, state, wb, pb, "b", marker_b);
         let probe = prepare_work!(app, state, wa, pa, "denied-probe", marker_a);
         assert_eq!(std::fs::read_to_string(a.path()).unwrap(), marker_a);
         assert_eq!(std::fs::read_to_string(b.path()).unwrap(), marker_b);
         let assignment = start_work!(app, state, a, "a");
-        complete_own_work(&mut requests, &a, &b, "a").await;
+        let (plan, child) =
+            complete_own_work(&state, &assignment, &mut requests, &a, &b, "a").await;
         let first = submitted(&state, &a, &assignment).await;
+        assert!(
+            plan.workspace_project_context(
+                &child,
+                Some(std::path::Path::new(&a.workspace.worktree))
+            )
+            .is_err(),
+            "stopped Work cannot reuse a prior workspace capability"
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         state.shutdown().await;
         (a, b, probe, first, assignment)
@@ -338,8 +700,12 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
         assert!(resumed.assignments[&a_assignment].process_stopped);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         let assignment = start_work!(app, state, b, "b");
-        complete_own_work(&mut requests, &b, &a, "b").await;
+        let (plan, child) =
+            complete_own_work(&state, &assignment, &mut requests, &b, &a, "b").await;
         let second = submitted(&state, &b, &assignment).await;
+        assert!(plan
+            .workspace_project_context(&child, Some(std::path::Path::new(&b.workspace.worktree)))
+            .is_err());
         assert_ne!(first.id, second.id);
         assert_ne!(first.runtime.session_id, second.runtime.session_id);
         assert_ne!(first.runtime.run_id, second.runtime.run_id);

@@ -57,6 +57,10 @@
 //!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
+use bamboo_domain::patrol_model_limits::{
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+    MAX_PROVIDER_INPUT_TOKENS,
+};
 use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1426,120 +1430,13 @@ pub struct TrustedKey {
 pub const JIANDU_PLUGIN_PUBLIC_KEY: &str =
     "bba9d0e5553401125f939bc3d844e891706d579a611fea9215545771d5306676";
 
-/// The official plugin-signing keys trusted by default, so an out-of-the-box
-/// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
-/// for a bundle those repos' release CI signed. One entry per first-party
-/// plugin publisher; each repo commits its public half as
-/// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
-/// (magpie and jiandu) for cross-checking.
-fn default_trusted_keys() -> Vec<TrustedKey> {
-    vec![
-        TrustedKey {
-            label: "jiandu (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: JIANDU_PLUGIN_PUBLIC_KEY.to_string(),
-        },
-        TrustedKey {
-            label: "nova (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59"
-                .to_string(),
-        },
-        TrustedKey {
-            label: "magpie (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e"
-                .to_string(),
-        },
-    ]
-}
-
 /// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
 /// (e.g. `github.com/bigduu/Nova/releases/...`).
-fn default_trusted_hosts() -> Vec<String> {
+pub(crate) fn default_trusted_hosts() -> Vec<String> {
     vec!["github.com/bigduu/".to_string()]
 }
 
-/// Plugin URL-install source-trust policy: a host allowlist (is the SOURCE
-/// authorized?) plus ed25519 publisher keys (is the PUBLISHER authentic?).
-/// This stacks on top of the checksum layer already enforced in
-/// `bamboo_plugin::registry::PluginSource::Url` (are the BYTES what the
-/// caller expected?) — see `bamboo-server`'s `plugin_source.rs` for where all
-/// three layers are enforced together. A pasted checksum alone cannot
-/// establish source trust (an attacker who controls the page a checksum was
-/// copied from can just publish a checksum for their own tampered bundle);
-/// the host allowlist and signature checks close that gap.
-///
-/// Both fields are user-editable (`config.json`, or the config-set HTTP/CLI
-/// path) so an operator can add their own trusted hosts/keys. Additive/
-/// back-compat: an absent `plugin_trust` key deserializes to
-/// [`PluginTrustConfig::default`] (the built-in defaults below), not an empty
-/// policy — so a fresh install can trust the official nova plugin out of the
-/// box.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PluginTrustConfig {
-    /// Host+path prefixes a `url` plugin source may be fetched from without
-    /// `--allow-untrusted-host`, e.g. `"github.com/bigduu/"` (a bare host
-    /// with no `/`, e.g. `"example.com"`, matches any path on that exact
-    /// host). Each entry is split into a host component and a path-prefix
-    /// component and matched on PARSED URL components — whole-host equality
-    /// plus a `/`-boundary path-prefix check, never a raw string
-    /// `starts_with` — see [`is_host_trusted`] for the precise rule and why
-    /// (it closes a domain-gluing bypass like `example.com` matching
-    /// `example.com.evil.com`, and a sibling-path bypass like
-    /// `github.com/bigduu` matching `github.com/bigduu-evil/x`).
-    #[serde(default = "default_trusted_hosts")]
-    pub trusted_hosts: Vec<String>,
-    /// Publisher keys a bundle's `.sig` signature may verify against without
-    /// `--allow-unsigned`.
-    #[serde(default = "default_trusted_keys")]
-    pub trusted_keys: Vec<TrustedKey>,
-    /// Persistent, config-level escape hatch for the whole three-layer
-    /// policy above: `Off` makes every `url` plugin install/update behave as
-    /// if `--insecure` (equivalently, `--allow-untrusted-host
-    /// --allow-unsigned --allow-unverified`) were passed, WITHOUT needing the
-    /// per-install flag every time — the "I run a private/dev bamboo and
-    /// don't want to pass flags on every install" customization. Defaults to
-    /// [`PluginTrustEnforcement::Strict`] — a fresh config, or one with no
-    /// `plugin_trust.enforcement` key at all, is secure by default; relaxing
-    /// it is always an explicit, user-initiated edit
-    /// (`bamboo config set plugin_trust.enforcement off`), never a silent
-    /// weakening. See `bamboo-server`'s `plugin_source.rs` for where this is
-    /// enforced, and `AppState::new` for the loud startup warning emitted
-    /// whenever a server boots with this set to `Off`.
-    #[serde(default)]
-    pub enforcement: PluginTrustEnforcement,
-}
-
-impl Default for PluginTrustConfig {
-    fn default() -> Self {
-        Self {
-            trusted_hosts: default_trusted_hosts(),
-            trusted_keys: default_trusted_keys(),
-            enforcement: PluginTrustEnforcement::default(),
-        }
-    }
-}
-
-impl PluginTrustConfig {
-    /// True when `url` is `https` and its host+path match one of
-    /// `trusted_hosts` on parsed URL components (host compared
-    /// case-insensitively as a WHOLE string, path matched on a `/` boundary
-    /// — see the free function [`is_host_trusted`] for the precise rule; an
-    /// unparseable URL or a non-`https` scheme is never trusted).
-    pub fn is_host_trusted(&self, url: &str) -> bool {
-        is_host_trusted(url, &self.trusted_hosts)
-    }
-
-    /// True when `enforcement` is [`PluginTrustEnforcement::Off`] — every
-    /// `url` plugin install/update should skip the host allowlist, signature,
-    /// and checksum-requirement layers, exactly as if `--insecure` were
-    /// passed to that individual install. See the field's doc comment for
-    /// the full rationale.
-    pub fn enforcement_is_off(&self) -> bool {
-        matches!(self.enforcement, PluginTrustEnforcement::Off)
-    }
-}
+pub use crate::plugin_trust::{PluginTrustConfig, PublisherMode};
 
 /// `plugin_trust.enforcement`: the persistent, config-level form of the
 /// `--insecure` escape hatch (see [`PluginTrustConfig::enforcement`]).
@@ -1714,6 +1611,14 @@ fn default_retrieval_window_min_recent_user_turns() -> usize {
     3
 }
 
+fn default_context_trigger_usage_ratio() -> f64 {
+    0.80
+}
+
+fn default_context_target_usage_ratio() -> f64 {
+    0.25
+}
+
 fn default_retrieval_window_trigger_usage_ratio() -> f64 {
     0.80
 }
@@ -1758,6 +1663,11 @@ impl Default for RetrievalWindowContextConfig {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ContextManagementConfig {
     pub strategy: ContextManagementStrategy,
+    /// Shared upper bound for proactive compression across every strategy.
+    /// The effective token boundary can be earlier after output/safety reserves.
+    pub trigger_usage_ratio: f64,
+    /// Shared post-compression target relative to the model's complete window.
+    pub target_usage_ratio: f64,
     pub retrieval_window: RetrievalWindowContextConfig,
 }
 
@@ -1765,6 +1675,8 @@ impl Default for ContextManagementConfig {
     fn default() -> Self {
         Self {
             strategy: ContextManagementStrategy::Summary,
+            trigger_usage_ratio: default_context_trigger_usage_ratio(),
+            target_usage_ratio: default_context_target_usage_ratio(),
             retrieval_window: RetrievalWindowContextConfig::default(),
         }
     }
@@ -1776,6 +1688,19 @@ impl ContextManagementConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.target_usage_ratio.is_finite()
+            || !self.trigger_usage_ratio.is_finite()
+            || self.target_usage_ratio < 0.01
+            || self.target_usage_ratio >= self.trigger_usage_ratio
+            || self.trigger_usage_ratio > 1.0
+            || (self.target_usage_ratio * 100.0).floor()
+                >= (self.trigger_usage_ratio * 100.0).floor()
+        {
+            return Err(
+                "context_management ratios must satisfy 0.01 <= target_usage_ratio < trigger_usage_ratio <= 1 with distinct whole-percent boundaries"
+                    .to_string(),
+            );
+        }
         let policy = &self.retrieval_window;
         if policy.min_recent_user_turns == 0 {
             return Err(
@@ -1804,12 +1729,22 @@ impl ContextManagementConfig {
         Ok(())
     }
 
-    /// Planner policy is intentionally percent-based in the domain primitive.
-    /// Flooring keeps fractional configuration conservative rather than
-    /// archiving less history than the configured target permits. The planner's
-    /// minimum representable positive target is one percent.
+    /// Resolve the common policy onto a runtime-only budget snapshot. Provider
+    /// limits and durable session overrides remain unchanged; only maintenance
+    /// ratios are shared, independent of the selected history representation.
+    pub fn apply_compression_policy(
+        &self,
+        mut budget: bamboo_domain::TokenBudget,
+    ) -> bamboo_domain::TokenBudget {
+        budget.compression_trigger_percent = (self.trigger_usage_ratio * 100.0).floor() as u8;
+        budget.compression_target_percent = (self.target_usage_ratio * 100.0).floor() as u8;
+        budget
+    }
+
+    /// Compatibility accessor. New runtime paths use the dynamically resolved
+    /// budget's target percentage, also for retrieval archive receipts.
     pub fn retrieval_target_usage_percent(&self) -> u8 {
-        ((self.retrieval_window.target_usage_ratio * 100.0).floor() as u8).max(1)
+        ((self.target_usage_ratio * 100.0).floor() as u8).max(1)
     }
 }
 
@@ -1818,30 +1753,111 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         #[serde(default)]
         struct Wire {
             strategy: ContextManagementStrategy,
-            retrieval_window: RetrievalWindowContextConfig,
-        }
-
-        impl Default for Wire {
-            fn default() -> Self {
-                let defaults = ContextManagementConfig::default();
-                Self {
-                    strategy: defaults.strategy,
-                    retrieval_window: defaults.retrieval_window,
-                }
-            }
+            trigger_usage_ratio: Option<f64>,
+            target_usage_ratio: Option<f64>,
+            retrieval_window: Option<RetrievalWindowContextConfig>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        let retrieval_window = wire.retrieval_window.unwrap_or_default();
+        // Older clients stored ratios under retrieval_window. Preserve stricter
+        // settings as common limits, while the old default 80/60 adopts 80/25.
+        // Explicit common fields take precedence on subsequent saves.
         let config = Self {
             strategy: wire.strategy,
-            retrieval_window: wire.retrieval_window,
+            trigger_usage_ratio: wire.trigger_usage_ratio.unwrap_or_else(|| {
+                default_context_trigger_usage_ratio().min(retrieval_window.trigger_usage_ratio)
+            }),
+            target_usage_ratio: wire.target_usage_ratio.unwrap_or_else(|| {
+                default_context_target_usage_ratio().min(retrieval_window.target_usage_ratio)
+            }),
+            retrieval_window,
         };
         config.validate().map_err(serde::de::Error::custom)?;
         Ok(config)
+    }
+}
+
+/// The provider route and pre-call input proof for semantic patrol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatrolModelProtocol {
+    LlamaCppRawV1,
+    RegisteredProviderV1,
+}
+
+/// Independent selection for semantic patrol preparation. Absent disables it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatrolModelConfig {
+    pub provider: String,
+    pub model: String,
+    pub protocol: PatrolModelProtocol,
+    /// Numeric loopback activation for the raw profile. Registered providers
+    /// use the endpoint of the configured instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<std::net::SocketAddr>,
+    pub max_input_tokens: std::num::NonZeroU32,
+    pub max_output_tokens: std::num::NonZeroU32,
+    pub max_evidence_bytes: std::num::NonZeroUsize,
+    pub max_evidence_refs: std::num::NonZeroUsize,
+}
+
+impl PatrolModelConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.provider.is_empty()
+            || self.provider.len() > 256
+            || self
+                .provider
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err("patrol_model requires an explicit provider identifier".into());
+        }
+        let input_limit = match self.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 => MAX_INPUT_TOKENS,
+            PatrolModelProtocol::RegisteredProviderV1 => MAX_PROVIDER_INPUT_TOKENS,
+        };
+        if self.max_input_tokens.get() > input_limit
+            || self.max_output_tokens.get() > MAX_OUTPUT_TOKENS
+            || self.max_evidence_bytes.get() > MAX_EVIDENCE_BYTES
+            || self.max_evidence_refs.get() > MAX_EVIDENCE_REFS
+        {
+            return Err(format!(
+                "patrol_model limits must be at most {input_limit} input tokens, \
+                 {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
+                 and {MAX_EVIDENCE_REFS} evidence references"
+            ));
+        }
+        if self
+            .endpoint
+            .is_some_and(|endpoint| !endpoint.ip().is_loopback() || endpoint.port() == 0)
+        {
+            return Err(
+                "patrol_model endpoint requires a numeric loopback address and port".into(),
+            );
+        }
+        match self.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 if self.model == "gpt-oss-20b" => Ok(()),
+            PatrolModelProtocol::LlamaCppRawV1 => {
+                Err("llama_cpp_raw_v1 requires the gpt-oss-20b patrol model".into())
+            }
+            PatrolModelProtocol::RegisteredProviderV1
+                if self.endpoint.is_none()
+                    && !self.model.is_empty()
+                    && self.model.len() <= 256
+                    && !self.model.chars().any(|ch| ch.is_whitespace() || ch.is_control()) =>
+            {
+                Ok(())
+            }
+            PatrolModelProtocol::RegisteredProviderV1 => Err(
+                "registered_provider_v1 requires a named model and uses the configured provider endpoint".into(),
+            ),
+        }
     }
 }
 
@@ -1869,11 +1885,11 @@ pub struct ConfigValues {
     /// Stable credential-store reference for proxy authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_auth_credential_ref: Option<crate::CredentialRef>,
-    /// Deprecated: Use `providers.copilot.headless_auth` instead
+    /// Legacy setting retained for configuration round trips.
     #[serde(default)]
     pub headless_auth: bool,
 
-    /// Default LLM provider to use (e.g., "anthropic", "openai", "gemini", "copilot")
+    /// Default LLM provider to use (e.g., "anthropic", "openai", "gemini")
     #[serde(default = "default_provider")]
     pub provider: String,
 
@@ -1917,6 +1933,10 @@ pub struct ConfigValues {
     /// Previously persisted in `gemini-model-mapping.json` (now unified into `config.json`).
     #[serde(default)]
     pub gemini_model_mapping: GeminiModelMapping,
+
+    /// Explicit model selection for offline semantic patrol input preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patrol_model: Option<PatrolModelConfig>,
 
     /// Request preflight hooks.
     ///
@@ -2059,6 +2079,7 @@ impl Default for ConfigValues {
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
+            patrol_model: None,
             hooks: HooksConfig::default(),
             lifecycle_hooks: LifecycleHooksConfig::default(),
             tools: ToolsConfig::default(),
@@ -2129,6 +2150,8 @@ struct ModelBehaviorConfigSection {
     anthropic_model_mapping: AnthropicModelMapping,
     #[serde(default)]
     gemini_model_mapping: GeminiModelMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patrol_model: Option<PatrolModelConfig>,
     #[serde(default)]
     hooks: HooksConfig,
     #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
@@ -2271,6 +2294,7 @@ impl From<ConfigValues> for ConfigRoot {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2312,6 +2336,7 @@ impl From<ConfigValues> for ConfigRoot {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
+                patrol_model,
                 hooks,
                 lifecycle_hooks,
             },
@@ -2374,6 +2399,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
         } = model_behavior;
@@ -2413,6 +2439,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2466,6 +2493,8 @@ define_counted_struct! {
         pub(crate) memory: crate::MemoryConfigModule,
         pub(crate) subagents: crate::SubagentsConfigModule,
         pub(crate) providers: crate::ProviderConfigsModule,
+        pub(crate) provider_metadata_overrides: crate::provider_instance::ProviderMetadataOverrides,
+        retired_provider_env_override: bool,
         recovery_status: Option<ConfigRecoveryStatus>,
     }
     count pub CONFIG_FIELD_COUNT;
@@ -2531,6 +2560,9 @@ impl<'de> Deserialize<'de> for Config {
             .map_err(D::Error::custom)?
             .unwrap_or_default();
         let root: ConfigRoot = serde_json::from_value(value).map_err(D::Error::custom)?;
+        if let Some(model) = &root.model_behavior.patrol_model {
+            model.validate().map_err(D::Error::custom)?;
+        }
 
         Ok(Self::from_parts(root.into(), memory, subagents, providers))
     }
@@ -2592,12 +2624,16 @@ pub struct ProviderConfigs {
     /// Google Gemini provider configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini: Option<GeminiConfig>,
-    /// GitHub Copilot provider configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub copilot: Option<CopilotConfig>,
     /// Bodhi proxy provider configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bodhi: Option<BodhiConfig>,
+
+    /// Routing aliases that were exact Copilot instance IDs before migration.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_provider_aliases: BTreeSet<String>,
+    /// The previous default was retired and requires explicit reconfiguration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub copilot_default_retired: bool,
 
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
@@ -2611,7 +2647,7 @@ impl ProviderConfigs {
         self.openai = None;
         self.anthropic = None;
         self.gemini = None;
-        self.copilot = None;
+        self.extra.remove("copilot");
         self.bodhi = None;
         self.extra.remove("provider");
     }
@@ -2663,6 +2699,9 @@ pub struct DefaultsConfig {
     /// Falls back to `fast`, then `chat`, when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<bamboo_domain::ProviderModelRef>,
+    /// Model for reviewing Work records. An absent role uses the configured Fast model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_review: Option<bamboo_domain::ProviderModelRef>,
     /// Default model for child SubAgent runs.
     /// Falls back to `fast`, then `chat` when unset.
     #[serde(
@@ -3323,59 +3362,6 @@ pub struct GeminiConfig {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// GitHub Copilot provider configuration
-///
-/// # Example
-///
-/// ```json
-/// "copilot": {
-///   "enabled": true,
-///   "headless_auth": false,
-///   "model": "gpt-4o"
-/// }
-/// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CopilotConfig {
-    /// Whether Copilot provider is enabled
-    #[serde(default)]
-    pub enabled: bool,
-    /// Print login URL to console instead of opening browser
-    #[serde(default)]
-    pub headless_auth: bool,
-    /// Default model to use for Copilot (used when clients request the "default" model)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Fast/cheap model for lightweight tasks (title generation, mermaid fix, summarization).
-    /// Falls back to `model` when not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fast_model: Option<String>,
-    /// Vision-capable model for image understanding tasks.
-    /// Falls back to `model` when not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_model: Option<String>,
-    /// Default reasoning effort for Copilot requests.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
-
-    /// Models that must use the OpenAI Responses API upstream (instead of chat/completions).
-    ///
-    /// This is useful for newer Copilot models that only support Responses-style requests.
-    ///
-    /// Example:
-    /// ```json
-    /// "responses_only_models": ["gpt-5.3-codex", "gpt-5*"]
-    /// ```
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub responses_only_models: Vec<String>,
-    /// Optional request overrides (headers/body patches/model rules).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_overrides: Option<RequestOverridesConfig>,
-
-    /// Preserve unknown keys under `providers.copilot`.
-    #[serde(default, flatten)]
-    pub extra: BTreeMap<String, Value>,
-}
-
 /// Bodhi proxy provider configuration.
 ///
 /// Routes LLM requests through a bodhi-server instance so that raw provider
@@ -3446,8 +3432,8 @@ fn default_provider() -> String {
 pub struct ProviderInstanceConfig {
     /// Which provider backend this instance targets.
     ///
-    /// Must be one of [`AVAILABLE_PROVIDERS`]: `"openai"`, `"anthropic"`,
-    /// `"gemini"`, `"copilot"`, `"bodhi"`.
+    /// New instances use `"openai"`, `"anthropic"` or `"gemini"`.
+    /// Existing gateway instances can use `"bodhi"`.
     pub provider_type: String,
 
     /// Human-readable label shown in the UI / catalog.
@@ -3666,6 +3652,8 @@ impl Config {
             memory: crate::MemoryConfigModule(memory),
             subagents: crate::SubagentsConfigModule(subagents),
             providers: crate::ProviderConfigsModule(providers),
+            provider_metadata_overrides: Default::default(),
+            retired_provider_env_override: false,
             recovery_status: None,
         }
     }
@@ -3832,6 +3820,7 @@ impl Config {
         config.normalize_skill_settings();
         config.normalize_plugin_trust_settings();
         config.extra.remove("data_dir");
+        crate::provider_instance::retire_copilot(&mut config);
         if apply_env {
             config.apply_env_overrides();
         }
@@ -4099,6 +4088,7 @@ impl Config {
         // Legacy: `data_dir` is no longer a persisted config field. The data directory is
         // derived from runtime (BAMBOO_DATA_DIR or `${HOME}/.bamboo`).
         config.extra.remove("data_dir");
+        crate::provider_instance::retire_copilot(&mut config);
 
         // Apply environment variable overrides (highest priority). Skipped by
         // one-shot CLI writers (`bamboo init` / `config set`) so transient
@@ -4121,6 +4111,7 @@ impl Config {
     /// config. Factored out so one-shot writers can skip it (see
     /// [`Config::from_data_dir_without_env`]).
     fn apply_env_overrides(&mut self) {
+        crate::provider_instance::retire_copilot(self);
         if let Ok(port) = std::env::var("BAMBOO_PORT") {
             if let Ok(port) = port.parse() {
                 self.server.port = port;
@@ -4135,9 +4126,14 @@ impl Config {
         // mode the override may name either an exact instance id or a provider
         // type. Type matches are ordered by instance id so the result is
         // deterministic even for a multi-account configuration.
+        self.retired_provider_env_override = false;
         if let Ok(provider) = crate::runtime_env_var("BAMBOO_PROVIDER") {
             let provider = provider.trim().to_string();
-            if !provider.is_empty() {
+            if self.is_retired_provider_alias(&provider)
+                || (provider == "copilot" && !self.provider_instances.contains_key(&provider))
+            {
+                self.retired_provider_env_override = true;
+            } else if !provider.is_empty() {
                 self.provider = provider.clone();
                 if !self.provider_instances.is_empty() {
                     let selected = self
@@ -4187,67 +4183,7 @@ impl Config {
             memory.project_first_dream = parse_bool_env(&project_first_dream);
         }
 
-        // Per-provider API keys from the environment (highest priority). Lets a
-        // 12-factor / secret-manager / --env-file / k8s-Secret deploy supply the
-        // key at runtime instead of baking a plaintext `api_key` into a mounted
-        // config.json. The `api_key_from_env` flag keeps `refresh_provider_api_keys_encrypted`
-        // from re-encrypting these keys into `api_key_encrypted` on a later save,
-        // so an env key is never persisted to disk. (#253)
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_OPENAI_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let openai = self
-                        .providers
-                        .openai
-                        .get_or_insert_with(OpenAIConfig::default);
-                    openai.api_key = key.to_string();
-                    openai.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("openai", key);
-                }
-            }
-        }
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_ANTHROPIC_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let anthropic = self
-                        .providers
-                        .anthropic
-                        .get_or_insert_with(AnthropicConfig::default);
-                    anthropic.api_key = key.to_string();
-                    anthropic.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("anthropic", key);
-                }
-            }
-        }
-        if let Ok(key) = crate::runtime_env_var("BAMBOO_GEMINI_API_KEY") {
-            let key = key.trim();
-            if !key.is_empty() {
-                if self.provider_instances.is_empty() {
-                    let gemini = self
-                        .providers
-                        .gemini
-                        .get_or_insert_with(GeminiConfig::default);
-                    gemini.api_key = key.to_string();
-                    gemini.api_key_from_env = true;
-                } else {
-                    self.apply_provider_instance_env_key("gemini", key);
-                }
-            }
-        }
-    }
-
-    fn apply_provider_instance_env_key(&mut self, provider_type: &str, key: &str) {
-        for instance in self.provider_instances.values_mut().filter(|instance| {
-            instance.provider_type == provider_type
-                && crate::provider_instance_api_key_from_env(instance)
-        }) {
-            instance.api_key = key.to_string();
-            instance.api_key_encrypted = None;
-        }
+        crate::provider_instance::apply_provider_env_overrides(self, true);
     }
 
     /// Apply runtime-only `BAMBOO_*` overrides to a config assembled by the
@@ -4256,6 +4192,22 @@ impl Config {
     /// using the no-env load path so overrides are never persisted.
     pub fn apply_runtime_env_overrides(&mut self) {
         self.apply_env_overrides();
+    }
+
+    /// Apply endpoint and model overrides when staging a provider update.
+    /// The caller's credential inputs are left to the credential transaction.
+    pub fn apply_runtime_provider_metadata_overrides(&mut self) {
+        crate::provider_instance::apply_provider_env_overrides(self, false);
+    }
+
+    /// Restore saved endpoint and model values on a detached settings view.
+    pub fn restore_saved_provider_metadata(&mut self) {
+        crate::provider_instance::restore_provider_metadata(self);
+    }
+
+    /// Whether the selected account has a rejected runtime endpoint override.
+    pub fn has_invalid_runtime_provider_base_url(&self, provider: &str) -> bool {
+        crate::provider_instance::has_invalid_runtime_base_url(self, provider)
     }
 
     /// Load config from disk AND publish its env vars to the process-global cache
@@ -4510,8 +4462,7 @@ impl Config {
     /// When `features.provider_model_ref` is enabled, reads from `defaults.chat`
     /// before falling back to legacy provider-specific config.
     ///
-    /// Note: for most providers this is a required config value (returns None when absent).
-    /// Copilot has a built-in fallback when no model is configured.
+    /// Returns None when no model is configured.
     pub fn get_model(&self) -> Option<String> {
         if self.features.provider_model_ref {
             if let Some(model_ref) = self.defaults.as_ref().map(|d| &d.chat) {
@@ -4520,10 +4471,7 @@ impl Config {
         }
         let provider = self.effective_default_provider();
         if let Some(instance) = self.provider_instances.get(provider) {
-            return instance
-                .model
-                .clone()
-                .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()));
+            return instance.model.clone();
         }
         match provider {
             "openai" => self.providers.openai.as_ref().and_then(|c| c.model.clone()),
@@ -4533,13 +4481,6 @@ impl Config {
                 .as_ref()
                 .and_then(|c| c.model.clone()),
             "gemini" => self.providers.gemini.as_ref().and_then(|c| c.model.clone()),
-            "copilot" => Some(
-                self.providers
-                    .copilot
-                    .as_ref()
-                    .and_then(|c| c.model.clone())
-                    .unwrap_or_else(|| "gpt-4o".to_string()),
-            ),
             _ => None,
         }
     }
@@ -4575,11 +4516,6 @@ impl Config {
                 "gemini" => self
                     .providers
                     .gemini
-                    .as_ref()
-                    .and_then(|c| c.fast_model.clone()),
-                "copilot" => self
-                    .providers
-                    .copilot
                     .as_ref()
                     .and_then(|c| c.fast_model.clone()),
                 _ => None,
@@ -4720,11 +4656,6 @@ impl Config {
                     .gemini
                     .as_ref()
                     .and_then(|c| c.vision_model.clone()),
-                "copilot" => self
-                    .providers
-                    .copilot
-                    .as_ref()
-                    .and_then(|c| c.vision_model.clone()),
                 _ => None,
             }
         };
@@ -4747,7 +4678,7 @@ impl Config {
 
     /// Resolve the configured default reasoning effort for a provider routing key.
     ///
-    /// The key may be a multi-instance provider id (for example `"copilot-work"`)
+    /// The key may be a multi-instance provider id (for example `"openai-work"`)
     /// or a legacy provider type (for example `"openai"`). In multi-instance mode
     /// the per-instance `reasoning_effort` lives under `provider_instances[<id>]`,
     /// so we resolve instance ids there first; otherwise we fall back to the
@@ -4782,11 +4713,6 @@ impl Config {
                 .gemini
                 .as_ref()
                 .and_then(|c| c.reasoning_effort),
-            "copilot" => self
-                .providers
-                .copilot
-                .as_ref()
-                .and_then(|c| c.reasoning_effort),
             "bodhi" => self
                 .providers
                 .bodhi
@@ -4819,7 +4745,18 @@ impl Config {
     pub fn disabled_tool_names(&self) -> BTreeSet<String> {
         self.disabled_tool_references()
             .into_iter()
-            .map(|reference| normalize_tool_ref(&reference).unwrap_or(reference))
+            .map(|reference| {
+                normalize_tool_ref(&reference)
+                    .or_else(|| {
+                        bamboo_domain::resolve_disabled_tool_reference_name(&reference, |name| {
+                            bamboo_domain::BUILTIN_TOOL_NAMES.contains(&name)
+                                || bamboo_domain::SERVER_TOOL_NAMES.contains(&name)
+                        })
+                    })
+                    .unwrap_or(reference)
+            })
+            // This compatibility facade predates the exact lowercase tool.
+            .map(|name| if name == "bash" { "Bash".into() } else { name })
             .collect()
     }
 
@@ -4866,9 +4803,42 @@ impl Config {
     /// Prefers `default_provider_instance` when set; falls back to the
     /// legacy `provider` string.
     pub fn effective_default_provider(&self) -> &str {
+        if self.has_retired_provider_default() {
+            return "";
+        }
         self.default_provider_instance
             .as_deref()
             .unwrap_or(&self.provider)
+    }
+
+    pub fn has_retired_provider_default(&self) -> bool {
+        self.retired_provider_env_override || self.has_saved_retired_provider_default()
+    }
+
+    pub fn has_saved_retired_provider_default(&self) -> bool {
+        self.default_provider_instance.is_none()
+            && self.provider == "copilot"
+            && self.providers().copilot_default_retired
+    }
+
+    /// An SDK caller's explicit provider selection outranks a runtime override.
+    pub fn clear_retired_provider_env_override(&mut self) {
+        self.retired_provider_env_override = false;
+    }
+
+    pub fn is_retired_provider_alias(&self, id: &str) -> bool {
+        self.providers().retired_provider_aliases.contains(id)
+            && !self.provider_instances.contains_key(id)
+    }
+
+    /// Keep the server-owned migration metadata and the runtime-only override
+    /// when a compatibility write or section publication reconstructs Config.
+    pub fn preserve_provider_retirement(&mut self, source: &Self) {
+        self.providers.0.retired_provider_aliases =
+            source.providers.0.retired_provider_aliases.clone();
+        self.providers.0.copilot_default_retired = source.providers.0.copilot_default_retired;
+        self.retired_provider_env_override = source.retired_provider_env_override;
+        self.provider_metadata_overrides = source.provider_metadata_overrides.clone();
     }
 
     /// Whether provider instances are configured (new multi-instance path).
@@ -4961,6 +4931,7 @@ impl Config {
                 keyword_masking: KeywordMaskingConfig::default(),
                 anthropic_model_mapping: AnthropicModelMapping::default(),
                 gemini_model_mapping: GeminiModelMapping::default(),
+                patrol_model: None,
                 hooks: HooksConfig::default(),
                 lifecycle_hooks: LifecycleHooksConfig::default(),
                 tools: ToolsConfig::default(),
@@ -5010,8 +4981,9 @@ impl Config {
     /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         crate::config_module::ensure_legacy_module_layout(data_dir)?;
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut config);
+        crate::validate_runtime_model_admission(&config).map_err(anyhow::Error::msg)?;
         config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
         config.providers.save_sync(data_dir)
@@ -5024,7 +4996,9 @@ impl Config {
         &self,
         provider_document: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
+        let mut to_save = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut to_save);
+        crate::validate_runtime_model_admission(&to_save).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
@@ -5032,7 +5006,6 @@ impl Config {
             );
         }
 
-        let mut to_save = self.clone();
         to_save.clear_legacy_provider_aliases_for_instance_mode();
         to_save.extra.remove("data_dir");
         to_save.extra.remove("model");
@@ -5186,7 +5159,9 @@ impl Config {
     /// an auto-persisted recovery. Call [`Config::confirm_recovery`] (or
     /// [`Config::confirm_recovery_and_save_to_dir`]) first.
     pub fn save_to_dir(&self, data_dir: PathBuf) -> Result<()> {
-        crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
+        let mut to_save = self.clone();
+        crate::provider_instance::restore_provider_metadata(&mut to_save);
+        crate::validate_runtime_model_admission(&to_save).map_err(anyhow::Error::msg)?;
         if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
             anyhow::bail!(
                 "refusing to overwrite config.json: it was recovered from corruption ({:?}) and \
@@ -5242,7 +5217,7 @@ impl Config {
         {
             crate::ConfigFacade::open_or_migrate(&data_dir)
                 .context("Failed to recover modular configuration before persistence")?;
-            crate::persist_facade_effective_config(&data_dir, self)
+            crate::persist_facade_effective_config(&data_dir, &to_save)
                 .context("Failed to persist modular configuration sections")?;
             return Ok(());
         }
@@ -5250,19 +5225,17 @@ impl Config {
         if crate::section_layout_is_active(&data_dir)
             .context("Failed to inspect modular configuration layout")?
         {
-            crate::persist_facade_effective_config(&data_dir, self)
+            crate::persist_facade_effective_config(&data_dir, &to_save)
                 .context("Failed to persist modular configuration sections")?;
             return Ok(());
         }
 
         let path = data_dir.join("config.json");
-
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config dir: {:?}", parent))?;
         }
 
-        let mut to_save = self.clone();
         to_save.clear_legacy_provider_aliases_for_instance_mode();
         // Never persist `data_dir` into config.json (data dir is runtime-derived).
         to_save.extra.remove("data_dir");
@@ -6142,7 +6115,7 @@ mod tests {
         );
         assert_eq!(
             config.context_management.retrieval_target_usage_percent(),
-            60
+            25
         );
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("context_management").is_none());
@@ -6216,6 +6189,52 @@ mod tests {
             ContextManagementConfig::default().strategy,
             ContextManagementStrategy::Summary
         );
+    }
+
+    #[test]
+    fn context_management_uses_one_explicit_policy_for_every_strategy() {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                "strategy": strategy,
+                "trigger_usage_ratio": 0.72,
+                "target_usage_ratio": 0.20,
+                "retrieval_window": {"trigger_usage_ratio": 0.9, "target_usage_ratio": 0.6}
+            }))
+            .unwrap();
+            let budget =
+                policy.apply_compression_policy(bamboo_domain::TokenBudget::for_model(200_000));
+            assert_eq!(budget.compression_trigger_percent, 72);
+            assert_eq!(budget.compression_target_percent, 20);
+            let saved = serde_json::to_value(&policy).unwrap();
+            let restored: ContextManagementConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored, policy);
+        }
+    }
+
+    #[test]
+    fn context_management_migrates_stricter_legacy_ratios_without_preserving_old_sixty_percent_target(
+    ) {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            for (trigger, target, expected_trigger, expected_target) in
+                [(0.80, 0.60, 0.80, 0.25), (0.65, 0.15, 0.65, 0.15)]
+            {
+                let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                    "strategy": strategy,
+                    "retrieval_window": {"trigger_usage_ratio": trigger, "target_usage_ratio": target}
+                })).unwrap();
+                assert_eq!(policy.trigger_usage_ratio, expected_trigger);
+                assert_eq!(policy.target_usage_ratio, expected_target);
+            }
+        }
+    }
+
+    #[test]
+    fn context_management_rejects_unrepresentable_shared_range() {
+        for (trigger, target) in [(0.80, 0.80), (1.01, 0.25), (0.015, 0.01), (0.80, 0.005)] {
+            let value =
+                serde_json::json!({"trigger_usage_ratio": trigger, "target_usage_ratio": target});
+            assert!(serde_json::from_value::<ContextManagementConfig>(value).is_err());
+        }
     }
 
     #[test]
@@ -9321,7 +9340,7 @@ mod tests {
             config.disabled_tool_names(),
             BTreeSet::from([
                 "Bash".to_string(),
-                "GetCurrentDir".to_string(),
+                "Workspace".to_string(),
                 "Read".to_string()
             ])
         );
@@ -9400,6 +9419,33 @@ mod tests {
         assert_eq!(config.server.port, 9999);
         assert_eq!(config.server.bind, "192.168.1.1");
         assert_eq!(config.provider, "openai");
+    }
+
+    #[test]
+    fn retired_provider_env_override_leaves_saved_default_unchanged() {
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("copilot"));
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "default_provider_instance": "work",
+            "provider_instances": {
+                "work": {"provider_type": "anthropic"}
+            }
+        }))
+        .unwrap();
+        config.apply_runtime_env_overrides();
+        assert_eq!(config.effective_default_provider(), "");
+        assert!(!config.has_saved_retired_provider_default());
+        let saved: Config =
+            serde_json::from_value(config.to_compatibility_value().unwrap()).unwrap();
+        assert_eq!(saved.effective_default_provider(), "work");
+
+        config.provider_instances.insert(
+            "copilot".into(),
+            serde_json::from_value(serde_json::json!({"provider_type": "openai"})).unwrap(),
+        );
+        config.apply_runtime_env_overrides();
+        assert_eq!(config.effective_default_provider(), "copilot");
     }
 
     #[test]
@@ -10455,6 +10501,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10492,6 +10539,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10532,6 +10580,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10575,6 +10624,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10601,6 +10651,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10647,6 +10698,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10676,6 +10728,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10722,6 +10775,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });

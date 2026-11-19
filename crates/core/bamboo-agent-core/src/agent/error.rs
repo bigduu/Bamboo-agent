@@ -223,6 +223,19 @@ pub enum AgentError {
         response_id: Option<String>,
     },
 
+    /// The provider reached its output ceiling before yielding a usable round.
+    #[error("LLM reached its output token limit (finish_reason={finish_reason}, response_id={response_id:?})")]
+    OutputTokenLimit {
+        finish_reason: &'static str,
+        response_id: Option<String>,
+        /// A completed attempt with reasoning and no visible answer or tool activity.
+        reasoning_only: bool,
+    },
+
+    /// The local stream reader stopped a reasoning-only attempt after sustained repetition.
+    #[error("LLM repeated its reasoning (response_id={response_id:?})")]
+    ReasoningRepetition { response_id: Option<String> },
+
     /// LLM request exceeded provider context/input limits and requires
     /// host-side overflow recovery before retry.
     #[error("LLM overflow: {0}")]
@@ -253,6 +266,10 @@ pub enum AgentError {
     /// Token budget exceeded error
     #[error("Budget error: {0}")]
     Budget(String),
+
+    /// The compression model completed without usable summary text.
+    #[error("The model returned no summary. Lower the reasoning effort for the model used for context compression, then try again.")]
+    EmptyContextSummary,
 
     /// Agent execution was cancelled by user
     #[error("Cancelled")]

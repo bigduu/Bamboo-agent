@@ -26,6 +26,10 @@ Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness �
 本文描述 **开发源码检出**：最初产品审查基线为 `025641317c5703226052a4b94a52d1844615c352`，本次文档更新基于 `dev` 提交 `10ca51ccdf1f253ff6ec1e78f21b4c74835e1582`，不表示每个命令和能力都已进入最新 crates.io 发布版。比较版本时请查看已安装程序的 `bamboo --help` 和[版本/源码审查](./docs/readme-audit.md)。源码 manifest 有意使用 `0.0.0` 占位，发布流程另行写入发布版本。下方录屏保留其独立的较早源码来源说明。
 
 
+## Terminal-Bench 评测
+
+Bamboo `7efc6bbd0` 使用 DS Flash high 和 Auto 模式，在本地 Terminal-Bench 2.1 的 78 道题子集上通过 **60 道（76.92%）**。按相同 78 道题重算，参考排名为 **第 2 / 11**。Bamboo 每题一次有效尝试，公开榜数据每题三次。[逐题结果、运行配置和复跑命令](./docs/benchmarks/terminal-bench-2.1-2026-11-15/README.md)
+
 ## 看界面准备项目上下文
 
 ![Lotus Next 在真实 Bamboo 后端创建演示项目，并为新任务选择工作区。](docs/demos/project-workspace.gif)
@@ -38,6 +42,18 @@ Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness �
 ## 开始使用
 
 ### 安装
+
+#### Bodhi 桌面版
+
+Bodhi 内置 Bamboo 运行时。终端安装脚本支持运行 macOS 13.5 或更高版本的 Apple Silicon Mac，以及使用 APT 的 Linux x64 发行版。
+
+```sh
+curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://bigduu.github.io/Pavilion/install.sh | sh
+```
+
+[Bodhi 安装要求与下载](https://bigduu.github.io/Pavilion/download?lang=zh#terminal-install)
+
+#### 独立安装 Bamboo
 
 安装已发布包：
 
@@ -88,6 +104,19 @@ bamboo history <session-id>
 bamboo -p "接下来应该读哪些文件？" -s <session-id>
 ```
 
+接入自定义网关时，按网关的 API 协议选 provider，再提供网关上的模型 ID。下面的命令使用 OpenAI 兼容协议，可从空数据目录运行。
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "回复 OK。" --provider openai
+```
+
+Anthropic 和 Gemini 使用同样的变量名规则。长期使用可运行 `bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id` 保存设置。[各 provider 的配置方式与优先级](./docs/config-reference.md#choosing-a-provider-and-model)。
+
+普通模式把推理进度写到 stderr。使用 `--stream-json` 时，stdout 输出 NDJSON 事件流。
+
 Headless 运行使用完整 agent 运行时和已配置的 provider。交互式 `bamboo -p` 因工具权限请求或提问暂停时，请在同一个终端回答提示。浏览器回应和 `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` 面向独立运行的 `bamboo serve` 所拥有的任务，不能解除进程内 headless 任务的等待。不要仅为了跑通示例而关闭权限检查。
 
 还没有密钥？`bamboo -p "ping" --echo` **仅用于传输链路冒烟**：它使用 echo executor 而非 LLM，不证明模型推理或工具任务成功。
@@ -117,6 +146,12 @@ curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
 ### 作为进程内 Rust SDK 使用
 
 嵌入 SDK 时，`bamboo_sdk::agent::Agent` 通过 `run`、`run_stream`、`execute` 使用同一引擎；默认装配需要已配置的 provider，不会提供凭据。参见 [CLI / HTTP / SDK 入门示例](./docs/guides/GETTING_STARTED.md)、[API 参考](./docs/guides/API.md)及[发布包 rustdoc](https://docs.rs/bamboo-agent)。
+
+## 通过 Tailscale 访问 Bamboo 和 Lotus
+
+在运行 Bamboo 的电脑上安装 Tailscale 客户端和命令行工具。通过绑定回环地址的 Bamboo HTTP 服务打开本机 Lotus，进入 **系统设置 → 系统 → Tailscale 远程访问**。连接这台电脑，按提示登录 Tailscale，再设置 Bamboo 访问密码。组网启用 MagicDNS 和 HTTPS 证书后，开启远程访问并复制 HTTPS 地址。[Tailscale CLI 安装指南](https://tailscale.com/docs/reference/tailscale-cli)
+
+在组网内以用户身份登录 Tailscale 的设备上打开该地址，再用 Bamboo 访问密码登录。Bamboo 重启后会为保存的 Tailscale 设备和 HTTPS 端口恢复远程访问。点击 **关闭远程访问** 会停止分享并断开已有的实时连接。
 
 ## 数据与运行边界
 

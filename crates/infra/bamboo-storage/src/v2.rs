@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::SessionPresentationMutation;
 use bamboo_domain::{
     is_matching_session_message, Message, MessagePart, ParentQuestion, ParentQuestionResolution,
     ParentRequest, ParentResolution, ProjectId, Role, RootModeOperationAction,
@@ -402,6 +403,8 @@ struct TaskControlPlaneUndo {
     task_list: Option<TaskList>,
     task_list_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_task_blocker: Option<bamboo_domain::ManagedTaskBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_witness: Option<TaskConversationWitness>,
 }
 
@@ -673,6 +676,19 @@ struct SessionControlPlane {
     session: Session,
 }
 
+fn decode_main_control_plane(raw: &str, side: Option<&Session>) -> serde_json::Result<Session> {
+    let main = serde_json::from_str::<SessionControlPlane>(raw)?.session;
+    if side.is_some_and(|side| {
+        crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+    }) {
+        // Only an ambiguous response pair needs its actual pending result ID.
+        // The caller still projects away all transcript fields.
+        serde_json::from_str(raw)
+    } else {
+        Ok(main)
+    }
+}
+
 impl<'de> Deserialize<'de> for SessionControlPlane {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ControlVisitor;
@@ -742,6 +758,11 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
 pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    // The handoff's acknowledgement shares the response's Main boundary.
+    // Runtime-only writes cannot publish or consume it.
+    snapshot
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
     // Native transcript groups are committed atomically with the ordinary
     // message that anchors them. Never let runtime.json expose a load/search
     // item without the corresponding session.json history boundary.
@@ -769,6 +790,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
             side.observe_main_session_version(main.session_version);
+            crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1082,6 +1104,9 @@ pub struct SessionPlacement {
 pub struct SessionIndexEntry {
     pub id: String,
     pub kind: SessionKind,
+    /// Derived discovery hint. Main and the original Inbox receipt own the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_notification_hint: Option<String>,
     /// Path relative to `bamboo_home_dir` (e.g. "sessions/<id>" or "sessions/<root>/children/<id>").
     pub rel_path: String,
     pub title: String,
@@ -1131,6 +1156,11 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// The latest run has a material subscriber while this Session has a
+    /// pending question. Its delivery hint can retire before the question clears.
+    /// Absent on older index rows or Sessions with no pending question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_material_run: Option<bool>,
     /// Whether this session has yielded to a delegated child, mirrored from
     /// `session.agent_runtime_state.waiting_for_children`. A yielding Root stops
     /// counting as a running runner, so without this mirror a list read cannot
@@ -1163,6 +1193,8 @@ pub struct SessionIndexEntry {
     /// Typed permission mode mirrored from the session runtime state.
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_profile_revision: Option<u64>,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1497,6 +1529,37 @@ struct SessionWriteGuard {
     metrics: Arc<SessionPersistenceMetrics>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SessionLockWait {
+    Wait,
+    Try,
+}
+
+impl SessionLockWait {
+    pub(crate) fn lock_exclusive(self, file: &std::fs::File) -> io::Result<()> {
+        match self {
+            Self::Wait => FileExt::lock_exclusive(file),
+            Self::Try => FileExt::try_lock_exclusive(file).map_err(|error| {
+                let contended = error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error().is_some_and(|code| {
+                        Some(code) == fs2::lock_contended_error().raw_os_error()
+                    });
+                if contended {
+                    io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+                } else {
+                    error
+                }
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaterialNotificationStamps {
+    pub main: (u64, std::time::SystemTime),
+    pub runtime: (u64, std::time::SystemTime),
+}
+
 #[derive(Debug)]
 struct WaitingSaveCounter {
     metrics: Arc<SessionPersistenceMetrics>,
@@ -1787,6 +1850,12 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
+    #[cfg(feature = "test-utils")]
+    full_save_fault: std::sync::Mutex<Option<(String, bool)>>,
+    #[cfg(feature = "test-utils")]
+    full_response_publication_fault: std::sync::Mutex<Option<String>>,
+    #[cfg(feature = "test-utils")]
+    once_handoff_claim_fault: std::sync::Mutex<Option<String>>,
     #[cfg(test)]
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
     #[cfg(test)]
@@ -1818,11 +1887,18 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
+    "runtime.host_run_id",
+    "runtime.root_writer_observation_v1",
+    "runtime.host_launch_generation",
+    "runtime.host_prior_activation_fence",
+    "runtime.reconciled_activation_fence",
+    "runtime.reconciled_terminal_generation",
     "agent.runtime.state",
     "assignment_prompt",
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
-    "created_by_connect_key",
+    bamboo_domain::CONNECT_SESSION_ORIGIN_KEY,
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",
@@ -1960,6 +2036,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         runtime.last_run_error = None;
         runtime.pending_injected_messages = None;
         runtime.task_list_version = None;
+        runtime.managed_task_blocker = None;
         runtime.todo_list_version = None;
         runtime.session_inbox_admission = None;
         runtime.supervised_root_outcomes = None;
@@ -2127,6 +2204,12 @@ impl SessionStoreV2 {
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_save_fault: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_response_publication_fault: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            once_handoff_claim_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2466,7 +2549,7 @@ impl SessionStoreV2 {
     }
 
     /// Same canonical pair, revocation and proof validation as the full reader.
-    /// The control view never deserializes private messages/provider history.
+    /// The control view discards private messages and provider history.
     async fn load_session_from_dir_strict_view(
         &self,
         abs_dir: &Path,
@@ -2555,7 +2638,18 @@ impl SessionStoreV2 {
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
         self.validate_root_tool_authority_overlay(id, &main, sidecar.as_ref())
             .await?;
+        if control_only
+            && sidecar.as_ref().is_some_and(|side| {
+                crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+            })
+        {
+            let transcript: Session = serde_json::from_str(&raw)?;
+            main.messages = transcript.messages;
+        }
         let mut session = overlay_runtime_sidecar(main, sidecar);
+        if control_only {
+            session.messages.clear();
+        }
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
@@ -2667,19 +2761,38 @@ impl SessionStoreV2 {
         session_id: &str,
         kind: SaveKind,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, Some(kind)).await
+        self.acquire_session_lock(session_id, Some(kind), SessionLockWait::Wait)
+            .await
     }
 
     async fn acquire_session_maintenance_lock(
         &self,
         session_id: &str,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, None).await
+        self.acquire_session_lock(session_id, None, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn try_acquire_session_maintenance_lock(
+        &self,
+        session_id: &str,
+    ) -> io::Result<SessionWriteGuard> {
+        self.acquire_session_lock(session_id, None, SessionLockWait::Try)
+            .await
     }
 
     async fn acquire_actor_tree_write_guard(
         &self,
         root_id: &str,
+    ) -> io::Result<ActorTreeWriteGuard> {
+        self.acquire_actor_tree_write_guard_with_wait(root_id, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn acquire_actor_tree_write_guard_with_wait(
+        &self,
+        root_id: &str,
+        wait: SessionLockWait,
     ) -> io::Result<ActorTreeWriteGuard> {
         validate_session_id(root_id)?;
         let mut hash = Sha256::new();
@@ -2694,7 +2807,7 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok::<_, io::Error>(file)
         })
         .await
@@ -2830,7 +2943,10 @@ impl SessionStoreV2 {
         durable_atomic_write(&directory.join(ACTOR_TREE_REVISION_FILE), &bytes).await
     }
 
-    async fn open_session_write_lock_file_at(path: PathBuf) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file_at(
+        path: PathBuf,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -2838,20 +2954,24 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok(file)
         })
         .await
         .map_err(|error| other_io_error(format!("join session write-lock task: {error}")))?
     }
 
-    async fn open_session_write_lock_file(&self, session_id: &str) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file(
+        &self,
+        session_id: &str,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         let path = self.session_write_lock_path(session_id);
-        match Self::open_session_write_lock_file_at(path.clone()).await {
+        match Self::open_session_write_lock_file_at(path.clone(), wait).await {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.ensure_session_write_lock_dir().await?;
-                Self::open_session_write_lock_file_at(path).await
+                Self::open_session_write_lock_file_at(path, wait).await
             }
             Err(error) => Err(error),
         }
@@ -2861,6 +2981,7 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
         kind: Option<SaveKind>,
+        wait: SessionLockWait,
     ) -> io::Result<SessionWriteGuard> {
         validate_session_id(session_id)?;
         let waiting = kind.map(|_| {
@@ -2887,8 +3008,13 @@ impl SessionStoreV2 {
             acquired: Instant::now(),
             metrics: self.persistence_metrics.clone(),
         };
-        session_guard.guard = Some(lock.lock_owned().await);
-        let file = self.open_session_write_lock_file(session_id).await?;
+        session_guard.guard = Some(match wait {
+            SessionLockWait::Wait => lock.lock_owned().await,
+            SessionLockWait::Try => lock.try_lock_owned().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+            })?,
+        });
+        let file = self.open_session_write_lock_file(session_id, wait).await?;
         session_guard.file = Some(file);
         drop(waiting);
         if let Some(kind) = kind {
@@ -2945,6 +3071,50 @@ impl SessionStoreV2 {
             pause.reached.wait().await;
             pause.release.wait().await;
         }
+    }
+
+    /// Interrupt the next full save for a test-owned Session at the Main boundary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_full_save_at_main_for_test(&self, session_id: &str, after_main: bool) {
+        *self.full_save_fault.lock().unwrap() = Some((session_id.into(), after_main));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_response_publication_for_test(&self, session_id: &str) {
+        *self.full_response_publication_fault.lock().unwrap() = Some(session_id.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_once_handoff_claim_for_test(&self, session_id: &str) {
+        *self.once_handoff_claim_fault.lock().unwrap() = Some(session_id.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_response_publication_fault(&self, session_id: &str) -> io::Result<()> {
+        let mut fault = self.full_response_publication_fault.lock().unwrap();
+        if fault.as_deref() == Some(session_id) {
+            fault.take();
+            return Err(io::Error::other(
+                "injected response publication interruption",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_full_save_fault(&self, session_id: &str, after_main: bool) -> io::Result<()> {
+        let mut fault = self.full_save_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(id, after)| id == session_id && *after == after_main)
+        {
+            *fault = None;
+            return Err(io::Error::other("injected full save interruption at Main"));
+        }
+        Ok(())
     }
 
     pub fn bamboo_home_dir(&self) -> &Path {
@@ -3358,9 +3528,122 @@ impl SessionStoreV2 {
         items
     }
 
+    pub async fn recent_index_entries_matching(
+        &self,
+        limit: usize,
+        matches: impl Fn(&SessionIndexEntry) -> bool,
+    ) -> Vec<SessionIndexEntry> {
+        let index = self.index.read().await;
+        let mut items: Vec<_> = index
+            .sessions
+            .values()
+            .filter(|entry| matches(entry))
+            .collect();
+        let newest = |left: &&SessionIndexEntry, right: &&SessionIndexEntry| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        };
+        if items.len() > limit {
+            items.select_nth_unstable_by(limit, newest);
+            items.truncate(limit);
+        }
+        items.sort_unstable_by(newest);
+        items.into_iter().cloned().collect()
+    }
+
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
         let index = self.index.read().await;
         index.sessions.get(session_id).cloned()
+    }
+
+    pub(crate) async fn mark_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        receipt_id: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let receipt_id = receipt_id.to_owned();
+        self.update_index(move |index| {
+            let entry = index
+                .sessions
+                .get_mut(&session_id)
+                .filter(|entry| entry.created_at == created_at)
+                .ok_or_else(|| {
+                    io::Error::other("material notification source index is unavailable")
+                })?;
+            entry.material_notification_hint = Some(receipt_id);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Retire a derived hint only if a newer request has not replaced it.
+    pub async fn clear_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        expected_hint: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let expected_hint = expected_hint.to_owned();
+        self.update_index(move |index| {
+            if let Some(entry) = index.sessions.get_mut(&session_id).filter(|entry| {
+                entry.created_at == created_at
+                    && entry.material_notification_hint.as_deref() == Some(expected_hint.as_str())
+            }) {
+                entry.material_notification_hint = None;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// File metadata is a cache hint. Physical notification admission reads Main.
+    pub async fn material_notification_stamps(
+        &self,
+        session_id: &str,
+    ) -> io::Result<MaterialNotificationStamps> {
+        validate_session_id(session_id)?;
+        let directory = self.sessions_dir.join(session_id);
+        if !fs::symlink_metadata(&directory).await?.file_type().is_dir() {
+            return Err(io::Error::other(
+                "material notification source is unavailable",
+            ));
+        }
+        let runtime = fs::symlink_metadata(directory.join(RUNTIME_SIDECAR_FILE)).await?;
+        if !runtime.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification runtime is unavailable",
+            ));
+        }
+        let metadata = fs::symlink_metadata(directory.join("session.json")).await?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification Main is not a regular file",
+            ));
+        }
+        Ok(MaterialNotificationStamps {
+            main: (metadata.len(), metadata.modified()?),
+            runtime: (runtime.len(), runtime.modified()?),
+        })
+    }
+
+    /// A notification may retry later while an ordinary writer owns this Root.
+    /// Preserve canonical snapshot validation without waiting on its lock.
+    pub async fn try_load_material_notification_source(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.try_acquire_session_maintenance_lock(id).await?;
+        self.load_execution_admission_unchecked(id).await
     }
 
     /// Recover a root session by its deterministic authoritative directory,
@@ -3704,9 +3987,18 @@ impl SessionStoreV2 {
             // An Ordinary Child may already own this ID in another tree.
             // Only canonical Root absence permits its normal control-plane read.
         }
-        if let Some(side) = self.read_runtime_sidecar_boxed(session_id).await? {
+        if let Some(mut side) = self.read_runtime_sidecar_boxed(session_id).await? {
             self.validate_root_tool_authority_against_proof(session_id, &side)
                 .await?;
+            if crate::session_merge::has_uncommitted_response_marker(&side) {
+                if let Some(path) = self.session_json_path(session_id).await? {
+                    let raw = fs::read_to_string(path).await?;
+                    compact_main::validate_full_main(raw.as_bytes())?;
+                    let main = decode_main_control_plane(&raw, Some(&side))?;
+                    supervisor::validate_overlay(&main, Some(&side))?;
+                    crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+                }
+            }
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
@@ -4261,6 +4553,11 @@ impl SessionStoreV2 {
         }
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        current
+            .runtime_metadata
+            .as_mut()
+            .expect("Task metadata was set")
+            .managed_task_blocker = undo.managed_task_blocker.clone();
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
             .await?;
         Ok((abs_dir, current))
@@ -4923,13 +5220,7 @@ impl SessionStoreV2 {
         {
             return Ok(false);
         }
-        let mut committed = current;
-        committed.task_list = updated.task_list.clone();
-        committed.set_task_list_version_meta(
-            updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let committed = Self::apply_unowned_task_update(&current, updated)?;
         self.write_existing_runtime_sidecar_durable_unchecked(
             &committed,
             RuntimeTaskDurabilityEvent::SingleUpdatedSidecarPublished,
@@ -5047,20 +5338,8 @@ impl SessionStoreV2 {
         // metadata writes from another store. Build the physical writes from
         // the just-revalidated durable snapshots and patch only Task-owned
         // fields, so the transaction remains narrowly targeted.
-        let mut first_commit = current_first.clone();
-        first_commit.task_list = first_updated.task_list.clone();
-        first_commit.set_task_list_version_meta(
-            first_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
-        let mut second_commit = current_second.clone();
-        second_commit.task_list = second_updated.task_list.clone();
-        second_commit.set_task_list_version_meta(
-            second_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let first_commit = Self::apply_unowned_task_update(&current_first, first_updated)?;
+        let second_commit = Self::apply_unowned_task_update(&current_second, second_updated)?;
 
         let transaction_id = Uuid::new_v4().to_string();
         let journal = RuntimeTaskTransactionJournal {
@@ -5071,12 +5350,20 @@ impl SessionStoreV2 {
                 conversation_witness: Some(TaskConversationWitness::capture(&current_first)?),
                 task_list: current_first.task_list.clone(),
                 task_list_version: first_version,
+                managed_task_blocker: current_first
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
             second: TaskControlPlaneUndo {
                 session_id: current_second.id.clone(),
                 conversation_witness: Some(TaskConversationWitness::capture(&current_second)?),
                 task_list: current_second.task_list.clone(),
                 task_list_version: second_version,
+                managed_task_blocker: current_second
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
         };
         let journal_path = self.write_runtime_task_journal(&journal).await?;
@@ -5161,6 +5448,22 @@ impl SessionStoreV2 {
         Ok(true)
     }
 
+    fn apply_unowned_task_update(current: &Session, updated: &Session) -> io::Result<Session> {
+        let mut committed = current.clone();
+        committed.task_list = updated.task_list.clone();
+        committed.set_task_list_version_meta(
+            updated
+                .task_list_version_meta()
+                .expect("validated updated Task generation"),
+        );
+        if !Self::runtime_task_owned_snapshot_matches(current, updated)? {
+            if let Some(metadata) = committed.runtime_metadata.as_mut() {
+                metadata.managed_task_blocker = None;
+            }
+        }
+        Ok(committed)
+    }
+
     fn runtime_task_owned_snapshot_matches(
         current: &Session,
         expected: &Session,
@@ -5233,6 +5536,90 @@ impl SessionStoreV2 {
             }
         }
         Ok(())
+    }
+
+    /// Recompute provenance under the same physical guard as the Task write.
+    /// The caller's snapshot never grants itself attribution, and a full save
+    /// may only carry forward a matching sidecar revision.
+    fn adopt_managed_task_blocker(
+        snapshot: &mut Session,
+        previous: Option<&Session>,
+        writer: Option<&root_actor_runtime::RootActorWriteProof>,
+    ) {
+        let blocker = previous
+            .filter(|previous| {
+                snapshot.kind == SessionKind::Root && snapshot.created_at == previous.created_at
+            })
+            .and_then(|previous| {
+                let version: u64 = snapshot.task_list_version_meta()?.parse().ok()?;
+                let tasks = snapshot
+                    .task_list
+                    .as_ref()
+                    .filter(|tasks| tasks.session_id == snapshot.id)?;
+                let previous_version = match previous.task_list_version_meta() {
+                    Some(value) => value.parse::<u64>().ok()?,
+                    None => 0,
+                };
+                let previous_tasks = previous.task_list.as_ref();
+                let previous_blocker = previous
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.as_ref())
+                    .filter(|blocker| {
+                        previous_tasks
+                            .is_some_and(|tasks| blocker.matches_revision(previous_version, tasks))
+                    });
+                if version == previous_version {
+                    return previous_blocker
+                        .filter(|blocker| blocker.matches_revision(version, tasks))
+                        .cloned();
+                }
+                let owner = writer.filter(|_| version > previous_version)?.owner();
+                let blocked = |task: &&bamboo_domain::TaskItem| {
+                    task.status == bamboo_domain::TaskItemStatus::Blocked
+                        && !task.id.is_empty()
+                        && task.id.len() <= 128
+                };
+                let mut blocked_tasks = tasks.items.iter().filter(blocked);
+                let new_blocker = blocked_tasks.find(|task| {
+                    !previous_tasks.is_some_and(|previous| {
+                        previous.items.iter().any(|item| {
+                            item.id == task.id
+                                && item.status == task.status
+                                && item.description == task.description
+                                && item.blockers == task.blockers
+                        })
+                    })
+                });
+                let (cursor, task_id) = match new_blocker {
+                    Some(task) => (version, task.id.clone()),
+                    None => {
+                        let retained = previous_blocker.filter(|blocker| {
+                            blocker.run_id == owner.fence.run_id
+                                && tasks
+                                    .items
+                                    .iter()
+                                    .filter(blocked)
+                                    .any(|task| task.id == blocker.task_id)
+                        })?;
+                        (retained.cursor, retained.task_id.clone())
+                    }
+                };
+                bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+                    owner.fence.run_id.clone(),
+                    cursor,
+                    version,
+                    task_id,
+                    tasks,
+                )
+                .ok()
+            });
+        if blocker.is_some() || snapshot.runtime_metadata.is_some() {
+            snapshot
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .managed_task_blocker = blocker;
+        }
     }
 
     fn runtime_task_non_task_snapshot(session: &Session) -> io::Result<serde_json::Value> {
@@ -5621,9 +6008,30 @@ impl SessionStoreV2 {
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
         let session_id = session.id.clone();
-        let entry = SessionIndexEntry {
+        let outcomes = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+        let material_notification_hint = outcomes.and_then(|outcomes| {
+            outcomes
+                .facts
+                .iter()
+                .rev()
+                .find_map(|fact| outcomes.material_hint_for(fact))
+        });
+        let has_pending_question = session.has_pending_question();
+        let pending_material_run = has_pending_question.then(|| {
+            outcomes.is_some_and(|outcomes| {
+                outcomes
+                    .facts
+                    .last()
+                    .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
+            })
+        });
+        let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
+            material_notification_hint,
             rel_path,
             title: session.title.clone(),
             title_version: session.title_version,
@@ -5646,13 +6054,17 @@ impl SessionStoreV2 {
             last_activity_at: session.updated_at,
             message_count: session.messages.len(),
             has_attachments,
-            has_pending_question: session.has_pending_question(),
+            has_pending_question,
+            pending_material_run,
             waiting_for_children: session_waiting_for_children(session),
             waiting_for_bash: session_waiting_for_bash(session),
             last_human_input,
             plan_mode,
             bypass_permissions,
             permission_mode,
+            supervisor_profile_revision: session
+                .supervisor_incarnation_id()
+                .map(|_| session.metadata_version),
             last_run_status,
             last_run_error,
             token_usage: session.token_usage.clone(),
@@ -5662,6 +6074,13 @@ impl SessionStoreV2 {
             placement,
         };
         self.update_index(move |index: &mut SessionsIndex| {
+            if entry.material_notification_hint.is_none() {
+                entry.material_notification_hint = index
+                    .sessions
+                    .get(&session_id)
+                    .filter(|previous| previous.created_at == entry.created_at)
+                    .and_then(|previous| previous.material_notification_hint.clone());
+            }
             if preserve_newer {
                 if let Some(existing) = index.sessions.get_mut(&session_id) {
                     if existing.updated_at > entry.updated_at {
@@ -6098,6 +6517,14 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "pending permission response must resume before clearing history",
+            ));
+        }
         if session.conversation_reset.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
                 "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
@@ -7095,6 +7522,10 @@ impl SessionStoreV2 {
             None => None,
         };
         let session = reconciled.as_ref().unwrap_or(session);
+        let normalized = self
+            .normalize_terminal_runtime_write(session, rel, guards)
+            .await?;
+        let session = &normalized;
         self.check_root_birth_guards(session, guards, false).await?;
         self.check_default_or_root_actor_context(
             session,
@@ -7132,15 +7563,26 @@ impl SessionStoreV2 {
         {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
+            crate::session_merge::reject_stale_permission_response(&durable, session, true)?;
+            let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+            let marker = durable.metadata.get(marker_key);
+            if (marker.is_some() || session.metadata.contains_key(marker_key))
+                && (marker != session.metadata.get(marker_key)
+                    || !crate::session_merge::same_permission_response_control(&durable, session))
+            {
+                return Err(root_actor_runtime::conflict(
+                    "pending permission response control changed",
+                ));
+            }
         }
-        if let Some(previous) = Self::read_runtime_sidecar_at(
+        let previous = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
             &session.id,
         )
-        .await?
-        {
-            reject_incompatible_session_write(&previous)?;
-            reject_conversation_generation_change(session, &previous)?;
+        .await?;
+        if let Some(previous) = previous.as_ref() {
+            reject_incompatible_session_write(previous)?;
+            reject_conversation_generation_change(session, previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -7150,7 +7592,7 @@ impl SessionStoreV2 {
                     previous.session_version,
                 )
             {
-                reject_session_version_change(session, &previous)?;
+                reject_session_version_change(session, previous)?;
             }
         }
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
@@ -7189,7 +7631,12 @@ impl SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(
+            &mut runtime_snapshot,
+            previous.as_ref(),
+            guards.root_actor.as_ref(),
+        );
         let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
@@ -7302,24 +7749,25 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
-        self.save_session_after_lock_with_title_intent(
+        self.save_session_after_lock_with_presentation_intent(
             session,
             total_started,
             guards,
             answer_permit,
-            false,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
-    async fn save_session_after_lock_with_title_intent(
+    async fn save_session_after_lock_with_presentation_intent(
         &self,
         session: &Session,
         total_started: Instant,
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
-        manual_title: bool,
-    ) -> io::Result<()> {
+        mutation: Option<SessionPresentationMutation>,
+    ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
             .metadata
@@ -7333,6 +7781,10 @@ impl SessionStoreV2 {
 
         self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
+        let normalized = self
+            .normalize_terminal_runtime_write(session, &intended_rel, guards)
+            .await?;
+        let session = &normalized;
         self.check_default_or_root_actor_context(
             session,
             &self.abs_path_from_rel(&intended_rel),
@@ -7341,7 +7793,11 @@ impl SessionStoreV2 {
         )
         .await?;
         self.validate_authority_for_save(session).await?;
-        self.validate_root_context_for_full_save(session).await?;
+        self.validate_root_context_for_full_save(
+            session,
+            guards.writes_supervisor_execution_profile(),
+        )
+        .await?;
         self.validate_child_project_for_write(session, true, None)
             .await?;
         self.reject_regressing_runtime_task(session).await?;
@@ -7353,6 +7809,7 @@ impl SessionStoreV2 {
         // save must still be able to repair an interrupted creation whose Main
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
+        let mut previous_sidecar = None;
         let previous_main = match fs::read_to_string(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
@@ -7371,6 +7828,7 @@ impl SessionStoreV2 {
                 {
                     previous_runtime.observe_main_session_version(durable.session_version);
                     reject_incompatible_session_write(&previous_runtime)?;
+                    previous_sidecar = Some(previous_runtime);
                 } else {
                     reject_incompatible_session_write(&durable)?;
                 }
@@ -7408,6 +7866,42 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
 
+        if let Some(previous) = previous_main.as_ref() {
+            let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+            let prior = previous.metadata.get(marker_key);
+            let proposed = session.metadata.get(marker_key);
+            if prior.is_none() && proposed.is_none() {
+                crate::session_merge::reject_stale_permission_response(previous, session, false)?;
+            }
+            if prior.is_some() && guards.once_response_handoff.is_none() {
+                if proposed != prior
+                    || !crate::session_merge::same_permission_response_control(previous, session)
+                    || serde_json::to_value(&previous.messages)?
+                        != serde_json::to_value(&session.messages)?
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "pending permission response must resume before changing its transcript or control",
+                    ));
+                }
+            } else if let Some(marker) = proposed {
+                let response: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
+                if bamboo_domain::consumed_pending_permission(previous, session).as_ref()
+                    != Some(&response)
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "permission response occurrence changed",
+                    ));
+                }
+            }
+        } else if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "permission response requires a canonical pending occurrence",
+            ));
+        }
+
         // An incoming Session field is never authority to create or roll back
         // Main-owned facts. The bound Root writer adopts the current Main and,
         // only for its exact retained Inbox lease, derives the input transition.
@@ -7436,6 +7930,46 @@ impl SessionStoreV2 {
                     .await?
             } else {
                 durable_outcomes.cloned()
+            };
+            if guards.input.is_none() {
+                if let (Some(outcomes), Some(response)) = (
+                    outcomes.as_mut(),
+                    bamboo_domain::consumed_pending_permission(durable, session),
+                ) {
+                    let reset = durable
+                        .conversation_reset_sha256()
+                        .map_err(|error| other_io_error(error.to_string()))?;
+                    outcomes
+                        .reserve_permission_resume(
+                            &root_actor.owner().fence,
+                            reset.as_deref(),
+                            &response,
+                        )
+                        .map_err(io::Error::other)?;
+                }
+            }
+            if let (Some(outcomes), Some(response)) =
+                (outcomes.as_mut(), guards.once_response_handoff.as_ref())
+            {
+                let reset = durable
+                    .conversation_reset_sha256()
+                    .map_err(io::Error::other)?;
+                outcomes
+                    .recover_permission_resume(
+                        &root_actor.owner().fence,
+                        reset.as_deref(),
+                        response,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            let current = if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
+                let mut current = session.clone();
+                if let Some(durable_outcomes) = durable_outcomes {
+                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
+                }
+                Some(current)
+            } else {
+                None
             };
             if guards.root_outcome_finalized {
                 if guards.input.is_some() {
@@ -7489,20 +8023,32 @@ impl SessionStoreV2 {
                                 ));
                             }
                         };
-                        outcomes.finalize(&owner.fence, result).map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                bamboo_domain::SessionAuthorityConflict(error.into()),
-                            )
-                        })?;
+                        let final_main = current.as_ref().unwrap_or(session);
+                        if result == bamboo_domain::SupervisedRootOutcomeResult::Suspended
+                            && outcomes.facts.last().is_some_and(|fact| {
+                                fact.run_id == owner.fence.run_id && fact.result.is_none()
+                            })
+                        {
+                            if let Some(question) =
+                                bamboo_domain::pending_permission_occurrence(final_main)
+                            {
+                                outcomes
+                                    .record_question(&owner.fence, &question)
+                                    .map_err(io::Error::other)?;
+                            }
+                        }
+                        outcomes
+                            .finalize_from_main(&owner.fence, result, final_main)
+                            .map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    bamboo_domain::SessionAuthorityConflict(error.into()),
+                                )
+                            })?;
                     }
                 }
             }
-            if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
-                let mut current = session.clone();
-                if let Some(durable_outcomes) = durable_outcomes {
-                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
-                }
+            if let Some(mut current) = current {
                 if let Some(outcomes) = outcomes {
                     current
                         .runtime_metadata
@@ -7525,11 +8071,13 @@ impl SessionStoreV2 {
 
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let session_bytes = compact_main::serialize_main(session)?;
-        let runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+        let mut session_bytes = compact_main::serialize_main(session)?;
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(&mut runtime_snapshot, previous_sidecar.as_ref(), None);
+        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
-        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+        let mut serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
         let directory_started = Instant::now();
         let rel_path = self.ensure_default_writer_dirs(session, guards).await?;
         let abs_dir = self.abs_path_from_rel(&rel_path);
@@ -7549,11 +8097,32 @@ impl SessionStoreV2 {
             let tree = self.acquire_actor_tree_write_guard(root_id).await?;
             guards.hold_tree(tree);
         }
-        let title_observations = if manual_title {
-            self.prepare_title_observations(session).await?
+        let mut presentation_candidate = mutation.map(|_| session.clone());
+        let presentation_observations = if let (Some(candidate), Some(mutation)) =
+            (presentation_candidate.as_mut(), mutation)
+        {
+            self.prepare_presentation_observations(candidate, mutation)
+                .await?
         } else {
             Vec::new()
         };
+        let session = presentation_candidate.as_ref().unwrap_or(session);
+        if mutation.is_some() {
+            // Initial buffers preflighted before directory preparation. Only
+            // the validated presentation lane can advance an existing observation;
+            // both actual files must publish that same canonical candidate.
+            let started = Instant::now();
+            session_bytes = compact_main::serialize_main(session)?;
+            let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+            Self::adopt_managed_task_blocker(
+                &mut runtime_snapshot,
+                previous_sidecar.as_ref(),
+                None,
+            );
+            runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)?;
+            serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+            stages.serialization += started.elapsed();
+        }
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
@@ -7599,8 +8168,22 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
         }
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, false)?;
+        #[cfg(feature = "test-utils")]
+        if guards.once_response_handoff.is_some() {
+            let mut fault = self.once_handoff_claim_fault.lock().unwrap();
+            if fault.as_deref() == Some(&session.id) {
+                fault.take();
+                return Err(io::Error::other(
+                    "injected Once handoff interruption before Main",
+                ));
+            }
+        }
         self.write_default_bytes(&path, session_bytes, guards)
             .await?;
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, true)?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Main)?;
         }
@@ -7621,8 +8204,8 @@ impl SessionStoreV2 {
         }
         // Observations must never lead canonical metadata: an ahead row
         // could conceal a later Project A→B→A revision. A failed refresh
-        // remains stale/fail-closed; the manual no-op path validates it too.
-        for (path, bytes) in title_observations {
+        // remains stale/fail-closed; presentation no-ops validate it too.
+        for (path, bytes) in presentation_observations {
             self.write_default_bytes(&path, bytes, guards).await?;
         }
         let (revision_path, revision) = self
@@ -7661,12 +8244,53 @@ impl SessionStoreV2 {
             total_ms = total.as_millis() as u64,
             "session durable commit completed; search indexing deferred"
         );
-        Ok(())
+        Ok(mutation.map(|_| session.clone()))
     }
 }
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn begin_host_run(&self, expected: &Session, run_id: &str) -> io::Result<()> {
+        self.begin_host_run_impl(expected, run_id).await
+    }
+
+    async fn fail_child_host_startup(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        self.fail_child_host_startup_impl(expected, run_id, error, &publish)
+            .await
+    }
+
+    async fn reconcile_child_runtime(
+        &self,
+        expected: &Session,
+        before: DateTime<Utc>,
+        error: Option<&str>,
+    ) -> io::Result<Option<Session>> {
+        self.reconcile_child_runtime_impl(expected, before, error, None)
+            .await
+    }
+
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: DateTime<Utc>,
+        error: Option<&str>,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        if expected.kind == SessionKind::Root {
+            self.reconcile_root_runtime_impl(expected, before, &publish)
+                .await
+        } else {
+            self.reconcile_child_runtime_impl(expected, before, error, Some(&publish))
+                .await
+        }
+    }
+
     async fn find_host_session_scope(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -7692,6 +8316,14 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.current_user_peer_session(caller, target_id).await
+    }
+
     async fn load_host_scoped_context_target(
         &self,
         token: &bamboo_domain::HostSessionScopeToken,
@@ -7703,12 +8335,25 @@ impl Storage for SessionStoreV2 {
     }
 
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        self.save_manual_title_committed(session).await.map(|_| ())
+    }
+
+    async fn save_manual_title_committed(&self, session: &Session) -> io::Result<Session> {
+        self.save_presentation_metadata_committed(session, SessionPresentationMutation::Title)
+            .await
+    }
+
+    async fn save_presentation_metadata_committed(
+        &self,
+        session: &Session,
+        mutation: SessionPresentationMutation,
+    ) -> io::Result<Session> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "manual title target has no canonical Root source",
+                "presentation metadata target has no canonical Root source",
             ));
         }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
@@ -7716,8 +8361,16 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
         let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
-        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
-            .await
+        let committed = self
+            .save_session_after_lock_with_presentation_intent(
+                session,
+                total_started,
+                &guards,
+                None,
+                Some(mutation),
+            )
+            .await?;
+        Ok(committed.expect("presentation transaction returns its committed candidate"))
     }
 
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {
@@ -7870,7 +8523,46 @@ impl Storage for SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, publish)
+        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, None, publish)
+            .await
+    }
+
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        approval: &bamboo_domain::storage::SupervisorApprovalCommit,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_bound_startup_impl(
+            owner,
+            session,
+            expected,
+            inherited,
+            Some(approval),
+            publish,
+        )
+        .await
+    }
+
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        approval: Option<&bamboo_domain::storage::SupervisorApprovalCommit>,
+    ) -> io::Result<Session> {
+        self.confirm_root_response_checkpoint_impl(owner, approval)
+            .await
+    }
+
+    async fn claim_once_response_handoff(
+        &self,
+        session: &Session,
+        owner: Option<&bamboo_domain::storage::RootActorRuntimeWrite>,
+        approval: Option<&bamboo_domain::storage::SupervisorApprovalCommit>,
+    ) -> io::Result<()> {
+        self.claim_once_response_handoff_impl(session, owner, approval)
             .await
     }
 
@@ -8365,7 +9057,16 @@ impl Storage for SessionStoreV2 {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let _session = self.acquire_session_maintenance_lock(session_id).await?;
-        self.load_execution_admission_unchecked(session_id).await
+        let current = self.load_execution_admission_unchecked(session_id).await?;
+        if let Some(session) = current.as_ref().filter(|session| {
+            session
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        }) {
+            let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
+            root_actor_runtime::sync_response_checkpoint(&directory)?;
+        }
+        Ok(current)
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -8381,6 +9082,26 @@ impl Storage for SessionStoreV2 {
     async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_runtime_control_plane_unchecked(session_id).await
+    }
+
+    async fn first_root_lifetime_matches(
+        &self,
+        session_id: &str,
+        birth_token: &str,
+    ) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        if self.root_revocation(session_id).await?.is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .load_runtime_control_plane_unchecked(session_id)
+            .await?
+            .is_some_and(|root| {
+                root.id == session_id
+                    && root.kind == SessionKind::Root
+                    && root.root_mode_birth_token() == birth_token
+            }))
     }
 
     async fn recover_task_control_plane_transaction(
@@ -8878,8 +9599,30 @@ mod tests {
     #[tokio::test]
     async fn paired_task_commit_marker_removal_failure_rolls_back_before_error() -> io::Result<()> {
         let (storage, _temp) = create_temp_storage().await?;
-        let (child_original, child_updated, root_original, root_updated) =
+        let (child_original, child_updated, mut root_original, mut root_updated) =
             seed_runtime_task_transaction_pair(&storage).await?;
+        // Seed the sidecar as it would look after an exact Root Task write.
+        let tasks = root_original.task_list.as_mut().unwrap();
+        tasks.items[0].status = TaskItemStatus::Blocked;
+        let proof = bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+            "recorded-run".into(),
+            1,
+            1,
+            tasks.items[0].id.clone(),
+            tasks,
+        )?;
+        for snapshot in [&mut root_original, &mut root_updated] {
+            snapshot
+                .runtime_metadata
+                .as_mut()
+                .unwrap()
+                .managed_task_blocker = Some(proof.clone());
+        }
+        fs::write(
+            storage.runtime_json_path(&root_original.id).await?.unwrap(),
+            serde_json::to_vec(&runtime_sidecar_snapshot(&root_original))?,
+        )
+        .await?;
         storage.inject_runtime_task_transaction_fault(RuntimeTaskTransactionFault::JournalRemove);
 
         let error = storage
@@ -8893,6 +9636,14 @@ mod tests {
             .expect_err("journal removal failure cannot publish success");
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_original_runtime_task_pair(&storage).await?;
+        let restored = storage
+            .load_runtime_control_plane(&root_original.id)
+            .await?
+            .unwrap();
+        assert_eq!(
+            restored.runtime_metadata.unwrap().managed_task_blocker,
+            Some(proof)
+        );
         assert!(storage.runtime_task_journal_paths().await?.is_empty());
         Ok(())
     }
@@ -9266,6 +10017,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id,
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9276,6 +10028,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9498,6 +10251,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9508,6 +10262,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9569,6 +10324,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9579,6 +10335,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9637,6 +10394,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9647,6 +10405,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -10281,6 +11040,55 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn material_notification_proof_does_not_wait_for_another_roots_writer() -> io::Result<()>
+    {
+        let (store, home) = create_temp_storage().await?;
+        for id in ["notification-busy", "notification-ready"] {
+            store
+                .save_session(&session_with_history(id, 2, "original-run"))
+                .await?;
+        }
+        let peer = SessionStoreV2::new(home.path().to_owned()).await?;
+        let held = store
+            .acquire_session_maintenance_lock("notification-busy")
+            .await?;
+        for reader in [&store, &peer] {
+            let busy = tokio::time::timeout(
+                Duration::from_secs(2),
+                reader.try_load_material_notification_source("notification-busy"),
+            )
+            .await
+            .expect("proof acquisition must return while the Root remains locked");
+            assert_eq!(busy.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert!(reader
+                .try_load_material_notification_source("notification-ready")
+                .await?
+                .is_some());
+        }
+        drop(held);
+        assert!(store
+            .try_load_material_notification_source("notification-busy")
+            .await?
+            .is_some());
+        let tree = store
+            .acquire_actor_tree_write_guard("notification-busy")
+            .await?;
+        assert_eq!(
+            peer.acquire_actor_tree_write_guard_with_wait(
+                "notification-busy",
+                SessionLockWait::Try
+            )
+            .await
+            .err()
+            .expect("a retained tree proof must refuse nonblocking acquisition")
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(tree);
         Ok(())
     }
 

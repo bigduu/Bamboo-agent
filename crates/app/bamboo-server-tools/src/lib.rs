@@ -18,7 +18,6 @@ pub mod memory;
 pub mod notify;
 pub mod overlay_executor;
 pub mod parent_request_reply;
-pub mod plan;
 pub mod project_tools;
 pub mod registry_keys;
 pub mod scoped_session_messaging;
@@ -44,7 +43,6 @@ pub use parent_request_reply::{
     validate_parent_answer_input, ParentQuestionReplyReceipt, ParentRequestMessageReceipt,
     ParentRequestReplyPort, ParentRequestReplyReceipt, ParentRequestReplyState,
 };
-pub use plan::PlanTool;
 pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
 pub use session_control::SessionControlTool;
 pub use session_inspector::SessionInspectorTool;

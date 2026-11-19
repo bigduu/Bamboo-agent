@@ -1,10 +1,9 @@
-name: Delegated Planner Acceptance
+name: Retained Planner Analysis
 
 on:
   pull_request:
     branches: [dev]
     paths:
-      - 'crates/app/bamboo-server-tools/src/plan.rs'
       - 'crates/app/bamboo-server/src/app_state/tools.rs'
       - 'crates/engine/bamboo-engine/src/session_app/child_session/planner_artifact.rs'
       - 'crates/engine/bamboo-engine/src/session_app/child_session/result_projection.rs'
@@ -12,7 +11,6 @@ on:
       - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
       - 'crates/infra/bamboo-memory/src/plan_store.rs'
       - 'tests/required_child_context_packet.rs'
-      - 'tests/support/delegated_planner.rs'
       - '.github/workflows/delegated-planner-acceptance.yml'
 
 permissions:
@@ -24,7 +22,7 @@ concurrency:
 
 jobs:
   planner:
-    name: Native Delegated Plan (Linux)
+    name: Retained Planner Analysis (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -55,19 +53,7 @@ jobs:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
           save-if: false
-      # Planner12/10 library runtime belongs to the canonical default driver.
-      # This source/config remains the distinct API-only CLI and lint owner.
-      - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
-        shell: bash
-        run: |
-          set -euo pipefail
-          result="$RUNNER_TEMP/planner-native.log"
-          cargo test --locked -p bamboo-agent --test required_child_context_packet \
-            delegated_planner::real_cli_planner_ \
-            -- --test-threads=1 --nocapture 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$result"
-          grep -Fq 'actual delegated Plan: source-bound Host+worker;' "$result"
-          grep -Fq 'actual delegated Plan crash: real Host SIGKILL/restart;' "$result"
+      # Recovery runtime cases belong to the canonical feature driver.
       - name: Check affected production libraries under original CI lint policy
         run: >-
           cargo clippy --locked --all-features

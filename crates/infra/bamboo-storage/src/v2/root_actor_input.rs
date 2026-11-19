@@ -3,8 +3,8 @@ use super::root_actor_runtime::{conflict, RootActorWriteProof};
 use super::*;
 use crate::session_inbox::{FileSessionInbox, InboxAuthority, OwnedFilesystem};
 use bamboo_domain::{
-    RootActorRuntimePublisher, RootActorRuntimeWrite, SessionInboxOwnedClaim, SessionInboxPort,
-    SessionMessageEnvelope,
+    RootActorRuntimePublisher, RootActorRuntimeWrite, SessionActivationPolicy,
+    SessionInboxOwnedClaim, SessionInboxPort, SessionMessageEnvelope,
 };
 
 /// A detached physical job can outlive the async waiter. Dropping the waiter
@@ -114,9 +114,9 @@ impl RootActorInputProof {
         durable: &Session,
     ) -> io::Result<Option<bamboo_domain::SupervisedRootOutcomes>> {
         self.root.validate_deadline(self.claim.lease.expires_at)?;
-        let (envelope, intent) = self
+        let (envelope, intent, message_policy) = self
             .inbox
-            .locked_owned_claim(
+            .locked_owned_claim_with_message_policy(
                 &self.directory,
                 &self.claim.claim.envelope.target_session_id,
                 &self.claim,
@@ -157,16 +157,32 @@ impl RootActorInputProof {
                 .last()
                 .is_none_or(|fact| fact.run_id != owner.fence.run_id || fact.result.is_some())
         {
-            if outcomes
-                .facts
-                .last()
-                .is_some_and(|fact| fact.result.is_none() && fact.run_id != owner.fence.run_id)
-            {
-                outcomes
-                    .mark_predecessor_interrupted(&owner.fence, reset.as_deref())
+            // The coordinator staged this completion and opened it separately.
+            // A queue prefix or an interrupt cannot prove that the old wait resumed.
+            let resumed_exec = intent.is_none()
+                && message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
+                && self.claim.claim.activation_policy
+                    == SessionActivationPolicy::RespectSpecificWait
+                && outcomes
+                    .reserve_background_exec_resume(
+                        &owner.fence,
+                        durable,
+                        &envelope,
+                        self.claim.claim.generation,
+                    )
                     .map_err(conflict)?;
+            if !resumed_exec {
+                if outcomes
+                    .facts
+                    .last()
+                    .is_some_and(|fact| fact.result.is_none() && fact.run_id != owner.fence.run_id)
+                {
+                    outcomes
+                        .mark_predecessor_interrupted(&owner.fence, reset.as_deref())
+                        .map_err(conflict)?;
+                }
+                return Ok(Some(outcomes));
             }
-            return Ok(Some(outcomes));
         }
         if outcomes
             .facts
@@ -357,7 +373,6 @@ impl SessionStoreV2 {
         Arc::get_mut(&mut guards)
             .expect("new Root guards are private")
             ._input_filesystem = Some(filesystem.clone());
-        let expected = crate::session_merge::bounded_live_bootstrap_value(session)?;
         let candidate = session.clone();
         let check_root = root.clone();
         let check_session_directory = self.sessions_dir.join(&session.id);
@@ -379,7 +394,13 @@ impl SessionStoreV2 {
             .map_err(conflict)
         })
         .await?;
-        self.save_session_after_lock(session, started, &guards, None)
+        // Keep the original complete precheck, then bind the exact normalized
+        // checkpoint which the owned writer will actually persist.
+        let checkpoint = self
+            .normalize_terminal_runtime_write(session, &Self::root_rel_path(&session.id), &guards)
+            .await?;
+        let expected = crate::session_merge::bounded_live_bootstrap_value(&checkpoint)?;
+        self.save_session_after_lock(&checkpoint, started, &guards, None)
             .await?;
         let check_root = root.clone();
         let check_session_directory = self.sessions_dir.join(&session.id);
@@ -544,12 +565,16 @@ impl SessionStoreV2 {
             directory: directory.clone(),
             claim: claim.clone(),
         };
-        let ack_input = input.clone();
-        let filesystem = filesystem.with_check(Arc::new(move || {
-            let durable = root_proof.validate()?;
-            ack_input.validate(true)?;
-            ack_input.validate_transcript(&durable)
+        let ack_input = Arc::new(input.clone());
+        let cleanup_input = ack_input.clone();
+        // The committed receipt fixes the exact claim under these same guards.
+        // Its cleanup still requires the live Root and the canonical checkpoint.
+        let cleanup = filesystem.with_check(Arc::new(move || {
+            root_proof.validate_inbox_cleanup(|durable| cleanup_input.validate_transcript(durable))
         }));
+        let filesystem = cleanup
+            .clone()
+            .with_check(Arc::new(move || ack_input.validate(true)));
         let mutable = Arc::get_mut(&mut guards).expect("new Root writer has no borrowers");
         mutable.input = Some(input);
         mutable._input_filesystem = Some(filesystem.clone());
@@ -573,7 +598,14 @@ impl SessionStoreV2 {
         }
         // No provider boundary or new lease driver between Main and ACK.
         inbox
-            .ack_owned_with_filesystem(&directory, &session.id, claim, Utc::now(), filesystem)
+            .ack_owned_with_filesystem(
+                &directory,
+                &session.id,
+                claim,
+                Utc::now(),
+                filesystem,
+                Some(&cleanup),
+            )
             .await
             .map_err(conflict)
     }

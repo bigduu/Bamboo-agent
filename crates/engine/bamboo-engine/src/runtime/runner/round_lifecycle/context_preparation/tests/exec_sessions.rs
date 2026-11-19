@@ -145,6 +145,7 @@ impl LLMProvider for PullFromContextProvider {
         )
         .unwrap();
         assert_eq!(ids.len(), 1);
+        assert!(!snapshot.content.contains("Continue polling while"));
         assert!(!snapshot.content.contains("PRIVATE_SHELL_OUTPUT"));
         assert!(!snapshot.content.contains("PRIVATE_POST_TOOL_FEEDBACK"));
         self.requests.lock().unwrap().push(messages.to_vec());
@@ -206,6 +207,7 @@ async fn dispatch_and_pull_from_context(
         &prepared.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,
@@ -213,8 +215,12 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: projected.input_tokens.saturating_sub(block_tokens) + 128,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(
+                projected.input_tokens.saturating_sub(block_tokens) + 128,
+                128,
+                Default::default(),
+            ),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -228,13 +234,14 @@ async fn dispatch_and_pull_from_context(
     assert!(requests.lock().unwrap().is_empty());
     // Exactly fit the projected input plus output reservation. The dynamic
     // snapshot must participate in both projection and the final dispatch gate.
-    let (output, _, _) = execute_llm_stream(
+    let (output, _, _, _completion, _) = execute_llm_stream(
         session,
         config,
         &llm,
         &prepared.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,
@@ -242,8 +249,8 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: projected.input_tokens + 128,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(projected.input_tokens + 128, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -310,6 +317,7 @@ async fn dispatch_and_pull_from_context(
         &after.prepared_context,
         schemas,
         &LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &tx,
             cancel_token: &CancellationToken::new(),
             session_id: &owner,
@@ -317,8 +325,8 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: projected.input_tokens + 128,
-            max_output_tokens: 128,
+            output_limit_recovery: None,
+            budget: &TokenBudget::new(projected.input_tokens + 128, 128, Default::default()),
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -375,6 +383,7 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
                 None,
                 "continuity-test",
                 None,
+                None,
             )
             .await
             .unwrap());
@@ -385,13 +394,14 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
                 .unwrap();
             assert!(stored_result.compressed);
             assert_eq!(stored_result.content, result.to_string());
-            assert_eq!(
+            assert!(
                 session
                     .compression_events
                     .last()
                     .unwrap()
-                    .fixed_prompt_tokens,
-                block_tokens
+                    .fixed_prompt_tokens
+                    >= block_tokens,
+                "fixed prompt reserve includes exec handles and the complete provider frame"
             );
             if strategy == ContextManagementStrategy::MessageSummary {
                 let sent = serde_json::to_string(&*summary_requests.lock().unwrap()).unwrap();

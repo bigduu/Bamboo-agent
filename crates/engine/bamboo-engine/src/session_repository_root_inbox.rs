@@ -2,7 +2,7 @@
 use super::*;
 use bamboo_domain::{
     ActorActivationStatus, RootActorRuntimeWrite, RootInboxAdmission, SessionInboxConsumerId,
-    SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
+    SessionInboxError, SessionInboxLeaseRequest, SessionInboxOwnedClaim, SessionInboxPort,
 };
 use std::io;
 
@@ -68,18 +68,21 @@ impl SessionRepository {
         session: &mut Session,
         inbox: Arc<dyn SessionInboxPort>,
         active_run_id: Option<&str>,
+        expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<Option<RootInboxAdmission>> {
         let Some((directory, owner)) = &self.root_actor_owner else {
             return Ok(None);
         };
-        if session.id != owner.fence.actor_id {
+        if session.id != owner.fence.actor_id
+            || expected_work_input.is_some() && active_run_id != Some(owner.fence.run_id.as_str())
+        {
             return Err(io::Error::other("Root Inbox execution target mismatch"));
         }
         // Probe/bind before claim changes this queue's durable protocol version.
         let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
         let consumer = SessionInboxConsumerId::new();
         let mut admission = RootInboxAdmission::default();
-        let limit = if self.root_inbox_receipt.is_some() {
+        let limit = if self.root_inbox_receipt.is_some() || expected_work_input.is_some() {
             1
         } else {
             128
@@ -93,6 +96,7 @@ impl SessionRepository {
                     directory.as_ref(),
                     owner,
                     &consumer,
+                    expected_work_input,
                 )
                 .await
             {
@@ -118,20 +122,33 @@ impl SessionRepository {
         directory: &dyn bamboo_domain::ActorDirectoryPort,
         owner: &RootActorRuntimeWrite,
         consumer: &SessionInboxConsumerId,
+        expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<InputAdmission> {
-        let request = lease_request(directory, owner, consumer).await?;
-        let claim = match self.root_inbox_receipt.as_ref() {
-            Some(receipt) => inbox
-                .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), &request)
-                .await
-                .map_err(io::Error::other)?,
+        let claim_once = async |request: &SessionInboxLeaseRequest| match self
+            .root_inbox_receipt
+            .as_ref()
+        {
+            Some(receipt) => {
+                inbox
+                    .claim_owned_receipt(&session.id, receipt, Some(&owner.fence.run_id), request)
+                    .await
+            }
             None => inbox
-                .claim_owned(&session.id, 1, active_run_id, &request)
+                .claim_owned(&session.id, 1, active_run_id, request)
                 .await
-                .map_err(io::Error::other)?
-                .into_iter()
-                .next(),
+                .map(|claims| claims.into_iter().next()),
         };
+        let request = lease_request(directory, owner, consumer).await?;
+        let claim = match claim_once(&request).await {
+            // This error comes from before the queue was touched. Refresh the
+            // request once, including a fresh check of the Root's authority.
+            Err(SessionInboxError::ClaimLeaseExpired) => {
+                let request = lease_request(directory, owner, consumer).await?;
+                claim_once(&request).await
+            }
+            result => result,
+        }
+        .map_err(io::Error::other)?;
         let Some(claim) = claim else {
             return Ok(InputAdmission::Empty);
         };
@@ -151,6 +168,11 @@ impl SessionRepository {
             .map_err(io::Error::other)?;
         pending.claim = Some(claim.clone());
         let envelope = &claim.claim.envelope;
+        if expected_work_input.is_some_and(|expected| &envelope.id != expected) {
+            return Err(io::Error::other(
+                "Root input differs from the reserved Work dispatch",
+            ));
+        }
         if self.root_inbox_receipt.is_some()
             && (envelope.source != bamboo_domain::SessionMessageSource::User
                 || envelope.kind != bamboo_domain::SessionMessageKind::UserInput)

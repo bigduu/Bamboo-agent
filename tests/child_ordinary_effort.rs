@@ -6,13 +6,16 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{ReasoningEffort, RootThinkingMode};
-use bamboo_server::app_state::{AppState, MemoryStore};
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
+
+#[path = "support/read_only_child_host.rs"]
+mod read_only_child_host;
+use read_only_child_host::{reported_result, Host};
 
 const REQUIRED: &str = "CHILD_EFFORT_REQUIRED: inspect only; preserve the user constraints";
 
@@ -22,7 +25,6 @@ struct ProviderProbe {
     root_calls: AtomicUsize,
     release_child: AtomicBool,
     child_ready: Notify,
-    workspace: Mutex<std::path::PathBuf>,
 }
 
 fn chunk(delta: Value, finish_reason: Option<&str>) -> String {
@@ -50,13 +52,17 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             wake.await;
         }
         (
-            json!({"content":"PLAN_PROVIDER_EVIDENCE: verified the read-only scope"}),
+            reported_result("PLAN_PROVIDER_EVIDENCE: verified the read-only scope"),
             "stop",
         )
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
-                json!({"tool_calls":[{"index":0,"id":"ordinary-plan","type":"function","function":{"name":"Plan","arguments":json!({"task":REQUIRED,"title":"Bounded Child effort plan","workspace":probe.workspace.lock().unwrap().clone()}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"ordinary-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                "tool_calls",
+            ),
+            1 => (
+                json!({"tool_calls":[{"index":0,"id":"ordinary-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
                 "tool_calls",
             ),
             _ => (
@@ -75,8 +81,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
 
 #[test]
 fn child_owned_effort_reaches_host_and_reused_compiled_worker_provider_wire() {
-    // The full debug AppState/route fixture exceeds libtest's default stack.
-    // Increase only the host test thread; the real child has its normal stack.
+    // Run the loopback provider fixture on its own Actix system thread.
     std::thread::Builder::new()
         .name("child-effort-fixture".into())
         .stack_size(32 * 1024 * 1024)
@@ -105,7 +110,6 @@ async fn run_effort_fixture() {
     let _restore_jiandu = RestoreJiandu(old_jiandu);
     std::env::set_var("BAMBOO_JIANDU_DATA_DIR", &jiandu);
     let probe = web::Data::new(ProviderProbe::default());
-    *probe.workspace.lock().unwrap() = home_path.clone();
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
         App::new()
@@ -129,56 +133,29 @@ async fn run_effort_fixture() {
     let config = json!({
         "provider":"openai",
         "features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test"}},
+        "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test", "runtime_models":["root-test","planner-test"]}},
         "defaults":{"chat":{"provider":"openai","model":"root-test","reasoning_effort":"high"},
-                    "subagent_models":{"planner":{"provider":"openai","model":"planner-test","reasoning_effort":"low"}}},
-        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "worker_bin":env!("CARGO_BIN_EXE_bamboo"), "worker_args":["subagent-worker"], "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
+                    "subagent_models":{"explorer":{"provider":"openai","model":"planner-test","reasoning_effort":"low"}}},
+        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
     });
     std::fs::write(
         home_path.join("config.json"),
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    let state = web::Data::new(
-        AppState::new_with_memory_store(home_path.clone(), MemoryStore::new(jiandu))
-            .await
-            .unwrap(),
-    );
-    {
-        let live = state.config.read().await;
-        let planner = &live.defaults.as_ref().unwrap().subagent_models["planner"];
-        assert_eq!(planner.model, "planner-test");
-        assert_eq!(planner.reasoning_effort, Some(ReasoningEffort::Low));
-        assert_eq!(
-            live.subagents().worker_bin.as_deref(),
-            Some(env!("CARGO_BIN_EXE_bamboo"))
-        );
-    }
-    let app = actix_test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(bamboo_server::routes::configure_routes),
-    )
-    .await;
+    let host = Host::start(&home_path).await;
     let root_id = "child-effort-root";
-    let response = actix_test::call_service(&app, actix_test::TestRequest::post().uri("/api/v1/chat").set_json(json!({
+    let response = host.post("chat", json!({
         "session_id":root_id,"message":REQUIRED,"model":"root-test","provider":"openai",
         "model_ref":{"provider":"openai","model":"root-test"},
-        "thinking_mode":"ultra","reasoning_effort":"high","permission_mode":"bypass","workspace_path":home_path
-    })).to_request()).await;
-    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
-    let response = actix_test::call_service(
-        &app,
-        actix_test::TestRequest::post()
-            .uri(&format!("/api/v1/execute/{root_id}"))
-            .set_json(json!({}))
-            .to_request(),
-    )
-    .await;
+        "thinking_mode":"ultra","permission_mode":"bypass","reasoning_effort":"high","workspace_path":home_path
+    })).await;
+    assert_eq!(response.status().as_u16(), 201);
+    let response = host.post(&format!("execute/{root_id}"), json!({})).await;
     assert!(response.status().is_success(), "execute must start");
     let (waiting_root, child_id) = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = state.storage.load_session(root_id).await.unwrap().unwrap();
+            let root = host.session(root_id).await;
             let wait = root
                 .agent_runtime_state
                 .as_ref()
@@ -215,15 +192,10 @@ async fn run_effort_fixture() {
         }
     })
     .await
-    .expect("real Plan must wait for the real provider worker");
+    .expect("the Root must wait for the real provider worker");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
     assert_eq!(waiting_root.reasoning_effort, Some(ReasoningEffort::High));
-    let child = state
-        .storage
-        .load_session(&child_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let child = host.session(&child_id).await;
     assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
     assert_eq!(child.root_thinking_mode(), RootThinkingMode::Standard);
     assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
@@ -233,14 +205,14 @@ async fn run_effort_fixture() {
     );
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "Root has not synthesized an unfinished child"
     );
     probe.release_child.store(true, Ordering::SeqCst);
     probe.child_ready.notify_waiters();
     let completed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = state.storage.load_session(root_id).await.unwrap().unwrap();
+            let root = host.session(root_id).await;
             if root
                 .messages
                 .iter()
@@ -257,12 +229,7 @@ async fn run_effort_fixture() {
         .messages
         .iter()
         .any(|message| message.content.contains("PLAN_PROVIDER_EVIDENCE")));
-    let child = state
-        .storage
-        .load_session(&child_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let child = host.session(&child_id).await;
     assert!(child
         .messages
         .iter()
@@ -272,7 +239,7 @@ async fn run_effort_fixture() {
         .iter()
         .filter(|request| request.to_string().contains("Ultra Root thinking mode"))
         .collect();
-    assert!(root_requests.len() >= 2);
+    assert!(root_requests.len() >= 3);
     for request in root_requests {
         assert_eq!(request["reasoning_effort"], "high");
         assert!(request.to_string().contains(REQUIRED));

@@ -227,12 +227,26 @@ pub(super) async fn initialize_loop_state(
     let local_resources = bamboo_tools::LocalTaskResources::current();
     if let Some(resources) = &local_resources {
         let owner = resources.identity();
+        let managed_work_root = crate::ticket_runtime::is_managed_work_root(session)
+            && config
+                .ticket_worker_plan
+                .as_ref()
+                .is_some_and(|plan| plan.run_id() == owner.run_id)
+            && config
+                .persistence
+                .as_ref()
+                .and_then(|persistence| persistence.root_actor_writer())
+                .is_some_and(|writer| {
+                    writer.fence.actor_id.as_str() == owner.session_id
+                        && writer.fence.run_id == owner.run_id
+                        && writer.created_at == owner.child_birth
+                });
         if owner.session_id != session.id
             || owner.child_birth != session.created_at
-            || session.kind != bamboo_domain::SessionKind::Child
+            || session.kind != bamboo_domain::SessionKind::Child && !managed_work_root
         {
             return Err(bamboo_agent_core::AgentError::LLM(
-                "local execution resource identity does not match canonical Child".into(),
+                "local execution resource identity does not match canonical Session".into(),
             ));
         }
         if config
@@ -1020,16 +1034,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrapped_copilot_queue_keeps_same_provider_without_network() {
+    fn rewrapped_openai_queue_keeps_same_provider_without_network() {
         use bamboo_domain::{ProviderModelRef, ReasoningEffort};
         use bamboo_llm::{LLMProvider, ResolvedModel};
         use std::sync::Arc;
 
-        let provider: Arc<dyn LLMProvider> = Arc::new(
-            bamboo_llm::providers::copilot::CopilotProvider::with_token("synthetic-only"),
-        );
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(bamboo_llm::OpenAIProvider::new("synthetic-only"));
         let reference =
-            ProviderModelRef::new("copilot", "model-a").with_reasoning_effort(ReasoningEffort::Low);
+            ProviderModelRef::new("openai", "model-a").with_reasoning_effort(ReasoningEffort::Low);
         let first = ResolvedModel::from_ref(provider.clone(), &reference).provider;
         let second = ResolvedModel::from_ref(provider, &reference).provider;
         assert!(
@@ -1037,7 +1050,7 @@ mod tests {
             "each resolution constructs a new role wrapper"
         );
         let queued = super::QueuedEvaluation::new((), first, "model-a".into())
-            .expect("normal Copilot can be queued");
+            .expect("OpenAI can be queued");
         assert!(queued.current_provider(second, "model-a").is_some());
     }
 }

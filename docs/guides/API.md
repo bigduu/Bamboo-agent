@@ -219,20 +219,17 @@ intents respect existing waits. Omission keeps legacy behavior. See the
 [delivery and receipt contract](SESSION_MESSAGING.md); an accepted message or
 activation receipt is not terminal completion.
 
-Root sessions can also select `"root_orchestration_only": true`. This durable
-execution mode supplies the same delegation guidance even when
-`root_orchestration_prompt` is unset. It limits the Root to these exact tool
-execution identities: `SubAgent`, `Plan`, `Task`, `session_history_current`,
-`session_message`, `Read`, `Grep`, `Glob`, `GetFileInfo`, `ViewImage`,
-`work_overview`, `work_search`, `work_inspect`, `work_changes`, `work_update`,
-and `work_dispatch`. Exposure still follows configuration and each tool's live
-authorization checks. Shell and editing tools are unavailable to that Root;
-delegated children retain their own tool authority. The mode and the prompt-only
-choice are independent.
+Root sessions can select `thinking_mode: "ultra"` or its legacy equivalent
+`"root_orchestration_only": true`. An ordinary Ultra Root prioritizes parallel
+SubAgents and retains authorized file writing and editing. Its tool catalog
+includes the installed, authorized subset of `SubAgent`, `spawn_session`,
+`Task`, `session_history_current`, `session_history`, `session_message`,
+`Read`, `Grep`, `Glob`, `GetFileInfo`, `ViewImage`, `Write`, and `Edit`.
+Children use their assigned tool profiles.
 
-The trusted default Supervisor uses this bounded orchestration posture in both
-Standard and Ultra, with `session_control` and scoped `session_history` admitted
-only through their existing Supervisor checks. Its independent-Root followup
+The trusted default Supervisor uses its own delegation policy in both
+Standard and Ultra. It can use Work tools with current Work authority and
+scoped Session management through the installed Host ports. Its independent-Root followup
 requires an explicitly attached target in current authorized Project/lifetime
 scope. Main execution first lists and inspects suitable managed independent
 Sessions; bounded Child agents assist with planning, review and verification.
@@ -625,6 +622,15 @@ permission gate, or a compatible persisted session.
 
 ### Tool Execution
 
+Use `exec_command` with `cmd` to start a command. When it yields a handle,
+use `write_stdin` to collect output and the exit status, send input, close
+stdin, or stop the process with a lone Ctrl-C. Direct HTTP calls to either
+tool require the owning Bamboo `session_id` in the request. The `session_id`
+parameter of `write_stdin` is the handle returned by `exec_command`.
+
+Callers of `Bash`, `bash`, and `execute_command` should use `exec_command`.
+Replace `BashInput`, `BashOutput`, and `KillShell` calls with `write_stdin`.
+
 #### Execute Tool Directly
 
 ```http
@@ -870,7 +876,7 @@ Bamboo follows a session-based architecture with unified server implementation:
 
 1. **Session**: Contains conversation history and state
 2. **Agent Loop**: Processes messages and executes tools
-3. **LLM Provider**: Communicates with AI model APIs (OpenAI, Anthropic, Gemini, Copilot)
+3. **LLM Provider**: Communicates with AI model APIs (OpenAI, Anthropic, Gemini)
 4. **Tool Executor**: Runs built-in tools (read, write, execute, etc.)
 5. **Event Broadcaster**: Streams real-time events via Server-Sent Events
 6. **Unified Server**: Single HTTP server with explicit routing (~120 routes)
@@ -882,7 +888,7 @@ Bamboo follows a session-based architecture with unified server implementation:
 - **Direct provider access**: No HTTP callbacks to self (eliminates proxy pattern)
 - **Handler organization** (`crates/bamboo-server/src/handlers/`):
   - Core agent handlers in `handlers/agent/` (chat, execute, events, stop, history, respond, etc.)
-  - Provider handlers in `handlers/` (openai/, anthropic/, gemini/, copilot_auth/, agent_api.rs)
+  - Provider handlers in `handlers/` (openai/, anthropic/, gemini/, agent_api.rs)
   - Feature handlers in `handlers/` (settings/, tools/, workspace/, skill/, command/)
 
 ---

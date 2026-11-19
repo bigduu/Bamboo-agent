@@ -139,7 +139,7 @@ pub async fn continue_completed_prefix(
     }
 }
 
-fn workflow_error(error: WorkflowRunError) -> HttpResponse {
+pub(crate) fn workflow_error(error: WorkflowRunError) -> HttpResponse {
     match error {
         WorkflowRunError::NotFound => HttpResponse::NotFound().json(serde_json::json!({
             "error": crate::error::error_value("workflow run not found")

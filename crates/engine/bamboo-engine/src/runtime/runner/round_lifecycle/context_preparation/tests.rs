@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+mod dynamic_range;
 #[cfg(unix)]
 mod exec_sessions;
 mod message_summary;
@@ -283,6 +284,7 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
         &prepared.prepared_context,
         &tools,
         &super::super::stream_execution::LlmStreamFrame {
+            provider_default_output: false,
             event_tx: &event_tx,
             cancel_token: &tokio_util::sync::CancellationToken::new(),
             session_id: "packet-child",
@@ -290,8 +292,8 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
-            max_context_tokens: prepared.budget.max_context_tokens,
-            max_output_tokens: prepared.budget.max_output_tokens,
+            output_limit_recovery: None,
+            budget: &prepared.budget,
             observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
@@ -736,6 +738,8 @@ fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> A
         persistence: Some(persistence),
         context_management: ContextManagementConfig {
             strategy: ContextManagementStrategy::RetrievalWindow,
+            trigger_usage_ratio: 0.45,
+            target_usage_ratio: 0.30,
             retrieval_window: RetrievalWindowContextConfig {
                 min_recent_user_turns: 2,
                 trigger_usage_ratio: 0.45,
@@ -1097,6 +1101,7 @@ enum BoundedFailureMode {
     Call(usize),
     PartialWithoutDone(usize),
     Reduce,
+    FillFinalBudget,
 }
 
 struct BoundedCompressionProvider {
@@ -1148,6 +1153,15 @@ impl LLMProvider for BoundedCompressionProvider {
                     LLMChunk::Token("partial summary that must not commit".to_string()),
                 )])))
             }
+            BoundedFailureMode::FillFinalBudget
+                if messages.iter().any(|message| message.content.contains("final reduce stage")) =>
+            {
+                let tokens = max_output_tokens.unwrap_or_default().saturating_sub(128).max(1);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token(" evidence".repeat(tokens as usize))),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
             _ => Ok(Box::pin(stream::iter(vec![
                 Ok::<LLMChunk, LLMError>(LLMChunk::Token(format!(
                     "bounded summary part {call_number} with requirements, decisions, and test evidence"
@@ -1186,6 +1200,7 @@ fn bounded_compression_llm_with_limits(
         model_info: ProviderModelInfo {
             id: "summary-model-763".to_string(),
             max_context_tokens: Some(max_context_tokens),
+            max_input_tokens: None,
             max_output_tokens: Some(max_output_tokens),
         },
         requests: Arc::clone(&requests),
@@ -1199,6 +1214,8 @@ fn bounded_compression_session(id: &str) -> Session {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 24_000,
         max_output_tokens: 4_000,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -1617,8 +1634,8 @@ impl AgentHook for CompressionInstructionHook {
             HookPayload::Compression {
                 estimated_tokens,
                 usage_percent,
-                max_context_tokens: 5_000,
-                trigger_context_tokens: 4_000,
+                max_context_tokens: 64_000,
+                trigger_context_tokens: 51_200,
                 trigger,
                 phase,
             } if *estimated_tokens > 0
@@ -1640,15 +1657,17 @@ impl AgentHook for CompressionInstructionHook {
 async fn maybe_apply_host_context_compression_uses_fast_model_for_every_summary_stage() {
     let mut session = Session::new("session-cp-fast-model", "main-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
         },
         safety_margin: 0,
         compression_trigger_percent: 80,
-        compression_target_percent: 50,
+        compression_target_percent: 25,
         working_reserve_tokens: 0,
         fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
@@ -1677,10 +1696,10 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_every_summary_
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 900,
-        total_tokens: 1000,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        window_tokens: 26_500,
+        total_tokens: 26_600,
+        max_context_tokens: 32_000,
+        budget_limit: 32_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -2564,6 +2583,8 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 2000,
         max_output_tokens: 0,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -2607,7 +2628,8 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         .retain(|message| message.role == Role::System);
     let context_tokens = projected_fixture_input_tokens(&required, &config, &[])
         .await
-        .saturating_add(2_000);
+        .saturating_add(2_000)
+        .saturating_mul(4);
     session.token_budget.as_mut().unwrap().max_context_tokens = context_tokens;
     session.token_usage = Some(pressure_usage(context_tokens * 99 / 100, context_tokens));
 
@@ -2642,15 +2664,17 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
 async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     let mut session = Session::new("session-cp-mid-turn", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
         },
         safety_margin: 0,
         compression_trigger_percent: 80,
-        compression_target_percent: 50,
+        compression_target_percent: 25,
         working_reserve_tokens: 0,
         fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
@@ -2679,10 +2703,10 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 850,
-        total_tokens: 950,
-        max_context_tokens: 1200,
-        budget_limit: 1000,
+        window_tokens: 26_500,
+        total_tokens: 26_600,
+        max_context_tokens: 32_000,
+        budget_limit: 32_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -2807,15 +2831,17 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
         "## External Memory (Persistent)\n\nSession memory note".to_string(),
     );
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 5000,
+        max_context_tokens: 64_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
         },
         safety_margin: 0,
         compression_trigger_percent: 80,
-        compression_target_percent: 50,
+        compression_target_percent: 25,
         working_reserve_tokens: 0,
         fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
@@ -2849,10 +2875,10 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 4_100,
-        total_tokens: 4_200,
-        max_context_tokens: 5000,
-        budget_limit: 5000,
+        window_tokens: 53_660,
+        total_tokens: 53_760,
+        max_context_tokens: 64_000,
+        budget_limit: 64_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -2919,15 +2945,17 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     activate_plan_mode(&mut session);
     attach_durable_instruction_workflow(&mut session);
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 5000,
+        max_context_tokens: 64_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
         },
         safety_margin: 0,
         compression_trigger_percent: 80,
-        compression_target_percent: 50,
+        compression_target_percent: 25,
         working_reserve_tokens: 0,
         fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
@@ -2960,10 +2988,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 4_100,
-        total_tokens: 4_200,
-        max_context_tokens: 5000,
-        budget_limit: 5000,
+        window_tokens: 53_660,
+        total_tokens: 53_760,
+        max_context_tokens: 64_000,
+        budget_limit: 64_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -3582,6 +3610,76 @@ async fn retrieval_window_rejects_a_preexisting_summary_before_pressure_or_side_
 }
 
 #[tokio::test]
+async fn automatic_retrieval_window_keeps_protected_content_above_target_when_it_fits() {
+    let id = "retrieval-protected-above-target";
+    let mut session = retrieval_window_session(id);
+    let call_id = "protected-tool-call";
+    let mut call = Message::assistant("", None);
+    call.tool_calls = Some(vec![ToolCall {
+        id: call_id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Read".into(),
+            arguments: "{}".into(),
+        },
+    }]);
+    let call_message_id = call.id.clone();
+    session.add_message(call);
+    let tool_result = Message::tool_result(call_id, " evidence".repeat(16_000));
+    let result_message_id = tool_result.id.clone();
+    session.add_message(tool_result);
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tools = [retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+    for _ in 0..2 {
+        let context =
+            prepare_round_context(&mut session, &config, "test-model", id, &tools, &llm, None)
+                .await
+                .expect("protected content fits the request input limit");
+        assert!(!context.prepared_context.truncation_occurred);
+        for protected_id in [&call_message_id, &result_message_id] {
+            assert!(context
+                .prepared_context
+                .messages
+                .iter()
+                .any(|message| &message.id == protected_id));
+            assert!(session
+                .messages
+                .iter()
+                .any(|message| &message.id == protected_id && !message.compressed));
+        }
+        assert_eq!(session.compression_events.len(), 1);
+        assert_eq!(checkpoints.lock().unwrap().len(), 1);
+        session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    }
+
+    let event = &session.compression_events[0];
+    assert_eq!(event.trigger_type, CompressionTriggerType::Auto);
+    assert_eq!(event.retrieval_archived_user_turn_count, 8);
+    assert!(event.retrieval_active_tokens_after > 9_600);
+    assert!(event.retrieval_active_tokens_after <= event.retrieval_request_input_limit_tokens);
+    assert!(session.conversation_summary.is_none());
+    assert!(model_calls.lock().unwrap().is_empty());
+
+    session
+        .messages
+        .last_mut()
+        .unwrap()
+        .content
+        .push_str(&" overflow".repeat(12_000));
+    let before = serde_json::to_vec(&session).unwrap();
+    assert!(
+        prepare_round_context(&mut session, &config, "test-model", id, &tools, &llm, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert_eq!(checkpoints.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn retrieval_window_missing_history_capability_fails_without_mutating_or_checkpointing() {
     let mut session = retrieval_window_session("retrieval-missing-history");
     let before = serde_json::to_vec(&session).unwrap();
@@ -3700,6 +3798,8 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
     let config = AgentLoopConfig {
         context_management: ContextManagementConfig {
             strategy: ContextManagementStrategy::RetrievalWindow,
+            trigger_usage_ratio: 0.95,
+            target_usage_ratio: 0.90,
             retrieval_window: RetrievalWindowContextConfig {
                 target_usage_ratio: 0.90,
                 trigger_usage_ratio: 0.95,
@@ -3715,7 +3815,7 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
     );
     assert_eq!(
         super::retrieval_window_trigger_tokens(&config, &budget),
-        801
+        640
     );
 }
 
@@ -4071,6 +4171,12 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
         BudgetStrategy::default(),
         0,
     ));
+    // Keep real history pressure above the target after tool-guide compaction.
+    session
+        .token_budget
+        .as_mut()
+        .unwrap()
+        .compression_target_percent = 10;
     session.metadata.insert(
         "responses.previous_response_id".to_string(),
         "resp-before-manual-archive".to_string(),
@@ -4098,6 +4204,8 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
 
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
     let mut config = retrieval_window_config(persistence);
+    // Exercise manual archival below the automatic trigger with compact tool guidance.
+    config.context_management.target_usage_ratio = 0.20;
     config
         .context_management
         .retrieval_window
@@ -5065,18 +5173,20 @@ async fn retrieval_window_uses_summary_only_when_fallback_is_explicit() {
 async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses_trigger() {
     // Host auto-compression now uses a single rule:
     // usage(context_window) >= compression_trigger_percent.
-    // Here total_tokens/context_window = 3500/4000 = 87.5% with trigger=80, so it should run.
+    // Here total_tokens/context_window = 28_000/32_000 = 87.5% with trigger=80, so it should run.
     let mut session = Session::new("session-cp-force-context-only", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 4000,
+        max_context_tokens: 32_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
         },
         safety_margin: 0,
         compression_trigger_percent: 80,
-        compression_target_percent: 50,
+        compression_target_percent: 25,
         working_reserve_tokens: 0,
         fallback_trigger_percent: 75,
         prompt_cache_min_tool_output_chars: 1_200,
@@ -5107,15 +5217,15 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
             None,
         ));
     }
-    // context_window = 4000
-    // total_tokens/context_window = 3500/4000 = 87.5% >= 80%
+    // context_window = 32_000
+    // total_tokens/context_window = 28_000/32_000 = 87.5% >= 80%
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 3400,
-        total_tokens: 3500,
-        max_context_tokens: 4000,
-        budget_limit: 4000,
+        window_tokens: 27_900,
+        total_tokens: 28_000,
+        max_context_tokens: 32_000,
+        budget_limit: 32_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -5162,6 +5272,8 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
         // must also accommodate fixed, non-droppable host context.
         max_context_tokens: 2000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5240,6 +5352,8 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 10_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -5456,6 +5570,8 @@ async fn multi_round_compression_cycle() {
     let budget = TokenBudget {
         max_context_tokens: 2000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 50,
             enable_summarization: true,
@@ -5981,6 +6097,8 @@ async fn pre_summarization_degradation_skips_llm_for_auto_triggered_compression(
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 100_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -6073,6 +6191,8 @@ async fn tokens_saved_is_computed_from_compressed_messages() {
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 100_000,
         max_output_tokens: 200,
+        max_input_tokens: None,
+        output_reserve_tokens: None,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
             enable_summarization: true,
@@ -6378,7 +6498,7 @@ fn context_pressure_notification_copy_is_strategy_aware() {
         assert_eq!(level, expected_level);
         assert!(message.contains("archiv"));
         assert!(message.contains("session_history_current"));
-        assert!(message.contains("session_note"));
+        assert!(message.contains("memory session_replace"));
         assert!(message.contains("decisions, paths, progress, and blockers"));
         assert!(message.contains("Do not copy raw transcript"));
         assert!(!message.contains("compact_context"));
@@ -6401,6 +6521,7 @@ fn context_pressure_notification_reports_explicit_summary_fallback_for_summarize
             fallback_strategy: ContextManagementFallbackStrategy::Summary,
             ..RetrievalWindowContextConfig::default()
         },
+        ..ContextManagementConfig::default()
     };
     let effective_strategy = effective_context_pressure_strategy(&session, &context_management);
     assert_eq!(effective_strategy, ContextManagementStrategy::Summary);

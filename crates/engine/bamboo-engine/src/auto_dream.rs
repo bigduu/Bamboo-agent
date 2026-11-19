@@ -485,7 +485,12 @@ fn session_note_tool_call_ids(session: &Session) -> HashSet<&str> {
         .iter()
         .filter_map(|message| message.tool_calls.as_ref())
         .flatten()
-        .filter(|call| bamboo_domain::canonical_tool_name(&call.function.name) == "session_note")
+        .filter(|call| {
+            matches!(
+                bamboo_domain::canonical_tool_name(&call.function.name).as_str(),
+                "memory" | "session_note" | "memory_note"
+            )
+        })
         .map(|call| call.id.as_str())
         .collect()
 }
@@ -509,14 +514,30 @@ fn sanitized_session_note_result(
     let action = source.get("action")?.as_str()?;
     if !matches!(
         action,
-        "read" | "append" | "replace" | "clear" | "list_topics"
+        "read"
+            | "append"
+            | "replace"
+            | "clear"
+            | "list_topics"
+            | "session_read"
+            | "session_append"
+            | "session_replace"
+            | "session_clear"
+            | "session_list_topics"
     ) {
         return None;
     }
     let mut safe = serde_json::Map::new();
     safe.insert(
         "tool".to_string(),
-        serde_json::Value::String("session_note".to_string()),
+        serde_json::Value::String(
+            if action.starts_with("session_") {
+                "memory"
+            } else {
+                "session_note"
+            }
+            .to_string(),
+        ),
     );
     safe.insert(
         "action".to_string(),
@@ -2999,11 +3020,7 @@ async fn run_auto_dream_once_for_scope(
     require_auto_dream_enabled: bool,
     project_resolver: Option<&ProjectContextResolver>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
-    let scope_label = match scope {
-        MemoryScope::Global => "global",
-        MemoryScope::Project => "project",
-        MemoryScope::Session => "session",
-    };
+    let scope_label = scope.as_str();
 
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
@@ -3046,8 +3063,10 @@ async fn run_auto_dream_once_for_scope(
                 .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
             collect_candidate_sessions_for_project(ctx, project_key, since).await
         }
-        MemoryScope::Session => {
-            return Err("session-scoped Dream generation is not supported".to_string())
+        MemoryScope::Session | MemoryScope::Section => {
+            return Err(format!(
+                "{scope_label}-scoped Dream generation is not supported"
+            ))
         }
     };
     if sessions.is_empty() {
@@ -3168,7 +3187,7 @@ async fn run_auto_dream_once_for_scope(
             model,
             notebook_body.trim(),
         ),
-        MemoryScope::Session => unreachable!("session scope handled above"),
+        MemoryScope::Session | MemoryScope::Section => unreachable!("scope handled above"),
     };
 
     let snapshot = memory

@@ -3,6 +3,7 @@
 use crate::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use crate::providers::anthropic::api_types::*;
 use crate::providers::common::log_identity;
+use crate::providers::common::tool_schema::sanitize_anthropic_tool_input_schema;
 use bamboo_domain::{FunctionSchema, ToolSchema};
 use bamboo_domain::{Message, Role};
 use serde_json::Value;
@@ -193,9 +194,7 @@ impl ToProvider<AnthropicTool> for ToolSchema {
         Ok(AnthropicTool {
             name: self.function.name.clone(),
             description: Some(self.function.description.clone()),
-            input_schema: crate::providers::common::tool_schema::canonicalize_json_value(
-                &self.function.parameters,
-            ),
+            input_schema: sanitize_anthropic_tool_input_schema(&self.function.parameters),
         })
     }
 }
@@ -524,6 +523,7 @@ mod tests {
         let roundtrip: AnthropicTool = internal_schema.to_provider().unwrap();
         assert_eq!(roundtrip.name, "search");
         assert_eq!(roundtrip.description, Some("Search the web".to_string()));
+        assert_eq!(roundtrip.input_schema, anthropic_tool.input_schema);
     }
 
     #[test]

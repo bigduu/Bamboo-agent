@@ -29,7 +29,9 @@ pub use service::{validate_native_tool_ceiling, Authority, Principal, TicketServ
 pub use sprint::*;
 pub use sprint_query::*;
 pub use store::{FaultPoint, Health, PublicationFault};
-pub use workspace_files::{FileOperation, FileReply, FILE_BYTES_LIMIT};
+pub use workspace_files::{
+    FileOperation, FileReply, ReadPageInfo, FILE_BYTES_LIMIT, READ_SOURCE_BYTES_LIMIT,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

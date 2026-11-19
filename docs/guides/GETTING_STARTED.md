@@ -18,8 +18,8 @@ Or build/run straight from the workspace without installing:
 bamboo init
 ```
 
-Interactive: picks a provider (`anthropic`/`openai`/`gemini`/`copilot`/
-`bodhi`) and prompts for an API key. Non-interactive form for scripts/CI:
+The interactive wizard prompts for a provider (`anthropic`, `openai`, or
+`gemini`) and its API key. Scripts can run it non-interactively.
 
 ```bash
 bamboo init --non-interactive --provider anthropic --api-key "sk-ant-..."
@@ -31,8 +31,37 @@ rest](../config-reference.md#encryption-at-rest)). Verify the install is
 sound at any point with:
 
 ```bash
-bamboo doctor    # checks config/credentials; reports server reachability; exits non-zero on config/credential errors
+bamboo doctor    # checks the selected provider, model, and credential; reports local server reachability
 ```
+
+### Use a custom gateway
+
+To try a model from a shell or CI job, supply the gateway key, base URL, and
+exact model ID in the process environment.
+
+```bash
+BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
+BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
+BAMBOO_OPENAI_MODEL="your-model-id" \
+  bamboo -p "Reply with OK." --provider openai
+```
+
+Switch both the prefix and `--provider` for Anthropic Messages
+(`BAMBOO_ANTHROPIC`, `anthropic`) or Gemini
+(`BAMBOO_GEMINI`, `gemini`). An env-only setup can be checked with
+`BAMBOO_PROVIDER=openai bamboo doctor` after exporting the matching variables.
+
+For repeated local use, save the address and model with `init`. It prompts for
+the API key and stores it encrypted.
+
+```bash
+bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id
+bamboo -p "Reply with OK."
+```
+
+For several accounts, save each under its own provider instance ID. Select
+an admitted model with `bamboo -p "Reply with OK." -m work:your-model-id`.
+[Provider configuration and precedence](../config-reference.md#choosing-a-provider-and-model).
 
 ## 3. Your first agent turn — three ways
 
@@ -44,7 +73,30 @@ bamboo -p "List the files here and tell me what this project does."
 
 Boots the full runtime (including sub-agent support), runs one turn, prints
 the result, exits. Add `-s <session-id>` on a later call to continue the same
-conversation.
+conversation. Plain mode reports the number of reasoning characters received
+on stderr.
+
+Use `--json` with the full headless command for one terminal `result` object on
+stdout.
+
+```bash
+bamboo -p "Check the build." --json
+printf '%s\n' 'Check the build.' | bamboo -p - --json
+```
+
+Use `--stream-json` (or `--raw`) for an NDJSON event stream that ends with the
+same `result` object. Choose one output flag per invocation. Both modes write
+logs to stderr and preserve the process exit code.
+
+After argument parsing, startup failures also produce a `result` with
+`status: "error"` and a null `session_id` when no session was opened. For success
+and failure, `result.usage` contains `input_tokens`, `output_tokens` and
+`total_tokens` from the engine's run-budget accounting for the root execution
+started by this command. The counters include accounted retries and can use
+engine estimates if the provider omits usage. Child executions and background
+services have separate accounting.
+Known pre-execution failures report zero, and a missing execution snapshot
+reports `usage: null`. Each `-s` invocation reports its own execution.
 
 ### b) HTTP server + curl
 

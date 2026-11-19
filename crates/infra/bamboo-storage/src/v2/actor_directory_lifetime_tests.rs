@@ -19,6 +19,8 @@ const DEADLINE: Duration = Duration::from_secs(10);
 struct LatchState {
     entered: bool,
     released: bool,
+    reconfirmed: usize,
+    visits: usize,
 }
 
 #[derive(Debug)]
@@ -26,21 +28,43 @@ pub(super) struct ActorWriteHook {
     file: &'static str,
     phase: DurableWritePhase,
     fail: bool,
+    occurrence: usize,
     state: StdMutex<LatchState>,
     wake: Condvar,
 }
 
 impl ActorWriteHook {
+    pub(super) fn record_reconfirmed(&self, path: &Path) {
+        if path.file_name().and_then(|name| name.to_str()) == Some(self.file) {
+            self.state.lock().unwrap().reconfirmed += 1;
+        }
+    }
+
+    pub(super) fn reconfirmed(&self) -> usize {
+        self.state.lock().unwrap().reconfirmed
+    }
+
     pub(super) fn install(
         store: &SessionStoreV2,
         file: &'static str,
         phase: DurableWritePhase,
         fail: bool,
     ) -> Arc<Self> {
+        Self::install_nth(store, file, phase, fail, 1)
+    }
+
+    pub(super) fn install_nth(
+        store: &SessionStoreV2,
+        file: &'static str,
+        phase: DurableWritePhase,
+        fail: bool,
+        occurrence: usize,
+    ) -> Arc<Self> {
         let hook = Arc::new(Self {
             file,
             phase,
             fail,
+            occurrence,
             state: StdMutex::new(LatchState::default()),
             wake: Condvar::new(),
         });
@@ -55,6 +79,10 @@ impl ActorWriteHook {
         }
         let mut state = self.state.lock().unwrap();
         if state.entered {
+            return Ok(());
+        }
+        state.visits += 1;
+        if state.visits < self.occurrence {
             return Ok(());
         }
         state.entered = true;
@@ -501,5 +529,66 @@ async fn replacement_errors_release_guards_and_reopen_actual_state(
             assert!(!file?.file_name().to_string_lossy().contains("durable.tmp."));
         }
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_root_claim_retains_physical_guards_after_caller_abort_and_reconfirms(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let (first, second) = stores(home.path()).await?;
+    first.ensure_actor(ACTOR).await?;
+    let original = first.load_session(ACTOR).await?.unwrap();
+    let request = claim("observed-root", Utc::now());
+    let hook = ActorWriteHook::install(&first, ENTRY, DurableWritePhase::AfterReplace, false);
+    let _release = ReleaseOnDrop(hook.clone());
+    let writer = {
+        let first = first.clone();
+        let original = original.clone();
+        let request = request.clone();
+        tokio::spawn(async move {
+            first
+                .claim_root_activation_observed(&request, &original)
+                .await
+        })
+    };
+    hook.wait_entered();
+    writer.abort();
+    assert!(writer.await.unwrap_err().is_cancelled());
+    assert_physical_locks_held(&first);
+    // An exclusive lifecycle transaction (including a future reset producer)
+    // cannot race the still-running real FS job after the async cancel ACK.
+    let mut exclusive = {
+        let second = second.clone();
+        tokio::spawn(async move { second.lock_session_lifecycle_exclusive().await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut exclusive)
+            .await
+            .is_err()
+    );
+    assert_physical_locks_held(&first);
+    hook.release();
+    drop(tokio::time::timeout(DEADLINE, exclusive).await???);
+    let settled = first.inspect_actor(ACTOR).await?.activation.unwrap();
+    assert_eq!(settled.run_id, request.run_id);
+    assert_eq!(
+        first
+            .claim_root_activation_observed(&request, &original)
+            .await?,
+        settled
+    );
+    assert_eq!(
+        hook.reconfirmed(),
+        1,
+        "idempotent claim must confirm actual file and directory durability"
+    );
+    let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+    assert_eq!(
+        reopened
+            .claim_root_activation_observed(&request, &original)
+            .await?,
+        settled
+    );
     Ok(())
 }

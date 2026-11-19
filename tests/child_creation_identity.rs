@@ -6,6 +6,7 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     Message, Session, SessionActivationPolicy, SessionInboxPort, SessionMessageEnvelope,
+    DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
 };
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use bamboo_subagent::{
@@ -358,7 +359,9 @@ async fn run_fixture() {
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
-        assert!(tools.contains(&"Read") && tools.contains(&"Glob") && tools.contains(&"Grep"));
+        assert!(tools.contains(&"Read") && tools.contains(&"Grep"));
+        assert!(tools.contains(&DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+        assert!(!tools.contains(&"Glob"));
         for denied in bamboo_engine::runtime::guardian_state::read_only_child_disabled_tools() {
             assert!(
                 !tools.contains(&denied.as_str()),

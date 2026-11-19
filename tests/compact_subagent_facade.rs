@@ -2,7 +2,9 @@
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
-use bamboo_domain::{Role, Session, SessionInboxLimits, SessionInboxPort};
+use bamboo_domain::{
+    Role, Session, SessionInboxLimits, SessionInboxPort, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
 use std::{
@@ -130,8 +132,18 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         for physical in ["ask_agent", "deploy_agent", "cluster"] {
             assert!(!tool_names.contains(physical), "Child model saw {physical}");
         }
+        let discover_glob = || {
+            assert!(tool_names.contains(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+            assert!(!tool_names.contains("Glob"));
+            call(
+                "compact-discover-glob",
+                DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                json!({"query":"Glob","limit":1}),
+            )
+        };
         match (probe.role, probe.child_calls.fetch_add(1, Ordering::SeqCst)) {
             (None, 0) => {
+                assert!(!tool_names.contains("Glob"));
                 // The isolated Worker has no Root ancestor, so a successful
                 // lineage-checked tree page must come from canonical Host storage.
                 call("compact-tree", "SubAgent", json!({"intent":"inspect"}))
@@ -235,18 +247,18 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .unwrap()
                     .unwrap();
                 assert_eq!(canonical.last_run_status().as_deref(), Some("cancelled"));
+                discover_glob()
+            }
+            (Some(_), 0) => discover_glob(),
+            (None, 6) | (Some(_), 1) => {
+                assert!(tool_names.contains("Glob"));
                 call(
                     "compact-glob",
                     "Glob",
                     json!({"pattern":"compact-marker.txt","limit":1}),
                 )
             }
-            (Some(_), 0) => call(
-                "compact-glob",
-                "Glob",
-                json!({"pattern":"compact-marker.txt","limit":1}),
-            ),
-            (None, 6) => {
+            (None, 7) => {
                 assert!(tool_content(&body, "compact-glob")
                     .contains(probe.workspace.join("compact-marker.txt").to_str().unwrap()));
                 call(
@@ -259,7 +271,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     }),
                 )
             }
-            (None, 7) => {
+            (None, 8) => {
                 let created: Value =
                     serde_json::from_str(&tool_content(&body, "grandchild-auto-create")).unwrap();
                 assert!(created["child_session_id"].as_str().is_some());
@@ -275,7 +287,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     (json!({"content":"CHILD_AWAITING_GRANDCHILD"}), "stop")
                 }
             }
-            (None, 8) => {
+            (None, 9) => {
                 assert!(
                     body.to_string().contains("GRANDCHILD_DONE"),
                     "resumed Child must receive canonical Grandchild outcome; messages={:?}",
@@ -298,7 +310,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 );
                 (json!({"content":"COMPACT_CHILD_EVIDENCE"}), "stop")
             }
-            (Some(_), 1) => {
+            (Some(_), 2) => {
                 assert!(tool_content(&body, "compact-glob")
                     .contains(probe.workspace.join("compact-marker.txt").to_str().unwrap()));
                 (json!({"content":"COMPACT_CHILD_EVIDENCE"}), "stop")
@@ -317,13 +329,12 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .iter()
                     .find(|tool| tool["function"]["name"] == "SubAgent")
                     .unwrap();
-                assert_eq!(
-                    schema["function"]["parameters"]["properties"]
-                        .as_object()
-                        .unwrap()
-                        .len(),
-                    5
-                );
+                let properties = schema["function"]["parameters"]["properties"]
+                    .as_object()
+                    .unwrap();
+                assert_eq!(properties.len(), 7);
+                assert_eq!(properties["model"]["type"], "string");
+                assert_eq!(properties["reasoning_effort"]["type"], "string");
                 let mut args = json!({"message":TASK});
                 if let Some(role) = probe.role {
                     args["role"] = json!(role);
@@ -667,7 +678,7 @@ async fn fixture(role: Option<&'static str>, fast_grandchild: bool) {
     );
     let inbox_state = inbox.inspect(&child.id).await.unwrap();
     assert_eq!((inbox_state.pending, inbox_state.claimed), (0, 0));
-    assert!(probe.child_calls.load(Ordering::SeqCst) >= 3);
+    assert!(probe.child_calls.load(Ordering::SeqCst) >= 4);
     let requests = probe.requests.lock().unwrap().clone();
     let matched = requests
         .iter()

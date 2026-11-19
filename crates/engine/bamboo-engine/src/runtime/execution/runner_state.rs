@@ -5,12 +5,12 @@
 //! orchestration layer across all background paths (HTTP execute, spawn, schedule).
 
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use bamboo_agent_core::AgentEvent;
+use bamboo_agent_core::{AgentEvent, TokenUsage};
 
 fn subagent_lifecycle_key(event: &AgentEvent) -> Option<(&str, &str)> {
     event
@@ -88,11 +88,15 @@ pub struct AgentRunner {
     // Only the exact-run finalizer sets this. Legacy HTTP Stop also sets the
     // visible status/completed_at when it signals, which is not finalization;
     // an unqualified finalizer cannot prove which run it finalized.
-    pub(super) execution_finalized: bool,
+    pub(super) execution_finalized: CancellationToken,
+    pub(super) terminal_usage: Arc<OnceLock<TokenUsage>>,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
     supervisor_run_workspace: Option<Option<String>>,
+
+    /// The exact start event published by this runner's forwarder.
+    pub published_execution_started: Option<AgentEvent>,
 
     /// Last token budget event to replay for new subscribers.
     ///
@@ -171,7 +175,43 @@ impl AgentRunner {
 
     /// This bit is set only by finalization of the matching run ID.
     pub fn exact_execution_finalized(&self) -> bool {
-        self.execution_finalized
+        self.execution_finalized.is_cancelled()
+    }
+
+    /// Cumulative loop usage recorded by this exact runner's finalizer.
+    pub fn terminal_usage(&self) -> Option<TokenUsage> {
+        self.terminal_usage.get().copied()
+    }
+
+    /// Retain start identity independently of the bounded critical event cache.
+    pub fn running_execution_started(&self) -> Option<&AgentEvent> {
+        self.published_execution_started.as_ref().filter(|event| {
+            matches!(self.status, AgentStatus::Running)
+                && matches!(event, AgentEvent::ExecutionStarted { run_id, .. } if run_id == &self.run_id)
+        })
+    }
+
+    /// Subscribe to the exact run's finalizer without granting the caller a way to signal it.
+    pub fn wait_for_exact_finalization(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.execution_finalized.clone().cancelled_owned()
+    }
+
+    pub async fn wait_for_managed_work_root_stop(
+        &self,
+        session: &bamboo_domain::Session,
+    ) -> std::io::Result<()> {
+        if !crate::ticket_runtime::is_managed_work_root(session) {
+            return Err(std::io::Error::other("managed Work Root required"));
+        }
+        tokio::time::timeout(
+            bamboo_orchestration::managed_session::MAX_FINALIZATION_WAIT,
+            self.root_execution
+                .wait_for_work_stop(session, &self.run_id),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("exact managed Work Root stop timed out"))?
     }
 
     /// Compare an existing Host observation without treating it as a grant.
@@ -199,7 +239,7 @@ impl AgentRunner {
         target: &bamboo_domain::SupervisorCurrentUserTarget,
         workspace_path: Option<&str>,
     ) -> bool {
-        self.execution_finalized
+        self.execution_finalized.is_cancelled()
             && self.supervisor_run_observation_matches(target, workspace_path) == Some(true)
     }
     /// Broadcast channel capacity for agent events.
@@ -227,9 +267,11 @@ impl AgentRunner {
             status: AgentStatus::Pending,
             started_at: Utc::now(),
             completed_at: None,
-            execution_finalized: false,
+            execution_finalized: CancellationToken::new(),
+            terminal_usage: Arc::default(),
             supervisor_run_target: None,
             supervisor_run_workspace: None,
+            published_execution_started: None,
             last_budget_event: None,
             last_critical_events: Vec::new(),
             last_tool_name: None,

@@ -471,12 +471,40 @@ fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, Per
 pub fn framework_root_spawn_permissions(
     args: &Value,
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
-    let project = required_string_arg(args, "project_id")?;
-    let workspace = required_string_arg(args, "workspace_path")?;
+    root_creation_permissions(args, "spawn_session")
+}
+
+fn root_creation_permissions(
+    args: &Value,
+    action: &str,
+) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
+    let (resource, description) = if args.get("project_id").is_none_or(Value::is_null)
+        && args.get("workspace_path").is_none_or(Value::is_null)
+    {
+        let operation = uuid::Uuid::parse_str(required_string_arg(args, "operation_id")?)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| {
+                PermissionError::CheckFailed(
+                    "standalone Root creation requires an operation UUID".into(),
+                )
+            })?;
+        (
+            format!("session_control create [unassigned] {operation}"),
+            "create a standalone independent Root in its own workspace and submit its first instruction",
+        )
+    } else {
+        let project = required_string_arg(args, "project_id")?;
+        let workspace = required_string_arg(args, "workspace_path")?;
+        (
+            format!("session_control create {project} {workspace}"),
+            "create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        )
+    };
     Ok(Some(vec![PermissionContext::new(
         PermissionType::ExecuteCommand,
-        format!("session_control create {project} {workspace}"),
-        "spawn_session: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        resource,
+        format!("{action}: {description}"),
     )]))
 }
 
@@ -585,7 +613,7 @@ pub fn check_permissions(
                 format!("Notebook edit: {}", path),
             )]))
         }
-        "Bash" | "exec_command" => {
+        "Bash" | "bash" | "exec_command" => {
             let command = shell_command(tool_name, args)
                 .ok_or_else(|| {
                     PermissionError::CheckFailed(
@@ -678,10 +706,9 @@ pub fn check_permissions(
             );
             let project_memory_dir = bamboo_config::paths::path_to_display_string(
                 // The permission classifier has no trusted session context, so
-                // it cannot resolve the exact opaque Project id. Gate durable
-                // writes at the conservative first-class Project root; runtime
-                // resolution narrows assigned writes to
-                // projects/<id>/memory/v1 and rejects Unassigned Project writes.
+                // it cannot resolve the exact Project or Section. Section uses
+                // the Project write gate. The memory tool validates the
+                // assignment and binds the actual scope before writing.
                 &bamboo_dir.join("projects"),
             );
             let context = |resource: String| {
@@ -697,15 +724,14 @@ pub fn check_permissions(
                     context(project_memory_dir.clone()),
                 ]
             };
-            let scoped_durable_contexts = || match args
+            let scope = args
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
+                .map(str::to_ascii_lowercase);
+            let scoped_durable_contexts = || match scope.as_deref() {
                 Some("global") => vec![context(global_memory_dir.clone())],
-                Some("project") => vec![context(project_memory_dir.clone())],
+                Some("project" | "section") => vec![context(project_memory_dir.clone())],
                 // Invalid/missing scope fails closed at the permission boundary.
                 // The tool may later reject the arguments, but no durable write
                 // can be authorized by a resource from only one possible scope.
@@ -718,13 +744,14 @@ pub fn check_permissions(
                 "write" | "rebuild" => Some(scoped_durable_contexts()),
                 // These actions identify existing memories by id(s), so the
                 // classifier cannot know whether execution will mutate the
-                // Global store or the assigned Project store.
+                // Global store or a scope in the assigned Project.
                 "merge" | "split" | "consolidate" => Some(ambiguous_durable_contexts()),
                 "purge"
-                    if args
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| !id.trim().is_empty()) =>
+                    if scope.as_deref() != Some("section")
+                        && args
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty()) =>
                 {
                     Some(ambiguous_durable_contexts())
                 }
@@ -1276,7 +1303,7 @@ pub fn check_permissions(
                     "SubAgent delete",
                     "SubAgent delete: remove a child session",
                 )])),
-                // wait / list / get / list_models → passive or read-only.
+                // Wait and read-only actions need no permission context.
                 _ => Ok(None),
             }
         }
@@ -1307,24 +1334,35 @@ pub fn check_permissions(
         }
         "session_control" => {
             let action = required_string_arg(args, "action")?;
-            if action == "scope" {
+            // Read-only observations grant no execution authority. The Host
+            // still validates the original Supervisor and its observation scope.
+            if matches!(action, "scope" | "directory" | "wait_outcomes") {
                 return Ok(None);
             }
-            if action == "observe_run" {
+            if action == "decide_approval" {
                 let target = required_string_arg(args, "target_session_id")?;
                 bamboo_domain::validate_supervisor_target_id(target)
                     .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                // The native Host owns the exact timed, one-shot authority.
+                // Requiring a second permission request here would delegate
+                // the approval of an approval.
                 return Ok(None);
             }
-            if action == "cancel" {
+            if matches!(action, "observe_run" | "wait_run" | "cancel") {
                 let target = required_string_arg(args, "target_session_id")?;
                 bamboo_domain::validate_supervisor_target_id(target)
                     .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                if action == "observe_run" {
+                    return Ok(None);
+                }
                 let run = required_string_arg(args, "expected_run_id")?;
                 if !bamboo_domain::valid_session_run_id(run) {
-                    return Err(PermissionError::CheckFailed(
-                        "session_control cancel requires a valid expected_run_id".into(),
-                    ));
+                    return Err(PermissionError::CheckFailed(format!(
+                        "session_control {action} requires a valid expected_run_id"
+                    )));
+                }
+                if action == "wait_run" {
+                    return Ok(None);
                 }
                 return Ok(Some(vec![PermissionContext::new(
                     PermissionType::ExecuteCommand,
@@ -1341,13 +1379,7 @@ pub fn check_permissions(
                             "session_control create requires request".into(),
                         )
                     })?;
-                let project = required_string_arg(request, "project_id")?;
-                let workspace = required_string_arg(request, "workspace_path")?;
-                return Ok(Some(vec![PermissionContext::new(
-                    PermissionType::ExecuteCommand,
-                    format!("session_control create {project} {workspace}"),
-                    "session_control create: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
-                )]));
+                return root_creation_permissions(request, "session_control create");
             }
             if action != "followup" {
                 return Err(PermissionError::CheckFailed(
@@ -1463,6 +1495,16 @@ fn subagent_permission_action(args: &Value) -> Result<Option<String>, Permission
         "chat" => "create",
         "inspect" => return Ok(None),
         "ask_parent" if !has_target => return Ok(None),
+        "wait"
+            if ["message", "model", "reasoning_effort"]
+                .iter()
+                .all(|field| {
+                    args.get(field)
+                        .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+                }) =>
+        {
+            "wait"
+        }
         "control" if has_target => {
             match args.get("message").and_then(Value::as_str).map(str::trim) {
                 Some("cancel") => "cancel",
@@ -1598,6 +1640,28 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[test]
+    fn standalone_creation_uses_the_same_operation_bound_permission_for_both_entrypoints() {
+        let operation = uuid::Uuid::new_v4();
+        let mut args = json!({"operation_id":operation, "message":"private instruction"});
+        let spawn = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        let control = check_permissions(
+            "session_control",
+            &json!({"action":"create", "request":args.clone()}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spawn[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(
+            spawn[0].resource,
+            format!("session_control create [unassigned] {operation}")
+        );
+        assert_eq!(control[0].resource, spawn[0].resource);
+        args["operation_id"] = json!(uuid::Uuid::new_v4());
+        let other = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        assert_ne!(other[0].resource, spawn[0].resource);
     }
 
     #[test]
@@ -2989,6 +3053,11 @@ mod tests {
         )
         .unwrap()
         .is_none());
+        let wait = json!({"action":"wait_run", "target_session_id":"root-a",
+            "expected_run_id":"private-run-id"});
+        assert!(check_permissions("session_control", &wait)
+            .unwrap()
+            .is_none());
         let args = json!({"action":"cancel", "target_session_id":"root-a",
             "expected_run_id":"private-run-id"});
         let contexts = check_permissions("session_control", &args)
@@ -3000,6 +3069,7 @@ mod tests {
         assert!(!contexts[0].resource.contains("private-run-id"));
         for invalid in [
             json!({"action":"observe_run"}),
+            json!({"action":"wait_run", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a", "expected_run_id":"not a run"}),
             json!({"action":"cancel", "target_session_id":"bad\ntarget", "expected_run_id":"run-a"}),
@@ -3166,6 +3236,27 @@ mod tests {
     }
 
     #[test]
+    fn subagent_compact_wait_preserves_legacy_wait_permission_without_launch_routing() {
+        for args in [
+            json!({"intent":"wait"}),
+            json!({"intent":"wait", "target":"child"}),
+        ] {
+            assert_eq!(
+                subagent_permission_action(&args).unwrap().as_deref(),
+                Some("wait")
+            );
+            assert!(check_permissions("SubAgent", &args).unwrap().is_none());
+        }
+        for field in ["message", "model", "reasoning_effort", "role", "reply_to"] {
+            for value in [json!("nonempty"), json!(true)] {
+                let mut args = json!({"intent":"wait"});
+                args[field] = value;
+                assert!(check_permissions("SubAgent", &args).is_err(), "{args}");
+            }
+        }
+    }
+
+    #[test]
     fn subagent_compact_invalid_routing_fails_closed() {
         for args in [
             json!(null),
@@ -3196,7 +3287,7 @@ mod tests {
             ("deploy_agent", json!({"action": "list"})),
             ("cluster", json!({"action": "list"})),
             ("cluster", json!({"action": "status", "node": "n1"})),
-            ("SubAgent", json!({"action": "list"})),
+            ("SubAgent", json!({"intent": "inspect"})),
             ("SubAgent", json!({"action": "wait"})),
             ("SubAgent", json!({"action": "get", "session_id": "c1"})),
             ("SubAgent", json!({"action": "list_models"})),
@@ -3377,6 +3468,31 @@ mod tests {
                 check_tool_rules("exec_command", &exec_args, &allowed, &denied),
                 Some(false)
             );
+        }
+    }
+
+    #[test]
+    fn foreground_bash_preserves_shell_restrictions_without_widening_grants() {
+        let command = "printf '%s' evidence";
+        let foreground = json!({"command": command, "timeout": 2.5});
+        let yielding = json!({"cmd": command, "interactive": true});
+        assert_eq!(
+            check_permissions("bash", &foreground).unwrap().unwrap()[0].resource,
+            command
+        );
+        for rule in ["Bash(printf *)", "exec_command(printf *)"] {
+            let rules = [rule.to_owned()];
+            assert_eq!(
+                check_tool_rules("bash", &foreground, &[], &rules),
+                Some(false)
+            );
+            assert_eq!(
+                check_tool_rules("bash", &foreground, &rules, &[]),
+                Some(true)
+            );
+        }
+        for (name, args) in [("Bash", &foreground), ("exec_command", &yielding)] {
+            assert_eq!(check_tool_rules(name, args, &["bash".into()], &[]), None);
         }
     }
 
@@ -3619,13 +3735,15 @@ mod tests {
             .resource
             .ends_with("/memory/v1/scopes/global"));
 
-        let project_write =
-            check_permissions("memory", &json!({"action": "write", "scope": "project"}))
-                .unwrap()
-                .unwrap();
-        assert_eq!(project_write.len(), 1);
-        assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
-        assert!(project_write[0].resource.ends_with("/projects"));
+        for scope in ["project", "section"] {
+            let project_write =
+                check_permissions("memory", &json!({"action": "write", "scope": scope}))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(project_write.len(), 1);
+            assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
+            assert!(project_write[0].resource.ends_with("/projects"));
+        }
 
         let ambiguous_write = check_permissions("memory", &json!({"action": "write"}))
             .unwrap()
@@ -3687,6 +3805,15 @@ mod tests {
         assert!(scoped_purge[0]
             .resource
             .ends_with("/memory/v1/scopes/global"));
+
+        let section_purge = check_permissions(
+            "memory",
+            &json!({"action": "purge", "scope": "section", "id": "memory-1"}),
+        )
+        .unwrap()
+        .expect("a purge explicitly scoped to Section must use the Project gate");
+        assert_eq!(section_purge.len(), 1);
+        assert!(section_purge[0].resource.ends_with("/projects"));
 
         // Read-only actions stay ungated.
         for action in [

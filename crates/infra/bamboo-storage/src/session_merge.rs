@@ -39,17 +39,18 @@ mod child_actor;
 use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
-use bamboo_domain::storage::Storage;
+use bamboo_domain::storage::{Storage, SupervisorApprovalCommit};
 use bamboo_domain::{
-    latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
-    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY,
-    CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    latest_response_occurrence, permission_request_generation, PermissionAuditSeed,
+    PermissionAuditSnapshot, ResponseOccurrence, RetrievalWindowCheckpointOutcome,
+    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
     "gold_config",
+    bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY,
     "workflow.run_ids.v1",
     "ticket.runtime.dispatch.v1",
     "ticket.runtime.owned_stop.v1",
@@ -61,20 +62,24 @@ const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "project_resources_rendered",
     "runtime_prompt_snapshot",
 ];
+const PERMISSION_RESPONSE_RESUME_KEYS: &[&str] = &[
+    "clarification_resume_pending",
+    "conclusion_with_options_resume_pending",
+    "execute.startup_handoff_at",
+];
+pub(crate) const PERMISSION_REPLAY_KEYS: &[&str] = &[
+    "permission.reexecute_tool_call_id",
+    "permission.reexecute_request_generation",
+];
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
     CONSUMED_RESPONSE_OCCURRENCES_KEY,
     "runtime.suspend_reason",
-    "clarification_resume_pending",
-    "conclusion_with_options_resume_pending",
-    "execute.startup_handoff_at",
-    "permission.reexecute_tool_call_id",
-    "permission.reexecute_request_generation",
     "retry_resume_pending",
     "retry_resume_reason",
-    "provider_name",
-    "runtime.child_completion_source_v1",
 ];
+const RESPONSE_RELATED_METADATA_KEYS: &[&str] =
+    &["provider_name", "runtime.child_completion_source_v1"];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
 const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
@@ -83,6 +88,175 @@ const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_r
 const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
 const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_handoff";
+
+/// A full response save replaces runtime.json before session.json. A typed
+/// consumption in the sidecar cannot clear the question until Main replaces
+/// the tool result with the decision receipt from that same response.
+pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Session) {
+    let handoff_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+    match main.metadata.get(handoff_key) {
+        Some(marker) => {
+            side.metadata.insert(handoff_key.into(), marker.clone());
+            copy_permission_response_control(main, side);
+            return;
+        }
+        None => {
+            side.metadata.remove(handoff_key);
+        }
+    }
+    if !main_may_have_uncommitted_response_control(main, side)
+        || main.id != side.id
+        || main.created_at != side.created_at
+        || main.check_conversation_generation(side).is_err()
+    {
+        return;
+    }
+    // The sidecar intentionally has no messages. Match its consumed ledger
+    // against the current Main occurrence, not just the provider's call ID.
+    let Some(occurrence) = bamboo_domain::pending_permission_occurrence(main) else {
+        return;
+    };
+    let consumed = |session: &Session| {
+        session
+            .metadata
+            .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            .and_then(|encoded| serde_json::from_str::<Vec<ResponseOccurrence>>(encoded).ok())
+            .is_some_and(|entries| entries.contains(&occurrence))
+    };
+    if !consumed(side) || consumed(main) {
+        return;
+    }
+    copy_permission_response_control(main, side);
+}
+
+fn copy_permission_response_control(main: &Session, side: &mut Session) {
+    side.pending_question.clone_from(&main.pending_question);
+    for &key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+    {
+        match main.metadata.get(key) {
+            Some(value) => {
+                side.metadata.insert(key.into(), value.clone());
+            }
+            None => {
+                side.metadata.remove(key);
+            }
+        }
+    }
+}
+
+/// Pending and consumed response controls are immutable while Main owns an
+/// unclaimed handoff. Only the dedicated claim may advance this checkpoint.
+pub(crate) fn same_permission_response_control(current: &Session, proposed: &Session) -> bool {
+    current.pending_question == proposed.pending_question
+        && RESPONSE_CONTROL_METADATA_KEYS
+            .iter()
+            .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+            .chain(PERMISSION_REPLAY_KEYS)
+            .all(|key| current.metadata.get(*key) == proposed.metadata.get(*key))
+}
+
+pub(crate) fn reject_stale_permission_response(
+    current: &Session,
+    proposed: &Session,
+    runtime_only: bool,
+) -> std::io::Result<()> {
+    let Some(raw) = current.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY) else {
+        return Ok(());
+    };
+    let consumed: Vec<ResponseOccurrence> = serde_json::from_str(raw)?;
+    let history = if runtime_only { current } else { proposed };
+    let occurrence = proposed
+        .pending_question
+        .as_ref()
+        .and_then(|question| latest_response_occurrence(history, &question.tool_call_id));
+    let replay_call_key = PERMISSION_REPLAY_KEYS[0];
+    let replay_generation_key = PERMISSION_REPLAY_KEYS[1];
+    let replay_call = proposed.metadata.get(replay_call_key);
+    let replay_generation = proposed.metadata.get(replay_generation_key);
+    let replay_controls_changed = current.metadata.get(replay_call_key) != replay_call
+        || current.metadata.get(replay_generation_key) != replay_generation;
+    let stale = consumed
+        .iter()
+        .filter(|entry| entry.permission_generation.is_some())
+        .any(|entry| {
+            let reopens = match &occurrence {
+                Some(pending) => entry == pending,
+                // Runtime-only control projections have no transcript. Only
+                // canonical history can attest a new generation in that case.
+                None => proposed.pending_question.as_ref().is_some_and(|question| {
+                    current.pending_question.as_ref() != Some(question)
+                        && entry.tool_call_id == question.tool_call_id
+                }),
+            };
+            let reintroduces_replay = replay_controls_changed
+                && replay_call == Some(&entry.tool_call_id)
+                && replay_generation.is_none_or(|generation| {
+                    Some(generation) == entry.permission_generation.as_ref()
+                });
+            reopens
+                || reintroduces_replay
+                || (!runtime_only && changes_permission_receipt(current, proposed, entry))
+        });
+    if stale {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "permission response was already consumed".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn changes_permission_receipt(
+    current: &Session,
+    proposed: &Session,
+    entry: &ResponseOccurrence,
+) -> bool {
+    fn result<'a>(
+        session: &'a Session,
+        entry: &ResponseOccurrence,
+    ) -> Option<&'a bamboo_domain::Message> {
+        session.messages.iter().rev().find(|message| {
+            message.id == entry.tool_result_message_id
+                && permission_request_generation(message) == entry.permission_generation
+        })
+    }
+    let Some(saved) = result(current, entry) else {
+        return false;
+    };
+    let Some(candidate) = result(proposed, entry) else {
+        // A repark has a new generation. History edits may also remove the
+        // entire occurrence after its handoff has been claimed.
+        return false;
+    };
+    let key = "permission_decision_receipt";
+    let saved = saved.metadata.as_ref().and_then(|value| value.get(key));
+    let candidate = candidate.metadata.as_ref().and_then(|value| value.get(key));
+    saved.is_some() && saved != candidate
+}
+
+/// Sidecar-only reads need Main only when the response's sidecar could be ahead.
+pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
+    side.pending_question.is_none()
+        && side
+            .metadata
+            .contains_key(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && PERMISSION_RESPONSE_RESUME_KEYS
+            .iter()
+            .chain(PERMISSION_REPLAY_KEYS)
+            .any(|key| side.metadata.contains_key(*key))
+}
+
+pub(crate) fn main_may_have_uncommitted_response_control(main: &Session, side: &Session) -> bool {
+    main.pending_question.is_some()
+        && main.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            != side.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && has_uncommitted_response_marker(side)
+}
 
 /// A worker clarification was already checkpointed by the Host while this
 /// runner still held an older in-memory Child snapshot. The Host checkpoint,
@@ -154,10 +328,17 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS.iter().copied().chain([
-        bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
-        bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
-    ]) {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .copied()
+        .chain([
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+            bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+        ])
+    {
         match durable.metadata.get(key) {
             Some(value) => {
                 session.metadata.insert(key.to_string(), value.clone());
@@ -220,6 +401,7 @@ fn reconcile_runtime_checkpoint(
     apply_authoritative_metadata(session, latest);
     adopt_fresher_disk_permission_posture(session, latest);
     let _ = adopt_durable_tagged_child_wait(session, latest);
+    adopt_durable_background_exec_wait(session, latest);
     Ok((appended, adopted_response))
 }
 
@@ -316,7 +498,7 @@ fn adopt_root_publication(
         ));
     }
     ensure_conversation_generation_is_current(session, &committed)?;
-    // These three fields are #[serde(skip)] runtime-only state. The persisted
+    // These fields are #[serde(skip)] runtime-only state. The persisted
     // copy never carries `resolved_token_budget` or `force_manual_compression`,
     // so adopting it would erase the live round's values: downstream dispatch
     // then loses the resolved tool-output cap (native skill calls fail with
@@ -329,6 +511,9 @@ fn adopt_root_publication(
     adopted.resolved_token_budget = session.resolved_token_budget.clone();
     adopted.observed_runtime_session_version = session.observed_runtime_session_version;
     adopted.force_manual_compression = session.force_manual_compression.clone();
+    // Carry the exact answer of this live execution through the transcript
+    // checkpoint. The owned terminal writer seals it against committed Main.
+    adopted.root_final_message_candidate = session.root_final_message_candidate.take();
     *session = adopted;
     Ok(())
 }
@@ -601,6 +786,79 @@ pub(crate) fn adopt_durable_tagged_child_wait(
     Some(registered_at)
 }
 
+/// The handoff notice and wait are committed together. Once that notice exists
+/// in durable history, the monitor owns later clears of that exact wait. A
+/// stale runner checkpoint cannot re-arm it or replace a newer shell wait.
+pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: &Session) {
+    const EXEC_ID: &str = "runtime.background_exec_id";
+    let (Some(runtime), Some(durable)) = (
+        session.agent_runtime_state.as_mut(),
+        latest.agent_runtime_state.as_ref(),
+    ) else {
+        return;
+    };
+    let Some([handle]) = runtime
+        .waiting_for_bash
+        .as_ref()
+        .map(|wait| wait.bash_ids.as_slice())
+    else {
+        return;
+    };
+    if session.id != latest.id
+        || session.created_at != latest.created_at
+        || runtime.waiting_for_bash == durable.waiting_for_bash
+        || !latest.messages.iter().rev().any(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "background_exec_wait"
+                        && metadata["source"] == "runtime"
+                        && metadata["exec_session_id"] == handle.as_str()
+                })
+        })
+    {
+        return;
+    }
+
+    runtime
+        .waiting_for_bash
+        .clone_from(&durable.waiting_for_bash);
+    if let Some(handle) = latest.metadata.get(EXEC_ID).filter(|handle| {
+        runtime
+            .waiting_for_bash
+            .as_ref()
+            .is_some_and(|wait| matches!(wait.bash_ids.as_slice(), [id] if id == *handle))
+    }) {
+        session.metadata.insert(EXEC_ID.into(), handle.clone());
+    } else {
+        session.metadata.remove(EXEC_ID);
+    }
+    if runtime.waiting_for_bash.is_none() {
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_bash")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if runtime
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_bash")
+        {
+            runtime.suspension.clone_from(&durable.suspension);
+            if runtime.status == bamboo_domain::AgentStatusState::Suspended {
+                runtime.status = durable.status;
+            }
+        }
+    }
+    if let Some(mirror) = session.metadata.get_mut("agent.runtime.state") {
+        if let Ok(serialized) = serde_json::to_string(runtime) {
+            *mirror = serialized;
+        }
+    }
+}
+
 /// A synchronous SubAgent tool has already persisted its tagged wait before
 /// launching the child. At runner finalization, the durable copy therefore
 /// owns later completion/rollback changes to that wait. Reconcile inside the
@@ -822,7 +1080,13 @@ fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .chain([&bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY])
+    {
         if let Some(value) = durable.metadata.get(*key) {
             session.metadata.insert((*key).to_string(), value.clone());
         } else {
@@ -932,6 +1196,7 @@ pub struct LockedSessionStore {
         bamboo_domain::RootActorRuntimeWrite,
         bamboo_domain::RootActorRuntimePublisher,
     )>,
+    supervisor_approval: Option<Arc<SupervisorApprovalCommit>>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Serializes recoverable child/root Task transactions. Per-session locks
     /// still provide the data isolation; this gate ensures a retained recovery
@@ -985,6 +1250,7 @@ impl LockedSessionStore {
             storage,
             inherited_child_wait: None,
             root_actor_writer: None,
+            supervisor_approval: None,
             child_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
@@ -1008,10 +1274,18 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: Some((owner, publish)),
+            supervisor_approval: None,
             child_actor_writer: None,
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         })
+    }
+
+    /// Restrict this private response writer to the original delegated
+    /// approval. Its storage CAS must retain the approval's authority.
+    pub fn bind_supervisor_approval(mut self, approval: Arc<SupervisorApprovalCommit>) -> Self {
+        self.supervisor_approval = Some(approval);
+        self
     }
 
     /// Keep the exact captured birth/wait in a private execution view, sharing
@@ -1021,6 +1295,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: Some(inherited),
             root_actor_writer: self.root_actor_writer.clone(),
+            supervisor_approval: self.supervisor_approval.clone(),
             child_actor_writer: self.child_actor_writer.clone(),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
@@ -1193,16 +1468,29 @@ impl LockedSessionStore {
                 let carried_wait = self.inherited_for_session(session).cloned();
                 let (publish, slot) = capture_root_publication(publish.clone());
                 let mut candidate = session.clone();
-                self.storage
-                    .save_root_actor_bound_startup(
-                        owner,
-                        &mut candidate,
-                        expected,
-                        carried_wait.as_ref(),
-                        publish,
-                    )
-                    .await
-                    .and_then(|()| adopt_root_publication(session, &slot))
+                let saved = if let Some(approval) = self.supervisor_approval.as_ref() {
+                    self.storage
+                        .save_supervisor_approval_response(
+                            owner,
+                            &mut candidate,
+                            expected,
+                            carried_wait.as_ref(),
+                            approval,
+                            publish,
+                        )
+                        .await
+                } else {
+                    self.storage
+                        .save_root_actor_bound_startup(
+                            owner,
+                            &mut candidate,
+                            expected,
+                            carried_wait.as_ref(),
+                            publish,
+                        )
+                        .await
+                };
+                saved.and_then(|()| adopt_root_publication(session, &slot))
             } else if self.child_actor_writer.is_some() {
                 self.save_child_snapshot(session, false, input.cloned(), inherited)
                     .await
@@ -1407,7 +1695,7 @@ impl LockedSessionStore {
                 == Some(generation);
             let already_started = matches!(
                 latest.last_run_status().as_deref(),
-                Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended")
+                Some("running" | "suspended")
             );
             return Ok((already_promised && already_started).then_some(latest));
         }
@@ -2143,11 +2431,11 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
-        if staged
+        let is_message_summary = staged
             .compression_events
             .last()
-            .is_some_and(|event| event.kind == bamboo_domain::CompressionEventKind::MessageSummary)
-        {
+            .is_some_and(|event| event.kind == bamboo_domain::CompressionEventKind::MessageSummary);
+        if is_message_summary {
             validate_staged_message_summary_transition(expected_base, staged)?;
         } else {
             validate_staged_retrieval_window_transition(expected_base, staged)?;
@@ -2158,13 +2446,18 @@ impl LockedSessionStore {
         if let Some(latest) = latest.as_ref() {
             ensure_conversation_generation_is_current(expected_base, latest)?;
             ensure_conversation_generation_is_current(staged, latest)?;
+            if is_message_summary && bamboo_domain::message_summary_tool_work_pending(latest) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "message-summary checkpoint found pending tool work",
+                ));
+            }
             if !retrieval_window_base_matches(expected_base, latest)? {
                 *staged = rebase_retrieval_window_base(expected_base, latest);
                 apply_authoritative_metadata(staged, latest);
                 adopt_fresher_disk_permission_posture(staged, latest);
                 return Ok(RetrievalWindowCheckpointOutcome::Rebased);
             }
-
             ensure_model_context_checkpoint_is_current(staged, latest)?;
             bamboo_domain::merge_session_inbox_admission(staged, latest);
             apply_authoritative_metadata(staged, latest);
@@ -2374,6 +2667,7 @@ impl LockedSessionStore {
             if let Some(registered_at) = adopt_durable_tagged_child_wait(session, latest) {
                 preserve_finalized_hidden_child_resumes(session, latest, registered_at);
             }
+            adopt_durable_background_exec_wait(session, latest);
             adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
@@ -2753,8 +3047,9 @@ impl LockedSessionStore {
         // overwriting a cross-instance profile or pending-question change.
         // Older backends retain their original fenced response save; Connect
         // verifies this capability before consuming a non-terminal answer.
-        let expected = (self.root_actor_writer.is_some()
-            && self.storage.supports_root_actor_bound_startup())
+        let expected = (self.supervisor_approval.is_some()
+            || (self.root_actor_writer.is_some()
+                && self.storage.supports_root_actor_bound_startup()))
         .then(|| session.clone());
         if let Err(error) = mutate(&mut session) {
             return Ok(Err(error));
@@ -3640,7 +3935,7 @@ fn validate_staged_retrieval_window_transition(
 
 /// Message-only summaries share the existing archive CAS/publication boundary.
 /// Validate their narrower projection separately: raw history is immutable,
-/// every completed tool exchange leaves the active view, and only derived
+/// all eligible tool rows leave the active view, and only derived
 /// compression state may change with the provider-continuation reset.
 fn validate_staged_message_summary_transition(
     expected: &Session,
@@ -3673,6 +3968,9 @@ fn validate_staged_message_summary_transition(
             "message-summary checkpoint has an invalid archive event",
         ));
     }
+    bamboo_domain::validate_message_summary_tool_protocol(expected).map_err(|error| {
+        invalid_retrieval_window_checkpoint(format!("message-summary checkpoint blocked: {error}"))
+    })?;
     let latest_user_id = expected
         .messages
         .iter()
@@ -3681,8 +3979,6 @@ fn validate_staged_message_summary_transition(
         .map(|message| message.id.as_str());
     let mut canonical = expected.clone();
     let mut newly_archived = 0usize;
-    let mut calls = std::collections::HashSet::new();
-    let mut results = std::collections::HashSet::new();
     for (before, canonical_message) in expected.messages.iter().zip(&mut canonical.messages) {
         if before.compressed {
             continue;
@@ -3698,43 +3994,9 @@ fn validate_staged_message_summary_transition(
         let should_archive = before.role != Role::System
             && Some(before.id.as_str()) != latest_user_id
             && (!before.never_compress || generated_recovery);
-        if has_tool_protocol && (before.never_compress || !should_archive) {
+        if has_tool_protocol && !should_archive {
             return Err(invalid_retrieval_window_checkpoint(
                 "message-summary checkpoint cannot retain active tool protocol",
-            ));
-        }
-        if has_calls {
-            if before.role != Role::Assistant {
-                return Err(invalid_retrieval_window_checkpoint(
-                    "message-summary checkpoint has tool calls outside an assistant message",
-                ));
-            }
-            for call in before.tool_calls.iter().flatten() {
-                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
-                    return Err(invalid_retrieval_window_checkpoint(
-                        "message-summary checkpoint has empty or duplicate tool call identifiers",
-                    ));
-                }
-            }
-        }
-        if before.role == Role::Tool {
-            let id = before
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    invalid_retrieval_window_checkpoint(
-                        "message-summary checkpoint has an uncorrelated tool result",
-                    )
-                })?;
-            if !results.insert(id) {
-                return Err(invalid_retrieval_window_checkpoint(
-                    "message-summary checkpoint has duplicate tool results",
-                ));
-            }
-        } else if before.tool_call_id.is_some() {
-            return Err(invalid_retrieval_window_checkpoint(
-                "message-summary checkpoint has a tool result identifier outside a tool message",
             ));
         }
         if should_archive {
@@ -3748,9 +4010,9 @@ fn validate_staged_message_summary_transition(
             newly_archived += 1;
         }
     }
-    if calls != results || newly_archived == 0 || event.messages_compressed != newly_archived {
+    if newly_archived == 0 || event.messages_compressed != newly_archived {
         return Err(invalid_retrieval_window_checkpoint(
-            "message-summary checkpoint must archive complete tool chains with an exact event count",
+            "message-summary checkpoint must archive eligible history with an exact event count",
         ));
     }
     if let Some(summary) = staged.conversation_summary.as_ref() {
@@ -3929,6 +4191,17 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if session.host_run_id().is_some() && session.host_run_id() == latest.host_run_id() {
+        let key = "runtime.host_prior_activation_fence";
+        match latest.metadata.get(key) {
+            Some(fence) => {
+                session.metadata.insert(key.into(), fence.clone());
+            }
+            None => {
+                session.metadata.remove(key);
+            }
+        }
+    }
     if session.kind == bamboo_domain::SessionKind::Child
         && latest.kind == bamboo_domain::SessionKind::Child
         && session.created_at == latest.created_at
@@ -3943,7 +4216,15 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
             .runtime_metadata
             .as_ref()
             .and_then(|metadata| metadata.child_launch_generation);
-        if latest_launch > incoming_launch {
+        // A terminal writer must retain the generation it actually executed.
+        // Promoting it to a newer pending launch would turn an old finish or
+        // enqueue/cancel failure into the newer launch's outcome. The
+        // physical writer below must reject the retained stale generation.
+        let closes_launch = matches!(
+            session.last_run_status().as_deref(),
+            Some("completed" | "cancelled" | "error" | "timeout" | "skipped")
+        );
+        if latest_launch > incoming_launch && !closes_launch {
             session
                 .runtime_metadata
                 .get_or_insert_with(Default::default)
@@ -6502,6 +6783,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_background_exec_snapshot_preserves_a_newer_shell_wait() {
+        use bamboo_domain::{AgentRuntimeState, Message, WaitingForBashState};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut session = fresh("background-exec-replacement");
+        session.agent_runtime_state = Some(AgentRuntimeState::default());
+        storage.save_session(&session).await.unwrap();
+
+        let mut notice = Message::assistant("Monitoring the command.", None);
+        notice.metadata = Some(serde_json::json!({
+            "runtime_kind": "background_exec_wait",
+            "source": "runtime",
+            "exec_session_id": "old-exec",
+        }));
+        session.add_message(notice);
+        session
+            .metadata
+            .insert("runtime.background_exec_id".into(), "old-exec".into());
+        let original = WaitingForBashState::for_bash(vec!["old-exec".into()], chrono::Utc::now());
+        session
+            .agent_runtime_state
+            .as_mut()
+            .unwrap()
+            .waiting_for_bash = Some(original.clone());
+        store.merge_save_runtime(&mut session).await.unwrap();
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_bash,
+            Some(original)
+        );
+
+        let replacement =
+            WaitingForBashState::for_bash(vec!["new-bash".into()], chrono::Utc::now());
+        store
+            .update_runtime_config(&session.id, |durable| {
+                durable
+                    .agent_runtime_state
+                    .as_mut()
+                    .unwrap()
+                    .waiting_for_bash = Some(replacement.clone());
+                durable.metadata.remove("runtime.background_exec_id");
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        store
+            .merge_save_finalized_runtime(&mut session)
+            .await
+            .unwrap();
+        let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.agent_runtime_state.unwrap().waiting_for_bash,
+            Some(replacement)
+        );
+        assert!(!saved.metadata.contains_key("runtime.background_exec_id"));
+    }
+
+    #[tokio::test]
     async fn checkpoint_runtime_session_preserves_disk_suffix_and_appends_live_messages() {
         use bamboo_domain::session::types::Message;
 
@@ -7243,6 +7587,46 @@ mod tests {
             .all(|message| message.compressed));
         assert_eq!(saved.messages[6].content, "Current user request");
         assert!(!saved.messages[6].compressed);
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_refuses_a_new_durable_wait_even_with_a_paired_result() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        for (id, has_paired_result) in [
+            ("message-summary-new-paired-wait", true),
+            ("message-summary-new-unanswered-wait", false),
+        ] {
+            let (mut expected, mut staged) = message_summary_fixture(id);
+            if !has_paired_result {
+                expected.messages.remove(3);
+                staged.messages.remove(3);
+                staged.compression_events[0].messages_compressed -= 1;
+                staged.conversation_summary.as_mut().unwrap().message_count -= 1;
+            }
+            let mut durable = expected.clone();
+            durable.pending_question = Some(bamboo_domain::PendingQuestion {
+                tool_call_id: "summary-tool-call".into(),
+                tool_name: "skills_read".into(),
+                question: "May this tool continue?".into(),
+                options: vec![],
+                allow_custom: true,
+                source: bamboo_domain::PendingQuestionSource::AgenticClarification,
+            });
+            storage.save_session(&durable).await.unwrap();
+
+            let error = store
+                .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {
+                    panic!("a blocked archive must not publish")
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{id}");
+            let saved = storage.load_session(id).await.unwrap().unwrap();
+            assert_eq!(saved.pending_question, durable.pending_question);
+            assert!(saved.compression_events.is_empty());
+            assert!(saved.messages.iter().all(|message| !message.compressed));
+        }
     }
 
     #[tokio::test]

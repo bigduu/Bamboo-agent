@@ -47,21 +47,30 @@ fn target_id_is_valid(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn target_project(target: &Session) -> io::Result<ProjectId> {
+fn root_project(target: &Session) -> io::Result<Option<ProjectId>> {
     if !target.authority_identity.is_ordinary() || target.kind != SessionKind::Root {
         return Err(denied("a target must be an independent Ordinary Root"));
     }
     target
         .project_id_meta()
-        .ok_or_else(|| denied("target has no Project"))?
-        .parse::<ProjectId>()
-        .map_err(|_| denied("target has an invalid Project"))
+        .map(|id| {
+            id.parse()
+                .map_err(|_| denied("target has an invalid Project"))
+        })
+        .transpose()
 }
 
-/// Shared canonical candidate check for both existing Supervisor creation and
-/// explicitly scoped Host creation. Neither route can create an elevated Root.
-pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<ProjectId> {
-    let project = target_project(candidate)?;
+fn target_project(target: &Session) -> io::Result<ProjectId> {
+    root_project(target)?.ok_or_else(|| denied("target has no Project"))
+}
+
+/// Shared canonical candidate check for Supervisor and finite Host creation.
+/// Only observed Supervisor dispatch supports the Ordinary Ultra tool catalog.
+pub(super) fn new_root_candidate_project(
+    candidate: &Session,
+    allow_ultra: bool,
+) -> io::Result<Option<ProjectId>> {
+    let project = root_project(candidate)?;
     candidate
         .check_execution_compatibility()
         .map_err(|error| denied(&error.to_string()))?;
@@ -72,7 +81,7 @@ pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<Proj
         || candidate.parent_session_id.is_some()
         || candidate.parent_created_at.is_some()
         || candidate.spawn_depth != 0
-        || candidate.root_orchestration_only_enabled()
+        || (!allow_ultra && candidate.root_orchestration_only_enabled())
         || candidate.supervisor_management.is_some()
         || candidate.conversation_reset.is_some()
         || candidate.metadata_version != 0
@@ -81,8 +90,13 @@ pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<Proj
             .is_none_or(|path| path.trim().is_empty())
     {
         return Err(denied(
-            "creation requires a new Standard Ordinary Root with an explicit workspace",
+            "creation requires an allowed new Ordinary Root with an explicit workspace",
         ));
+    }
+    if candidate.root_orchestration_only_enabled() {
+        candidate
+            .validate_root_orchestration_compatibility()
+            .map_err(|error| denied(&error.to_string()))?;
     }
     Ok(project)
 }
@@ -90,7 +104,7 @@ pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<Proj
 pub(super) fn reserved_root_matches(target: &Session, candidate: &Session) -> bool {
     target.id == candidate.id
         && target.created_at == candidate.created_at
-        && target_project(target).ok() == target_project(candidate).ok()
+        && matches!((root_project(target), root_project(candidate)), (Ok(target), Ok(candidate)) if target == candidate)
         && target.workspace_path_meta() == candidate.workspace_path_meta()
         && target.metadata_version == 0
         && target.root_session_id == target.id
@@ -98,7 +112,7 @@ pub(super) fn reserved_root_matches(target: &Session, candidate: &Session) -> bo
         && target.parent_created_at.is_none()
         && target.spawn_depth == 0
         && target.supervisor_management.is_none()
-        && !target.root_orchestration_only_enabled()
+        && target.root_thinking_mode() == candidate.root_thinking_mode()
         && target.session_version == candidate.session_version
         && candidate.check_conversation_generation(target).is_ok()
 }
@@ -1074,7 +1088,11 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorManagementReceipt> {
         reference_is_valid(supervisor)?;
         target_id_is_valid(&candidate.id)?;
-        new_root_candidate_project(candidate)?;
+        if new_root_candidate_project(candidate, original_caller.is_some())?.is_none()
+            && original_caller.is_none()
+        {
+            return Err(denied("target has no Project"));
+        }
         if original_caller.is_some_and(|caller| caller.session_id != supervisor.session_id) {
             return Err(denied("current-user original caller mismatch"));
         }

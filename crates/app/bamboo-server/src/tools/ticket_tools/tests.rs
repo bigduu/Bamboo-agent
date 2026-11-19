@@ -4,10 +4,13 @@ use bamboo_config::Config;
 use bamboo_domain::{Session, SessionAuthorityIdentity, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_storage::SessionStoreV2;
 use tokio::sync::RwLock;
+#[path = "tests/variants.rs"]
+mod variants;
 
 struct Fixture {
     _root: tempfile::TempDir,
     app: Arc<TicketApplication>,
+    storage: Arc<SessionStoreV2>,
     session: Session,
 }
 impl Fixture {
@@ -15,7 +18,7 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
         let config: Config = serde_json::from_value(
-            json!({"provider":"openai","features":{"ticket_mutation":true},
+            json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
             "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}}),
         )
         .unwrap();
@@ -31,6 +34,7 @@ impl Fixture {
         Self {
             _root: root,
             app,
+            storage,
             session,
         }
     }
@@ -62,6 +66,32 @@ async fn invoke(tool: &TicketTool, args: Value, ctx: ToolCtx) -> (bool, Value) {
 }
 
 #[tokio::test]
+async fn work_review_refuses_missing_caller_and_plan_mode_before_accounting() {
+    let fixture = Fixture::new().await;
+    let tool = fixture.tool("work_review");
+    let args = json!({
+        "project_id":"project", "work_id":"work", "assignment_id":"assignment",
+        "operation_id":"126c8257-7631-4540-997d-6fe532c774d0"
+    });
+    let service = fixture.app.service().unwrap();
+    let before = service.published().unwrap().0;
+    assert!(matches!(
+        tool.call(args.clone(), &fixture.ctx()).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("original Work Review caller missing")
+    ));
+    let mut ctx = fixture.ctx();
+    ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        &fixture.session,
+    )));
+    ctx.plan_read_only = true;
+    assert!(matches!(
+        tool.call(args, &ctx).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("Plan mode is read-only")
+    ));
+    assert_eq!(service.published().unwrap().0, before);
+}
+
+#[tokio::test]
 async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
     let fixture = Fixture::new().await;
     let tools: Vec<_> = NAMES.iter().map(|&name| fixture.tool(name)).collect();
@@ -76,6 +106,7 @@ async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
         _root: root,
         app,
         session,
+        ..
     } = fixture;
     let writer_root = root
         .path()
@@ -168,9 +199,104 @@ async fn ticket_model_update_replays_exact_receipt_and_cannot_write_ingress_or_u
     assert!(f.session.task_list.is_none());
 }
 
+#[tokio::test]
+async fn exact_handoff_tool_reads_a_submission_under_original_supervisor_authority() {
+    let f = Fixture::new().await;
+    let (service, supervisor) = f
+        .app
+        .authority(Principal::Supervisor {
+            session_id: f.session.id.clone(),
+        })
+        .await
+        .unwrap();
+    let operations = serde_json::from_value(json!([
+        {"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],"contract":{
+            "title":"One Work","objective":"One result","constraints":[],"acceptance":["Exact output"],
+            "user_acceptance_required":true,"allowed_tools":["Task"]}},
+        {"op":"ready","work_id":"work"},
+        {"op":"start","work_id":"work","temp_id":"assignment","workspace":null}
+    ])).unwrap();
+    let create = service
+        .prepare_command(&supervisor, "handoff-create", operations)
+        .unwrap();
+    let ids = service.execute(&supervisor, &create).unwrap().ids;
+    let snapshot = service.published().unwrap().1;
+    let binding = snapshot.binding.clone();
+    let assignment = &snapshot.assignments[&ids["assignment"]];
+    let runtime = Authority::from_verified_host(binding.clone(), Principal::Runtime);
+    let receipt = RuntimeReceipt {
+        dispatch_key: assignment.dispatch_key.clone(),
+        spec_hash: snapshot.intents[&assignment.dispatch_key].spec_hash.clone(),
+        run_id: "retained-run".into(),
+        session_id: "missing-execution-session".into(),
+    };
+    let admit = service
+        .prepare_command(
+            &runtime,
+            "handoff-admit",
+            vec![
+                Operation::Admitted {
+                    assignment_id: assignment.id.clone(),
+                    receipt: receipt.clone(),
+                },
+                Operation::Running {
+                    assignment_id: assignment.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    service.execute(&runtime, &admit).unwrap();
+    let worker = Authority::from_verified_host(
+        binding,
+        Principal::Worker {
+            assignment_id: assignment.id.clone(),
+            generation: assignment.generation,
+            run_id: receipt.run_id,
+            session_id: receipt.session_id,
+        },
+    );
+    let artifact = service
+        .store_artifact(&runtime, b"original artifact bytes")
+        .unwrap();
+    let submit = service
+        .prepare_command(
+            &worker,
+            "handoff-submit",
+            vec![Operation::Submit {
+                assignment_id: assignment.id.clone(),
+                temp_id: "submission".into(),
+                evidence: vec!["retained evidence".into()],
+                artifacts: vec![artifact.clone()],
+            }],
+        )
+        .unwrap();
+    let submission = &service.execute(&worker, &submit).unwrap().ids["submission"];
+
+    let args = json!({
+        "ids":[ids["work"]],"depth":0,"sections":[],"budget_bytes":4096,
+        "submission_id":submission, "source_path":"src/example.rs",
+    });
+    let tool = f.tool("work_inspect");
+    let mut plan = f.ctx();
+    plan.plan_read_only = true;
+    let (ok, view) = invoke(&tool, args.clone(), plan).await;
+    assert!(ok, "{view}");
+    assert_eq!(view["submission_id"], *submission);
+    assert_eq!(view["artifacts"][0]["sha256"], artifact.sha256);
+    assert_eq!(view["committed_plan"]["steps"], json!([]));
+    assert_eq!(
+        view["source_reads"]["status"],
+        "execution_evidence_unavailable"
+    );
+    assert_eq!(
+        invoke(&tool, args, ToolCtx::none("unobserved")).await.1["status_code"],
+        403
+    );
+}
+
 #[test]
 fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
-    for name in NAMES {
+    for &name in NAMES {
         let schema = schema::parameters(name);
         assert_eq!(schema["additionalProperties"], false);
         for forbidden in ["authority", "principal", "source", "approved", "binding"] {
@@ -185,6 +311,135 @@ fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
         schema::parameters("work_update")["properties"]["operations"]["maxItems"],
         64
     );
+}
+
+#[tokio::test]
+async fn registered_chat_does_not_block_typed_work_creation_or_dispatch() {
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    for (seq, id, text) in [(1, "hello", "Hi"), (2, "status", "How is it going?")] {
+        let ingress = VerifiedUserIngress::from_verified_host(
+            id.into(),
+            HumanIngressRecord {
+                user_id: "host-owner".into(),
+                source_ingress_seq: seq,
+                text: text.into(),
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        service.register_user_ingress(&user, &ingress).unwrap();
+    }
+    let create = f.mutation(
+        "create-despite-chat",
+        json!([{
+            "op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],
+            "contract":{"title":"One Work","objective":"One result","constraints":[],
+                "acceptance":["Exact output"],"user_acceptance_required":true,"allowed_tools":["Task"]}
+        }, {"op":"ready","work_id":"work"}]),
+    );
+    let (ok, created) = invoke(&f.tool("work_update"), create, f.ctx()).await;
+    assert!(ok, "{created}");
+    let work = &created["receipt"]["ids"]["work"];
+    let start = f.mutation(
+        "dispatch-despite-chat",
+        json!([{"op":"start","work_id":work,"temp_id":"assignment","workspace":null}]),
+    );
+    let (ok, dispatched) = invoke(&f.tool("work_dispatch"), start, f.ctx()).await;
+    assert!(ok, "{dispatched}");
+    assert_eq!(dispatched["status"], "accepted_for_dispatch");
+    let snapshot = service.published().unwrap().1;
+    let assignment_id = dispatched["receipt"]["ids"]["assignment"].as_str().unwrap();
+    assert!(snapshot.assignments.contains_key(assignment_id));
+    assert!(snapshot.resolutions.values().all(|r| r.proposal.is_none()));
+}
+
+#[tokio::test]
+async fn current_admitted_human_can_create_work_behind_older_chat_and_ahead_of_queued_input() {
+    use bamboo_domain::{
+        SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+        SessionMessageKind, SessionMessageSource,
+    };
+
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let mut admitted = f.session.clone();
+    for (seq, id, text) in [
+        (1, "hello", "Hi"),
+        (2, "draft", "Create a draft"),
+        (3, "queued", "Queued future input"),
+    ] {
+        let ingress = VerifiedUserIngress::from_verified_host(
+            id.into(),
+            HumanIngressRecord {
+                user_id: "host-owner".into(),
+                source_ingress_seq: seq,
+                text: text.into(),
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        service.register_user_ingress(&user, &ingress).unwrap();
+        if id != "queued" {
+            let envelope = SessionMessageEnvelope {
+                id: SessionMessageId::parse(id).unwrap(),
+                source: SessionMessageSource::User,
+                target_session_id: admitted.id.clone(),
+                kind: SessionMessageKind::UserInput,
+                body: SessionMessageBody::Content(SessionMessageContent::text(text)),
+                created_at: chrono::Utc::now(),
+                thread_id: None,
+                in_reply_to: None,
+                attempt: None,
+                correlation_id: None,
+            };
+            admitted.add_message(envelope.to_provider_message().unwrap());
+        }
+    }
+    f.storage.save_session(&admitted).await.unwrap();
+    let tool = f.tool("work_overview");
+    let (ok, overview) = invoke(&tool, json!({}), f.ctx()).await;
+    assert!(ok, "{overview}");
+    assert_eq!(overview["pending_message"]["input"]["message_id"], "draft");
+    assert_eq!(
+        overview["data"]["pending_ingress"],
+        json!({"count":3,"oldest":{"message_id":"hello","proposal_saved":false}})
+    );
+    let request = json!({"message_id":"draft","proposal":{"groups":[{
+        "group_id":"create","item_ids":["report"],"source_quote":"Create a draft",
+        "clarification":null,"operations":[{"op":"create","temp_id":"report","kind":"work",
+            "parent":null,"depends_on":[],"contract":{"title":"Report","objective":"A short report",
+            "constraints":[],"acceptance":["Report included"],"user_acceptance_required":true,
+            "allowed_tools":["Task"]}}]
+    }]}});
+    let (ok, resolved) = invoke(&f.tool("work_update"), request, f.ctx()).await;
+    assert!(ok, "{resolved}");
+    assert_eq!(resolved["resolution"]["groups"][0]["status"], "committed");
+    assert!(invoke(&tool, json!({}), f.ctx()).await.1["pending_message"].is_null());
+    let (ok, earlier) = invoke(&tool, json!({"message_id":"hello"}), f.ctx()).await;
+    assert!(ok, "{earlier}");
+    assert_eq!(earlier["pending_message"]["input"]["message_id"], "hello");
+    assert_eq!(earlier["data"]["pending_ingress"]["count"], 2);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets.len(), 1);
+    assert!(snapshot.resolutions["hello"].proposal.is_none());
+    assert!(snapshot.resolutions["queued"].basis.is_none());
 }
 
 #[tokio::test]
@@ -213,8 +468,9 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
     let seq = service.published().unwrap().1.seq;
     let mut read_only = f.ctx();
     read_only.plan_read_only = true;
+    let select = json!({"message_id":"hello"});
     assert!(
-        invoke(&f.tool("work_overview"), json!({}), read_only)
+        invoke(&f.tool("work_overview"), select.clone(), read_only)
             .await
             .0
     );
@@ -223,18 +479,11 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
         seq,
         "Plan reads cannot pin/publish a message basis"
     );
-    let overview = invoke(&f.tool("work_overview"), json!({}), f.ctx()).await;
+    let overview = invoke(&f.tool("work_overview"), select, f.ctx()).await;
     assert_eq!(
         overview.1["pending_message"]["input"]["human"]["text"],
         "你好"
     );
-    let bypass = invoke(
-        &f.tool("work_update"),
-        f.mutation("bypass", json!([])),
-        f.ctx(),
-    )
-    .await;
-    assert_eq!(bypass.1["status_code"], 423);
     let args = json!({"message_id":"hello","proposal":{"groups":[]}});
     let resolved = invoke(&f.tool("work_update"), args.clone(), f.ctx()).await;
     assert!(resolved.0);
@@ -244,8 +493,10 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
         resolved
     );
     assert_eq!(service.published().unwrap().1.seq, seq);
-    assert!(
-        invoke(&f.tool("work_overview"), json!({}), f.ctx()).await.1["pending_message"].is_null()
+    let (_, overview) = invoke(&f.tool("work_overview"), json!({}), f.ctx()).await;
+    assert_eq!(
+        overview["data"]["pending_ingress"],
+        json!({"count":0,"oldest":null})
     );
     assert_eq!(service.published().unwrap().1.tickets.len(), 0);
 }
@@ -509,6 +760,8 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
         "work_changes".to_string(),
         "work_update".to_string(),
         "work_dispatch".to_string(),
+        #[cfg(unix)]
+        "work_review".to_string(),
     ]);
     assert_eq!(names(), expected_names);
     assert!(app.service().is_err());
@@ -522,7 +775,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     let config_before = serde_json::to_value(&*config.read().await).unwrap();
     let mut ordinary = Session::new("ordinary-ultra", "model");
     ordinary.set_root_orchestration_only(true).unwrap();
-    for name in NAMES {
+    for &name in NAMES {
         // Even a canonical executing Supervisor cannot create a scope by
         // calling a resident definition, including the two mutation tools.
         let (ok, denied) = execute_overlay(tools.as_ref(), name, Some(&session)).await;
@@ -566,7 +819,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     assert!(ok);
     assert_eq!(result["data"]["work_count"], 0);
     let before = app.service().unwrap().published().unwrap().0;
-    for name in NAMES {
+    for &name in NAMES {
         for caller in [None, Some(&ordinary)] {
             let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
             assert!(!ok, "unauthorized initialized {name} succeeded");

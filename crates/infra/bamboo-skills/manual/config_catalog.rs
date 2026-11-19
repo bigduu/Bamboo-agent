@@ -114,12 +114,41 @@ pub fn entries() -> Vec<Entry> {
         default_root => ("option<string>", "example-worktrees", "Optional default root for user-created worktrees, not a runtime path observation.", []),
         project_roots => ("map<string,string>", json!({"example-project":"example-worktrees"}), "Per-project worktree root overrides; dynamic map keys are project identifiers, not config-field names.", []),
     ], []);
+    entries.push(Entry { key: "features.ticket_mutation", kind: "bool", example: json!(true),
+        meaning: "Allow Work scope initialization and record changes for the canonical Supervisor. Existing readable scopes can still be inspected when disabled.",
+        aliases: &[], read: |c| json!(c.features.ticket_mutation), required_when: None });
+    entries.push(Entry { key: "features.ticket_dispatch", kind: "bool", example: json!(true),
+        meaning: "Allow fresh Work execution admission. Work record changes and scope initialization use features.ticket_mutation.",
+        aliases: &[], read: |c| json!(c.features.ticket_dispatch), required_when: None });
     entries.push(Entry { key: "lifecycle_hooks.enabled", kind: "bool", example: json!(true),
         meaning: "Native lifecycle-hook switch; handler configuration and authorization remain separate.",
         aliases: &[], read: |c| json!(c.lifecycle_hooks.enabled), required_when: None });
     entries.push(Entry { key: "context_management.strategy", kind: "enum", example: json!("retrieval_window"),
         meaning: "Context strategy; retrieval-window validation and history-tool requirements still apply.",
         aliases: &[], read: |c| json!(c.context_management.strategy), required_when: None });
+    entries.push(Entry { key: "context_management.trigger_usage_ratio", kind: "f64", example: json!(0.70),
+        meaning: "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
+        aliases: &[], read: |c| json!(c.context_management.trigger_usage_ratio), required_when: None });
+    entries.push(Entry { key: "context_management.target_usage_ratio", kind: "f64", example: json!(0.20),
+        meaning: "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
+        aliases: &[], read: |c| json!(c.context_management.target_usage_ratio), required_when: None });
+    entries.push(Entry {
+        key: "patrol_model",
+        kind: "option<object>",
+        example: json!({
+            "provider": "configured-provider",
+            "model": "configured-model",
+            "protocol": "registered_provider_v1",
+            "max_input_tokens": 4096,
+            "max_output_tokens": 256,
+            "max_evidence_bytes": 16384,
+            "max_evidence_refs": 16
+        }),
+        meaning: "Independent patrol model selection. The registered profile uses an existing configured provider and requires a known model ceiling within the Work caps. The raw profile uses its explicit numeric loopback endpoint.",
+        aliases: &[],
+        read: |c| json!(c.patrol_model),
+        required_when: None,
+    });
     entries.sort_by_key(|entry| entry.key);
     entries
 }

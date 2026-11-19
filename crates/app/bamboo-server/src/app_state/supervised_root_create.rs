@@ -2,11 +2,19 @@
 //! publication flow. Supervisor management and finite Host creation retain
 //! distinct final authority and Inbox ports; neither is a second create chain.
 
-use std::sync::Arc;
+use std::{io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
-use bamboo_domain::{Session, SessionActivationDisposition, Storage, SupervisorReference};
+use bamboo_agent_core::workspace_state::{
+    preview_default_session_workspace_dir, preview_pin_workspace_path,
+};
+use bamboo_domain::{
+    RootThinkingMode, Session, SessionActivationDisposition, SessionPermissionMode, Storage,
+    SupervisorReference,
+};
+use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
+use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
 use bamboo_engine::{SessionMessenger, SessionMessengerError, SessionRepository};
 use bamboo_server_tools::session_control::root_creation::{
     SupervisedRootCreatePort, SupervisedRootCreateRequest,
@@ -36,6 +44,12 @@ pub(super) struct SupervisedRootCreator {
     pub repo: SessionRepository,
     pub messenger: Arc<SessionMessenger>,
     pub account: Arc<bamboo_engine::events::AccountEventSink>,
+}
+
+struct ManagedRootCreation {
+    service: bamboo_tickets::TicketService,
+    spec: bamboo_tickets::DispatchSpec,
+    dispatch: TicketDispatchBinding,
 }
 
 fn blocked(
@@ -95,6 +109,33 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
     }
 
     async fn scope(&self, supervisor: &SupervisorReference) -> Result<ToolResult, ToolError> {
+        self.creation_scope(supervisor, false).await
+    }
+
+    async fn create(
+        &self,
+        supervisor: &SupervisorReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        request.validate()?;
+        // A response timeout or cancelled originating tool future must not drop
+        // the operation claim between the three existing durable boundaries.
+        let service = self.clone();
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { service.create_inner(&supervisor, request).await })
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("supervised Root creation task failed: {error}"))
+            })?
+    }
+}
+
+impl SupervisedRootCreator {
+    pub(super) async fn creation_scope(
+        &self,
+        supervisor: &SupervisorReference,
+        observed: bool,
+    ) -> Result<ToolResult, ToolError> {
         let scope = self
             .store
             .inspect_supervisor_current_user_scope(supervisor)
@@ -128,51 +169,93 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
             "orchestration_revision":scope.orchestration_revision,
             "allowed_projects":legacy.allowed_projects, "legacy_scope_is_authorization":false,
             "projects":projects, "requires_project_authorization":false,
-            "create_route_exposed":true, "project_scope_configured":true,
+            "create_route_exposed":true, "project_scope_configured":true, "create_unassigned":observed,
+            "create_material_notifications":self.messenger.inbox().supports_root_creation_material_notifications(),
             "code":"current_user_scope_ready", "owner_action":null,
             "work_scope":{
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No Project selection or Session attachment is required. Creation still validates the selected Project and bound workspace, and workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. Workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
-    async fn create(
+    pub(super) async fn create_managed_work(
         &self,
-        supervisor: &SupervisorReference,
+        service: &bamboo_tickets::TicketService,
+        spec: &bamboo_tickets::DispatchSpec,
+        dispatch: &TicketDispatchBinding,
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
         request.validate()?;
-        // A response timeout or cancelled originating tool future must not drop
-        // the operation claim between the three existing durable boundaries.
-        let service = self.clone();
-        let supervisor = supervisor.clone();
-        tokio::spawn(async move { service.create_inner(&supervisor, request).await })
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("supervised Root creation task failed: {error}"))
-            })?
+        if request.project_id.is_none() {
+            return Err(ToolError::InvalidArguments(
+                "managed Work Root creation requires a Project and workspace".into(),
+            ));
+        }
+        let target = spec
+            .managed_root
+            .as_ref()
+            .ok_or_else(|| ToolError::Execution("managed Work target missing".into()))?;
+        let authority = CreationAuthority::Supervisor {
+            reference: target
+                .supervisor()
+                .ok_or_else(|| ToolError::Execution("managed Work Supervisor missing".into()))?,
+            original_caller: Some(target.caller.clone()),
+        };
+        let creator = self.clone();
+        let managed = ManagedRootCreation {
+            service: service.clone(),
+            spec: spec.clone(),
+            dispatch: dispatch.clone(),
+        };
+        tokio::spawn(async move {
+            creator
+                .create_authorized_inner(&authority, request, Some(&managed))
+                .await
+        })
+        .await
+        .map_err(|error| {
+            ToolError::Execution(format!("managed Work Root creation task failed: {error}"))
+        })?
     }
-}
 
-impl SupervisedRootCreator {
     async fn create_inner(
         &self,
         supervisor: &SupervisorReference,
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
         let authority = CreationAuthority::legacy_supervisor(supervisor.clone());
-        self.create_authorized_inner(&authority, request).await
+        self.create_authorized_inner(&authority, request, None)
+            .await
     }
 
     async fn create_authorized_inner(
         &self,
         authority: &CreationAuthority,
         request: SupervisedRootCreateRequest,
+        managed: Option<&ManagedRootCreation>,
     ) -> Result<ToolResult, ToolError> {
+        if request.thinking_mode == Some(RootThinkingMode::Ultra)
+            && (managed.is_some()
+                || !matches!(
+                    authority,
+                    CreationAuthority::Supervisor {
+                        original_caller: Some(_),
+                        ..
+                    }
+                ))
+        {
+            return Err(ToolError::InvalidArguments(
+                "Ultra creation requires an observed Supervisor creating an independent execution Session".into(),
+            ));
+        }
         let operation_id = request.operation_id;
-        let (digest, reserved_id, fingerprint) = authority.operation_identity(&request)?;
+        let (digest, reserved_id, mut fingerprint) = authority.operation_identity(&request)?;
+        if let Some(managed) = managed {
+            fingerprint = payload_fingerprint(&(&fingerprint, &managed.dispatch))
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        }
         let state_revision = match authority.validate_request(self, &request).await {
             Ok(revision) => revision,
             Err(error) => {
@@ -188,6 +271,10 @@ impl SupervisedRootCreator {
         let _claim = self.operations.lock(&digest).await.map_err(|error| {
             ToolError::Execution(format!("creation claim unavailable: {error}"))
         })?;
+        if let Some(managed) = managed {
+            ticket_runtime::require_dispatch_permission(&managed.service, &managed.dispatch)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+        }
         let mut existing = if authority.retains_operation() {
             // An observed caller's exact operation truth is never expired by a
             // retry. Its reserved birth survives restart and grant rotation.
@@ -215,6 +302,25 @@ impl SupervisedRootCreator {
                     "The operation UUID is already bound to a different request",
                 ));
             }
+        }
+        if request.notify_on_material_event
+            && !self
+                .messenger
+                .inbox()
+                .supports_root_creation_material_notifications()
+            && existing
+                .as_ref()
+                .is_none_or(|operation| operation.status != StoredOperationStatus::Succeeded)
+        {
+            return Ok(blocked(
+                operation_id,
+                existing
+                    .as_ref()
+                    .map(|operation| operation.session_id.as_str()),
+                "authorization",
+                "notification_scope_unavailable",
+                "First-input material notifications are unavailable on this Host",
+            ));
         }
         if authority.retains_operation() {
             if let Some(operation) = existing
@@ -249,14 +355,21 @@ impl SupervisedRootCreator {
             ));
         }
         let mut operation = existing.unwrap_or_else(|| {
-            SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id)
+            let mut operation =
+                SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id);
+            if !authority.is_host() && managed.is_none() {
+                operation.supervisor_execution_permission_mode = Some(
+                    bamboo_orchestration::managed_session::DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
+                );
+            }
+            operation
         });
         let id = operation.session_id.clone();
-        let workspace =
+        let workspace = if let Some(path) = request.workspace_path.as_deref() {
             match crate::project_context::validate_explicit_session_workspace_with_resolver(
                 &self.projects,
-                Some(&request.project_id),
-                &request.workspace_path,
+                request.project_id.as_ref(),
+                path,
                 &self.workspace,
             ) {
                 Ok(workspace) => workspace,
@@ -269,7 +382,21 @@ impl SupervisedRootCreator {
                         error,
                     ))
                 }
-            };
+            }
+        } else {
+            match self.standalone_workspace(&id) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    return Ok(blocked(
+                        operation_id,
+                        replayed.then_some(id.as_str()),
+                        "workspace",
+                        "workspace_invalid",
+                        error,
+                    ));
+                }
+            }
+        };
         if let Err(error) = authority.validate_workspace(&request, &workspace) {
             return Ok(blocked(
                 operation_id,
@@ -279,24 +406,71 @@ impl SupervisedRootCreator {
                 error.message,
             ));
         }
-        let mut candidate = self.build_candidate(&operation, &request, &workspace).await;
-        if let Err(error) = self
-            .project_context
-            .refresh_session_prompt_read_only(&mut candidate)
-            .await
-        {
-            return Ok(blocked(
-                operation_id,
-                replayed.then_some(id.as_str()),
-                "workspace",
-                "project_context_unavailable",
-                error,
-            ));
+        let model =
+            managed.and_then(|managed| managed.spec.managed_root.as_ref().map(|root| &root.model));
+        let mut candidate = self
+            .build_candidate(&operation, &request, &workspace, model)
+            .await?;
+        if let Some(managed) = managed {
+            candidate.metadata.insert(
+                ticket_runtime::TICKET_DISPATCH_KEY.into(),
+                serde_json::to_string(&managed.dispatch)
+                    .map_err(|error| ToolError::Execution(error.to_string()))?,
+            );
+        } else {
+            if let Err(error) = self
+                .project_context
+                .refresh_session_prompt_read_only(&mut candidate)
+                .await
+            {
+                return Ok(blocked(
+                    operation_id,
+                    replayed.then_some(id.as_str()),
+                    "workspace",
+                    "project_context_unavailable",
+                    error,
+                ));
+            }
+            if request.project_id.is_none()
+                && candidate.workspace_path_meta().as_deref()
+                    != Some(bamboo_config::paths::path_to_display_string(&workspace).as_str())
+            {
+                return Ok(blocked(
+                    operation_id,
+                    replayed.then_some(id.as_str()),
+                    "workspace",
+                    "workspace_invalid",
+                    "Standalone Session workspace changed during resolution",
+                ));
+            }
         }
         if !replayed {
             // Reserve the same UUID and immutable birth before any Root/link
             // side effect, reusing the normal creation operation store/claim.
-            self.operations.save(&operation).await.map_err(|error| {
+            let save = match authority {
+                CreationAuthority::Supervisor {
+                    original_caller: Some(caller),
+                    ..
+                } if managed.is_none() => {
+                    let reserved = &mut operation;
+                    let worker = &mut candidate;
+                    self.store
+                        .with_supervisor_dispatch_consent(caller, |auto| async move {
+                            if auto {
+                                reserved.supervisor_execution_permission_mode =
+                                    Some(SessionPermissionMode::Auto);
+                                worker
+                                    .agent_runtime_state
+                                    .get_or_insert_with(Default::default)
+                                    .set_permission_mode(SessionPermissionMode::Auto);
+                            }
+                            self.operations.save(reserved).await
+                        })
+                        .await
+                }
+                _ => self.operations.save(&operation).await,
+            };
+            save.map_err(|error| {
                 ToolError::Execution(format!("creation reservation unavailable: {error}"))
             })?;
         }
@@ -319,6 +493,34 @@ impl SupervisedRootCreator {
                 ))
             }
         };
+        if let Some(managed) = managed {
+            let spec = &managed.spec;
+            let canonical = self
+                .store
+                .load_runtime_control_plane(&id)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let matches = canonical.as_ref().is_some_and(|session| {
+                session.created_at == operation.created_at
+                    && spec.managed_root.as_ref().is_some_and(|target| {
+                        bamboo_orchestration::managed_work::matches_root(target, spec, session)
+                    })
+                    && ticket_runtime::read_dispatch(session)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(&managed.dispatch)
+            });
+            if !matches {
+                return Ok(blocked(
+                    operation_id,
+                    Some(&id),
+                    "creation",
+                    "work_root_conflict",
+                    "The canonical Root differs from its reserved Work lifetime",
+                ));
+            }
+        }
         if operation.status == StoredOperationStatus::Succeeded {
             let Some(delivery) = operation.supervised_delivery.as_ref() else {
                 return Ok(blocked(
@@ -331,7 +533,7 @@ impl SupervisedRootCreator {
             };
             return Ok(completed(
                 &request,
-                &id,
+                &candidate,
                 relation.state_revision,
                 relation.link_revision,
                 relation.linked,
@@ -360,6 +562,10 @@ impl SupervisedRootCreator {
                 error.code,
                 error.message,
             ));
+        }
+        if let Some(managed) = managed {
+            ticket_runtime::require_dispatch_permission(&managed.service, &managed.dispatch)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
         }
         let result = authority.first_input(self, &request, &candidate).await;
         let (receipt, activation) = match result {
@@ -409,7 +615,7 @@ impl SupervisedRootCreator {
         }
         let mut response = completed(
             &request,
-            &id,
+            &candidate,
             relation.state_revision,
             relation.link_revision,
             relation.linked,
@@ -432,7 +638,8 @@ impl SupervisedRootCreator {
         operation: &SessionCreateOperationRecord,
         request: &SupervisedRootCreateRequest,
         workspace: &std::path::Path,
-    ) -> Session {
+        model: Option<&bamboo_domain::ProviderModelRef>,
+    ) -> Result<Session, ToolError> {
         use bamboo_engine::session_app::session_create::{
             build_new_session, CreateSessionConfig, CreateSessionInput,
         };
@@ -440,16 +647,20 @@ impl SupervisedRootCreator {
         let mut candidate = build_new_session(
             &CreateSessionInput {
                 id: operation.session_id.clone(),
-                project_id: Some(request.project_id.clone()),
+                project_id: request.project_id.clone(),
                 title: request.title.clone(),
                 title_generated: None,
                 system_prompt: None,
                 model: None,
-                model_ref: None,
+                model_ref: model.cloned(),
                 reasoning_effort: None,
                 gold_config_json: None,
                 workspace_path: Some(bamboo_config::paths::path_to_display_string(workspace)),
-                permission_mode: Some(bamboo_domain::SessionPermissionMode::Default),
+                permission_mode: Some(
+                    operation
+                        .supervisor_execution_permission_mode
+                        .unwrap_or_default(),
+                ),
             },
             &CreateSessionConfig {
                 default_model: config.get_model(),
@@ -459,6 +670,17 @@ impl SupervisedRootCreator {
                 builtin_fallback_prompt: super::DEFAULT_BASE_PROMPT,
             },
         );
+        if let Some(mode) = request.thinking_mode {
+            candidate
+                .set_root_orchestration_only(mode.enabled())
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        }
+        if request.project_id.is_none() {
+            candidate.metadata.insert(
+                WORKSPACE_SOURCE_METADATA_KEY.into(),
+                WorkspaceSource::Session.as_str().into(),
+            );
+        }
         // The existing reservation supplies an immutable retry birth as well
         // as the UUID. A recreated or unrelated lifetime can never match it.
         candidate.created_at = operation.created_at;
@@ -471,7 +693,24 @@ impl SupervisedRootCreator {
         candidate
             .metadata
             .insert("session.origin.v1".into(), "supervisor_created".into());
-        candidate
+        Ok(candidate)
+    }
+
+    fn standalone_workspace(&self, id: &str) -> io::Result<PathBuf> {
+        let config = self
+            .workspace
+            .workspace_root_config()
+            .ok_or_else(|| io::Error::other("Session workspace root is unavailable"))?;
+        let root = preview_pin_workspace_path(&config.root, &config.root, true);
+        let workspace = preview_default_session_workspace_dir(&root, id);
+        match std::fs::symlink_metadata(&workspace) {
+            Ok(metadata) if metadata.is_dir() => Ok(workspace),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(workspace),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "Session workspace is not a plain directory",
+            )),
+        }
     }
 
     async fn publish_created(&self, id: &str) -> std::io::Result<()> {
@@ -486,9 +725,22 @@ impl SupervisedRootCreator {
             .ok_or_else(|| std::io::Error::other("reserved Root is unavailable"))?;
         let workspace = session
             .workspace_path_meta()
-            .ok_or_else(|| std::io::Error::other("reserved Root has no workspace"))?;
+            .ok_or_else(|| io::Error::other("reserved Root has no workspace"))?;
+        let (workspace, source) = if session.project_id_meta().is_none() {
+            let expected = self.standalone_workspace(id)?;
+            if bamboo_config::paths::path_to_display_string(&expected) != workspace {
+                return Err(io::Error::other("reserved Session workspace changed"));
+            }
+            self.workspace.materialize_resolved_workspace(&expected)?;
+            if expected.canonicalize()? != expected {
+                return Err(io::Error::other("reserved Session workspace changed"));
+            }
+            (expected, WorkspaceSource::Session)
+        } else {
+            (workspace.into(), WorkspaceSource::Explicit)
+        };
         self.workspace
-            .publish_resolved_workspace(id, workspace.into(), "explicit");
+            .publish_resolved_workspace(id, workspace, source.as_str());
         let event = bamboo_agent_core::AgentEvent::SessionCreated {
             session_id: id.into(),
             project_id: session.project_id_meta(),
@@ -507,7 +759,7 @@ impl SupervisedRootCreator {
 
 fn completed(
     request: &SupervisedRootCreateRequest,
-    id: &str,
+    target: &Session,
     state_revision: u64,
     link_revision: Option<u64>,
     linked: Option<bool>,
@@ -515,7 +767,7 @@ fn completed(
     replayed: bool,
 ) -> ToolResult {
     let mut response = json!({
-        "action":"create", "operation_id":request.operation_id, "target_session_id":id,
+        "action":"create", "operation_id":request.operation_id, "target_session_id":target.id,
         "project_id":request.project_id, "created_durable":true, "linked":linked,
         "state_revision":state_revision, "link_revision":link_revision,
         "admitted":true, "receipt_id":delivery.receipt_id, "generation":delivery.generation,
@@ -536,6 +788,20 @@ fn completed(
     }
     if delivery.activation == "delivery_not_pending" {
         response["activation_requested"] = json!(false);
+    }
+    if request.notify_on_material_event {
+        response["notify_on_material_event"] = json!(true);
+        if !replayed
+            && matches!(
+                delivery.activation.as_str(),
+                "active_notified" | "activation_reserved" | "activation_coalesced"
+            )
+        {
+            response["note"] = json!(bamboo_orchestration::managed_session::DISPATCH_CONFIRMATION);
+        }
+        if let Ok(reference) = bamboo_domain::SupervisorCurrentUserTarget::capture(target) {
+            response["current_user_target"] = json!(reference);
+        }
     }
     ToolResult::text(
         delivery.activation != "activation_retry_required",

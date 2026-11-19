@@ -58,7 +58,9 @@ pub struct WorkTokenConfiguration {
     pub revision: u64,
     pub user_id: String,
     pub committed_seq: u64,
-    pub limits: WorkTokenLimits,
+    /// Explicit null records semantic usage without enabling Worker quotas.
+    #[serde(deserialize_with = "required_nullable_limits")]
+    pub limits: Option<WorkTokenLimits>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,11 +125,20 @@ pub enum WorkTokenAdmission {
     Blocked(WorkTokenBlock),
 }
 
+/// The accounting record and the one-time right to submit are separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkTokenSubmission {
+    New(Box<WorkTokenReservation>),
+    Existing(Box<WorkTokenReservation>),
+    Blocked(WorkTokenBlock),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTokenBudget {
     pub revision: u64,
-    pub limits: WorkTokenLimits,
+    #[serde(deserialize_with = "required_nullable_limits")]
+    pub limits: Option<WorkTokenLimits>,
     pub current_utc_day: Option<u64>,
     pub last_reservation_ms: Option<u64>,
     pub total_charged: u64,
@@ -205,6 +216,29 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         .as_ref()
         .and_then(|id| snapshot.submissions.get(id))
         .is_some_and(|submission| submission.assignment_id == assignment.id);
+    // Snapshot validation already binds awaiting_request to this assignment,
+    // generation, contract, and yielded Worker question.
+    let yielded_for_input = |assignment: &crate::Assignment| {
+        assignment.state == crate::AssignmentState::Blocked
+            && assignment.process_stopped
+            && assignment
+                .awaiting_request
+                .as_ref()
+                .and_then(|id| snapshot.requests.get(id))
+                .is_some_and(|request| request.status == crate::RequestStatus::Open)
+    };
+    let current_yielded_review = request.purpose == ExecutionBudgetPurpose::SupervisorDecision
+        && work.state == crate::WorkState::Blocked
+        && work.active_assignment.is_none()
+        && work.current_submission.is_none()
+        && yielded_for_input(assignment)
+        && !snapshot.assignments.values().any(|other| {
+            other.id != assignment.id
+                && other.work_id == work.id
+                && other.generation == work.generation
+                && other.contract_revision == work.contract_revision
+                && yielded_for_input(other)
+        });
     if assignment.work_id != work.id
         || work.generation != attempt.generation
         || assignment.generation != attempt.generation
@@ -219,7 +253,9 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         || intent.immutable_spec.binding != snapshot.binding
         || intent.spec_hash != content_hash(&canonical_bytes(&intent.immutable_spec)?)
         || assignment.runtime != intent.receipt
-        || (work.active_assignment.as_ref() != Some(&assignment.id) && !current_submission)
+        || (work.active_assignment.as_ref() != Some(&assignment.id)
+            && !current_submission
+            && !current_yielded_review)
         || matches!(
             work.state,
             crate::WorkState::Accepted | crate::WorkState::Cancelled
@@ -253,7 +289,19 @@ fn charge(record: &WorkTokenReservation) -> Result<u64> {
         }
     }
 }
-fn limits_valid(limits: &WorkTokenLimits, snapshot: &Snapshot) -> Result<()> {
+fn required_nullable_limits<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WorkTokenLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn limits_valid(limits: &Option<WorkTokenLimits>, snapshot: &Snapshot) -> Result<()> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
     if limits.work_tokens.is_empty()
         || limits.work_tokens.len() > 64
         || !(1..=MAX_LIMIT).contains(&limits.utc_day_tokens)
@@ -331,6 +379,15 @@ pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
     let mut works = BTreeMap::<String, u64>::new();
     for (id, record) in &budget.reservations {
         valid_request(&record.request)?;
+        if snapshot
+            .tickets
+            .get(&record.request.work_id)
+            .is_none_or(|work| work.kind != TicketKind::Work)
+            || snapshot.project.links.get(&record.request.work_id)
+                != Some(&record.request.project_id)
+        {
+            return Err(invalid("Work token receipt lost its Work/Project identity"));
+        }
         if record.over_cap_usage.is_some_and(|usage| {
             !usage.exceeds(&record.request)
                 || matches!(record.usage, Some(ExecutionTokenUsage::Known { .. }))
@@ -363,14 +420,15 @@ pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
     if total != budget.total_charged
         || daily != budget.daily_charged
         || works != budget.work_charged
-        || total > budget.limits.total_tokens
-        || daily > budget.limits.utc_day_tokens
-        || works.iter().any(|(work, used)| {
-            budget
-                .limits
-                .work_tokens
-                .get(work)
-                .is_none_or(|limit| used > limit)
+        || budget.limits.as_ref().is_some_and(|limits| {
+            total > limits.total_tokens
+                || daily > limits.utc_day_tokens
+                || works.iter().any(|(work, used)| {
+                    limits
+                        .work_tokens
+                        .get(work)
+                        .is_none_or(|limit| used > limit)
+                })
         })
         || budget.last_reservation_ms.map(|ms| ms / DAY_MS) != budget.current_utc_day
     {
@@ -390,6 +448,54 @@ impl TicketService {
         expected_revision: u64,
         limits: WorkTokenLimits,
     ) -> Result<u64> {
+        self.configure_work_token_budget_inner(authority, None, expected_revision, Some(limits))
+            .map(|configuration| configuration.revision)
+    }
+
+    /// Owner-facing configuration identity is the scope's next budget revision.
+    /// Exact retries read its original immutable decision, even after later
+    /// configurations or spending. The current authority epoch is checked under
+    /// the same canonical transaction lock; no executable permission is stored.
+    pub fn configure_work_token_budget_at_epoch(
+        &self,
+        authority: &Authority,
+        authority_epoch: u64,
+        expected_revision: u64,
+        limits: WorkTokenLimits,
+    ) -> Result<WorkTokenConfiguration> {
+        self.configure_work_token_budget_inner(
+            authority,
+            Some(authority_epoch),
+            expected_revision,
+            Some(limits),
+        )
+    }
+
+    /// Explicit owner choice for semantic accounting with optional quotas.
+    /// Null retains the original ledger and leaves Native Worker usage on its
+    /// existing Session path; it grants no execution or model authority.
+    pub fn configure_work_token_accounting_at_epoch(
+        &self,
+        authority: &Authority,
+        authority_epoch: u64,
+        expected_revision: u64,
+        limits: Option<WorkTokenLimits>,
+    ) -> Result<WorkTokenConfiguration> {
+        self.configure_work_token_budget_inner(
+            authority,
+            Some(authority_epoch),
+            expected_revision,
+            limits,
+        )
+    }
+
+    fn configure_work_token_budget_inner(
+        &self,
+        authority: &Authority,
+        authority_epoch: Option<u64>,
+        expected_revision: u64,
+        limits: Option<WorkTokenLimits>,
+    ) -> Result<WorkTokenConfiguration> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -402,6 +508,25 @@ impl TicketService {
                 "explicit User token-budget decision required".into(),
             ));
         };
+        if authority_epoch.is_some_and(|epoch| epoch != snapshot.authority_epoch) {
+            return Err(Error::RevisionConflict);
+        }
+        if authority_epoch.is_some() {
+            let revision = expected_revision
+                .checked_add(1)
+                .ok_or(Error::RevisionConflict)?;
+            if let Some(previous) = snapshot
+                .execution_budget
+                .as_ref()
+                .and_then(|budget| budget.configurations.get(&revision))
+            {
+                return if previous.user_id == *user_id && previous.limits == limits {
+                    Ok(previous.clone())
+                } else {
+                    Err(Error::IdempotencyConflict)
+                };
+            }
+        }
         if store.health != Health::Writable {
             return Err(Error::AuthorityUnavailable(
                 "token ledger is not writable".into(),
@@ -444,22 +569,20 @@ impl TicketService {
         let configuration_limits = budget.limits.clone();
         next.schema = next.schema.max(8);
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
+        let configuration = WorkTokenConfiguration {
+            revision,
+            user_id: user_id.clone(),
+            committed_seq: next.seq,
+            limits: configuration_limits,
+        };
         next.execution_budget
             .as_mut()
             .expect("configured")
             .configurations
-            .insert(
-                revision,
-                WorkTokenConfiguration {
-                    revision,
-                    user_id: user_id.clone(),
-                    committed_seq: next.seq,
-                    limits: configuration_limits,
-                },
-            );
+            .insert(revision, configuration.clone());
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(revision)
+        Ok(configuration)
     }
 
     pub fn work_token_budget(&self, authority: &Authority) -> Result<Option<WorkTokenBudget>> {
@@ -482,6 +605,24 @@ impl TicketService {
         request: &WorkTokenRequest,
         now_ms: u64,
     ) -> Result<WorkTokenAdmission> {
+        Ok(
+            match self.reserve_work_token_submission(authority, request, now_ms)? {
+                WorkTokenSubmission::New(record) | WorkTokenSubmission::Existing(record) => {
+                    WorkTokenAdmission::Reserved(record)
+                }
+                WorkTokenSubmission::Blocked(block) => WorkTokenAdmission::Blocked(block),
+            },
+        )
+    }
+
+    /// Reserve and report whether this invocation owns a fresh submission.
+    /// Retries can read the original receipt but must not repeat provider I/O.
+    pub fn reserve_work_token_submission(
+        &self,
+        authority: &Authority,
+        request: &WorkTokenRequest,
+        now_ms: u64,
+    ) -> Result<WorkTokenSubmission> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -512,7 +653,7 @@ impl TicketService {
             .ok_or_else(|| Error::ResourceBlocked("Work token limits are not configured".into()))?;
         if let Some(record) = budget.reservations.get(&request.operation_id) {
             return if record.request == *request {
-                Ok(WorkTokenAdmission::Reserved(Box::new(record.clone())))
+                Ok(WorkTokenSubmission::Existing(Box::new(record.clone())))
             } else {
                 Err(Error::IdempotencyConflict)
             };
@@ -529,10 +670,10 @@ impl TicketService {
             .values()
             .any(|record| record.over_cap_usage.is_some())
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Accounting));
         }
         if budget.reservations.len() >= MAX_RECORDS {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Capacity));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Capacity));
         }
         let tokens = u64::from(request.input_cap) + u64::from(request.output_cap);
         let used = budget
@@ -540,30 +681,26 @@ impl TicketService {
             .get(&request.work_id)
             .copied()
             .unwrap_or(0);
-        if budget
-            .limits
-            .work_tokens
-            .get(&request.work_id)
-            .is_none_or(|limit| tokens > limit.saturating_sub(used))
-        {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Work));
-        }
         let day = now_ms / DAY_MS;
         let daily = if Some(day) == budget.current_utc_day {
             budget.daily_charged
         } else {
             0
         };
-        if tokens > budget.limits.utc_day_tokens.saturating_sub(daily) {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Daily));
-        }
-        if tokens
-            > budget
-                .limits
-                .total_tokens
-                .saturating_sub(budget.total_charged)
-        {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Total));
+        if let Some(limits) = &budget.limits {
+            if limits
+                .work_tokens
+                .get(&request.work_id)
+                .is_none_or(|limit| tokens > limit.saturating_sub(used))
+            {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Work));
+            }
+            if tokens > limits.utc_day_tokens.saturating_sub(daily) {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Daily));
+            }
+            if tokens > limits.total_tokens.saturating_sub(budget.total_charged) {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Total));
+            }
         }
         let record = WorkTokenReservation {
             request: request.clone(),
@@ -596,7 +733,7 @@ impl TicketService {
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(WorkTokenAdmission::Reserved(Box::new(record)))
+        Ok(WorkTokenSubmission::New(Box::new(record)))
     }
 
     /// Reconcile only the original receipt. Unknown usage retains all caps;

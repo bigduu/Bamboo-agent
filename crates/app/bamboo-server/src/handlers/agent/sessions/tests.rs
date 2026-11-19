@@ -8,11 +8,13 @@ use chrono::Utc;
 #[test]
 fn session_summary_from_entry_includes_last_run_fields() {
     let entry = SessionIndexEntry {
+        material_notification_hint: None,
         id: "child-1".to_string(),
         // Simulate a pre-#770 index row: the compatibility boolean is present
         // but the newly added typed field deserializes to its default.
         bypass_permissions: true,
         permission_mode: bamboo_domain::SessionPermissionMode::Default,
+        supervisor_profile_revision: None,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-1".to_string(),
         title: "Child Session".to_string(),
@@ -36,6 +38,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         message_count: 5,
         has_attachments: false,
         has_pending_question: true,
+        pending_material_run: None,
         waiting_for_children: false,
         waiting_for_bash: false,
         last_human_input: None,
@@ -77,9 +80,11 @@ fn session_summary_from_entry_includes_last_run_fields() {
 #[test]
 fn session_summary_from_entry_propagates_subagent_type() {
     let entry = SessionIndexEntry {
+        material_notification_hint: None,
         id: "child-2".to_string(),
         bypass_permissions: false,
         permission_mode: bamboo_domain::SessionPermissionMode::Default,
+        supervisor_profile_revision: None,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-2".to_string(),
         title: "Plan Child".to_string(),
@@ -103,6 +108,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         message_count: 0,
         has_attachments: false,
         has_pending_question: false,
+        pending_material_run: None,
         waiting_for_children: false,
         waiting_for_bash: false,
         last_human_input: None,

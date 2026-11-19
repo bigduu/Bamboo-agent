@@ -1,6 +1,6 @@
 # Plan default workspace (#1347)
 
-Plan loads its Root parent from durable storage before selecting a workspace.
+The original Plan function loaded its Root parent from durable storage before selecting a workspace.
 The existing `ChildSessionPort` selection entry point then delegates to that
 port's workspace validator. The server adapter keeps its existing ProjectStore
 ownership checks and AppState-scoped WorkspaceResolver; this change adds no
@@ -33,8 +33,8 @@ behavior before any Child is persisted or parent wait armed.
 
 `tests/plan_default_workspace.rs` uses a real first-chat route and the exact
 source's `CARGO_BIN_EXE_bamboo` worker. The first chat stores only workspace
-metadata; the provider emits Plan without a workspace argument. A read-only
-planner calls Glob with a bounded filename pattern and no path, and its next
+metadata. The provider creates an explorer through SubAgent and waits for it.
+The read-only Child calls Glob with a bounded filename pattern and no path, and its next
 actual provider request must contain the canonical marker path from the Tool
 result. The fixture observes the durable parent wait before releasing the
 worker request, then observes Root resuming with the actual Child result.

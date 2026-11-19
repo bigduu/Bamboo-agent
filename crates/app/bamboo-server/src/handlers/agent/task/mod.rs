@@ -8,3 +8,6 @@ pub use handlers::{get_task_list, has_task_list};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod work_plan_tests;

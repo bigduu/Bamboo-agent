@@ -3,7 +3,7 @@
 //! Bamboo provides a complete backend system for AI agents, including:
 //! - Built-in HTTP/HTTPS server (Actix-web)
 //! - Agent execution loop with tool support
-//! - LLM provider integrations (OpenAI, Anthropic, Google Gemini, GitHub Copilot)
+//! - LLM provider integrations (OpenAI, Anthropic, Google Gemini)
 //! - Session management and persistence
 //! - Workflow and slash command systems
 //! - Process management for external tools

@@ -64,7 +64,7 @@ bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 # HTTP/2. Actix 4's `http2` feature still resolves vulnerable `h2 0.3`; Bamboo's
 # public WSS contract uses HTTP/1.1 Upgrade and is served by the explicit H1
 # builder in `server/h1.rs` (#849).
-actix-web = { version = "4", default-features = false, features = [
+actix-web = { version = "4.18.2", default-features = false, features = [
     "macros",
     "compress-brotli",
     "compress-gzip",
@@ -74,12 +74,13 @@ actix-web = { version = "4", default-features = false, features = [
     "compat",
     "ws",
 ] }
-actix-http = { version = "3", default-features = false, features = ["rustls-0_23"] }
+# This minimum includes the Actix security fixes tracked in #2792.
+actix-http = { version = "3.21.3", default-features = false, features = ["rustls-0_23"] }
 actix-server = "2"
 actix-service = "2"
 socket2 = "0.6"
 actix-cors = "0.7"
-actix-files = "0.7"
+actix-files = "0.7.4"
 # v2-P1 (#181): the `GET /v2/stream` unified WebSocket multiplex. `actix-ws`
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
@@ -204,6 +205,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 zbus = { version = "6", default-features = false }
 
 [dev-dependencies]
+jsonschema = { version = "0.60.0", default-features = false, features = ["idna"] }
 bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
 wiremock = "0.6"
 tokio-test = "0.4"
@@ -224,7 +226,7 @@ bamboo-storage = { path = "../../infra/bamboo-storage", features = ["test-utils"
 bamboo-engine = { path = "../../engine/bamboo-engine", features = ["test-utils"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.6", features = ["fs"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

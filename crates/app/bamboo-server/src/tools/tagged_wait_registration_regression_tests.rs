@@ -2,6 +2,9 @@
 //! Each barrier returns the exact real snapshot read before a competing writer.
 //! No provider, scheduler, watchdog, sleep, or synthetic completion is used.
 
+#[path = "compact_wait_tests.rs"]
+mod compact_wait_tests;
+
 use super::*;
 use bamboo_domain::{AgentRuntimeState, WaitingForChildrenState};
 use bamboo_engine::execution::{ChildCompletion, ChildCompletionHandler};

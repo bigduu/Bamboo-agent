@@ -205,6 +205,9 @@ async fn http_root_authority_loss_before_started_interrupts_only_live_transport(
     fixture
         .assert_interrupted(&input, &mut history, &persisted, 0)
         .await;
+    assert!(fixture.state.agent_runners.read().await[ROOT]
+        .published_execution_started
+        .is_none());
 }
 
 async fn rejected_event_interrupts_http_run(event: AgentEvent) {

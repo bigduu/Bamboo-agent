@@ -111,6 +111,7 @@ test('actual package/target routes separate costly cases before broad thematic g
     ['bamboo-llm', 'bamboo_llm', ['lib'], 'retry::tests::timeout', 'llm-retry'],
     ['bamboo-engine', 'bamboo_engine', ['lib'], 'session_app::approval_replay::test', 'session-permissions'],
     ['bamboo-engine', 'bamboo_engine', ['lib'], 'runtime::compression::budget', 'engine-compression'],
+    ['bamboo-agent', 'supervisor_inspection_wait', ['test'], 'supervisor_inspection_wait_native_host_mechanism_and_directory_followup', 'engine-compression'],
     ['bamboo-server', 'frontend_build_contract', ['test'], 'frontend_build::tests::zip', 'frontend-resources'],
     ['bamboo-server', 'ordinary_root_owned_inbox_restart', ['test'], 'claimed_owned_input_survives_real_host_process_loss_and_restarts_once', 'restart-takeover'],
     ['bamboo-orchestration', 'patrol_restart', ['test'], 'restart', 'restart-takeover'],

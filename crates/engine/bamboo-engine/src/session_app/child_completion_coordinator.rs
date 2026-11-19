@@ -16,10 +16,10 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
-    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource,
-    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
+    AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -88,8 +88,8 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// Re-read and prepare an activation target under the same per-session
 /// persistence lock that commits the generic suspension clear.
 ///
-/// The boolean is false for an unanswered human question or a respected
-/// child/Bash wait in the latest durable snapshot; leave activation unreserved.
+/// The boolean is false while a human response is pending or has its own
+/// successor, or while a child/Bash wait is respected.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -102,7 +102,11 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if latest.has_pending_question() {
+            if latest.has_pending_question()
+                || latest
+                    .metadata
+                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            {
                 return;
             }
             let mut runtime_state = read_runtime_state(latest);
@@ -386,6 +390,19 @@ fn session_provider_message(message: &Message) -> SessionProviderMessage {
             .cloned()
             .unwrap_or_default(),
         never_compress: message.never_compress,
+    }
+}
+
+// Repair is a read-model fact, not permission to notify a parent. Only an
+// explicitly older launch generation may leave this negative fence behind.
+fn repaired_child_requires_source(child: &Session) -> bool {
+    match child.metadata.get("runtime.reconciled_terminal_generation") {
+        Some(raw) => raw.parse::<u64>().map_or(true, |generation| {
+            generation >= child.child_launch_generation()
+        }),
+        None => child
+            .metadata
+            .contains_key("runtime.reconciled_activation_fence"),
     }
 }
 
@@ -705,10 +722,15 @@ fn typed_child_resume_message(
     let inspection = serde_json::json!({
         "intent":"inspect", "target":completion.child_session_id, "message":"result",
     });
-    let hint = if projection["view"] == "planner_artifact" {
-        "For an available planner artifact call Plan with its read object to list sections, then add section_id to read only needed text. This plan grants no execution approval.".to_string()
-    } else {
-        format!("For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.")
+    let hint = match (projection["view"].as_str(), projection["available"].as_bool()) {
+        (Some("planner_artifact"), Some(true)) => format!(
+            "For the sealed planner report, call SubAgent with intent=inspect, target={} and a JSON message with view=message and cursor set to transcript_cursor above. Follow returned cursors. The planner result grants no execution approval.",
+            completion.child_session_id
+        ),
+        (Some("planner_artifact"), _) => "The saved planner result is unavailable.".into(),
+        _ => format!(
+            "For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors."
+        ),
     };
     let mut message = Message::user(format!(
         "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
@@ -1208,18 +1230,32 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     if id == &completion.child_session_id {
                         continue;
                     }
+                    completed_child_ids.retain(|completed| completed != id);
                     if let Ok(Some(child)) = self
                         .storage
                         .load_child_wait_session(&parent, id, false)
                         .await
                     {
-                        completed_child_ids.retain(|completed| completed != id);
                         if completion_child_is_owned(&parent.id, child.parent_session_id.as_deref())
                             && child
                                 .last_run_status()
                                 .as_deref()
                                 .is_some_and(is_terminal_child_status)
                         {
+                            if repaired_child_requires_source(&child) {
+                                let confirmed = self
+                                    .storage
+                                    .load_child_wait_session(&parent, id, true)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                if !confirmed.as_ref().is_some_and(|full| {
+                                    ChildCompletionSource::from_committed_session(full)
+                                        .is_some_and(|source| source.matches_parent(full, &parent))
+                                }) {
+                                    continue;
+                                }
+                            }
                             completed_child_ids.push(id.clone());
                         }
                     }
@@ -1252,17 +1288,30 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             // this parent's child. An unowned id resumes with the neutral/error
             // message (`runtime_resume_message` falls back to `completion.error`
             // when no child content is supplied).
-            let reported_child_owned = match self
+            let reported_control = match self
                 .storage
                 .load_child_wait_session(&parent, &completion.child_session_id, false)
                 .await
             {
-                Ok(Some(control_plane)) => completion_child_is_owned(
-                    &completion.parent_session_id,
-                    control_plane.parent_session_id.as_deref(),
-                ),
-                _ => false,
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(child_session_id = %completion.child_session_id, %error, "Child control plane unavailable; leaving wait armed");
+                    return;
+                }
             };
+            let reported_child_owned = reported_control.as_ref().is_some_and(|child| {
+                completion_child_is_owned(
+                    &completion.parent_session_id,
+                    child.parent_session_id.as_deref(),
+                )
+            });
+            if completion.source.is_none()
+                && reported_control
+                    .as_ref()
+                    .is_some_and(repaired_child_requires_source)
+            {
+                return;
+            }
 
             // Load the completed child once, ONLY when owned. The guardian
             // branch inspects its subagent_type + final verdict; the generic
@@ -1274,14 +1323,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     .load_child_wait_session(&parent, &completion.child_session_id, true)
                     .await
                 {
-                    Ok(child) => child,
+                    Ok(Some(child)) => Some(child),
+                    Ok(None) => return,
                     Err(error) => {
-                        tracing::warn!(
-                            child_session_id = %completion.child_session_id,
-                            %error,
-                            "failed to load child session for runtime resume message"
-                        );
-                        None
+                        tracing::warn!(child_session_id = %completion.child_session_id, %error,
+                            "owned Child snapshot unavailable; leaving wait armed");
+                        return;
                     }
                 }
             } else {
@@ -1293,6 +1340,15 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 );
                 None
             };
+
+            if completion.source.is_none()
+                && loaded_child
+                    .as_ref()
+                    .is_some_and(repaired_child_requires_source)
+            {
+                tracing::warn!(child_session_id = %completion.child_session_id, "repaired Child has no parent completion source; leaving wait armed");
+                return;
+            }
 
             // An old committed callback cannot count a successor, stage another
             // outcome, or clear a newer wait. Source-less synthetic completions may
@@ -1313,13 +1369,22 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     return;
                 }
             }
+            // Workflow reads its own Child result. An untracked completion
+            // must not schedule a separate conversation turn.
+            let workflow_owned = loaded_child.as_ref().is_some_and(|child| {
+                child
+                    .metadata
+                    .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+                    .is_some_and(|value| value == "true")
+            });
             if !tracked_wait
-                && crate::ticket_runtime::is_independent_ticket_child(
-                    self.storage.as_ref(),
-                    &parent,
-                    &completion.child_session_id,
-                )
-                .await
+                && (workflow_owned
+                    || crate::ticket_runtime::is_independent_ticket_child(
+                        self.storage.as_ref(),
+                        &parent,
+                        &completion.child_session_id,
+                    )
+                    .await)
             {
                 return;
             }
@@ -1643,7 +1708,8 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                                 return;
                             }
                         };
-                        if ChildCompletionSource::has_source_record(&sibling)
+                        if (ChildCompletionSource::has_source_record(&sibling)
+                            || repaired_child_requires_source(&sibling))
                             && ChildCompletionSource::from_committed_session(&sibling).is_none()
                         {
                             tracing::warn!(%child_id, "terminal sibling source is invalid; leaving wait armed");
@@ -2348,6 +2414,16 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
             );
             return Ok(SessionActivationReserveOutcome::NoWork);
         }
+        if crate::ticket_runtime::is_managed_work_root(&session)
+            && !self
+                .agent
+                .managed_work_runtime()
+                .is_some_and(|runtime| runtime.require_launch_permission(&session).is_ok())
+        {
+            // A retained Inbox input cannot relaunch cancelled Work. The
+            // actual run still checks the ledger again before taking authority.
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
 
         enum LaunchPlan {
             Root(Box<ResumeConfigSnapshot>),
@@ -2630,21 +2706,20 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
 ///
 /// `timed_out` selects the wording: the normal path (all shells finished)
 /// announces completion; the deadline path (the 6h+10m wait ceiling was hit with
-/// shells STILL running) must NOT claim the shells completed — it says they may
-/// still be running so the model verifies with BashOutput instead of assuming
-/// success on a false premise.
+/// shells still running) asks the model to verify the command's effects before
+/// assuming completion.
 fn bash_completion_resume_message(bash_ids: &[String], timed_out: bool) -> Message {
     let body = if timed_out {
         format!(
             "Runtime notification: the background-Bash wait ceiling was reached while one or more \
-             shell(s) ({}) may still be running. The session is being resumed so it is not \
-             stranded; verify their actual status with BashOutput before assuming completion.",
+             shell(s) ({}) may still be running. Verify the command's expected effects before \
+             assuming completion or restarting it.",
             bash_ids.join(", ")
         )
     } else {
         format!(
             "Runtime notification: all background Bash shell(s) ({}) have completed. \
-             Review their output with BashOutput and resume the task from where you left off.",
+             Review the recorded output and exit status before continuing the task.",
             bash_ids.join(", ")
         )
     };
@@ -3102,9 +3177,9 @@ where
         .await
 }
 
-fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
+pub(crate) fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
     let mut message = Message::user(format!(
-        "Runtime notification: background command monitoring for {} {}. Completion is not confirmed by this notice. Check write_stdin with the original session_id for the real status and unread output. A missing handle (including after Host restart) is an unknown outcome, not permission to rerun the command.",
+        "Runtime notification: background command monitoring for {} {}. Completion is not confirmed by this notice. Reassess the approach or continue independent work. Use write_stdin with the original session_id when you need the current status or unread output. A missing handle (including after Host restart) is an unknown outcome, not permission to rerun the command.",
         ids.join(", "),
         if timed_out { "reached its wait ceiling" } else { "ended or lost its live handle" },
     ));
@@ -3112,6 +3187,12 @@ fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
         RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
         RUNTIME_RESUME_MESSAGE_KIND_KEY: BASH_COMPLETION_RESUME_KIND,
     }));
+    message
+}
+
+pub(crate) fn exec_completion_message(info: &BashCompletionInfo) -> Message {
+    let mut message = bash_resume_message_from_info(info);
+    message.content = exec_completion_injection_body(info);
     message
 }
 
@@ -3141,10 +3222,6 @@ fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
         body.push_str("\n\nOutput tail:\n");
         body.push_str(&info.output_tail);
     }
-    body.push_str(&format!(
-        "\n\nUse BashOutput with bash_id=\"{}\" for the full output, then continue the task.",
-        info.bash_id
-    ));
     body
 }
 
@@ -3156,9 +3233,11 @@ fn shell_completion_envelope(
     info: &BashCompletionInfo,
     kind: ShellCompletionKind,
 ) -> bamboo_domain::SessionMessageEnvelope {
-    let mut provider_message = bash_resume_message_from_info(info);
+    let provider_message = match kind {
+        ShellCompletionKind::Exec => exec_completion_message(info),
+        ShellCompletionKind::Bash => bash_resume_message_from_info(info),
+    };
     let (identity_kind, instruction, content, data) = if kind == ShellCompletionKind::Exec {
-        provider_message.content = exec_completion_injection_body(info);
         (
             "background_exec",
             "background_exec_completed",
@@ -3648,18 +3727,14 @@ impl ChildCompletionCoordinator {
         });
     }
 
-    /// One-shot startup reconciliation: a process restart kills every in-flight
-    /// child task AND the in-memory bash backstop polls, but the durable state
-    /// (child index status `running`, parents suspended on bash) survives —
-    /// previously stranding those parents forever.
+    /// One-shot inspection uses a fixed boot cutoff. A missing local runner
+    /// does not prove a remote Worker stopped; Storage selects exact trusted
+    /// terminal facts or revokes an expired logical lease under its guards.
     async fn reconcile_orphans_at_boot(&self) {
         let cutoff = Utc::now();
 
-        // (1) Children left `running` by the previous process: no task in THIS
-        // process is driving them, so no completion will ever fire. Mark them
-        // terminal and wake their parents through the canonical path. (Root
-        // sessions left `running` are user-visible and user-recoverable; only
-        // children hold a suspended parent hostage.)
+        // (1) Inspect old running candidates. The shared paced index sweep also
+        // repairs already-terminal records; this legacy entry remains narrow.
         let running = self
             .storage
             .list_sessions_by_run_status("running")
@@ -3681,8 +3756,7 @@ impl ChildCompletionCoordinator {
             tracing::warn!(
                 child_session_id = %child_id,
                 parent_session_id = %parent_id,
-                "boot reconciliation: child was running when the process died; \
-                 marking it error and waking the parent"
+                "boot reconciliation: inspecting exact Child terminal authority"
             );
             self.synthesize_child_completion(
                 &parent_id,
@@ -3693,6 +3767,7 @@ impl ChildCompletionCoordinator {
                      was running"
                         .to_string(),
                 ),
+                cutoff,
             )
             .await;
         }
@@ -3807,6 +3882,15 @@ impl ChildCompletionCoordinator {
     /// durable state proves: dead children are synthesized terminal, an
     /// already-satisfied wait gets its lost wake replayed, an expired lease or
     /// empty wait force-resumes the parent.
+    #[cfg(test)]
+    pub(crate) async fn sweep_child_wait_for_test(
+        &self,
+        parent_session_id: &str,
+        wait: WaitingForChildrenState,
+    ) {
+        self.sweep_child_wait(parent_session_id, wait).await;
+    }
+
     async fn sweep_child_wait(&self, parent_session_id: &str, wait: WaitingForChildrenState) {
         let now = Utc::now();
 
@@ -3909,7 +3993,21 @@ impl ChildCompletionCoordinator {
                     // per-child watchdog machinery itself is dead (task
                     // panicked or lost), because it would have cancelled and
                     // published a timeout long before.
-                    let last_activity = runner.last_activity_at().unwrap_or(runner.started_at);
+                    let scheduler = self.spawn_scheduler.read().await.upgrade();
+                    let shell_wait = control_plane.as_ref().zip(scheduler.as_ref()).and_then(
+                        |(child, scheduler)| {
+                            scheduler.shell_wait_activity_at(
+                                child_id,
+                                &runner.run_id,
+                                child.created_at,
+                                now,
+                            )
+                        },
+                    );
+                    let last_activity = runner
+                        .last_activity_at()
+                        .max(shell_wait)
+                        .unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
                     let policy = match &control_plane {
@@ -3919,10 +4017,30 @@ impl ChildCompletionCoordinator {
                         None => Default::default(),
                     };
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
-                    let total_limit = policy
-                        .max_total_secs
-                        .saturating_add(STALE_RUNNER_SLACK_SECS);
-                    if idle_secs >= idle_limit || total_secs >= total_limit {
+                    let current_native_work =
+                        if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {
+                            match (&control_plane, scheduler) {
+                                (Some(child), Some(scheduler)) => {
+                                    scheduler
+                                        .owns_current_native_work(
+                                            child_id,
+                                            &runner.run_id,
+                                            child.created_at,
+                                        )
+                                        .await
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+                    if idle_secs >= idle_limit
+                        || policy.total_timeout_reached(
+                            total_secs,
+                            STALE_RUNNER_SLACK_SECS,
+                            current_native_work,
+                        )
+                    {
                         runner.cancel_token.cancel();
                         dead.push(DeadChild {
                             child_id: child_id.clone(),
@@ -3976,6 +4094,7 @@ impl ChildCompletionCoordinator {
                         &entry.child_id,
                         &entry.status,
                         Some(entry.reason),
+                        Utc::now(),
                     )
                     .await;
                 } else {
@@ -4024,7 +4143,10 @@ impl ChildCompletionCoordinator {
                 };
                 completion.source = ChildCompletionSource::from_committed_session(&child)
                     .filter(|source| source.matches_completion(&completion));
-                if ChildCompletionSource::has_source_record(&child) && completion.source.is_none() {
+                if (ChildCompletionSource::has_source_record(&child)
+                    || repaired_child_requires_source(&child))
+                    && completion.source.is_none()
+                {
                     tracing::warn!(%child_id,
                             "unavailable committed replay source; leaving wait armed");
                     continue;
@@ -4035,79 +4157,41 @@ impl ChildCompletionCoordinator {
         }
     }
 
-    /// Persist a synthesized terminal status on the child (so the index flips
-    /// and nothing re-detects or re-suspends on it), finalize any lingering
-    /// runner entry (so a future re-run can reserve), then publish through the
-    /// canonical completion path — broadcast + `on_child_completed`, exactly
-    /// like a real child terminal.
+    /// Repair only the selected Child's logical state. The caller's requested
+    /// status, local runner absence and cancel ACK grant no terminal authority,
+    /// Worker-stop proof or parent delivery permission. Existing published
+    /// sources retain their normal replay path; a repair snapshot is no source.
     async fn synthesize_child_completion(
         &self,
         parent_session_id: &str,
         child_session_id: &str,
         status: &str,
         error: Option<String>,
+        before: chrono::DateTime<Utc>,
     ) {
-        match self.storage.load_session(child_session_id).await {
-            Ok(Some(mut child)) => {
-                // Ownership guard (defense in depth — callers check too): only
-                // a session that IS a child of this parent may be mutated. An
-                // arbitrary session id named in a wait still wakes the parent
-                // via the publish below, but its own state stays untouched.
-                if child.parent_session_id.as_deref() != Some(parent_session_id) {
-                    tracing::warn!(
-                        %parent_session_id,
-                        child_session_id = %child.id,
-                        "child-wait watchdog: refusing to synthesize status onto a session \
-                         that is not a child of this parent"
-                    );
-                    self.publish_synthetic_completion(
-                        parent_session_id,
-                        child_session_id,
-                        status,
-                        error,
-                    )
-                    .await;
-                    return;
-                }
-                child.set_last_run_status(status);
-                match &error {
-                    Some(message) => child.set_last_run_error(message.clone()),
-                    None => child.clear_last_run_error(),
-                }
-                child.updated_at = Utc::now();
-                if let Err(save_error) = self.persistence.merge_save_runtime(&mut child).await {
-                    tracing::warn!(
-                        child_session_id = %child.id,
-                        %save_error,
-                        "child-wait watchdog: failed to persist synthesized terminal status"
-                    );
-                }
-                self.sessions.insert(
-                    child.id.clone(),
-                    Arc::new(crate::SessionSnapshot::new(child)),
-                );
-            }
-            Ok(None) => {}
-            Err(load_error) => {
-                tracing::warn!(
-                    %child_session_id,
-                    %load_error,
-                    "child-wait watchdog: failed to load child for synthesized terminal status"
-                );
-            }
+        let Ok(Some(child)) = self.storage.load_session(child_session_id).await else {
+            return;
+        };
+        if child.parent_session_id.as_deref() != Some(parent_session_id) {
+            return;
         }
-        finalize_runner(
-            &self.agent_runners,
-            child_session_id,
-            &Err(bamboo_agent_core::AgentError::LLM(
-                error
-                    .clone()
-                    .unwrap_or_else(|| format!("synthesized {status}")),
-            )),
-        )
-        .await;
-        self.publish_synthetic_completion(parent_session_id, child_session_id, status, error)
-            .await;
+        let cache = self.sessions.clone();
+        let selected = child.clone();
+        if let Err(repair_error) = self
+            .storage
+            .reconcile_session_runtime(
+                &child,
+                before,
+                Some("Child activation lease expired without confirmed Host completion"),
+                Arc::new(move |saved| {
+                    crate::SessionRepository::publish_reconciled_child(&cache, &selected, saved)
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%child_session_id, requested_status = status, ?error, %repair_error,
+                "Child terminal repair unconfirmed; no completion or Worker-stop proof published");
+        }
     }
 
     async fn publish_synthetic_completion(
@@ -4614,6 +4698,200 @@ mod tests {
         store.save_session(&saved).await.unwrap();
     }
 
+    async fn repaired_unactivated_test_child(
+        store: &bamboo_storage::SessionStoreV2,
+        parent: &Session,
+        id: &str,
+    ) -> Session {
+        let mut child = Session::new_child_of(id, parent, "model", "Child");
+        child.agent_runtime_state = Some(AgentRuntimeState::new("unactivated-host-pipeline"));
+        child.set_last_run_status("running");
+        child.add_message(Message::assistant(
+            "UNSEALED_REPAIR_MUST_NOT_BE_IMPORTED",
+            None,
+        ));
+        store.save_session(&child).await.unwrap();
+        store
+            .begin_host_run(&child, "unactivated-host-A")
+            .await
+            .unwrap();
+        let mut terminal = store.load_session(id).await.unwrap().unwrap();
+        terminal.set_last_run_status("cancelled");
+        // An actual legacy Host Main commit with the audited typed split.
+        store.save_session(&terminal).await.unwrap();
+        let expected = store.load_session(id).await.unwrap().unwrap();
+        let repaired = store
+            .reconcile_session_runtime(&expected, Utc::now(), None, Arc::new(|_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Cancelled
+        );
+        assert_eq!(
+            repaired
+                .metadata
+                .get("runtime.reconciled_terminal_generation")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(!repaired
+            .metadata
+            .contains_key("runtime.reconciled_activation_fence"));
+        assert!(ChildCompletionSource::from_committed_session(&repaired).is_none());
+        repaired
+    }
+
+    #[tokio::test]
+    async fn recovered_source_less_sibling_never_satisfies_all_or_stages_with_legal_short_circuit()
+    {
+        for policy in [
+            ChildWaitPolicy::All,
+            ChildWaitPolicy::Any,
+            ChildWaitPolicy::FirstError,
+        ] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "repair-parent",
+                vec!["repair-A".into(), "sealed-B".into()],
+                policy,
+            )
+            .await;
+            let parent = store.load_session("repair-parent").await.unwrap().unwrap();
+            let repaired = repaired_unactivated_test_child(&store, &parent, "repair-A").await;
+            // A direct legacy-looking callback cannot borrow the repaired fact.
+            ChildCompletionHandler::on_child_completed(
+                coordinator.as_ref(),
+                ChildCompletion {
+                    parent_session_id: parent.id.clone(),
+                    child_session_id: repaired.id.clone(),
+                    status: "cancelled".into(),
+                    error: None,
+                    completed_at: repaired.updated_at,
+                    source: None,
+                },
+            )
+            .await;
+            assert_eq!(inbox.inspect(&parent.id).await.unwrap().pending, 0);
+            let b = save_completion_test_child(&store, &parent.id, "sealed-B", "error").await;
+            ChildCompletionHandler::on_child_completed(coordinator.as_ref(), b).await;
+            let claims = inbox.claim(&parent.id, 8).await.unwrap();
+            // Preserve the existing incremental sealed-B notification, even
+            // while All still waits. A contributes neither count nor outcome.
+            assert_eq!(claims.len(), 1);
+            assert!(
+                matches!(&claims[0].envelope.body, SessionMessageBody::ChildOutcome(outcome) if outcome.child_session_id == "sealed-B")
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            let current = store.load_session(&parent.id).await.unwrap().unwrap();
+            assert_eq!(
+                read_runtime_state(&current).waiting_for_children.is_some(),
+                policy == ChildWaitPolicy::All
+            );
+            assert!(!serde_json::to_string(&current)
+                .unwrap()
+                .contains("UNSEALED_REPAIR_MUST_NOT_BE_IMPORTED"));
+            for raw in ["bad", "1"] {
+                let mut invalid = repaired.clone();
+                invalid
+                    .metadata
+                    .insert("runtime.reconciled_terminal_generation".into(), raw.into());
+                assert!(repaired_child_requires_source(&invalid));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_child_read_failure_cannot_become_neutral_parent_permission() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "fault-parent",
+            vec!["fault-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let parent = store.load_session("fault-parent").await.unwrap().unwrap();
+        let child = repaired_unactivated_test_child(&store, &parent, "fault-child").await;
+        let dir = store
+            .bamboo_home_dir()
+            .join(store.resolve_rel_path(&child.id).await.unwrap());
+        let main = dir.join("session.json");
+        let held = dir.join("held-main.json");
+        tokio::fs::rename(&main, &held).await.unwrap();
+        tokio::fs::create_dir(&main).await.unwrap();
+        let callback = ChildCompletion {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child.id,
+            status: "cancelled".into(),
+            error: None,
+            completed_at: child.updated_at,
+            source: None,
+        };
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), callback.clone()).await;
+        assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(
+            read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_some()
+        );
+        tokio::fs::remove_dir(&main).await.unwrap();
+        tokio::fs::rename(&held, &main).await.unwrap();
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), callback).await;
+        assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_generation_does_not_block_exact_later_queued_cancel() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let mut parent = Session::new("cancel-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child = repaired_unactivated_test_child(&store, &parent, "cancel-child").await;
+        child.advance_child_launch_generation().unwrap();
+        child.add_message(Message::user("queued B input"));
+        child.set_last_run_status("pending");
+        store.save_session(&child).await.unwrap();
+        child = store.load_session(&child.id).await.unwrap().unwrap();
+        child.cancel_child_launch_generation();
+        child.set_last_run_status("cancelled");
+        store.save_session(&child).await.unwrap();
+        child = store.load_session(&child.id).await.unwrap().unwrap();
+        assert!(!child.host_run_matches_launch());
+        assert!(!repaired_child_requires_source(&child));
+        let mut runtime = AgentRuntimeState::new("fresh-wait");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec![child.id.clone()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        ));
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent.id.clone(),
+                child_session_id: child.id,
+                status: "cancelled".into(),
+                error: None,
+                completed_at: child.updated_at,
+                source: None,
+            },
+        )
+        .await;
+        assert!(
+            read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
+        );
+        assert_eq!(inbox.claim(&parent.id, 8).await.unwrap().len(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
     async fn test_child_source(
         store: &bamboo_storage::SessionStoreV2,
         id: &str,
@@ -4711,6 +4989,7 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         let message = claims[0].envelope.to_provider_message().unwrap();
         assert!(message.content.contains("planner_artifact"));
+        assert!(message.content.contains("call SubAgent"));
         assert!(!message
             .content
             .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
@@ -4789,51 +5068,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report(
-    ) {
-        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
-        save_waiting_test_parent(
-            &store,
-            "lost-plan-parent",
-            vec!["lost-plan-child".into()],
-            ChildWaitPolicy::All,
-        )
-        .await;
-        let mut parent = store
-            .load_session("lost-plan-parent")
-            .await
-            .unwrap()
-            .unwrap();
-        parent.add_message(Message::user("Original selected source"));
-        store.save_session(&parent).await.unwrap();
-        let mut child = planner_test_child(&parent, "lost-plan-child");
-        child.set_last_run_status("running");
-        child.messages.last_mut().unwrap().content = "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
-        ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
-        child.updated_at = Utc::now() - chrono::Duration::minutes(5);
-        store.save_session(&child).await.unwrap();
-
-        // Exercise the actual boot watchdog, including canonical error save
-        // and publish_synthetic_completion(source=None), not a fabricated report.
-        coordinator.reconcile_orphans_at_boot().await;
-        coordinator.reconcile_orphans_at_boot().await;
-        let claims = inbox.claim(&parent.id, 8).await.unwrap();
-        assert_eq!(
-            claims.len(),
-            1,
-            "the lost worker must not strand the six-hour wait"
-        );
-        assert_eq!(launches.load(Ordering::SeqCst), 1);
-        let message = claims[0].envelope.to_provider_message().unwrap();
-        assert!(message.content.contains("planner_artifact"));
-        assert!(message.content.contains("\"available\":false"));
-        assert!(!serde_json::to_string(&claims[0].envelope)
-            .unwrap()
-            .contains("UNSEALED_REPORT"));
-        let child = store.load_session(&child.id).await.unwrap().unwrap();
-        assert_eq!(child.last_run_status().as_deref(), Some("error"));
-        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
-        assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
+    async fn planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private() {
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+        for mode in ["unknown", "expired", "unactivated-host"] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "lost-plan-parent",
+                vec!["lost-plan-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut parent = store
+                .load_session("lost-plan-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            parent.add_message(Message::user("Original selected source"));
+            store.save_session(&parent).await.unwrap();
+            if mode == "unactivated-host" {
+                repaired_unactivated_test_child(&store, &parent, "lost-plan-child").await;
+                coordinator.reconcile_orphans_at_boot().await;
+                coordinator.reconcile_orphans_at_boot().await;
+                assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+                assert_eq!(launches.load(Ordering::SeqCst), 0);
+                assert!(read_runtime_state(
+                    &store.load_session(&parent.id).await.unwrap().unwrap()
+                )
+                .waiting_for_children
+                .is_some());
+                continue;
+            }
+            let expired_actor = mode == "expired";
+            let mut child = planner_test_child(&parent, "lost-plan-child");
+            // Real first activation requires the creator's exact parent birth;
+            // the report-only legacy helper intentionally does not supply it.
+            child.parent_created_at = Some(parent.created_at);
+            child.set_last_run_status("running");
+            child
+                .agent_runtime_state
+                .get_or_insert_with(|| {
+                    bamboo_domain::AgentRuntimeState::new("lost-worker-pipeline")
+                })
+                .status = bamboo_domain::AgentStatusState::Running;
+            child.messages.last_mut().unwrap().content =
+                "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+            ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
+            child.updated_at = Utc::now() - chrono::Duration::minutes(5);
+            store.save_session(&child).await.unwrap();
+            if expired_actor {
+                let now = Utc::now();
+                let activation = store
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: child.id.clone(),
+                        run_id: "lost-worker".into(),
+                        lease_owner: "synthetic-owner".into(),
+                        lease_expires_at: now + chrono::Duration::seconds(2),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .start_activation(&activation.fence(), now)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(2100)).await;
+            }
+            // Actual boot path twice: no Actor is unknown; an expired exact Actor
+            // can close Child authority, without granting a parent resume source.
+            coordinator.reconcile_orphans_at_boot().await;
+            coordinator.reconcile_orphans_at_boot().await;
+            let claims = inbox.claim(&parent.id, 8).await.unwrap();
+            assert!(
+                claims.is_empty(),
+                "source-less recovery is not parent delivery permission"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            let waiting = store.load_session(&parent.id).await.unwrap().unwrap();
+            assert!(waiting
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .is_some());
+            let child = store.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(
+                child.last_run_status().as_deref(),
+                Some(if expired_actor { "error" } else { "running" })
+            );
+            assert_eq!(
+                child.agent_runtime_state.as_ref().unwrap().status,
+                if expired_actor {
+                    bamboo_domain::AgentStatusState::Failed
+                } else {
+                    bamboo_domain::AgentStatusState::Running
+                }
+            );
+            assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+            assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
+        }
     }
 
     fn unusable_typed_test_child(
@@ -5484,6 +5819,45 @@ mod tests {
             error: None,
             completed_at: child.updated_at,
             source: test_child_source(store, child_id).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_skill_teaching_child_completion_respects_parent_wait() {
+        for tracked in [false, true] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "workflow-parent";
+            let child_id = "workflow-child";
+            if tracked {
+                save_waiting_test_parent(
+                    &store,
+                    parent_id,
+                    vec![child_id.into()],
+                    ChildWaitPolicy::All,
+                )
+                .await;
+            } else {
+                store
+                    .save_session(&Session::new(parent_id, "model"))
+                    .await
+                    .unwrap();
+            }
+            let mut child = Session::new_child(child_id, parent_id, "model", "Workflow Child");
+            child.metadata.insert(
+                bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY.into(),
+                "true".into(),
+            );
+            store.save_session(&child).await.unwrap();
+            let completion =
+                save_completion_test_child(&store, parent_id, child_id, "completed").await;
+            coordinator.on_child_completed(completion).await;
+
+            let outcomes = inbox
+                .pending_child_outcomes(parent_id, child_id)
+                .await
+                .unwrap();
+            assert_eq!(outcomes.len(), usize::from(tracked));
+            assert_eq!(launches.load(Ordering::SeqCst), usize::from(tracked));
         }
     }
 
@@ -7683,7 +8057,7 @@ mod tests {
     fn bash_completion_resume_message_deadline_does_not_claim_completion() {
         // The 6h+10m deadline force-breaks with shells STILL running. The message
         // must NOT say "have completed" — that would let the model assume success
-        // on a false premise. It must direct the model to verify with BashOutput.
+        // on a false premise. It must direct the model to verify the effects.
         let ids = vec!["bg-long".to_string()];
         let message = bash_completion_resume_message(&ids, true);
         assert!(
@@ -7697,8 +8071,10 @@ mod tests {
             message.content
         );
         assert!(
-            message.content.contains("BashOutput"),
-            "deadline resume message must direct verification via BashOutput: {}",
+            message
+                .content
+                .contains("Verify the command's expected effects"),
+            "deadline resume message must direct verification: {}",
             message.content
         );
         // Same hidden/kind shape so the resume gate is satisfied identically.
@@ -7768,9 +8144,7 @@ mod tests {
         assert!(body.contains("completed"), "body: {body}");
         assert!(body.contains("exit code 0"), "body: {body}");
         assert!(body.contains("BUILD OK"), "body: {body}");
-        // The model is pointed at BashOutput for the full log.
-        assert!(body.contains("BashOutput"), "body: {body}");
-        assert!(body.contains("bash_id=\"abc123\""), "body: {body}");
+        assert!(!body.contains("BashOutput"), "body: {body}");
     }
 
     #[test]
@@ -8125,7 +8499,7 @@ mod tests {
             msg.content
         );
         assert!(
-            msg.content.contains("BashOutput"),
+            !msg.content.contains("BashOutput"),
             "content: {}",
             msg.content
         );

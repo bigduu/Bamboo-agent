@@ -183,8 +183,20 @@ fn core_proxy_patch_error() -> AppError {
 
 pub fn build_merged_config(
     current: &Config,
-    patch_obj: Map<String, Value>,
+    mut patch_obj: Map<String, Value>,
 ) -> Result<Config, AppError> {
+    // Merge editable provider fields against their saved values. This keeps an
+    // explicit value identical to the environment override meaningful.
+    let mut saved = current.clone();
+    saved.restore_saved_provider_metadata();
+    let current = &saved;
+    if let Some(policy) = patch_obj.get_mut("plugin_trust") {
+        current
+            .plugin_trust
+            .prepare_update(policy)
+            .map_err(|error| AppError::BadRequest(format!("Invalid publisher policy: {error}")))?;
+    }
+    let publisher_policy = patch_obj.get("plugin_trust").cloned();
     // Captured before the merge consumes the patch: which providers/instances
     // this patch explicitly sets or clears — those must NOT get their dropped
     // key carried forward below (#516).
@@ -200,9 +212,47 @@ pub fn build_merged_config(
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
 
     deep_merge_json(&mut merged, Value::Object(patch_obj));
+    if let Some(policy) = publisher_policy {
+        merged["plugin_trust"] = policy;
+    }
 
     let mut new_config: Config = serde_json::from_value(merged)
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
+    if new_config.providers().extra.contains_key("copilot")
+        && !current.providers().extra.contains_key("copilot")
+    {
+        return Err(AppError::BadRequest(
+            "GitHub Copilot provider is no longer supported".to_string(),
+        ));
+    }
+    for (id, instance) in &new_config.provider_instances {
+        if current.is_retired_provider_alias(id) {
+            return Err(AppError::BadRequest(format!(
+                "Provider instance id '{id}' is reserved for a retired provider; use a new id"
+            )));
+        }
+        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str())
+            && !current
+                .provider_instances
+                .get(id)
+                .is_some_and(|existing| existing.provider_type == instance.provider_type)
+        {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported provider type '{}' for new provider instance '{id}'",
+                instance.provider_type
+            )));
+        }
+    }
+    new_config.preserve_provider_retirement(current);
+    let saved_default = new_config
+        .default_provider_instance
+        .as_deref()
+        .unwrap_or(&new_config.provider);
+    if new_config.is_retired_provider_alias(saved_default) {
+        return Err(AppError::BadRequest(
+            "The default provider instance was retired; select a configured provider".to_string(),
+        ));
+    }
     // An explicit `api_key: ""` clear must drop the round-tripped ciphertext
     // BEFORE hydration — otherwise hydration refills the plaintext from it and
     // the subsequent sync/save re-encrypts, silently undoing the clear (#516).
@@ -244,14 +294,104 @@ pub fn build_merged_config(
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
     new_config.normalize_plugin_trust_settings();
+    new_config.apply_runtime_provider_metadata_overrides();
 
     Ok(new_config)
+}
+
+pub(crate) fn validate_provider_settings(config: &Config) -> Result<(), bamboo_llm::LLMError> {
+    if config.has_retired_provider_default() {
+        return Ok(());
+    }
+    bamboo_llm::validate_provider_config(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn explicit_provider_model_persists_when_it_matches_the_environment() {
+        let _model = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_MODEL",
+            Some("runtime-model"),
+        );
+        let mut current: Config = serde_json::from_value(serde_json::json!({
+            "default_provider_instance": "openai",
+            "provider_instances": {"openai": {
+                "provider_type": "openai", "api_key_from_env": true, "model": "saved-model",
+            }},
+        }))
+        .unwrap();
+        current.apply_runtime_provider_metadata_overrides();
+        assert_eq!(
+            current.provider_instances["openai"].model.as_deref(),
+            Some("runtime-model")
+        );
+        let patch = serde_json::json!({
+            "provider_instances": {"openai": {"model": "runtime-model"}}
+        });
+        let mut next = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+        next.restore_saved_provider_metadata();
+        assert_eq!(
+            next.provider_instances["openai"].model.as_deref(),
+            Some("runtime-model")
+        );
+    }
+
+    #[test]
+    fn compatibility_patch_preserves_retirement_and_rejects_reusing_an_alias() {
+        let mut current = Config::default();
+        current.provider = "copilot".into();
+        current.providers_mut().copilot_default_retired = true;
+        current
+            .providers_mut()
+            .retired_provider_aliases
+            .insert("openai".into());
+        let patch = serde_json::json!({
+            "providers": {"retired_provider_aliases": [], "copilot_default_retired": false}
+        });
+        let updated = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+        assert!(updated.has_retired_provider_default());
+        assert!(updated.is_retired_provider_alias("openai"));
+        let patch = serde_json::json!({
+            "provider_instances": {"openai": {"provider_type": "openai"}}
+        });
+        let error = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserved for a retired provider"));
+    }
+
+    #[test]
+    fn publisher_compatibility_patches_keep_revocations_and_explicit_empty_lists() {
+        let mut current = Config::default();
+        current.plugin_trust.revoke_official_publisher("jiandu");
+        for patch in [
+            serde_json::json!({"plugin_trust":{"trusted_keys":[]}}),
+            serde_json::json!({"plugin_trust":{"enforcement":"strict"}}),
+            serde_json::json!({"server":{"port":9563}}),
+        ] {
+            let result = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+            assert_eq!(
+                result.plugin_trust.revoked_publishers,
+                current.plugin_trust.revoked_publishers
+            );
+            assert!(!result
+                .plugin_trust
+                .effective_trusted_keys()
+                .iter()
+                .any(|key| key.public_key == bamboo_config::JIANDU_PLUGIN_PUBLIC_KEY));
+            if patch["plugin_trust"].get("trusted_keys").is_some() {
+                assert_eq!(
+                    result.plugin_trust.publisher_mode,
+                    bamboo_config::PublisherMode::Explicit
+                );
+                assert!(result.plugin_trust.effective_trusted_keys().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn unrelated_root_patch_preserves_store_hydrated_proxy_auth() {

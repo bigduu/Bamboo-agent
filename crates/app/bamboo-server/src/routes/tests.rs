@@ -843,7 +843,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
 }
 
 /// #251 (finding 1): every route that used to live ONLY under bare `/v1/*`
-/// (commands/settings/skills/tools/workspace/copilot/cluster) must now ALSO
+/// (commands/settings/skills/tools/workspace/cluster) must now ALSO
 /// resolve under the canonical `/api/v1/*` prefix — proving the alias in
 /// `routes::bamboo_v1::bamboo_v1_routes` actually mounts both prefixes, not
 /// just the legacy one.
@@ -853,7 +853,7 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
 
     // A representative sample spanning every route group registered by
     // `bamboo_routes_scope` (commands / settings / skills / tools / workspace /
-    // copilot / provider-catalog / provider-instances / cluster nodes).
+    // provider-catalog / provider-instances / cluster nodes).
     let relative_paths = [
         "/commands",
         "/bamboo/workflows",

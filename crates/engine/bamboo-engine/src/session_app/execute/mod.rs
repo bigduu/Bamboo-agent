@@ -82,6 +82,13 @@ pub async fn prepare_execute(
         });
     }
 
+    if session
+        .metadata
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+    {
+        return Err(ExecutePreparationError::PermissionResponsePending);
+    }
+
     let scheduled_binding = if session.metadata.contains_key("created_by_schedule_id") {
         Some(
             schedule_bound_model_ref(&session)
@@ -188,7 +195,7 @@ pub async fn prepare_execute(
     })
 }
 
-fn resolve_execution_model(
+pub(crate) fn resolve_execution_model(
     session: &Session,
     input: &ExecuteInput,
     config: &ExecutionConfigSnapshot,

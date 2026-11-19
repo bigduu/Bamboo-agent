@@ -434,13 +434,11 @@ mod tests {
         assert!(snapshot
             .env_context
             .as_deref()
-            .is_some_and(|value| value.contains(
-                "environment variables were explicitly configured by the user inside Bodhi"
-            )));
+            .is_some_and(|value| value.contains("available to tool processes.")));
         assert!(snapshot
             .env_context
             .as_deref()
-            .is_some_and(|value| value.contains("Bash/tool processes launched by Bodhi")));
+            .is_some_and(|value| value.contains("available to tool processes")));
         assert!(snapshot
             .skill_context
             .as_deref()

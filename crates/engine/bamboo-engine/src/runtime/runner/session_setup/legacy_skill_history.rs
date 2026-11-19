@@ -1,19 +1,20 @@
 //! Pure loaded-only conversion plan, applied by defaults SDK runner setup.
 
 use bamboo_agent_core::{Message, Role};
+use bamboo_skills::capability_discovery::MAX_AUTOMATIC_SKILL_CANDIDATES;
 use bamboo_skills::runtime_metadata::*;
 use bamboo_skills::{
     ActiveWorkflow, DurableWorkflowActivation, SkillActivationDescriptor, SkillActivationSnapshot,
-    WorkflowActivationStatus, WorkflowCatalogEntry, WorkflowKind, WorkflowSelection,
-    WorkflowStatus, ACTIVE_WORKFLOW_METADATA_KEY, ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
-    MAX_DURABLE_WORKFLOW_ACTIVATION_BYTES, WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
-    WORKFLOW_CONTEXT_CACHE_METADATA_KEY, WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
-    WORKFLOW_SELECTION_METADATA_KEY,
+    WorkflowActivationStatus, WorkflowCatalogEntry, WorkflowInvokedBy, WorkflowKind,
+    WorkflowSelection, WorkflowStatus, ACTIVE_WORKFLOW_METADATA_KEY,
+    ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY, MAX_DURABLE_WORKFLOW_ACTIVATION_BYTES,
+    WORKFLOW_ACTIVATION_EVENT_METADATA_KEY, WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+    WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY, WORKFLOW_SELECTION_METADATA_KEY,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const OBSOLETE_INSTRUCTION_KEYS: &[&str] = &[
     ACTIVE_WORKFLOW_METADATA_KEY,
@@ -33,6 +34,7 @@ const OBSOLETE_INSTRUCTION_KEYS: &[&str] = &[
     LAST_LOADED_SKILL_ID_METADATA_KEY,
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY,
     LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
+    bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY,
     WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
     WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
     WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
@@ -137,9 +139,17 @@ pub fn plan_legacy_skill_history(
     else {
         return Ok(unsupported("no original selected catalog"));
     };
+    // A model-selected Skill keeps its exact loaded bytes. Other advertised
+    // candidates may have metadata but no persisted instruction/resource bytes.
+    let model_selected_from_shortlist = active.invoked_by == WorkflowInvokedBy::Model
+        && metadata
+            .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+            .is_some_and(|source| source == "auto")
+        && pinned.skills.len() == 1
+        && (2..=MAX_AUTOMATIC_SKILL_CANDIDATES).contains(&catalog.len());
     if pinned.skills.is_empty()
         || pinned.skills.len() > 32
-        || pinned.skills.len() != catalog.len()
+        || (pinned.skills.len() != catalog.len() && !model_selected_from_shortlist)
         || pinned.catalog_revision != durable.snapshot.catalog_revision
         || pinned.selected_skill_mode != durable.snapshot.selected_skill_mode
     {
@@ -151,21 +161,32 @@ pub fn plan_legacy_skill_history(
     {
         return Ok(unsupported("mixed Orchestration pin remains untouched"));
     }
-    let mut catalog_ids = BTreeSet::new();
+    let mut catalog_revisions = BTreeMap::new();
     for candidate in &catalog {
-        let original = pinned
-            .skills
-            .get(&candidate.id)
-            .ok_or("catalog candidate is not pinned")?;
-        if !catalog_ids.insert(&candidate.id)
-            || candidate != &original.catalog_entry
-            || original.definition.id != candidate.id
-            || original.revision != candidate.revision
-            || original.revision == 0
+        if catalog_revisions
+            .insert(candidate.id.clone(), candidate.revision)
+            .is_some()
+            || candidate.revision == 0
             || !candidate.winner
             || candidate.status != WorkflowStatus::Valid
         {
             return Err("original selected catalog and snapshot disagree".into());
+        }
+        if let Some(original) = pinned.skills.get(&candidate.id) {
+            if candidate != &original.catalog_entry
+                || original.definition.id != candidate.id
+                || original.revision != candidate.revision
+            {
+                return Err("original selected catalog and snapshot disagree".into());
+            }
+        } else if !model_selected_from_shortlist {
+            return Err("catalog candidate is not pinned".into());
+        }
+        if model_selected_from_shortlist
+            && (candidate.legacy
+                || candidate.invocation_policy["automatic"].as_bool() != Some(true))
+        {
+            return Err("original automatic catalog candidate was ineligible".into());
         }
     }
     let original = pinned
@@ -181,11 +202,9 @@ pub fn plan_legacy_skill_history(
     }
     let descriptor = SkillActivationDescriptor {
         catalog_revision: pinned.catalog_revision,
-        skill_revisions: pinned
-            .skills
-            .iter()
-            .map(|(id, entry)| (id.clone(), entry.revision))
-            .collect(),
+        // The catalog/revision map proves which identities were advertised.
+        // Only the active entry above has independently validated payload bytes.
+        skill_revisions: catalog_revisions,
         selected_skill_mode: pinned.selected_skill_mode.clone(),
     };
     if !validate_pinned_activation_metadata(metadata, Some(&descriptor), Some(&active.id))? {
@@ -421,7 +440,7 @@ mod tests {
     use super::*;
     use crate::session_app::skill_input::tests::{selection, snapshot};
     use bamboo_agent_core::{FunctionCall, Session, ToolCall};
-    use bamboo_skills::activation::{DynamicContextBlock, WorkflowInvokedBy};
+    use bamboo_skills::activation::DynamicContextBlock;
     use chrono::{Duration, Utc};
     use serde_json::json;
 
@@ -600,6 +619,51 @@ mod tests {
         assert!(!plan.remove_metadata.contains(&"workflow.run_ids.v1".into()));
         assert_eq!(serde_json::to_value(messages).unwrap(), originals);
         assert_eq!(metadata, original_metadata);
+    }
+
+    #[test]
+    fn legacy_skill_history_projects_only_the_loaded_entry_from_an_automatic_shortlist() {
+        let (messages, mut metadata, mut durable) = fixture();
+        durable.active.invoked_by = WorkflowInvokedBy::Model;
+        let loaded = &mut durable
+            .snapshot
+            .skills
+            .get_mut("review")
+            .unwrap()
+            .catalog_entry;
+        loaded.invocation_policy["automatic"] = json!(true);
+        let mut other = loaded.clone();
+        other.id = "other".into();
+        other.name = "UNLOADED_METADATA".into();
+        other.revision = 8;
+        let loaded = loaded.clone();
+        sync_durable(&mut metadata, &durable);
+        metadata.remove(WORKFLOW_SELECTION_METADATA_KEY);
+        metadata.insert(SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "auto".into());
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_CATALOG_KEY.into(),
+            serde_json::to_string(&[loaded, other]).unwrap(),
+        );
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+            json!(["review", "other"]).to_string(),
+        );
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.into(),
+            json!({"review":7, "other":8}).to_string(),
+        );
+
+        let plan = plan_legacy_skill_history(&messages, &metadata).unwrap();
+        assert_eq!(plan.insert_after, Some(3));
+        let content = plan.message.unwrap().content;
+        assert!(content.contains("PRIVATE Instructions"));
+        assert!(!content.contains("UNLOADED_METADATA"));
+
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.into(),
+            json!({"review":7, "other":9}).to_string(),
+        );
+        assert!(plan_legacy_skill_history(&messages, &metadata).is_err());
     }
 
     #[test]

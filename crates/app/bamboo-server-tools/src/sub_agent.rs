@@ -164,7 +164,6 @@ enum SubAgentArgs {
         #[serde(default)]
         wait_for: Option<ChildWaitPolicy>,
     },
-    List,
     Get {
         child_session_id: String,
         /// Overview is metadata only. Other views return bounded, durable
@@ -331,7 +330,7 @@ async fn enqueue_waiting_child(
         // The child was persisted as pending while the synchronous launch was
         // prepared, but it was never enqueued. Make it terminal before the
         // parent runner's end-of-turn safety net scans active child sessions.
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+        let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
         return Err(tool_error_from_child_session(
             child_session::rollback_failed_wait_launch(
                 sessions,
@@ -368,7 +367,7 @@ async fn enqueue_waiting_child(
     if had_wait {
         return Err(tool_error_from_child_session(error));
     }
-    let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+    let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
     Err(tool_error_from_child_session(
         child_session::rollback_failed_wait_launch(sessions, &parent.id, child_session_id, error)
             .await,
@@ -401,13 +400,8 @@ async fn enqueue_background_child(
         Ok(bamboo_domain::AdmissionCommit::Committed(()))
         | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => Ok(()),
         Ok(bamboo_domain::AdmissionCommit::Cancelled) => {
-            let error = mark_failed_child_enqueue(
-                sessions,
-                parent,
-                child_session_id,
-                cancelled_launch_error(),
-            )
-            .await;
+            let error =
+                mark_failed_child_enqueue(sessions, parent, &child, cancelled_launch_error()).await;
             Err(tool_error_from_child_session(error))
         }
         Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
@@ -415,7 +409,7 @@ async fn enqueue_background_child(
             Ok(())
         }
         Err(error) => {
-            let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+            let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
             Err(tool_error_from_child_session(error))
         }
     }
@@ -424,20 +418,25 @@ async fn enqueue_background_child(
 async fn mark_failed_child_enqueue(
     sessions: &dyn ChildSessionPort,
     parent: &bamboo_agent_core::Session,
-    child_session_id: &str,
+    expected: &bamboo_agent_core::Session,
     error: ChildSessionError,
 ) -> ChildSessionError {
     let status_update = async {
         let mut child = sessions
-            .load_child_for_parent(&parent.id, child_session_id)
+            .load_child_for_parent(&parent.id, &expected.id)
             .await?;
-        if child.last_run_status().as_deref().is_some_and(|status| {
-            matches!(status, "completed" | "cancelled" | "timeout" | "skipped")
-        }) {
+        if child.created_at != expected.created_at
+            || child.parent_created_at != expected.parent_created_at
+            || child.host_run_id() != expected.host_run_id()
+            || child.child_launch_generation() != expected.child_launch_generation()
+            || child.last_run_status().as_deref() != Some("pending")
+        {
             return Ok(());
         }
+        child.cancel_child_launch_generation();
         child.set_last_run_status("error");
         child.set_last_run_error(format!("Child launch failed: {error}"));
+        child.synchronize_terminal_runtime_status();
         child.updated_at = chrono::Utc::now();
         sessions.save_child_session(&mut child).await
     }
@@ -524,7 +523,9 @@ fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
         ChildSessionError::NotRootSession(id) => {
             ToolError::Execution(format!("session is not a root session: {id}"))
         }
-        ChildSessionError::InvalidArguments(msg) => ToolError::InvalidArguments(msg),
+        ChildSessionError::InvalidArguments(msg) | ChildSessionError::ModelNotAdmitted(msg) => {
+            ToolError::InvalidArguments(msg)
+        }
         ChildSessionError::Execution(msg) => ToolError::Execution(msg),
         other => ToolError::Execution(other.to_string()),
     }
@@ -1394,7 +1395,7 @@ impl SubAgentTool {
                     None => None,
                 };
 
-                let (child_session_id, child_model, reused, child_reasoning_effort, should_wait) =
+                let (child_session_id, child_model, child_model_ref, reused, child_reasoning_effort, should_wait) =
                     if let Some(existing_id) = existing_resident {
                         // A resident is stable Project identity. A root may
                         // have been explicitly reassigned since this resident
@@ -1610,13 +1611,13 @@ impl SubAgentTool {
                             }
                             requested_wait
                         };
-                        let (model, child_reasoning_effort) = self
+                        let (model, model_ref, child_reasoning_effort) = self
                             .sessions
                             .load_child_for_parent(&parent.id, &existing_id)
                             .await
-                            .map(|child| (child.model, child.reasoning_effort))
+                            .map(|child| (child.model, child.model_ref, child.reasoning_effort))
                             .unwrap_or_default();
-                        (existing_id, model, true, child_reasoning_effort, wait_armed)
+                        (existing_id, model, model_ref, true, child_reasoning_effort, wait_armed)
                     } else {
                         let child_id = Uuid::new_v4().to_string();
                         // Model precedence: explicit `model` arg > per-subagent_type
@@ -1675,11 +1676,19 @@ impl SubAgentTool {
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
                             };
                         let result = if compact {
-                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input)).await
+                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input))
+                                .await
+                                .map_err(|error| match error {
+                                    ChildSessionError::ModelNotAdmitted(_) =>
+                                        ToolError::InvalidArguments(facade::MODEL_NOT_ADMITTED_ERROR.into()),
+                                    other => tool_error_from_child_session(other),
+                                })
                         } else {
-                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input)).await
-                        }.map_err(tool_error_from_child_session)?;
-                        {
+                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input))
+                                .await
+                                .map_err(tool_error_from_child_session)
+                        }?;
+                        let (child_model, child_model_ref, child_reasoning_effort) = {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
                             if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(&child)
@@ -1688,7 +1697,8 @@ impl SubAgentTool {
                                 "background_omitted": binding.payload.background_omitted,
                                 "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}));
                             }
-                        }
+                            (child.model, child.model_ref, child.reasoning_effort)
+                        };
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.
                         self.sessions.ensure_child_indexed(&result.child_session_id).await;
@@ -1712,9 +1722,10 @@ impl SubAgentTool {
                         }
                         (
                             result.child_session_id,
-                            result.model,
+                            child_model,
+                            child_model_ref,
                             false,
-                            effective_reasoning_effort,
+                            child_reasoning_effort,
                             requested_wait,
                         )
                     };
@@ -1757,6 +1768,7 @@ impl SubAgentTool {
                     "child_session_id": child_session_id,
                     "parent_session_id": parent_session_id,
                     "model": child_model,
+                    "model_ref": child_model_ref,
                     "reasoning_effort": child_reasoning_effort.map(|effort| effort.as_str()),
                     "status": status,
                     "lifecycle": resident_name.as_ref().map(|_| "resident"),
@@ -1775,6 +1787,15 @@ impl SubAgentTool {
                 child_session_ids,
                 wait_for,
             } => {
+                if compact {
+                    // A compact target is a logical direct child, not an
+                    // arbitrary legacy wait/watchdog identifier. Reuse the
+                    // existing Host ownership check before registering a wait.
+                    for id in child_session_ids.iter().flatten() {
+                        self.sessions.load_child_for_parent(&parent.id, id).await
+                            .map_err(tool_error_from_child_session)?;
+                    }
+                }
                 let policy = wait_for.unwrap_or(ChildWaitPolicy::All);
                 // Default to every currently-active child; honor an explicit
                 // subset when provided. Explicit ids the index POSITIVELY
@@ -1875,11 +1896,6 @@ impl SubAgentTool {
                     "waiting_on": count,
                     "note": "Each completed child wakes the parent to process its result. Unfinished children remain tracked until the wait release policy is satisfied.",
                 }))
-            }
-            SubAgentArgs::List => {
-                let result =
-                    child_session::list_children_action(self.sessions.as_ref(), &parent.id).await;
-                tool_result(result)
             }
             SubAgentArgs::Get { .. } => unreachable!("get returns before loading the root"),
             SubAgentArgs::Update {
@@ -2203,7 +2219,7 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["intent"]["enum"],
-            json!(["chat", "inspect", "control", "ask_parent"])
+            json!(["chat", "inspect", "control", "ask_parent", "wait"])
         );
         let actual: std::collections::BTreeSet<_> = schema["properties"]
             .as_object()
@@ -2213,16 +2229,17 @@ mod tests {
             .collect();
         assert_eq!(
             actual,
-            std::collections::BTreeSet::from(["intent", "target", "role", "message", "reply_to",])
+            std::collections::BTreeSet::from([
+                "intent",
+                "target",
+                "role",
+                "model",
+                "reasoning_effort",
+                "message",
+                "reply_to",
+            ])
         );
-        for physical_or_runtime in [
-            "model",
-            "workspace",
-            "worker_bin",
-            "endpoint",
-            "action",
-            "auto_run",
-        ] {
+        for physical_or_runtime in ["workspace", "worker_bin", "endpoint", "action", "auto_run"] {
             assert!(schema["properties"].get(physical_or_runtime).is_none());
         }
     }

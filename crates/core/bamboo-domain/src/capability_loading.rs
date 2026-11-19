@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    canonical_tool_name, FunctionSchema, ToolSchema, DISCOVER_CAPABILITY_NAME,
+    canonical_tool_name, FunctionSchema, Message, Role, ToolSchema, DISCOVER_CAPABILITY_NAME,
     MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
 };
 
@@ -32,10 +32,12 @@ pub enum CapabilityLoadingMode {
     LegacyFullCatalog,
     Progressive,
     /// Compatibility path for providers without native deferred-tool search.
-    /// The top-level catalog stays fixed at Core plus Bamboo's synthetic
-    /// discovery function while loaded definitions live in conversation
-    /// history.
+    /// Bamboo declares initially available functions and its discovery gateway.
+    /// Validated discovery history supplies further callable definitions.
     StickyFallback,
+    /// Compatibility value used by older provider adapters. The agent treats
+    /// it as StickyFallback for every session role.
+    StickyFallbackForRootChat,
 }
 
 /// The complete and intentionally small always-resident function surface.
@@ -44,10 +46,11 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 13] = [
+pub const CORE_TOOL_NAMES: [&str; 15] = [
     "exec_command",
     "write_stdin",
     "Read",
+    "ViewImage",
     "Grep",
     "Edit",
     "Write",
@@ -59,6 +62,7 @@ pub const CORE_TOOL_NAMES: [&str; 13] = [
     "work_changes",
     "work_update",
     "work_dispatch",
+    "work_review",
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
@@ -72,10 +76,9 @@ pub const HOST_ONLY_TOOL_NAMES: [&str; 6] = [
 ];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
     "Glob",
     "GetFileInfo",
-    "ViewImage",
     "load_skill",
     "workflow_run",
     "update_goal",
@@ -87,6 +90,43 @@ pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
 /// fallback adapter. Native provider search items map to the logical gateway
 /// directly and do not use this function identity.
 pub const DISCOVERY_CONTROL_FALLBACK_TOOL_NAME: &str = "discover_capabilities";
+
+#[doc(hidden)]
+pub const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
+#[doc(hidden)]
+pub const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
+
+/// Recognize a complete internal lookup step when projecting Actor execution
+/// data. Its Worker messages remain available to the model during the run.
+#[doc(hidden)]
+pub fn is_sticky_discovery_pair(assistant: &Message, result: &Message) -> bool {
+    let Some([call]) = assistant.tool_calls.as_deref() else {
+        return false;
+    };
+    let marked = |message: &Message| {
+        message.never_compress
+            && message.metadata.as_ref().is_some_and(|metadata| {
+                metadata["runtime_kind"].as_str() == Some(STICKY_DISCOVERY_RUNTIME_KIND)
+                    && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
+            })
+    };
+    assistant.role == Role::Assistant
+        && assistant.tool_call_id.is_none()
+        && assistant.tool_success.is_none()
+        && call.tool_type == "function"
+        && call.function.name == DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+        && !call.id.trim().is_empty()
+        && marked(assistant)
+        && result.role == Role::Tool
+        && result.tool_calls.is_none()
+        && result.tool_call_id.as_deref() == Some(call.id.as_str())
+        && result.tool_success.is_some()
+        && result
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata["canonical_new_names"].is_array())
+        && marked(result)
+}
 
 /// Complete, bounded function schema used by the compatibility fallback.
 ///
@@ -162,22 +202,16 @@ pub const DISCOVERY_CONTROL_GATEWAY: DiscoveryControlGateway =
 /// This function is intentionally reference-oriented: callers that classify a
 /// registered schema, build a logical catalog, or make admission decisions must
 /// use [`ClassifiedToolIdentity`] / [`ClassifiedToolSchema`] instead. Their
-/// exact-first registration semantics prevent a custom exact `bash` or
+/// exact-first registration semantics prevent a custom exact `read_file` or
 /// `apply_patch` registration from inheriting Core policy from a builtin alias.
 /// Unknown references deliberately remain Deferred so a new builtin, server
 /// overlay, plugin, desktop, MCP, or custom tool cannot silently expand the
 /// always-resident surface.
 pub fn capability_loading_class_for_reference(name: &str) -> CapabilityLoadingClass {
     let canonical = canonical_tool_name(name);
-    if CORE_TOOL_NAMES
-        .iter()
-        .any(|core| core.eq_ignore_ascii_case(&canonical))
-    {
+    if CORE_TOOL_NAMES.contains(&canonical.as_str()) {
         CapabilityLoadingClass::Core
-    } else if HOST_ONLY_TOOL_NAMES
-        .iter()
-        .any(|host_only| host_only.eq_ignore_ascii_case(&canonical))
-    {
+    } else if HOST_ONLY_TOOL_NAMES.contains(&canonical.as_str()) {
         CapabilityLoadingClass::HostOnly
     } else {
         CapabilityLoadingClass::Deferred
@@ -381,7 +415,8 @@ impl EffectiveCallableSet {
         let mut callable_execution_names = catalog
             .iter()
             .filter(|entry| match mode {
-                CapabilityLoadingMode::LegacyFullCatalog => entry.is_model_visible(),
+                CapabilityLoadingMode::LegacyFullCatalog
+                | CapabilityLoadingMode::StickyFallbackForRootChat => entry.is_model_visible(),
                 CapabilityLoadingMode::Progressive | CapabilityLoadingMode::StickyFallback => {
                     entry.is_initially_visible()
                 }
@@ -469,6 +504,7 @@ mod tests {
                 "exec_command",
                 "write_stdin",
                 "Read",
+                "ViewImage",
                 "Grep",
                 "Edit",
                 "Write",
@@ -479,6 +515,7 @@ mod tests {
                 "work_changes",
                 "work_update",
                 "work_dispatch",
+                "work_review",
             ]
         );
         for name in CORE_TOOL_NAMES {
@@ -605,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             capability_loading_class_for_reference("default::getCurrentDir"),
-            CapabilityLoadingClass::HostOnly
+            CapabilityLoadingClass::Deferred
         );
         assert_eq!(
             capability_loading_class_for_reference("default::sub_task"),
@@ -660,8 +697,8 @@ mod tests {
             );
         }
         let host_alias =
-            ClassifiedToolIdentity::from_schema_name("GetCurrentDir").expect("host alias identity");
-        assert_eq!(host_alias.execution_name(), "GetCurrentDir");
+            ClassifiedToolIdentity::from_schema_name("Workspace").expect("host identity");
+        assert_eq!(host_alias.execution_name(), "Workspace");
         assert_eq!(host_alias.loading_class(), CapabilityLoadingClass::HostOnly);
         assert_eq!(
             ClassifiedToolIdentity::from_schema_name("exec_command")
@@ -692,7 +729,6 @@ mod tests {
             "BashOutput",
             "KillShell",
             "execute_command",
-            "bash",
             "default::Bash",
         ] {
             let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
@@ -829,18 +865,21 @@ mod tests {
     #[test]
     fn legacy_effective_set_keeps_core_and_deferred_but_excludes_host_only() {
         let catalog = classified_catalog(&["Read", "Glob", "custom_tool", "Workspace"]);
-        let effective = EffectiveCallableSet::from_catalog(
-            &catalog,
+        for mode in [
             CapabilityLoadingMode::LegacyFullCatalog,
-            std::iter::empty::<&str>(),
-        );
+            CapabilityLoadingMode::StickyFallbackForRootChat,
+        ] {
+            let effective =
+                EffectiveCallableSet::from_catalog(&catalog, mode, std::iter::empty::<&str>());
 
-        assert_eq!(
-            effective.execution_names().collect::<Vec<_>>(),
-            vec!["Glob", "Read", "custom_tool"]
-        );
-        assert_eq!(effective.discovery_gateway(), DISCOVERY_CONTROL_GATEWAY);
-        assert!(effective.discovery_gateway().is_initially_visible());
+            assert_eq!(
+                effective.execution_names().collect::<Vec<_>>(),
+                vec!["Glob", "Read", "custom_tool"],
+                "{mode:?}"
+            );
+            assert_eq!(effective.discovery_gateway(), DISCOVERY_CONTROL_GATEWAY);
+            assert!(effective.discovery_gateway().is_initially_visible());
+        }
     }
 
     #[test]

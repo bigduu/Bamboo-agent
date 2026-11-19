@@ -462,6 +462,23 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
     assert!(err
         .to_string()
         .contains("run_config.task_message is required when auto_execute is true"));
+
+    let err = tool
+        .invoke(
+            serde_json::json!({
+                "action": "create",
+                "name": "missing-execution-choice",
+                "enabled": true,
+                "trigger": {"type": "interval", "every_seconds": 60},
+                "run_config": {"task_message": "Run the scheduled check"}
+            }),
+            ctx_for_session("root-session").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Specify run_config.auto_execute when supplying a task_message"));
 }
 
 #[tokio::test]
@@ -581,7 +598,7 @@ async fn schedule_tasks_crud_and_list_sessions() {
                 "misfire_policy": { "type": "catch_up_window", "max_catch_up_runs": 2, "max_lateness_seconds": 1800 },
                 "overlap_policy": "skip",
                 "enabled": false,
-                "run_config": { "auto_execute": false }
+                "run_config": { "task_message": "Review the draft", "auto_execute": false }
             }),
             ctx_for_session("root-session").to_tool_ctx(),
         )
@@ -613,6 +630,22 @@ async fn schedule_tasks_crud_and_list_sessions() {
         created_v["schedule"]["trigger"]["type"].as_str(),
         Some("daily")
     );
+    assert_eq!(created_v["schedule"]["run_config"]["auto_execute"], false);
+
+    let err = tool
+        .invoke(
+            serde_json::json!({
+                "action": "patch",
+                "schedule_id": schedule_id,
+                "run_config": {"task_message": "Replace the draft"}
+            }),
+            ctx_for_session("root-session").to_tool_ctx(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Specify run_config.auto_execute when supplying a task_message"));
 
     // List schedules should include it.
     let listed_out = tool
@@ -655,6 +688,10 @@ async fn schedule_tasks_crud_and_list_sessions() {
     };
     let patched_v: serde_json::Value = serde_json::from_str(&patched.result).unwrap();
     assert_eq!(patched_v["schedule"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        patched_v["schedule"]["run_config"],
+        created_v["schedule"]["run_config"]
+    );
     assert!(
         patched_v["schedule"].get("state").is_some(),
         "patched schedule should expose state"
@@ -922,13 +959,13 @@ async fn schedule_run_uses_config_get_fast_then_default_fallback() {
         .await
         .unwrap();
 
-    // Copilot has no dedicated fast model configured here, so schedules should
-    // fall back from fast to the default chat model.
     let mut cfg = clean_config(dir.path());
-    cfg.provider = "copilot".to_string();
-    let expected_model = cfg
-        .get_fast_model()
-        .expect("copilot should have a schedule model fallback");
+    cfg.provider = "openai".to_string();
+    cfg.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        model: Some("schedule-chat".into()),
+        ..Default::default()
+    });
+    let expected_model = "schedule-chat";
 
     let (_agent, manager) = build_manager(
         dir.path(),

@@ -626,7 +626,6 @@ pub(super) fn boot_provider_is_complete(
         ("openai", providers.openai.is_some()),
         ("anthropic", providers.anthropic.is_some()),
         ("gemini", providers.gemini.is_some()),
-        ("copilot", providers.copilot.is_some()),
         ("bodhi", providers.bodhi.is_some()),
     ]
     .iter()
@@ -701,6 +700,7 @@ fn provider_input(config: &Config) -> Value {
         .collect();
     let mut input = json!({
         "provider": config.provider,
+        "effective_default": config.effective_default_provider(),
         "providers": providers,
         "instances": config.provider_instances,
         "default_instance": config.default_provider_instance,

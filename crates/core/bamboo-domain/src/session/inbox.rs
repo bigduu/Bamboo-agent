@@ -1582,6 +1582,8 @@ pub enum SessionInboxError {
     BacklogFull { current: usize, limit: usize },
     #[error("session inbox claim is invalid: {0}")]
     InvalidClaim(String),
+    #[error("session inbox lease expired before the claim could begin")]
+    ClaimLeaseExpired,
     #[error("session inbox storage failure: {0}")]
     Storage(String),
 }
@@ -1936,10 +1938,17 @@ pub trait SessionInboxPort: Send + Sync {
         _operation_id: uuid::Uuid,
         _reserved_root: &super::Session,
         _envelope: &SessionMessageEnvelope,
+        _notify_on_material_event: bool,
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "unscoped observed Supervisor Root first-input admission is unsupported".into(),
         ))
+    }
+
+    /// The first-input writer and its native material notification projector
+    /// are both installed. The writer still validates each concrete admission.
+    fn supports_root_creation_material_notifications(&self) -> bool {
+        false
     }
 
     /// Canonical adapter compatibility only. The concrete writer must retain
@@ -2005,6 +2014,23 @@ pub trait SessionInboxPort: Send + Sync {
         Err(SessionInboxError::Storage(
             "current-user Supervisor followup admission is unsupported".into(),
         ))
+    }
+
+    async fn deliver_supervisor_followup_with_material_notifications(
+        &self,
+        caller: &crate::SessionCallerReference,
+        supervisor: &crate::SupervisorReference,
+        target: &crate::SupervisorCurrentUserTarget,
+        envelope: &SessionMessageEnvelope,
+        notify_on_material_event: bool,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if notify_on_material_event {
+            return Err(SessionInboxError::Storage(
+                "managed Session material notifications are unsupported".into(),
+            ));
+        }
+        self.deliver_supervisor_current_user_followup(caller, supervisor, target, envelope)
+            .await
     }
 
     /// Admit one typed Supervisor peer message while retaining canonical
@@ -3269,6 +3295,7 @@ mod tests {
             supervisor_created_at: Utc::now(),
             caller: None,
             requires_host_scope: None,
+            notify_on_material_event: false,
             target: crate::SupervisorCurrentUserTarget::capture(&target_session).unwrap(),
             operation_id: SessionMessageId::parse("origin-operation").unwrap(),
         };

@@ -1,14 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::{
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+};
 
 use actix_files as fs;
 use actix_web::{
     dev::{fn_service, ServiceRequest, ServiceResponse},
-    web, App, HttpResponse,
+    App, HttpResponse,
 };
 use tracing::{error, info};
 
 use super::h1::build_h1_server;
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
+use super::tailscale::{restrict_ingress, TailscaleAccess};
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
 use crate::config::{
@@ -21,6 +25,27 @@ use crate::services::frontend_package::{
     has_embedded_frontend_package, resolve_frontend_package_path,
 };
 use bamboo_config::TlsConfig;
+
+fn bound_addresses(listeners: &[TcpListener]) -> Result<Vec<SocketAddr>, String> {
+    listeners
+        .iter()
+        .map(|listener| {
+            listener
+                .local_addr()
+                .map_err(|error| format!("Failed to read bound HTTP address: {error}"))
+        })
+        .collect()
+}
+
+fn log_running_server(scheme: &str, bind: &str, port: u16, addresses: &[SocketAddr]) {
+    if port == 0 {
+        for address in addresses {
+            info!("Unified server running on {scheme}://{address}");
+        }
+    } else {
+        info!("Unified server running on {scheme}://{bind}:{port}");
+    }
+}
 
 /// Whether `path` belongs to bamboo's API surface (as opposed to a SPA
 /// frontend route the static-file fallback should serve `index.html` for).
@@ -155,11 +180,10 @@ pub async fn run_with_tls(
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, None)?;
 
-    let app_state = web::Data::new(
-        AppState::new(bamboo_home_dir.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-    );
+    let app_state = AppState::new(bamboo_home_dir.clone())
+        .await
+        .map_err(|e| format!("Failed to initialize app state: {e}"))?
+        .into_http_data();
     // Retained for graceful shutdown after the server stops — the `move` factory
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();
@@ -198,6 +222,7 @@ pub async fn run_with_tls(
     };
 
     let listeners = build_desktop_listeners(port)?;
+    let addresses = bound_addresses(&listeners)?;
 
     let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
         .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
@@ -207,7 +232,7 @@ pub async fn run_with_tls(
     } else {
         "http"
     };
-    info!("Unified server running on {scheme}://127.0.0.1:{port}");
+    log_running_server(scheme, "127.0.0.1", port, &addresses);
 
     let result = server.await;
 
@@ -331,15 +356,40 @@ async fn run_with_static_options(
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, static_dir)?;
 
-    let app_state = web::Data::new(
-        AppState::new(bamboo_home_dir.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-    );
+    let app_state = AppState::new(bamboo_home_dir.clone())
+        .await
+        .map_err(|e| format!("Failed to initialize app state: {e}"))?
+        .into_http_data();
     // Retained for graceful shutdown after the server stops — the `move` factory
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();
     let workers = resolve_worker_count();
+    // Validate the TLS configuration before opening any listeners.
+    let rustls_cfg = match &tls {
+        Some(tls) => Some(build_rustls_config(tls)?),
+        None => None,
+    };
+    let mut listeners = build_bind_listeners(bind, port)?;
+    let addresses = bound_addresses(&listeners)?;
+    let tailscale = if !apply_rate_limit
+        && rustls_cfg.is_none()
+        && static_dir.is_some()
+        && TailscaleAccess::supported()
+    {
+        match TailscaleAccess::bind(&bamboo_home_dir).await {
+            Ok((listener, access)) => {
+                listeners.push(listener);
+                Some(access)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Tailscale ingress unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tailscale_for_factory = tailscale.clone();
 
     // Per-IP rate limiter for the network-exposed production server (#13). Built
     // once and shared (Clone) across workers. It is wrapped so that a throttled
@@ -369,8 +419,12 @@ async fn run_with_static_options(
         .wrap(actix_web::middleware::from_fn(
             crate::config::add_asset_cache_headers,
         ))
+        .wrap(actix_web::middleware::from_fn(restrict_ingress))
         .configure(configure_routes_with_rate_limiting);
 
+        if let Some(access) = &tailscale_for_factory {
+            app = app.app_data(access.clone());
+        }
         if let Some(static_path) = &static_dir {
             info!("Serving static files from: {:?}", static_path);
             app = app.service(frontend_files(static_path));
@@ -378,16 +432,6 @@ async fn run_with_static_options(
 
         app
     };
-
-    // Fail-fast: build the rustls config before binding so a bad/missing cert
-    // refuses startup rather than silently downgrading to plaintext. `None` →
-    // unchanged plaintext H1 path (desktop/loopback behavior preserved). #181.
-    let rustls_cfg = match &tls {
-        Some(tls) => Some(build_rustls_config(tls)?),
-        None => None,
-    };
-
-    let listeners = build_bind_listeners(bind, port)?;
 
     let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
         .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
@@ -397,7 +441,7 @@ async fn run_with_static_options(
     } else {
         "http"
     };
-    info!("Unified server running on {scheme}://{}:{}", bind, port);
+    log_running_server(scheme, bind, port, &addresses);
     let native_channel = if native_scope {
         Some(
             super::supervisor_host_protocol::NativeChannel::start(app_state_for_shutdown.clone())
@@ -407,7 +451,17 @@ async fn run_with_static_options(
         None
     };
 
+    let reconcile = tailscale
+        .as_ref()
+        .map(|access| TailscaleAccess::reconcile(access.clone(), app_state_for_shutdown.clone()));
     let result = server.await;
+    if let Some(reconcile) = reconcile {
+        reconcile.abort();
+        let _ = reconcile.await;
+    }
+    if let Some(access) = tailscale {
+        access.shutdown().await;
+    }
     if let Some(channel) = native_channel {
         channel.shutdown().await;
     }

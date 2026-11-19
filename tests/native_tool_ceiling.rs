@@ -8,10 +8,13 @@ use bamboo_agent::server::{
 };
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
-use bamboo_domain::{ChildContextPacket, Role, Session, SessionKind};
+use bamboo_domain::{
+    ChildContextPacket, Role, Session, SessionKind, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+};
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -59,6 +62,22 @@ fn call(name: &str, args: Value) -> (Value, &'static str) {
         "tool_calls",
     )
 }
+fn discover(name: &str) -> (Value, &'static str) {
+    let (mut delta, finish) = call(
+        DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+        json!({"query":name,"limit":1}),
+    );
+    delta["tool_calls"][0]["id"] = json!(format!("discover-{name}"));
+    (delta, finish)
+}
+fn declared_tools(body: &Value) -> BTreeSet<&str> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect()
+}
 async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
@@ -81,7 +100,9 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 "Read",
                 json!({"file_path":probe.workspace.join("input.txt")}),
             ),
-            2 if probe.case == Case::Narrow => {
+            1 if !probe.case.forced() => discover("Glob"),
+            2 if probe.case == Case::Narrow => discover("Glob"),
+            3 if probe.case == Case::Narrow => {
                 call("Glob", json!({"pattern":"*.txt","path":probe.workspace}))
             }
             _ => {
@@ -116,8 +137,8 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
         match probe.root.fetch_add(1, Ordering::SeqCst) {
             0 => call(
-                "Write",
-                json!({"file_path":probe.workspace.join("root-denied.txt"),"content":"forbidden root"}),
+                "exec_command",
+                json!({"cmd":"printf 'forbidden root' > root-denied.txt","workdir":probe.workspace}),
             ),
             1 => {
                 let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
@@ -586,12 +607,18 @@ async fn fixture(case: Case) {
                 .iter()
                 .all(|r| !r.to_string().contains("WORKSPACE_SKILL_SHOULD_NOT_APPLY")));
         }
-        let names: std::collections::BTreeSet<_> = child[0]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
+        let names = declared_tools(child[0]);
+        assert!(names.contains(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+        assert!(!names.contains("Glob"));
+        if !case.forced() {
+            let first_after_discovery = if case == Case::Narrow { 3 } else { 2 };
+            let mut expected_after_discovery = names.clone();
+            expected_after_discovery.insert("Glob");
+            assert_eq!(
+                declared_tools(child[first_after_discovery]),
+                expected_after_discovery
+            );
+        }
         assert!(
             seen_wait,
             "actual worker provider waited behind the durable Root wait"
@@ -600,11 +627,26 @@ async fn fixture(case: Case) {
             .iter()
             .filter(|r| r["model"] == "native-root" && r["tools"].to_string().contains("SubAgent"))
             .collect();
-        assert!(root_calls.iter().all(|r| !r["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["function"]["name"] == "Write")));
+        assert!(!root_calls.is_empty());
+        for request in root_calls {
+            for tool in ["Write", "Edit"] {
+                assert_eq!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["function"]["name"] == tool),
+                    case != Case::Narrow,
+                    "Root {tool} visibility for {case:?}"
+                );
+            }
+            assert!(request["tools"].as_array().unwrap().iter().all(|t| {
+                !matches!(
+                    t["function"]["name"].as_str(),
+                    Some("exec_command" | "write_stdin")
+                )
+            }));
+        }
         if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
             assert!(probe.audit_seen.load(Ordering::SeqCst));
@@ -627,7 +669,10 @@ async fn fixture(case: Case) {
                 );
             }
         } else if case == Case::Narrow {
-            assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
+            assert_eq!(
+                names,
+                BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"])
+            );
             assert!(!workspace.join("child-write.txt").exists());
             let history = child.last().unwrap()["messages"].to_string();
             assert!(history.contains("ACTUAL_READ_EVIDENCE"));
@@ -640,17 +685,17 @@ async fn fixture(case: Case) {
             if matches!(case, Case::Write | Case::Unassigned) {
                 assert_eq!(
                     names,
-                    std::collections::BTreeSet::from([
+                    BTreeSet::from([
                         "exec_command",
                         "write_stdin",
                         "Edit",
-                        "Glob",
+                        DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
                         "Read",
                         "Write",
                     ])
                 );
             } else {
-                assert!(names.contains("Grep"), "legacy surface unchanged");
+                assert!(names.contains("Grep"), "legacy core tool remains resident");
             }
         }
         assert!(parent

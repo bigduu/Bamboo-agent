@@ -83,7 +83,7 @@ pub struct ModelRoster {
     /// `Config::provider` at the resolution site.
     pub provider_name: Option<String>,
     /// Underlying provider type for the primary model (e.g. `openai`,
-    /// `anthropic`, `copilot`). Distinct from `provider_name` so
+    /// `anthropic`, `gemini`). Distinct from `provider_name` so
     /// provider-specific behavior stays correct when the routing key is an
     /// instance id.
     pub provider_type: Option<String>,

@@ -30,6 +30,19 @@ impl Tool for Concrete {
     fn parameters_schema(&self) -> Value {
         if self.name == "session_history" {
             json!({"type":"object", "properties":{"action":{"enum":["list", "inspect", "get_meta", "read_messages"]}}})
+        } else if self.name == "session_control" {
+            json!({"type":"object", "oneOf":[{"properties":{"action":{"const":"create"}}}]})
+        } else if self.name == "spawn_session" {
+            json!({
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "operation_id":{"type":"string"},
+                    "project_id":{"type":"string"},
+                    "workspace_path":{"type":"string"}
+                },
+                "required":["operation_id"]
+            })
         } else {
             json!({"type":"object"})
         }

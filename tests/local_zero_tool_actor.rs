@@ -6,7 +6,7 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorActivationStatus, ActorDirectoryPort, ActorSnapshotLimits, ActorSnapshotPort,
-    ActorSnapshotPrincipal,
+    ActorSnapshotPrincipal, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
 };
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
@@ -24,6 +24,7 @@ use std::{
 // Keep this binary's other listeners out of that handoff; only startup is
 // serialized, while the actual Actor/provider scenarios still run together.
 static FIXTURE_LISTENER_ADMISSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const GLOB_DISCOVERY_ID: &str = "owned-discover-glob";
 
 struct Probe {
     root_calls: AtomicUsize,
@@ -587,8 +588,19 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         } else if (probe.correction || probe.recovery) && child_call == 0 {
             (json!({"content":"INITIAL_BEFORE_CORRECTION"}), "stop")
         } else if probe.glob && child_call == 0 {
-            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            (
+                json!({"tool_calls":[{"index":0,"id":GLOB_DISCOVERY_ID,"type":"function","function":{
+                    "name":DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,"arguments":r#"{"query":"Glob","limit":1}"#
+                }}]}),
+                "tool_calls",
+            )
+        } else if probe.glob && child_call == 1 {
+            assert_eq!(body["tools"].as_array().unwrap().len(), 2);
             assert_eq!(body["tools"][0]["function"]["name"], "Glob");
+            assert_eq!(
+                body["tools"][1]["function"]["name"],
+                DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+            );
             (
                 json!({"tool_calls":[{"index":0,"id":"owned-glob-once","type":"function","function":{"name":"Glob","arguments":json!({"pattern":"owned-marker.txt","limit":1}).to_string()}}]}),
                 "tool_calls",
@@ -800,6 +812,7 @@ async fn await_host_pre_ack_cut(
             let entry = store.inspect_actor(id).await.unwrap();
             if entry.activation.as_ref().unwrap().status == ActorActivationStatus::Failed
                 && child.last_run_status().as_deref() == Some("error")
+                && child.last_run_error().is_some()
             {
                 let host_log =
                     std::fs::read_to_string(probe.data.join("host.log")).unwrap_or_default();
@@ -1225,7 +1238,12 @@ async fn fixture_with_followups(
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "Host startup health timeout: {}",
+            fixture_host_log_tail(&data)
+        )
+    });
     drop(listener_admission);
     let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Delegate one plain answer","model":"plain-root","provider":"openai","model_ref":{"provider":"openai","model":"plain-root"},"thinking_mode":if ultra {"ultra"} else {"standard"},"permission_mode":"bypass","workspace_path":workspace,"project_id":project.id})).send().await.unwrap();
     assert!(
@@ -1453,9 +1471,10 @@ async fn fixture_with_followups(
         .unwrap();
     assert!(
         (glob
-            && child_wire["tools"]
-                .as_array()
-                .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Glob"))
+            && child_wire["tools"].as_array().is_some_and(|tools| {
+                tools.len() == 1
+                    && tools[0]["function"]["name"] == DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+            }))
             || (!glob
                 && (child_wire["tools"].is_null()
                     || child_wire["tools"].as_array().is_some_and(Vec::is_empty)))
@@ -1704,7 +1723,9 @@ async fn fixture_with_followups(
         return;
     }
     let child_calls = probe.child_calls.load(Ordering::SeqCst);
-    let expected_calls = if correction || retry || recovery || (glob && !reasoning) {
+    let expected_calls = if glob && !reasoning {
+        3
+    } else if correction || retry || recovery {
         2
     } else {
         1
@@ -1818,6 +1839,14 @@ async fn fixture_with_followups(
         serde_json::to_value(&completed.messages).unwrap()
     );
     if glob && !reasoning {
+        assert!(!cold.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some(GLOB_DISCOVERY_ID)
+                || message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .any(|call| call.id == GLOB_DISCOVERY_ID)
+        }));
         let tail = &cold.messages[cold.messages.len() - 3..];
         assert_eq!(tail[0].role, bamboo_domain::Role::Assistant);
         let calls = tail[0].tool_calls.as_ref().unwrap();
@@ -2926,11 +2955,18 @@ async fn message_only_provider(
             let result: Value =
                 serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
             assert_eq!(result["observed_status"], "running_in_background");
-            assert_eq!(result.as_object().unwrap().len(), 2);
+            assert_eq!(result.as_object().unwrap().len(), 5);
             let child_id = result["actor_id"].as_str().unwrap();
             assert!(!child_id.is_empty() && child_id != "plain-root");
             let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
             let root = store.load_session("plain-root").await.unwrap().unwrap();
+            let selected_child = store.load_session(child_id).await.unwrap().unwrap();
+            assert_eq!(result["model"], json!(selected_child.model));
+            assert_eq!(result["model_ref"], json!(selected_child.model_ref));
+            assert_eq!(
+                result["reasoning_effort"],
+                json!(selected_child.reasoning_effort)
+            );
             let provider_outcomes = message_only_child_outcome(&root).map_or(0, |(message, _)| {
                 body["messages"]
                     .as_array()
@@ -3078,7 +3114,7 @@ fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> V
     assert_eq!(results[0].tool_success, Some(true));
     let result: Value = serde_json::from_str(&results[0].content).unwrap();
     assert_eq!(result["observed_status"], "running_in_background");
-    assert_eq!(result.as_object().unwrap().len(), 2);
+    assert_eq!(result.as_object().unwrap().len(), 5);
     assert!(result["actor_id"]
         .as_str()
         .is_some_and(|id| !id.is_empty() && id != root.id));
@@ -3388,6 +3424,9 @@ async fn message_only_fixture(
     drop(store);
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let before = store.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(result["model"], json!(before.model));
+    assert_eq!(result["model_ref"], json!(before.model_ref));
+    assert_eq!(result["reasoning_effort"], json!(before.reasoning_effort));
     assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
     assert_eq!(before.root_session_id, "plain-root");
     assert_eq!(before.spawn_depth, 1);

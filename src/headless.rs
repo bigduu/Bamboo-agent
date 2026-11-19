@@ -10,12 +10,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use actix_web::web;
+use actix_web::{body, web};
 
 use bamboo_agent_core::storage::Storage as _;
-use bamboo_agent_core::{Message, Role, Session, SessionKind};
+use bamboo_agent_core::{Message, Role, Session, SessionKind, TokenUsage};
 use bamboo_server::app_state::AppState;
-use bamboo_server::handlers::agent::execute::{handle_execute, ExecuteRequest};
+use bamboo_server::handlers::agent::execute::{handle_execute, ExecuteRequest, ExecuteResponse};
 use bamboo_server::handlers::agent::respond::{submit_response, RespondRequest};
 use bamboo_tools::permission::PermissionMode;
 
@@ -222,6 +222,71 @@ pub struct HeadlessArgs {
     pub timeout_secs: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Text,
+    Json,
+    StreamJson,
+}
+
+impl OutputMode {
+    fn from_stream_json(stream_json: bool) -> Self {
+        if stream_json {
+            Self::StreamJson
+        } else {
+            Self::Text
+        }
+    }
+
+    fn is_machine(self) -> bool {
+        self != Self::Text
+    }
+}
+
+struct StreamResult {
+    session_id: Option<String>,
+    reply: Option<String>,
+    usage: Option<TokenUsage>,
+}
+
+impl Default for StreamResult {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            reply: None,
+            usage: Some(TokenUsage::default()),
+        }
+    }
+}
+
+impl StreamResult {
+    fn print(self, error: Option<&str>) {
+        let usage = self.usage.map(|usage| {
+            serde_json::json!({
+                "input_tokens": usage.prompt_tokens,
+                "output_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            })
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "result",
+                "session_id": self.session_id,
+                "status": if error.is_some() { "error" } else { "finished" },
+                "result": self.reply,
+                "error": error,
+                "usage": usage,
+            })
+        );
+    }
+}
+
+/// Print the terminal JSON result when the CLI could not start an execution.
+pub fn print_stream_startup_error(error: &str) {
+    StreamResult::default().print(Some(error));
+}
+
 /// Validate `--timeout` at the CLI boundary: zero would fire (almost)
 /// immediately, which is never useful and is more likely a typo than intent.
 fn validate_timeout_secs(secs: Option<u64>) -> Result<(), String> {
@@ -232,21 +297,62 @@ fn validate_timeout_secs(secs: Option<u64>) -> Result<(), String> {
 }
 
 pub async fn run(args: HeadlessArgs) -> Result<(), String> {
-    // Validate cheap argument errors BEFORE any state is booted or a session is
-    // created/persisted — an invalid `--timeout 0` must not leave an orphaned
-    // session on disk.
-    validate_timeout_secs(args.timeout_secs)?;
+    let output = OutputMode::from_stream_json(args.stream_json);
+    run_with_output(args, output).await
+}
 
-    // Full server assembly — identical to `bamboo serve`, minus the HTTP listener.
-    let state = AppState::new(args.data_dir.clone())
-        .await
-        .map_err(|e| format!("boot app state: {e}"))?;
-    run_with_state(args, state).await
+/// Run a headless session and write only its terminal JSON result to stdout.
+pub async fn run_json(args: HeadlessArgs) -> Result<(), String> {
+    run_with_output(args, OutputMode::Json).await
+}
+
+async fn run_with_output(args: HeadlessArgs, output: OutputMode) -> Result<(), String> {
+    let state = async {
+        // Validate before booting the server or creating a session.
+        validate_timeout_secs(args.timeout_secs)?;
+        AppState::new(args.data_dir.clone())
+            .await
+            .map_err(|e| format!("boot app state: {e}"))
+    }
+    .await;
+    match state {
+        Ok(state) => run_with_state_and_output(args, state, output).await,
+        Err(error) => {
+            if output.is_machine() {
+                print_stream_startup_error(&error);
+            }
+            Err(error)
+        }
+    }
 }
 
 // Keep one execution implementation; controlled tests inject an isolated Host
 // through this seam instead of booting real credentials or canonical memory.
+#[cfg(test)]
 async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), String> {
+    let output = OutputMode::from_stream_json(args.stream_json);
+    run_with_state_and_output(args, state, output).await
+}
+
+async fn run_with_state_and_output(
+    args: HeadlessArgs,
+    state: AppState,
+    output: OutputMode,
+) -> Result<(), String> {
+    let mut terminal = StreamResult::default();
+    let exit = run_session(args, state, output, &mut terminal).await;
+    if output.is_machine() {
+        terminal.print(exit.as_ref().err().map(String::as_str));
+    }
+    exit
+}
+
+async fn run_session(
+    args: HeadlessArgs,
+    state: AppState,
+    output: OutputMode,
+    terminal: &mut StreamResult,
+) -> Result<(), String> {
     // Admit explicit CLI intent before creating/changing a session. A selected
     // provider without a default model is an error, not parent inheritance.
     let config_snapshot = state.config.read().await.clone();
@@ -461,6 +567,7 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
             id
         }
     };
+    terminal.session_id = Some(session_id.clone());
 
     // Append the prompt as the driving user message (execute runs the session's
     // last user turn — same contract as the HTTP API).
@@ -537,17 +644,17 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
         }
     }
 
-    if args.stream_json {
-        println!(
+    match output {
+        OutputMode::StreamJson => println!(
             "{}",
             serde_json::json!({
                 "type": "session_started",
                 "session_id": session_id,
                 "resumed": args.session.is_some(),
             })
-        );
-    } else {
-        eprintln!("▶ session {session_id}");
+        ),
+        OutputMode::Text => eprintln!("▶ session {session_id}"),
+        OutputMode::Json => {}
     }
     let data = web::Data::new(state);
     // -p / ExecuteRequest parity (#246 part A): every field `ExecuteRequest`
@@ -593,6 +700,26 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
     if !response.status().is_success() {
         return Err(format!("execute rejected: HTTP {}", response.status()));
     }
+    // Retain this runner's receipt if a follow-on activation replaces the
+    // live runner before the execution tree becomes quiescent.
+    let runner = if output.is_machine() {
+        let accepted = body::to_bytes(response.into_body())
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ExecuteResponse>(&bytes).ok())
+            .filter(|response| response.status == "started" && response.session_id == session_id);
+        let runners = data.agent_runners.read().await;
+        accepted
+            .and_then(|response| response.run_id)
+            .and_then(|run_id| {
+                runners
+                    .get(&session_id)
+                    .filter(|runner| runner.run_id == run_id)
+                    .cloned()
+            })
+    } else {
+        None
+    };
 
     // ---- drive the run ----
     // Drain each execution segment to quiescence. When the run pauses on a
@@ -602,6 +729,7 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
     // pending question.
     let mut exit: Result<(), String> = Ok(());
     let mut streamed_tokens = false;
+    let mut reasoning_progress = ReasoningProgress::default();
     // `--timeout`: measured from before the FIRST execute, so it covers the
     // whole run wall-clock including any permission-gate round trips across
     // resumed segments below (not reset per segment).
@@ -627,10 +755,10 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                         Ok(event) => {
                             last_event = Instant::now();
                             if let Ok(value) = serde_json::to_value(&event) {
-                                if args.stream_json {
-                                    println!("{value}");
-                                } else {
-                                    print_server_event(&value, &mut streamed_tokens);
+                                match output {
+                                    OutputMode::StreamJson => println!("{value}"),
+                                    OutputMode::Text => print_server_event(&value, &mut streamed_tokens, &mut reasoning_progress),
+                                    OutputMode::Json => {}
                                 }
                                 match value["type"].as_str().unwrap_or("") {
                                     // `need_clarification` also ends this segment: the
@@ -690,9 +818,9 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
             ));
         }
 
-        // Segment quiescent. Stop on error; never prompt in machine (NDJSON) mode.
+        // Segment quiescent. Stop on error or when using machine output.
         // Otherwise resume through a pending question if one is parked, else done.
-        if exit.is_err() || args.stream_json {
+        if exit.is_err() || output.is_machine() {
             break 'run;
         }
         let pending = data
@@ -761,18 +889,9 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                 .map(|m| m.content.clone())
         });
 
-    if args.stream_json {
-        // Terminal envelope: machine-readable summary closing the stream.
-        println!(
-            "{}",
-            serde_json::json!({
-                "type": "result",
-                "session_id": session_id,
-                "status": if exit.is_ok() { "finished" } else { "error" },
-                "result": final_reply,
-                "error": exit.as_ref().err(),
-            })
-        );
+    if output.is_machine() {
+        terminal.reply = final_reply;
+        terminal.usage = runner.and_then(|runner| runner.terminal_usage());
     } else {
         println!();
         if !streamed_tokens {
@@ -793,6 +912,10 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
 #[cfg(test)]
 #[path = "headless_model_routing_tests.rs"]
 mod model_routing_tests;
+
+#[cfg(all(test, unix))]
+#[path = "headless_quiet_exec_tests.rs"]
+mod quiet_exec_tests;
 
 /// The tree is done when the root runner is not running, the root is not
 /// suspended waiting for children, and no child runner is still running.
@@ -912,9 +1035,36 @@ fn resolve_model_selection(
     })
 }
 
+#[derive(Default)]
+struct ReasoningProgress {
+    chars: usize,
+    last_update: Option<Instant>,
+}
+
+impl ReasoningProgress {
+    fn observe(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        self.chars += content.chars().count();
+        let now = Instant::now();
+        if self
+            .last_update
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        {
+            eprintln!("[thinking: {} chars]", self.chars);
+            self.last_update = Some(now);
+        }
+    }
+}
+
 /// Pretty-print one server event (typed `AgentEvent`, serialized form).
 /// Child (sub-agent) streams are shown indented under a `│` gutter.
-fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
+fn print_server_event(
+    value: &serde_json::Value,
+    streamed_tokens: &mut bool,
+    reasoning_progress: &mut ReasoningProgress,
+) {
     use std::io::Write;
     match value["type"].as_str().unwrap_or("") {
         "token" => {
@@ -922,6 +1072,7 @@ fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
             print!("{}", value["content"].as_str().unwrap_or(""));
             let _ = std::io::stdout().flush();
         }
+        "reasoning_token" => reasoning_progress.observe(value["content"].as_str().unwrap_or("")),
         "tool_start" => eprintln!("\n⚙ {}", value["tool_name"].as_str().unwrap_or("tool")),
         "tool_complete" => eprintln!("✔ tool done"),
         "tool_error" => eprintln!("✘ tool error: {}", value["error"].as_str().unwrap_or("")),

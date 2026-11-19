@@ -21,8 +21,8 @@ mod workflows;
 #[cfg(test)]
 pub(crate) use access_control::issue_device_token;
 pub(crate) use access_control::{
-    bootstrap_access_snapshot, request_is_authorized, verify_device_token, BootstrapAccessSnapshot,
-    BootstrapRequestState,
+    bootstrap_access_snapshot, has_usable_access_password, request_is_authorized,
+    verify_device_token, BootstrapAccessSnapshot, BootstrapRequestState,
 };
 pub use access_control::{
     create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
@@ -53,6 +53,7 @@ pub use permission::{
     create_permission_rule, delete_permission_rule, diagnose_permission,
     get_default_session_permission_mode, get_permission_ask_rules, get_permission_policy,
     update_default_session_permission_mode, update_permission_ask_rules, update_permission_rule,
+    update_supervisor_approval_handoff,
 };
 pub use provider::{fetch_catalog_models, get_provider_catalog, reload_provider_config};
 pub use provider_instances::{
@@ -64,9 +65,10 @@ pub use setup::{get_setup_status, mark_setup_complete, mark_setup_incomplete};
 pub(crate) use workflows::is_safe_workflow_name;
 pub use workflows::{
     clone_workflow, create_workflow_definition, delete_workflow, get_workflow,
-    get_workflow_definition, list_workflow_catalog, list_workflows, migrate_workflow,
-    save_workflow, update_workflow_definition, validate_workflow_definition, CloneWorkflowRequest,
-    CloneWorkflowTarget, MigrateWorkflowRequest, SaveWorkflowRequest, WorkflowCatalogQuery,
+    get_workflow_definition, get_workflow_proposal, list_workflow_catalog, list_workflows,
+    migrate_workflow, save_workflow, start_workflow_proposal, update_workflow_definition,
+    validate_workflow_definition, CloneWorkflowRequest, CloneWorkflowTarget,
+    MigrateWorkflowRequest, SaveWorkflowRequest, WorkflowCatalogQuery,
 };
 
 // NOTE: the production `/bamboo/*` route map lives in `routes::bamboo_v1_routes`

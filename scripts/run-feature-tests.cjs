@@ -19,31 +19,12 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 // Planner library cases have one canonical default compiler and serial owner.
 const PLANNER_SERIAL = {
-  "bamboo-server-tools": {
-    "target": "bamboo_server_tools",
-    "filter": "plan::tests::",
-    "names": [
-      "plan::tests::actor_runtime_is_required_for_typed_read_only_enforcement",
-      "plan::tests::assignment_forbids_implementation_and_interactive_questions",
-      "plan::tests::invalid_selected_context_never_saves_a_child_or_arms_a_wait",
-      "plan::tests::planner_enqueue_failure_rolls_back_wait_and_deletes_unstarted_child",
-      "plan::tests::planner_wait_is_armed_before_the_child_is_enqueued",
-      "plan::tests::selected_context_uses_canonical_child_binding_without_changing_parent_authority",
-      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_normalized_subagent_launch_and_wait_before_ports",
-      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_plan_before_any_child_port_or_wait",
-      "plan::tests::suspension_contract_tests::disabled_suspension_keeps_subagent_read_and_cancel_authority_paths",
-      "plan::tests::suspension_contract_tests::ordinary_plan_keeps_original_create_wait_enqueue_order",
-      "plan::tests::title_defaults_to_a_bounded_task_summary",
-      "plan::tests::unsupported_selected_context_route_fails_before_persist_without_legacy_fallback"
-    ]
-  },
   "bamboo-engine": {
     "target": "bamboo_engine",
     "filter": "planner_artifact",
     "names": [
-      "runtime::runner::loop_execution::pipeline::tests::planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it",
       "session_app::child_completion_coordinator::tests::planner_artifact_completion_publishes_before_durable_resume_and_deduplicates",
-      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report",
+      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private",
       "session_app::child_completion_coordinator::tests::planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference",
       "session_app::child_session::planner_artifact::tests::planner_artifact_binds_source_revision_and_never_grants_execution",
       "session_app::child_session::planner_artifact::tests::planner_artifact_completion_only_publishes_current_sealed_report",
@@ -100,7 +81,122 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
-const FEATURE_SOURCE_SHA256 = "bbebd1f968007e8616f7e11ae284de0f1ad423e92fc71c5acd1225f629abd0aa";
+// Terminal projection/replay tests and hooks are cfg(test), owned by the
+// default storage packages-0 library. V2's existing test-utils cfg is unchanged;
+// the four additive contexts still own the same 20 feature-only cases.
+// Publisher mode/revocation serde and CLI/CAS cases are unconditional config
+// library tests in packages-4. Policy HTTP/setup cases remain server-handlers;
+// signature and compatibility-merge cases remain server-other. Moving the
+// ungated policy definitions out of config.rs changes this source fingerprint,
+// but no feature cfg expression, default target or 20 additive cases changes.
+// Terminal projection hooks/tests from accepted #2463 remain default
+// storage/packages-0 cases; existing V2 test-utils cfg is unchanged.
+// #2452 adds unconditional policy control in TicketApplication, fingerprinted
+// by its existing ticket-runtime-fixtures cfg. Six Ready owner cases belong
+// to server-tests-1 and Worker-auth to server-handlers. All four additive
+// contexts and 20 explicit cases remain unchanged.
+// Admitted #2469 runtime observation and #2460 terminal-save integration keep
+// their existing default owners; no additive context or case selection changes.
+// #2453 adds an unconditional token-budget owner module to TicketApplication,
+// whose existing ticket-runtime-fixtures cfg fingerprints its complete source.
+// Five canonical configuration cases join default bamboo-tickets/packages-0;
+// four native HTTP cases join native_work_token_budget/server-tests-0; the
+// Worker-auth case belongs to server-handlers. No feature cfg, package graph,
+// additive context or its 20 explicit cases changed.
+// Both owner entrances now share the actual HTTP acceptance path. Their
+// original default owners remain distinct, with no additive case repetition.
+// #2503's unconditional evidence exports change the fingerprinted facade only.
+// Host cases stay in server-app-state; Core/Projects stay in packages-3.
+// Existing four additive contexts and twenty selected cases are unchanged.
+// #2510 changes config.rs inside its existing test-utils-sensitive closure.
+// Shared compression policy/serde regressions are ordinary config/packages-4
+// cases; domain/packages-2, compression/packages-0, engine/packages-3 and
+// skills/packages-1 retain their default owners. Feature declarations, cfg
+// expressions, module edges, four additive contexts and twenty selected cases
+// are unchanged.
+// #2522 keeps patrol prompt and tokenizer tests in their existing default
+// owners. The Model Policy projection and Host evidence fixture use the
+// config and server-app-state owners. All additive cases are unchanged.
+// Its patrol bounds regression extends the existing config/packages-4 case.
+// #2527 adds an ordinary workspace receipt case to packages-0 and a native
+// progress case to the existing Ready integration owner in server-tests-1.
+// The receipt implementation changes the fingerprinted file source while the
+// four additive contexts and twenty selected cases remain the same.
+// #2534 adds patrol endpoint configuration and the Ready Host adapter.
+// The existing config and server-app-state owners cover those regressions.
+// #2547 extends the same Model Policy and server-app-state test owners.
+// #2513 changes the final-request checkpoint reprepare path in engine
+// stream_execution/image_fallback so a bookkeeping-only checkpoint no longer
+// repeats the paid Legacy Vision description. Its regression cases are ordinary
+// default bamboo-engine library tests in packages-3; stream_execution/tests.rs
+// carries no feature cfg expression and is not feature-sensitive at all. Only
+// stream_execution.rs is fingerprinted, through its pre-existing
+// `cfg!(feature = "token-usage-log")` observation line, and its whole-file
+// source hash moves with the new helper. No feature declaration, cfg
+// expression, required-features target, owner, additive context or explicit
+// case changes; engine tests are not part of any additive feature owner.
+// Role-scoped tool loading and the provider wire regressions run in the
+// existing default Engine and LLM owners. No feature context changes.
+// #2583 adds compact model catalog and canonical Child selection observations
+// to the existing default Engine, Server Tools and Server owners. No feature
+// declaration, additive context or explicitly selected case changes.
+// #2582 changes the complete V2 writer source covered by its existing
+// test-utils fingerprint. Presentation-metadata regressions remain ordinary
+// storage/packages-0 and metadata-service/server-other cases. No feature
+// declaration, module gate, additive context or selected additive case changes;
+// the existing four contexts still own the same twenty feature-only cases.
+// #2598 preserves all four additive contexts and twenty feature-only cases.
+// Scoped path controls and default-shaped Host file regressions remain with
+// the existing default Tickets/Engine owners; no new test producer.
+// #2599 keeps paged-file codec, scoped I/O and Native Read/Task cases in
+// the existing default Tickets/Engine/Agent owners. Additive contexts and
+// their twenty explicit cases are unchanged; no second test producer.
+// #2603 keeps Work-update union/authority cases in default Server tools.
+// The direct jsonschema dev edge reuses the locked existing validator; no
+// feature declaration, additive context or twenty-case selection changes.
+// #2604 exposes the existing native wait through the compact facade. Its
+// normalization/Host/permission regressions retain the default package owners;
+// all four additive contexts and their twenty explicit cases are unchanged.
+// #2608 keeps removal-scope native fork/barrier regressions in the existing
+// default server-browser owner; all additive contexts and cases are unchanged.
+// #2611 keeps Local Read retry-window and strict Remote whole-read cases in
+// default Engine, plus the >64-page native fixture in its default Agent owner.
+// No feature declaration, additive context or twenty-case selection changes.
+// #2657 uses packages-0 for Storage and server-app-state for parallel dispatch.
+// The dispatch fixture uses Storage's existing test-utils dev dependency.
+// #2664 runs Human and delegated approval regressions in server-handlers and
+// server-app-state using Storage's existing test-utils dev dependency.
+// #1125 keeps provider deletion recovery in packages-4 and the HTTP cases in
+// server-settings. The existing additive contexts and cases are unchanged.
+// #2741 keeps the tool advisory and request regressions in the default Engine
+// owner. Stream lowering changes without adding a feature or test context.
+// Copilot retirement removes its default provider and OAuth cases. The
+// replacement checks run in the existing config, LLM, server-settings and
+// server-app-state owners. The four additive contexts and 20 cases stay intact.
+// #2742 keeps output-limit coverage with the existing default Engine and LLM
+// owners. The request changes move the fingerprint without changing ownership.
+// #2757 reasoning repetition and optional recovery budgets are default Engine
+// cases in packages-3. Provider stream cases belong to default LLM packages-2.
+// The four additive contexts own their 20 explicitly selected cases.
+// #2772 model metadata and request window regressions use the default LLM
+// packages-2 and Engine packages-3 owners.
+// #2790 scopes the default Chat Completions tool projection in the engine.
+// Its regression stays in the default Engine owner with the same additive cases.
+// #2802 changes unconditional disabled-tool alias resolution in Config.
+// Its regression stays in default packages-4. Feature cfg, four additive
+// contexts and twenty feature-only cases retain their existing owners.
+// #2807 changes guidance assembly in the feature-sensitive stream runner.
+// Guide/cache cases stay in default Engine/packages-3. The token-usage-log
+// cfg, four additive contexts and twenty feature-only cases are unchanged.
+// #2831 changes the default Storage save path. Supervisor dispatch consent
+// cases stay in the default Server owners; all 20 additive cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "55611f5e748bb53f8f14eba71acfdabc7547c1961e47755d3a18c1c52cc385d5";
+// Child Host admission and startup failure tests retain the existing default
+// Storage/Engine/Server owners and unchanged additive contexts.
+// Root terminal recovery keeps the existing default owners, four feature
+// contexts and 20 additive cases; its nested tests add no producer.
+// Reasoning output recovery and task splitting use the existing Engine and LLM owners.
+
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

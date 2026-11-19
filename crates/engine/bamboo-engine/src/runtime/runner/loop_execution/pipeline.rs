@@ -23,6 +23,10 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
+use crate::runtime::runner::round_lifecycle::{
+    fallback_tool_is_resident, uses_sticky_fallback, RoundOutputLimitPolicy, RoundToolDispatch,
+    TaskSplitPrompt,
+};
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
 };
@@ -31,15 +35,16 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
-    WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, RoundRuntimeState, SuspensionState,
+    WaitingForBashState, WaitingForChildrenState,
 };
 use bamboo_domain::{
     AgentHookPoint, CapabilityInvocationTarget, CapabilityLoadingClass, CapabilityLoadingMode,
     CapabilityMatch, CapabilitySource, ClassifiedToolSchema, DiscoverCapabilitiesRequest,
     EffectiveCallableSet, HookPayload, HookResult, ProviderFamily, ProviderProtocol,
     ProviderTranscriptAuthor, ProviderTranscriptItem, ProviderTranscriptItemKind,
-    ProviderTranscriptOrigin,
+    ProviderTranscriptOrigin, RootFinalMessageCandidate, RootFinalMessageReference,
+    STICKY_DISCOVERY_RUNTIME_KIND, STICKY_DISCOVERY_RUNTIME_VERSION,
 };
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
@@ -53,12 +58,12 @@ use super::gold::{
     select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
+use super::output_limit_split::{SplitRecovery, Stage as SplitStage};
 use crate::runtime::runner::state_bridge;
+use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
-const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
-const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
 const STICKY_DISCOVERY_RESULT_START: &str = "<loaded_tools>";
 const STICKY_DISCOVERY_RESULT_END: &str = "</loaded_tools>";
 
@@ -93,25 +98,21 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> EffectiveCallableSet {
+    let catalog = tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .filter(|entry| session.allows_model_tool_execution(entry.execution_name()))
+        .collect::<Vec<_>>();
     if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
-        if legacy_browser_needs_discovery(
-            session,
-            tool_schemas,
-            crate::runtime::runner::round_lifecycle::required_tool_for_session(session),
-        ) {
-            let without_browser = tool_schemas
-                .iter()
-                .filter(|schema| schema.function.name != "browser")
-                .cloned()
-                .collect::<Vec<_>>();
-            return crate::runtime::runner::tool_execution::legacy_effective_callable_set(
-                &without_browser,
-            );
-        }
-        return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
+        return EffectiveCallableSet::from_catalog(
+            &catalog,
+            capability_loading_mode,
+            std::iter::empty::<&str>(),
+        );
     }
 
-    let loaded_names = if capability_loading_mode == CapabilityLoadingMode::StickyFallback {
+    let mut loaded_names = if uses_sticky_fallback(capability_loading_mode) {
         validated_sticky_fallback_loaded_tool_names(session)
     } else {
         let transcript = &session.provider_transcript;
@@ -141,16 +142,22 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
             _ => Vec::new(),
         }
     };
-    let catalog = tool_schemas
-        .iter()
-        .cloned()
-        .filter_map(ClassifiedToolSchema::new)
-        .collect::<Vec<_>>();
-    EffectiveCallableSet::from_catalog(
-        &catalog,
-        capability_loading_mode,
-        loaded_names.iter().map(String::as_str),
-    )
+    // Native and fallback history store exact wire identities. A stale name
+    // must not load an unrelated registration through alias resolution.
+    loaded_names.retain(|name| catalog.iter().any(|entry| entry.execution_name() == name));
+    let mode = if uses_sticky_fallback(capability_loading_mode) {
+        loaded_names.extend(
+            catalog
+                .iter()
+                .map(ClassifiedToolSchema::execution_name)
+                .filter(|name| fallback_tool_is_resident(session, name))
+                .map(str::to_owned),
+        );
+        CapabilityLoadingMode::StickyFallback
+    } else {
+        capability_loading_mode
+    };
+    EffectiveCallableSet::from_catalog(&catalog, mode, loaded_names.iter().map(String::as_str))
 }
 
 fn openai_client_tool_search_requests(
@@ -312,7 +319,6 @@ impl CompleteCapabilityDiscovery {
         session: &Session,
         config: &AgentLoopConfig,
         tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-        browser_only: bool,
         include_commands: bool,
     ) -> Result<Self, AgentError> {
         let catalog = tool_schemas
@@ -321,14 +327,26 @@ impl CompleteCapabilityDiscovery {
             .filter_map(ClassifiedToolSchema::new)
             .filter(|entry| session.allows_model_tool_execution(entry.execution_name()))
             .collect::<Vec<_>>();
-        let searchable_tool_catalog = catalog.iter().filter(|entry| {
-            entry.loading_class() == CapabilityLoadingClass::Deferred
-                && (!browser_only || entry.execution_name() == "browser")
-        });
+        let (disabled_tools, _) = config.resolve_disabled_filters();
+        let disabled_names = disabled_tools
+            .iter()
+            .filter_map(|reference| {
+                bamboo_domain::resolve_disabled_tool_reference_name(reference, |name| {
+                    catalog.iter().any(|entry| entry.execution_name() == name)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let catalog = catalog
+            .into_iter()
+            .filter(|entry| !disabled_names.contains(entry.execution_name()))
+            .collect::<Vec<_>>();
+        let searchable_tool_catalog = catalog
+            .iter()
+            .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred);
         let tools = bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(
             searchable_tool_catalog,
         );
-        if browser_only || !include_commands || session.model_orchestration_only_enabled() {
+        if !include_commands || session.model_orchestration_only_enabled() {
             // Tool search does not depend on Skill applicability or its store.
             return Ok(Self {
                 catalog,
@@ -533,7 +551,9 @@ fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
         .collect()
 }
 
-fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String> {
+pub(in crate::runtime::runner) fn validated_sticky_fallback_loaded_tool_names(
+    session: &Session,
+) -> Vec<String> {
     let mut loaded = Vec::new();
     for message in validated_sticky_fallback_results(session) {
         let definition_names = sticky_result_definition_values(message)
@@ -557,44 +577,74 @@ fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String>
     loaded
 }
 
-/// Return only canonical, browser-only discovery results. The full result in
-/// Session history remains the authority for admission; callers may replace a
-/// matching provider-visible copy when the browser schema is already present
-/// in that request's top-level tool catalog.
-pub(in crate::runtime::runner) fn legacy_browser_loaded_result_content(
+/// Keep persisted discovery results intact. On the wire, hide definitions
+/// removed by the current role or request selection and avoid repeating full
+/// definitions already declared on a compatibility request.
+pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
     session: &Session,
-) -> BTreeMap<String, String> {
+    eligible: &[bamboo_agent_core::tools::ToolSchema],
+    declared: &[bamboo_agent_core::tools::ToolSchema],
+    mode: CapabilityLoadingMode,
+) -> BTreeMap<String, (String, String)> {
+    let eligible_names = eligible
+        .iter()
+        .filter(|tool| session.allows_model_tool_execution(&tool.function.name))
+        .map(|tool| tool.function.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let declared_definitions = if mode == CapabilityLoadingMode::Progressive {
+        BTreeMap::new()
+    } else {
+        declared
+            .iter()
+            .filter_map(|tool| {
+                serde_json::to_value(tool)
+                    .ok()
+                    .map(|definition| (tool.function.name.as_str(), definition))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
     validated_sticky_fallback_results(session)
         .into_iter()
-        .filter(|message| {
-            let canonical_browser_only = message
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata["canonical_new_names"].as_array())
-                .is_some_and(|names| names.len() == 1 && names[0].as_str() == Some("browser"));
-            let browser_definition_only =
-                sticky_result_definition_values(message).is_some_and(|definitions| {
-                    definitions.len() == 1
-                        && sticky_definition_name(&definitions[0]) == Some("browser")
-                });
-            canonical_browser_only && browser_definition_only
+        .filter_map(|message| {
+            let definitions = sticky_result_definition_values(message)?;
+            let mut duplicate = false;
+            let remaining = definitions
+                .iter()
+                .filter(|definition| {
+                    let Some(name) = sticky_definition_name(definition) else {
+                        return false;
+                    };
+                    if !eligible_names.contains(name) {
+                        return false;
+                    }
+                    if declared_definitions.get(name) == Some(*definition) {
+                        duplicate = true;
+                        return false;
+                    }
+                    true
+                })
+                .collect::<Vec<_>>();
+            if remaining.len() == definitions.len() {
+                return None;
+            }
+            let content = if remaining.is_empty() {
+                if duplicate
+                    && definitions.len() == 1
+                    && sticky_definition_name(&definitions[0]) == Some("browser")
+                {
+                    "Browser loaded. Its complete schema is in the tools for this request.".into()
+                } else if duplicate {
+                    "Loaded tool definitions are in the tools for this request.".into()
+                } else {
+                    "The previously discovered tools are unavailable for this request.".into()
+                }
+            } else {
+                let result = serde_json::json!({"tools": remaining});
+                format!("{STICKY_DISCOVERY_RESULT_START}{result}{STICKY_DISCOVERY_RESULT_END}")
+            };
+            Some((message.id.clone(), (message.content.clone(), content)))
         })
-        .map(|message| (message.id.clone(), message.content.clone()))
         .collect()
-}
-
-pub(in crate::runtime::runner) fn legacy_browser_needs_discovery(
-    session: &Session,
-    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-    required_tool: Option<&str>,
-) -> bool {
-    required_tool != Some("browser")
-        && tool_schemas
-            .iter()
-            .any(|schema| schema.function.name == "browser")
-        && !validated_sticky_fallback_loaded_tool_names(session)
-            .iter()
-            .any(|name| name == "browser")
 }
 
 fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
@@ -642,14 +692,8 @@ async fn ensure_discovery_allowed(
     config: &AgentLoopConfig,
 ) -> Result<(), AgentError> {
     state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref()).await?;
-    if session.root_orchestration_only_enabled() && session.supervisor_incarnation_id().is_none() {
-        return Err(AgentError::Tool(
-            "capability discovery is outside this Root's tool authority".into(),
-        ));
-    }
-    // A trusted Supervisor may load its already-approved orchestration tools.
-    // CompleteCapabilityDiscovery re-filters exact names and never opens its
-    // Skill/Workflow store. Discovery does not grant execution authority.
+    // The same exact role rules apply to discovery and execution. The
+    // discovery gateway itself is read-only, including for Ultra.
     Ok(())
 }
 
@@ -658,8 +702,7 @@ async fn commit_sticky_fallback_discovery_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-    browser_only: bool,
-) -> Result<(), AgentError> {
+) -> Result<Option<[u8; 32]>, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -697,6 +740,7 @@ async fn commit_sticky_fallback_discovery_round(
 
     let discovery_is_alone = tool_calls.len() == 1
         && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+    let mut fingerprint = None;
     if !discovery_is_alone {
         const ERROR: &str = "discovery must be called alone";
         for call in &tool_calls {
@@ -712,7 +756,7 @@ async fn commit_sticky_fallback_discovery_round(
         let discovery_result =
             serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
                 .map_err(|error| format!("invalid discovery arguments: {error}"));
-        let definitions = match discovery_result {
+        let definitions = match &discovery_result {
             Ok(request) => {
                 let include_commands = request.kinds.as_ref().is_some_and(|kinds| {
                     kinds
@@ -723,16 +767,12 @@ async fn commit_sticky_fallback_discovery_round(
                     session,
                     config,
                     tool_schemas,
-                    browser_only,
                     include_commands,
                 )
                 .await
-                .and_then(|discovery| discovery.discover_complete_schemas(&request))
+                .and_then(|discovery| discovery.discover_complete_schemas(request))
                 {
-                    Ok(mut schemas) => {
-                        if browser_only {
-                            schemas.retain(|schema| schema.function.name == "browser");
-                        }
+                    Ok(schemas) => {
                         sticky_fallback_definition_delta(session, &schemas).map_err(|error| {
                             format!("discovered tool definitions could not be serialized: {error}")
                         })
@@ -740,9 +780,9 @@ async fn commit_sticky_fallback_discovery_round(
                     Err(error) => Err(error.to_string()),
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.clone()),
         };
-        match definitions {
+        let (content, success, new_names) = match definitions {
             Ok(definitions) => {
                 let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
                     .into_iter()
@@ -763,24 +803,34 @@ async fn commit_sticky_fallback_discovery_round(
                         "sticky discovery result could not be serialized: {error}"
                     ))
                 })?;
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
+                (
                     format!(
                         "{STICKY_DISCOVERY_RESULT_START}{payload}{STICKY_DISCOVERY_RESULT_END}"
                     ),
                     true,
-                    &canonical_new_names,
-                ));
+                    canonical_new_names,
+                )
             }
-            Err(error) => {
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
-                    format!("capability discovery failed: {error}"),
-                    false,
-                    &[],
-                ));
-            }
-        }
+            Err(error) => (
+                format!("capability discovery failed: {error}"),
+                false,
+                Vec::new(),
+            ),
+        };
+        fingerprint = discovery_result
+            .ok()
+            .and_then(|request| serde_json::to_value(request).ok())
+            .and_then(|arguments| {
+                discovery_tool_fingerprint(
+                    bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                    &arguments,
+                    success,
+                    content.as_bytes(),
+                )
+            });
+        session.add_message(sticky_fallback_tool_result(
+            &call.id, content, success, &new_names,
+        ));
     }
 
     if let Some(persistence) = config.persistence.as_ref() {
@@ -793,7 +843,15 @@ async fn commit_sticky_fallback_discovery_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(fingerprint)
+}
+
+const OPENAI_CLIENT_SEARCH_TOOL_NAME: &str = "tool_search";
+
+#[derive(Debug)]
+struct ClientToolSearchOutput {
+    item: ProviderTranscriptItem,
+    fingerprint: Option<[u8; 32]>,
 }
 
 async fn build_openai_client_tool_search_outputs(
@@ -801,10 +859,9 @@ async fn build_openai_client_tool_search_outputs(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     provider_items: &[ProviderTranscriptItem],
-) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+) -> Result<Vec<ClientToolSearchOutput>, AgentError> {
     let requests = openai_client_tool_search_requests(provider_items)?;
-    let discovery =
-        CompleteCapabilityDiscovery::new(session, config, tool_schemas, false, false).await?;
+    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas, false).await?;
     let mut outputs = Vec::with_capacity(requests.len());
     for (call_id, request) in requests {
         if request.kinds.as_ref().is_some_and(|kinds| {
@@ -839,7 +896,17 @@ async fn build_openai_client_tool_search_outputs(
                 "OpenAI client tool-search output could not be constructed: {error}"
             ))
         })?;
-        outputs.push(item);
+        // Provider call IDs pair the transcript items but never describe
+        // progress. Compare the actual returned definitions and search input.
+        let fingerprint = serde_json::to_value(request).ok().and_then(|arguments| {
+            discovery_tool_fingerprint(
+                OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                &arguments,
+                true,
+                item.payload()["tools"].to_string().as_bytes(),
+            )
+        });
+        outputs.push(ClientToolSearchOutput { item, fingerprint });
     }
     Ok(outputs)
 }
@@ -849,7 +916,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<Message, AgentError> {
+) -> Result<(Message, Vec<Option<[u8; 32]>>), AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -871,14 +938,16 @@ async fn commit_openai_client_tool_search_round(
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
     commit_assistant_message(session, message.clone(), &mut provider_items)?;
-    for output in host_outputs {
+    let mut fingerprints = Vec::with_capacity(host_outputs.len());
+    for ClientToolSearchOutput { item, fingerprint } in host_outputs {
         session
-            .append_provider_transcript_group(&anchor, None, vec![output])
+            .append_provider_transcript_group(&anchor, None, vec![item])
             .map_err(|error| {
                 AgentError::LLM(format!(
                     "OpenAI client tool-search result could not be committed: {error}"
                 ))
             })?;
+        fingerprints.push(fingerprint);
     }
     if let Some(persistence) = config.persistence.as_ref() {
         persistence
@@ -890,7 +959,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(message)
+    Ok((message, fingerprints))
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -934,41 +1003,29 @@ struct TurnOutcome {
 
 // ---- Per-run resource guardrails (issue #221) ----
 
-/// Child-spawning tool names owned by `bamboo-server-tools`.
-///
-/// Duplicated here as plain strings — the engine has no dependency on the
-/// server-tools crate that owns them — purely to COUNT spawn attempts for the
-/// per-run `max_subagents` budget guardrail below; they never affect dispatch.
-/// A tool rename must update both sites.
+/// Child-spawning tool owned by `bamboo-server-tools`. Used only for the
+/// per-run `max_subagents` budget.
 const SUBAGENT_TOOL_NAME: &str = "SubAgent";
-const PLAN_TOOL_NAME: &str = "Plan";
 
-/// True when `call` creates one new child session.
-///
-/// `Plan` creates one one-shot planner child except for its explicit artifact
-/// `read` action. Missing/unparsable Plan arguments stay conservatively counted.
-/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
-/// absent/unparsable (the tool's legacy create default). All other SubAgent
-/// actions manage existing children and do not consume the spawn budget.
+/// Count attempts to create a Child in the legacy and compact SubAgent forms.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
-    match call.function.name.as_str() {
-        PLAN_TOOL_NAME => {
-            return !serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_ok_and(
-                |value| value.get("action").and_then(|action| action.as_str()) == Some("read"),
-            );
-        }
-        SUBAGENT_TOOL_NAME => {}
-        _ => return false,
+    if call.function.name != SUBAGENT_TOOL_NAME {
+        return false;
     }
-    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("action")
-                .and_then(|a| a.as_str())
-                .map(str::to_string)
-        })
-        .is_none_or(|action| action == "create")
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return true;
+    };
+    if let Some(action) = args["action"].as_str() {
+        return action == "create";
+    }
+    match args["intent"].as_str() {
+        Some("inspect" | "wait" | "control" | "ask_parent") => false,
+        Some("chat") | None => {
+            args["target"].as_str().is_none_or(str::is_empty)
+                && args["reply_to"].as_str().is_none_or(str::is_empty)
+        }
+        Some(_) => true,
+    }
 }
 
 /// A per-run resource guardrail that has just tripped: which budget, its
@@ -1041,24 +1098,57 @@ impl RoundActivity {
     /// followed by validation or post-LLM failure must still affect the runtime
     /// budget just as it affects durable metrics.
     fn commit_to_runtime(&self, runtime_state: &mut AgentRuntimeState) {
+        self.apply_to_round(&mut runtime_state.round);
+    }
+
+    fn apply_to_round(&self, round: &mut RoundRuntimeState) {
         let mut accumulated = MetricsTokenUsage {
-            prompt_tokens: runtime_state.round.total_prompt_tokens,
-            completion_tokens: runtime_state.round.total_completion_tokens,
+            prompt_tokens: round.total_prompt_tokens,
+            completion_tokens: round.total_completion_tokens,
             total_tokens: 0,
         }
         .clamped_for_durable_metrics();
         accumulated.add_assign_durable(self.token_usage());
-        runtime_state.round.total_prompt_tokens = accumulated.prompt_tokens;
-        runtime_state.round.total_completion_tokens = accumulated.completion_tokens;
-        runtime_state.round.total_tool_calls = runtime_state
-            .round
-            .total_tool_calls
-            .saturating_add(self.tool_call_count);
-        runtime_state.round.total_subagents_spawned = runtime_state
-            .round
+        round.total_prompt_tokens = accumulated.prompt_tokens;
+        round.total_completion_tokens = accumulated.completion_tokens;
+        round.total_tool_calls = round.total_tool_calls.saturating_add(self.tool_call_count);
+        round.total_subagents_spawned = round
             .total_subagents_spawned
             .saturating_add(self.subagent_spawn_count);
     }
+}
+
+fn run_tokens_used(round: &RoundRuntimeState) -> u64 {
+    round
+        .total_prompt_tokens
+        .saturating_add(round.total_completion_tokens)
+        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT)
+}
+
+fn can_split_tasks(
+    session: &Session,
+    config: &AgentLoopConfig,
+    runtime: &AgentRuntimeState,
+    round: u32,
+) -> bool {
+    // The split owns the remaining rounds. Managed runs already have their
+    // own completion and recovery gates.
+    session.kind == bamboo_domain::SessionKind::Root
+        && session.authority_identity.is_ordinary()
+        && config.effective_counted_loop().is_none()
+        && config.loop_control.is_none()
+        && !config.goal_loop_active()
+        && !config.guardian_active()
+        && !config.features_final_evidence_check
+        && config.host_gold_run.is_none()
+        && crate::runtime::runner::round_lifecycle::required_tool_for_session(session).is_none()
+        && runtime.suspension.is_none()
+        && runtime.waiting_for_children.is_none()
+        && runtime.waiting_for_bash.is_none()
+        && config
+            .run_budget
+            .max_rounds
+            .is_none_or(|max| round.saturating_add(2) < max)
 }
 
 /// Checks the run's cumulative activity (already accumulated into `round` —
@@ -1068,13 +1158,10 @@ impl RoundActivity {
 /// same round. Mirrors the `max_rounds` exhaustion check in spirit: this is a
 /// graceful-stop trigger, not an error.
 fn check_run_budget_exceeded(
-    round: &bamboo_domain::session::runtime_state::RoundRuntimeState,
+    round: &RoundRuntimeState,
     budget: &bamboo_config::RunBudgetConfig,
 ) -> Option<RunBudgetExceeded> {
-    let total_tokens = round
-        .total_prompt_tokens
-        .saturating_add(round.total_completion_tokens)
-        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT);
+    let total_tokens = run_tokens_used(round);
     if let Some(limit) = budget.max_total_tokens {
         if total_tokens >= limit {
             return Some(RunBudgetExceeded {
@@ -1204,6 +1291,18 @@ async fn maybe_suspend_for_orphaned_children(
     config: &AgentLoopConfig,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<Option<TurnOutcome>, AgentError> {
+    maybe_suspend_for_children(session, config, runtime_state, None).await
+}
+
+/// The same completion-serialized wait gate serves both end-of-turn safety and
+/// repeated Supervisor observations. An inspection can select only currently
+/// active ordinary direct children; it cannot replace an existing wait policy.
+async fn maybe_suspend_for_children(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime_state: &mut AgentRuntimeState,
+    inspected_targets: Option<&[String]>,
+) -> Result<Option<TurnOutcome>, AgentError> {
     if session
         .metadata
         .get("runtime.canonical_subagent_host")
@@ -1260,6 +1359,9 @@ async fn maybe_suspend_for_orphaned_children(
             }
         }
         active = ordinary;
+    }
+    if let Some(targets) = inspected_targets {
+        active.retain(|id| targets.contains(id));
     }
     if active.is_empty() && !inherited_wait {
         return Ok(None);
@@ -1339,6 +1441,32 @@ async fn maybe_suspend_for_orphaned_children(
         session.id,
         active.len(),
     );
+    if inspected_targets.is_some() {
+        let persistence = config.persistence.as_ref().ok_or_else(|| {
+            AgentError::Tool("unchanged child inspections require a durable wait owner".into())
+        })?;
+        // Stage before committing: a failed checkpoint must not claim a
+        // durable suspension or overwrite an unrelated wait in the live state.
+        let mut candidate = session.clone();
+        let mut candidate_runtime = runtime_state.clone();
+        let outcome = suspend_to_wait_for_children(
+            &mut candidate,
+            &mut candidate_runtime,
+            None,
+            active,
+            ChildWaitPolicy::All,
+        )
+        .await;
+        persistence
+            .save_runtime_session(&mut candidate)
+            .await
+            .map_err(|_| {
+                AgentError::Tool("unchanged child inspection wait could not be persisted".into())
+            })?;
+        *session = candidate;
+        *runtime_state = candidate_runtime;
+        return Ok(Some(outcome));
+    }
     Ok(Some(
         suspend_to_wait_for_children(
             session,
@@ -1474,9 +1602,9 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
-/// Transfer the trusted quiet-poll observation to the host without spending
-/// another model recovery round. Stage the notice and wait together: failed
-/// persistence must neither publish a handoff nor start a detached monitor.
+/// Yield an owned quiet command to background monitoring without spending
+/// another model recovery round. A new handoff commits its notice and wait
+/// together before the monitor starts.
 async fn maybe_background_quiet_exec(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1484,10 +1612,18 @@ async fn maybe_background_quiet_exec(
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
 ) -> Result<bool, AgentError> {
-    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
-        || runtime.waiting_for_bash.is_some()
-    {
+    if !crate::runtime::runner::tool_execution::quiet_poll_guard_active(session, runtime, config) {
         return Ok(false);
+    }
+    if let Some(wait) = runtime.waiting_for_bash.as_ref() {
+        // A Human follow-up may poll an exec already handed off in a previous
+        // turn. Let terminal wait reconciliation restore this suspension if
+        // the durable monitor still owns it.
+        return Ok(matches!(wait.bash_ids.as_slice(), [id] if id == handle)
+            && session
+                .metadata
+                .get("runtime.background_exec_id")
+                .is_some_and(|id| id == handle));
     }
     let (Some(persistence), Some(hook)) = (
         config.persistence.as_ref(),
@@ -1526,11 +1662,15 @@ async fn maybe_background_quiet_exec(
         format!("Moved command `{handle}` to background monitoring. You can continue this conversation; its result will return automatically."),
         None,
     );
-    notice.metadata = Some(serde_json::json!({
+    let mut notice_metadata = serde_json::json!({
         "runtime_kind": "background_exec_wait",
         "source": "runtime",
         "exec_session_id": handle,
-    }));
+    });
+    if let Some(owner) = persistence.root_actor_writer() {
+        notice_metadata["run_id"] = serde_json::json!(owner.fence.run_id);
+    }
+    notice.metadata = Some(notice_metadata);
     candidate.add_message(notice.clone());
     persistence
         .save_runtime_session(&mut candidate)
@@ -2464,11 +2604,13 @@ async fn handle_no_tool_calls_with_native(
     // assistant message was appended).
     let add_message_before_gold =
         config.goal_loop_active() || config.effective_counted_loop().is_some();
-    let mut deferred_assistant_message = Some(assistant_with_visible_identity(
+    let assistant = assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
         visible_message,
-    ));
+    );
+    let answer_id = assistant.id.clone();
+    let mut deferred_assistant_message = Some(assistant);
     let buffered_candidate = config.features_final_evidence_check.then(|| {
         deferred_assistant_message
             .as_ref()
@@ -2772,6 +2914,29 @@ async fn handle_no_tool_calls_with_native(
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
     }
+    if let Some(owner) = config
+        .persistence
+        .as_ref()
+        .and_then(|persistence| persistence.root_actor_writer())
+        .filter(|owner| {
+            owner.fence.actor_id.as_str() == session.id && owner.created_at == session.created_at
+        })
+    {
+        // Stop/AfterRound hooks can append context. Bind the exact accepted
+        // answer, including any revision made by the final evidence check.
+        session.root_final_message_candidate = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.id == answer_id)
+            .and_then(RootFinalMessageReference::capture)
+            .map(|message| {
+                Box::new(RootFinalMessageCandidate {
+                    run_id: owner.fence.run_id,
+                    message,
+                })
+            });
+    }
     let usage = to_event_token_usage(
         complete_usage.prompt_tokens,
         complete_usage.completion_tokens,
@@ -2864,6 +3029,27 @@ async fn handle_no_tool_calls(
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
 
+const QUIET_EXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+async fn wait_for_quiet_exec(
+    job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+    cancel_token: &CancellationToken,
+) -> Result<Message, AgentError> {
+    use crate::session_app::child_completion_coordinator::{
+        exec_completion_message, exec_wait_resume_message,
+    };
+
+    let result = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+        result = tokio::time::timeout(QUIET_EXEC_WAIT_TIMEOUT, job.completion()) => result,
+    };
+    Ok(match result {
+        Ok(info) => exec_completion_message(&info),
+        Err(_) => exec_wait_resume_message(&[job.id().to_owned()], true),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tool_calls_path(
     frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
@@ -2876,6 +3062,8 @@ async fn handle_tool_calls_path(
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
     cancel_token: &CancellationToken,
+    output_limit_recovery: bool,
+    tool_dispatch: &RoundToolDispatch,
 ) -> Result<TurnOutcome, AgentError> {
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -2915,28 +3103,16 @@ async fn handle_tool_calls_path(
             })?;
     }
 
-    let compression_model = Some(model_name.to_string())
-        .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.trim().to_string()));
-    if compression_model.is_none() {
-        tracing::warn!(
-            "[{}] Skipping mid-turn context compression after tool execution: missing model name",
-            frame.session_id
-        );
-    }
-    let eligible_tool_schemas =
+    let mut tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
-    let required_tool = crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
-    let request_tool_schemas = crate::runtime::runner::round_lifecycle::effective_tool_schemas(
-        session,
-        &eligible_tool_schemas,
-    );
-    let tool_schemas = request_tool_schemas.as_ref();
-    let capability_loading_mode = frame
-        .llm
-        .capability_loading_mode(model_name, required_tool)
-        .await;
+    tool_schemas.retain(|live| {
+        tool_dispatch
+            .catalog
+            .iter()
+            .any(|offered| offered.function.name == live.function.name)
+    });
     let effective_callable_set =
-        effective_callable_set_for_round(session, tool_schemas, capability_loading_mode);
+        effective_callable_set_for_round(session, &tool_schemas, tool_dispatch.mode);
 
     // Tool execution can block for a long time (up to parallel_batch_timeout_secs,
     // default 300s, and per_tool_timeout_secs for single tools). The loop only
@@ -2963,14 +3139,12 @@ async fn handle_tool_calls_path(
                 runtime_state,
                 policy_guard,
                 task_context,
-                compression_model_name: compression_model
-                    .as_deref()
-                    .or(auxiliary_models.background_model_name.as_deref()),
+                compression_model_name: (!output_limit_recovery).then_some(model_name),
                 compression_model_provider: auxiliary_models
                     .summarization_model_provider
                     .as_ref()
                     .or(auxiliary_models.background_model_provider.as_ref()),
-                tool_schemas,
+                tool_schemas: &tool_schemas,
                 effective_callable_set: &effective_callable_set,
             },
         ) => result?,
@@ -2993,6 +3167,23 @@ async fn handle_tool_calls_path(
     }
     if tool_execution.waiting_for_children {
         waiting_for_children = true;
+    }
+
+    let unchanged_targets = policy_guard.unchanged_child_inspection_targets();
+    if round_status == MetricsRoundStatus::Success
+        && !awaiting_clarification
+        && !waiting_for_children
+        && session.supervisor_incarnation_id().is_some()
+        && !unchanged_targets.is_empty()
+    {
+        waiting_for_children = maybe_suspend_for_children(
+            session,
+            frame.config,
+            runtime_state,
+            Some(&unchanged_targets),
+        )
+        .await?
+        .is_some();
     }
 
     let ticket_question_yield = frame.config.ticket_worker_plan.is_some()
@@ -3052,6 +3243,25 @@ async fn handle_tool_calls_path(
                 "message_count": session.messages.len(),
             })
         );
+    }
+
+    // The poll has already returned and its tool result is paired. A sole
+    // follow-up quiet read can now wait within this run, outside tool deadlines
+    // and without spending another provider turn.
+    if !output_limit_recovery && round_status == MetricsRoundStatus::Success {
+        if let Some(handle) = tool_execution.quiet_exec_handle {
+            if let Some(job) =
+                bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
+                    .await
+            {
+                let message = wait_for_quiet_exec(job, cancel_token).await?;
+                session.add_message(message.clone());
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::message_appended(&session.id, &message))
+                    .await;
+            }
+        }
     }
 
     // ---- Dynamic model routing: classify task complexity ----
@@ -3379,9 +3589,13 @@ async fn run_pipeline_inner(
     // across rounds, so resetting it per iteration would make the guard unable
     // to ever fire (#2425).
     let mut no_tool_call_continuation_streak: u32 = 0;
+    let mut split_recovery: Option<SplitRecovery> = None;
+    let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
-        if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+        if (split_recovery.is_some() || config.effective_counted_loop().is_some())
+            && cancel_token.is_cancelled()
+        {
             return Err(AgentError::Cancelled);
         }
         // Startup has already admitted this run's input. A runtime-only wakeup
@@ -3402,6 +3616,21 @@ async fn run_pipeline_inner(
         {
             break;
         }
+        if split_recovery.is_some()
+            && (check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
+                || config
+                    .run_budget
+                    .max_rounds
+                    .is_some_and(|max| turn_counter >= max))
+        {
+            return Err(AgentError::Budget(
+                "output-limit task recovery reached the run budget; confirmed progress is in the session".into(),
+            ));
+        }
+        let split_request = split_recovery
+            .as_mut()
+            .map(SplitRecovery::next_request)
+            .transpose()?;
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -3422,31 +3651,33 @@ async fn run_pipeline_inner(
             abort_in_flight_evaluations(state, event_tx, "delegation_failure_limit").await;
             return Err(error);
         }
-        refresh_auxiliary_models_for_round(state, config);
-        poll_completed_task_evaluation(state).await;
-        apply_completed_task_evaluation(session, event_tx, config, state).await;
-        start_queued_task_evaluation_if_idle(
-            state,
-            event_tx,
-            llm.clone(),
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
-        poll_completed_gold_evaluation(state).await;
-        apply_completed_gold_evaluation(session, config, state).await;
-        let gold_provider = select_gold_evaluation_provider(
-            config,
-            &llm,
-            state.auxiliary_models.fast_model_provider.as_ref(),
-        );
-        start_queued_gold_evaluation_if_idle(
-            state,
-            event_tx,
-            gold_provider,
-            config,
-            cancel_token.clone(),
-            config.auxiliary_evaluation_max_concurrency,
-        );
+        if split_request.is_none() {
+            refresh_auxiliary_models_for_round(state, config);
+            poll_completed_task_evaluation(state).await;
+            apply_completed_task_evaluation(session, event_tx, config, state).await;
+            start_queued_task_evaluation_if_idle(
+                state,
+                event_tx,
+                llm.clone(),
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+            poll_completed_gold_evaluation(state).await;
+            apply_completed_gold_evaluation(session, config, state).await;
+            let gold_provider = select_gold_evaluation_provider(
+                config,
+                &llm,
+                state.auxiliary_models.fast_model_provider.as_ref(),
+            );
+            start_queued_gold_evaluation_if_idle(
+                state,
+                event_tx,
+                gold_provider,
+                config,
+                cancel_token.clone(),
+                config.auxiliary_evaluation_max_concurrency,
+            );
+        }
 
         state.runtime_state.round.current_round = turn_counter;
 
@@ -3501,7 +3732,7 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let (prompt_memory_exposure, observation) =
+        let (prompt_memory_exposure, observation, admitted_messages) =
             crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
                 &mut state.runtime_state,
@@ -3509,7 +3740,7 @@ async fn run_pipeline_inner(
                 Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
-                Some(&runtime_context),
+                split_request.is_none().then_some(&runtime_context),
                 &state.execution_id,
             )
             .await?;
@@ -3522,6 +3753,11 @@ async fn run_pipeline_inner(
                     || input.wrapper.as_deref() == Some("root_chat_turn_v1")
             })
         });
+        if split_request.is_some() && fresh_human_input {
+            return Err(AgentError::LLMNonRetryable(
+                "output-limit task recovery stopped after new user input; confirmed progress is in the session".into(),
+            ));
+        }
         observation.update_current(
             &mut state.current_inputs,
             &state.session_id,
@@ -3535,15 +3771,34 @@ async fn run_pipeline_inner(
         if fresh_human_input || resumed_progress_question {
             tool_policy_guard.reset_observation_progress();
         }
-        // Consume only after the complete real tool batch and newly admitted
-        // Human input. The same-model facts are mandatory for each bounded
-        // recovery request; they create neither a pending question nor a grant.
-        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+        for message in admitted_messages {
+            let Some(handle) =
+                tool_policy_guard.observe_background_exec_completion(&session.id, &message)
+            else {
+                continue;
+            };
+            if state
+                .runtime_state
+                .waiting_for_bash
+                .as_ref()
+                .is_some_and(|wait| matches!(wait.bash_ids.as_slice(), [id] if id == handle))
+            {
+                if let Some(saved) = session.agent_runtime_state.as_ref() {
+                    state
+                        .runtime_state
+                        .waiting_for_bash
+                        .clone_from(&saved.waiting_for_bash);
+                }
+            }
+        }
+        // Evaluate feedback after the real tool batch and any newly admitted
+        // Human input. Quiet command recovery retains its existing handoff.
+        let quiet_poll_active = crate::runtime::runner::tool_execution::quiet_poll_guard_active(
             session,
             &state.runtime_state,
             config,
         );
-        if feedback_active {
+        if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
                 if maybe_background_quiet_exec(
                     session,
@@ -3559,24 +3814,7 @@ async fn run_pipeline_inner(
             }
         }
         let observation_progress_hint =
-            match tool_policy_guard.feedback_for_next_round(feedback_active) {
-                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
-                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
-                    feedback,
-                    summary,
-                } => {
-                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
-                        session,
-                        &state.runtime_state,
-                        event_tx,
-                        config,
-                        &feedback,
-                        &summary,
-                    )
-                    .await?;
-                    break;
-                }
-            };
+            tool_policy_guard.feedback_for_next_round(quiet_poll_active);
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3615,6 +3853,10 @@ async fn run_pipeline_inner(
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
+        let mut output_limit_recovery = split_recovery.as_ref().map(|split| split.retry);
+        let mut previous_prompt_tokens = split_recovery
+            .as_ref()
+            .map_or(0, |split| split.prompt_floor);
         let mut turn_outcome: Option<TurnOutcome> = None;
         // Whether this round produced any tool call. Per-round, so it belongs
         // inside the loop; captured from the provider output rather than
@@ -3668,7 +3910,12 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
+        let attempt_limit = if split_request.is_some() {
+            1
+        } else {
+            MAX_LLM_TURN_ATTEMPTS + extra_attempts
+        };
+        for attempt in 1..=attempt_limit {
             if config.goal_loop_active() && extra_attempts > 0 {
                 if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
                     session,
@@ -3689,6 +3936,32 @@ async fn run_pipeline_inner(
             // transient record when context preparation/provider dispatch fails
             // before streaming starts.
             let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
+            let remaining_run_tokens = recovery_token_limit.map(|limit| {
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                limit.saturating_sub(run_tokens_used(&spent))
+            });
+            let output_limit_policy = RoundOutputLimitPolicy {
+                retry: output_limit_recovery,
+                remaining_run_tokens,
+                previous_prompt_tokens,
+                task_split: split_request.as_ref().map(|(stage, advisory)| TaskSplitPrompt {
+                    advisory,
+                    private_plan: *stage == SplitStage::Plan,
+                }),
+            };
+            let split_tools;
+            let request_tools = match split_request.as_ref() {
+                Some((SplitStage::Plan | SplitStage::Report, _)) => &[],
+                Some((SplitStage::Work, _)) => {
+                    split_tools = tool_schemas.iter()
+                        .filter(|schema| !super::output_limit_split::forbidden_tool(&schema.function.name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    split_tools.as_slice()
+                }
+                None => tool_schemas.as_slice(),
+            };
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
                 config,
@@ -3697,7 +3970,7 @@ async fn run_pipeline_inner(
                 cancel_token,
                 &state.session_id,
                 &state.model_name,
-                &tool_schemas,
+                request_tools,
                 observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
@@ -3705,10 +3978,15 @@ async fn run_pipeline_inner(
                         provenance: &prompt_memory_exposure,
                     },
                 ),
+                Some(output_limit_policy),
             )
             .await
             {
                 Ok(output) => output,
+                Err(error) if output_limit_recovery.is_some() => {
+                    terminal_error = Some(error);
+                    break;
+                }
                 Err(error) => {
                     if is_overflow_recoverable(&error) && !overflow_recovery_attempted {
                         overflow_recovery_attempted = true;
@@ -3735,21 +4013,13 @@ async fn run_pipeline_inner(
                             MAX_LLM_TURN_ATTEMPTS,
                             error,
                         );
-                        let overflow_tool_schemas =
-                            crate::runtime::runner::round_lifecycle::context_tool_schemas_for_session(
-                                session,
-                                &llm,
-                                &state.model_name,
-                                &tool_schemas,
-                            )
-                            .await;
                         let recovered =
                             match crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
                                 session,
                                 config,
                                 &state.model_name,
                                 &state.session_id,
-                                overflow_tool_schemas.as_ref(),
+                                &tool_schemas,
                                 &llm,
                                 Some(event_tx),
                             )
@@ -3797,6 +4067,7 @@ async fn run_pipeline_inner(
                                         provenance: &prompt_memory_exposure,
                                     },
                                 ),
+                                None,
                             )
                             .await
                             {
@@ -3937,9 +4208,178 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
-            if let Some(error) = llm_output.terminal_validation_error {
+            if let Some(split) = split_recovery.as_mut() {
+                split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
+            }
+            let validation_error = llm_output.terminal_validation_error.or_else(|| {
+                output_limit_recovery?;
+                let limit = recovery_token_limit?;
+                let mut spent = state.runtime_state.round.clone();
+                round_activity.apply_to_round(&mut spent);
+                (run_tokens_used(&spent) > limit).then(|| AgentError::Budget(
+                    "output-limit recovery exceeded its token budget on reported usage".into(),
+                ))
+            });
+            if let Some(error) = validation_error {
+                let reasoning_repeated = matches!(error, AgentError::ReasoningRepetition { .. });
+                let response_rejected = reasoning_repeated
+                    || matches!(error, AgentError::OutputTokenLimit { .. });
+                if output_limit_recovery.is_some() || response_rejected {
+                    if let Some(visible) = stream_output.visible_message {
+                        let _ = event_tx
+                            .send(AgentEvent::VisibleMessageDiscard {
+                                message_id: visible.message_id,
+                            })
+                            .await;
+                    }
+                }
+                if matches!(split_request.as_ref(), Some((SplitStage::Plan, _)))
+                    && llm_output.can_resume_truncated_messages
+                {
+                    // The model has already spent its single planning request.
+                    // Try one bounded action using the existing checkpoint.
+                    split_recovery
+                        .as_mut()
+                        .expect("planning belongs to an active split")
+                        .continue_after_truncated_plan();
+                    crate::runtime::runner::metrics_lifecycle::record_round_completed(
+                        state.metrics_collector.as_ref(),
+                        &round_id,
+                        &state.session_id,
+                        session.messages.len() as u32,
+                        MetricsRoundStatus::Error,
+                        round_activity.token_usage(),
+                        0,
+                        0,
+                        Some(error.to_string()),
+                    );
+                    tracing::info!(session_id = %state.session_id, "Continuing with one action after the recovery plan was interrupted");
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
+                if response_rejected && split_request.is_none() {
+                    let reasoning_only = reasoning_repeated
+                        || matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. });
+                    let mut spent = state.runtime_state.round.clone();
+                    round_activity.apply_to_round(&mut spent);
+                    previous_prompt_tokens = previous_prompt_tokens.max(llm_output.attempt_usage.prompt_tokens);
+                    let next = llm_output.output_limit_recovery;
+                    let remaining_tokens = recovery_token_limit.map(|limit| limit.saturating_sub(run_tokens_used(&spent)));
+                    let split_candidate = next.filter(|candidate| reasoning_repeated || candidate.prefers_task_split())
+                        .or_else(|| output_limit_recovery.filter(|attempt| reasoning_only && attempt.is_convergence()))
+                        .filter(|candidate| candidate.allows_task_split());
+                    if let Some(candidate) = split_candidate {
+                        let cost = previous_prompt_tokens.saturating_add(candidate.output_limit());
+                        if remaining_tokens.is_none_or(|remaining| cost.saturating_mul(2) <= remaining)
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                            && can_split_tasks(session, config, &state.runtime_state, turn_counter)
+                        {
+                            split_recovery = Some(SplitRecovery::new(
+                                candidate.for_task_split(), previous_prompt_tokens,
+                            ));
+                            crate::runtime::runner::metrics_lifecycle::record_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session.messages.len() as u32,
+                                MetricsRoundStatus::Error,
+                                round_activity.token_usage(),
+                                0,
+                                0,
+                                Some(error.to_string()),
+                            );
+                            abort_in_flight_evaluations(state, event_tx, "output_limit_task_split").await;
+                            tracing::info!(session_id = %state.session_id, "Splitting unfinished work after an interrupted response");
+                            turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                            break;
+                        }
+                    }
+                    if let Some(recovery) = next.filter(|_| {
+                        !reasoning_repeated && reasoning_only
+                            && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
+                    }) {
+                        let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
+                        if remaining_tokens.is_none_or(|remaining| next_cost <= remaining)
+                            && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                        {
+                            output_limit_recovery = Some(recovery);
+                            tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
+                            continue;
+                        }
+                    }
+                    tracing::warn!(
+                        session_id = %state.session_id,
+                        ?remaining_tokens,
+                        recovery_available = next.is_some() || split_candidate.is_some(),
+                        "Recovery could not start under the current request and run limits"
+                    );
+                }
                 terminal_error = Some(error);
                 break;
+            }
+            if let (Some((stage, _)), Some(split)) = (split_request.as_ref(), split_recovery.as_mut()) {
+                let max_tools = usize::from(*stage == SplitStage::Work);
+                let invalid_tool = stream_output.tool_calls.len() > max_tools
+                    || stream_output.tool_calls.iter().any(|call| {
+                        super::output_limit_split::forbidden_tool(&call.function.name)
+                    })
+                    || stream_output.provider_transcript_items.iter().any(|item| {
+                        item.kind().is_discovery()
+                            || (max_tools == 0 && matches!(item.kind(),
+                                ProviderTranscriptItemKind::AnthropicToolUse
+                                    | ProviderTranscriptItemKind::OpenAiFunctionCall))
+                    });
+                if invalid_tool {
+                    if let Some(visible) = stream_output.visible_message {
+                        let _ = event_tx.send(AgentEvent::VisibleMessageDiscard {
+                            message_id: visible.message_id,
+                        }).await;
+                    }
+                    terminal_error = Some(AgentError::LLMNonRetryable(
+                        "output-limit task recovery rejected a tool outside the current step".into(),
+                    ));
+                    break;
+                }
+
+                if *stage == SplitStage::Plan {
+                    if let Err(error) = split.accept_plan(&stream_output.content) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
+
+                if *stage == SplitStage::Work && stream_output.tool_calls.is_empty() {
+                    let confirmed_checkpoint = stream_output.content.trim()
+                        .strip_prefix("CHECKPOINT:")
+                        .is_some_and(|evidence| !evidence.trim().is_empty());
+                    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                        .then_some(stream_output.reasoning_content);
+                    let mut checkpoint = assistant_with_visible_identity(
+                        Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+                            .with_reasoning_signature(stream_output.reasoning_signature),
+                        stream_output.visible_message,
+                    );
+                    checkpoint.phase = Some(bamboo_domain::MessagePhase::Commentary);
+                    if let Err(error) = commit_assistant_message(
+                        session, checkpoint, &mut Some(stream_output.provider_transcript_items),
+                    ) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    split.finish_step(confirmed_checkpoint);
+                    record_no_tool_calls_round_completed(
+                        state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                        session, round_activity.token_usage(),
+                    );
+                    turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
+                    break;
+                }
             }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
@@ -3963,11 +4403,18 @@ async fn run_pipeline_inner(
                         stream_output,
                         session,
                         config,
-                        &tool_schemas,
+                        &llm_output.tool_dispatch.catalog,
                     )
                     .await
                     {
-                        Ok(message) => {
+                        Ok((message, fingerprints)) => {
+                            tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                            for fingerprint in fingerprints {
+                                tool_policy_guard.observe_repeated_call(
+                                    OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                                    fingerprint,
+                                );
+                            }
                             if config.features_final_evidence_check {
                                 publish_buffered_message(event_tx, &message).await;
                             }
@@ -4146,16 +4593,7 @@ async fn run_pipeline_inner(
                 break;
             }
 
-            let required_tool =
-                crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
-            let capability_loading_mode = llm
-                .capability_loading_mode(&state.model_name, required_tool)
-                .await;
-            let legacy_browser_discovery = capability_loading_mode
-                == CapabilityLoadingMode::LegacyFullCatalog
-                && legacy_browser_needs_discovery(session, &tool_schemas, required_tool);
-            if (capability_loading_mode == CapabilityLoadingMode::StickyFallback
-                || legacy_browser_discovery)
+            if llm_output.tool_dispatch.fallback_discovery
                 && stream_output.tool_calls.iter().any(|call| {
                     call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
                 })
@@ -4164,12 +4602,16 @@ async fn run_pipeline_inner(
                     stream_output,
                     session,
                     config,
-                    &tool_schemas,
-                    legacy_browser_discovery,
+                    &llm_output.tool_dispatch.catalog,
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(fingerprint) => {
+                        tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                        tool_policy_guard.observe_repeated_call(
+                            bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                            fingerprint,
+                        );
                         record_no_tool_calls_round_completed(
                             state.metrics_collector.as_ref(),
                             &round_id,
@@ -4204,9 +4646,14 @@ async fn run_pipeline_inner(
             let injected_handler_error = take_test_post_llm_retry_failure(session);
             #[cfg(not(test))]
             let injected_handler_error: Option<AgentError> = None;
+            let split_tool = split_request.as_ref()
+                .and_then(|_| stream_output.tool_calls.first())
+                .map(|call| (call.function.name.clone(), call.id.clone()));
+            let before_tool = session.messages.len();
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
                 None => {
+                    tool_policy_guard.set_supervisor_spawn_route(llm_output.standalone_supervisor_spawn);
                     handle_tool_calls_path(
                         &frame,
                         stream_output,
@@ -4218,6 +4665,8 @@ async fn run_pipeline_inner(
                         &state.model_name,
                         &mut state.task_context,
                         cancel_token,
+                        output_limit_recovery.is_some(),
+                        &llm_output.tool_dispatch,
                     )
                     .await
                 }
@@ -4235,11 +4684,21 @@ async fn run_pipeline_inner(
                             }
                         }
                     }
+                    if let (Some(split), Some((name, id))) = (split_recovery.as_mut(), split_tool) {
+                        if !outcome.should_break {
+                            let confirmed = session.messages.iter().skip(before_tool).any(|message| {
+                                super::output_limit_split::confirms_tool_result(
+                                    &name, &id, message,
+                                )
+                            });
+                            split.finish_step(confirmed);
+                        }
+                    }
                     turn_outcome = Some(outcome);
                     break;
                 }
                 Err(error) => {
-                    if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                    if output_limit_recovery.is_none() && should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
                         if let Some(message_id) = crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
                             session,
                             attempt_tail_message_id.as_deref(),
@@ -4539,6 +4998,10 @@ async fn run_pipeline_inner(
         if outcome.should_break {
             break;
         }
+        if split_recovery.is_some() {
+            turn_counter = turn_counter.saturating_add(1);
+            continue;
+        }
 
         // Bounded progress guard (#2425). When a round produced no tool calls,
         // nothing new can have been learned, yet the goal/task continuation gates
@@ -4837,7 +5300,7 @@ fn heuristic_complexity(
         "exec_command",
         "write_stdin",
     ];
-    let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
+    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
         .iter()
@@ -4857,8 +5320,7 @@ fn heuristic_complexity(
 
 #[cfg(test)]
 #[tokio::test]
-async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ordinary_ultra_denial()
-{
+async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -4889,10 +5351,9 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
         ensure_discovery_allowed(&mut supervisor, &config)
             .await
             .unwrap();
-        let discovery =
-            CompleteCapabilityDiscovery::new(&supervisor, &config, &schemas, false, true)
-                .await
-                .unwrap();
+        let discovery = CompleteCapabilityDiscovery::new(&supervisor, &config, &schemas, true)
+            .await
+            .unwrap();
         assert!(
             discovery.commands.is_none(),
             "Supervisor must not open Skill/Workflow discovery"
@@ -4922,9 +5383,21 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
     let mut ordinary = Session::new("ordinary-ultra", "model");
     ordinary.metadata.insert("role".into(), "supervisor".into());
     ordinary.set_root_orchestration_only(true).unwrap();
-    assert!(ensure_discovery_allowed(&mut ordinary, &config)
+    ensure_discovery_allowed(&mut ordinary, &config)
         .await
-        .is_err());
+        .unwrap();
+    let discovery = CompleteCapabilityDiscovery::new(&ordinary, &config, &schemas, true)
+        .await
+        .unwrap();
+    assert!(discovery.commands.is_none());
+    assert_eq!(
+        discovery
+            .catalog
+            .iter()
+            .map(|entry| entry.execution_name())
+            .collect::<Vec<_>>(),
+        ["Read", "SubAgent"]
+    );
 }
 
 #[cfg(test)]
@@ -5517,7 +5990,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([{
                 "type":"function",
                 "name":"ReadArchive",
@@ -5553,7 +6026,9 @@ mod tests {
             loading_test_schema_with_description("Glob", "Find paths"),
             browser.clone(),
         ];
-        let provider: Arc<dyn LLMProvider> = Arc::new(StubProvider);
+        let provider: Arc<dyn LLMProvider> = Arc::new(CodexSearchLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
         let mut first_chat = Session::new("browser-chat-a", "chat-model");
         let mut second_chat = Session::new("browser-chat-b", "chat-model");
 
@@ -5568,19 +6043,13 @@ mod tests {
         assert!(initial
             .iter()
             .any(|tool| tool.function.name == "discover_capabilities"));
-        assert_eq!(initial[1].function.name, "Glob");
-        let initial_bytes = serde_json::to_vec(initial.as_ref()).unwrap().len();
-        let full_bytes = serde_json::to_vec(&tools).unwrap().len();
-        assert!(
-            initial_bytes < full_bytes,
-            "initial projection should be smaller: {initial_bytes} vs {full_bytes} bytes"
-        );
+        assert!(initial.iter().all(|tool| tool.function.name != "Glob"));
         let first_before = effective_callable_set_for_round(
             &first_chat,
             &tools,
-            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
         );
-        assert!(first_before.contains_execution_name("Glob"));
+        assert!(!first_before.contains_execution_name("Glob"));
         assert!(!first_before.contains_execution_name("browser"));
 
         commit_sticky_fallback_discovery_round(
@@ -5592,7 +6061,6 @@ mod tests {
             &mut first_chat,
             &AgentLoopConfig::default(),
             &tools,
-            true,
         )
         .await
         .unwrap();
@@ -5611,7 +6079,7 @@ mod tests {
         let first_after = effective_callable_set_for_round(
             &first_chat,
             &tools,
-            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
         );
         assert!(first_after.contains_execution_name("browser"));
         let resumed: Session =
@@ -5619,7 +6087,7 @@ mod tests {
         assert!(effective_callable_set_for_round(
             &resumed,
             &tools,
-            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
         )
         .contains_execution_name("browser"));
         let loaded_projection =
@@ -5631,14 +6099,17 @@ mod tests {
             )
             .await;
         assert_eq!(
-            serde_json::to_value(loaded_projection.as_ref()).unwrap(),
-            serde_json::to_value(&tools).unwrap()
+            loaded_projection
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Read", "browser", "discover_capabilities"]
         );
 
         let second_before = effective_callable_set_for_round(
             &second_chat,
             &tools,
-            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
         );
         assert!(!second_before.contains_execution_name("browser"));
         let second_projection =
@@ -5662,14 +6133,12 @@ mod tests {
             &mut second_chat,
             &AgentLoopConfig::default(),
             &tools,
-            true,
         )
         .await
         .unwrap();
-        assert!(
-            sticky_result_definition_values(second_chat.messages.last().unwrap())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            vec!["Glob"]
         );
 
         second_chat.add_message(Message::assistant(
@@ -5684,11 +6153,14 @@ mod tests {
             ),
             true,
         ));
-        assert!(validated_sticky_fallback_loaded_tool_names(&second_chat).is_empty());
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            vec!["Glob"]
+        );
         assert!(!effective_callable_set_for_round(
             &second_chat,
             &tools,
-            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
         )
         .contains_execution_name("browser"));
     }
@@ -5740,7 +6212,6 @@ mod tests {
             &mut session,
             &config,
             &tools,
-            true,
         )
         .await
         .unwrap();
@@ -5796,7 +6267,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5820,7 +6291,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            refreshed[0].payload()["tools"],
+            refreshed[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5838,7 +6309,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(missing[0].payload()["tools"], serde_json::json!([]));
+        assert_eq!(missing[0].item.payload()["tools"], serde_json::json!([]));
         let invalid_kind = native_client_search_item_with_arguments(
             "search_skill",
             serde_json::json!({
@@ -6119,9 +6590,12 @@ mod tests {
             if self.mode == CapabilityLoadingMode::StickyFallback {
                 assert!(tools.iter().any(|schema| schema.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
-                assert!(!tools
-                    .iter()
-                    .any(|schema| schema.function.name == "SubAgent"));
+                assert_eq!(
+                    tools
+                        .iter()
+                        .any(|schema| schema.function.name == "SubAgent"),
+                    count != 0
+                );
             } else {
                 let response_options = ir.responses_request_options(None);
                 let body = bamboo_llm::providers::common::openai_responses::build_responses_body_with_capability_loading(
@@ -6159,9 +6633,10 @@ mod tests {
                                 message.tool_call_id.as_deref() == Some("supervisor-search")
                             })
                             .unwrap();
-                        let definitions = sticky_result_definition_values(result).unwrap();
-                        assert_eq!(definitions.len(), 1);
-                        assert_eq!(definitions[0]["function"]["name"], "SubAgent");
+                        assert!(result.content.contains("Loaded tool definitions"));
+                        assert!(tools
+                            .iter()
+                            .any(|schema| schema.function.name == "SubAgent"));
                     } else {
                         let result = ir
                             .provider_transcript_groups
@@ -6408,37 +6883,54 @@ mod tests {
             _: Option<u32>,
             _: &str,
         ) -> Result<LLMStream, LLMError> {
-            // The actual runner request always contains only Core + search;
-            // discovered complete definitions arrive in canonical history.
-            assert!(tools.iter().all(
-                |tool| tool.function.name != "lookup" && tool.function.name != "hidden_lookup"
-            ));
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(tools
+                .iter()
+                .all(|tool| tool.function.name != "hidden_lookup"));
+            assert_eq!(
+                tools.iter().any(|tool| tool.function.name == "lookup"),
+                count > 0,
+            );
             assert!(tools
                 .iter()
                 .any(|tool| tool.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
-            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let advice = messages
+                .iter()
+                .find(|message| message.content.starts_with("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 4);
             let chunks = match count {
-                0 => vec![
+                0..=3 => vec![
                     Ok(LLMChunk::ToolCalls(vec![activation_call(
-                        "codex-search",
+                        &format!("codex-search-{count}"),
                         bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
                         r#"{"query":"timezone!","limit":1}"#,
                     )])),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
-                    let result = messages
+                4 => {
+                    assert!(advice.unwrap().content.contains("discover_capabilities"));
+                    let discovered = tools
                         .iter()
-                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search"))
+                        .find(|tool| tool.function.name == "lookup")
                         .unwrap();
-                    let definitions = sticky_result_definition_values(result).unwrap();
-                    assert_eq!(definitions.len(), 1);
-                    assert_eq!(definitions[0]["function"]["name"], "lookup");
                     assert_eq!(
-                        definitions[0]["function"]["parameters"]["required"],
+                        discovered.function.parameters["required"],
                         serde_json::json!(["timezone"])
                     );
+                    let first_result = messages
+                        .iter()
+                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search-0"))
+                        .unwrap();
+                    assert!(first_result.content.contains("Loaded tool definitions"));
+                    for index in 1..4 {
+                        let call_id = format!("codex-search-{index}");
+                        let result = messages
+                            .iter()
+                            .find(|message| message.tool_call_id.as_deref() == Some(&call_id))
+                            .unwrap();
+                        assert!(sticky_result_definition_values(result).unwrap().is_empty());
+                    }
                     vec![
                         Ok(LLMChunk::ToolCalls(vec![activation_call(
                             "codex-lookup",
@@ -6448,7 +6940,7 @@ mod tests {
                         Ok(LLMChunk::Done),
                     ]
                 }
-                2 => {
+                5 => {
                     assert!(messages
                         .iter()
                         .any(
@@ -6522,8 +7014,12 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| { !message.content.starts_with("[Runtime tool advisory]") }));
         let mut resumed: Session =
             serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
         let current =
@@ -6602,14 +7098,33 @@ mod tests {
                 .iter()
                 .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let input = body["input"].as_array().unwrap();
+            let advice = input
+                .iter()
+                .position(|item| item.to_string().contains("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 3);
             let chunks = match count {
-                0 => vec![
+                0..=2 => vec![
                     Ok(LLMChunk::ProviderTranscriptItem(
-                        native_client_search_item_for("codex-native-search", "timezone!"),
+                        native_client_search_item_for(
+                            &format!("codex-native-search-{count}"),
+                            "timezone!",
+                        ),
                     )),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
+                3 => {
+                    let advisory_index = advice.unwrap();
+                    assert!(input[advisory_index].to_string().contains("tool_search"));
+                    for index in 0..3 {
+                        let call_id = format!("codex-native-search-{index}");
+                        assert!(
+                            input[..advisory_index].iter().any(|item| {
+                                item["type"] == "tool_search_output" && item["call_id"] == call_id
+                            }),
+                            "each actual search result must precede the request-only advice"
+                        );
+                    }
                     let output = ir
                         .provider_transcript_groups
                         .iter()
@@ -6627,7 +7142,7 @@ mod tests {
                     // only for discovery; ordinary calls use normalized chunks.
                     vec![Ok(LLMChunk::ToolCalls(vec![call])), Ok(LLMChunk::Done)]
                 }
-                2 => {
+                4 => {
                     assert!(body["input"]
                         .as_array()
                         .unwrap()
@@ -6674,7 +7189,7 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -6721,7 +7236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mid_round_root_tightening_rejects_both_discovery_paths() {
+    async fn mid_round_root_tightening_filters_both_discovery_paths() {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
         let mut running = Session::new("mid-round-discovery", "model");
         let mut durable = running.clone();
@@ -6730,7 +7245,10 @@ mod tests {
             storage: Some(storage.clone()),
             ..Default::default()
         };
-        let tools = vec![loading_test_schema("Read"), loading_test_schema("Bash")];
+        let tools = vec![
+            loading_test_schema("Read"),
+            loading_test_schema("load_skill"),
+        ];
 
         // A provider request was already in flight when the host selected
         // orchestration-only Root authority on the durable control plane.
@@ -6740,27 +7258,23 @@ mod tests {
         let sticky = stream_output_with_tool_call(activation_call(
             "stale-discovery",
             bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
-            r#"{"query":"bash"}"#,
+            r#"{"query":"load_skill"}"#,
         ));
-        let error =
-            commit_sticky_fallback_discovery_round(sticky, &mut running, &config, &tools, false)
-                .await
-                .expect_err("StickyFallback discovery must stop before transcript mutation");
-        assert!(error
-            .to_string()
-            .contains("outside this Root's tool authority"));
-        assert!(running.messages.is_empty());
-
-        let mut native = stream_output_with_tool_call(activation_call("unused", "Read", "{}"));
-        native.tool_calls.clear();
-        native.provider_transcript_items = vec![native_client_search_item()];
-        let error = commit_openai_client_tool_search_round(native, &mut running, &config, &tools)
+        commit_sticky_fallback_discovery_round(sticky, &mut running, &config, &tools)
             .await
-            .expect_err("OpenAI client search must stop before returning definitions");
-        assert!(error
-            .to_string()
-            .contains("outside this Root's tool authority"));
-        assert!(running.messages.is_empty());
+            .unwrap();
+        assert!(running.root_orchestration_only_enabled());
+        assert!(
+            sticky_result_definition_values(running.messages.last().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        let native = native_client_search_item_for("stale-native", "load_skill");
+        let outputs = build_openai_client_tool_search_outputs(&running, &config, &tools, &[native])
+            .await
+            .unwrap();
+        assert_eq!(outputs[0].item.payload()["tools"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -6791,7 +7305,6 @@ mod tests {
             &mut session,
             &config,
             &tools,
-            false,
         )
         .await
         .unwrap();
@@ -6873,7 +7386,6 @@ mod tests {
             &mut resumed,
             &config,
             &tools,
-            false,
         )
         .await
         .unwrap();
@@ -7163,11 +7675,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].payload()["type"], "tool_search_output");
-        assert_eq!(outputs[0].payload()["execution"], "client");
-        assert_eq!(outputs[0].payload()["call_id"], "search_1");
-        assert_eq!(outputs[0].payload()["status"], "completed");
-        let discovered = outputs[0].payload()["tools"].as_array().unwrap();
+        assert_eq!(outputs[0].item.payload()["type"], "tool_search_output");
+        assert_eq!(outputs[0].item.payload()["execution"], "client");
+        assert_eq!(outputs[0].item.payload()["call_id"], "search_1");
+        assert_eq!(outputs[0].item.payload()["status"], "completed");
+        let discovered = outputs[0].item.payload()["tools"].as_array().unwrap();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0]["name"], "search_orders");
         assert_eq!(discovered[0]["strict"], false);
@@ -7183,9 +7695,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(empty_outputs.len(), 1);
-        assert_eq!(empty_outputs[0].payload()["call_id"], "search_empty");
+        assert_eq!(empty_outputs[0].item.payload()["call_id"], "search_empty");
         assert_eq!(
-            empty_outputs[0].payload()["tools"],
+            empty_outputs[0].item.payload()["tools"],
             serde_json::json!([]),
             "an empty discovery result remains an explicit completed tools array"
         );
@@ -8409,7 +8921,7 @@ mod tests {
         }
     }
 
-    fn e2e_loop_state(
+    pub(super) fn e2e_loop_state(
         session_id: &str,
     ) -> crate::runtime::runner::loop_execution::startup::LoopRunState {
         use crate::runtime::runner::loop_execution::startup::{
@@ -9672,7 +10184,7 @@ mod tests {
         );
     }
 
-    fn canonical_usage_pipeline_config() -> AgentLoopConfig {
+    pub(super) fn canonical_usage_pipeline_config() -> AgentLoopConfig {
         use crate::runtime::config::PromptMemoryFlags;
 
         AgentLoopConfig {
@@ -10027,6 +10539,548 @@ mod tests {
             .expect("terminal runtime state mirrored to session");
         assert_eq!(persisted_runtime.round.total_prompt_tokens, 31);
         assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
+    }
+
+    pub(super) fn mock_messages_completion(
+        block: serde_json::Value,
+        delta: serde_json::Value,
+        finish_reason: &str,
+        output_tokens: Option<u64>,
+    ) -> wiremock::ResponseTemplate {
+        use serde_json::json;
+
+        let usage =
+            output_tokens.map_or_else(|| json!({}), |output| json!({"output_tokens":output}));
+        mock_completion_sse(&[
+            json!({"type":"message_start","message":{"usage":{
+                "input_tokens":31,"cache_creation_input_tokens":0,"cache_read_input_tokens":0
+            }}}),
+            json!({"type":"content_block_start","index":0,"content_block":block}),
+            json!({"type":"content_block_delta","index":0,"delta":delta}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":finish_reason},
+                   "usage":usage}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    pub(super) fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
+        let sse = events
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse)
+    }
+
+    #[derive(Default)]
+    pub(super) struct OutputLimitExecutor(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for OutputLimitExecutor {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(bamboo_agent_core::tools::ToolError::Execution(
+                "unexpected dispatch".into(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".into(),
+                function: bamboo_domain::FunctionSchema {
+                    name: "fixture_tool".into(),
+                    description: "Tool for the output limit fixture".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_output_token_limit_recovers_reasoning_and_blocks_truncated_tools() {
+        use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let reasoning_progress = "The reasoning reaches its limit.";
+        let make_thinking = |usage| {
+            mock_messages_completion(
+                json!({"type":"thinking","thinking":"","signature":""}),
+                json!({"type":"thinking_delta","thinking":reasoning_progress}),
+                "max_tokens",
+                usage,
+            )
+        };
+        let thinking = make_thinking(Some(7));
+        let unreported_thinking = make_thinking(None);
+        let truncated_tool = mock_messages_completion(
+            json!({"type":"tool_use","id":"call_partial","name":"fixture_tool","input":{}}),
+            json!({"type":"input_json_delta","partial_json":"{"}),
+            "max_tokens",
+            Some(7),
+        );
+        let answer = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"The recovered answer."}),
+            "end_turn",
+            Some(3),
+        );
+
+        for (scenario, first, retry, succeeds) in [
+            ("recovery", &thinking, Some(&answer), true),
+            ("provider-default-effort", &thinking, Some(&answer), true),
+            ("repeated-limit", &thinking, Some(&thinking), false),
+            ("truncated-tool", &truncated_tool, None, false),
+            ("run-budget", &thinking, None, false),
+            ("missing-output-usage", &unreported_thinking, None, false),
+            ("unset-effort", &thinking, Some(&answer), true),
+            ("pinned-effort", &thinking, Some(&answer), true),
+        ] {
+            let preserve_effort = matches!(scenario, "unset-effort" | "pinned-effort");
+            let server = MockServer::start().await;
+            let mut first_request = Mock::given(method("POST")).and(path("/messages"));
+            if scenario != "unset-effort" {
+                first_request =
+                    first_request.and(body_partial_json(json!({"output_config":{"effort":"max"}})));
+            }
+            first_request
+                .respond_with(first.clone())
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            if let Some(retry) = retry {
+                let request = Mock::given(method("POST")).and(path("/messages"));
+                let request = if preserve_effort {
+                    request.and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                } else {
+                    request.and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                };
+                request
+                    .respond_with(retry.clone())
+                    .with_priority(1)
+                    .expect(if scenario == "repeated-limit" { 2 } else { 1 })
+                    .mount(&server)
+                    .await;
+            }
+            let overrides = (scenario == "pinned-effort").then(|| {
+                serde_json::from_value(json!({"common":{"body_patch":[{
+                    "op":"set","path":"/output_config/effort","value":"max"
+                }]}}))
+                .unwrap()
+            });
+            let llm = bamboo_llm::AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_reasoning_effort(
+                    (scenario == "provider-default-effort").then_some(ReasoningEffort::Max),
+                )
+                .with_request_overrides(overrides);
+            let tools = Arc::new(OutputLimitExecutor::default());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.reasoning_effort =
+                (!matches!(scenario, "unset-effort" | "provider-default-effort"))
+                    .then_some(ReasoningEffort::Max);
+            config.token_budget = Some(bamboo_compression::TokenBudget::with_safety_margin(
+                32_000,
+                256,
+                Default::default(),
+                0,
+            ));
+            if matches!(scenario, "run-budget" | "missing-output-usage") {
+                config.run_budget.max_total_tokens = Some(38);
+            }
+            // Keep this fixture on the bounded single-round retry path.
+            config.run_budget.max_rounds = Some(1);
+            let mut session = Session::new(scenario, "model");
+            session.add_message(Message::user("Answer the original request."));
+            let mut state = e2e_loop_state(scenario);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                1 + usize::from(retry.is_some()) + usize::from(scenario == "repeated-limit"),
+                "{scenario}"
+            );
+            let first: Value = requests[0].body_json().unwrap();
+            if scenario == "unset-effort" {
+                assert!(first.get("thinking").is_none());
+                assert!(first.pointer("/output_config/effort").is_none());
+            }
+            if retry.is_some() {
+                let second: Value = requests[1].body_json().unwrap();
+                if preserve_effort {
+                    assert!(second["messages"]
+                        .to_string()
+                        .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                    assert_eq!(second.get("thinking"), first.get("thinking"));
+                    assert_eq!(second.get("output_config"), first.get("output_config"));
+                } else {
+                    let mut expected = first.clone();
+                    expected["output_config"]["effort"] = json!("low");
+                    assert_eq!(second, expected);
+                }
+            }
+            if scenario == "repeated-limit" {
+                assert!(String::from_utf8_lossy(&requests[2].body)
+                    .contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+            }
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+            let mut answer_tokens = String::new();
+            let mut saw_reasoning_progress = false;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    AgentEvent::Token { content } => answer_tokens.push_str(&content),
+                    AgentEvent::ReasoningToken { content } => {
+                        saw_reasoning_progress |= content.contains(reasoning_progress);
+                    }
+                    AgentEvent::ToolStart { .. } => panic!("unexpected tool start in {scenario}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(saw_reasoning_progress, scenario != "truncated-tool");
+            if succeeds {
+                assert!(result.unwrap(), "{scenario}");
+                let last = session.messages.last().unwrap();
+                assert_eq!(last.content, "The recovered answer.");
+                assert_eq!(answer_tokens, last.content);
+                assert!(last.reasoning.is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(AgentError::OutputTokenLimit {
+                            finish_reason: "max_tokens",
+                            ..
+                        })
+                    ),
+                    "{scenario}: {result:?}"
+                );
+                assert_eq!(
+                    session.messages.last().unwrap().content,
+                    "Answer the original request."
+                );
+                assert!(answer_tokens.is_empty());
+            }
+            let round = &state.runtime_state.round;
+            assert_eq!(round.total_prompt_tokens, 31 * requests.len() as u64);
+            assert_eq!(
+                round.total_completion_tokens,
+                if succeeds {
+                    10
+                } else if scenario == "repeated-limit" {
+                    21
+                } else if retry.is_some() {
+                    14
+                } else if scenario == "missing-output-usage" {
+                    first["max_tokens"].as_u64().unwrap()
+                } else {
+                    7
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_output_token_limit_converges_after_wire_truncation() {
+        use bamboo_domain::ReasoningEffort;
+        use bamboo_llm::provider::OUTPUT_LIMIT_CONVERGENCE_HINT;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let exhausted = mock_messages_completion(
+            json!({"type":"thinking","thinking":"","signature":""}),
+            json!({"type":"thinking_delta","thinking":"Incomplete reasoning."}),
+            "max_tokens",
+            Some(16_384),
+        );
+        let answer = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"A small next step."}),
+            "end_turn",
+            Some(3),
+        );
+
+        for (scenario, starts_low, pinned, run_limit) in [
+            ("reported-wire", false, false, None),
+            ("configured-low", true, false, None),
+            ("patched-low", true, true, None),
+            ("final-limit", true, false, None),
+            ("run-budget", false, false, Some(40_000)),
+        ] {
+            let server = MockServer::start().await;
+            let request = || Mock::given(method("POST")).and(path("/messages"));
+            if !starts_low {
+                request()
+                    .and(body_partial_json(
+                        json!({"output_config":{"effort":"medium"}}),
+                    ))
+                    .respond_with(exhausted.clone())
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            request()
+                .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                .respond_with(exhausted.clone())
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let sends_final = scenario != "run-budget";
+            let final_hits_limit = scenario == "final-limit";
+            if sends_final {
+                request()
+                    .and(body_string_contains(OUTPUT_LIMIT_CONVERGENCE_HINT))
+                    .respond_with(if final_hits_limit {
+                        exhausted.clone()
+                    } else {
+                        answer.clone()
+                    })
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let mut patches = vec![json!({"op":"set","path":"/max_tokens","value":16_384})];
+            if pinned {
+                patches.push(json!({"op":"set","path":"/output_config/effort","value":"low"}));
+            }
+            let overrides =
+                serde_json::from_value(json!({"common":{"body_patch":patches}})).unwrap();
+            let llm = bamboo_llm::AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_thinking_replay_always(true)
+                .with_request_overrides(Some(overrides));
+            let tools = Arc::new(OutputLimitExecutor::default());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.reasoning_effort = Some(if starts_low && !pinned {
+                ReasoningEffort::Low
+            } else {
+                ReasoningEffort::Medium
+            });
+            config.token_budget = Some(bamboo_compression::TokenBudget::with_safety_margin(
+                65_536,
+                16_384,
+                Default::default(),
+                0,
+            ));
+            config.run_budget.max_total_tokens = run_limit;
+            config.run_budget.max_rounds = Some(1);
+            let mut session = Session::new(scenario, "model");
+            session.add_message(Message::user("Answer the original request."));
+            session.add_message(
+                Message::assistant_with_reasoning(
+                    "",
+                    Some(vec![bamboo_domain::ToolCall {
+                        id: "call_prior".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_domain::FunctionCall {
+                            name: "fixture_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                    Some("Earlier accepted reasoning.".into()),
+                )
+                .with_reasoning_signature(Some("prior_signature".into())),
+            );
+            session.add_message(Message::tool_result("call_prior", "Confirmed result."));
+            let prior_messages = session.messages.len();
+            let mut state = e2e_loop_state(scenario);
+            let (tx, _rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0, "{scenario}");
+            let requests = server.received_requests().await.unwrap();
+            let failed_requests = if starts_low { 1 } else { 2 };
+            assert_eq!(
+                requests.len(),
+                failed_requests + usize::from(sends_final),
+                "{scenario}: {result:?}"
+            );
+            let bodies: Vec<Value> = requests
+                .iter()
+                .map(|request| request.body_json().unwrap())
+                .collect();
+            if !starts_low {
+                let mut expected = bodies[0].clone();
+                expected["output_config"]["effort"] = json!("low");
+                assert_eq!(bodies[1], expected, "{scenario}");
+            }
+            for body in &bodies {
+                assert_eq!(body["max_tokens"], 16_384);
+                assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+            }
+            if sends_final {
+                let last_body = bodies.last().unwrap();
+                assert_eq!(last_body["output_config"]["effort"], "low");
+                let messages = last_body["messages"].to_string();
+                assert!(messages.contains("Answer the original request."));
+                assert!(messages.contains("Earlier accepted reasoning."));
+                assert!(messages.contains("prior_signature"));
+                assert!(messages.contains("Confirmed result."));
+                assert!(messages.contains(OUTPUT_LIMIT_CONVERGENCE_HINT));
+                assert!(!messages.contains("Incomplete reasoning."));
+            }
+            if sends_final && !final_hits_limit {
+                assert!(result.unwrap(), "{scenario}");
+                assert_eq!(session.messages.len(), prior_messages + 1);
+                assert_eq!(
+                    session.messages[prior_messages].content,
+                    "A small next step."
+                );
+                assert!(session.messages[prior_messages].reasoning.is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(AgentError::OutputTokenLimit {
+                            finish_reason: "max_tokens",
+                            reasoning_only: true,
+                            ..
+                        })
+                    ),
+                    "{scenario}: {result:?}"
+                );
+                assert_eq!(session.messages.len(), prior_messages);
+            }
+            let round = &state.runtime_state.round;
+            assert_eq!(round.total_prompt_tokens, 31 * requests.len() as u64);
+            assert_eq!(
+                round.total_completion_tokens,
+                16_384 * (failed_requests as u64 + u64::from(final_hits_limit))
+                    + if sends_final && !final_hits_limit {
+                        3
+                    } else {
+                        0
+                    }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
+        use bamboo_domain::ReasoningEffort;
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+            .respond_with(mock_completion_sse(&[
+                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"}),
+                json!({"type":"response.incomplete",
+                    "response":{"id":"resp_limited","status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "output":[{"id":"fc_partial","type":"function_call","call_id":"call_partial",
+                            "name":"fixture_tool","arguments":"{"}],
+                        "usage":{"input_tokens":29,"output_tokens":11,
+                                 "output_tokens_details":{"reasoning_tokens":10}}}}),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let llm = bamboo_llm::OpenAIProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_responses_only_models(vec!["model".into()])
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        let tools = Arc::new(OutputLimitExecutor::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = canonical_usage_pipeline_config();
+        config.app_data_dir = Some(dir.path().into());
+        config.reasoning_effort = Some(ReasoningEffort::Max);
+        let mut session = Session::new("responses-truncated", "model");
+        session.add_message(Message::user("Answer the original request."));
+        session
+            .metadata
+            .insert("responses.previous_response_id".into(), "resp_prior".into());
+        let mut state = e2e_loop_state(&session.id);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(llm),
+            tools.clone(),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::OutputTokenLimit {
+                    finish_reason: "max_output_tokens",
+                    response_id: Some(ref id),
+                    reasoning_only: false,
+                }) if id == "resp_limited"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "Answer the original request."
+        );
+        assert_eq!(
+            session.metadata["responses.previous_response_id"],
+            "resp_prior"
+        );
+        let (mut visible, mut discarded) = (None, None);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::VisibleMessageStart { message_id, .. } => visible = Some(message_id),
+                AgentEvent::VisibleMessageDiscard { message_id } => discarded = Some(message_id),
+                AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
+                _ => {}
+            }
+        }
+        assert!(visible.is_some());
+        assert_eq!(discarded, visible);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 29);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 11);
     }
 
     #[tokio::test]
@@ -10766,80 +11820,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it() {
-        use crate::runtime::stream::handler::StreamHandlingOutput;
-
-        let call = |arguments: serde_json::Value| bamboo_agent_core::tools::ToolCall {
-            id: "plan-budget".into(),
-            tool_type: "function".into(),
-            function: bamboo_agent_core::tools::FunctionCall {
-                name: "Plan".into(),
-                arguments: arguments.to_string(),
-            },
-        };
-        let mut output = StreamHandlingOutput {
-            response_id: None,
-            visible_message: None,
-            content: String::new(),
-            reasoning_content: String::new(),
-            reasoning_signature: None,
-            token_count: 0,
-            tool_calls: [0, 512, 1024]
-                .into_iter()
-                .map(|offset| {
-                    call(serde_json::json!({
-                        "action":"read", "child_session_id":"existing-planner",
-                        "expected_child_created_at":"2026-10-26T00:00:00Z",
-                        "expected_assignment_sha256":"a".repeat(64),
-                        "revision":"b".repeat(64), "section_id":"s1", "offset":offset
-                    }))
-                })
-                .collect(),
-            output_tokens: 0,
-            thinking_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            provider_usage: None,
-            input_tokens: 0,
-            provider_transcript_items: Vec::new(),
-        };
-        let mut reads = super::RoundActivity::default();
-        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 0, 0);
-        reads.absorb_attempt(&output, usage);
-        reads.absorb_attempt(&output, usage);
-        let mut runtime = AgentRuntimeState::default();
-        reads.commit_to_runtime(&mut runtime);
-        assert_eq!(
-            runtime.round.total_tool_calls, 6,
-            "reads still count as tools"
-        );
-        assert_eq!(runtime.round.total_subagents_spawned, 0);
-        let budget = bamboo_config::RunBudgetConfig {
-            max_subagents: Some(2),
-            ..Default::default()
-        };
-        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
-
-        output.tool_calls = vec![call(
-            serde_json::json!({"action":"create","task":"Plan only"}),
-        )];
-        let mut create = super::RoundActivity::default();
-        create.absorb_attempt(&output, usage);
-        create.commit_to_runtime(&mut runtime);
-        assert_eq!(runtime.round.total_subagents_spawned, 1);
-        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
-        create.commit_to_runtime(&mut runtime);
-        let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
-        assert_eq!(exceeded.kind, "max_subagents");
-        assert_eq!(exceeded.actual, 2);
-        for arguments in [r#"{"task":"legacy create"}"#, "{"] {
-            output.tool_calls[0].function.arguments = arguments.into();
-            assert!(is_child_spawn_call(&output.tool_calls[0]));
-        }
-    }
-
-    #[test]
-    fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
+    fn is_child_spawn_call_counts_subagent_creates_only() {
         let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
             tool_type: "function".to_string(),
@@ -10849,8 +11830,8 @@ mod tests {
             },
         };
         assert!(
-            is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
-            "a default Plan call creates one planner child"
+            !is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
+            "a retired Plan call cannot consume child capacity"
         );
         assert!(
             is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
@@ -10865,13 +11846,27 @@ mod tests {
             "action=wait manages an existing child, not a spawn"
         );
         assert!(
-            !is_child_spawn_call(&call("SubAgent", r#"{"action":"list"}"#)),
-            "action=list is read-only, not a spawn"
+            !is_child_spawn_call(&call(
+                "SubAgent",
+                r#"{"action":"get","child_session_id":"child"}"#,
+            )),
+            "action=get inspects an existing child"
         );
         assert!(
             !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),
             "a differently named tool is never counted, regardless of args"
         );
+        assert!(is_child_spawn_call(&call(
+            "SubAgent",
+            r#"{"message":"Read only","role":"explorer"}"#,
+        )));
+        for args in [
+            r#"{"intent":"inspect","target":"child","message":"result"}"#,
+            r#"{"intent":"wait","target":"child"}"#,
+            r#"{"intent":"chat","target":"child","message":"Continue"}"#,
+        ] {
+            assert!(!is_child_spawn_call(&call("SubAgent", args)), "{args}");
+        }
     }
 
     #[test]
@@ -11926,6 +12921,7 @@ mod tests {
     }
 
     include!("child_index_observation_tests.rs");
+    include!("child_inspection_wait_tests.rs");
 
     #[tokio::test]
     async fn safety_net_suspends_on_orphaned_active_children() {
@@ -13053,6 +14049,13 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                false,
+                &super::RoundToolDispatch {
+                    mode: CapabilityLoadingMode::LegacyFullCatalog,
+                    catalog: tools.list_tools(),
+                    fallback_discovery: false,
+                    selection: Default::default(),
+                },
             ),
         )
         .await;
@@ -13359,6 +14362,13 @@ mod tests {
                 "model",
                 &mut task_context,
                 &cancel_token,
+                false,
+                &super::RoundToolDispatch {
+                    mode: CapabilityLoadingMode::LegacyFullCatalog,
+                    catalog: tools.list_tools(),
+                    fallback_discovery: false,
+                    selection: Default::default(),
+                },
             ),
         )
         .await
@@ -16329,6 +17339,10 @@ mod final_evidence_tests;
 #[cfg(test)]
 #[path = "pipeline_model_routing_tests.rs"]
 mod model_routing_tests;
+
+#[cfg(test)]
+#[path = "pipeline_output_limit_split_tests.rs"]
+mod output_limit_split_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

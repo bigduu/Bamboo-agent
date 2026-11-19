@@ -56,30 +56,36 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
 /// A session-selected prompt enhancement for a root that coordinates child
 /// work. Keep this independent of the current SubAgent action schema: the
 /// runtime will continue to own the concrete delegation and inspection calls.
-const ROOT_ORCHESTRATION_GUIDANCE: &str = "Root delegation mode (explicitly selected for this Session):\n\
-Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate. Split multi-part work into non-overlapping independently verifiable slices and run them as parallel children; serialize dependent slices or shared-file writes.\n\
-For uncertain or multi-step work, delegate a read-only Plan to a child and review its plan and evidence before assigning implementation.\n\
-Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
+const ROOT_ORCHESTRATION_INTRO: &str = "Root delegation mode (explicitly selected for this Session):\n\
+Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate. Split multi-part work into non-overlapping independently verifiable slices and run them as parallel children; serialize dependent slices or shared-file writes.";
+
+const ROOT_ORCHESTRATION_GUIDANCE: &str = "Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
 Inspect authoritative child progress and results when needed. Correct or revise the same child's assignment, then confirm the child received the change.\n\
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
-const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode: increase task-wide reasoning through independent child planning and narrow delegated execution, followed by Root verification and synthesis. Use the existing read-only Plan for planning. Split the work into non-overlapping independently verifiable slices and run them in parallel rather than funneling all work through one delegate; serialize dependent slices or shared-file writes. Keep required user goals, constraints and acceptance criteria intact. This product policy is independent of each model call's reasoning effort; it does not claim a native provider Ultra budget.";
+const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
+
+const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
+Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
+This mode is independent of each model call's reasoning effort.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
 Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to authorized workers. Use only bounded Session/Work/plan views here. Delegate every direct workspace/file read, search, image read, write, shell or process operation to another Session; read-only file tools are not an exception. A Skill, Workflow, browser or external tool is not a shortcut. Split multi-part execution into independently verifiable slices with non-overlapping file ownership and dispatch them in parallel to separate workers instead of funneling everything through one worker; serialize only dependent slices or shared-file writes.\n\
-Existing-session-first: discover the current application user's Projects and Sessions through canonical Host views. Use session_history list to find existing Sessions, then bounded inspect of suitable targets. The trusted Supervisor role has default management within this user-data domain; do not ask for per-Project UI authorization. It has no authority over other users, data domains or external accounts. Prefer a task-aligned existing independent Root and continue or correct that same target rather than creating an overlapping worker. Use the canonical session_control followup or separately authorized session_message route; preserve the target's own history, model, Project, workspace, run and permissions. A pending target approval still requires its real decision. When no suitable Root exists, use session_control create only when the Host advertises it, in a canonical current-user Project with a Host-bound workspace. Reuse the complete request and operation UUID after an uncertain response; creation/admission is not completion. This creates neither a Child nor a formal Work/Ticket or isolated worktree. Never inherit Supervisor management into a worker or Observer. Track the parallel workstreams you manage through session_control directory observation instead of memory: entries report origin (supervisor-created or user-opened), live-link state, persisted progress, and the last canonical Human engagement mark. An entry whose engagement postdates your dispatch means the user has taken over that session: do not keep followup-interrupting it unless the user asks. Directory observation grants no control and is never completion evidence. Inspect authoritative progress and result evidence before claiming completion.\n\
-Compare each returned artifact and its evidence against the assigned acceptance criteria. Missing, stale or mismatching evidence is not a pass: identify the failed criterion, reject the exact current submission when applicable, and send a bounded correction through the existing assignment or Work rework path. Reinspect the corrected result before reporting technical verification. Technical verification does not replace final User acceptance: preserve user_acceptance_required and, when it is true, wait for explicit User acceptance of the exact current submission.\n\
-Use a bounded SubAgent or read-only Plan child only for auxiliary planning, review or verification; keep main execution with an independent managed Session. Continue or correct the same child by its returned ActorId. Use work_dispatch only within an existing explicit Work authority; do not introduce Work as a fallback for missing Session scope. Do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
+Session discovery: use canonical Host views for the current application user's Projects and Sessions. Use session_history list and bounded inspect when you need to verify a candidate. The trusted Supervisor role has default management within this user-data domain; do not ask for per-Project UI authorization. It has no authority over other users, data domains or external accounts. To continue a verified assignment, use the canonical session_control followup or separately authorized session_message route; preserve the target's history, model, Project, workspace, run and permissions. A pending target approval still requires its real decision. For a new independent Root, use the Host's advertised creation tool. Reuse the complete request and operation UUID after an uncertain response; creation/admission is not completion. This creates neither a Child nor a formal Work/Ticket or isolated worktree. Never inherit Supervisor management into a worker or Observer. Track parallel workstreams through session_control directory observation instead of memory: entries report origin (supervisor-created or user-opened), live-link state, persisted progress, and the last canonical Human engagement mark. An entry whose engagement postdates your dispatch means the user has taken over that session: do not keep followup-interrupting it unless the user asks. Directory observation grants no control and is never completion evidence. Use authoritative Run evidence for delivery status and compare acceptance evidence when verification is requested.\n\
+When technical verification or acceptance is part of the workflow, compare the returned artifact and its evidence against the assigned acceptance criteria. Missing, stale or mismatching evidence is not a pass: identify the failed criterion, reject the exact current submission when applicable, and send a bounded correction through the existing assignment or Work rework path. Reinspect the corrected result before reporting technical verification. Technical verification does not replace final User acceptance: preserve user_acceptance_required and, when it is true, wait for explicit User acceptance of the exact current submission.\n\
+Use SubAgent only for auxiliary planning, review or verification. Select its read-only explorer role for planning and keep main execution with an independent managed Session. Continue or correct the same child by its returned ActorId. Use work_dispatch only within an existing explicit Work authority; do not introduce Work as a fallback for missing Session scope. Do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
 No suitable Session and no available canonical creation route is an actionable blocker. If the Host still exposes an older per-Project restriction, report the missing current-user management capability as a Host migration blocker instead of requesting one grant per Project. If a worker or tool is unavailable, a target requires a human decision, or an assignment fails, report the actual recoverable blocker; never self-execute or substitute a main-execution Child. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying and reuse it where possible. Do not create overlapping assignments, retry unchanged failures indefinitely, change target permissions or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
     if session.supervisor_incarnation_id().is_some() {
-        let guidance = if session.root_orchestration_only_enabled() {
-            format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{ULTRA_ROOT_GUIDANCE}")
-        } else {
-            SUPERVISOR_DELEGATION_GUIDANCE.to_string()
-        };
+        let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
+        let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
+        let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
+        if session.root_orchestration_only_enabled() {
+            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification when the assignments are independent.");
+        }
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
             ContextBlockPriority::Critical,
@@ -91,9 +97,9 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
     (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
         || {
             let guidance = if session.root_orchestration_only_enabled() {
-                format!("{ULTRA_ROOT_GUIDANCE}\n\n{ROOT_ORCHESTRATION_GUIDANCE}")
+                format!("{ULTRA_ROOT_GUIDANCE}\n\n{ROOT_ORCHESTRATION_INTRO}\n{ROOT_ORCHESTRATION_GUIDANCE}")
             } else {
-                ROOT_ORCHESTRATION_GUIDANCE.to_string()
+                format!("{ROOT_ORCHESTRATION_INTRO}\n{ROOT_PLANNING_GUIDANCE}\n{ROOT_ORCHESTRATION_GUIDANCE}")
             };
             ContextBlock::new(
                 ContextBlockType::RootOrchestration,
@@ -160,17 +166,11 @@ pub(crate) fn build_root_orchestration_context_block_for_tools(
 #[cfg(test)]
 #[test]
 fn root_orchestration_guidance_is_bounded_and_schema_independent() {
-    assert!(ROOT_ORCHESTRATION_GUIDANCE.len() <= 1_200);
-    assert!(ULTRA_ROOT_GUIDANCE.len() + ROOT_ORCHESTRATION_GUIDANCE.len() <= 1_800);
-    for concept in [
-        "Plan",
-        "progress",
-        "Correct",
-        "scope",
-        "approval",
-        "evidence",
-        "parallel children",
-    ] {
+    let shared_len = ROOT_ORCHESTRATION_INTRO.len() + ROOT_ORCHESTRATION_GUIDANCE.len();
+    assert!(shared_len + ROOT_PLANNING_GUIDANCE.len() + 2 <= 1_200);
+    assert!(shared_len + ULTRA_ROOT_GUIDANCE.len() + 3 <= 1_800);
+    assert!(ROOT_ORCHESTRATION_INTRO.contains("parallel children"));
+    for concept in ["progress", "Correct", "scope", "approval", "evidence"] {
         assert!(
             ROOT_ORCHESTRATION_GUIDANCE.contains(concept),
             "missing {concept}"
@@ -196,12 +196,21 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     let guidance = build_root_orchestration_context_block(&restored)
         .expect("durable orchestration-only mode supplies delegation guidance");
     assert_eq!(guidance.block_type, ContextBlockType::RootOrchestration);
-    assert!(guidance.content.contains("delegate a read-only Plan"));
+    assert!(guidance.content.contains("read-only explorer role"));
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance.content.contains("independent of each model call"));
-    assert!(guidance
-        .content
-        .contains("run them in parallel rather than funneling"));
+    for concept in [
+        "Launch ready independent SubAgent assignments in parallel",
+        "within the available capacity and budget",
+        "While children run, dispatch additional ready assignments and advance your own independent work",
+        "Make authorized file edits directly",
+        "prerequisites only for the work that depends on them",
+        "Wait when a required child result blocks further useful work",
+        "one child can be enough for simple or sequential tasks",
+    ] {
+        assert!(guidance.content.contains(concept), "missing {concept}");
+    }
+    assert!(!guidance.content.contains(ROOT_PLANNING_GUIDANCE));
 
     let child = Session::new_child_of("child", &restored, "model", "worker");
     assert!(build_root_orchestration_context_block(&child).is_none());
@@ -214,6 +223,7 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     disabled.set_root_orchestration_prompt_enabled(true);
     let prompt_only = build_root_orchestration_context_block(&disabled).unwrap();
     assert!(!prompt_only.content.contains("Ultra Root thinking mode"));
+    assert!(prompt_only.content.contains(ROOT_PLANNING_GUIDANCE));
 }
 
 #[cfg(test)]
@@ -230,13 +240,15 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
-        assert_eq!(block.content.contains("Ultra Root thinking mode"), ultra);
         assert_eq!(
             block
                 .content
-                .contains("Split the work into non-overlapping independently verifiable slices"),
+                .contains("In Ultra, prefer parallel auxiliary"),
             ultra
         );
+        assert!(!block
+            .content
+            .contains("Make authorized file edits directly"));
         assert!(block.content.contains("before retrying"));
         for concept in [
             "Supervisor",
@@ -932,7 +944,7 @@ mod tests {
 
 #[cfg(test)]
 #[test]
-fn supervisor_existing_session_first_policy_keeps_children_auxiliary_and_scope_explicit() {
+fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -944,12 +956,20 @@ fn supervisor_existing_session_first_policy_keeps_children_auxiliary_and_scope_e
             .unwrap()
             .content;
         for concept in [
-            "Existing-session-first",
+            "dispatch and report only the requested assignments",
+            "its own fresh Host notification",
+            "same assignment",
+            "new independent Session for a separate assignment or requested context isolation",
+            "intended Project and workspace",
+            "Project is optional",
+            "omit both project_id and workspace_path",
+            "a sole available Project does not count",
+            "ask one focused question before dispatching that assignment",
             "session_history list",
             "bounded inspect",
             "main execution",
             "auxiliary planning",
-            "same target",
+            "continue a verified assignment",
             "current application user",
             "No suitable Session",
             "never self-execute",

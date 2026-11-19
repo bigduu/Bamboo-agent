@@ -8,7 +8,44 @@ use bamboo_tickets::{
     TicketKind, TicketService, WorkState,
 };
 
-use super::{DiagnosticInput, Observation, ObservationKind, ObservationPort, PortError, Scope};
+use super::{
+    DiagnosticInput, ExpectedWait, Observation, ObservationKind, ObservationPort, Policy,
+    PortError, Progress, Scope, WaitKind,
+};
+
+/// One read-only Host sample, tied to the exact canonical Ticket snapshot and
+/// receipt. It carries no executable permission and is never deserialized from
+/// a model, HTTP request or recovery checkpoint. The Host verifies Child birth,
+/// native Run identity and the exact current wait before constructing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeObservation {
+    pub scope: Scope,
+    pub source_commit: String,
+    pub receipt: bamboo_tickets::RuntimeReceipt,
+    pub wait: RuntimeWait,
+}
+
+/// Fresh Host start and wait facts. Heartbeat is supplied separately by callers
+/// that can prove a successful native renewal. These facts carry no grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFacts {
+    pub scope: Scope,
+    pub source_commit: String,
+    pub receipt: bamboo_tickets::RuntimeReceipt,
+    pub started_at_ms: Option<u64>,
+    pub wait: Option<RuntimeWait>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeWait {
+    pub kind: WaitKind,
+    /// A canonical wait/suspension/yield boundary, never observation time.
+    pub registered_at_ms: u64,
+    /// Existing runtime deadline, if any. None creates no business deadline.
+    pub timeout_at_ms: Option<u64>,
+    pub request_id: Option<String>,
+    pub evidence_ref: String,
+}
 
 /// A single-use observation prepared after the outer Host's fresh authority
 /// check. It cannot become a cached read grant or silently refresh itself.
@@ -78,9 +115,63 @@ pub fn scope_for_assignment(
     Ok(scope)
 }
 
+/// Canonical attempt selector only; callers still authorize through
+/// scope_for_assignment/read_observation. A yielded Question has no active
+/// pointer after owned stop, so retain only its unique exact current attempt.
+pub fn current_assignment_id(
+    snapshot: &Snapshot,
+    work_id: &str,
+) -> Result<Option<String>, PortError> {
+    let work = snapshot.tickets.get(work_id).ok_or(PortError::Denied)?;
+    if let Some(id) = work.active_assignment.as_ref().or_else(|| {
+        work.current_submission
+            .as_ref()
+            .and_then(|id| snapshot.submissions.get(id))
+            .map(|submission| &submission.assignment_id)
+    }) {
+        return Ok(Some(id.clone()));
+    }
+    let mut candidates = snapshot.assignments.values().filter(|assignment| {
+        assignment.work_id == work.id
+            && assignment.generation == work.generation
+            && assignment.contract_revision == work.contract_revision
+            && (work.state == WorkState::Cancelled
+                || yielded_question(snapshot, assignment).is_some())
+    });
+    let result = candidates.next().map(|assignment| assignment.id.clone());
+    if candidates.next().is_some() {
+        return Err(PortError::Conflict);
+    }
+    Ok(result)
+}
+
+fn yielded_question<'a>(
+    snapshot: &'a Snapshot,
+    assignment: &bamboo_tickets::Assignment,
+) -> Option<&'a bamboo_tickets::PendingRequest> {
+    let work = snapshot.tickets.get(&assignment.work_id)?;
+    let request = snapshot
+        .requests
+        .get(assignment.awaiting_request.as_ref()?)?;
+    (work.state == WorkState::Blocked
+        && assignment.state == AssignmentState::Blocked
+        && assignment.process_stopped
+        && request.work_id == work.id
+        && request.assignment_id.as_deref() == Some(&assignment.id)
+        && request.generation == work.generation
+        && request.contract_revision == work.contract_revision
+        && request.status == bamboo_tickets::RequestStatus::Open
+        && request.kind == bamboo_tickets::RequestKind::Question
+        && request.prompt_revision > 0
+        && request.worker_packet_hash.as_ref().is_some_and(|hash| {
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }))
+    .then_some(request)
+}
+
 /// Always projects a bounded authoritative snapshot, so an event gap causes no
-/// replay of cached deltas. There are currently no canonical start/heartbeat/
-/// progress/wait timestamps in Ticket: these stay explicitly unavailable.
+/// replay of cached deltas. Live runtime facts, including progress from a
+/// receipt tied to a current native Task, require the separate Host read.
 pub fn read_observation(
     service: &TicketService,
     authority: &Authority,
@@ -88,6 +179,146 @@ pub fn read_observation(
 ) -> Result<TicketObservation, PortError> {
     let (commit, snapshot) = checked_snapshot(service, authority, &scope.work_id)?;
     let observation = project(&snapshot, scope)?;
+    current(service, &commit)?;
+    Ok(TicketObservation {
+        observation: Some(observation),
+        scope: scope.clone(),
+    })
+}
+
+/// Join a verified wait to fresh ledger authority.
+pub fn read_observation_with_runtime(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeObservation,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
+    read_observation_with_runtime_facts(
+        service,
+        authority,
+        scope,
+        &RuntimeFacts {
+            scope: runtime.scope.clone(),
+            source_commit: runtime.source_commit.clone(),
+            receipt: runtime.receipt.clone(),
+            started_at_ms: None,
+            wait: Some(runtime.wait.clone()),
+        },
+        policy,
+    )
+}
+
+pub fn read_observation_with_runtime_facts(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
+    read_observation_with_runtime_heartbeat(service, authority, scope, runtime, None, policy)
+}
+
+/// Join a confirmed native heartbeat to the same current Scope and receipt as
+/// the Task entry. A heartbeat supplies no meaningful-progress measurement.
+pub fn read_observation_with_runtime_heartbeat(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    heartbeat_at_ms: Option<u64>,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
+    read_observation_with_live_runtime(
+        service,
+        authority,
+        scope,
+        runtime,
+        heartbeat_at_ms,
+        None,
+        policy,
+    )
+}
+
+/// Project qualifying committed workspace progress within the live Task's
+/// observation window. Only the Host may supply the verified Task entry.
+pub fn read_observation_with_live_runtime(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    heartbeat_at_ms: Option<u64>,
+    progress_cutoff_ms: Option<u64>,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
+    let (commit, snapshot) = checked_snapshot(service, authority, &scope.work_id)?;
+    if runtime.scope != *scope || runtime.source_commit != commit {
+        return Err(PortError::Conflict);
+    }
+    if runtime.started_at_ms == Some(0)
+        || heartbeat_at_ms
+            .is_some_and(|heartbeat| runtime.started_at_ms.is_none_or(|start| heartbeat < start))
+    {
+        return Err(PortError::Denied);
+    }
+    let mut observation = project(&snapshot, scope)?;
+    let assignment = &snapshot.assignments[&scope.assignment_id];
+    if assignment.runtime.as_ref() != Some(&runtime.receipt) {
+        return Err(PortError::Denied);
+    }
+    if !observation.execution_unknown && !observation.terminal {
+        observation.started_at_ms = runtime.started_at_ms;
+        observation.heartbeat_at_ms = heartbeat_at_ms;
+        observation.progress = runtime
+            .started_at_ms
+            .zip(progress_cutoff_ms)
+            .and_then(|(start, cutoff)| {
+                snapshot.latest_workspace_write_progress(&assignment.id, start, cutoff)
+            })
+            .map(|(sequence, at_ms)| Progress { sequence, at_ms });
+        if let Some(wait) = &runtime.wait {
+            match wait.kind {
+                WaitKind::User => {
+                    let request = wait
+                        .request_id
+                        .as_ref()
+                        .and_then(|id| snapshot.requests.get(id))
+                        .ok_or(PortError::Denied)?;
+                    if assignment.awaiting_request.as_ref() != Some(&request.id)
+                        || yielded_question(&snapshot, assignment).map(|question| &question.id)
+                            != Some(&request.id)
+                        || request.work_id != scope.work_id
+                        || request.assignment_id.as_deref() != Some(&scope.assignment_id)
+                        || request.generation != scope.generation
+                        || request.contract_revision != assignment.contract_revision
+                        || request.status != bamboo_tickets::RequestStatus::Open
+                        || request.kind != bamboo_tickets::RequestKind::Question
+                    {
+                        return Err(PortError::Denied);
+                    }
+                }
+                WaitKind::Dependency | WaitKind::RunningTool if wait.request_id.is_some() => {
+                    return Err(PortError::Denied);
+                }
+                _ => {}
+            }
+            let allowance = wait
+                .registered_at_ms
+                .checked_add(policy.max_expected_wait_ms)
+                .ok_or(PortError::Unavailable)?;
+            let until_ms = wait.timeout_at_ms.map_or(allowance, |at| at.min(allowance));
+            if until_ms <= wait.registered_at_ms || !super::valid_id(&wait.evidence_ref) {
+                return Err(PortError::Denied);
+            }
+            observation.expected_wait = Some(ExpectedWait {
+                kind: wait.kind,
+                issued_at_ms: wait.registered_at_ms,
+                until_ms,
+                progress_sequence: observation.progress.map_or(0, |progress| progress.sequence),
+                evidence_ref: wait.evidence_ref.clone(),
+            });
+        }
+    }
     current(service, &commit)?;
     Ok(TicketObservation {
         observation: Some(observation),
@@ -143,7 +374,7 @@ fn current(service: &TicketService, commit: &str) -> Result<(), PortError> {
     Ok(())
 }
 
-fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError> {
+pub(super) fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError> {
     if !super::valid_scope(scope) {
         return Err(PortError::Denied);
     }
@@ -210,7 +441,10 @@ fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError>
                 && s.contract_revision == work.contract_revision
                 && Some(&s.runtime) == assignment.runtime.as_ref()
         });
-        if !current_submission && work.state != WorkState::Cancelled {
+        if !current_submission
+            && work.state != WorkState::Cancelled
+            && yielded_question(snapshot, assignment).is_none()
+        {
             return Err(PortError::Denied);
         }
     }

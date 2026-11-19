@@ -17,7 +17,9 @@ use bamboo_orchestration::{
         ReadyRetryKey, ReadyRetryPhase, ReadyRetryRequest, ReadyRetryStore, VersionedReadyRetry,
     },
 };
-use bamboo_server::app_state::ticket_application::{FileReadyRetryStore, ReadyReconcile};
+use bamboo_server::app_state::ticket_application::{
+    FileReadyRetryStore, PatrolCheckpointStore, ReadyReconcile,
+};
 use bamboo_tickets::{RuntimeReceipt, ScopeBinding, WorkState};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -536,6 +538,19 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
     ));
     assert!(host.snapshot().assignments.is_empty());
     host.assert_quiet(0).await;
+    // Own the real binding-level namespace before enabling the managed writer.
+    // Its nonblocking observer lease must fail closed while native dispatch
+    // remains available; the fixture will seed this same journal after drain.
+    let patrol_binding = bamboo_tickets::content_hash(
+        &bamboo_tickets::canonical_bytes(&host.snapshot().binding).unwrap(),
+    );
+    let patrol_root = root
+        .canonicalize()
+        .unwrap()
+        .join("orchestration")
+        .join("patrol")
+        .join(patrol_binding);
+    let mut journal = PatrolCheckpointStore::open(&patrol_root).unwrap();
     host.state()
         .tickets
         .install_ready_work_policy(support::Host::policy(project, grant))
@@ -571,6 +586,14 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
         .unwrap();
     assert_eq!(scope.authority_epoch, spec.authority_epoch);
     let observation = observe(host.state().tickets.as_ref(), &scope, 0).await;
+    // Force the managed-before-manual schedule from the negative control.
+    // The held namespace lease protects absence; Child stop alone does not
+    // quiesce this independent writer. Revoke/drain it before manual writes.
+    assert!(matches!(
+        host.state().tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::Idle
+    ));
+    host.state().tickets.revoke_ready_work_policy().await;
     let checked_at = now_ms(); // Host check time, never start or effective progress.
     let cp = Checkpoint {
         scope: scope.clone(),
@@ -597,12 +620,7 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
             escalation: None,
         }),
     };
-    let mut journal = host
-        .state()
-        .tickets
-        .open_patrol_checkpoints(&scope)
-        .await
-        .unwrap();
+    assert_eq!(journal.load(&scope).unwrap(), None);
     assert_eq!(journal.save(None, &cp), Ok(1));
     assert_eq!(journal.save(None, &cp), Err(PortError::Conflict));
     let checkpoint = journal.load(&scope).unwrap().unwrap();

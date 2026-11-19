@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -220,6 +221,42 @@ pub(crate) async fn open_skill_file_no_follow(path: &Path) -> std::io::Result<to
     Ok(tokio::fs::File::from_std(file))
 }
 
+pub(crate) async fn read_skill_file_bounded(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> SkillResult<Vec<u8>> {
+    read_skill_file_with_metadata(path, label, max_bytes)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+async fn read_skill_file_with_metadata(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> SkillResult<(Vec<u8>, std::fs::Metadata)> {
+    let file = open_skill_file_no_follow(path).await?;
+    let metadata = file.metadata().await?;
+    let size = metadata.len();
+    let over_limit = |size| {
+        SkillError::Storage(format!(
+            "{label} exceeds per-file limit ({size} > {max_bytes} bytes)"
+        ))
+    };
+    if size > max_bytes as u64 {
+        return Err(over_limit(size));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes {
+        return Err(over_limit(bytes.len() as u64));
+    }
+    Ok((bytes, metadata))
+}
+
 fn public_skill_error(error: &SkillError) -> String {
     match error {
         SkillError::Yaml(error) => match error.location() {
@@ -400,7 +437,33 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
         None,
     )
     .await
-    .map(|(report, _)| report)
+    .map(|(report, _, _)| report)
+}
+
+pub(crate) type AuthoredHeaders = HashMap<PathBuf, std::fs::Metadata>;
+
+pub(crate) async fn verify_authored_header(
+    root: &Path,
+    opened: &std::fs::Metadata,
+) -> SkillResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(root.join("SKILL.md")).await?;
+        if !current.is_file()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || current.len() != opened.len()
+            || current.modified()? != opened.modified()?
+        {
+            return Err(SkillError::Storage(
+                "Authored Workflow changed during catalog refresh".into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, opened);
+    Ok(())
 }
 
 pub(crate) async fn load_captured_records(
@@ -408,10 +471,15 @@ pub(crate) async fn load_captured_records(
     max_skill_file_bytes: usize,
     max_skill_candidates: usize,
     pool: Option<std::sync::Arc<crate::progressive::source::SourcePool>>,
-) -> SkillResult<(SkillLoadReport, crate::progressive::source::CapturedSources)> {
+) -> SkillResult<(
+    SkillLoadReport,
+    crate::progressive::source::CapturedSources,
+    AuthoredHeaders,
+)> {
     use crate::progressive::source::CandidateKey;
     let mut report = SkillLoadReport::default();
     let mut captures = crate::progressive::source::CapturedSources::new();
+    let mut authored_headers = AuthoredHeaders::new();
 
     for discovery in discovery_dirs {
         match fs::try_exists(&discovery.dir).await {
@@ -537,46 +605,34 @@ pub(crate) async fn load_captured_records(
             } else {
                 None
             };
-            let bytes = if let Some(captured) = &mut captured {
-                std::mem::take(&mut captured.main).into_bytes()
+            let (bytes, opened_header) = if let Some(captured) = &mut captured {
+                (std::mem::take(&mut captured.main).into_bytes(), None)
             } else {
-                let metadata_bytes = fs::metadata(&skill_file).await?.len() as usize;
-                if metadata_bytes > max_skill_file_bytes {
-                    let skill_root = skill_file
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    report.failed.push(FailedSkillRecord {
-                    skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
-                    skill_root,
-                    skill_file,
-                    source: discovery.source,
-                    mode: discovery.mode.clone(),
-                    error: format!("SKILL.md exceeds per-file limit ({metadata_bytes} > {max_skill_file_bytes} bytes)"),
-                });
-                    continue;
+                match read_skill_file_with_metadata(&skill_file, "SKILL.md", max_skill_file_bytes)
+                    .await
+                {
+                    Ok((bytes, metadata)) => {
+                        (bytes, (cfg!(unix) && workflow_marker).then_some(metadata))
+                    }
+                    Err(error) => {
+                        let skill_root = skill_file
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| discovery.dir.clone());
+                        report.failed.push(FailedSkillRecord {
+                            skill_id: skill_root
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_string),
+                            skill_root,
+                            skill_file,
+                            source: discovery.source,
+                            mode: discovery.mode.clone(),
+                            error: error.to_string(),
+                        });
+                        continue;
+                    }
                 }
-                let file = open_skill_file_no_follow(&skill_file).await?;
-                let mut bytes = Vec::with_capacity(metadata_bytes.min(max_skill_file_bytes));
-                file.take(max_skill_file_bytes.saturating_add(1) as u64)
-                    .read_to_end(&mut bytes)
-                    .await?;
-                if bytes.len() > max_skill_file_bytes {
-                    let skill_root = skill_file
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    report.failed.push(FailedSkillRecord {
-                    skill_id: skill_root.file_name().and_then(|name| name.to_str()).map(str::to_string),
-                    skill_root,
-                    skill_file,
-                    source: discovery.source,
-                    mode: discovery.mode.clone(),
-                    error: format!("SKILL.md exceeds per-file limit after read ({} > {max_skill_file_bytes} bytes)", bytes.len()),
-                });
-                    continue;
-                }
-                bytes
             };
             match String::from_utf8(bytes) {
                 Ok(content) => match parse_markdown_skill(&skill_file, &content) {
@@ -595,6 +651,16 @@ pub(crate) async fn load_captured_records(
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| discovery.dir.clone());
+                        if skill.metadata.as_ref().is_some_and(|metadata| {
+                            metadata
+                                .get("workflow_definition_authoring")
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(1)
+                        }) {
+                            if let Some(metadata) = opened_header {
+                                authored_headers.insert(skill_root.clone(), metadata);
+                            }
+                        }
                         report.loaded.push(LoadedSkillRecord {
                             skill,
                             skill_root,
@@ -661,7 +727,7 @@ pub(crate) async fn load_captured_records(
         report.loaded.len(),
         report.failed.len()
     );
-    Ok((report, captures))
+    Ok((report, captures, authored_headers))
 }
 
 /// Discover additional skill-discovery dirs contributed by installed

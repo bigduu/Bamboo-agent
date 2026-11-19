@@ -12,6 +12,20 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_memory::memory_store::{resolve_jiandu_data_root, BAMBOO_JIANDU_DATA_DIR_ENV};
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 
+async fn init_account_event_sink(
+    events_dir: PathBuf,
+) -> std::io::Result<Arc<bamboo_engine::events::AccountEventSink>> {
+    // Recovery takes the same blocking file lock as journal publishers. Keep
+    // their runtime available while the complete constructor waits on it.
+    tokio::task::spawn_blocking(move || bamboo_engine::events::AccountEventSink::new(events_dir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+#[cfg(test)]
+#[path = "account_journal_tests.rs"]
+mod account_journal_tests;
+
 fn default_app_state_memory_store(
     bamboo_home_dir: &std::path::Path,
 ) -> Result<bamboo_memory::memory_store::MemoryStore, AppError> {
@@ -601,7 +615,8 @@ impl AppState {
         // Account-scoped durable change feed. It is initialized before the
         // Project tool surface so non-HTTP Project mutations publish the same
         // replayable events as the REST API.
-        let account_sink = bamboo_engine::events::AccountEventSink::new(data_dir.join("events"))
+        let account_sink = init_account_event_sink(data_dir.join("events"))
+            .await
             .map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!(
                     "failed to initialize account change-feed journal: {e}"
@@ -620,11 +635,12 @@ impl AppState {
 
         // Build one creation service before shared tools. Both the generic
         // caller port and Supervisor controls retain this same durable writer.
+        let project_context_source = Arc::new(
+            crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
+        );
         let project_context_resolver = Arc::new(
             bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
-                Arc::new(crate::project_context::ProjectStoreContextSource::new(
-                    project_store.clone(),
-                )),
+                project_context_source.clone(),
                 workspace_resolver.clone(),
             ),
         );
@@ -639,6 +655,7 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
+        tickets.bind_managed_work_host(root_creator.clone(), provider_registry.clone());
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
@@ -646,7 +663,7 @@ impl AppState {
             crate::skill_runtime::WorkspaceHandoffs::new(storage.clone(), agent_runners.clone())
                 .with_actor_directory(session_store.clone()),
         );
-        let (base_tools, native_tool_ceiling, _builtin_permission_executor) = build_base_tools(
+        let (base_tools, native_tool_ceiling) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -789,7 +806,15 @@ impl AppState {
         let agent = Arc::new(
             agent_builder
                 .build()
-                .expect("agent runtime should be fully configured"),
+                .expect("agent runtime should be fully configured")
+                .with_managed_work_runtime(
+                    bamboo_engine::ticket_runtime::managed::ManagedWorkRuntime {
+                        service: tickets.managed_work_service(),
+                        inbox: file_session_inbox.clone(),
+                        config: config.clone(),
+                        projects: project_context_source,
+                    },
+                ),
         );
 
         // Only Host-owned Connect and Schedule use the mutable default
@@ -1219,13 +1244,17 @@ impl AppState {
             data_dir.join("browser-profiles"),
         ));
         let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
+        let approval_runtime = super::approval_handoff::ApprovalRuntime::default();
         let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
+            approval_runtime: approval_runtime.clone(),
             store: session_store.clone(),
+            inbox: file_session_inbox.clone(),
             router: session_activation_router.clone(),
             runners: agent_runners.clone(),
             live_retry: live_retry.clone(),
             fresh_sync: fresh_sync.clone(),
         });
+        tickets.bind_managed_work_runs(root_run.clone());
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -1240,7 +1269,7 @@ impl AppState {
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
-            subagent_model_resolver,
+            subagent_model_resolver.clone(),
             config.clone(),
             provider_registry.clone(),
             config_snapshot.subagents().broker.clone(),
@@ -1349,6 +1378,7 @@ impl AppState {
             ),
         );
         if start_inbox_reconciler {
+            observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
             // runtime recovery for due leases and missed activation handoffs.
@@ -1357,6 +1387,7 @@ impl AppState {
                 session_activation_router.clone(),
                 mcp_proxy_shutdown.clone(),
                 observer_subscriptions.clone(),
+                sessions.clone(),
             )
             .await;
             if wake_report.attempted > 0
@@ -1398,12 +1429,10 @@ impl AppState {
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
         );
-        // Dedicated child-session adapter backing the guardian review spawner.
-        // The guardian path passes an explicit model (no subagent_type routing)
-        // and registers its parent wait at the terminal gate (not via the
-        // adapter's coalescing slots), so a lightweight adapter with no resolver
-        // and a fresh wait-slot map suffices. `Arc<ChildSessionAdapter>` doubles
-        // as `Arc<dyn GuardianSpawner>`.
+        // Dedicated adapter shared by Guardian, Workflow and native Work.
+        // Guardian passes an explicit model and registers its own terminal wait;
+        // native Work uses the same saved role resolver as the Root tools.
+        // `Arc<ChildSessionAdapter>` also implements `GuardianSpawner`.
         let child_adapter = Arc::new(crate::tools::ChildSessionAdapter {
             browser: Some(browser.clone()),
             session_store: session_store.clone(),
@@ -1414,7 +1443,7 @@ impl AppState {
             sessions_cache: sessions.clone(),
             agent_runners: agent_runners.clone(),
             session_event_senders: session_event_senders.clone(),
-            subagent_model_resolver: None,
+            subagent_model_resolver,
             config: config.clone(),
             project_store: Some(project_store.clone()),
             workspace_resolver: workspace_resolver.clone(),
@@ -1427,6 +1456,15 @@ impl AppState {
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         tickets.bind_adapter(child_adapter.clone());
         tickets.bind_messenger(session_messenger.clone());
+        tickets.bind_patrol_sources(
+            memory_store.clone(),
+            project_store.clone(),
+            provider_registry.clone(),
+            config_io_lock.clone(),
+            config_facade
+                .as_ref()
+                .map(|facade| facade.registry().model_limits.clone()),
+        );
         tickets.spawn_ready_worker(mcp_proxy_shutdown.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
@@ -1544,6 +1582,7 @@ impl AppState {
             persistence,
             session_inbox,
             observer_subscriptions,
+            approval_runtime,
             session_activation_router,
             session_messenger,
             spawn_scheduler,
@@ -2079,13 +2118,29 @@ mod broker_embed_tests {
         assert!(state.config.read().await.subagents().broker.is_none());
         assert!(!dir.path().join("broker").exists());
         let child_tools = state.tools_for(crate::tools::ToolSurface::Child);
-        for name in ["Read", "Write", "Edit", "Bash", "Task"] {
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "exec_command",
+            "write_stdin",
+            "Task",
+        ] {
             assert!(
                 child_tools.owns_exact_tool(name),
                 "missing native tool {name}"
             );
         }
-        for name in ["ask_agent", "deploy_agent", "cluster"] {
+        for name in [
+            "ask_agent",
+            "deploy_agent",
+            "cluster",
+            "Bash",
+            "bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
             assert!(!state
                 .tools_for(crate::tools::ToolSurface::Root)
                 .owns_exact_tool(name));

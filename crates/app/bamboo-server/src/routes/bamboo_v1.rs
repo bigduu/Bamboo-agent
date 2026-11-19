@@ -1,9 +1,9 @@
 use actix_web::{dev::HttpServiceFactory, web};
 
-use crate::handlers::{command, copilot_auth, settings, skill, tools, workflow_runs, workspace};
+use crate::handlers::{command, settings, skill, tools, workflow_runs, workspace};
 
 /// Builds the full Bamboo internal route table (commands / settings / skills /
-/// tools / workspace / copilot-auth / provider-catalog / provider-instances /
+/// tools / workspace / provider-catalog / provider-instances /
 /// cluster-fabric) as a set of routes relative to whatever scope mounts them —
 /// this factory adds NO path prefix and NO middleware wrap of its own.
 ///
@@ -28,6 +28,7 @@ use crate::handlers::{command, copilot_auth, settings, skill, tools, workflow_ru
 pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
     web::scope("")
         .service(settings::config_share_routes())
+        .service(crate::server::tailscale::routes())
         // Command routes
         .route("/commands", web::get().to(command::list_commands))
         .route(
@@ -62,6 +63,14 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
         .route(
             "/bamboo/workflow-catalog/{workflow_id}/clone",
             web::post().to(settings::clone_workflow),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-proposals",
+            web::post().to(settings::start_workflow_proposal),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-proposals/{run_id}",
+            web::get().to(settings::get_workflow_proposal),
         )
         .route(
             "/sessions/{session_id}/workflow-runs",
@@ -267,6 +276,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::update_default_session_permission_mode),
         )
         .route(
+            "/bamboo/permission/supervisor-handoff",
+            web::put().to(settings::update_supervisor_approval_handoff),
+        )
+        .route(
             "/bamboo/permission/policy",
             web::get().to(settings::get_permission_policy),
         )
@@ -349,26 +362,6 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(workspace::list_workspace_files),
         )
         // Copilot auth routes
-        .route(
-            "/bamboo/copilot/auth/start",
-            web::post().to(copilot_auth::start_copilot_auth),
-        )
-        .route(
-            "/bamboo/copilot/auth/complete",
-            web::post().to(copilot_auth::complete_copilot_auth),
-        )
-        .route(
-            "/bamboo/copilot/authenticate",
-            web::post().to(copilot_auth::authenticate_copilot),
-        )
-        .route(
-            "/bamboo/copilot/auth/status",
-            web::post().to(copilot_auth::get_copilot_auth_status),
-        )
-        .route(
-            "/bamboo/copilot/logout",
-            web::post().to(copilot_auth::logout_copilot),
-        )
         // Provider catalog routes
         .route(
             "/bamboo/provider-catalog",
@@ -457,7 +450,7 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
 /// Configure the legacy `/v1/*` alias for Bamboo's internal routes.
 ///
 /// Three native-API prefixes used to coexist (`/api/v1` for the agent surface,
-/// bare `/v1` for settings/skills/tools/workspace/copilot/cluster, `/v2` for
+/// bare `/v1` for settings/skills/tools/workspace/cluster, `/v2` for
 /// pairing/devices/ws) — pure historical drift for the first two, since both
 /// are bamboo's own API and nothing distinguishes them by version or
 /// capability. `/api/v1` is now canonical for ALL of bamboo's native REST

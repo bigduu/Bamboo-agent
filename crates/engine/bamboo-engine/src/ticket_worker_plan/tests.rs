@@ -8,10 +8,21 @@ use std::collections::BTreeSet;
 struct CreationPort {
     parent: Session,
     saved: std::sync::Mutex<Option<Session>>,
+    validated_workspace: Option<String>,
 }
 
 #[async_trait::async_trait]
 impl ChildSessionPort for CreationPort {
+    async fn validate_child_workspace(
+        &self,
+        _: Option<&bamboo_domain::ProjectId>,
+        workspace: &str,
+    ) -> std::result::Result<String, ChildSessionError> {
+        Ok(self
+            .validated_workspace
+            .clone()
+            .unwrap_or_else(|| workspace.into()))
+    }
     async fn validate_required_child_context_route(
         &self,
         _: &std::collections::HashMap<String, String>,
@@ -104,11 +115,28 @@ pub(crate) struct Fixture {
     pub supervisor: Authority,
     pub session: Session,
     _dir: tempfile::TempDir,
+    _source: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::with_objective("Own steps only", false)
+    }
+
+    fn with_objective(objective: &str, with_project: bool) -> Self {
+        Self::with_workspace(objective, with_project, with_project)
+    }
+
+    fn with_workspace(objective: &str, with_project: bool, with_workspace: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let source = with_workspace.then(|| tempfile::tempdir().unwrap());
+        let source_path = source.as_ref().map(|dir| {
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        });
         let binding = ScopeBinding {
             scope_id: "fixture-scope".into(),
             supervisor_session_id: "fixture-supervisor".into(),
@@ -121,35 +149,76 @@ impl Fixture {
                 session_id: binding.supervisor_session_id.clone(),
             },
         );
-        let command = service
-            .prepare_command(
-                &supervisor,
-                "create",
-                vec![
-                    Operation::Create {
-                        temp_id: "work".into(),
-                        kind: TicketKind::Work,
-                        parent: None,
-                        contract: Contract {
-                            title: "Isolated fixture".into(),
-                            objective: "Own steps only".into(),
-                            constraints: vec!["Keep root private".into()],
-                            acceptance: vec!["Evidence required".into()],
-                            user_acceptance_required: true,
-                            allowed_tools: BTreeSet::from(["Task".into()]),
+        let contract = Contract {
+            title: "Isolated fixture".into(),
+            objective: objective.into(),
+            constraints: vec!["Keep root private".into()],
+            acceptance: vec!["Evidence required".into()],
+            user_acceptance_required: true,
+            allowed_tools: BTreeSet::from(["Task".into()]),
+        };
+        let mut operations = vec![Operation::Create {
+            temp_id: "work".into(),
+            kind: TicketKind::Work,
+            parent: None,
+            contract: contract.clone(),
+            depends_on: BTreeSet::new(),
+        }];
+        if with_project {
+            let project_id: bamboo_domain::ProjectId =
+                "00000000-0000-4000-8000-000000000548".parse().unwrap();
+            operations.extend([
+                Operation::AssociateProject {
+                    ticket_id: "work".into(),
+                    project_id: project_id.clone(),
+                },
+                Operation::SetProjectContext {
+                    work_id: "work".into(),
+                    context: bamboo_tickets::ProjectContextSnapshot {
+                        project_id,
+                        project_revision: 1,
+                        resource_revision: 1,
+                        workspace_binding: bamboo_domain::WorkspaceBinding {
+                            path: source_path.clone().unwrap(),
+                            label: Some("Accepted source audit".into()),
+                            git_common_dir: None,
                         },
-                        depends_on: BTreeSet::new(),
+                        contract_revision: 1,
+                        contract,
+                        sources: std::collections::BTreeMap::from([(
+                            "accepted-source".into(),
+                            "f9e69b9fbefdc0b5249c3dbe4cd1ef33739f19f7".into(),
+                        )]),
                     },
-                    Operation::Ready {
-                        work_id: "work".into(),
-                    },
-                    Operation::Start {
-                        work_id: "work".into(),
-                        temp_id: "a".into(),
-                        workspace: None,
-                    },
-                ],
-            )
+                },
+            ]);
+        }
+        operations.extend([
+            Operation::Ready {
+                work_id: "work".into(),
+            },
+            Operation::Start {
+                work_id: "work".into(),
+                temp_id: "a".into(),
+                // Metadata-only adapter fixture; physical Git/Host admission
+                // belongs to the native Work integration tests.
+                workspace: source_path
+                    .as_ref()
+                    .map(|_| bamboo_tickets::ExecutionWorkspace {
+                        repo: source_path.clone().unwrap(),
+                        base_commit: "f9e69b9fbefdc0b5249c3dbe4cd1ef33739f19f7".into(),
+                        branch: "source-audit".into(),
+                        worktree: source_path.clone().unwrap(),
+                        write_roots: vec![source_path.clone().unwrap()],
+                        claims: BTreeSet::from([format!(
+                            "worktree:{}",
+                            source_path.as_ref().unwrap()
+                        )]),
+                    }),
+            },
+        ]);
+        let command = service
+            .prepare_command(&supervisor, "create", operations)
             .unwrap();
         let receipt = service.execute(&supervisor, &command).unwrap();
         let work = receipt.ids["work"].clone();
@@ -194,6 +263,7 @@ impl Fixture {
             supervisor,
             session,
             _dir: dir,
+            _source: source,
         }
     }
 
@@ -220,6 +290,7 @@ async fn ticket_child_creation_requires_host_packet_and_starts_with_no_parent_pl
     let port = CreationPort {
         parent: parent.clone(),
         saved: std::sync::Mutex::new(None),
+        validated_workspace: None,
     };
     let input = CreateChildInput {
         parent_session: parent,
@@ -284,6 +355,125 @@ async fn ticket_child_creation_requires_host_packet_and_starts_with_no_parent_pl
         .runtime_metadata
         .insert(TICKET_LOCAL_PLAN_KEY.into(), f.assignment.clone());
     assert!(create_child_action(&port, forged).await.is_err());
+}
+
+#[tokio::test]
+async fn ticket_child_admits_multiline_packet_within_existing_required_byte_bounds() {
+    assert_bounded_ticket_child_packet(24, false, false).await;
+}
+
+#[tokio::test]
+async fn ticket_child_admits_project_packet_without_losing_adopted_context() {
+    assert_bounded_ticket_child_packet(9, true, false).await;
+}
+
+#[tokio::test]
+async fn ticket_child_accepts_same_physical_workspace_from_host_display_validation() {
+    for with_project in [false, true] {
+        assert_bounded_ticket_child_packet(24, with_project, true).await;
+    }
+}
+
+async fn assert_bounded_ticket_child_packet(
+    repetitions: usize,
+    with_project: bool,
+    display_validation: bool,
+) {
+    let objective =
+        "Review the accepted source; cite exact lines and preserve evidence boundaries. "
+            .repeat(repetitions);
+    assert!(objective.len() < 2048);
+    let f = Fixture::with_workspace(&objective, with_project, with_project || display_validation);
+    let workspace = tempfile::tempdir().unwrap();
+    let parent = Session::new("fixture-supervisor", "fixture-model");
+    let runtime =
+        Authority::from_verified_host(f.service.published().unwrap().1.binding, Principal::Runtime);
+    let packet = f
+        .service
+        .child_context_packet(&runtime, &f.assignment, 65536)
+        .unwrap();
+    let validated_workspace = display_validation.then(|| {
+        let canonical = std::path::Path::new(&packet.workspace.as_ref().unwrap().worktree);
+        let display =
+            std::path::PathBuf::from(bamboo_config::paths::path_to_display_string(canonical));
+        // The Host returns display forms, including non-verbatim paths on
+        // Windows. Exercise a distinct spelling on every local platform too.
+        let nested = display.join("display-form");
+        std::fs::create_dir(&nested).unwrap();
+        let alias = nested.join("..");
+        assert_ne!(alias, canonical);
+        assert_eq!(alias.canonicalize().unwrap(), canonical);
+        alias.to_string_lossy().into_owned()
+    });
+    let port = CreationPort {
+        parent: parent.clone(),
+        saved: std::sync::Mutex::new(None),
+        validated_workspace,
+    };
+    let compact = serde_json::to_string(&packet).unwrap();
+    assert!(
+        compact.len() > 2048,
+        "exercise serialization-induced line overflow: {} bytes",
+        compact.len()
+    );
+    eprintln!(
+        "objective={} compact_packet={} with_project={with_project}",
+        objective.len(),
+        compact.len()
+    );
+    let input = CreateChildInput {
+        parent_session: parent,
+        child_id: "fixture-child".into(),
+        title: "Source audit".into(),
+        responsibility: objective.clone(),
+        assignment_prompt: String::new(),
+        subagent_type: "worker".into(),
+        workspace: packet.workspace.as_ref().map_or_else(
+            || workspace.path().to_string_lossy().into_owned(),
+            |workspace| workspace.worktree.clone(),
+        ),
+        workspace_source: crate::project_context::WorkspaceSource::Explicit,
+        model_override: None,
+        model_ref_override: None,
+        runtime_metadata: Default::default(),
+        read_only: false,
+        auto_run: false,
+        reasoning_effort: None,
+        lifecycle: None,
+        resident_name: None,
+        resident_context: None,
+        disabled_tools: None,
+        context_fork: None,
+    };
+    create_ticket_child_action(&port, input.clone(), &f.service, &runtime, &f.assignment)
+        .await
+        .expect("a bounded Work must not fail because its JSON was serialized on one line");
+    let child = port.saved.lock().unwrap().clone().unwrap();
+    let binding = bamboo_domain::ChildContextBinding::from_session(&child)
+        .unwrap()
+        .unwrap();
+    let brief: serde_json::Value =
+        serde_json::from_str(&child.metadata["assignment_prompt"]).unwrap();
+    assert_eq!(brief, serde_json::to_value(&packet).unwrap());
+    assert!(binding.payload.required_assignment.contains(&objective));
+    assert!(binding.payload.required_assignment.len() <= bamboo_domain::MAX_CHILD_ASSIGNMENT_BYTES);
+    assert_eq!(child.metadata[TICKET_LOCAL_PLAN_KEY], f.assignment);
+    assert!(child.task_list.is_none());
+    assert_eq!(child.project_id_meta(), port.parent.project_id_meta());
+    if display_validation {
+        let other = tempfile::tempdir().unwrap();
+        let relocated = CreationPort {
+            parent: port.parent.clone(),
+            saved: std::sync::Mutex::new(None),
+            validated_workspace: Some(bamboo_config::paths::path_to_display_string(other.path())),
+        };
+        assert!(
+            create_ticket_child_action(&relocated, input, &f.service, &runtime, &f.assignment)
+                .await
+                .is_err()
+        );
+        assert!(relocated.saved.lock().unwrap().is_none());
+    }
 }
 
 #[test]

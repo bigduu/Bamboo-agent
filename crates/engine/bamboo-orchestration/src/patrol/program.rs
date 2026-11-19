@@ -41,6 +41,60 @@ impl ProgramPatrol {
         clock: &dyn Clock,
         checkpoints: &mut dyn CheckpointPort,
     ) -> Result<usize, Error> {
+        self.tick_project_with_observations(
+            service,
+            authority,
+            selection,
+            clock,
+            checkpoints,
+            &mut |scope| super::host::read_observation(service, authority, scope),
+        )
+    }
+
+    /// The outer Host may prepare runtime samples before this synchronous pass.
+    /// The factory is a read projection, not authority: the same fixed Ticket
+    /// snapshot, per-chunk authorization and exact Scope checks still apply.
+    pub fn tick_project_with_observations(
+        &self,
+        service: &bamboo_tickets::TicketService,
+        authority: &bamboo_tickets::Authority,
+        selection: &ProgramSelection<'_>,
+        clock: &dyn Clock,
+        checkpoints: &mut dyn CheckpointPort,
+        observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
+    ) -> Result<usize, Error> {
+        self.visit_project_with_observations(
+            service,
+            authority,
+            selection,
+            clock,
+            checkpoints,
+            observations,
+            &mut |scope, checkpoints, observations, _existing| {
+                self.tick(scope, clock, checkpoints, observations)
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// Visit only due, currently authorized scopes through the same bounded
+    /// Ready selection. The outer Host can supply the staged semantic pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_project_with_observations(
+        &self,
+        service: &bamboo_tickets::TicketService,
+        authority: &bamboo_tickets::Authority,
+        selection: &ProgramSelection<'_>,
+        clock: &dyn Clock,
+        checkpoints: &mut dyn CheckpointPort,
+        observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
+        visit: &mut dyn FnMut(
+            &Scope,
+            &mut dyn CheckpointPort,
+            &mut dyn ObservationPort,
+            Option<&StoredCheckpoint>,
+        ) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
         if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT
             || selection.work_ids.iter().any(|id| !super::valid_id(id))
             || selection
@@ -59,6 +113,7 @@ impl ProgramPatrol {
             return Err(PortError::Denied.into());
         }
         let (commit, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+        let health = service.health();
         // Ready permits 64 Works; the canonical inspect API bounds each read
         // to 32. Authorize every chunk against one fixed snapshot before any
         // journal write, without relaxing that API's limit.
@@ -81,34 +136,19 @@ impl ProgramPatrol {
         }
         let mut checked = 0;
         for work_id in selection.work_ids {
-            if service.published().map_err(|_| PortError::Unavailable)?.0 != commit {
+            let (_, current) = service.published().map_err(|_| PortError::Unavailable)?;
+            // Settlement can advance HEAD without changing any execution fact.
+            if current.execution_facts_revision() != snapshot.execution_facts_revision()
+                || current.binding != snapshot.binding
+                || current.seq < snapshot.seq
+                || service.health() != health
+            {
                 return Err(PortError::Conflict.into());
             }
-            let work = snapshot.tickets.get(work_id).ok_or(PortError::Denied)?;
             if snapshot.project.links.get(work_id) != Some(selection.project_id) {
                 return Err(PortError::Denied.into());
             }
-            let mut assignment = work.active_assignment.as_ref().or_else(|| {
-                work.current_submission
-                    .as_ref()
-                    .and_then(|id| snapshot.submissions.get(id))
-                    .map(|s| &s.assignment_id)
-            });
-            if assignment.is_none() && work.state == bamboo_tickets::WorkState::Cancelled {
-                // RuntimeStopped clears the active pointer after cancellation.
-                // Discover only this canonical generation/contract's attempt;
-                // the original Host projection still verifies its Spec, receipt
-                // and terminal evidence. Never guess between multiple attempts.
-                let mut candidates = snapshot.assignments.values().filter(|candidate| {
-                    candidate.work_id == work.id
-                        && candidate.generation == work.generation
-                        && candidate.contract_revision == work.contract_revision
-                });
-                assignment = candidates.next().map(|candidate| &candidate.id);
-                if candidates.next().is_some() {
-                    return Err(PortError::Conflict.into());
-                }
-            }
+            let assignment = super::host::current_assignment_id(&snapshot, work_id)?;
             let Some(assignment) = assignment else {
                 continue;
             };
@@ -117,9 +157,12 @@ impl ProgramPatrol {
                 authority,
                 selection.project_id.as_str(),
                 work_id,
-                assignment,
+                &assignment,
             )?;
-            let mut observation = super::host::read_observation(service, authority, &scope)?;
+            let mut observation = observations(&scope)?;
+            if observation.scope() != &scope {
+                return Err(PortError::Denied.into());
+            }
             let existing = checkpoints.load(&scope)?;
             if let Some(stored) = &existing {
                 super::validate_checkpoint(&stored.checkpoint, &scope)?;
@@ -135,7 +178,7 @@ impl ProgramPatrol {
                     continue;
                 }
             }
-            self.tick(&scope, clock, checkpoints, &mut observation)?;
+            visit(&scope, checkpoints, &mut observation, existing.as_ref())?;
             checked += 1;
         }
         Ok(checked)
@@ -200,6 +243,13 @@ impl ProgramPatrol {
         }
 
         let detected = self.patrol.reason(&observation, now);
+        if detected.is_none() && observation.expected_wait.is_some() {
+            // Current supported waiting is not missing execution progress.
+            // Preserve every earlier incident/notice/charge for its original
+            // reconciliation; a wait is not meaningful progress or resolution.
+            save(&mut host, &mut version, &mut cp)?;
+            return Ok(report(&cp, Status::ExpectedWait));
+        }
         if detected.is_none()
             && cp
                 .incident

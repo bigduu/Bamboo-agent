@@ -918,6 +918,10 @@ pub fn repark_permission_replay(
         serde_json::to_value(&new_request).expect("permission request serializes"),
     );
     object.remove("permission_decision_receipt");
+    object.insert(
+        bamboo_domain::PERMISSION_REPARKED_AT_KEY.into(),
+        serde_json::json!(chrono::Utc::now()),
+    );
     message.content.clone_from(&result.result);
     message.tool_success = Some(result.success);
 
@@ -946,6 +950,7 @@ pub fn repark_permission_replay(
         "runtime.suspend_reason".to_string(),
         "awaiting_clarification".to_string(),
     );
+    session.set_last_run_status("suspended");
     Ok(Some(ReparkedPermissionApproval {
         question,
         options,
@@ -1430,6 +1435,7 @@ mod tests {
                 "write_stdin",
                 "load_skill",
                 "workflow_run",
+                "Plan",
             ] {
                 assert_eq!(
                     refresh_approval_replay_posture(
@@ -1444,7 +1450,7 @@ mod tests {
                     "{ultra}: {name}"
                 );
             }
-            for name in ["Plan", "SubAgent", "session_control"] {
+            for name in ["SubAgent", "session_control"] {
                 assert!(
                     matches!(
                         refresh_approval_replay_posture(
@@ -1553,24 +1559,26 @@ mod tests {
                 &storage,
                 &mut owned,
                 PermissionMode::Default,
-                Some("Write"),
+                Some("exec_command"),
             )
             .await
             .unwrap(),
             ApprovalReplayDecision::BlockedByRootToolAuthority
         );
         assert!(owned.root_orchestration_only_enabled());
-        assert!(matches!(
-            refresh_approval_replay_posture(
-                &storage,
-                &mut owned,
-                PermissionMode::Default,
-                Some("Read")
-            )
-            .await
-            .unwrap(),
-            ApprovalReplayDecision::Execute(_)
-        ));
+        for name in ["Read", "Write", "Edit"] {
+            assert!(matches!(
+                refresh_approval_replay_posture(
+                    &storage,
+                    &mut owned,
+                    PermissionMode::Default,
+                    Some(name)
+                )
+                .await
+                .unwrap(),
+                ApprovalReplayDecision::Execute(_)
+            ));
+        }
         assert_eq!(
             refresh_approval_replay_posture(&storage, &mut owned, PermissionMode::Default, None)
                 .await
@@ -1860,6 +1868,7 @@ mod tests {
                 .unwrap()
                 .expect("second context must park");
         assert_eq!(reparked.question, "Approve context two?");
+        assert_eq!(session.last_run_status().as_deref(), Some("suspended"));
         assert_eq!(
             session
                 .pending_question

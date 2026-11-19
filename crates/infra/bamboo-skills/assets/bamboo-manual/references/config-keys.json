@@ -24,6 +24,42 @@
     },
     {
       "aliases": [],
+      "default": 0.25,
+      "example": 0.2,
+      "key": "context_management.target_usage_ratio",
+      "meaning": "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
+      "default": 0.8,
+      "example": 0.7,
+      "key": "context_management.trigger_usage_ratio",
+      "meaning": "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
+      "default": false,
+      "example": true,
+      "key": "features.ticket_dispatch",
+      "meaning": "Allow fresh Work execution admission. Work record changes and scope initialization use features.ticket_mutation.",
+      "section": "providers",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": false,
+      "example": true,
+      "key": "features.ticket_mutation",
+      "meaning": "Allow Work scope initialization and record changes for the canonical Supervisor. Existing readable scopes can still be inspected when disabled.",
+      "section": "providers",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
       "default": false,
       "example": true,
       "key": "lifecycle_hooks.enabled",
@@ -275,6 +311,23 @@
     },
     {
       "aliases": [],
+      "default": null,
+      "example": {
+        "max_evidence_bytes": 16384,
+        "max_evidence_refs": 16,
+        "max_input_tokens": 4096,
+        "max_output_tokens": 256,
+        "model": "configured-model",
+        "protocol": "registered_provider_v1",
+        "provider": "configured-provider"
+      },
+      "key": "patrol_model",
+      "meaning": "Independent patrol model selection. The registered profile uses an existing configured provider and requires a known model ceiling within the Work caps. The raw profile uses its explicit numeric loopback endpoint.",
+      "section": "model-policy",
+      "type": "option<object>"
+    },
+    {
+      "aliases": [],
       "default": "127.0.0.1",
       "example": "0.0.0.0",
       "key": "server.bind",
@@ -452,7 +505,7 @@
     },
     {
       "coverage": "selected_fields",
-      "documented_entries": 1,
+      "documented_entries": 3,
       "kind": "compatibility_dto_field",
       "root": "context_management",
       "section": "core"
@@ -493,8 +546,8 @@
       "section": "core"
     },
     {
-      "coverage": "not_documented",
-      "documented_entries": 0,
+      "coverage": "selected_fields",
+      "documented_entries": 2,
       "kind": "compatibility_dto_field",
       "root": "features",
       "section": "providers"
@@ -567,6 +620,13 @@
       "kind": "compatibility_dto_field",
       "root": "notifications",
       "section": "notifications"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "patrol_model",
+      "section": "model-policy"
     },
     {
       "coverage": "not_documented",

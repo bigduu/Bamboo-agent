@@ -13,7 +13,7 @@ pub use bamboo_server_tools::{
     assemble_legacy_skill_tools, ArchiveContextTool, AskAgentTool, ClusterTool, CompactContextTool,
     DeployAgentTool, DeployedRegistry, LedgerScheduleBridge, LedgerTool,
     LegacySkillContextRegistry, LoadSkillTool, MemoryTool, NotificationDispatcher, NotifyTool,
-    OverlayToolExecutor, PlanTool, ProjectTool, ProjectWorkspaceTool, ReadSkillResourceTool,
+    OverlayToolExecutor, ProjectTool, ProjectWorkspaceTool, ReadSkillResourceTool,
     SessionInspectorTool, SubAgentTool, ToolSurface, ToolSurfaceFactory,
 };
 

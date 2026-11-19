@@ -42,7 +42,19 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route(
+            "/publishers",
+            web::get().to(agent::plugin::publisher_policy),
+        )
+        .route(
+            "/publishers",
+            web::post().to(agent::plugin::change_publisher_policy),
+        )
         .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route(
+            "/official/jiandu/trust",
+            web::post().to(agent::plugin::trust_official_jiandu),
+        )
         .route("/nova/app", web::get().to(agent::plugin::nova_app))
         .route(
             "/nova/app/install",
@@ -118,6 +130,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::supervisor::inspect_managed_sessions),
         )
         .route(
+            "/supervisor/default/approvals",
+            web::get().to(agent::respond::list_supervisor_approval_cards),
+        )
+        .route(
             "/supervisor/default/sessions/{target_id}/history",
             web::post().to(agent::supervisor::inspect_managed_history),
         )
@@ -127,10 +143,21 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::patrol::configure)
+                .configure(agent::tickets::ready_policy::configure)
                 .configure(agent::tickets::sprints::configure)
+                .configure(agent::tickets::token_budget::configure)
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
+                .route(
+                    "/ingress/{message_id}",
+                    web::get().to(agent::tickets::inspect_ingress),
+                )
+                .route(
+                    "/ingress/{message_id}/dismiss",
+                    web::post().to(agent::tickets::dismiss_ingress),
+                )
                 .route("/search", web::post().to(agent::tickets::search))
                 .route(
                     "/project-board",
@@ -379,6 +406,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}/clear",
             web::post().to(agent::sessions::clear_session),
+        )
+        .route(
+            "/sessions/{session_id}/compact",
+            web::post().to(agent::sessions::compact_session),
+        )
+        .route(
+            "/sessions/{session_id}/compact",
+            web::get().to(agent::sessions::get_session_compaction),
         )
         .route(
             "/sessions/{session_id}/project-dream/run",
@@ -639,7 +674,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     }
 
     // Bamboo internal routes (commands/settings/skills/tools/workspace/
-    // copilot/provider-catalog/provider-instances/cluster-fabric) — nested
+    // provider-catalog/provider-instances/cluster-fabric) — nested
     // into this SAME `/api/v1` scope (not a second competing
     // `Scope("/api/v1")`) so they become reachable at the canonical prefix
     // while a separate `/v1` scope (`routes::bamboo_v1::bamboo_v1_routes`)

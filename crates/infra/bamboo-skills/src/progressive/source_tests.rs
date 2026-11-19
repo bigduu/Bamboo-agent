@@ -339,7 +339,7 @@ async fn policy_present_absent_and_same_bytes_replacement_cannot_race_publicatio
 }
 
 #[tokio::test]
-async fn invalid_lkg_refresh_failure_removal_and_recovery_never_reuse_old_authority() {
+async fn invalid_lkg_removal_and_recovery_never_reuse_old_authority() {
     let temp = Fixture::new();
     let base = temp.path().join("skills");
     let root = bundle(&base);
@@ -380,7 +380,8 @@ async fn invalid_lkg_refresh_failure_removal_and_recovery_never_reuse_old_author
         vec![b'x'; crate::store::SkillSnapshotLimits::default().max_file_bytes + 1],
     )
     .unwrap();
-    assert!(store.reload().await.is_err());
+    store.reload().await.unwrap();
+    assert_eq!(row(&store).await.status, WorkflowStatus::Invalid);
     assert_eq!(
         store.get_skill("source-fixture").await.unwrap().prompt,
         "Body"

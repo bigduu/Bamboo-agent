@@ -816,6 +816,7 @@ async fn removed_publisher_or_source_trust_fails_closed_even_if_generic_enforcem
         let mut trust = original.clone();
         trust.enforcement = bamboo_config::PluginTrustEnforcement::Off;
         if publisher {
+            trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
             trust.trusted_keys.clear();
         } else {
             trust.trusted_hosts.clear();
@@ -1194,7 +1195,12 @@ async fn download_time_policy_and_binary_changes_are_rechecked_before_install() 
     let (_dir, state, catalog, entry) = fixture(&format!("printf '%s\\n' '{}'", missing())).await;
     let artifact = catalog.app.as_ref().unwrap();
     let archive = state.app_data_dir.join("fixture.zip");
-    state.config.write().await.plugin_trust.trusted_keys.clear();
+    state
+        .config
+        .write()
+        .await
+        .plugin_trust
+        .revoke_official_publisher("nova");
     assert_eq!(
         install_downloaded(&state, mac(), &catalog, artifact, &archive)
             .await

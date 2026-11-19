@@ -21,7 +21,8 @@ use bamboo_engine::runtime::managers::lifecycle::{
 };
 use bamboo_server_tools::skill_runtime::{
     skill_response_byte_budget, SkillCatalogCaller, SkillCatalogCallerResolver,
-    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillsListTool, SkillsReadTool,
+    SkillCatalogInvocation, SkillInputFactory, SkillInputSession, SkillScopeLease, SkillsListTool,
+    SkillsReadTool,
 };
 use bamboo_server_tools::OverlayToolExecutor;
 use bamboo_skills::progressive::{render_skill_usage_instructions, SkillMetadataBudget};
@@ -41,6 +42,7 @@ pub(crate) use workspace_handoff::WorkspaceHandoffs;
 use workspace_handoff::{NativeSource, SourceBinding};
 
 const METADATA_TOKENS: usize = 2_000;
+const SKILL_GUIDANCE: &str = "Check Skill applicability. Select a candidate only when it clearly applies. If the candidates are insufficient, use skills_list when further discovery could help. Otherwise continue normally.";
 // Producer page ceiling, further narrowed by the actual dispatch cap.
 const RESPONSE_BYTES: usize = 4 * 1024;
 
@@ -342,7 +344,11 @@ impl Policy {
         self.check_source_scope(session)?;
         Ok(tightened)
     }
-    fn catalog(&self, resolver: Arc<dyn SkillCatalogCallerResolver>) -> SkillsListTool {
+    fn catalog(
+        &self,
+        resolver: Arc<dyn SkillCatalogCallerResolver>,
+        lease: &Arc<SkillScopeLease>,
+    ) -> SkillsListTool {
         SkillsListTool::new(
             self.state.skill_manager.clone(),
             self.state.config.clone(),
@@ -350,6 +356,7 @@ impl Policy {
             resolver,
         )
         .with_project_store(self.state.project_store.clone())
+        .with_scope_lease(lease)
     }
 }
 
@@ -473,6 +480,13 @@ impl NativeRun {
     fn revoke(&self) {
         self.live.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.revoke_skills();
+    }
+    fn revoke_skills(&self) {
+        self.skills_revoked.store(true, Ordering::Release);
+        if let Ok(binding) = self.source.binding() {
+            binding.skill_scope_lease.close();
+        }
     }
     fn check_live(&self) -> Result<u64, ToolError> {
         self.policy.check()?;
@@ -540,7 +554,7 @@ impl NativeRun {
         {
             // Sticky for this exact execution. Returning to bypass must not
             // revive a retained Reader or its page cursor.
-            self.skills_revoked.store(true, Ordering::Release);
+            self.revoke_skills();
         }
         Ok(())
     }
@@ -633,9 +647,11 @@ impl NativeRun {
         };
         let usage = render_skill_usage_instructions(SkillMetadataBudget::Tokens(METADATA_TOKENS))
             .ok_or_else(|| denied("Native Skill usage does not fit"))?;
+        let budget = SkillMetadataBudget::Tokens(METADATA_TOKENS);
         let tokens = METADATA_TOKENS.saturating_sub(
-            SkillMetadataBudget::Tokens(METADATA_TOKENS)
+            budget
                 .cost(usage)
+                .saturating_add(budget.cost(SKILL_GUIDANCE))
                 .saturating_add(1),
         );
         let generation = self.source.binding()?.generation;
@@ -711,7 +727,7 @@ impl SkillCatalogCallerResolver for NativeResolver {
         {
             // Retain the strict Reader rejection below, and make its observed
             // revocation sticky even if the Host later restores bypass.
-            run.skills_revoked.store(true, Ordering::Release);
+            run.revoke_skills();
         }
         workspace_handoff::check_session(self.policy.clone(), session).await?;
         run.check_owner().await?;
@@ -827,7 +843,7 @@ impl SkillExecutionHost for NativeHost {
                         .binding()
                         .map_err(engine_error)?
                         .catalog
-                        .render_catalog(&ctx)
+                        .render_task_catalog(&ctx)
                         .await;
                     let render = match render {
                         Ok(render) => render,
@@ -846,13 +862,13 @@ impl SkillExecutionHost for NativeHost {
                         }
                     };
                     if render.included_count == 0 {
-                        return Ok(String::new());
+                        return Ok(SKILL_GUIDANCE.into());
                     }
                     let usage = render_skill_usage_instructions(SkillMetadataBudget::Tokens(
                         METADATA_TOKENS,
                     ))
                     .ok_or_else(|| engine_error(denied("Native Skill usage does not fit")))?;
-                    Ok::<_, AgentError>(format!("{}\n\n{usage}", render.text))
+                    Ok::<_, AgentError>(format!("{}\n\n{}\n\n{usage}", SKILL_GUIDANCE, render.text))
                 },
             )
             .await?;

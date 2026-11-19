@@ -80,11 +80,8 @@ pub(super) async fn prepare(
                 {
                     return Err(RespondError::InvalidResponse(CHANGED_LIFETIME.to_owned()));
                 }
-                let (removed, _, clear, _) = super::prepare_error_retry(session)
+                let (removed, _) = super::prepare_error_retry(session)
                     .map_err(|reason| RespondError::InvalidResponse(reason.to_owned()))?;
-                if clear {
-                    super::clear_derived_context_state(session);
-                }
                 session.updated_at = chrono::Utc::now();
                 captured.store(removed, Ordering::Relaxed);
                 Ok(())

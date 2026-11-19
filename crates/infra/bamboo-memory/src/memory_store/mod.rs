@@ -21,6 +21,7 @@ pub use jiandu_memory::memory_store::{
     MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN,
     MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
 };
+pub use jiandu_memory::SectionId;
 
 /// Jiandu's inspection result plus Bamboo's flattened Dream timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +194,19 @@ impl MemoryStore {
             .expect("Bamboo ProjectId must satisfy Jiandu's identical path-safe contract");
         Self {
             store: self.store.for_project(&project_id),
+        }
+    }
+
+    /// Bind Section memory after the Host has resolved its Project assignment.
+    pub fn for_section(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        section_id: &SectionId,
+    ) -> Self {
+        let project_id = jiandu_memory::ProjectId::parse(project_id.as_str())
+            .expect("Bamboo ProjectId must satisfy Jiandu's identical path-safe contract");
+        Self {
+            store: self.store.for_section(&project_id, section_id),
         }
     }
 
@@ -395,6 +409,18 @@ impl MemoryStore {
     ) -> io::Result<Option<DurableMemoryDocument>> {
         self.store
             .archive_memory(id, preferred_project_key, mode, reason)
+            .await
+            .map(|document| document.map(with_unknown_session_ranges))
+    }
+
+    pub async fn archive_section_memory(
+        &self,
+        id: &str,
+        mode: DurableMemoryStatus,
+        reason: Option<&str>,
+    ) -> io::Result<Option<DurableMemoryDocument>> {
+        self.store
+            .archive_section_memory(id, mode, reason)
             .await
             .map(|document| document.map(with_unknown_session_ranges))
     }

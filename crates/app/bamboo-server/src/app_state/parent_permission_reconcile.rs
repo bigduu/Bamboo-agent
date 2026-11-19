@@ -315,6 +315,9 @@ mod tests {
         child.created_at = Utc::now() - chrono::Duration::minutes(7);
         if running_child {
             child.set_last_run_status("running");
+            let mut runtime = bamboo_domain::AgentRuntimeState::new("old-run");
+            runtime.status = bamboo_domain::AgentStatusState::Running;
+            child.agent_runtime_state = Some(runtime);
             child.updated_at = Utc::now() - chrono::Duration::minutes(1);
         }
         store.save_session(&child).await.unwrap();
@@ -616,57 +619,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_restart_denies_expired_request_and_orphaned_child_stops_running() {
-        let seed = seed_request(-chrono::Duration::seconds(1), true).await;
-        let Seed {
-            home,
-            store,
-            sessions,
-            request,
-        } = seed;
-        drop(sessions);
-        drop(store);
-        let restarted = super::super::AppState::new(home.path().to_path_buf())
-            .await
-            .unwrap();
-        let parent = restarted
-            .storage
-            .load_session("permission-parent")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            outcome::state(&parent, &request),
-            Ok(State::Terminal(false))
-        );
-        assert_eq!(parent.messages.len(), 2);
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
+    async fn server_restart_denies_expired_request_and_reconciles_only_proven_child_termination() {
+        use bamboo_domain::{
+            ActorActivationClaim, ActorActivationStatus, ActorDirectoryPort, AgentStatusState,
+        };
+        for expired_actor in [false, true] {
+            let seed = seed_request(-chrono::Duration::seconds(1), true).await;
+            let fence = if expired_actor {
+                let now = Utc::now();
+                let activation = seed
+                    .store
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: "permission-child".into(),
+                        run_id: "old-run".into(),
+                        lease_owner: "permission-restart-fixture".into(),
+                        lease_expires_at: now + chrono::Duration::seconds(2),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                seed.store
+                    .start_activation(&activation.fence(), now)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(2100)).await;
+                Some(activation.fence())
+            } else {
+                None
+            };
+            let Seed {
+                home,
+                store,
+                sessions,
+                request,
+            } = seed;
+            drop(sessions);
+            drop(store);
+            // The bounded startup sweep completes this two-record fixture
+            // before serving; a lost in-memory approval scope is no death proof.
+            let restarted = super::super::AppState::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            let parent = restarted
+                .storage
+                .load_session("permission-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                outcome::state(&parent, &request),
+                Ok(State::Terminal(false))
+            );
+            assert_eq!(parent.messages.len(), 2);
+            if let Some(fence) = fence {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let child = restarted
+                            .storage
+                            .load_session("permission-child")
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if child.last_run_status().as_deref() == Some("error") {
+                            assert_eq!(
+                                child.agent_runtime_state.as_ref().unwrap().status,
+                                AgentStatusState::Failed
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("only a proven expired attempt can close the Child run");
+                let current = restarted
+                    .session_store
+                    .inspect_actor("permission-child")
+                    .await
+                    .unwrap()
+                    .activation
+                    .unwrap();
+                assert_eq!(current.fence(), fence);
+                assert_eq!(current.run_id, "old-run");
+                assert_eq!(current.status, ActorActivationStatus::Failed);
+            } else {
                 let child = restarted
                     .storage
                     .load_session("permission-child")
                     .await
                     .unwrap()
                     .unwrap();
-                if child.last_run_status().as_deref() == Some("error") {
-                    break;
+                assert!(restarted
+                    .storage
+                    .reconcile_session_runtime(
+                        &child,
+                        Utc::now(),
+                        None,
+                        Arc::new(|_| panic!("unactivated Child has no terminal proof"))
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+                let current = restarted
+                    .storage
+                    .load_session("permission-child")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(current.last_run_status().as_deref(), Some("running"));
+                assert_eq!(
+                    current.agent_runtime_state.as_ref().unwrap().status,
+                    AgentStatusState::Running
+                );
+                let directory = restarted
+                    .session_store
+                    .resolve_rel_path(&current.id)
+                    .await
+                    .unwrap();
+                let authority = home.path().join(directory).join("actor-authority.json");
+                match tokio::fs::read(authority).await {
+                    Ok(bytes) => {
+                        let entry: bamboo_domain::ActorDirectoryEntry =
+                            serde_json::from_slice(&bytes).unwrap();
+                        assert!(entry.activation.is_none());
+                        assert_eq!(entry.actor.current_attempt, 0);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("unexpected authority read: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await
-        .expect("existing child-wait boot watchdog must retire the orphaned run");
-        assert_eq!(
-            outcome::commit(&restarted.session_repo, &request, Some(true), false).await,
-            Ok(State::Terminal(false))
-        );
-        let current = restarted
-            .storage
-            .load_session("permission-parent")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.messages.len(), 2);
+            assert_eq!(
+                outcome::commit(&restarted.session_repo, &request, Some(true), false).await,
+                Ok(State::Terminal(false))
+            );
+            let current = restarted
+                .storage
+                .load_session("permission-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.messages.len(), 2);
+        }
     }
 }

@@ -355,6 +355,12 @@ pub(super) async fn handle_get_meta(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MessageReadView {
+    Session,
+    VisibleDialogue,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_read_messages(
     tool: &SessionInspectorTool,
@@ -368,6 +374,7 @@ pub(super) async fn handle_read_messages(
     include_tool: Option<bool>,
     include_tool_calls: Option<bool>,
     include_image_urls: Option<bool>,
+    view: MessageReadView,
 ) -> Result<ToolResult, ToolError> {
     let session_id = session_id.trim().to_string();
     if session_id.is_empty() {
@@ -378,12 +385,18 @@ pub(super) async fn handle_read_messages(
 
     let from_end = from_end.unwrap_or(true);
     let offset = offset.unwrap_or(0).min(50_000);
-    let limit = limit.unwrap_or(40).min(200);
-    let truncate_chars = truncate_chars.unwrap_or(800).min(4000);
-    let include_system = include_system.unwrap_or(false);
-    let include_tool = include_tool.unwrap_or(true);
-    let include_tool_calls = include_tool_calls.unwrap_or(false);
-    let include_image_urls = include_image_urls.unwrap_or(true);
+    let visible_dialogue = view == MessageReadView::VisibleDialogue;
+    let limit = limit
+        .unwrap_or(40)
+        .min(if visible_dialogue { 20 } else { 200 });
+    let truncate_chars =
+        truncate_chars
+            .unwrap_or(800)
+            .min(if visible_dialogue { 1000 } else { 4000 });
+    let include_system = !visible_dialogue && include_system.unwrap_or(false);
+    let include_tool = !visible_dialogue && include_tool.unwrap_or(true);
+    let include_tool_calls = !visible_dialogue && include_tool_calls.unwrap_or(false);
+    let include_image_urls = !visible_dialogue && include_image_urls.unwrap_or(true);
 
     let session = match loaded_session {
         Some(session) => session,
@@ -396,6 +409,11 @@ pub(super) async fn handle_read_messages(
         .iter()
         .enumerate()
         .filter(|(_, m)| {
+            if visible_dialogue {
+                return matches!(m.role, Role::User | Role::Assistant)
+                    && !m.content.trim().is_empty()
+                    && !bamboo_engine::session_app::execute::is_hidden_from_ui(m);
+            }
             if !include_system && matches!(m.role, Role::System) {
                 return false;
             }
@@ -453,7 +471,11 @@ pub(super) async fn handle_read_messages(
             "limit": limit,
             "slice_count": slice.len(),
             "messages": slice,
-            "note": "If you need to read a lot of content, iterate with bounded read_messages calls. Only delegate to a child session if the user explicitly asks."
+            "note": if visible_dialogue {
+                "Cross-Session pages contain visible user and assistant text, including archived messages. Continue with read_messages using offset."
+            } else {
+                "If you need to read a lot of content, iterate with bounded read_messages calls. Only delegate to a child session if the user explicitly asks."
+            }
         })
         .to_string(),
         display_preference: Some("Collapsible".to_string()),

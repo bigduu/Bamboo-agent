@@ -20,6 +20,10 @@ use crate::plugin_source::{
     install_server_plugin_from_source_with_event_sink_grants, PluginSourceInput,
 };
 
+mod publisher_trust;
+pub use publisher_trust::{change_publisher_policy, publisher_policy, trust_official_jiandu};
+use publisher_trust::{observe_trust, PublisherTrustAction};
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Release {
     version: String,
@@ -34,13 +38,13 @@ struct Release {
 #[derive(Deserialize)]
 struct Catalog {
     release: Option<Release>,
+    legacy_release: Option<Release>,
 }
 
-fn accepted_release() -> Option<Release> {
-    // Populated only from a published, signature-verified release receipt.
-    serde_json::from_str::<Catalog>(include_str!("official-jiandu.json"))
+fn accepted_catalog() -> Catalog {
+    // Populated only from published, signature-verified release receipts.
+    serde_json::from_str(include_str!("official-jiandu.json"))
         .expect("reviewed Jiandu catalog is valid JSON")
-        .release
 }
 
 #[derive(Clone, Serialize)]
@@ -131,13 +135,14 @@ struct Setup {
     host: Host,
     release: Option<Release>,
     trust: Trust,
+    trust_action: Option<PublisherTrustAction>,
     install: Availability,
     installed: Installed,
     external_client: Option<ExternalClient>,
 }
 
 fn trust_reason(trust: &PluginTrustConfig, release: Option<&Release>) -> Option<&'static str> {
-    if !trust.trusted_keys.iter().any(|key| {
+    if !trust.effective_trusted_keys().iter().any(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key
                 .public_key
@@ -156,7 +161,7 @@ fn trust_reason(trust: &PluginTrustConfig, release: Option<&Release>) -> Option<
 async fn setup(
     state: &web::Data<AppState>,
     host: Host,
-    release: Option<Release>,
+    catalog: &Catalog,
 ) -> Result<Setup, bamboo_plugin::PluginError> {
     let installer = ServerPluginInstaller::new(state.clone());
     // Same lock as install/update/remove: no replacement while reading provenance/files.
@@ -164,11 +169,26 @@ async fn setup(
     let registry =
         InstalledPlugins::load(&state.app_data_dir.join("plugins/installed.json")).await?;
     let entry = registry.get_unique("jiandu")?;
+    // Setup reports the accepted release for the installed connector so its
+    // external MCP configuration remains available until an explicit update.
+    let legacy_release = catalog.legacy_release.as_ref().filter(|release| {
+        entry.is_some_and(|entry| {
+            entry.status == PluginInstallStatus::Installed && valid_provenance(entry, release)
+        })
+    });
+    let release = legacy_release.or(catalog.release.as_ref());
     let memory_reason = installer
         .jiandu_memory_path_reason(&state.app_data_dir.join("plugins/jiandu"))
         .await;
-    let trust = state.config.read().await.plugin_trust.clone();
-    let trust_reason = trust_reason(&trust, release.as_ref());
+    let (trust, trust_action) = observe_trust(
+        state,
+        &host,
+        release,
+        memory_reason,
+        entry.is_some_and(|entry| entry.status == PluginInstallStatus::Installing),
+    )
+    .await;
+    let trust_reason = trust_reason(&trust, release);
     let mut installed = Installed {
         state: "missing",
         version: None,
@@ -184,7 +204,7 @@ async fn setup(
             installed.state = "unverified";
             installed.reason = Some("unverified_install");
             if host.supported && trust_reason.is_none() && memory_reason.is_none() {
-                if let Some(release) = &release {
+                if let Some(release) = release {
                     if let Ok(command) = validated_executable(state, entry, release, &host.os).await
                     {
                         let root = state.memory_store.data_dir();
@@ -230,11 +250,12 @@ async fn setup(
     Ok(Setup {
         plugin_id: "jiandu",
         host,
-        release,
+        release: release.cloned(),
         trust: Trust {
             trusted: trust_reason.is_none(),
             reason: trust_reason,
         },
+        trust_action,
         install: Availability {
             available: unavailable.is_none(),
             reason: unavailable,
@@ -355,7 +376,7 @@ async fn validated_executable(
 
 /// Passive host/store/package metadata. Does not launch a process or create a store.
 pub async fn jiandu_setup(state: web::Data<AppState>) -> HttpResponse {
-    match setup(&state, Host::detect(), accepted_release()).await {
+    match setup(&state, Host::detect(), &accepted_catalog()).await {
         Ok(report) => HttpResponse::Ok().json(report),
         Err(error) => plugin_error_response(&error),
     }
@@ -370,15 +391,17 @@ pub async fn install_official_jiandu(
     state: web::Data<AppState>,
     _body: web::Json<OfficialInstallRequest>,
 ) -> HttpResponse {
-    let release = accepted_release();
-    let report = match setup(&state, Host::detect(), release.clone()).await {
+    let catalog = accepted_catalog();
+    let report = match setup(&state, Host::detect(), &catalog).await {
         Ok(report) => report,
         Err(error) => return plugin_error_response(&error),
     };
     if !report.install.available {
         return HttpResponse::Conflict().json(serde_json::json!({"error": {"type":"official_plugin_unavailable", "reason": report.install.reason}}));
     }
-    let release = release.expect("availability requires an accepted release");
+    let release = catalog
+        .release
+        .expect("availability requires an accepted release");
     let mut trust = state.config.read().await.plugin_trust.clone();
     // Recheck live policy after setup; no user-edited key list is augmented.
     if let Some(reason) = trust_reason(&trust, Some(&release)) {
@@ -387,6 +410,8 @@ pub async fn install_official_jiandu(
         );
     }
     trust.enforcement = PluginTrustEnforcement::Strict;
+    trust.trusted_keys = trust.effective_trusted_keys();
+    trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
     trust.trusted_keys.retain(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key

@@ -3,9 +3,11 @@
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
+use bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -77,6 +79,21 @@ fn call(name: &str, args: Value) -> (Value, &'static str) {
         "tool_calls",
     )
 }
+fn declared_tools(body: &Value) -> BTreeSet<&str> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect()
+}
+fn discover(name: &str) -> (Value, &'static str) {
+    handoff_call(
+        &format!("discover-{name}"),
+        DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+        json!({"query":name,"limit":1}),
+    )
+}
 async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
@@ -99,14 +116,15 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 "Read",
                 json!({"file_path":probe.workspace.join("input.txt")}),
             ),
-            2 => call("Glob", json!({"pattern":"*.txt","path":probe.workspace})),
+            2 => discover("Glob"),
+            3 => call("Glob", json!({"pattern":"*.txt","path":probe.workspace})),
             _ => (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop"),
         }
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
         match probe.root.fetch_add(1, Ordering::SeqCst) {
             0 => call(
                 "Write",
-                json!({"file_path":probe.workspace.join("root-denied.txt"),"content":"forbidden root"}),
+                json!({"file_path":probe.workspace.join("root-write.txt"),"content":"authorized Ultra root"}),
             ),
             1 => {
                 let mut args = json!({"action":"create","title":"Profile child","responsibility":"Complete a bounded assignment with evidence","prompt":"Use the real file tools and report evidence","subagent_type":role(probe.case),"workspace":probe.workspace,"auto_run":false});
@@ -404,7 +422,14 @@ async fn fixture(case: Case) {
             std::fs::read_to_string(data.join("host.log")).unwrap()
         )
     });
-    assert!(!workspace.join("root-denied.txt").exists());
+    if case == Case::Narrow {
+        assert!(!workspace.join("root-write.txt").exists());
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("root-write.txt")).unwrap(),
+            "authorized Ultra root"
+        );
+    }
     {
         assert!(
             parent
@@ -438,7 +463,7 @@ async fn fixture(case: Case) {
             handle.stop(true).await;
             return;
         }
-        assert!(child.len() >= 2);
+        assert!(child.len() >= 5);
         if case != Case::Unknown {
             for request in &child {
                 let text = request["messages"].to_string();
@@ -469,12 +494,12 @@ async fn fixture(case: Case) {
                 .iter()
                 .all(|r| !r.to_string().contains("WORKSPACE_SKILL_SHOULD_NOT_APPLY")));
         }
-        let names: std::collections::BTreeSet<_> = child[0]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
+        let names = declared_tools(child[0]);
+        assert!(names.contains(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+        assert!(!names.contains("Glob"));
+        let mut expected_after_discovery = names.clone();
+        expected_after_discovery.insert("Glob");
+        assert_eq!(declared_tools(child[3]), expected_after_discovery);
         assert!(
             seen_wait,
             "actual worker provider waited behind the durable Root wait"
@@ -483,13 +508,25 @@ async fn fixture(case: Case) {
             .iter()
             .filter(|r| r["model"] == "native-root" && r["tools"].to_string().contains("SubAgent"))
             .collect();
-        assert!(root_calls.iter().all(|r| !r["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["function"]["name"] == "Write")));
+        assert!(!root_calls.is_empty());
+        for request in root_calls {
+            for tool in ["Write", "Edit"] {
+                assert_eq!(
+                    request["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["function"]["name"] == tool),
+                    case != Case::Narrow,
+                    "Root {tool} visibility for {case:?}"
+                );
+            }
+        }
         if case == Case::Narrow || read_only(case) {
-            assert_eq!(names, std::collections::BTreeSet::from(["Glob", "Read"]));
+            assert_eq!(
+                names,
+                BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"])
+            );
             assert!(!workspace.join("child-write.txt").exists());
             let history = child.last().unwrap()["messages"].to_string();
             assert!(history.contains("ACTUAL_READ_EVIDENCE"));
@@ -502,16 +539,16 @@ async fn fixture(case: Case) {
             if matches!(case, Case::Implementer | Case::ExplicitModel) {
                 assert_eq!(
                     names,
-                    std::collections::BTreeSet::from(["Glob", "Read", "Write"])
+                    BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read", "Write"])
                 );
             } else if case == Case::BuiltinImplementer {
                 assert_eq!(
                     names,
-                    std::collections::BTreeSet::from([
+                    BTreeSet::from([
                         "exec_command",
                         "write_stdin",
                         "Edit",
-                        "Glob",
+                        DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
                         "Read",
                         "Write",
                     ])
@@ -519,7 +556,7 @@ async fn fixture(case: Case) {
             } else {
                 assert!(
                     names.contains("Grep"),
-                    "unknown-name legacy surface unchanged"
+                    "the default role retains the resident Grep tool"
                 );
             }
         }
@@ -753,8 +790,9 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
         "handoff-reviewer" => {
             let step = probe.reviewer.fetch_add(1, Ordering::SeqCst);
             match step {
-                0 | 4 => handoff_call(
-                    if step == 0 {
+                0 => discover("Glob"),
+                1 | 5 => handoff_call(
+                    if step == 1 {
                         "review-glob"
                     } else {
                         "recheck-glob"
@@ -762,10 +800,10 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                     "Glob",
                     json!({"path":probe.workspace,"pattern":"answer.txt"}),
                 ),
-                1 | 5 => {
+                2 | 6 => {
                     assert!(handoff_tool(
                         &body,
-                        if step == 1 {
+                        if step == 2 {
                             "review-glob"
                         } else {
                             "recheck-glob"
@@ -773,7 +811,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                     )
                     .contains("answer.txt"));
                     handoff_call(
-                        if step == 1 {
+                        if step == 2 {
                             "review-read"
                         } else {
                             "recheck-read"
@@ -782,7 +820,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                         json!({"file_path":probe.workspace.join("answer.txt")}),
                     )
                 }
-                2 => {
+                3 => {
                     assert!(handoff_tool(&body, "review-read").contains("answer=41"));
                     handoff_call(
                         "review-write-denied",
@@ -790,7 +828,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                         json!({"file_path":probe.workspace.join("answer.txt"),"content":"REVIEWER_MUST_NOT_WRITE"}),
                     )
                 }
-                3 => {
+                4 => {
                     let rejected = handoff_tool(&body, "review-write-denied");
                     assert!(
                         rejected == "Error: Tool 'Write' is not callable at the current conversation position",
@@ -806,7 +844,7 @@ async fn handoff_response(body: web::Json<Value>, probe: web::Data<HandoffProbe>
                         "stop",
                     )
                 }
-                6 => {
+                7 => {
                     assert!(handoff_tool(&body, "recheck-read").contains("answer=42"));
                     (
                         json!({"content":handoff_report("completed", "Independent recheck passed", "Glob found answer.txt; Read observed answer=42 after the parent correction").to_string()}),
@@ -1220,7 +1258,7 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
     );
     assert_eq!(probe.root.load(Ordering::SeqCst), 13);
     assert_eq!(probe.implementer.load(Ordering::SeqCst), 5);
-    assert_eq!(probe.reviewer.load(Ordering::SeqCst), 7);
+    assert_eq!(probe.reviewer.load(Ordering::SeqCst), 8);
     assert_eq!(
         std::fs::read_to_string(workspace.join("answer.txt")).unwrap(),
         CORRECT
@@ -1329,34 +1367,42 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
     ] {
         let selected: Vec<_> = requests.iter().filter(|r| r["model"] == model).collect();
         assert!(!selected.is_empty());
-        for request in selected {
+        for (index, request) in selected.into_iter().enumerate() {
             let text = request["messages"].to_string();
             assert!(text.contains(&format!("HANDOFF_{}_V1", role.to_uppercase())));
             assert!(!text.contains("HANDOFF_RELOADED_MUST_NOT_APPLY"));
             assert!(!text.contains("HANDOFF_GLOBAL_MUST_NOT_APPLY"));
-            let names: std::collections::BTreeSet<_> = request["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["function"]["name"].as_str().unwrap())
-                .collect();
-            assert_eq!(
-                names,
-                if role == "reviewer" {
-                    std::collections::BTreeSet::from(["Read", "Glob"])
-                } else {
-                    std::collections::BTreeSet::from(["Read", "Glob", "Write"])
-                }
-            );
+            let mut expected = BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"]);
+            if role == "implementer" {
+                expected.insert("Write");
+            } else if index > 0 {
+                expected.insert("Glob");
+            }
+            assert_eq!(declared_tools(request), expected);
         }
     }
-    assert!(requests
+    let root_requests: Vec<_> = requests
         .iter()
-        .filter(|r| r["model"] == "handoff-root" && r["tools"].is_array())
-        .all(|r| r["tools"]
+        .filter(|request| {
+            request["model"] == "handoff-root"
+                && request["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "SubAgent")
+                })
+        })
+        .collect();
+    assert!(!root_requests.is_empty());
+    for request in root_requests {
+        let names: std::collections::BTreeSet<_> = request["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|t| t["function"]["name"] != "Write")));
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        for tool in ["Write", "Edit"] {
+            assert!(names.contains(tool), "Root {tool} missing from {names:?}");
+        }
+    }
     handle.stop(true).await;
 }

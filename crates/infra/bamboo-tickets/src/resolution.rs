@@ -75,8 +75,8 @@ impl TicketService {
         Ok(record)
     }
 
-    // Admission can run ahead of resolution. Pin only when processing starts,
-    // so a queued message sees changes committed by its preceding Human turn.
+    // Admission can run ahead of resolution. Pin against the current Work
+    // snapshot when this Human input is selected for processing.
     fn pin_message_basis(
         &self,
         authority: &Authority,
@@ -318,19 +318,8 @@ impl TicketService {
         if saved.groups[index].status != ResolutionStatus::Proposed {
             return Ok(saved);
         }
-        // Later ingress is durable, but cannot overtake an unresolved prefix.
-        if current.resolutions.values().any(|r| {
-            r.ingress_seq < saved.ingress_seq
-                && r.ingress.is_some()
-                && (r.proposal.is_none()
-                    || r.groups
-                        .iter()
-                        .any(|g| g.status == ResolutionStatus::Proposed))
-        }) {
-            return Err(Error::ResourceBlocked(
-                "earlier Human ingress is unresolved".into(),
-            ));
-        }
+        // Each group checks its exact Work and request versions under the
+        // writer lock. Independent Human inputs can settle in either order.
         let group = &proposal.groups[index];
         let ops: Vec<_> = group.operations.iter().map(operation).collect();
         let command = Command {
@@ -357,12 +346,18 @@ impl TicketService {
             Err(Error::RevisionConflict)
         } else {
             validate_group(current, human, group).and_then(|()| {
-                apply_operations(&mut next, authority, &command.operations, store.root())
+                apply_operations(
+                    &mut next,
+                    authority,
+                    &command.operations,
+                    store.root(),
+                    None,
+                )
             })
         };
         match attempted.and_then(|ids| {
             validate_snapshot(&next)?;
-            validate_new_assignment_contexts(current, &next, &store)?;
+            validate_new_assignment_contexts(current, &next, &store, None)?;
             validate_answer_contexts(current, &next, &store)?;
             Ok(ids)
         }) {

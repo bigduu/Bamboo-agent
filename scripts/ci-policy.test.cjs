@@ -299,8 +299,8 @@ test("feature shards bound debug artifacts and record capacity without changing 
   assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
-    assert.ok(feature.includes(setting))
-    assert.equal(workflow.split(setting).length - 1, 1, "debug override belongs only to the feature job")
+    for (const owner of [feature, job("arm64-feature")]) assert.ok(owner.includes(setting))
+    assert.equal(workflow.split(setting).length - 1, 2, "debug overrides belong to feature test jobs")
   }
   assert.match(workflow, /^  CARGO_INCREMENTAL: "0"$/mu)
   assert.match(feature, /rustc -vV\n            cargo -V/u)
@@ -499,6 +499,7 @@ function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
       "feature-shards": "The canonical isolated-default and explicit-feature test shards",
+      "arm64-feature": "Native Linux/Windows ARM64 embedded frontend acceptance",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",
@@ -513,12 +514,15 @@ function assertLinuxTestOwnership(definitions) {
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
     "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
-    "delegated-planner-acceptance.yml": { planner: "Distinct API-only/F Planner CLI and original Clippy; library cases run once on canonical M" },
     "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
   for (const [file, source] of Object.entries(definitions)) {
     if (file === "observer-subscriptions.yml") assertSubscriptionException(source)
+    if (file === "delegated-planner-acceptance.yml") {
+      // Keep the original API-only Clippy configurations for retained artifacts.
+      assert.equal(createHash("sha256").update(source).digest("hex"), "31a1022246889543ee3d2ac0b32c9de1d59d21a8705ec3c1494901eabe096689")
+    }
     if (!/^  pull_request:\s*$/mu.test(source)) continue
     const jobs = source.slice(source.indexOf("\njobs:\n") + 7)
       .split(/(?=^  [a-z][a-z0-9-]*:\n)/mu).filter(Boolean)
@@ -531,18 +535,6 @@ function assertLinuxTestOwnership(definitions) {
       if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
-      if (file === "delegated-planner-acceptance.yml") {
-        // Retain #2304 API-only CLI/lint; default library runtime has moved to M.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "e40d291b67054a05629a85a8b802fe198a0ee6e3b0d9beb8102e09bd744509ff")
-        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
-        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
-        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
-        assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
-        assert.doesNotMatch(block, /cargo test --locked -p bamboo-(?:server-tools|engine) --lib/u)
-        assert.ok(block.includes("-p bamboo-engine -p bamboo-server-tools -p bamboo-server --lib --"))
-        for (const command of ["cargo test --locked -p bamboo-agent --test required_child_context_packet",
-          "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
-      }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
         assert.equal(createHash("sha256").update(source).digest("hex"), "aa6c09cd846756df8908d26b555a9131ccf05f0fe3c984fe9ca4771fa3c76de2")
@@ -1272,7 +1264,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 8, "all remaining Cargo cache actions retain the frozen batch policy")
+  assert.equal(caches, 9, "all Cargo cache actions retain the frozen batch policy")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
   const nativePublisher = publisher.split('  executables:\n')[1].split('  publish-executables:\n')[0]
@@ -2021,17 +2013,26 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
     const out = output[0].out_dir
     const actual = JSON.parse(readFileSync(path.join(out, "identity.json"), "utf8"))
     const runs = Number(readFileSync(path.join(out, "counter.txt"), "utf8"))
-    const watches = [...readFileSync(path.join(out, "../output"), "utf8").matchAll(/^cargo:rerun-if-changed=(.+)$/gm)]
+    // Cargo 1.100 stores build-script stdout in run/stdout beside OUT_DIR.
+    // Older Cargo stores the same output in the sibling file output.
+    const stdoutFiles = ["../run/stdout", "../output"].map(relative => path.join(out, relative)).filter(existsSync)
+    assert.equal(stdoutFiles.length, 1, label + ": expected one Cargo build-script stdout file beside " + out)
+    const buildScriptStdout = readFileSync(stdoutFiles[0], "utf8")
+    const stdoutCounters = [...buildScriptStdout.matchAll(/^cargo:rustc-env=SOURCE_WATCH_COUNTER=(\d+)\r?$/gm)]
+    assert.deepEqual(stdoutCounters.map(match => Number(match[1])), [runs], label + ": Cargo stdout matches the invocation counter")
+    const watches = [...buildScriptStdout.matchAll(/^cargo:rerun-if-changed=([^\r\n]+)$/gm)]
       .map(match => path.resolve(manifest, match[1]))
     const keys = units.map(key).sort()
     const record = { label, manifest, expectedRuns: count, runs, identity: actual,
-      artifacts: units.length, fresh: units.filter(row => row.fresh).length, productFresh: product[0].fresh, watches }
+      artifacts: units.length, fresh: units.filter(row => row.fresh).length, productFresh: product[0].fresh,
+      stdoutFile: path.relative(out, stdoutFiles[0]), watches }
     phases.push(record)
     writeFileSync(path.join(evidence, label + ".json"), JSON.stringify(record, null, 2) + "\n")
     writeFileSync(path.join(evidence, label + ".counter.txt"), readFileSync(path.join(out, "counter.txt")))
     writeFileSync(path.join(evidence, label + ".identity.json"), readFileSync(path.join(out, "identity.json")))
     assert.equal(runs, count, `${label}: build-script invocation count; evidence=${evidence}`)
     assert.deepEqual(actual, identity, label + ": exact source identity")
+    assert.equal(watches.length > 0, identity.identity_source !== "unknown", label + ": source watch presence")
     assert.ok(watches.every(file => existsSync(file) && file !== path.join(repo, ".git") && !file.startsWith(target)),
       "Only existing bounded source-identity inputs may be watched")
     if (fresh) {
@@ -2115,18 +2116,16 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
   }
 })
 
-test("Planner12/10 libraries have one canonical serial owner while API-only CLI and Clippy remain", () => {
+test("Retained Planner artifact cases have one serial owner and the separate API-only job only lints", () => {
   const { PLANNER_SERIAL, cargoArguments } = require("./run-feature-tests.cjs")
-  assert.deepEqual(Object.keys(PLANNER_SERIAL), ["bamboo-server-tools", "bamboo-engine"])
-  assert.deepEqual(Object.values(PLANNER_SERIAL).map(recipe => recipe.names.length), [12, 10])
+  assert.deepEqual(Object.keys(PLANNER_SERIAL), ["bamboo-engine"])
+  assert.deepEqual(Object.values(PLANNER_SERIAL).map(recipe => recipe.names.length), [9])
   for (const [name, recipe] of Object.entries(PLANNER_SERIAL)) {
     assert.equal(new Set(recipe.names).size, recipe.names.length)
     assert.deepEqual(cargoArguments({ name }).slice(7), recipe.names.flatMap(name => ["--skip", name]))
   }
   const planner = readFileSync(".github/workflows/delegated-planner-acceptance.yml", "utf8")
-  assert.equal([...planner.matchAll(/cargo test/g)].length, 1)
-  assert.match(planner, /delegated_planner::real_cli_planner_/u)
-  assert.match(planner, /test result: ok\. 2 passed; 0 failed; 0 ignored/u)
+  assert.doesNotMatch(planner, /cargo test/u)
   assert.equal([...planner.matchAll(/cargo clippy/g)].length, 2)
   assert.match(planner, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
 })

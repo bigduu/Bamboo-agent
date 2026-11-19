@@ -177,6 +177,17 @@ Child, resident, guardian, remote actor, schedule, connect, headless, TUI, and
 SDK creation paths propagate the typed Project ID. Normal chat and Workspace
 changes never reassign it.
 
+A native Ticket Work keeps its Supervisor's Session/tree Project identity.
+An Unassigned Supervisor can authorize the Work's exact frozen Git worktree
+through the existing Host-installed execution capability. Creation checks the
+adopted Work Project; runtime resolution rechecks the Child birth, parent/root,
+Run, current Assignment permit, immutable dispatch/context hashes and exact
+canonical path against current Project registry facts. Missing, archived,
+foreign or stale facts deny this admission. The capability belongs only to that
+execution and does not project the adopted Project's memory, skills, MCP or
+shared resources into the Unassigned Session. Metadata alone grants no such
+workspace access.
+
 The system prompt uses separate Project and Workspace marker blocks. The
 Project block distinguishes `Project path` from `Project home (Bamboo data)`;
 the Workspace block reports the effective path plus `explicit`, `session`, or

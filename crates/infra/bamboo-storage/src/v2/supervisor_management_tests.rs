@@ -792,3 +792,53 @@ async fn session_version_writer_management_compatible_legacy_scope_and_creation_
         assert!(loaded.execution_compatibility().execution_allowed);
     }
 }
+
+// Regression for bigduu/Bamboo-agent#2424 / PR #2431: a pre-schema Child
+// (no parent_created_at, no actor-authority) must be excluded from the
+// current-user directory instead of failing the whole page.
+#[tokio::test]
+async fn pre_schema_child_is_excluded_from_current_user_directory() {
+    let (_home, store, reference) = fixture().await;
+    // Positive control: an ordinary Root stays listed.
+    let parent = target(&store, "directory-root", "project-a").await;
+    // Positive control: a schema-era Child (parent_created_at recorded)
+    // stays listed, so exclusion is specific to the pre-schema shape.
+    let mut modern = Session::new_child_of("directory-modern-child", &parent, "model", "child");
+    assert!(modern.parent_created_at.is_some());
+    modern.set_project_id_meta("project-a");
+    modern.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(
+        "directory-modern-child",
+    ));
+    modern.add_message(Message::assistant("synthetic child history", None));
+    store.save_session(&modern).await.unwrap();
+    // `new_child` leaves parent_created_at None: exactly the shape of a
+    // Child created before ancestor birth proofs existed.
+    let legacy = Session::new_child("directory-legacy-child", &parent.id, "model", "legacy");
+    assert!(legacy.parent_created_at.is_none());
+    store.save_session(&legacy).await.unwrap();
+    // The directory page must succeed and skip the pre-schema Child.
+    let page = store
+        .list_supervisor_current_user_targets(&reference, None, None, 20)
+        .await
+        .unwrap();
+    let listed = page
+        .targets
+        .iter()
+        .map(|target| target.session_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(listed.contains(&parent.id.as_str()));
+    assert!(listed.contains(&modern.id.as_str()));
+    assert!(
+        !listed.contains(&legacy.id.as_str()),
+        "pre-schema Child must be excluded from the current-user directory"
+    );
+    // A direct inspection reports it as absent, not as a page failure.
+    assert_eq!(
+        store
+            .inspect_supervisor_current_user_target(&reference, &legacy.id)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}

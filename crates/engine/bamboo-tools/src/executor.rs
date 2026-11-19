@@ -13,10 +13,10 @@ use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
-    BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
-    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, LoopControlTool, ReadTool,
-    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool,
-    ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
+    EditTool, ExecCommandTool, ExitPlanModeTool, GetFileInfoTool, GlobTool, GrepTool,
+    LoopControlTool, ReadTool, RequestPermissionsTool, SessionMemoryTool, SleepTool, TaskTool,
+    ToolRegistry, UpdateGoalTool, ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool,
+    WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -153,9 +153,6 @@ fn normalize_legacy_builtin_args(
         "read_file" | "write_file" | "Read" | "Write" | "apply_patch" => {
             copy_legacy_arg_if_missing(args, "path", "file_path");
         }
-        "execute_command" | "Bash" => {
-            copy_legacy_arg_if_missing(args, "cmd", "command");
-        }
         "list_directory" | "Glob" => {
             let should_default_pattern = raw_tool_name == "list_directory"
                 || args.contains_key("path")
@@ -190,7 +187,7 @@ fn normalize_resolved_builtin_args(
     execution_name: &str,
     args: &mut serde_json::Value,
 ) {
-    if !matches!(execution_name, "Read" | "Write" | "Edit" | "Bash" | "Glob") {
+    if !matches!(execution_name, "Read" | "Write" | "Edit" | "Glob") {
         return;
     }
     let unqualified = reference
@@ -353,31 +350,24 @@ impl BuiltinToolExecutor {
     fn register_builtin_tools(registry: &ToolRegistry) -> BTreeMap<String, Arc<dyn Tool>> {
         let mut framework_tools = BTreeMap::new();
         // NOTE: apply_patch is now an alias for Edit – no separate registration.
-        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
-            framework_tools.insert(name, tool);
-        }
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
             framework_tools.insert(name, tool);
         }
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteStdinTool::new()) {
             framework_tools.insert(name, tool);
         }
-        let _ = registry.register(BashInputTool::new());
-        let _ = registry.register(BashOutputTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
             framework_tools.insert(name, tool);
         }
         let _ = registry.register(ExitPlanModeTool::new());
-        // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, GlobTool::new()) {
             framework_tools.insert(name, tool);
         }
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
-        let _ = registry.register(KillShellTool::new());
         let _ = registry.register(LoopControlTool::new());
-        let _ = registry.register(SessionNoteTool::new());
+        let _ = registry.register(SessionMemoryTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);
         }
@@ -388,7 +378,6 @@ impl BuiltinToolExecutor {
         }
         let _ = registry.register(ViewImageTool::new());
         let _ = registry.register(WebFetchTool::new());
-        // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
         let _ = registry.register(WorkspaceTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteTool::new()) {
             framework_tools.insert(name, tool);
@@ -414,10 +403,9 @@ impl BuiltinToolExecutor {
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
     }
 
-    // Kept in sync with the startup wire's NativeToolCeiling::NAMES. This crate
-    // intentionally does not depend on the sub-agent transport crate.
-    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
-        "Bash",
+    // Kept in sync with the active startup wire's NativeToolCeiling::NAMES.
+    // This crate intentionally does not depend on the sub-agent transport crate.
+    const NATIVE_TOOL_NAMES: [&'static str; 7] = [
         "Edit",
         "Glob",
         "Read",
@@ -573,7 +561,7 @@ impl BuiltinToolExecutor {
         // safely merely by dropping its future. Custom/plugin tools stay inline:
         // their private task-local capability scopes must not be lost.
         let owned_resources = crate::LocalTaskResources::current().filter(|_| {
-            matches!(execution_name, "Write" | "Edit" | "Bash" | "exec_command")
+            matches!(execution_name, "Write" | "Edit" | "exec_command")
                 && self.is_framework_builtin_instance(execution_name, &tool)
         });
         let outcome = if let Some(resources) = owned_resources {
@@ -1235,6 +1223,10 @@ impl ToolExecutor for BuiltinToolExecutor {
             .then_some(self as &dyn ToolExecutor)
     }
 
+    fn local_tool_is_native_builtin(&self, name: &str) -> bool {
+        self.eligible_native_tool(name)
+    }
+
     fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
         if !self.owns_exact_tool(name) {
             return None;
@@ -1374,27 +1366,24 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific command tool by name
     pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "Bash" || name == "exec_command" {
-            let (name, tool) = if name == "Bash" {
-                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?
-            } else {
-                BuiltinToolExecutor::register_tracked_builtin(
-                    &self.registry,
-                    ExecCommandTool::new(),
-                )?
-            };
-            self.framework_builtin_tools.insert(name, tool);
+        if name == "Task" {
+            self.registry
+                .register(TaskTool::new())
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
             return Ok(self);
         }
-        match name {
-            "write_stdin" => self.registry.register(WriteStdinTool::new()),
-            "BashInput" => self.registry.register(BashInputTool::new()),
-            "BashOutput" => self.registry.register(BashOutputTool::new()),
-            "KillShell" => self.registry.register(KillShellTool::new()),
-            "Task" => self.registry.register(TaskTool::new()),
+        let (name, tool) = match name {
+            "exec_command" => BuiltinToolExecutor::register_tracked_builtin(
+                &self.registry,
+                ExecCommandTool::new(),
+            )?,
+            "write_stdin" => BuiltinToolExecutor::register_tracked_builtin(
+                &self.registry,
+                WriteStdinTool::new(),
+            )?,
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
-        }
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
+        };
+        self.framework_builtin_tools.insert(name, tool);
         Ok(self)
     }
 
@@ -2024,32 +2013,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_normalize_tool_ref_accepts_claude_style_names() {
-        assert_eq!(
-            normalize_tool_ref("default::Bash"),
-            Some("Bash".to_string())
+    #[tokio::test]
+    async fn retired_tool_aliases_cannot_dispatch() {
+        let executor = BuiltinToolExecutor::new();
+        for name in [
+            "FileExists",
+            "file_exists",
+            "default::fileExists",
+            "GetCurrentDir",
+            "getCurrentDir",
+            "default::get_current_dir",
+            "SetWorkspace",
+            "set_workspace",
+            "default::setWorkspace",
+            "memory_note",
+            "recall",
+            "session_inspector",
+            "schedule_tasks",
+        ] {
+            let call = make_tool_call(name, json!({}));
+            assert!(
+                matches!(executor.execute(&call).await, Err(ToolError::NotFound(_))),
+                "{name}"
+            );
+        }
+        assert!(
+            executor
+                .execute(&make_tool_call("Workspace", json!({})))
+                .await
+                .unwrap()
+                .success
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            executor
+                .execute(&make_tool_call("GetFileInfo", json!({"path": file.path()})))
+                .await
+                .unwrap()
+                .success
         );
     }
 
     #[test]
+    fn tool_ref_excludes_retired_shell_names() {
+        for name in [
+            "bash",
+            "Bash",
+            "default::Bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+            "default::execute_command",
+        ] {
+            assert_eq!(normalize_tool_ref(name), None, "{name}");
+        }
+    }
+
+    #[test]
     fn test_normalize_tool_ref_accepts_legacy_camel_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::fileExists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::getCurrentDir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::fileExists"), None);
+        assert_eq!(normalize_tool_ref("default::getCurrentDir"), None);
         assert_eq!(
             normalize_tool_ref("default::getFileInfo"),
             Some("GetFileInfo".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::setWorkspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::setWorkspace"), None);
         assert_eq!(
             normalize_tool_ref("default::sleep"),
             Some("Sleep".to_string())
@@ -2058,18 +2086,8 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_legacy_snake_case_aliases() {
-        assert_eq!(
-            normalize_tool_ref("default::execute_command"),
-            Some("Bash".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::file_exists"),
-            Some("FileExists".to_string())
-        );
-        assert_eq!(
-            normalize_tool_ref("default::get_current_dir"),
-            Some("GetCurrentDir".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::file_exists"), None);
+        assert_eq!(normalize_tool_ref("default::get_current_dir"), None);
         assert_eq!(
             normalize_tool_ref("default::get_file_info"),
             Some("GetFileInfo".to_string())
@@ -2078,18 +2096,12 @@ mod tests {
             normalize_tool_ref("default::list_directory"),
             Some("Glob".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::memory_note"),
-            Some("memory_note".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::memory_note"), None);
         assert_eq!(
             normalize_tool_ref("default::read_file"),
             Some("Read".to_string())
         );
-        assert_eq!(
-            normalize_tool_ref("default::set_workspace"),
-            Some("SetWorkspace".to_string())
-        );
+        assert_eq!(normalize_tool_ref("default::set_workspace"), None);
         assert_eq!(
             normalize_tool_ref("default::write_file"),
             Some("Write".to_string())
@@ -2234,7 +2246,7 @@ mod tests {
                 "Write",
                 json!({"file_path": "/tmp/par_cls.txt", "content": "y"}),
             ),
-            ("Bash", json!({"command": "echo hi"})),
+            ("exec_command", json!({"cmd": "echo hi"})),
             ("exec_command", json!({"cmd": "echo hi"})),
             ("write_stdin", json!({"session_id": "exec", "chars": ""})),
             ("write_stdin", json!({"session_id": "exec", "chars": "y\n"})),
@@ -2367,14 +2379,14 @@ mod tests {
         assert_eq!(edit["properties"]["patch"]["type"], "string");
         assert_eq!(edit["properties"]["line_number"]["type"], "integer");
 
-        let bash = get_params("Bash");
-        assert_eq!(bash["required"], json!(["command"]));
-        assert_eq!(bash["properties"]["run_in_background"]["type"], "boolean");
-        assert_eq!(bash["properties"]["workdir"]["type"], "string");
+        let exec = get_params("exec_command");
+        assert_eq!(exec["required"], json!(["cmd"]));
+        assert_eq!(exec["properties"]["interactive"]["type"], "boolean");
+        assert_eq!(exec["properties"]["workdir"]["type"], "string");
 
-        let bash_output = get_params("BashOutput");
-        assert_eq!(bash_output["required"], json!(["bash_id"]));
-        assert_eq!(bash_output["properties"]["filter"]["type"], "string");
+        let continuation = get_params("write_stdin");
+        assert_eq!(continuation["required"], json!(["session_id"]));
+        assert_eq!(continuation["properties"]["eof"]["type"], "boolean");
     }
 
     #[test]
@@ -2435,8 +2447,8 @@ mod tests {
     fn test_executor_builds_enhanced_prompt() {
         let executor = BuiltinToolExecutor::new();
         let prompt = executor.build_enhanced_prompt(GuideBuildContext::default());
-        assert!(prompt.contains("## Tool Usage Guidelines"));
-        assert!(prompt.contains("**Read**"));
+        assert!(prompt.contains("## Tool Guidance"));
+        assert!(!prompt.contains("**Read**"));
     }
 
     #[test]
@@ -2502,8 +2514,8 @@ mod tests {
         let config = Arc::new(crate::permission::PermissionConfig::new());
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_permission_checker(checker)
             .build();
         let dir = tempfile::tempdir().unwrap();
@@ -2516,7 +2528,7 @@ mod tests {
         });
         let (event_tx, mut event_rx) = mpsc::channel(8);
 
-        let call = make_tool_call("Bash", json!({"command": command}));
+        let call = make_tool_call("exec_command", json!({"cmd": command}));
         let ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-bypass"),
@@ -2602,8 +2614,8 @@ mod tests {
         let config = Arc::new(crate::permission::PermissionConfig::new());
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_permission_checker(checker)
             .build();
         let dir = tempfile::tempdir().unwrap();
@@ -2614,7 +2626,7 @@ mod tests {
             requests: requests.clone(),
             approve: false,
         });
-        let call = make_tool_call("Bash", json!({"command": command}));
+        let call = make_tool_call("exec_command", json!({"cmd": command}));
         let ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-hook-hard-dangerous"),
@@ -3195,8 +3207,8 @@ mod tests {
         let config = Arc::new(crate::permission::PermissionConfig::new());
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_permission_checker(checker)
             .build();
         let dir = tempfile::tempdir().unwrap();
@@ -3209,7 +3221,7 @@ mod tests {
                 approve: false,
             });
 
-        let denied_call = make_tool_call("Bash", json!({"command": denied_command}));
+        let denied_call = make_tool_call("exec_command", json!({"cmd": denied_command}));
         let denied_ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-forced"),
@@ -3245,7 +3257,7 @@ mod tests {
                 requests: approved_requests.clone(),
                 approve: true,
             });
-        let approved_call = make_tool_call("Bash", json!({"command": approved_command}));
+        let approved_call = make_tool_call("exec_command", json!({"cmd": approved_command}));
         let approved_ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-forced"),
@@ -3279,8 +3291,8 @@ mod tests {
         let config = Arc::new(crate::permission::PermissionConfig::new());
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_permission_checker(checker)
             .build();
         let dir = tempfile::tempdir().unwrap();
@@ -3292,7 +3304,7 @@ mod tests {
             approve: false,
         });
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let call = make_tool_call("Bash", json!({"command": command}));
+        let call = make_tool_call("exec_command", json!({"cmd": command}));
         let ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-auto"),
@@ -3332,8 +3344,8 @@ mod tests {
         );
         let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(base));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_tool(WriteTool::new())
             .expect("register Write tool")
             .with_permission_checker(checker)
@@ -3347,7 +3359,7 @@ mod tests {
             [("auto", false, true), ("bypass", true, false)]
         {
             for command in ["pwd", "cat Cargo.toml"] {
-                let call = make_tool_call("Bash", json!({"command": command}));
+                let call = make_tool_call("exec_command", json!({"cmd": command}));
                 let session_id = format!("planner-no-shell-{mode}");
                 let ctx = ToolExecutionContext {
                     executing_supervisor: None,
@@ -3413,7 +3425,7 @@ mod tests {
             ("planner-auto", false, true),
             ("planner-bypass", true, false),
         ] {
-            let call = make_tool_call("Bash", json!({"command": command.clone()}));
+            let call = make_tool_call("exec_command", json!({"cmd": command.clone()}));
             let ctx = ToolExecutionContext {
                 executing_supervisor: None,
                 session_id: Some(session_id),
@@ -3448,7 +3460,7 @@ mod tests {
             ("planner-delete-auto", false, true),
             ("planner-delete-bypass", true, false),
         ] {
-            let call = make_tool_call("Bash", json!({"command": delete_command.clone()}));
+            let call = make_tool_call("exec_command", json!({"cmd": delete_command.clone()}));
             let ctx = ToolExecutionContext {
                 executing_supervisor: None,
                 session_id: Some(session_id),
@@ -3479,7 +3491,7 @@ mod tests {
             ("planner-git-auto", false, true),
             ("planner-git-bypass", true, false),
         ] {
-            let call = make_tool_call("Bash", json!({"command": git_command.clone()}));
+            let call = make_tool_call("exec_command", json!({"cmd": git_command.clone()}));
             let ctx = ToolExecutionContext {
                 executing_supervisor: None,
                 session_id: Some(session_id),
@@ -3532,7 +3544,7 @@ mod tests {
             for (mode, bypass_permissions, auto_approve_permissions) in
                 [("auto", false, true), ("bypass", true, false)]
             {
-                let call = make_tool_call("Bash", json!({"command": command.clone()}));
+                let call = make_tool_call("exec_command", json!({"cmd": command.clone()}));
                 let session_id = format!("planner-{command_kind}-{mode}");
                 let ctx = ToolExecutionContext {
                     executing_supervisor: None,
@@ -3573,7 +3585,7 @@ mod tests {
         for (mode, bypass_permissions, auto_approve_permissions) in
             [("auto", false, true), ("bypass", true, false)]
         {
-            let call = make_tool_call("Bash", json!({"command": ansi_find_command.clone()}));
+            let call = make_tool_call("exec_command", json!({"cmd": ansi_find_command.clone()}));
             let session_id = format!("planner-find-ansi-{mode}");
             let ctx = ToolExecutionContext {
                 executing_supervisor: None,
@@ -3653,11 +3665,11 @@ mod tests {
         ));
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
         let executor = BuiltinToolExecutorBuilder::new()
-            .with_tool(BashTool::new())
-            .expect("register Bash tool")
+            .with_tool(ExecCommandTool::new())
+            .expect("register exec_command tool")
             .with_permission_checker(checker)
             .build();
-        let call = make_tool_call("Bash", json!({"command": "rm child-to-preserve"}));
+        let call = make_tool_call("exec_command", json!({"cmd": "rm child-to-preserve"}));
         let ctx = ToolExecutionContext {
             executing_supervisor: None,
             session_id: Some("s-explicit-delete-deny"),
@@ -5754,25 +5766,32 @@ mod tests {
                     .collect(),
             )
             .unwrap();
-        for name in ["Bash", "exec_command", "write_stdin"] {
+        for name in ["exec_command", "write_stdin"] {
             assert!(executor.eligible_native_tool(name));
             assert!(executor.owns_exact_tool(name));
+            assert!(executor.local_tool_is_native_builtin(name));
+            // Catalog ownership is separate from retained approval semantics.
+            assert_eq!(executor.execution_contract_for_exact(name), None);
         }
         for name in [
             "default::exec_command",
             "Exec_Command",
+            "Bash",
+            "bash",
             "BashInput",
             "BashOutput",
             "KillShell",
         ] {
             assert!(!executor.eligible_native_tool(name));
         }
-        let narrowed = executor
+        assert!(BuiltinToolExecutor::new()
             .with_native_tool_ceiling(vec!["Bash".into()])
+            .is_err());
+        let narrowed = executor
+            .with_native_tool_ceiling(vec!["write_stdin".into()])
             .unwrap();
-        assert!(narrowed.owns_exact_tool("Bash"));
         assert!(!narrowed.owns_exact_tool("exec_command"));
-        assert!(!narrowed.owns_exact_tool("write_stdin"));
+        assert!(narrowed.owns_exact_tool("write_stdin"));
         assert!(narrowed
             .with_native_tool_ceiling(vec!["exec_command".into()])
             .is_err());
@@ -6241,58 +6260,6 @@ mod tests {
                 AgentEvent::ToolApprovalRequested { .. }
             ));
             assert!(!path.exists());
-        }
-    }
-
-    mod owned_suspension_rebind_tests {
-        use super::*;
-        use bamboo_agent_core::tools::with_suspension_disabled;
-        #[tokio::test]
-        async fn managed_owned_builtin_keeps_suspension_denial_before_background_bash_spawn() {
-            let directory = tempfile::tempdir().unwrap();
-            let session_id = "owned-rebind-background-probe";
-            let resources =
-                crate::LocalTaskResources::new(session_id, "probe-run", chrono::Utc::now());
-            let executor = BuiltinToolExecutor::new();
-            let call = make_tool_call(
-                "Bash",
-                json!({"command":"exit 0","run_in_background":true,"workdir":directory.path()}),
-            );
-            let (tx, mut rx) = mpsc::channel(32);
-            let ctx = ToolExecutionContext {
-                session_id: Some(session_id),
-                event_tx: Some(&tx),
-                can_async_resume: true,
-                ..ToolExecutionContext::none(&call.id)
-            };
-            let result = with_suspension_disabled(
-                resources.scope(executor.execute_with_context_outcome(&call, ctx)),
-            )
-            .await;
-            // A RED may have spawned this fixture's exact short shell. Clean
-            // only its returned handle and drain this fixture before asserting.
-            if let Ok(ToolOutcome::Completed(output)) = &result {
-                if let Some(id) = serde_json::from_str::<serde_json::Value>(&output.result)
-                    .ok()
-                    .and_then(|v| v["bash_id"].as_str().map(str::to_owned))
-                {
-                    if let Some(shell) = crate::tools::bash_runtime::get_shell(&id) {
-                        let _ = shell.kill().await;
-                    }
-                }
-            }
-            let drained = resources.close_and_drain().await;
-            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-            assert!(
-                matches!(result,Err(ToolError::Execution(ref text)) if text.contains("suspension_disabled")),
-                "{result:?}"
-            );
-            drained.unwrap();
-            assert!(
-                events.is_empty(),
-                "no detached shell event should be published: {events:?}"
-            );
-            assert!(crate::tools::bash_runtime::running_shells_for_session(session_id).is_empty());
         }
     }
 

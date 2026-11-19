@@ -150,6 +150,7 @@ pub struct AgentRuntime {
     pub(crate) workspace_execution_host:
         Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    pub(crate) managed_work: Option<Arc<crate::ticket_runtime::managed::ManagedWorkRuntime>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
     pub(crate) host_gold_origin_resolver: Option<crate::runtime::host_gold::HostGoldOriginResolver>,
@@ -165,6 +166,7 @@ pub struct AgentRuntime {
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
+    pub(crate) context_compactions: super::context_compaction::ContextCompactions,
     pub(crate) model_limits_section:
         Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     /// Live process-wide permission policy when the embedding exposes one.
@@ -356,6 +358,7 @@ impl AgentRuntimeBuilder {
                 .persistence
                 .ok_or_else(|| format_missing("persistence"))?,
             session_inbox: self.session_inbox,
+            managed_work: None,
             live_bootstrap_host: None,
             gold_target_resolver: None,
             host_gold_origin_resolver: None,
@@ -376,6 +379,7 @@ impl AgentRuntimeBuilder {
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
             config: self.config.ok_or_else(|| format_missing("config"))?,
+            context_compactions: Default::default(),
             model_limits_section: self.model_limits_section,
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
@@ -1012,6 +1016,19 @@ impl AgentRuntime {
                 "Root execution route requires a bound Actor writer and event handoff".into(),
             ));
         }
+        let managed_root = crate::ticket_runtime::is_managed_work_root(session);
+        if managed_root
+            && (req.ticket_worker_plan.is_none()
+                || self.persistence.root_actor_writer().is_none_or(|writer| {
+                    req.ticket_token_budget.as_ref().is_none_or(|budget| {
+                        !budget.matches_managed_root(session, &writer.fence.run_id)
+                    })
+                }))
+        {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "managed Work requires its exact native dispatch owner".into(),
+            ));
+        }
         let session_activation_notifications = match self.activation_router.as_ref() {
             Some(router) => Some(Arc::new(parking_lot::Mutex::new(
                 router.subscribe(&session.id).await,
@@ -1202,7 +1219,11 @@ impl AgentRuntime {
             skip_initial_user_message: true,
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),
-            session_inbox: self.session_inbox.clone(),
+            session_inbox: if managed_root {
+                None
+            } else {
+                self.session_inbox.clone()
+            },
             live_bootstrap_host: self.live_bootstrap_host.clone(),
             gold_target_resolver: self.gold_target_resolver.clone(),
             session_activation_notifications,
@@ -1237,6 +1258,7 @@ impl AgentRuntime {
                 .map(|memory| memory.summary_target_ratio)
                 .unwrap_or(0.20),
             context_management: config.context_management.clone(),
+            context_compactions: Some(self.context_compactions.clone()),
             summary_safe_window_percent: config
                 .memory()
                 .as_ref()
@@ -1415,6 +1437,10 @@ impl AgentRuntime {
                 .run_id = plan.run_id().to_owned();
             plan.bind_session(session)
                 .map_err(|e| bamboo_agent_core::AgentError::LLM(e.to_string()))?;
+            if let Some(resolver) = loop_config.project_context_resolver.as_deref() {
+                loop_config.project_context_resolver =
+                    Some(Arc::new(resolver.for_work_execution(plan.clone())));
+            }
         }
 
         let trace_message_start = session.messages.len();

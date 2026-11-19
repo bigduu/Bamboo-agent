@@ -41,7 +41,7 @@ pub enum SdkError {
     ProviderInit(String),
 
     /// [`AgentBuilder::api_key`](super::AgentBuilder::api_key) was paired with
-    /// a provider that does not accept a plain API key (for example `copilot`,
+    /// a provider that does not accept a key through this method (for example
     /// which uses cached OAuth) or an unknown provider name.
     #[error("provider '{provider}' does not accept a plain API key")]
     UnsupportedApiKeyProvider { provider: String },

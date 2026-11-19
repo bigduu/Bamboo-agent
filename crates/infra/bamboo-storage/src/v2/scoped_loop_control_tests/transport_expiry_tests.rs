@@ -93,8 +93,6 @@ async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backl
             stage == "committed_cur"
         );
         let dir = target_dir(&f);
-        let main_before = std::fs::read(dir.join("session.json")).unwrap();
-        let runtime_before = std::fs::read(dir.join(RUNTIME_SIDECAR_FILE)).unwrap();
         if evidence == "terminal" {
             f.store
                 .finish_activation(
@@ -129,6 +127,10 @@ async fn native_terminal_reclaims_pending_claimed_and_committed_cur_before_backl
             assert_eq!(observed.lease_expires_at, expired_at);
             assert!(observed.lease_expires_at <= Utc::now());
         }
+        // Native terminalization may project runtime state. This contract is
+        // that subsequent Inbox reclamation leaves canonical state untouched.
+        let main_before = std::fs::read(dir.join("session.json")).unwrap();
+        let runtime_before = std::fs::read(dir.join(RUNTIME_SIDECAR_FILE)).unwrap();
         let user = SessionMessageEnvelope::user_input(
             &f.target.id,
             "independent genuine User after terminal native run",

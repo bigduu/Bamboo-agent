@@ -93,7 +93,7 @@ impl ChangedResource {
     }
 }
 
-async fn wait_prepared_child(fixture: &Fixture) -> (Snapshot, Session) {
+pub(super) async fn wait_prepared_child(fixture: &Fixture) -> (Snapshot, Session) {
     tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = fixture.snapshot();

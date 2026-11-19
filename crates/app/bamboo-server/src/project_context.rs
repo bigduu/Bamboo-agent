@@ -532,10 +532,61 @@ impl ProjectStoreContextSource {
     pub fn new(store: Arc<ProjectStore>) -> Self {
         Self { store }
     }
+
+    fn workspace_facts_with_owner(
+        &self,
+        project_id: &ProjectId,
+        owner: impl FnOnce() -> Result<Option<ProjectId>, ProjectStoreError>,
+    ) -> Result<Option<bamboo_engine::project_context::ProjectWorkspaceFacts>, ProjectContextError>
+    {
+        let manifest = match self.store.get(project_id) {
+            Ok(project) => project,
+            Err(ProjectStoreError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(ProjectContextError::Source(error.to_string())),
+        };
+        let owner = owner().map_err(|error| ProjectContextError::Source(error.to_string()))?;
+        // Owner lookup reads the registry independently. Do not combine its
+        // result with a manifest that changed during that read. Project CAS
+        // revisions also make an archive/restore or resource-change ABA fail.
+        let current = self
+            .store
+            .get(project_id)
+            .map_err(|error| ProjectContextError::Source(error.to_string()))?;
+        if current != manifest {
+            return Err(ProjectContextError::Source(
+                "Project changed while resolving Work workspace ownership".into(),
+            ));
+        }
+        Ok(Some(
+            bamboo_engine::project_context::ProjectWorkspaceFacts {
+                project_id: manifest.id,
+                status: manifest.status,
+                resource_revision: manifest.resource_revision,
+                project_path: manifest.project_path,
+                workspace_bindings: manifest.workspace_bindings,
+                owner,
+            },
+        ))
+    }
 }
 
 #[async_trait]
 impl ProjectContextSource for ProjectStoreContextSource {
+    async fn workspace_facts(
+        &self,
+        project_id: &ProjectId,
+        workspace: &std::path::Path,
+    ) -> Result<Option<bamboo_engine::project_context::ProjectWorkspaceFacts>, ProjectContextError>
+    {
+        self.workspace_facts_with_owner(project_id, || {
+            self.store
+                .find_workspace_owner_for_path(&bamboo_config::paths::path_to_display_string(
+                    workspace,
+                ))
+                .map(|owner| owner.map(|project| project.id))
+        })
+    }
+
     async fn find_project(
         &self,
         project_id: &ProjectId,
@@ -591,6 +642,65 @@ impl ProjectContextSource for ProjectStoreContextSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_workspace_facts_reject_project_changes_during_owner_lookup() {
+        for archive in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let store = Arc::new(ProjectStore::open(home.path()).unwrap());
+            let project = store
+                .create_with_project_path(
+                    "Work owner",
+                    None,
+                    workspace.path().to_string_lossy(),
+                    Vec::new(),
+                )
+                .unwrap();
+            let source = ProjectStoreContextSource::new(store.clone());
+            let result = source.workspace_facts_with_owner(&project.id, || {
+                if archive {
+                    store.archive(&project.id, project.revision)?;
+                } else {
+                    store.bump_resource_revision(&project.id, project.revision)?;
+                }
+                store
+                    .find_workspace_owner_for_path(&workspace.path().to_string_lossy())
+                    .map(|owner| owner.map(|project| project.id))
+            });
+            assert!(
+                matches!(result, Err(ProjectContextError::Source(_))),
+                "must reject mixed Project revisions (archive={archive})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn work_workspace_facts_read_current_unchanged_project() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(ProjectStore::open(home.path()).unwrap());
+        let project = store
+            .create_with_project_path(
+                "Work owner",
+                None,
+                workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let source = ProjectStoreContextSource::new(store.clone());
+        let facts = source
+            .workspace_facts(&project.id, workspace.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.project_id, project.id);
+        assert_eq!(facts.owner, Some(project.id));
+        assert_eq!(facts.status, project.status);
+        assert_eq!(facts.resource_revision, project.resource_revision);
+        assert_eq!(facts.project_path, project.project_path);
+        assert_eq!(facts.workspace_bindings, project.workspace_bindings);
+    }
 
     #[test]
     fn confinement_final_path_is_the_authority_for_ownership_and_persistence() {

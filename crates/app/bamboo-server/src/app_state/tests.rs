@@ -222,7 +222,7 @@ async fn app_state_creation_reconciles_stale_running_metrics_from_durable_sessio
 }
 
 #[tokio::test]
-async fn root_tools_include_server_overlays_and_session_note() {
+async fn root_tools_include_server_overlays_and_memory() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -243,9 +243,11 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("session_note"));
+    assert!(names.contains("memory"));
+    assert!(!names.contains("session_note"));
     assert!(names.contains("ViewImage"));
     for retired in [
+        "Plan",
         "EnterPlanMode",
         "js_repl",
         "NotebookEdit",
@@ -257,6 +259,12 @@ async fn root_tools_include_server_overlays_and_session_note() {
             !names.contains(retired),
             "retired tool {retired} leaked into the root catalog"
         );
+    }
+    let root = state.tools_for(ToolSurface::Root);
+    for stale_name in ["Plan", "default::Plan"] {
+        let call = make_tool_call(stale_name, json!({"task": "Prepare a plan"}));
+        let result = root.execute(&call).await;
+        assert!(matches!(result, Err(ToolError::NotFound(_))), "{result:?}");
     }
 
     let history = state
@@ -317,6 +325,7 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
             "Edit".to_string(),
             "Grep".to_string(),
             "Read".to_string(),
+            "ViewImage".to_string(),
             "Write".to_string(),
             "session_history_current".to_string(),
             "work_overview".to_string(),
@@ -325,6 +334,8 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
             "work_changes".to_string(),
             "work_update".to_string(),
             "work_dispatch".to_string(),
+            #[cfg(unix)]
+            "work_review".to_string(),
         ])
     );
     let broad_history = bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_history")
@@ -362,7 +373,8 @@ async fn shared_base_history_keeps_host_scopes_separate_from_current_history() {
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("session_note"));
+    assert!(names.contains("memory"));
+    assert!(!names.contains("session_note"));
 
     let history = tools
         .iter()
@@ -639,11 +651,11 @@ async fn overlay_tools_require_session_context() {
 
     let sub_agent_result = state
         .tools_for(ToolSurface::Root)
-        .execute(&make_tool_call("SubAgent", json!({ "action": "list" })))
+        .execute(&make_tool_call("SubAgent", json!({ "intent": "inspect" })))
         .await;
     assert!(matches!(
         sub_agent_result,
-        Err(ToolError::Execution(msg)) if msg.contains("session_id")
+        Err(ToolError::Execution(msg)) if msg.contains("current session")
     ));
 }
 
@@ -1167,9 +1179,9 @@ async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
         .tools_for(ToolSurface::Root)
         .execute_with_context(
             &make_tool_call(
-                "session_note",
+                "memory",
                 json!({
-                    "action": "replace",
+                    "action": "session_replace",
                     "content": "Shared AppState Jiandu note"
                 }),
             ),
@@ -1189,7 +1201,7 @@ async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
             },
         )
         .await
-        .expect("session_note replace should succeed");
+        .expect("memory session_replace should succeed");
 
     assert_eq!(
         state

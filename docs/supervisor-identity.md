@@ -86,15 +86,14 @@ selecting Ultra on an Ordinary Root does not make it a Supervisor.
 | Executing Session | Model posture | Management authority |
 | --- | --- | --- |
 | Ordinary Root, Standard | Existing configured execution tools and permissions | Existing ordinary checks; no Supervisor exception |
-| Ordinary Root, Ultra | Bounded planning, delegation, read-only acquisition and verification | No Supervisor-only exception |
-| Trusted Supervisor, Standard or Ultra | Bounded orchestration and necessary dedicated read-only acquisition | Only current, explicitly authorized scope |
+| Ordinary Root, Ultra | Parallel delegation, verification and authorized file edits | No Supervisor-only exception |
+| Trusted Supervisor, Standard or Ultra | Bounded Session and Work orchestration | Only current, explicitly authorized scope |
 | Child | Its own profile, tools and permissions | Does not inherit Supervisor identity or management scope |
 
 The Supervisor owns task boundaries, planning, dispatch, progress, coordination,
 evidence verification and synthesis. It delegates implementation, including
-simple changes. Necessary reads use dedicated `Read`, `Grep`, `Glob`,
-`GetFileInfo`, `ViewImage` and scoped history tools. Shell commands, editing,
-Skill/Workflow execution and external tools cannot become read-only shortcuts.
+simple changes. It uses scoped Session and Work views and delegates direct
+workspace reads, file edits, shell commands, and Skill or Workflow execution.
 Catalog projection, final dispatch, approval replay and queued tool actions
 apply the same exact execution-name boundary.
 
@@ -106,8 +105,8 @@ an observation rather than a grant. If no suitable authorized Root exists,
 report the missing scope or target, or create a Root only when separately
 authorized.
 
-Use `SubAgent` for bounded auxiliary planning, review or verification and `Plan`
-for a read-only planning child. `work_dispatch` retains the existing Work
+Use `SubAgent` for bounded auxiliary planning, review or verification. Select
+the explorer role for a read-only Child. `work_dispatch` retains the existing Work
 authority. The default `session_message` adapter keeps Ordinary/Child sends
 within their task tree; the trusted Supervisor adapter may use an explicitly
 attached followup with `delivery_intent=trigger_turn` under the same independent
@@ -225,6 +224,6 @@ observation, not a retained grant for a later command. Command admission must
 retain a final relationship/target authorization fence through durable Inbox
 acceptance; inspecting a link alone does not authorize a later followup.
 
-Followups, cancellation, Tracker subscriptions and Plan delegation still need
+Followups, cancellation, Tracker subscriptions and Child delegation still need
 their own trusted admission checks. Like the existing Session store, this is not
 an OS sandbox against arbitrary data-directory changes by the same OS user.

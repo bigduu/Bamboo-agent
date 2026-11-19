@@ -67,7 +67,7 @@ pub struct ExecuteSyncInfo {
 /// * `status` - Execution status ("started", "completed", "already_running")
 /// * `events_url` - URL endpoint to subscribe to agent events (SSE)
 /// * `run_id` - Unique identifier for this execution run (present when started/already_running)
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ExecuteResponse {
     /// Session identifier for tracking this execution
     pub session_id: String,

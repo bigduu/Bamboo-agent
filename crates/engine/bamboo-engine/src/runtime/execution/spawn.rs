@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedMutexGuard, RwLock};
@@ -186,12 +186,97 @@ pub struct SessionInboxRuntimeBinding {
     pub parent_question_lock: Option<Arc<bamboo_storage::LockedSessionStore>>,
 }
 
-/// Trait for external child session runtimes (e.g. A2A, CLI adapters).
-///
-/// Implementors are responsible for emitting AgentEvents via `event_tx`
-/// and respecting the `cancel_token`.
+/// A live native owner's once-only Agent execution entry, never persisted or
+/// reconstructed from Actor/Session timestamps. It proves no heartbeat or progress.
+/// Engine owns this physical fact; Orchestration decides its meaning. Server
+/// adapters only join it to current Ticket/Host authority. Stop, shutdown and
+/// restart provide no live sample and cannot recover execution permission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTaskStart {
+    pub session_id: String,
+    pub child_birth: chrono::DateTime<chrono::Utc>,
+    pub run_id: String,
+    pub instance_id: uuid::Uuid,
+    pub entered_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl NativeTaskStart {
+    pub fn started_at_ms(&self) -> Option<u64> {
+        if self.entered_at < self.child_birth || self.entered_at > chrono::Utc::now() {
+            return None;
+        }
+        self.entered_at.timestamp_millis().try_into().ok()
+    }
+}
+
+/// A heartbeat is a successful renewal attempted after this exact Task entered.
+/// It measures owner liveness independently of the Task's progress.
+#[derive(Clone, Debug)]
+pub struct NativeTaskLiveness {
+    pub start: NativeTaskStart,
+    pub renewal_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl NativeTaskLiveness {
+    pub fn heartbeat_at_ms(&self) -> Option<u64> {
+        let at = self.renewal_started_at?;
+        if at < self.start.entered_at || at > chrono::Utc::now() {
+            return None;
+        }
+        at.timestamp_millis().try_into().ok()
+    }
+}
+
+/// External child session runtimes emit events and respect the cancel token.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// Current Ticket authority AND this exact in-process task must agree.
+    /// A model label, durable receipt alone or remote lease is insufficient.
+    async fn owns_current_native_work(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        false
+    }
+
+    /// Live Host evidence only. Queue/preparation, persisted Actor timestamps
+    /// and absent/non-native owners cannot supply a Task-entry witness.
+    fn native_task_start(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskStart> {
+        None
+    }
+
+    /// Read the current native owner and its last acknowledged renewal.
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.native_task_start(session_id, run_id, child_birth)
+            .map(|start| NativeTaskLiveness {
+                start,
+                renewal_started_at: None,
+            })
+    }
+
+    /// Point-in-time activity for a bounded shell wait owned by this exact run.
+    fn shell_wait_activity_at(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: DateTime<Utc>,
+        _now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        None
+    }
+
     /// Capability of the actually assembled backend, independent of hot config.
     /// Only the in-process backend consumes canonical Ticket request ceilings.
     fn supports_native_ticket_budget(&self) -> bool {
@@ -399,6 +484,55 @@ pub struct SpawnScheduler {
 }
 
 impl SpawnScheduler {
+    pub(crate) fn shell_wait_activity_at(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.ctx
+            .external_child_runner
+            .shell_wait_activity_at(session_id, run_id, child_birth, now)
+    }
+
+    pub(crate) async fn owns_current_native_work(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        current_native_work(
+            self.ctx.external_child_runner.as_ref(),
+            session_id,
+            run_id,
+            child_birth,
+        )
+        .await
+    }
+
+    pub fn native_task_start(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskStart> {
+        self.ctx
+            .external_child_runner
+            .native_task_start(session_id, run_id, child_birth)
+    }
+
+    pub fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.ctx
+            .external_child_runner
+            .native_task_liveness(session_id, run_id, child_birth)
+    }
+
     pub fn supports_native_ticket_budget(&self) -> bool {
         self.ctx
             .external_child_runner
@@ -860,6 +994,7 @@ pub(crate) struct ChildWatchdogPolicy {
     // when a Running runner entry whose task died (frozen last_event_at) is
     // stale beyond what the per-child liveness watchdog could still act on.
     pub(crate) max_total_secs: i64,
+    total_is_explicit: bool,
     pub(crate) max_idle_secs: i64,
 }
 
@@ -871,10 +1006,48 @@ impl Default for ChildWatchdogPolicy {
             // liveness. A one hour total cap avoids indefinitely orphaned
             // sub-session runners.
             max_total_secs: 60 * 60,
+            total_is_explicit: false,
             // No child event for 15 minutes is considered stalled.
             max_idle_secs: 15 * 60,
         }
     }
+}
+
+impl ChildWatchdogPolicy {
+    pub(crate) fn needs_native_work_proof(self, elapsed_secs: i64, slack_secs: i64) -> bool {
+        !self.total_is_explicit && self.total_timeout_reached(elapsed_secs, slack_secs, false)
+    }
+
+    pub(crate) fn total_timeout_reached(
+        self,
+        elapsed_secs: i64,
+        slack_secs: i64,
+        current_native_work: bool,
+    ) -> bool {
+        use bamboo_orchestration::work_lifetime::ChildTotalLimit;
+        let limit = if self.total_is_explicit {
+            ChildTotalLimit::Explicit(self.max_total_secs)
+        } else {
+            ChildTotalLimit::Default(self.max_total_secs)
+        };
+        limit
+            .enforced_seconds(current_native_work)
+            .is_some_and(|seconds| elapsed_secs >= seconds.saturating_add(slack_secs))
+    }
+}
+
+async fn current_native_work(
+    runtime: &dyn ExternalChildRunner,
+    session_id: &str,
+    run_id: &str,
+    child_birth: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.owns_current_native_work(session_id, run_id, child_birth),
+    )
+    .await
+    .unwrap_or(false)
 }
 
 fn metadata_i64(session: &Session, key: &str) -> Option<i64> {
@@ -889,6 +1062,7 @@ pub(crate) fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPol
     let mut policy = ChildWatchdogPolicy::default();
     if let Some(value) = metadata_i64(session, "child_watchdog.max_total_secs") {
         policy.max_total_secs = value;
+        policy.total_is_explicit = true;
     }
     if let Some(value) = metadata_i64(session, "child_watchdog.max_idle_secs") {
         policy.max_idle_secs = value;
@@ -963,15 +1137,29 @@ pub(crate) async fn publish_child_completion_parts(
     .await;
 }
 
+pub(crate) struct ChildWatchdogTarget {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub child_birth: chrono::DateTime<chrono::Utc>,
+    pub run_id: String,
+    pub runtime: Arc<dyn ExternalChildRunner>,
+}
+
 pub(crate) async fn watch_child_liveness(
-    parent_session_id: String,
-    child_session_id: String,
+    target: ChildWatchdogTarget,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     cancel_token: CancellationToken,
     timeout_reason: Arc<RwLock<Option<String>>>,
     done: CancellationToken,
     policy: ChildWatchdogPolicy,
 ) {
+    let ChildWatchdogTarget {
+        parent_session_id,
+        child_session_id,
+        child_birth,
+        run_id,
+        runtime,
+    } = target;
     let mut ticker =
         tokio::time::interval(Duration::from_secs(policy.check_interval_secs.max(1) as u64));
     // Skip the immediate tick.
@@ -992,13 +1180,16 @@ pub(crate) async fn watch_child_liveness(
                 let Some(runner) = snapshot else {
                     return;
                 };
-                if !matches!(runner.status, super::runner_state::AgentStatus::Running) {
+                if runner.run_id != run_id || !matches!(runner.status, super::runner_state::AgentStatus::Running) {
                     return;
                 }
 
                 let now = Utc::now();
                 let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                if total_secs >= policy.max_total_secs {
+                let current_native_work = if policy.needs_native_work_proof(total_secs, 0) {
+                    current_native_work(runtime.as_ref(), &child_session_id, &run_id, child_birth).await
+                } else { false };
+                if policy.total_timeout_reached(total_secs, 0, current_native_work) {
                     let reason = format!(
                         "Child session timed out after {} seconds (max_total_secs={})",
                         total_secs, policy.max_total_secs
@@ -1014,7 +1205,8 @@ pub(crate) async fn watch_child_liveness(
                     return;
                 }
 
-                let last_activity_at = runner.last_activity_at().unwrap_or(runner.started_at);
+                let shell_wait = runtime.shell_wait_activity_at(&child_session_id, &run_id, child_birth, now);
+                let last_activity_at = runner.last_activity_at().max(shell_wait).unwrap_or(runner.started_at);
                 let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
                 if idle_secs >= policy.max_idle_secs {
                     let reason = format!(
@@ -1086,9 +1278,7 @@ async fn queued_launch_state(
     }
     match child.last_run_status().as_deref() {
         Some("pending") => Ok(QueuedLaunchState::Eligible),
-        Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended") => {
-            Ok(QueuedLaunchState::AlreadyStarted)
-        }
+        Some("running" | "suspended") => Ok(QueuedLaunchState::AlreadyStarted),
         _ => Ok(QueuedLaunchState::Stale),
     }
 }

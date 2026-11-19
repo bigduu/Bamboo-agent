@@ -23,6 +23,10 @@ pub(super) struct ChildActorWriteProof {
 }
 
 impl ChildActorWriteProof {
+    pub(super) fn owner(&self) -> &ChildActorRuntimeWrite {
+        &self.owner
+    }
+
     fn new(sessions: PathBuf, owner: ChildActorRuntimeWrite) -> io::Result<Self> {
         for id in [
             &owner.fence.actor_id,
@@ -602,7 +606,14 @@ impl SessionStoreV2 {
         }
         if let Some((inbox, directory, claim, filesystem)) = pending_ack {
             inbox
-                .ack_owned_with_filesystem(&directory, &session.id, &claim, Utc::now(), filesystem)
+                .ack_owned_with_filesystem(
+                    &directory,
+                    &session.id,
+                    &claim,
+                    Utc::now(),
+                    filesystem,
+                    None,
+                )
                 .await
                 .map_err(conflict)?;
         }

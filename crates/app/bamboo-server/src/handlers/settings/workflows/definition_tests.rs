@@ -389,7 +389,20 @@ async fn authoring_project_scope_uses_durable_session_and_remains_isolated() {
     std::fs::write(&fixture_file, "PROJECT_AUTHORING_READ_ONLY_MARKER").unwrap();
     let mut project_definition = definition("project-flow", 1);
     project_definition["steps"][0]["args"] = json!({"file_path":fixture_file});
-    let response = webtest::call_service(&app,webtest::TestRequest::post().uri("/definitions").set_json(json!({"target":"project","session_id":"definition-project-session","description":"Project-owned definition","definition":project_definition})).to_request()).await;
+    let stale_project = webtest::call_service(
+        &app,
+        webtest::TestRequest::post()
+            .uri("/definitions")
+            .set_json(json!({
+                "target": "project", "session_id": "definition-project-session",
+                "expected_project_id": other.id, "description": "Wrong project",
+                "definition": project_definition,
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale_project.status(), StatusCode::CONFLICT);
+    let response = webtest::call_service(&app,webtest::TestRequest::post().uri("/definitions").set_json(json!({"target":"project","session_id":"definition-project-session","expected_project_id":project.id,"description":"Project-owned definition","definition":project_definition})).to_request()).await;
     let status = response.status();
     let bytes = webtest::read_body(response).await;
     assert_eq!(

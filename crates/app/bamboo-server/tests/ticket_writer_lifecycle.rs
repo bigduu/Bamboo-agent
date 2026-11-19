@@ -15,7 +15,9 @@ use bamboo_orchestration::{
         ReadyRetryKey, ReadyRetryPhase, ReadyRetryRequest, ReadyRetryStore, VersionedReadyRetry,
     },
 };
-use bamboo_server::app_state::ticket_application::{FileReadyRetryStore, ReadyReconcile};
+use bamboo_server::app_state::ticket_application::{
+    FileReadyRetryStore, PatrolCheckpointStore, ReadyReconcile,
+};
 use bamboo_tickets::{canonical_bytes, Health, RuntimeReceipt, WorkState};
 use std::{sync::Arc, time::Duration};
 
@@ -519,6 +521,15 @@ async fn stopped_native_child_shutdown_drop_reopens_the_same_writer_and_preserve
         ReadyReconcile::Disabled
     ));
     host.assert_quiet(0).await;
+    // Own the actual independent Patrol namespace before enabling its managed
+    // writer. Child stop does not imply an absent checkpoint or a quiet patrol.
+    let patrol_binding =
+        bamboo_tickets::content_hash(&canonical_bytes(&host.snapshot().binding).unwrap());
+    let patrol_root = root
+        .join("orchestration")
+        .join("patrol")
+        .join(patrol_binding);
+    let mut physical_writer = PatrolCheckpointStore::open(&patrol_root).unwrap();
     host.state()
         .tickets
         .install_ready_work_policy(support::Host::policy(project.clone(), grant))
@@ -597,20 +608,19 @@ async fn stopped_native_child_shutdown_drop_reopens_the_same_writer_and_preserve
             observation.source_revision,
         )
     };
+    // Force the managed-before-manual schedule that rejected save(None) in the
+    // negative control. Real lock contention leaves dispatch available while
+    // preventing the program pass from racing this fixture's manual seed.
+    assert!(matches!(
+        host.state().tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::Idle
+    ));
     let original_checkpoint = {
-        let mut physical_writer = host
-            .state()
-            .tickets
-            .open_patrol_checkpoints(&scope)
-            .await
-            .unwrap();
+        assert_eq!(physical_writer.load(&scope).unwrap(), None);
         assert_eq!(physical_writer.save(None, &cp), Ok(1));
         assert_eq!(physical_writer.save(None, &cp), Err(PortError::Conflict));
         let stored = physical_writer.load(&scope).unwrap().unwrap();
         assert_eq!(stored.checkpoint, cp);
-        // The CP writer is explicitly dropped before shutdown; it is not the
-        // Ticket writer whose physical lifecycle this test is measuring.
-        drop(physical_writer);
         stored
     };
     host.assert_quiet(2).await;
@@ -629,7 +639,12 @@ async fn stopped_native_child_shutdown_drop_reopens_the_same_writer_and_preserve
         .join(before.binding.scope_id.strip_prefix("supervisor/").unwrap())
         .join("writer.lock");
     assert!(writer_path.is_file());
+    // Keep the Ready policy installed through the original shutdown boundary.
+    // This independent file lease holds no AppState/TicketService reference;
+    // retain it until the actual managed worker is joined, then release it
+    // before reopening either writer. No revoke ACK is used as release proof.
     host.shutdown_and_drop().await;
+    drop(physical_writer);
     // Only owned snapshots, stored values and Weak handles cross this boundary.
     // Do not assert the Weak result first: capture a REAL same-root reopen so
     // RED diagnoses the physical scope-lock failure as well as retained owners.

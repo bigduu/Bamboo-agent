@@ -16,7 +16,7 @@ pub(super) fn build_plan_mode_instructions(plan_mode: &PlanModeState) -> String 
         PlanModeStatus::Reviewing => {
             "Phase: REVIEW — Review the plan for completeness and correctness."
         }
-        PlanModeStatus::Finalizing => "Phase: FINALIZE — Write the plan to the plan file.",
+        PlanModeStatus::Finalizing => "Phase: FINALIZE — Prepare the plan for approval.",
         PlanModeStatus::AwaitingApproval => {
             "Phase: AWAITING APPROVAL — Plan is ready for user review."
         }
@@ -27,33 +27,9 @@ pub(super) fn build_plan_mode_instructions(plan_mode: &PlanModeState) -> String 
 
 {status_hint}
 
-The user has indicated they want you to PLAN before implementing. You MUST NOT:
-- Make any file edits (Write, Edit, NotebookEdit)
-- Execute or continue any shell commands (exec_command, write_stdin, legacy Bash tools)
-- Make HTTP requests that modify state
-- Spawn child sessions for implementation (only read-only exploration)
-
-You MAY:
-- Read files, search code (Read, Glob, Grep, GetFileInfo)
-- Fetch web content (WebFetch, WebSearch)
-- Use SubAgent with subagent_type="plan" to spawn read-only exploration agents
-- Update the task list (Task tool) — tasks created in plan mode default to phase=planning
-- Write notes to session memory (session_note tool)
-
-Your goal: Explore the codebase thoroughly, understand the problem, and produce a detailed implementation plan.
-
-Workflow:
-1. EXPLORE: Use read-only tools to understand the codebase structure and relevant code
-2. DESIGN: Formulate a concrete implementation approach with clear steps
-3. DECOMPOSE: Use the Task tool to break the plan into concrete steps (tasks default to planning phase)
-4. WRITE PLAN: Save your plan (the assistant runtime will handle plan file persistence)
-5. EXIT: Call ExitPlanMode when the plan is ready for user review
-
-The plan should include:
-- Files that need to be changed
-- Key functions/structs to modify
-- Testing approach
-- Any risks or considerations
+You MUST NOT edit files, execute or continue shell commands, make mutating HTTP requests, or delegate implementation.
+Use available read-only tools and authorized session notes.
+Include affected files and functions, implementation steps, tests, and risks. Call ExitPlanMode when the plan is ready for review. The runtime persists the plan.
 "#
     )
 }
@@ -100,9 +76,11 @@ mod tests {
         let instructions = build_plan_mode_instructions(&plan_mode);
         assert!(instructions.contains("PLAN MODE ACTIVE"));
         assert!(instructions.contains("MUST NOT"));
-        assert!(instructions.contains("Write, Edit, NotebookEdit"));
-        assert!(instructions.contains("Bash"));
-        assert!(instructions.contains("exec_command, write_stdin"));
+        assert!(instructions.contains("MUST NOT edit files"));
+        assert!(instructions.contains("execute or continue shell commands"));
+        assert!(instructions.contains("ExitPlanMode"));
+        assert!(!instructions.contains("NotebookEdit"));
+        assert!(!instructions.contains("WebSearch"));
         assert!(instructions.contains("EXPLORE"));
     }
 

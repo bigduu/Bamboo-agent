@@ -65,6 +65,9 @@ pub enum AppError {
     #[error("Configuration revision conflict: expected {expected}, actual {actual}")]
     ConfigConflict { expected: u64, actual: u64 },
 
+    #[error("Provider instance is still referenced by model defaults")]
+    ProviderInstanceInUse { reference_paths: Vec<String> },
+
     #[error("Internal server error: {0}")]
     InternalError(#[from] anyhow::Error),
 
@@ -128,7 +131,11 @@ pub fn json_internal_server_error(message: impl Into<String>) -> actix_web::Erro
     actix_web::error::InternalError::from_response(message, response).into()
 }
 
-fn json_error_with_code(status: StatusCode, message: String, code: Option<&str>) -> HttpResponse {
+pub(crate) fn json_error_with_code(
+    status: StatusCode,
+    message: String,
+    code: Option<&str>,
+) -> HttpResponse {
     HttpResponse::build(status).json(JsonErrorWrapper {
         error: JsonError {
             message,
@@ -151,6 +158,7 @@ impl ResponseError for AppError {
             AppError::ProxyAuthRequired => StatusCode::PRECONDITION_REQUIRED,
             AppError::ConfigRecoveryPending(_) => StatusCode::CONFLICT,
             AppError::ConfigConflict { .. } => StatusCode::CONFLICT,
+            AppError::ProviderInstanceInUse { .. } => StatusCode::CONFLICT,
             AppError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::SerializationError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -163,6 +171,16 @@ impl ResponseError for AppError {
             AppError::ProxyAuthRequired => Some("proxy_auth_required"),
             AppError::ConfigRecoveryPending(_) => Some("config_recovery_pending"),
             AppError::ConfigConflict { .. } => Some("config_revision_conflict"),
+            AppError::ProviderInstanceInUse { reference_paths } => {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "message": self.to_string(),
+                        "type": "api_error",
+                        "code": "provider_instance_in_use",
+                    },
+                    "reference_paths": reference_paths,
+                }));
+            }
             _ => None,
         };
         json_error_with_code(status_code, self.to_string(), code)

@@ -386,6 +386,7 @@ impl ChildSessionAdapter {
                     if running_token.is_none() {
                         child.set_last_run_status("cancelled");
                         child.set_last_run_error("Cancelled by parent before activation");
+                        child.synchronize_terminal_runtime_status();
                         queued_parent = child.parent_session_id.clone();
                     }
                 },

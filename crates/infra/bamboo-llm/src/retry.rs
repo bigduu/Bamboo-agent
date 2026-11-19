@@ -178,6 +178,15 @@ pub(crate) fn work_request_budget_active() -> bool {
     WORK_PHYSICAL_REQUEST.try_with(|_| ()).is_ok()
 }
 
+fn single_attempt_required() -> bool {
+    work_request_budget_active() || output_limit_recovery_active()
+}
+
+pub(crate) fn output_limit_recovery_active() -> bool {
+    crate::provider::current_completion_diagnostics()
+        .is_some_and(|diagnostics| diagnostics.is_output_limit_recovery())
+}
+
 pub(crate) fn claim_work_physical_request() -> Result<(), LLMError> {
     WORK_PHYSICAL_REQUEST.try_with(|spent| {
         spent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -198,6 +207,43 @@ pub async fn send_provider_request<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    send_provider_request_with_remaining_attempt(config, provider, build)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// Authority to make one corrected physical send under the original bootstrap
+/// policy. Consuming this value cannot start another transient retry loop.
+pub(crate) struct RemainingInitialRequestAttempt {
+    deadline: Option<Instant>,
+    attempt_timeout: Duration,
+}
+
+impl RemainingInitialRequestAttempt {
+    pub(crate) async fn send(
+        self,
+        build: impl FnOnce() -> RequestBuilder,
+    ) -> Result<Option<Response>, LLMError> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Ok(None);
+        }
+        claim_work_physical_request()?;
+        let _managed_request = ManagedRequestScope::enter();
+        let response = send_managed_attempt(self.deadline, self.attempt_timeout, build)
+            .await
+            .result?;
+        check_work_text_response(response).map(Some)
+    }
+}
+
+pub(crate) async fn send_provider_request_with_remaining_attempt(
+    config: &RetryConfig,
+    provider: &str,
+    build: impl Fn() -> RequestBuilder,
+) -> Result<(Response, Option<RemainingInitialRequestAttempt>), LLMError> {
     claim_work_physical_request()?;
     // Take the policy once instead of trusting a second independent read of the
     // limits: a configuration change between those reads would combine two
@@ -209,70 +255,93 @@ where
     } else {
         *config
     };
-    send_managed_request(&retry, provider, limits, build).await
+    let (response, remaining_attempt) = send_managed_request(&retry, provider, limits, build).await;
+    Ok((check_work_text_response(response?)?, remaining_attempt))
 }
 
-// The timeout owns only the headers future, never the successful SSE body.
-// Anthropic separately shares one budget across its compatibility fallbacks.
-async fn send_managed_request<F>(
+async fn send_managed_request(
     config: &RetryConfig,
     provider: &str,
     limits: InitialRequestLimits,
-    build: F,
-) -> Result<Response, LLMError>
-where
-    F: Fn() -> RequestBuilder,
-{
+    build: impl Fn() -> RequestBuilder,
+) -> (
+    Result<Response, LLMError>,
+    Option<RemainingInitialRequestAttempt>,
+) {
     let continuous = continuous_request_retries();
     let deadline = (!continuous).then(|| Instant::now() + limits.total_budget);
     let _managed_request = ManagedRequestScope::enter();
-    retry_initial_request(
+    let (response, attempts) = retry_initial_request(
         config,
         provider,
         continuous,
         0,
-        || async {
-            let started = Instant::now();
-            if deadline.is_some_and(|deadline| started >= deadline) {
-                return RetryAttempt::final_result(Err(LLMError::RequestFailed(
-                    "initial upstream request time budget exhausted".into(),
-                )));
-            }
-            let attempt_deadline = deadline
-                .map(|deadline| deadline.min(started + limits.attempt_timeout))
-                .unwrap_or(started + limits.attempt_timeout);
-            match tokio::time::timeout_at(attempt_deadline, build().send()).await {
-                Ok(Ok(response)) => RetryAttempt {
-                    retry: is_retryable_status(response.status()),
-                    status: Some(response.status()),
-                    retry_after: parse_retry_after_with_date(&response),
-                    deadline,
-                    observation: None,
-                    result: Ok(response),
-                },
-                Ok(Err(error)) => RetryAttempt {
-                    retry: is_retryable_reqwest_error(&error),
-                    status: None,
-                    retry_after: None,
-                    deadline,
-                    observation: None,
-                    result: Err(LLMError::Http(error)),
-                },
-                Err(_) => RetryAttempt {
-                    retry: true,
-                    status: None,
-                    retry_after: None,
-                    deadline,
-                    observation: None,
-                    result: Err(LLMError::RequestFailed(
-                        "initial response headers timed out".into(),
-                    )),
-                },
-            }
-        },
+        || send_managed_attempt(deadline, limits.attempt_timeout, &build),
         |_, _| {},
     )
-    .await
+    .await;
+    let remaining_attempt = (!single_attempt_required()
+        && (continuous || attempts < config.max_attempts.max(1)))
+    .then_some(RemainingInitialRequestAttempt {
+        deadline,
+        attempt_timeout: limits.attempt_timeout,
+    });
+    (response, remaining_attempt)
+}
+
+fn check_work_text_response(response: Response) -> Result<Response, LLMError> {
+    if crate::work_text::active() && !response.status().is_success() {
+        return Err(LLMError::Api(format!(
+            "Work text request returned {}",
+            response.status()
+        )));
+    }
+    Ok(response)
+}
+
+// The timeout owns only the headers future, never the successful SSE body.
+async fn send_managed_attempt(
+    deadline: Option<Instant>,
+    attempt_timeout: Duration,
+    build: impl FnOnce() -> RequestBuilder,
+) -> RetryAttempt<Result<Response, LLMError>> {
+    let started = Instant::now();
+    if deadline.is_some_and(|deadline| started >= deadline) {
+        return RetryAttempt::final_result(Err(LLMError::RequestFailed(
+            "initial upstream request time budget exhausted".into(),
+        )));
+    }
+    let attempt_deadline = deadline
+        .map(|deadline| deadline.min(started + attempt_timeout))
+        .unwrap_or(started + attempt_timeout);
+    match tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await {
+        Ok(Ok(response)) => RetryAttempt {
+            retry: is_retryable_status(response.status()),
+            status: Some(response.status()),
+            retry_after: parse_retry_after_with_date(&response),
+            deadline,
+            observation: None,
+            result: Ok(response),
+        },
+        Ok(Err(error)) => RetryAttempt {
+            retry: matches!(&error, LLMError::Http(error) if is_retryable_reqwest_error(error)),
+            status: None,
+            retry_after: None,
+            deadline,
+            observation: None,
+            result: Err(error),
+        },
+        Err(_) => RetryAttempt {
+            retry: true,
+            status: None,
+            retry_after: None,
+            deadline,
+            observation: None,
+            result: Err(LLMError::RequestFailed(
+                "initial response headers timed out".into(),
+            )),
+        },
+    }
 }
 
 pub async fn observe_initial_http_retries<F: Future>(
@@ -516,24 +585,11 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     false
 }
 
-/// Parse delay-seconds without turning numeric overflow into a short backoff.
-/// The date parser below handles the HTTP-date and legacy RFC2822 forms.
-fn parse_retry_after(response: &Response) -> Option<Duration> {
-    let value = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .to_string();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    // A syntactically numeric value larger than u64 cannot be safely waited;
-    // saturating preserves a stop decision instead of ignoring the server hint.
-    Some(Duration::from_secs(
-        value.parse::<u64>().unwrap_or(u64::MAX),
-    ))
+fn retry_after_header(response: &Response) -> Option<&reqwest::header::HeaderValue> {
+    let headers = response.headers();
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .or_else(|| headers.get("llm_provider-retry-after"))
 }
 
 /// Compute the exponential backoff delay for a given zero-based attempt index,
@@ -597,6 +653,7 @@ where
         || async {
             match build().send().await {
                 Ok(response) => {
+                    crate::http_client::observe_provider_response(&response);
                     let status = response.status();
                     let retry_after = parse_retry_after_with_date(&response);
                     RetryAttempt {
@@ -621,6 +678,7 @@ where
         |_, _| {},
     )
     .await
+    .0
 }
 
 struct RetryAttempt<T> {
@@ -664,18 +722,18 @@ async fn retry_initial_request<T, F, Fut, D>(
     initial_index: u32,
     attempt: F,
     decide: D,
-) -> T
+) -> (T, u32)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = RetryAttempt<T>>,
     D: Fn(&mut RetryAttempt<T>, RetryDecision),
 {
-    let max_attempts = if work_request_budget_active() {
+    let max_attempts = if single_attempt_required() {
         1
     } else {
         config.max_attempts.max(1)
     };
-    let continuous = allow_continuous && !work_request_budget_active();
+    let continuous = allow_continuous && !single_attempt_required();
     let mut index: u32 = initial_index;
     loop {
         let mut outcome = attempt().await;
@@ -713,7 +771,7 @@ where
         };
         decide(&mut outcome, decision);
         let RetryDecision::Retry(delay) = decision else {
-            return outcome.result;
+            return (outcome.result, index.saturating_add(1));
         };
         if let Some(status) = outcome.status {
             let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
@@ -766,7 +824,7 @@ impl InitialRequestBudget {
         let limits = initial_request_limits();
         Self {
             attempts: AtomicU32::new(0),
-            max_attempts: if work_request_budget_active() {
+            max_attempts: if single_attempt_required() {
                 1
             } else {
                 config.max_attempts.max(1)
@@ -796,7 +854,7 @@ impl InitialRequestBudget {
     }
 
     fn record_live_candidate(&self, retry_after: Option<Duration>) {
-        if self.is_continuous() || work_request_budget_active() {
+        if self.is_continuous() || single_attempt_required() {
             return;
         }
         let Some(not_before) = Instant::now().checked_add(retry_after.unwrap_or_default()) else {
@@ -809,7 +867,7 @@ impl InitialRequestBudget {
 
     fn can_defer_terminal(&self, stop: RequestStopReason) -> bool {
         if self.is_continuous()
-            || work_request_budget_active()
+            || single_attempt_required()
             || !matches!(
                 stop,
                 RequestStopReason::AttemptsExhausted
@@ -951,27 +1009,27 @@ async fn read_connector_body(response: &mut Response) -> reqwest::Result<String>
 }
 
 fn parse_retry_after_with_date(response: &Response) -> Option<Duration> {
-    parse_retry_after(response).or_else(|| {
-        let value = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?;
-        httpdate::parse_http_date(value)
-            .map(|date| {
-                date.duration_since(std::time::SystemTime::now())
+    let value = retry_after_header(response)?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Saturate on numeric overflow to avoid retrying before the server permits it.
+        return Some(Duration::from_secs(
+            value.parse::<u64>().unwrap_or(u64::MAX),
+        ));
+    }
+    httpdate::parse_http_date(value)
+        .map(|date| {
+            date.duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+        })
+        // Preserve the previously accepted numeric-zone RFC2822 form.
+        .or_else(|_| {
+            chrono::DateTime::parse_from_rfc2822(value).map(|date| {
+                (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                    .to_std()
                     .unwrap_or_default()
             })
-            // Preserve the previously accepted numeric-zone RFC2822 form.
-            .or_else(|_| {
-                chrono::DateTime::parse_from_rfc2822(value).map(|date| {
-                    (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                        .to_std()
-                        .unwrap_or_default()
-                })
-            })
-            .ok()
-    })
+        })
+        .ok()
 }
 
 pub(crate) async fn send_anthropic_with_retry<F>(
@@ -1087,7 +1145,8 @@ where
                     .deadline
                     .min(attempt_started + budget.attempt_timeout)
             };
-            let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
+            let sent =
+                tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await;
             let mut response = match sent {
                 Err(_) => {
                     budget.record_live_candidate(None);
@@ -1103,15 +1162,20 @@ where
                     );
                 }
                 Ok(Err(error)) => {
-                    let retry = is_retryable_reqwest_error(&error);
-                    let kind = crate::providers::common::http_error_kind(&error);
+                    let (retry, kind) = match &error {
+                        LLMError::Http(error) => (
+                            is_retryable_reqwest_error(error),
+                            crate::providers::common::http_error_kind(error),
+                        ),
+                        _ => (false, "local admission"),
+                    };
                     let mut outcome = budget.failure(
                         budget.observation(attempt_started, "send_headers", kind, None),
                         (!retry).then_some(RequestStopReason::NonRetryableTransport),
                         None,
                     );
                     if !retry {
-                        outcome.result = Err(LLMError::Http(error));
+                        outcome.result = Err(error);
                     }
                     return outcome;
                 }
@@ -1119,10 +1183,8 @@ where
             };
             let status = response.status();
             let retry_after = parse_retry_after_with_date(&response);
-            let retry_after_known = !response
-                .headers()
-                .contains_key(reqwest::header::RETRY_AFTER)
-                || retry_after.is_some();
+            let retry_after_known =
+                retry_after_header(&response).is_none() || retry_after.is_some();
             if is_retryable_status(status) && retry_after_known {
                 budget.record_live_candidate(retry_after);
             }
@@ -1209,6 +1271,7 @@ where
         |outcome, decision| budget.decide(outcome, decision),
     )
     .await
+    .0
 }
 
 #[cfg(test)]
@@ -1298,6 +1361,57 @@ mod tests {
             ))
             .await;
         assert!(matches!(retry, Err(LLMError::RequestFailed(_))));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remaining_initial_attempt_cannot_send_after_the_original_deadline() {
+        let remainder = RemainingInitialRequestAttempt {
+            deadline: Some(Instant::now()),
+            attempt_timeout: Duration::from_secs(60),
+        };
+        let response = remainder
+            .send(|| panic!("expired bootstrap must not build a corrected request"))
+            .await
+            .unwrap();
+        assert!(response.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_transport_respects_gateway_backoff_and_correlates_response_headers() {
+        use crate::providers::common::{log_identity, log_privacy_tests::EventCapture};
+
+        const UPSTREAM_ID: &str = "fixture-raw-provider-id";
+        const GATEWAY_ID: &str = "fixture-raw-gateway-id";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("llm_provider-retry-after", "86400")
+                    .insert_header("llm_provider-request-id", UPSTREAM_ID)
+                    .insert_header("x-litellm-call-id", GATEWAY_ID),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+        let client = reqwest::Client::new();
+        let response = send_provider_request(&fast_config(2), "local-gateway", || {
+            client.post(server.uri())
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers()["llm_provider-request-id"], UPSTREAM_ID);
+        capture.assert_private(
+            "LLM provider response headers received",
+            &[UPSTREAM_ID, GATEWAY_ID],
+        );
+        let text = capture.text();
+        assert!(text.contains(&log_identity(UPSTREAM_ID)));
+        assert!(text.contains(&log_identity(GATEWAY_ID)));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 

@@ -157,7 +157,7 @@ fn snapshot(path: &Path, processing_time_sessions: &[&str]) -> Vec<Vec<Vec<Value
         let mut data = rows(&connection, &format!("SELECT * FROM {table} ORDER BY rowid"));
         if table == "session_metrics" && !processing_time_sessions.is_empty() {
             let statement = connection.prepare("SELECT * FROM session_metrics").unwrap();
-            let updated_at = statement.column_names().iter().position(|name| *name == "updated_at").unwrap();
+            let updated_at = statement.column_names().position(|name| name == "updated_at").unwrap();
             for row in &mut data {
                 if matches!(&row[0], Value::Text(id) if processing_time_sessions.contains(&id.as_str())) {
                     row[updated_at] = Value::Text("bounded prune processing time".into());

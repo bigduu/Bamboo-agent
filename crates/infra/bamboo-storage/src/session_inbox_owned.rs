@@ -72,6 +72,11 @@ impl StoredLease {
         self.policy
     }
 
+    #[cfg(feature = "test-utils")]
+    pub(super) fn expires_at_for_testing(&self) -> DateTime<Utc> {
+        self.token.expires_at
+    }
+
     /// Structural evidence only. Retirement does not mint or renew a lease.
     pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
         FileSessionInbox::owned_name(generation, &self.token) == name
@@ -622,6 +627,7 @@ pub(super) enum AckAuthority<'a> {
     Owned {
         lease: &'a StoredLease,
         filesystem: &'a OwnedFilesystem,
+        post_receipt_cleanup: Option<&'a OwnedFilesystem>,
     },
 }
 impl AckAuthority<'_> {
@@ -647,11 +653,19 @@ impl AckAuthority<'_> {
             }
         }
     }
-    pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
+    pub(super) async fn remove_committed_claim(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::remove_file(path).await,
-            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
-                filesystem.remove(path).await
+            Self::ScopedLegacy(filesystem) => filesystem.remove(path).await,
+            Self::Owned {
+                filesystem,
+                post_receipt_cleanup,
+                ..
+            } => {
+                post_receipt_cleanup
+                    .unwrap_or(filesystem)
+                    .remove(path)
+                    .await
             }
         }
     }
@@ -792,8 +806,18 @@ impl FileSessionInbox {
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        let wait = match &authority {
+            InboxAuthority::SupervisedRootOutcome { _guard, .. } => _guard.lock_wait,
+            _ => crate::v2::SessionLockWait::Wait,
+        };
         let dir = self.inbox_dir_with_authority(target, &authority).await?;
-        let process = self.lock_process(&dir).await;
+        let process = match wait {
+            crate::v2::SessionLockWait::Wait => self.lock_process(&dir).await,
+            crate::v2::SessionLockWait::Try => self
+                .process_lock(&dir)
+                .try_lock_owned()
+                .map_err(|_| SessionInboxError::Storage("Inbox proof I/O is busy".into()))?,
+        };
         let scope = Arc::new(OwnedScope {
             _process: process,
             _authority: authority,
@@ -813,7 +837,7 @@ impl FileSessionInbox {
             // instead of creating or locking an object outside the Inbox.
             let anchor = super::anchor::InboxAnchor::acquire(&path)?;
             let file = anchor.open_lock(OPERATION_LOCK_FILE)?;
-            file.lock_exclusive()?;
+            wait.lock_exclusive(&file)?;
             Ok::<_, std::io::Error>(Arc::new(OwnedGuards {
                 _file: FileOperationLock(file),
                 dir: anchor,
@@ -1289,6 +1313,11 @@ impl FileSessionInbox {
         let actual_request;
         let request = if self.root_owner.is_some() || self.child_owner.is_some() {
             let now = Utc::now();
+            if expires_at <= now {
+                // No queue operation has started. A live owner can submit a
+                // fresh bounded request after dropping these physical guards.
+                return Err(SessionInboxError::ClaimLeaseExpired);
+            }
             actual_request = SessionInboxLeaseRequest {
                 consumer: request.consumer.clone(),
                 now,
@@ -1512,6 +1541,25 @@ impl FileSessionInbox {
         allow_terminal: bool,
     ) -> Result<(SessionMessageEnvelope, Option<SessionInboxActivationIntent>), SessionInboxError>
     {
+        self.locked_owned_claim_with_message_policy(dir, target, claim, now, allow_terminal)
+            .map(|(envelope, intent, _)| (envelope, intent))
+    }
+
+    pub(crate) fn locked_owned_claim_with_message_policy(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        now: DateTime<Utc>,
+        allow_terminal: bool,
+    ) -> Result<
+        (
+            SessionMessageEnvelope,
+            Option<SessionInboxActivationIntent>,
+            Option<SessionActivationPolicy>,
+        ),
+        SessionInboxError,
+    > {
         use std::io::Read;
         let storage = |error: std::io::Error| SessionInboxError::Storage(error.to_string());
         let read = |path: &Path| -> Result<Vec<u8>, SessionInboxError> {
@@ -1547,6 +1595,10 @@ impl FileSessionInbox {
         let stored = stored.ok_or_else(|| invalid("Inbox lease missing"))?;
         let intent = Self::activation_intent(&wrapper.body)?;
         let activation_intent = Self::message_activation_intent(&wrapper.body)?;
+        let message_policy = activation_intent
+            .as_ref()
+            .map(|intent| intent.policy())
+            .transpose()?;
         if !stored.same_identity(&claim.lease)
             || stored.policy != claim.claim.activation_policy
             || stored.token.expires_at <= now
@@ -1575,7 +1627,7 @@ impl FileSessionInbox {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
         }
-        Ok((actual.claim.envelope, intent))
+        Ok((actual.claim.envelope, intent, message_policy))
     }
 
     async fn current_owned(
@@ -1701,6 +1753,7 @@ impl FileSessionInbox {
                     AckAuthority::Owned {
                         lease,
                         filesystem: &filesystem,
+                        post_receipt_cleanup: None,
                     },
                 )
                 .await;
@@ -1718,7 +1771,7 @@ impl FileSessionInbox {
         } else {
             filesystem
         };
-        self.ack_owned_with_filesystem(&dir, target, claim, now, filesystem)
+        self.ack_owned_with_filesystem(&dir, target, claim, now, filesystem, None)
             .await
     }
 
@@ -1729,6 +1782,7 @@ impl FileSessionInbox {
         claim: &SessionInboxOwnedClaim,
         now: DateTime<Utc>,
         filesystem: OwnedFilesystem,
+        post_receipt_cleanup: Option<&OwnedFilesystem>,
     ) -> Result<(), SessionInboxError> {
         let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, dir, target, claim, true)
@@ -1753,6 +1807,7 @@ impl FileSessionInbox {
             AckAuthority::Owned {
                 lease: &stored,
                 filesystem: &filesystem,
+                post_receipt_cleanup,
             },
         )
         .await

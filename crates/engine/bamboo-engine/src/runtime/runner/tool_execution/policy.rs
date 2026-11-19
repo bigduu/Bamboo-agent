@@ -8,11 +8,13 @@ use sha2::{Digest, Sha256};
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
+const REPEATED_TOOL_CALLS: usize = 3;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
 const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
+pub(super) const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ToolCircuitKey {
+pub(super) enum ToolCircuitKey {
     Tool(String),
     SubAgentInspection,
 }
@@ -39,8 +41,6 @@ struct ObservationProgress {
     previous: Option<BTreeSet<[u8; 32]>>,
     unchanged_rounds: usize,
     last_round: Option<usize>,
-    last_call_ids: Vec<String>,
-    made_progress: bool,
 }
 
 impl ObservationProgress {
@@ -54,8 +54,6 @@ impl ObservationProgress {
         }
         self.last_round = Some(round);
         self.current = Some(BTreeSet::new());
-        self.last_call_ids.clear();
-        self.made_progress = false;
     }
 
     fn observe(&mut self, call: &ToolCall, outcome: &Result<ToolResult, String>) {
@@ -96,16 +94,10 @@ impl ObservationProgress {
         fingerprint.update([0u8]);
         fingerprint.update(result.result.as_bytes());
         current.insert(fingerprint.finalize().into());
-        if self.last_call_ids.len() < 8 {
-            self.last_call_ids.push(call.id.chars().take(129).collect());
-        }
     }
 
     fn finish_round(&mut self) -> Option<&'static str> {
         let current = self.current.take().filter(|round| !round.is_empty());
-        self.made_progress = current
-            .as_ref()
-            .is_some_and(|round| self.previous.as_ref() != Some(round));
         self.unchanged_rounds = match &current {
             Some(round) if self.previous.as_ref() == Some(round) => {
                 self.unchanged_rounds.saturating_add(1)
@@ -120,7 +112,159 @@ impl ObservationProgress {
     }
 }
 
-const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
+/// Track consecutive equivalent calls within one execution.
+#[derive(Debug, Clone, Default)]
+struct RepeatedToolCalls {
+    fingerprint: Option<[u8; 32]>,
+    count: usize,
+    last_round: Option<usize>,
+    pending: BTreeSet<String>,
+}
+
+impl RepeatedToolCalls {
+    fn begin_round(&mut self, round: usize) {
+        if self
+            .last_round
+            .is_some_and(|last| last.checked_add(1) != Some(round))
+        {
+            *self = Self::default();
+        }
+        self.last_round = Some(round);
+    }
+
+    fn observe(&mut self, name: &str, fingerprint: Option<[u8; 32]>) {
+        if fingerprint.is_some() && self.fingerprint == fingerprint {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.fingerprint = fingerprint;
+            self.count = usize::from(fingerprint.is_some());
+        }
+        if self.count == REPEATED_TOOL_CALLS {
+            // Keep the notice even if further calls in the batch break this streak.
+            self.pending.insert(name.chars().take(128).collect());
+        }
+    }
+
+    fn advisory(&mut self, file_hint: Option<&str>) -> Option<String> {
+        if self.pending.is_empty() {
+            return file_hint
+                .filter(|_| self.count < REPEATED_TOOL_CALLS)
+                .map(|hint| format!("{REPEATED_TOOL_ADVISORY_PREFIX}{hint}"));
+        }
+        let tools = std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "{REPEATED_TOOL_ADVISORY_PREFIX}The following tools each returned the same result at least {REPEATED_TOOL_CALLS} times in a row with identical arguments ({tools}). Consider using the evidence already collected or trying a different approach. If you are intentionally polling, wait for a useful change or use the appropriate status tool.",
+        ))
+    }
+}
+
+/// Compare real results before compression, using the admitted identity and inputs.
+pub(super) fn dispatched_tool_fingerprint(
+    call: &ToolCall,
+    outcome: &super::per_call::ToolExecutionOutcome,
+) -> Option<[u8; 32]> {
+    outcome.output_cap?;
+    if outcome.needs_human.is_some() {
+        return None;
+    }
+    let tool = outcome.portable_tool.as_ref()?;
+    let mut fingerprint = start_tool_fingerprint("dispatch", tool.execution_name(), tool.input())?;
+    match &outcome.result {
+        Ok(result) => {
+            if super::clarification::requires_suspension(call, result)
+                || bamboo_agent_core::tools::tool_result_requires_suspension(result)
+            {
+                return None;
+            }
+            fingerprint.update([
+                1,
+                u8::from(result.success),
+                u8::from(outcome.post_tool_hook_eligible),
+            ]);
+            let normalized = normalized_shell_poll(tool.execution_name(), result);
+            hash_field(
+                &mut fingerprint,
+                normalized.as_deref().unwrap_or(result.result.as_bytes()),
+            );
+            for image in &result.images {
+                hash_field(&mut fingerprint, image.mime_type.as_bytes());
+                hash_field(&mut fingerprint, image.data.as_bytes());
+            }
+        }
+        Err(error) => {
+            fingerprint.update([0]);
+            hash_field(&mut fingerprint, error.as_bytes());
+        }
+    }
+    Some(fingerprint.finalize().into())
+}
+
+pub(crate) fn discovery_tool_fingerprint(
+    name: &str,
+    arguments: &serde_json::Value,
+    success: bool,
+    result: &[u8],
+) -> Option<[u8; 32]> {
+    let mut fingerprint = start_tool_fingerprint("discovery", name, arguments)?;
+    fingerprint.update([u8::from(success)]);
+    hash_field(&mut fingerprint, result);
+    Some(fingerprint.finalize().into())
+}
+
+fn start_tool_fingerprint(
+    source: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<Sha256> {
+    let mut arguments = arguments.clone();
+    arguments.sort_all_objects();
+    let mut fingerprint = Sha256::new();
+    hash_field(&mut fingerprint, source.as_bytes());
+    hash_field(&mut fingerprint, name.as_bytes());
+    hash_field(&mut fingerprint, &serde_json::to_vec(&arguments).ok()?);
+    Some(fingerprint)
+}
+
+/// Shell clocks and advice change while an empty capture still observes the
+/// same process state. Preserve the handle, output and exit observations.
+fn normalized_shell_poll(name: &str, result: &ToolResult) -> Option<Vec<u8>> {
+    if !matches!(name, "exec_command" | "write_stdin") || !result.success {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&result.result).ok()?;
+    if value["status"] != "running"
+        || value["session_id"].as_str().is_none()
+        || value["output"] != ""
+        || value
+            .get("output_omitted_bytes")
+            .is_some_and(|v| v.as_u64() != Some(0))
+    {
+        return None;
+    }
+    let polling = value.get_mut("polling")?.as_object_mut()?;
+    for field in [
+        "elapsed_ms",
+        "output_idle_ms",
+        "consecutive_empty_readouts",
+        "state",
+        "advisory",
+    ] {
+        polling.remove(field);
+    }
+    value.sort_all_objects();
+    serde_json::to_vec(&value).ok()
+}
+
+fn hash_field(fingerprint: &mut Sha256, bytes: &[u8]) {
+    fingerprint.update((bytes.len() as u64).to_be_bytes());
+    fingerprint.update(bytes);
+}
+
+const STRICT_ARGUMENT_TOOL_NAMES: [&str; 10] = [
     "Write",
     "Edit",
     "NotebookEdit",
@@ -130,8 +274,7 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "SubAgent",
     "scheduler",
     "sub_session_manager",
-    "session_note",
-    "memory_note",
+    "memory",
 ];
 
 fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
@@ -161,7 +304,10 @@ fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Optio
 /// Separate read-only SubAgent inspection from delegation only when the
 /// arguments unambiguously select an inspection route. Ambiguous or malformed
 /// requests remain in the delegation circuit, including compact/legacy mixes.
-fn tool_policy_key(tool_call: &ToolCall, admitted_execution_name: Option<&str>) -> ToolCircuitKey {
+pub(super) fn tool_policy_key(
+    tool_call: &ToolCall,
+    admitted_execution_name: Option<&str>,
+) -> ToolCircuitKey {
     let name = normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
     if name != "SubAgent" {
         return ToolCircuitKey::Tool(name);
@@ -187,7 +333,7 @@ fn tool_policy_key(tool_call: &ToolCall, admitted_execution_name: Option<&str>) 
         });
     let legacy_inspection = matches!(
         object.get("action").and_then(|value| value.as_str()),
-        Some("get" | "list" | "list_models")
+        Some("get" | "list_models")
     ) && ["intent", "target", "role", "reply_to"]
         .iter()
         .all(|key| !object.contains_key(*key));
@@ -221,9 +367,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
         return Ok(());
     }
 
-    if normalized_tool_name.eq_ignore_ascii_case("session_note")
-        || normalized_tool_name.eq_ignore_ascii_case("memory_note")
-    {
+    if normalized_tool_name.eq_ignore_ascii_case("memory") {
         let (parsed, parse_warning) = parse_tool_args_best_effort(&tool_call.function.arguments);
         if parse_warning.is_some()
             && parsed
@@ -232,7 +376,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
                 .unwrap_or(false)
         {
             return Err(format!(
-                "Tool policy blocked '{}' due to invalid JSON arguments: unable to recover arguments. Rewrite the {} call with a valid JSON object, for example {{\"action\":\"read\",\"topic\":\"default\"}}.",
+                "Tool policy blocked '{}' due to invalid JSON arguments: unable to recover arguments. Rewrite the {} call with a valid JSON object, for example {{\"action\":\"session_read\",\"topic\":\"default\"}}.",
                 normalized_tool_name, normalized_tool_name,
             ));
         }
@@ -251,6 +395,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ToolPolicyPrecheckViolation {
+    StandaloneSpawnArguments(&'static str),
     RoundToolLimit {
         limit: usize,
         tool_name: String,
@@ -270,6 +415,7 @@ impl ToolPolicyPrecheckViolation {
 
     pub(super) fn into_message(self) -> String {
         match self {
+            Self::StandaloneSpawnArguments(message) => message.into(),
             Self::RoundToolLimit { limit, tool_name } => format!(
                 "Tool policy blocked '{}': per-round tool call limit ({limit}) reached",
                 tool_name
@@ -297,8 +443,10 @@ pub(crate) struct ToolPolicyGuard {
     executed_calls: usize,
     consecutive_failures: HashMap<ToolCircuitKey, usize>,
     observation_progress: ObservationProgress,
+    repeated_tool_calls: RepeatedToolCalls,
+    pub(super) standalone_supervisor_spawn: bool,
+    pub(super) child_inspections: super::child_inspection::ChildInspectionProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
-    progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
 }
 
 impl ToolPolicyGuard {
@@ -312,8 +460,10 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
             observation_progress: ObservationProgress::default(),
+            repeated_tool_calls: RepeatedToolCalls::default(),
+            standalone_supervisor_spawn: false,
+            child_inspections: super::child_inspection::ChildInspectionProgress::default(),
             quiet_polls: super::quiet_poll::QuietPollGuard::default(),
-            progress_feedback: super::progress_feedback::ProgressFeedbackBudget::default(),
         }
     }
 
@@ -328,6 +478,10 @@ impl ToolPolicyGuard {
         // Preserve each SubAgent circuit across model turns. Other tools keep
         // their existing per-round circuit behavior.
         self.consecutive_failures.retain(|key, _| key.run_scoped());
+    }
+
+    pub(crate) fn set_supervisor_spawn_route(&mut self, standalone: bool) {
+        self.standalone_supervisor_spawn = standalone;
     }
 
     pub(crate) fn delegation_failure_message(&self) -> Option<String> {
@@ -353,7 +507,21 @@ impl ToolPolicyGuard {
     }
 
     pub(super) fn begin_observation_round(&mut self, round: usize) {
+        self.begin_repeated_tool_round(round);
         self.observation_progress.begin_round(round);
+        self.child_inspections.begin_round(round);
+    }
+
+    pub(crate) fn begin_repeated_tool_round(&mut self, round: usize) {
+        self.repeated_tool_calls.begin_round(round);
+    }
+
+    pub(crate) fn observe_repeated_call(&mut self, name: &str, fingerprint: Option<[u8; 32]>) {
+        self.repeated_tool_calls.observe(name, fingerprint);
+    }
+
+    pub(crate) fn unchanged_child_inspection_targets(&mut self) -> Vec<String> {
+        self.child_inspections.finish_round()
     }
 
     #[cfg(test)]
@@ -366,40 +534,58 @@ impl ToolPolicyGuard {
         self.quiet_polls.pending_handle()
     }
 
-    /// Consume one completed batch. Only actual raw evidence can end a recovery
-    /// episode; hidden wakeups and model claims cannot refund its finite budget.
-    pub(crate) fn feedback_for_next_round(
+    /// Only the provider boundary's newly admitted Inbox records are eligible.
+    pub(crate) fn observe_background_exec_completion<'a>(
         &mut self,
-        active: bool,
-    ) -> super::progress_feedback::FeedbackDecision {
-        use super::progress_feedback::{FeedbackDecision, ProgressEvidence};
-        let legacy_hint = self.observation_progress.finish_round();
-        if !active {
-            return FeedbackDecision::Continue(legacy_hint.map(str::to_owned));
-        }
-        let quiet_evidence = self.quiet_polls.take_feedback_evidence();
-        let made_progress =
-            self.observation_progress.made_progress || self.quiet_polls.take_observed_progress();
-        let evidence = quiet_evidence.or_else(|| {
-            (self.observation_progress.unchanged_rounds >= UNCHANGED_OBSERVATION_ROUNDS).then(
-                || ProgressEvidence::UnchangedFiles {
-                    consecutive_rounds: self.observation_progress.unchanged_rounds,
-                    observation_count: self
-                        .observation_progress
-                        .previous
-                        .as_ref()
-                        .map_or(0, BTreeSet::len),
-                    tool_call_ids: self.observation_progress.last_call_ids.clone(),
-                },
+        session_id: &str,
+        message: &'a bamboo_agent_core::Message,
+    ) -> Option<&'a str> {
+        let envelope = message.metadata.as_ref()?.get("session_message")?;
+        let body = &envelope["body"];
+        let data = &body["data"];
+        let handle = data["exec_session_id"].as_str()?;
+        if envelope["source"]["type"] == "runtime"
+            && envelope["source"]["subsystem"] == "background_exec"
+            && envelope["kind"] == "runtime_instruction"
+            && envelope["target_session_id"] == session_id
+            && envelope["correlation_id"] == handle
+            && body["instruction"] == "background_exec_completed"
+            && data["session_id"] == session_id
+            && matches!(
+                data["status"].as_str(),
+                Some("completed" | "killed" | "error")
             )
-        });
-        self.progress_feedback.next_round(evidence, made_progress)
+        {
+            self.quiet_polls.forget_handle(handle);
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
+    /// Emit a quiet-command advisory only when a new group of polls qualifies.
+    /// Consuming that evidence also releases suppression for the next batch.
+    pub(crate) fn feedback_for_next_round(&mut self, quiet_poll_active: bool) -> Option<String> {
+        let file_hint = self.observation_progress.finish_round();
+        let quiet_advisory = if quiet_poll_active {
+            self.quiet_polls
+                .take_feedback_evidence()
+                .map(super::progress_feedback::render_quiet_command_advisory)
+        } else {
+            None
+        };
+        let repeated_advisory = self.repeated_tool_calls.advisory(file_hint);
+        match (repeated_advisory, quiet_advisory) {
+            (Some(repeated), Some(quiet)) => Some(format!("{repeated}\n\n{quiet}")),
+            (repeated, quiet) => repeated.or(quiet),
+        }
     }
 
     pub(crate) fn reset_observation_progress(&mut self) {
         self.observation_progress = ObservationProgress::default();
+        self.repeated_tool_calls = RepeatedToolCalls::default();
+        self.child_inspections = super::child_inspection::ChildInspectionProgress::default();
         self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
-        self.progress_feedback.reset_for_human_input();
     }
 
     #[cfg(test)]
@@ -435,6 +621,13 @@ impl ToolPolicyGuard {
                 limit: self.max_consecutive_failures_per_tool,
                 run_scoped: key.run_scoped(),
             });
+        }
+
+        if self.standalone_supervisor_spawn && admitted_execution_name == Some("spawn_session") {
+            bamboo_orchestration::managed_session::validate_standalone_spawn_arguments(
+                &tool_call.function.arguments,
+            )
+            .map_err(ToolPolicyPrecheckViolation::StandaloneSpawnArguments)?;
         }
 
         Ok(())
@@ -531,6 +724,124 @@ mod tests {
         }
     }
 
+    fn fingerprint(name: &str, arguments: serde_json::Value, result: &str) -> Option<[u8; 32]> {
+        let call = tool_call(name, "{}");
+        let tool =
+            super::super::per_call::PortableToolExecution::with_input_fixture(name, arguments);
+        dispatched_tool_fingerprint(
+            &call,
+            &super::super::per_call::ToolExecutionOutcome {
+                output_cap: Some(None),
+                portable_tool: Some(tool),
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(true, result)),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                managed_running_violation: false,
+                tool_duration: std::time::Duration::ZERO,
+            },
+        )
+    }
+
+    #[test]
+    fn repeated_tool_advisory_rearms_when_tool_arguments_or_result_change() {
+        let first = fingerprint(
+            "browser_eval",
+            serde_json::json!({"code":"document.title","expected_epoch":17}),
+            "title",
+        );
+        let same = fingerprint(
+            "browser_eval",
+            serde_json::from_str(r#"{"expected_epoch":17,"code":"document.title"}"#).unwrap(),
+            "title",
+        );
+        assert!(first.is_some());
+        assert_eq!(first, same);
+        for changed in [
+            fingerprint(
+                "browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":18}),
+                "title",
+            ),
+            fingerprint(
+                "browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":17}),
+                "new title",
+            ),
+            fingerprint(
+                "vendor::browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":17}),
+                "title",
+            ),
+            None,
+        ] {
+            assert_ne!(first, changed);
+            let mut repeats = RepeatedToolCalls::default();
+            for observed in [first, same] {
+                repeats.observe("browser_eval", observed);
+                assert!(repeats.advisory(None).is_none());
+            }
+            repeats.observe("browser_eval", first);
+            assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
+            repeats.observe("browser_eval", same);
+            assert!(repeats.advisory(None).is_none());
+            for observed in [changed, first, same] {
+                repeats.observe("browser_eval", observed);
+                assert!(repeats.advisory(None).is_none());
+            }
+            repeats.observe("browser_eval", first);
+            assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
+        }
+    }
+
+    #[test]
+    fn shell_poll_comparison_keeps_process_and_output_changes() {
+        use serde_json::json;
+        let args = json!({"session_id":"process-a","chars":""});
+        let before = json!({
+            "session_id":"process-a",
+            "status":"running",
+            "output":"",
+            "polling":{
+                "terminal_result_ttl_ms":300000,
+                "state":"waiting",
+                "elapsed_ms":1000,
+                "output_idle_ms":500,
+                "consecutive_empty_readouts":2,
+                "exit_observed":false
+            }
+        });
+        let capture =
+            |tool, value: &serde_json::Value| fingerprint(tool, args.clone(), &value.to_string());
+        let initial = capture("write_stdin", &before);
+        assert!(initial.is_some());
+        let mut later = before.clone();
+        later["polling"]["elapsed_ms"] = json!(92000);
+        later["polling"]["output_idle_ms"] = json!(91500);
+        later["polling"]["state"] = json!("needs_diagnosis");
+        later["polling"]["consecutive_empty_readouts"] = json!(4);
+        later["polling"]["advisory"] = json!("wait for the command or inspect it");
+        assert_eq!(initial, capture("write_stdin", &later));
+        assert_ne!(
+            capture("mcp__terminal__write_stdin", &before),
+            capture("mcp__terminal__write_stdin", &later)
+        );
+        let mut exited = later.clone();
+        exited["polling"]["exit_observed"] = json!(true);
+        let mut other_process = later.clone();
+        other_process["session_id"] = json!("process-b");
+        let mut new_output = later;
+        new_output["output"] = json!("new bytes");
+        for changed in [
+            exited,
+            other_process,
+            new_output,
+            json!({"status":"completed","exit_code":0,"output":""}),
+        ] {
+            assert_ne!(initial, capture("write_stdin", &changed));
+        }
+    }
+
     #[test]
     fn strict_tools_reject_invalid_json_arguments() {
         let invalid = tool_call("Write", "{invalid");
@@ -545,16 +856,16 @@ mod tests {
     }
 
     #[test]
-    fn session_note_accepts_repairable_json_arguments() {
-        let call = tool_call("session_note", r#"{"action":"read""#);
+    fn memory_accepts_repairable_json_arguments() {
+        let call = tool_call("memory", r#"{"action":"session_read""#);
         assert!(validate_tool_call_arguments(&call).is_ok());
     }
 
     #[test]
-    fn session_note_rejects_unrecoverable_json_with_retry_guidance() {
-        let call = tool_call("session_note", "not-json");
+    fn memory_rejects_unrecoverable_json_with_retry_guidance() {
+        let call = tool_call("memory", "not-json");
         let err = validate_tool_call_arguments(&call).expect_err("expected strict rejection");
-        assert!(err.contains("Rewrite the session_note call with a valid JSON object"));
+        assert!(err.contains("Rewrite the memory call with a valid JSON object"));
     }
 
     #[test]
@@ -771,7 +1082,7 @@ mod tests {
             r#"{"intent":"inspect","target":"child","message":"messages"}"#,
             r#"{"intent":"inspect","target":"child","role":null,"reply_to":""}"#,
             r#"{"action":"get","child_session_id":"child"}"#,
-            r#"{"action":"list"}"#,
+            r#"{"intent":"inspect"}"#,
             r#"{"action":"list_models"}"#,
         ] {
             assert_eq!(
@@ -785,6 +1096,7 @@ mod tests {
             r#"{"intent":"inspect","role":"implementer"}"#,
             r#"{"intent":"inspect","unknown":"value"}"#,
             r#"{"action":"get","target":"child"}"#,
+            r#"{"action":"list"}"#,
             r#"{"target":"child","message":"result"}"#,
             "not-json",
         ] {

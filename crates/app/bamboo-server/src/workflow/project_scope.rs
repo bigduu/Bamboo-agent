@@ -15,6 +15,7 @@ pub(super) struct WorkflowProjectScope {
 
 pub(super) struct WorkflowStartContext {
     pub store: Arc<SkillStore>,
+    pub project_id: Option<bamboo_domain::ProjectId>,
     pub workspace_trusted: bool,
     pub automatic_opted_in: bool,
 }
@@ -57,6 +58,7 @@ impl WorkflowRunAccess {
                 })?;
             return Ok(WorkflowStartContext {
                 store,
+                project_id: None,
                 workspace_trusted,
                 automatic_opted_in: automatic_opted_in(&session),
             });
@@ -78,11 +80,11 @@ impl WorkflowRunAccess {
             resolved.execution_workspace,
             "workflow_durable_context",
         );
-        let store = if let Some(project_id) = resolved.project_id {
-            let project_home = scope.projects.paths().project_home(&project_id);
+        let store = if let Some(project_id) = resolved.project_id.as_ref() {
+            let project_home = scope.projects.paths().project_home(project_id);
             self.skills
                 .store_for_project_workspace(
-                    &project_id,
+                    project_id,
                     &project_home,
                     resolved.catalog_workspace.as_deref(),
                 )
@@ -95,6 +97,7 @@ impl WorkflowRunAccess {
         .map_err(|_| WorkflowRunError::Preflight("workflow catalog is unavailable".to_string()))?;
         Ok(WorkflowStartContext {
             store,
+            project_id: resolved.project_id,
             workspace_trusted: false,
             automatic_opted_in: automatic_opted_in(&session),
         })

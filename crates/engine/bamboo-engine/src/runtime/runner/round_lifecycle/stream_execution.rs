@@ -20,20 +20,24 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
+use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
-use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
+use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
     ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
-use bamboo_llm::provider::ResponsesRequestOptions;
+use bamboo_llm::provider::{
+    CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
+    REASONING_REPETITION_FINISH_REASON,
+};
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegmentKind, Segment, SegmentRole,
@@ -41,7 +45,10 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
-use super::PromptMemoryExposureFrame;
+use super::{
+    request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
+    PromptMemoryExposureFrame, RoundOutputLimitPolicy, RoundToolDispatch,
+};
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -54,8 +61,9 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub max_context_tokens: u32,
-    pub max_output_tokens: u32,
+    pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
+    pub budget: &'a TokenBudget,
+    pub provider_default_output: bool,
     pub observation_progress_hint: Option<&'a str>,
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
@@ -67,6 +75,7 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+#[cfg(test)]
 const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
     "Browser loaded. Its complete schema is in the tools for this request.";
 
@@ -185,6 +194,8 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::Cancelled => "cancelled",
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
+        AgentError::OutputTokenLimit { .. } => "output_token_limit",
+        AgentError::ReasoningRepetition { .. } => REASONING_REPETITION_FINISH_REASON,
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
         AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
@@ -302,6 +313,39 @@ fn agent_loop_prompt_cache_key(
         hasher.update(component);
     }
     Some(hex::encode(hasher.finalize()))
+}
+
+/// Domain separator for [`provider_relevant_source_digest`].
+const PROVIDER_SOURCE_DIGEST_DOMAIN: &[u8] = b"bamboo.final-request.provider-source.v1";
+
+/// Digest of the Session state an append-safe final-request checkpoint can adopt
+/// that also changes what the provider is asked: the durable message transcript
+/// and the provider-native transcript that anchors it.
+///
+/// A checkpoint that leaves this digest identical adopted nothing relevant, so
+/// the request already reconciled and validated against budget remains exactly
+/// right. Rebuilding it would only re-run nondeterministic request-only work —
+/// most importantly the paid Legacy Vision description, whose fresh text changes
+/// the model-context ledger and can stop the checkpoint loop from ever
+/// stabilizing. This digest is in-memory and request-scoped: it never persists a
+/// description and never becomes a durable image cache.
+fn provider_relevant_source_digest(session: &Session) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PROVIDER_SOURCE_DIGEST_DOMAIN);
+    let mut absorb = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    for message in &session.messages {
+        absorb(message.id.as_bytes());
+        // Serialize each message so an in-place edit that keeps the id is still
+        // observed as a source change.
+        let rendered = serde_json::to_vec(message).unwrap_or_default();
+        absorb(&rendered);
+    }
+    let transcript = serde_json::to_vec(&session.provider_transcript).unwrap_or_default();
+    absorb(&transcript);
+    hex::encode(hasher.finalize())
 }
 
 /// Whether the stateful Responses continuation (`previous_response_id`) may be
@@ -658,59 +702,24 @@ pub(super) fn build_exec_session_continuation_context_block(
         ContextBlockStability::RoundDynamic,
         "Shell sessions awaiting a terminal result",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result. Continue polling while the tool result includes session_id.\nSession IDs: {}",
+            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))
 }
 
-fn legacy_browser_results_for_projection(
-    session: &Session,
-    tool_schemas: &[ToolSchema],
-    loading_mode: CapabilityLoadingMode,
-) -> Option<BTreeMap<String, String>> {
-    if loading_mode != CapabilityLoadingMode::LegacyFullCatalog
-        || !tool_schemas
-            .iter()
-            .any(|schema| schema.function.name == "browser")
-    {
-        return None;
-    }
-    let results =
-        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(session);
-    (!results.is_empty()).then_some(results)
-}
-
-fn project_legacy_browser_history(messages: &mut [Message], results: &BTreeMap<String, String>) {
+fn project_discovery_history(
+    messages: &mut [Message],
+    results: &BTreeMap<String, (String, String)>,
+) {
     for message in messages {
-        if message.role == Role::Tool
-            && message.content_parts.is_none()
-            && results
-                .get(&message.id)
-                .is_some_and(|original| original == &message.content)
-        {
-            message.content = LOADED_BROWSER_ACKNOWLEDGEMENT.to_string();
+        if message.role == Role::Tool && message.content_parts.is_none() {
+            if let Some((original, projected)) = results.get(&message.id) {
+                if original == &message.content {
+                    message.content.clone_from(projected);
+                }
+            }
         }
-    }
-}
-
-/// The Supervisor host context sees its complete approved logical catalog;
-/// provider measurement and dispatch see exactly the existing wire projection.
-fn provider_tool_schemas<'a>(
-    session: &Session,
-    tool_schemas: &'a [ToolSchema],
-    loading_mode: CapabilityLoadingMode,
-    required_tool: Option<&str>,
-) -> Cow<'a, [ToolSchema]> {
-    if session.supervisor_incarnation_id().is_some() {
-        super::request_tool_schemas_for_loading_mode(
-            session,
-            tool_schemas,
-            loading_mode,
-            required_tool,
-        )
-    } else {
-        Cow::Borrowed(tool_schemas)
     }
 }
 
@@ -728,19 +737,27 @@ pub(super) async fn project_request_usage(
 ) -> Result<ProjectedRequestUsage, AgentError> {
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
-    let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
-    let loading_mode = llm.capability_loading_mode(model, required_tool).await;
-    let browser_results = legacy_browser_results_for_projection(
+    let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
+    let effective_tool_schemas = select_request_tool_schemas(&shadow, tool_schemas, &selection)?;
+    let wire_schemas = request_tool_schemas_for_loading_mode(
         &shadow,
         effective_tool_schemas.as_ref(),
         loading_mode,
+        true,
     );
-    let prepared_message_input_tokens = if let Some(results) = browser_results.as_ref() {
-        let mut projected = prepared_context.messages.clone();
-        project_legacy_browser_history(&mut projected, results);
-        TiktokenTokenCounter::default().count_messages(&projected)
-    } else {
+    let discovery_history =
+        crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
+            &shadow,
+            effective_tool_schemas.as_ref(),
+            wire_schemas.as_ref(),
+            loading_mode,
+        );
+    let prepared_message_input_tokens = if discovery_history.is_empty() {
         TiktokenTokenCounter::default().count_messages(&prepared_context.messages)
+    } else {
+        let mut projected = prepared_context.messages.clone();
+        project_discovery_history(&mut projected, &discovery_history);
+        TiktokenTokenCounter::default().count_messages(&projected)
     };
     let envelope = build_request_envelope_reconciled_for_loading_mode(
         &mut shadow,
@@ -750,12 +767,6 @@ pub(super) async fn project_request_usage(
         model,
         loading_mode,
         None,
-    );
-    let wire_schemas = provider_tool_schemas(
-        &shadow,
-        effective_tool_schemas.as_ref(),
-        loading_mode,
-        required_tool,
     );
     let tool_footprint = llm
         .provider_visible_tool_footprint(&envelope.ir, wire_schemas.as_ref(), model, required_tool)
@@ -789,14 +800,14 @@ fn build_request_envelope_reconciled(
     )
 }
 
-fn build_request_envelope_reconciled_for_loading_mode(
+fn build_request_envelope_reconciled_for_loading_mode<'a>(
     session: &mut Session,
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
-    observation_progress_hint: Option<&str>,
+    request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
     let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
     let requested_protocol = requested_family.map(|family| match family {
@@ -843,41 +854,46 @@ fn build_request_envelope_reconciled_for_loading_mode(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    if let Some(block) =
-        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode)
-    {
-        context_blocks.push(block);
+    let mut orchestration =
+        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode);
+    if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
+        session,
+        config.guidance_active_run_id.as_deref(),
+    ) {
+        if let Some(block) = orchestration.as_mut() {
+            block.content.push_str("\n\n");
+            block.content.push_str(&handoff.content);
+        } else {
+            orchestration = Some(handoff);
+        }
     }
+    context_blocks.extend(orchestration);
     let newly_activated = activated_discoverable_tools(session)
         .difference(&activated)
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if !newly_activated.is_empty() {
-        let names = tool_schemas
+        let schemas = tool_schemas
             .iter()
             .filter(|schema| {
                 newly_activated.contains(&bamboo_domain::canonical_tool_name(&schema.function.name))
             })
-            .map(|schema| schema.function.name.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        if !names.is_empty() {
-            let mut guide_context =
-                bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
-                    &stable_instructions,
-                );
-            guide_context.activated_discoverable_tools = newly_activated;
-            guide_context.include_best_practices = false;
-            let schemas = tool_schemas
-                .iter()
-                .filter(|schema| names.contains(&schema.function.name))
-                .cloned()
-                .collect::<Vec<_>>();
-            let content = bamboo_tools::guide::EnhancedPromptBuilder::build_for_tools(
-                Some(config.tool_registry.as_ref()),
-                &names,
-                &schemas,
-                &guide_context,
-            );
+        let guide_context = bamboo_tools::guide::context::GuideBuildContext {
+            activated_discoverable_tools: newly_activated,
+            include_best_practices: false,
+            max_examples_per_tool: 1,
+            ..bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
+                &stable_instructions,
+            )
+        };
+        let content = bamboo_tools::guide::EnhancedPromptBuilder::build(
+            Some(config.tool_registry.as_ref()),
+            &schemas,
+            &guide_context,
+        );
+        if !content.is_empty() {
             context_blocks.push(ContextBlock::new(
                 ContextBlockType::ToolGuide,
                 ContextBlockPriority::High,
@@ -938,23 +954,11 @@ fn build_request_envelope_reconciled_for_loading_mode(
             conversation_messages.push(message.clone());
         }
     }
-    // Advisory context belongs only to this request, after the complete tool
-    // result batch. Reconcile it before ledger/native transcript anchoring.
-    if let Some(hint) = observation_progress_hint {
-        let mut message = Message::user(hint);
-        if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
-            message.metadata = Some(
-                serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}),
-            );
-        }
-        conversation_messages.push(message);
-    }
-
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
     //
-    // The tool/server guide (tool schemas + each connected MCP server's
-    // `initialize` instructions — e.g. nova's targeting workflow) is relocated OUT
+    // Supplemental tool guidance and each connected MCP server's
+    // `initialize` instructions are relocated OUT
     // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
     // invariant identity/directives, and the large, session-stable guide rides as
     // a typed context block at a known position with its own cache
@@ -1106,6 +1110,8 @@ fn build_request_envelope_reconciled_for_loading_mode(
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
     let cache_scope = serde_json::json!({
+        // Rebuild saved prompt prefixes that still contain unconditional memory guidance.
+        "external_memory_projection_version": 2,
         "model": model,
         "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
@@ -1126,6 +1132,9 @@ fn build_request_envelope_reconciled_for_loading_mode(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
+    // One-shot advice follows the tool batch on the wire. It is not an item in
+    // the durable transcript, where dropping it would reset the cache epoch.
+    model_transcript.extend(request_advisories.into_iter().map(Message::user));
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
@@ -1159,16 +1168,21 @@ fn build_request_envelope_reconciled_for_loading_mode(
         cache: cache_plan,
         continuation: None,
     };
-    if let Some(results) =
-        legacy_browser_results_for_projection(session, tool_schemas, loading_mode)
+    let wire_schemas =
+        request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode, true);
+    let discovery_history =
+        crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
+            session,
+            tool_schemas,
+            wire_schemas.as_ref(),
+            loading_mode,
+        );
+    if let Some(transcript) = ir
+        .segments
+        .iter_mut()
+        .find(|segment| segment.role == SegmentRole::ModelTranscript)
     {
-        if let Some(transcript) = ir
-            .segments
-            .iter_mut()
-            .find(|segment| segment.role == SegmentRole::ModelTranscript)
-        {
-            project_legacy_browser_history(&mut transcript.messages, &results);
-        }
+        project_discovery_history(&mut transcript.messages, &discovery_history);
     }
 
     // Prefix-drift diagnostics must observe only bytes that actually participate
@@ -1443,14 +1457,16 @@ pub(super) async fn execute_llm_stream(
         crate::runtime::stream::handler::StreamHandlingOutput,
         u128,
         u64,
+        CompletionDiagnostics,
+        RoundToolDispatch,
     ),
     AgentError,
 > {
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let cancel_token = frame.cancel_token;
-    let mut max_context_tokens = frame.max_context_tokens;
-    let mut max_output_tokens = frame.max_output_tokens;
+    let mut budget = frame.budget.clone();
+    let mut provider_default_output = frame.provider_default_output;
     let model = frame.model;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
@@ -1460,8 +1476,10 @@ pub(super) async fn execute_llm_stream(
     let llm_started_at = std::time::Instant::now();
     let base_tool_schemas = tool_schemas;
     let mut prepared_context = prepared_context.clone();
-    let mut required_tool = required_tool_for_session(session);
-    let mut effective_schemas = effective_tool_schemas(session, base_tool_schemas);
+
+    let task_split = frame
+        .output_limit_recovery
+        .and_then(|policy| policy.task_split);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1469,10 +1487,30 @@ pub(super) async fn execute_llm_stream(
     let continuation_enabled = bamboo_domain::ChildContextBinding::from_session(session)
         .map_err(|error| AgentError::Budget(error.to_string()))?
         .is_none()
+        && task_split.is_none()
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
-    let (mut prepared_envelope, previous_response_id, final_usage, loading_mode) = loop {
+    let recovery = frame.output_limit_recovery.and_then(|policy| policy.retry);
+    let convergence_hint = task_split.map(|split| split.advisory).or_else(|| {
+        recovery
+            .is_some_and(|retry| retry.is_convergence())
+            .then_some(OUTPUT_LIMIT_CONVERGENCE_HINT)
+    });
+    let private_plan = task_split.is_some_and(|split| split.private_plan);
+    let (
+        mut prepared_envelope,
+        previous_response_id,
+        final_usage,
+        window_limit,
+        required_tool,
+        tool_dispatch,
+    ) = loop {
+        let required_tool = required_tool_for_session(session);
+        let (loading_mode, selection) =
+            request_tool_policy(llm.as_ref(), model, required_tool).await?;
+        let effective_schemas =
+            select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
@@ -1483,7 +1521,6 @@ pub(super) async fn execute_llm_stream(
         };
         let previous_model_context_state = session.model_context_state.clone();
         let previous_provider_transcript = session.provider_transcript.clone();
-        let loading_mode = llm.capability_loading_mode(model, required_tool).await;
         let prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
             session,
             &prepared_context,
@@ -1491,15 +1528,21 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
-            observation_progress_hint,
+            observation_progress_hint
+                .into_iter()
+                .chain(convergence_hint),
         );
         // `prepare_round_context` reserves the already-durable ledger history. The
         // reconciliation above can append a new host-state snapshot, so verify the
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
-        let wire_schemas =
-            provider_tool_schemas(session, tool_schemas, loading_mode, required_tool);
+        let wire_schemas = request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            task_split.is_none(),
+        );
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
@@ -1519,26 +1562,74 @@ pub(super) async fn execute_llm_stream(
             }
         };
         let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-        let mut request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        let requested_output = recovery.map_or(u64::from(budget.max_output_tokens), |retry| {
+            retry.output_limit()
+        });
+        let window_limit = budget.output_reserve_tokens.map(|_| {
+            budget
+                .output_limit_for_input(final_usage.input_tokens)
+                .min(u32::try_from(requested_output).unwrap_or(u32::MAX))
+        });
+        let planned_output = window_limit.map_or(requested_output, u64::from);
+        let reserved_space = if window_limit.is_some() {
+            requested_output
+                .min(u64::from(budget.output_reserve()))
+                .saturating_add(u64::from(budget.safety_margin))
+        } else {
+            requested_output
+        };
+        let mut request_input_limit = u64::from(budget.max_context_tokens)
+            .saturating_sub(reserved_space)
+            .min(u64::from(budget.input_ceiling()));
         if bamboo_domain::ChildContextBinding::from_session(session)
             .map_err(|error| AgentError::Budget(error.to_string()))?
             .is_some()
         {
             request_input_limit =
-                request_input_limit.min(prepared_context.token_usage.budget_limit);
+                request_input_limit.min(u64::from(prepared_context.token_usage.budget_limit));
         }
-        if final_usage.input_tokens > request_input_limit
+        let retry_exceeds_run_budget = frame
+            .output_limit_recovery
+            .filter(|policy| policy.retry.is_some())
+            .and_then(|policy| Some((policy.remaining_run_tokens?, policy.previous_prompt_tokens)))
+            .is_some_and(|(remaining, previous_input)| {
+                u64::from(final_usage.input_tokens)
+                    .max(previous_input)
+                    .saturating_add(planned_output)
+                    > remaining
+            });
+        let cannot_fit =
+            u64::from(final_usage.input_tokens) > request_input_limit || window_limit == Some(0);
+        if cannot_fit
             || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+            || retry_exceeds_run_budget
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
-            // Legacy optional advice can be omitted, but the exact recovery
-            // control facts must reach the model or fail before dispatch. A
-            // budget retry must never silently claim that feedback was sent.
-            let required_progress_feedback = observation_progress_hint
-                .is_some_and(crate::runtime::runner::tool_execution::is_required_progress_feedback);
-            if !required_progress_feedback && observation_progress_hint.take().is_some() {
+            // Keep the original request when the optional advisory exceeds
+            // the available context.
+            if observation_progress_hint.take().is_some() {
                 continue;
+            }
+            if retry_exceeds_run_budget {
+                return Err(AgentError::Budget(
+                    "output-limit retry would exceed the remaining run token budget".into(),
+                ));
+            }
+            if budget.max_output_tokens == 0 && window_limit.is_some() {
+                return Err(AgentError::Budget(
+                    "resolved model limits permit no output tokens".into(),
+                ));
+            }
+            if cannot_fit
+                && window_limit.is_some()
+                && recovery.is_none()
+                && final_usage.ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES
+            {
+                return Err(AgentError::LLMOverflow(format!(
+                    "projected input {} leaves too little output space in the model window (input limit {})",
+                    final_usage.input_tokens, request_input_limit
+                )));
             }
             return Err(AgentError::Budget(format!(
                 "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
@@ -1567,6 +1658,10 @@ pub(super) async fn execute_llm_stream(
                         "model-context request could not stabilize after {MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES} append-safe checkpoint reprepares"
                     )));
                 }
+                // Capture what this checkpoint could adopt that the provider would
+                // observe. The comparison below separates a bookkeeping-only
+                // checkpoint from one that genuinely moved the request.
+                let provider_source_digest = provider_relevant_source_digest(session);
                 if let Err(error) = persistence.checkpoint_runtime_session(session).await {
                     // Reconciliation is an in-memory transaction until its durable
                     // checkpoint succeeds. Restore the prior state so an in-process
@@ -1579,36 +1674,72 @@ pub(super) async fn execute_llm_stream(
                     )));
                 }
                 checkpoint_reprepares += 1;
-                required_tool = required_tool_for_session(session);
-                effective_schemas = effective_tool_schemas(session, base_tool_schemas);
-                let reprepared = Box::pin(super::context_preparation::prepare_round_context(
-                    session,
-                    config,
-                    model,
-                    session_id,
-                    effective_schemas.as_ref(),
-                    llm,
-                    Some(event_tx),
-                ))
-                .await?;
-                max_context_tokens = reprepared.budget.max_context_tokens;
-                max_output_tokens = reprepared.budget.max_output_tokens;
+                // Reuse an already-prepared image description only while the
+                // provider-relevant source state is unchanged. Re-deriving the
+                // prepared context is still required — it owns the convergence
+                // mutation the next reconcile observes — but the paid, inherently
+                // nondeterministic Legacy Vision description inside it must not be
+                // requested again for the same source.
+                if provider_relevant_source_digest(session) != provider_source_digest {
+                    if recovery.is_some() {
+                        return Err(AgentError::LLMNonRetryable(
+                            "output-limit recovery context changed before dispatch".into(),
+                        ));
+                    }
+                    config.vision_description_reuse.clear();
+                }
+                let reprepared = if recovery.is_some() {
+                    Box::pin(
+                        super::context_preparation::prepare_output_limit_recovery_context(
+                            session,
+                            config,
+                            model,
+                            session_id,
+                            base_tool_schemas,
+                            llm,
+                        ),
+                    )
+                    .await?
+                } else {
+                    Box::pin(super::context_preparation::prepare_round_context(
+                        session,
+                        config,
+                        model,
+                        session_id,
+                        effective_schemas.as_ref(),
+                        llm,
+                        Some(event_tx),
+                    ))
+                    .await?
+                };
+                budget = reprepared.budget;
+                provider_default_output = reprepared.provider_default_output;
                 prepared_context = reprepared.prepared_context;
                 continue;
             }
         }
+        let fallback_discovery = wire_schemas
+            .iter()
+            .any(|tool| tool.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME);
         break (
             prepared_envelope,
             previous_response_id,
             final_usage,
-            loading_mode,
+            window_limit,
+            required_tool,
+            RoundToolDispatch {
+                mode: loading_mode,
+                catalog: effective_schemas.into_owned(),
+                fallback_discovery,
+                selection,
+            },
         );
     };
-    let wire_schemas = provider_tool_schemas(
+    let wire_schemas = request_tool_schemas_for_loading_mode(
         session,
-        effective_schemas.as_ref(),
-        loading_mode,
-        required_tool,
+        &tool_dispatch.catalog,
+        tool_dispatch.mode,
+        task_split.is_none(),
     );
     let tool_schemas = wire_schemas.as_ref();
     // Freeze the already-reconciled request's Session before the following
@@ -1620,7 +1751,7 @@ pub(super) async fn execute_llm_stream(
         config.persistence.as_ref(),
         config.session_inbox.as_ref(),
     ) {
-        (Some(host), Some(persistence), Some(inbox)) => persistence
+        (Some(host), Some(persistence), Some(inbox)) if recovery.is_none() => persistence
             .root_actor_writer()
             .filter(|owner| {
                 owner.fence.actor_id == session.id
@@ -1670,7 +1801,7 @@ pub(super) async fn execute_llm_stream(
     // Single home for turning the canonical envelope into a concrete provider
     // request (request POLICY + observability). The ledger keeps every previously
     // emitted item byte-stable while appending real turns and context events.
-    let planned = plan_llm_request(
+    let mut planned = plan_llm_request(
         &prepared_envelope,
         session_id,
         reasoning_effort,
@@ -1678,6 +1809,9 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         final_usage,
     );
+    if task_split.is_some() {
+        planned.request_options.parallel_tool_calls = Some(false);
+    }
     if !continuation_enabled {
         tracing::debug!(
             "[{}] Responses API previous_response_id disabled (store={:?}, provider={})",
@@ -1760,16 +1894,42 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let recovery = recovery.map(|retry| match window_limit {
+        Some(limit) => retry.tighten_output_limit(limit),
+        None => retry,
+    });
+    if let Some(limit) = window_limit {
+        tracing::debug!(
+            session_id,
+            input_tokens = final_usage.input_tokens,
+            output_tokens = limit,
+            safety_margin = budget.safety_margin,
+            "Computed output allowance for the projected model request"
+        );
+    }
+    let provider_default_output = provider_default_output
+        && recovery.is_none()
+        && task_split.is_none()
+        && config.run_budget.max_total_tokens.is_none()
+        && frame
+            .output_limit_recovery
+            .is_none_or(|policy| policy.remaining_run_tokens.is_none());
+    let completion = CompletionDiagnostics::for_agent_round(recovery)
+        .with_model_window_limit(window_limit)
+        .with_provider_default_output(provider_default_output);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
-                llm.chat_stream_ir(
-                    &prepared_envelope.ir,
-                    tool_schemas,
-                    Some(max_output_tokens),
-                    model,
-                    Some(&planned.request_options),
+                bamboo_llm::provider::scope_completion_diagnostics(
+                    completion.clone(),
+                    llm.chat_stream_ir(
+                        &prepared_envelope.ir,
+                        tool_schemas,
+                        Some(window_limit.unwrap_or(budget.max_output_tokens)),
+                        model,
+                        Some(&planned.request_options),
+                    ),
                 ),
                 cancel_token,
                 session_id,
@@ -1854,7 +2014,7 @@ pub(super) async fn execute_llm_stream(
         })
     });
     let stream = match stream {
-        Ok(stream) => stream,
+        Ok(stream) => stop_repeated_reasoning(stream, completion.clone()),
         Err(error) => {
             usage_guard.finish(usage_status(&error), None);
             observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
@@ -1907,7 +2067,7 @@ pub(super) async fn execute_llm_stream(
         summary_tokens: prepared_context.token_usage.summary_tokens,
         window_tokens: prepared_context.token_usage.window_tokens,
         total_tokens: prepared_context.token_usage.total_tokens,
-        max_context_tokens,
+        max_context_tokens: budget.max_context_tokens,
         budget_limit: prepared_context.token_usage.budget_limit,
         truncation_occurred: prepared_context.truncation_occurred,
         segments_removed: prepared_context.segments_removed,
@@ -1942,7 +2102,7 @@ pub(super) async fn execute_llm_stream(
     // Buffer this response until tool calls tell us whether it is a candidate.
     let stream_output_result = observation
         .scope(async {
-            if activation_pending || config.features_final_evidence_check {
+            if activation_pending || config.features_final_evidence_check || private_plan {
                 crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                     stream,
                     cancel_token,
@@ -1985,11 +2145,12 @@ pub(super) async fn execute_llm_stream(
             observation.finish(crate::runtime::runner::telemetry_error_outcome(
                 &failure.error,
             ));
-            let appended = append_interrupted_assistant_output(
-                session,
-                *failure.partial_output,
-                &failure.error,
-            );
+            let appended = !private_plan
+                && append_interrupted_assistant_output(
+                    session,
+                    *failure.partial_output,
+                    &failure.error,
+                );
             if appended {
                 tracing::warn!(
                     "[{}] Preserved interrupted partial assistant output in the live transcript",
@@ -2003,14 +2164,28 @@ pub(super) async fn execute_llm_stream(
     if let Some(usage) = stream_output.provider_usage {
         observation.model_usage(&token_usage(usage));
     }
-    usage_guard.finish(
-        bamboo_domain::ModelCallStatus::Success,
-        stream_output.provider_usage,
-    );
-    observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
+    let finish_reason = completion.finish_reason();
+    let incomplete_recovery = recovery.is_some() && !completion.has_recovery_completion();
+    let (status, outcome) =
+        if finish_reason == REASONING_REPETITION_FINISH_REASON || incomplete_recovery {
+            (
+                bamboo_domain::ModelCallStatus::Error,
+                bamboo_infrastructure::telemetry::Outcome::ProviderError,
+            )
+        } else {
+            (
+                bamboo_domain::ModelCallStatus::Success,
+                bamboo_infrastructure::telemetry::Outcome::Success,
+            )
+        };
+    usage_guard.finish(status, stream_output.provider_usage);
+    observation.finish(outcome);
 
+    let response_rejected = finish_reason == REASONING_REPETITION_FINISH_REASON
+        || super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
     if config.features_final_evidence_check
         && !activation_pending
+        && !response_rejected
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
@@ -2135,32 +2310,37 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if continuation_enabled {
-        if let Some(response_id) = stream_output
-            .response_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            session.metadata.insert(
-                SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
-                response_id.to_string(),
-            );
-        } else {
-            session
-                .metadata
-                .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    if !response_rejected && !incomplete_recovery && !private_plan {
+        let response_id = stream_output.response_id.as_deref().map(str::trim);
+        match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
+            Some(id) => {
+                session.metadata.insert(
+                    SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+                    id.to_string(),
+                );
+            }
+            None => {
+                session
+                    .metadata
+                    .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            }
         }
-    } else {
-        session
-            .metadata
-            .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
-    let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
+    let prompt_tokens = if response_rejected || recovery.is_some() {
+        u64::from(final_usage.input_tokens)
+    } else {
+        super::token_estimation::estimate_prompt_tokens(&prepared_context.messages)
+    };
 
-    Ok((stream_output, llm_duration, prompt_tokens))
+    Ok((
+        stream_output,
+        llm_duration,
+        prompt_tokens,
+        completion,
+        tool_dispatch,
+    ))
 }
 
 #[cfg(test)]

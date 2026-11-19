@@ -378,7 +378,7 @@ async fn sidebar_support_is_explicit_and_snapshot_reopens_with_empty_sections_an
         };
         assert_eq!(value.get("sidebar"), Some(&Value::Null));
     }
-    save_root(&state, "assigned", Some(&project.id)).await;
+    let assigned = save_root(&state, "assigned", Some(&project.id)).await;
     save_root(&state, "unmoved", Some(&project.id)).await;
     let mut feed = state.account_sink.subscribe();
     let cursor = state.account_sink.latest_seq();
@@ -391,7 +391,15 @@ async fn sidebar_support_is_explicit_and_snapshot_reopens_with_empty_sections_an
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get(header::ETAG).unwrap(), "\"2\"");
-    let saved: ProjectManifest = serde_json::from_value(body(response).await).unwrap();
+    let mut saved: ProjectManifest = serde_json::from_value(body(response).await).unwrap();
+    assert!(saved.sidebar_section_bindings.is_empty());
+    saved.sidebar_section_bindings.insert(
+        assigned.id.clone(),
+        ProjectSidebarSectionBinding {
+            section_id: SECTION.into(),
+            root_birth_token: assigned.root_mode_birth_token(),
+        },
+    );
     let sidebar = saved.sidebar.as_ref().unwrap();
     assert_eq!(sidebar.sections.len(), 2);
     assert_eq!(sidebar.sections[0].name, "Support");
@@ -514,6 +522,12 @@ async fn sidebar_deletion_clears_assignments_even_after_root_disappears() {
         .status(),
         StatusCode::OK
     );
+    let original_bindings = state
+        .project_store
+        .get(&project.id)
+        .unwrap()
+        .sidebar_section_bindings;
+    assert!(original_bindings.contains_key("assigned"));
     state.storage.delete_session("assigned").await.unwrap();
     let mut renamed = snapshot(json!({"assigned":SECTION}));
     renamed["sections"][0]["name"] = json!("Renamed");
@@ -522,6 +536,14 @@ async fn sidebar_deletion_clears_assignments_even_after_root_disappears() {
             .await
             .status(),
         StatusCode::OK
+    );
+    assert_eq!(
+        state
+            .project_store
+            .get(&project.id)
+            .unwrap()
+            .sidebar_section_bindings,
+        original_bindings
     );
     let response = patch(
         &state,
@@ -537,6 +559,12 @@ async fn sidebar_deletion_clears_assignments_even_after_root_disappears() {
         body(response).await["sidebar"]["session_sections"]["assigned"],
         Value::Null
     );
+    assert!(state
+        .project_store
+        .get(&project.id)
+        .unwrap()
+        .sidebar_section_bindings
+        .is_empty());
     assert_eq!(
         patch(
             &state,
@@ -644,6 +672,7 @@ async fn sidebar_import_preserves_distinct_lowercase_names_ids_and_assignments_o
     )
     .unwrap();
     assert_eq!(manifest["sidebar"], requested);
+    assert!(manifest.get("sidebar_section_bindings").is_none());
 
     let reopened = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
     assert_eq!(reopened.get(&project.id).unwrap(), saved);

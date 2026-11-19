@@ -178,7 +178,7 @@ function assertAdmissionCompatibility(recorded, current) {
 function validatePreparation(preparation, identity, contractVersion) {
   assert.equal(preparation?.schemaVersion, 1)
   assert.equal(preparation.kind, 'bamboo-release-preparation/v1')
-  assert.ok(contractVersion === 1 || contractVersion === 2)
+  require('./sidecar-release.cjs').contractForVersion(contractVersion)
   assert.equal(preparation.contractVersion, contractVersion)
   for (const key of ['repository', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId']) {
     assert.equal(preparation[key], identity[key], `Release preparation mismatch: ${key}`)
@@ -513,10 +513,10 @@ function github(repository, route, payload, method, allowMissing = false) {
   return parsed
 }
 
-function receiptBody(receipt) {
+function receiptBody(receipt, notes = '') {
   const { repository, sourceRevision, frontend } = receipt.identity
   const frozen = receipt.validation?.kind === 'bamboo-frozen-dev-release/v1'
-  return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
+  return (notes ? notes + '\n\n' : '') + `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
     (receipt.ciRun ? `${frozen ? 'Feature CI' : 'Main publication CI'}: ${receipt.ciRun}\n\n` : '') +
@@ -525,6 +525,51 @@ function receiptBody(receipt) {
       `(attempt ${receipt.validation.premerge.runAttempt}, tested snapshot ${receipt.validation.premerge.snapshotRevision}).\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
     `<!-- bamboo-release-provenance\n${JSON.stringify(receipt)}\n-->`
+}
+
+function releaseNotes(repository, source, releaseId, releases, read) {
+  const limit = 100
+  const candidates = releases.filter(release => release.id !== releaseId &&
+    release.draft === false && release.prerelease === false && SHA.test(release.target_commitish) &&
+    /^v\d+\.\d+\.\d+$/.test(release.tag_name) && Number.isFinite(Date.parse(release.published_at)))
+  candidates.sort((left, right) => Date.parse(right.published_at) - Date.parse(left.published_at))
+
+  const url = 'https://github.com/' + repository
+  let history = url + '/commits/' + source
+  let comparison
+  for (const previous of candidates) {
+    const base = previous.target_commitish
+    const result = read('compare/' + base + '...' + source + '?per_page=' + limit)
+    if (result?.behind_by === 0 && result.merge_base_commit?.sha === base) {
+      comparison = result
+      history = url + '/compare/' + base + '...' + source
+      break
+    }
+  }
+  const commits = comparison ? comparison.commits : read('commits?sha=' + source + '&per_page=' + limit)
+  assert.ok(Array.isArray(commits) && commits.length <= limit, 'Invalid GitHub commit history for release notes')
+  const groups = new Map([['新功能 / Features', []], ['修复 / Fixes', []], ['其他改动 / Other changes', []]])
+  for (const { sha, commit, parents } of commits) {
+    assert.match(sha, SHA)
+    assert.ok(Array.isArray(parents) && typeof commit?.message === 'string', 'Invalid release note commit')
+    if (parents.length > 1) continue
+    const subject = commit.message.split(/\r?\n/, 1)[0].slice(0, 300) || 'Untitled commit'
+    const text = subject.replace(/[&<>@]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '@': '&#64;' }[char]))
+      .replace(/[\\`*_[\]]/g, '\\$&')
+    const heading = /^feat(?:\([^)]*\))?!?:/.test(subject) ? '新功能 / Features'
+      : /^fix(?:\([^)]*\))?!?:/.test(subject) ? '修复 / Fixes' : '其他改动 / Other changes'
+    groups.get(heading).push('- [`' + sha.slice(0, 8) + '`](' + url + '/commit/' + sha + ') ' + text)
+  }
+  const notes = ['## 改了什么 / What changed']
+  for (const [heading, entries] of groups) {
+    if (entries.length) notes.push('', '### ' + heading, '', ...entries)
+  }
+  if (comparison?.total_commits === 0) notes.push('', '本次发布沿用同一源码。 / This release uses the same source.')
+  if (comparison ? comparison.total_commits > commits.length : commits.length === limit) {
+    notes.push('', '更多提交见完整记录。 / See the full history for additional commits.')
+  }
+  notes.push('', '[完整 Git 提交记录 / Full Git history](' + history + ')')
+  return notes.join('\n')
 }
 
 function readBodyReceipt(release) {
@@ -605,11 +650,24 @@ async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verif
   await upload()
 }
 
-async function registryFetch(url, allowMissing = false) {
-  const response = await fetch(url, { headers: { 'User-Agent': 'bamboo-publish-crate/2.0 (+https://github.com/bigduu/Bamboo-agent)' } })
+async function registryFetch(url, allowMissing = false, retryRead = read => read()) {
+  const read = () => fetch(url, { headers: { 'User-Agent': 'bamboo-publish-crate/2.0 (+https://github.com/bigduu/Bamboo-agent)' } })
+  const response = await retryRead(read)
   if (allowMissing && response.status === 404) return null
   assert.ok(response.ok, `Registry request failed (${response.status}): ${url}`)
   return response
+}
+
+async function waitForCargoArchive(name, version, read, wait) {
+  // The crates.io API download redirect can become available before the
+  // static path Cargo uses when the index's dl URL has no markers.
+  const url = `https://static.crates.io/crates/${name}/${version}/download`
+  for (let attempt = 1; attempt <= 60; attempt++) {
+    const response = await read(url, true)
+    if (response) return response
+    if (attempt < 60) await wait(10)
+  }
+  throw new Error(`Timed out waiting for Cargo download: ${name}@${version} (${url})`)
 }
 
 // A successful queued run does not authorize publication after main advances.
@@ -693,8 +751,8 @@ function makeRecoveryContext(env = process.env) {
   return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
 }
 
-function makeFrozenRecoveryContext(env = process.env) {
-  const recovery = require('./crate-release-frozen-recovery.cjs').makeAuthority(env)
+function makeFrozenRecoveryContext(env = process.env, makeAuthority = require('./crate-release-frozen-recovery.cjs').makeAuthority) {
+  const recovery = makeAuthority(env)
   assert.equal(command(['git', 'rev-parse', 'HEAD']).trim(), recovery.receipt.identity.sourceRevision)
   const context = makeVerifiedContext(env, env.GITHUB_REPOSITORY, recovery.receipt.identity.sourceRevision,
     recovery.receipt.validation.ciRun, true, true, recovery)
@@ -731,12 +789,13 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   const receiptFile = path.join(directory, RECEIPT_NAME)
   const verifiedSources = new Map()
   const paginated = (route) => jsonCommand(['gh', 'api', '--paginate', '--slurp', `repos/${repository}/${route}`]).flat()
+  const readRegistry = (url, allowMissing) => registryFetch(url, allowMissing, recovery?.retryRegistryRead)
   const registryVersions = async (name) => {
-    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}`, true)
+    const response = await readRegistry(`https://crates.io/api/v1/crates/${name}`, true)
     return response ? (await response.json()).versions.map((version) => version.num) : []
   }
-  const downloadArchive = async (name, version) => {
-    const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}/download`)
+  const downloadArchive = async (name, version, available) => {
+    const response = available ?? await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}/download`)
     const bytes = Buffer.from(await response.arrayBuffer())
     const archive = path.join(directory, `${name}-${version}.crate`)
     fs.writeFileSync(archive, bytes)
@@ -826,7 +885,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       })
     },
     registry: async (name, version) => {
-      const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}`, true)
+      const response = await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}`, true)
       return response ? (await response.json()).version : null
     },
     package: async (name, version, expected, release) => {
@@ -886,15 +945,24 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       return { status: result.status, output }
     },
     verifyArchive: async (name, receipt, checksum) => {
-      const { bytes, entry } = await downloadArchive(name, receipt.version)
+      const available = frozen && (!recovery || recovery.verifyCargoDownload)
+        ? await waitForCargoArchive(name, receipt.version, readRegistry, context.wait)
+        : undefined
+      const { bytes, entry } = await downloadArchive(name, receipt.version, available)
       verifyPackageArchive(bytes, receipt, name, checksum, entry)
     },
     wait: async (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
     complete: async (release, receipt, makeLatest) => {
+      const notes = frozen && !recovery
+        ? releaseNotes(repository, sourceRevision, release.id, await context.releases(), route => github(repository, route, undefined, 'GET', true))
+        : ''
+      const body = receiptBody(receipt, notes)
       await write(() => command(['gh', 'release', 'upload', `v${receipt.version}`, receiptFile, '--clobber', '--repo', repository]))
-      return write(() => github(repository, `releases/${release.id}`, {
-        tag_name: `v${receipt.version}`, draft: false, make_latest: makeLatest ? 'true' : 'false', body: receiptBody(receipt),
+      const published = await write(() => github(repository, `releases/${release.id}`, {
+        tag_name: `v${receipt.version}`, draft: false, make_latest: makeLatest ? 'true' : 'false', body,
       }, 'PATCH'))
+      if (notes) assert.ok(published.body === body, 'Published release notes differ from the generated body')
+      return published
     },
   }
   return context
@@ -945,8 +1013,8 @@ function preparationIdentity(context, version, env = process.env) {
 }
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
-  plan, publish, publishCrates, makeContext, makeRecoveryContext, makeFrozenRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
-  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
+  plan, publish, publishCrates, makeContext, makeRecoveryContext, makeFrozenRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt, releaseNotes,
+  frontendIdentity, verifyPackageArchive, waitForCargoArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
   assertAdmissionCompatibility, assertFrozenPublisherRun, assertCrateCompilationAllowed, prepareFrozenCrateOriginal }

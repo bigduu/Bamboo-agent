@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 
 use bamboo_agent_core::{tools::ToolSchema, Message};
 use bamboo_domain::CapabilityLoadingMode;
-use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, Result};
+use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, ProviderModelInfo, Result};
 use bamboo_llm::{LLMStream, PromptIR, ProviderVisibleToolFootprint};
 
 /// An `LLMProvider` wrapper that always delegates to the latest provider stored in a shared lock.
@@ -60,7 +60,9 @@ impl LLMProvider for ReloadableProvider {
                 )
             })?
             .clone();
-        Ok(Some(bamboo_llm::provider::queued_snapshot_for(current)?))
+        Ok(Some(bamboo_llm::provider::snapshot_forwarded_provider(
+            current,
+        )?))
     }
 
     fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
@@ -85,6 +87,13 @@ impl LLMProvider for ReloadableProvider {
             .await
             .capability_loading_mode(model, required_tool)
             .await
+    }
+
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<bamboo_llm::provider::RequestToolSelection> {
+        self.current().await.request_tool_selection(model).await
     }
 
     async fn provider_visible_tool_footprint(
@@ -153,6 +162,14 @@ impl LLMProvider for ReloadableProvider {
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.current().await;
         provider.list_models().await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.current().await.list_model_info().await
+    }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.current().await.model_info_for_request(model).await
     }
 }
 
@@ -366,7 +383,7 @@ mod tests {
             official
                 .capability_loading_mode("claude-opus-4-1", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
         assert_eq!(
             official
@@ -383,7 +400,7 @@ mod tests {
             custom
                 .capability_loading_mode("claude-sonnet-4-6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         );
     }
 
@@ -436,12 +453,32 @@ mod tests {
 
     #[tokio::test]
     async fn queued_snapshot_tracks_the_actual_reloadable_provider() {
-        use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for, QueuedRouteIdentity};
+        use bamboo_llm::provider::{
+            queued_identity_for, queued_snapshot_for, scope_main_dispatch, QueuedRouteIdentity,
+            RequestToolSelection,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
 
-        struct Capture(Arc<AtomicUsize>);
+        struct Capture {
+            calls: Arc<AtomicUsize>,
+            mode: CapabilityLoadingMode,
+            selection: RequestToolSelection,
+        }
         #[async_trait]
         impl LLMProvider for Capture {
+            async fn capability_loading_mode(
+                &self,
+                _: &str,
+                _: Option<&str>,
+            ) -> CapabilityLoadingMode {
+                self.mode
+            }
+
+            async fn request_tool_selection(&self, _: &str) -> Result<RequestToolSelection> {
+                Ok(self.selection.clone())
+            }
+
             async fn chat_stream(
                 &self,
                 _: &[Message],
@@ -449,7 +486,7 @@ mod tests {
                 _: Option<u32>,
                 _: &str,
             ) -> Result<LLMStream> {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::pin(futures::stream::empty()))
             }
         }
@@ -465,9 +502,21 @@ mod tests {
 
         let a_calls = Arc::new(AtomicUsize::new(0));
         let b_calls = Arc::new(AtomicUsize::new(0));
-        let a: Arc<dyn LLMProvider> = Arc::new(Capture(a_calls.clone()));
-        let b: Arc<dyn LLMProvider> = Arc::new(Capture(b_calls.clone()));
-        let inner = Arc::new(RwLock::new(a));
+        let a: Arc<dyn LLMProvider> = Arc::new(Capture {
+            calls: a_calls.clone(),
+            mode: CapabilityLoadingMode::Progressive,
+            selection: RequestToolSelection::Automatic,
+        });
+        let forced_read = RequestToolSelection::Forced {
+            name: "Read".into(),
+            exactly_one: true,
+        };
+        let b: Arc<dyn LLMProvider> = Arc::new(Capture {
+            calls: b_calls.clone(),
+            mode: CapabilityLoadingMode::LegacyFullCatalog,
+            selection: forced_read.clone(),
+        });
+        let inner = Arc::new(RwLock::new(a.clone()));
         let reloadable: Arc<dyn LLMProvider> = Arc::new(ReloadableProvider::new(inner.clone()));
         let first = queued_snapshot_for(reloadable.clone()).unwrap();
         let unchanged = queued_snapshot_for(reloadable.clone()).unwrap();
@@ -482,14 +531,40 @@ mod tests {
             queued_identity_for(&first),
             queued_identity_for(&replaced)
         ));
-        // A frozen dispatch handle cannot retarget to B after it was resolved.
-        let mut stream = unchanged
-            .chat_stream(&[], &[], None, "synthetic")
-            .await
-            .unwrap();
+        // Policy, dispatch, and origin observation belong to the same
+        // provider after the live handle switches to a different route.
+        assert_eq!(
+            unchanged.capability_loading_mode("synthetic", None).await,
+            CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(
+            unchanged.request_tool_selection("synthetic").await.unwrap(),
+            RequestToolSelection::Automatic,
+        );
+        assert_eq!(
+            replaced.request_tool_selection("synthetic").await.unwrap(),
+            forced_read,
+        );
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let receive = observed.clone();
+        let ir = PromptIR::default();
+        let options = LLMRequestOptions {
+            request_purpose: Some("agent_loop".into()),
+            ..Default::default()
+        };
+        let mut stream = scope_main_dispatch(
+            Arc::new(move |origin| receive.lock().unwrap().push(origin)),
+            unchanged.chat_stream_ir(&ir, &[], None, "synthetic", Some(&options)),
+        )
+        .await
+        .unwrap();
         assert!(futures::StreamExt::next(&mut stream).await.is_none());
         assert_eq!(a_calls.load(Ordering::SeqCst), 1);
         assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(Arc::ptr_eq(&observed[0], &a));
+        drop(observed);
 
         let _guard = inner.write().await;
         assert!(

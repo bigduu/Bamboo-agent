@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use bamboo_config::{ConfigStoreError, SectionSnapshot, SectionSourceKind, SectionStatus};
 use bamboo_domain::SessionPermissionMode;
 use bamboo_tools::permission::{
@@ -139,6 +139,8 @@ pub struct DefaultSessionPermissionModeResponse {
     /// The mode stamped onto NEW sessions at creation:
     /// `default` | `bypass` | `auto`.
     pub mode: SessionPermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_approval_handoff_enabled: Option<bool>,
     pub revision: u64,
     pub loaded_at: DateTime<Utc>,
     pub source_path: PathBuf,
@@ -148,12 +150,17 @@ pub struct DefaultSessionPermissionModeResponse {
 }
 
 impl DefaultSessionPermissionModeResponse {
-    fn from_snapshot(snapshot: &SectionSnapshot<SerializablePermissionConfig>) -> Self {
+    fn from_snapshot(
+        snapshot: &SectionSnapshot<SerializablePermissionConfig>,
+        supports_handoff: bool,
+    ) -> Self {
         Self {
             mode: snapshot
                 .data
                 .default_session_permission_mode
                 .unwrap_or_default(),
+            supervisor_approval_handoff_enabled: supports_handoff
+                .then_some(snapshot.data.supervisor_approval_handoff_since.is_some()),
             revision: snapshot.revision,
             loaded_at: snapshot.loaded_at,
             source_path: snapshot.source_path.clone(),
@@ -182,6 +189,7 @@ pub async fn get_default_session_permission_mode(
     Ok(
         HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
             &snapshot,
+            app_state.spawn_scheduler.supports_native_ticket_budget(),
         )),
     )
 }
@@ -200,6 +208,53 @@ pub async fn update_default_session_permission_mode(
     Ok(
         HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
             &snapshot,
+            app_state.spawn_scheduler.supports_native_ticket_budget(),
+        )),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSupervisorApprovalHandoff {
+    pub expected_revision: u64,
+    pub enabled: bool,
+}
+
+pub async fn update_supervisor_approval_handoff(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    payload: web::Json<UpdateSupervisorApprovalHandoff>,
+) -> Result<HttpResponse, AppError> {
+    super::super::agent::tickets::user(&state, &request)
+        .await
+        .map_err(|error| AppError::Forbidden(error.to_string()))?;
+    if !state.spawn_scheduler.supports_native_ticket_budget() {
+        return Err(AppError::Forbidden(
+            "Approval handoff requires the native Host".into(),
+        ));
+    }
+    let snapshot = state.permission_section.snapshot();
+    require_current_revision(payload.expected_revision, snapshot.revision)?;
+    let mut candidate = snapshot.data.as_ref().clone();
+    candidate.supervisor_approval_handoff_since = payload.enabled.then(|| {
+        candidate
+            .supervisor_approval_handoff_since
+            .unwrap_or_else(Utc::now)
+    });
+    if candidate.supervisor_approval_handoff_since
+        == snapshot.data.supervisor_approval_handoff_since
+    {
+        return Ok(
+            HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+                &snapshot, true,
+            )),
+        );
+    }
+    let committed =
+        commit_permission_candidate(&state, payload.expected_revision, candidate).await?;
+    Ok(
+        HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+            &committed, true,
         )),
     )
 }

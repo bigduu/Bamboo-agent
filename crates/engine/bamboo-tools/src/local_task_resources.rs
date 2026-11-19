@@ -11,13 +11,14 @@ use std::{
     process::ExitStatus,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
 };
 use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{oneshot, watch},
     task::JoinHandle,
+    time::Instant,
 };
 
 #[cfg(target_os = "macos")]
@@ -69,6 +70,8 @@ struct State {
     closed: bool,
     tasks: Vec<TrackedTask>,
     failure: Option<String>,
+    shell_wait_deadlines: Vec<Weak<Instant>>,
+    last_shell_wait_finished_at: Option<DateTime<Utc>>,
 }
 impl State {
     fn admit_task(&mut self) -> io::Result<()> {
@@ -164,6 +167,51 @@ impl LocalTaskResources {
     }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
         RESOURCES.scope(self.clone(), future).await
+    }
+
+    /// Sample activity from this exact execution's bounded shell waits.
+    /// A dropped or overdue wait cannot defer the idle timeout.
+    pub fn shell_wait_activity_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return None;
+        }
+        let sample = Instant::now();
+        if state
+            .shell_wait_deadlines
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|deadline| sample < *deadline)
+        {
+            Some(now)
+        } else {
+            state.last_shell_wait_finished_at
+        }
+    }
+
+    pub(crate) async fn observe_shell_wait<F: Future>(
+        &self,
+        deadline: Instant,
+        wait: F,
+    ) -> F::Output {
+        let deadline = Arc::new(deadline);
+        {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .shell_wait_deadlines
+                .retain(|wait| wait.strong_count() > 0);
+            state.shell_wait_deadlines.push(Arc::downgrade(&deadline));
+        }
+        let output = wait.await;
+        // Begin the idle interval when the wait yields. This also covers the
+        // gap before the runner can publish the tool result.
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_shell_wait_finished_at = Some(Utc::now());
+        drop(deadline);
+        output
     }
     /// Poison this resource domain when external/blocking work cannot be
     /// proved stopped. This can only deny a receipt, never manufacture one.
@@ -777,6 +825,33 @@ mod tests {
 
     fn resources(run: &str) -> LocalTaskResources {
         LocalTaskResources::new("same-session", run, Utc::now())
+    }
+
+    #[tokio::test]
+    async fn local_task_resources_shell_wait_activity_expires_or_ends_with_the_wait() {
+        let scope = resources("shell-wait");
+        let mut active = Box::pin(scope.observe_shell_wait(
+            Instant::now() + std::time::Duration::from_secs(30),
+            std::future::pending::<()>(),
+        ));
+        assert!(futures::poll!(active.as_mut()).is_pending());
+        let sample = Utc::now();
+        assert_eq!(scope.shell_wait_activity_at(sample), Some(sample));
+
+        let mut expired =
+            Box::pin(scope.observe_shell_wait(Instant::now(), std::future::pending::<()>()));
+        assert!(futures::poll!(expired.as_mut()).is_pending());
+        drop(active);
+        assert_eq!(scope.shell_wait_activity_at(Utc::now()), None);
+        drop(expired);
+
+        scope.observe_shell_wait(Instant::now(), async {}).await;
+        let finished = scope
+            .shell_wait_activity_at(Utc::now())
+            .expect("a finished wait starts a fresh idle interval");
+        assert!(finished >= sample);
+        scope.close_and_drain().await.unwrap();
+        assert_eq!(scope.shell_wait_activity_at(Utc::now()), None);
     }
 
     #[tokio::test]

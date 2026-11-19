@@ -1,14 +1,56 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::config::{AgentLoopConfig, ImageFallbackMode};
 use bamboo_agent_core::{AgentError, Message, Role};
 use bamboo_compression::PreparedContext;
 use bamboo_llm::LLMProvider;
 
 use super::super::super::image_fallback::{
-    apply_image_fallback_to_llm_messages, resolve_bamboo_attachments_for_llm,
+    apply_image_fallback_to_llm_messages_reusing, prepare_tool_images,
+    resolve_bamboo_attachments_for_llm,
 };
+
+pub(super) enum ImageProjection {
+    Native,
+    Nonvision,
+    LegacyFallback(ImageFallbackMode),
+}
+
+impl ImageProjection {
+    pub(super) fn keeps_native_images(self) -> bool {
+        match self {
+            Self::Native => true,
+            Self::LegacyFallback(ImageFallbackMode::Ocr) => !cfg!(windows),
+            Self::Nonvision | Self::LegacyFallback(_) => false,
+        }
+    }
+}
+
+pub(super) async fn image_projection(
+    config: &AgentLoopConfig,
+    llm: &dyn LLMProvider,
+    model_name: &str,
+) -> ImageProjection {
+    if !llm.supports_vision(model_name).await {
+        return ImageProjection::Nonvision;
+    }
+    // Explicit Vision support bypasses the separately configured legacy hook.
+    if let Some(fallback) = config.image_fallback.as_ref() {
+        if llm.vision_support_override(model_name).await != Some(true) {
+            return ImageProjection::LegacyFallback(fallback.mode);
+        }
+    }
+    ImageProjection::Native
+}
+
+pub(super) fn has_image_parts(message: &Message) -> bool {
+    message.content_parts.as_ref().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+    })
+}
 
 pub(super) async fn apply_message_transforms(
     config: &AgentLoopConfig,
@@ -17,33 +59,70 @@ pub(super) async fn apply_message_transforms(
     session_id: &str,
     model_name: &str,
 ) -> Result<(), AgentError> {
+    apply_message_transforms_with_vision_budget(
+        config,
+        prepared_context,
+        llm,
+        session_id,
+        model_name,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn apply_message_transforms_with_vision_budget(
+    config: &AgentLoopConfig,
+    prepared_context: &mut PreparedContext,
+    llm: &Arc<dyn LLMProvider>,
+    session_id: &str,
+    model_name: &str,
+    allow_paid_vision: bool,
+) -> Result<(), AgentError> {
     normalize_tool_chains(&mut prepared_context.messages, session_id);
-    if !llm.supports_vision(model_name).await {
-        let has_images = prepared_context.messages.iter().any(|message| {
-            message.content_parts.as_ref().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
-            })
-        });
-        if has_images && config.vision_model_resolver.is_none() {
-            return Err(AgentError::LLM(
-                super::super::super::image_fallback::VISION_CONFIGURATION_ERROR.into(),
-            ));
+    match image_projection(config, llm.as_ref(), model_name).await {
+        ImageProjection::Nonvision => {
+            let has_images = prepared_context.messages.iter().any(has_image_parts);
+            if has_images && config.vision_model_resolver.is_none() {
+                return Err(AgentError::LLM(
+                    super::super::super::image_fallback::VISION_CONFIGURATION_ERROR.into(),
+                ));
+            }
+            super::super::super::image_fallback::project_nonvision_images(
+                &mut prepared_context.messages,
+                session_id,
+            );
+            return Ok(());
         }
-        super::super::super::image_fallback::project_nonvision_images(
-            &mut prepared_context.messages,
-            session_id,
-        );
-    } else if llm.vision_support_override(model_name).await != Some(true) {
-        // Vision remains enabled by default. Preserve a legacy fallback only
-        // when the user independently opted into that transform; it is not a
-        // declaration that this model lacks Vision. Explicit support sends the
-        // native image parts without rewriting them.
-        apply_image_fallback(config, prepared_context, llm).await?;
+        ImageProjection::LegacyFallback(ImageFallbackMode::Vision) => {
+            // Legacy Vision validates the budget before making auxiliary calls.
+            prepare_tool_images(
+                &mut prepared_context.messages,
+                session_id,
+                config.attachment_reader.as_deref(),
+            )
+            .await?;
+            if !allow_paid_vision {
+                if prepared_context.messages.iter().any(has_image_parts) {
+                    return Err(AgentError::Budget(
+                        "output-limit recovery cannot reserve an auxiliary vision request".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            return apply_image_fallback(config, prepared_context, llm).await;
+        }
+        ImageProjection::LegacyFallback(_) => {
+            apply_image_fallback(config, prepared_context, llm).await?;
+        }
+        ImageProjection::Native => {}
     }
-    resolve_attachments(config, prepared_context).await?;
-    Ok(())
+    prepare_tool_images(
+        &mut prepared_context.messages,
+        session_id,
+        config.attachment_reader.as_deref(),
+    )
+    .await?;
+    resolve_attachments(config, prepared_context).await
 }
 
 fn normalize_tool_chains(messages: &mut Vec<Message>, session_id: &str) {
@@ -140,13 +219,7 @@ async fn apply_image_fallback(
     // LLM context only. This must never mutate the persisted session messages
     // (UI should still show images).
     if let Some(mut fallback) = config.image_fallback.clone() {
-        let has_images = prepared_context.messages.iter().any(|message| {
-            message.content_parts.as_ref().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
-            })
-        });
+        let has_images = prepared_context.messages.iter().any(has_image_parts);
         let target = if has_images
             && fallback.mode == crate::ImageFallbackMode::Vision
             && config.legacy_vision_model_resolver.is_some()
@@ -158,7 +231,7 @@ async fn apply_image_fallback(
         if let Some(target) = target.as_ref() {
             fallback.vision_model = Some(target.model_name.clone());
         }
-        apply_image_fallback_to_llm_messages(
+        apply_image_fallback_to_llm_messages_reusing(
             &mut prepared_context.messages,
             fallback,
             config.attachment_reader.as_deref(),
@@ -168,6 +241,10 @@ async fn apply_image_fallback(
                     .map(|target| &target.provider)
                     .unwrap_or(llm),
             ),
+            // Reuse a description this request already prepared for the same
+            // source. The caller clears the store whenever provider-relevant
+            // source state changes, so a changed input still describes afresh.
+            Some(config.vision_description_reuse.as_ref()),
         )
         .await?;
     }
@@ -206,11 +283,140 @@ mod vision_tests {
             _: &[Message],
             _: &[bamboo_domain::ToolSchema],
             _: Option<u32>,
-            _: &str,
+            model: &str,
         ) -> bamboo_llm::provider::Result<bamboo_llm::LLMStream> {
-            panic!("no paid fallback during capability checks")
+            assert_eq!(model, "overflow-vision");
+            Ok(Box::pin(futures::stream::iter([Ok(
+                bamboo_llm::LLMChunk::Token("retained image description".into()),
+            )])))
         }
     }
+
+    #[tokio::test]
+    async fn tool_image_overflow_preserves_attachment_reference_on_native_and_legacy_vision() {
+        use bamboo_agent_core::storage::{AttachmentReader, Storage};
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{FunctionCall, ImageUrlRef, MessagePart, ToolCall, ToolResultImage};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut session = Session::new("tool-image-overflow", "vision");
+        store.save_session(&session).await.unwrap();
+        let png = [
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+            b"fixture image bytes ".repeat(10).as_slice(),
+        ]
+        .concat();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+        let (_, reference) = store
+            .write_image_attachment(&session, &encoded, Some("image/png"))
+            .await
+            .unwrap();
+        let call_id = "screenshots";
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: call_id.into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "screenshot".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        let remaining = reference.len() + 1;
+        let mut tool_result = Message::tool_result_with_images(
+            call_id,
+            "original tool output",
+            true,
+            vec![ToolResultImage {
+                mime_type: "image/png".into(),
+                data: "A".repeat(
+                    bamboo_llm::MAX_TOOL_IMAGE_URL_BYTES
+                        - "data:image/png;base64,".len()
+                        - remaining,
+                ),
+            }],
+        );
+        tool_result.content_parts.as_mut().unwrap().insert(
+            0,
+            MessagePart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: reference.clone(),
+                    detail: None,
+                },
+            },
+        );
+        session.add_message(tool_result);
+        assert!(bamboo_llm::validate_tool_image_budget(session.messages.iter()).is_ok());
+
+        let attachment_reader: Arc<dyn AttachmentReader> = store;
+        let config = AgentLoopConfig {
+            attachment_reader: Some(attachment_reader.clone()),
+            image_fallback: Some(crate::runtime::config::ImageFallbackConfig {
+                mode: ImageFallbackMode::Vision,
+                vision_model: Some("overflow-vision".into()),
+            }),
+            ..Default::default()
+        };
+        let llm: Arc<dyn LLMProvider> = Arc::new(SwitchingProvider);
+        for (model, expected_vision_call) in [("image", false), ("old", true)] {
+            let mut prepared = PreparedContext {
+                messages: session.messages.clone(),
+                token_usage: bamboo_domain::TokenUsageBreakdown {
+                    system_tokens: 0,
+                    summary_tokens: 0,
+                    window_tokens: 0,
+                    total_tokens: 0,
+                    budget_limit: 1000,
+                },
+                truncation_occurred: false,
+                segments_removed: 0,
+                compressed_message_ids: vec![],
+                prompt_cached_tool_outputs: 0,
+                prompt_cached_tool_tokens_saved: 0,
+            };
+            apply_message_transforms(&config, &mut prepared, &llm, &session.id, model)
+                .await
+                .unwrap();
+            let result = prepared.messages.last().unwrap();
+            assert_eq!(result.tool_call_id.as_deref(), Some(call_id));
+            assert!(result.content.contains("original tool output"));
+            assert!(result.content.contains(&reference));
+            assert_eq!(
+                result.content.contains("retained image description"),
+                expected_vision_call,
+            );
+            let count = result.content_parts.as_ref().map_or(0, Vec::len);
+            assert_eq!(count, usize::from(!expected_vision_call));
+            assert!(bamboo_llm::validate_tool_image_budget(prepared.messages.iter()).is_ok());
+        }
+        let reader = super::super::super::super::image_fallback::image_reference_reader(
+            &session,
+            Some(attachment_reader),
+        );
+        assert_eq!(reader(reference).await.unwrap(), png);
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "original tool output"
+        );
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .unwrap()
+                .content_parts
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn vision_model_switch_preserves_history_and_true_bypasses_legacy_fallback() {
         let image = Message::user_with_parts(

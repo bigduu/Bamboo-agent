@@ -36,7 +36,6 @@ pub use agent::{
 // Multi-provider API handlers
 pub mod anthropic;
 pub mod command;
-pub mod copilot_auth;
 pub mod gemini;
 pub(crate) mod llm_compat;
 pub mod openai;

@@ -43,7 +43,8 @@ impl ResolvedModel {
 /// consumer of a resolved role model (including legacy `chat_stream` callers)
 /// observes the same setting without duplicating effort plumbing throughout
 /// the runtime. Explicit call-site values remain the fallback when the role
-/// does not specify an effort.
+/// does not specify an effort. An explicit Disabled request suppresses reasoning
+/// even when the role specifies a different preference.
 pub(crate) fn provider_with_reasoning_effort(
     provider: Arc<dyn LLMProvider>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -65,7 +66,9 @@ struct RoleReasoningProvider {
 impl RoleReasoningProvider {
     fn options(&self, options: Option<&LLMRequestOptions>) -> LLMRequestOptions {
         let mut effective = options.cloned().unwrap_or_default();
-        effective.reasoning_effort = Some(self.reasoning_effort);
+        if effective.reasoning_effort != Some(ReasoningEffort::Disabled) {
+            effective.reasoning_effort = Some(self.reasoning_effort);
+        }
         effective
     }
 }
@@ -121,6 +124,13 @@ impl LLMProvider for RoleReasoningProvider {
         self.inner
             .capability_loading_mode(model, required_tool)
             .await
+    }
+
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> crate::provider::Result<crate::provider::RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
     }
 
     async fn provider_visible_tool_footprint(
@@ -183,6 +193,10 @@ impl LLMProvider for RoleReasoningProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
     }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +258,44 @@ mod tests {
         assert_eq!(
             inner.efforts.lock().unwrap().as_slice(),
             &[Some(ReasoningEffort::Low)]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_disable_survives_role_resolution_for_options_and_ir() {
+        let inner = Arc::new(CaptureProvider::default());
+        let provider = provider_with_reasoning_effort(inner.clone(), Some(ReasoningEffort::Max));
+        let options = LLMRequestOptions {
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream(&[], &[], Some(128), "model")
+            .await
+            .unwrap();
+        let _stream = provider
+            .chat_stream_with_options(&[], &[], Some(128), "model", Some(&options))
+            .await
+            .unwrap();
+        let _stream = provider
+            .chat_stream_ir(
+                &PromptIR::default(),
+                &[],
+                Some(128),
+                "model",
+                Some(&options),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inner.efforts.lock().unwrap().as_slice(),
+            &[
+                Some(ReasoningEffort::Max),
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::Disabled),
+            ]
         );
     }
 }

@@ -565,7 +565,10 @@ async fn inherited_root_wait_uses_actual_bound_full_runtime_and_owned_input_writ
             .await
             .unwrap()
             .unwrap();
-        let before = serde_json::to_value(&durable).unwrap();
+        // Explicit activation finish now projects its trusted terminal state.
+        // Only the later rejected stale writer must leave these bytes intact.
+        let before =
+            serde_json::to_value(store.load_session(&original.id).await.unwrap().unwrap()).unwrap();
         let cached_before =
             serde_json::to_value(crate::read_cached_session(host.cache(), &original.id)).unwrap();
         incoming.add_message(bamboo_domain::Message::assistant(

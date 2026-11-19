@@ -27,8 +27,10 @@ pub use compression_tooling::{
     active_messages_for_budget, apply_compression_plan, build_compression_plan_with_summary,
     build_forced_compression_candidate_plan,
     build_forced_compression_candidate_plan_with_fixed_tokens,
+    build_forced_compression_candidate_plan_with_input_costs,
     build_forced_compression_plan_with_summary,
-    build_message_summary_candidate_plan_with_fixed_tokens, build_summary_prompt,
+    build_message_summary_candidate_plan_with_fixed_tokens,
+    build_message_summary_candidate_plan_with_input_costs, build_summary_prompt,
     compression_summary_message, context_window_usage_percent,
     estimate_context_compression_exposure, estimate_context_compression_exposure_with_fixed_tokens,
     finalize_compression_candidate_plan, normalized_summary_target_ratio,
@@ -44,11 +46,12 @@ pub use preparation::{
     estimate_prompt_cache_savings, estimate_prompt_cache_savings_with_fixed_tokens,
     prepare_hybrid_context, prepare_hybrid_context_with_fixed_tokens,
 };
+pub use retrieval_window::build_retrieval_window_full_archive_plan_with_token_accounting as build_retrieval_window_critical_overflow_plan_with_token_accounting;
 pub use retrieval_window::{
     apply_retrieval_window_plan, apply_retrieval_window_plan_with_trigger,
     build_retrieval_window_candidate_plan, build_retrieval_window_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
-    build_retrieval_window_critical_overflow_plan_with_token_accounting,
+    build_retrieval_window_full_archive_plan_with_token_accounting,
     effective_retrieval_window_target_tokens, RetrievalWindowApplyError,
     RetrievalWindowApplyResult, RetrievalWindowCandidatePlan, RetrievalWindowPlanError,
     RetrievalWindowPolicy, RetrievalWindowTokenAccounting,

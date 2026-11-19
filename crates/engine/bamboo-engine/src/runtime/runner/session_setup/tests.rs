@@ -375,6 +375,268 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
 }
 
 #[tokio::test]
+async fn oversized_workspace_bundles_do_not_block_model_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let skills = workspace.join(".bamboo/skills");
+    for id in ["healthy-skill", "oversized-skill", "oversized-workflow"] {
+        let root = skills.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Test bundle {id}\n---\nInstructions\n"),
+        )
+        .unwrap();
+        if id != "healthy-skill" {
+            std::fs::create_dir(root.join("scripts")).unwrap();
+            std::fs::File::create(root.join("scripts/large.bin"))
+                .unwrap()
+                .set_len(11_600_174)
+                .unwrap();
+        }
+    }
+    std::fs::write(
+        skills.join("oversized-workflow/workflow.yaml"),
+        "id: oversized-workflow\nname: Test workflow\ndescription: Runs tools\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .unwrap();
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("global-skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    for (session_id, selection) in [
+        ("ordinary-chat", None),
+        ("healthy-selection", Some(vec!["healthy-skill".to_string()])),
+    ] {
+        let mut session = Session::new(session_id, "model");
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        let config = crate::runtime::config::AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: selection,
+            ..Default::default()
+        };
+        let context = super::legacy_instruction::prepare_context(
+            &mut session,
+            "Hello",
+            &config,
+            session_id,
+            &crate::runtime::runner::logging::DebugLogger::new(false),
+            false,
+        )
+        .await
+        .expect("bundle-local failures must not block model setup");
+        if config.selected_skill_ids.is_some() {
+            assert!(context.contains("explicitly selected `healthy-skill`"));
+        }
+        assert!(!context.contains("oversized-skill"));
+        assert!(!context.contains("oversized-workflow"));
+    }
+    let store = manager.store_for_workspace(Some(&workspace)).await.unwrap();
+    for (catalog, id) in [
+        (store.skill_catalog_snapshot().await, "oversized-skill"),
+        (
+            store.workflow_catalog_snapshot().await,
+            "oversized-workflow",
+        ),
+    ] {
+        let entry = catalog.entries.iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(entry.status, bamboo_skills::WorkflowStatus::Invalid);
+        assert!(entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("11600174 > 8388608 bytes"));
+    }
+}
+
+#[tokio::test]
+async fn oversized_replacement_preserves_restorable_legacy_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let skills = SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    };
+    let root = skills.skills_dir.join("retained-skill");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("SKILL.md"),
+        "---\nname: retained-skill\ndescription: Retained skill\n---\nOriginal instructions\n",
+    )
+    .unwrap();
+    let first = Arc::new(SkillManager::with_config(skills.clone()));
+    first.initialize().await.unwrap();
+    std::fs::File::create(root.join("large.bin"))
+        .unwrap()
+        .set_len(11_600_174)
+        .unwrap();
+
+    let session_id = "restorable-after-oversize";
+    let mut session = Session::new(session_id, "model");
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(first),
+        selected_skill_ids: Some(vec!["retained-skill".to_string()]),
+        ..Default::default()
+    };
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let context = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Hello",
+        &config,
+        session_id,
+        &logger,
+        false,
+    )
+    .await
+    .expect("legacy activation uses the last good bundle");
+    assert!(context.contains("explicitly selected `retained-skill`"));
+    record_test_activation_from_pinned_snapshot(&mut session, "retained-skill");
+    drop(config);
+
+    let restarted = Arc::new(SkillManager::with_config(skills));
+    restarted.initialize().await.unwrap();
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(restarted.clone()),
+        ..Default::default()
+    };
+    let context = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Continue",
+        &config,
+        session_id,
+        &logger,
+        true,
+    )
+    .await
+    .expect("restored activation must reach model setup");
+    assert!(context.contains("Explicit Workflow Already Activated"));
+    assert!(restarted.store().activation_was_restored(session_id).await);
+}
+
+#[tokio::test]
+async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+
+    for (session_id, max_context_tokens, shows_guidance) in [
+        ("no-match-resume", 128_000, true),
+        ("tiny-context-resume", 100, false),
+    ] {
+        let config = crate::runtime::config::AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            token_budget: Some(bamboo_domain::TokenBudget::for_model(max_context_tokens)),
+            ..Default::default()
+        };
+        let mut session = Session::new(session_id, "model");
+        let before = super::legacy_instruction::prepare_context(
+            &mut session,
+            "with this",
+            &config,
+            session_id,
+            &logger,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            before.contains("Check Skill applicability."),
+            shows_guidance
+        );
+        let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
+        let diagnostic = session.metadata[diagnostic_key].clone();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic).unwrap()["automatic_outcome"],
+            "no_match"
+        );
+
+        let resumed = super::legacy_instruction::prepare_context(
+            &mut session,
+            "with this",
+            &config,
+            session_id,
+            &logger,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed, before);
+        assert_eq!(session.metadata[diagnostic_key], diagnostic);
+    }
+}
+
+#[tokio::test]
+async fn retained_automatic_candidates_resume_the_workflow_that_was_loaded() {
+    let directory = tempfile::tempdir().unwrap();
+    let skills_dir = directory.path().join("skills");
+    for id in ["pdf", "docx"] {
+        let root = skills_dir.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Generate portable documents\n---\n{id} instructions\n"),
+        )
+        .unwrap();
+    }
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir,
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager.clone()),
+        ..Default::default()
+    };
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let id = "automatic-activation-resume";
+    let mut session = Session::new(id, "model");
+    let prompt = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Generate portable documents",
+        &config,
+        id,
+        &logger,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(prompt.contains("- skill_id: `pdf`") && prompt.contains("- skill_id: `docx`"));
+    let candidates = manager
+        .store()
+        .export_activation_snapshot(id)
+        .await
+        .unwrap();
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.into(),
+        serde_json::to_string(&candidates).unwrap(),
+    );
+    record_test_activation_from_pinned_snapshot(&mut session, "pdf");
+
+    let resumed = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Continue",
+        &config,
+        id,
+        &logger,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(resumed.contains("The `pdf` workflow was loaded"));
+    assert!(!resumed.contains("docx"));
+    assert!(super::legacy_instruction::active_context_block(&session).is_some());
+    let snapshot: bamboo_skills::SkillActivationSnapshot = serde_json::from_str(
+        &session.metadata[bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY],
+    )
+    .unwrap();
+    assert_eq!(snapshot.skills.into_keys().collect::<Vec<_>>(), ["pdf"]);
+}
+
+#[tokio::test]
 async fn pre_execute_explicit_snapshot_restores_after_restart_without_suspended_runtime() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = SkillStoreConfig {
@@ -1088,7 +1350,7 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
 }
 
 #[test]
-fn legacy_projection_keeps_deferred_tools_with_short_guide_descriptions() {
+fn legacy_projection_uses_real_descriptions_for_deferred_tools() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
         schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
@@ -1103,17 +1365,10 @@ fn legacy_projection_keeps_deferred_tools_with_short_guide_descriptions() {
 
     assert_eq!(names, vec!["Read", "Sleep", "scheduler"]);
 
-    // Inactive discoverable tools get shortened descriptions
-    let sleep = resolved
-        .iter()
-        .find(|s| s.function.name == "Sleep")
-        .unwrap();
-    assert!(sleep.function.description.contains("Discoverable"));
-    let scheduler = resolved
-        .iter()
-        .find(|s| s.function.name == "scheduler")
-        .unwrap();
-    assert!(scheduler.function.description.contains("Discoverable"));
+    assert_eq!(
+        serde_json::to_value(&resolved).unwrap(),
+        serde_json::to_value(&tools.schemas).unwrap()
+    );
 }
 
 #[test]
@@ -1220,6 +1475,74 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
         discovery_names, model_names,
         "legacy provider projection and discovery must consume one classified catalog"
     );
+}
+
+#[test]
+fn default_models_use_yielding_shell_and_resident_view_image() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = bamboo_tools::BuiltinToolExecutor::new();
+    let session = Session::new("yielding-shell-catalog", "model");
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let discovery =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&catalog);
+    for mode in [
+        CapabilityLoadingMode::LegacyFullCatalog,
+        CapabilityLoadingMode::Progressive,
+        CapabilityLoadingMode::StickyFallback,
+    ] {
+        let callable = EffectiveCallableSet::from_catalog(
+            &catalog,
+            mode,
+            ["exec_command", "write_stdin", "default::write_stdin"],
+        );
+        assert!(callable.contains_execution_name("exec_command"));
+        assert!(callable.contains_execution_name("write_stdin"));
+        assert!(callable.contains_execution_name("ViewImage"));
+        for retired in ["Bash", "bash", "BashInput", "BashOutput", "KillShell"] {
+            assert!(
+                callable.resolve_callable_reference(retired).is_none(),
+                "{retired}"
+            );
+            assert!(!discovery
+                .iter()
+                .any(|entry| entry.canonical_name == retired));
+        }
+    }
+    let (prompt, sections) = build_stable_prompt_frame_with_sections(
+        &session,
+        &config,
+        &resolve_available_tool_schemas_for_session(&config, &tools, &session),
+        &Default::default(),
+    );
+    assert!(!prompt.stable_instructions.contains("write_stdin"));
+    let guide = sections
+        .iter()
+        .find(|section| section.name == "tool_guide")
+        .unwrap();
+    assert!(!guide.content.contains("write_stdin"));
+    assert!(!guide.content.contains("exec_command"));
+
+    for disabled in [
+        "bash",
+        "Bash",
+        "default::execute_command",
+        "exec_command",
+        "write_stdin",
+        "BashOutput",
+    ] {
+        let config = crate::runtime::config::AgentLoopConfig {
+            disabled_tools: [disabled.into()].into(),
+            ..Default::default()
+        };
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+        assert!(
+            !schemas.iter().any(|schema| matches!(
+                schema.function.name.as_str(),
+                "bash" | "exec_command" | "write_stdin"
+            )),
+            "{disabled}"
+        );
+    }
 }
 
 #[test]
@@ -1338,6 +1661,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_names.contains("Edit"));
     assert!(child_names.contains("load_skill"));
     assert!(child_names.contains("mcp__external__read"));
+    assert!(!child_names.contains("work_overview"));
     let child_provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &child)
         .into_iter()
         .map(|entry| entry.function.name)
@@ -1345,6 +1669,58 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     assert!(child_provider_names.contains("exec_command"));
     assert!(child_provider_names.contains("write_stdin"));
     assert!(!child_provider_names.contains("Bash"));
+}
+
+#[test]
+fn shared_work_registry_is_visible_only_to_a_trusted_supervisor() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "Write",
+            "Edit",
+            "work_overview",
+            "work_dispatch",
+            "work_review",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let exposed = |session: &Session| {
+        resolve_available_tool_schemas_for_session(&config, &tools, session)
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect::<Vec<_>>()
+    };
+    let mut root = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    root.metadata.insert("role".into(), "supervisor".into());
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        root.set_root_orchestration_only(ultra).unwrap();
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        assert_eq!(exposed(&root), ["Edit", "Write"]);
+        assert_eq!(
+            exposed(&supervisor),
+            ["work_dispatch", "work_overview", "work_review"]
+        );
+        let child = Session::new_child_of("child", &supervisor, "model", "worker");
+        assert_eq!(exposed(&child), ["Edit", "Write"]);
+    }
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["Write".to_string()].into_iter().collect(),
+        ..config
+    };
+    assert_eq!(
+        resolve_available_tool_schemas_for_session(&config, &tools, &root)
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect::<Vec<_>>(),
+        ["Edit"]
+    );
 }
 
 #[test]
@@ -1407,7 +1783,7 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
 }
 
 #[test]
-fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_disabled_tool_leak() {
+fn supervisor_delegation_contract_without_user_activation_or_disabled_tool_leak() {
     use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
@@ -1443,9 +1819,12 @@ fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_dis
             &supervisor.id,
             &effective_guide_activation(&config, &supervisor),
         );
-        assert!(guide.contains("**SubAgent**"));
-        assert!(guide.contains("A trusted Supervisor delegates execution even for simple tasks"));
-        assert!(guide.contains("From a child session"));
+        assert!(!guide.contains("**SubAgent**"));
+        let role = super::prompt_envelope::build_root_orchestration_context_block(&supervisor)
+            .expect("Supervisor role context");
+        assert!(role
+            .content
+            .contains("Delegate execution, including simple implementation tasks"));
     }
     let config = crate::runtime::config::AgentLoopConfig {
         disabled_tools: ["SubAgent".into()].into(),
@@ -1580,7 +1959,7 @@ fn session_port_catalog_uses_concrete_host_schema_for_ordinary_ultra_supervisor_
 }
 
 #[test]
-fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
+fn ultra_root_keeps_subagent_schema_without_a_second_builtin_guide() {
     use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
     let config = crate::runtime::config::AgentLoopConfig {
         freeze_tool_exposure_for_cache: true,
@@ -1612,8 +1991,11 @@ fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
         .iter()
         .map(|schema| schema.function.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["Read", "SubAgent"]);
-    assert!(!schemas[1].function.description.contains("Discoverable"));
+    assert_eq!(names, vec!["Edit", "Read", "SubAgent"]);
+    assert_eq!(
+        schemas[2].function.description,
+        schema("SubAgent").function.description
+    );
     let guide = super::prompt_setup::build_tool_guide_context(
         &config,
         &schemas,
@@ -1621,16 +2003,7 @@ fn ultra_root_renders_full_subagent_guide_from_frozen_empty_activation() {
         &root.id,
         &effective_guide_activation(&config, &root),
     );
-    assert!(guide.contains("**SubAgent**"));
-    assert!(guide.contains("omit unused fields"));
-    assert!(guide.contains("intent=inspect"));
-    assert!(guide.contains("ParentRequest"));
-    assert!(guide.contains("approve_once or deny"));
-    let spec = bamboo_tools::guide::builtin_guides::builtin_guide_spec("SubAgent")
-        .expect("SubAgent guide");
-    for example in spec.examples.iter().take(2) {
-        assert!(guide.contains(&serde_json::to_string(&example.parameters).unwrap()));
-    }
+    assert!(!guide.contains("SubAgent"));
     assert_eq!(root.metadata["prompt_tool_exposure_activated"], "[]");
     assert!(bamboo_tools::exposure::activated_discoverable_tools(&root).is_empty());
 }
@@ -1684,13 +2057,15 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
     assert!(!child_schemas
         .iter()
         .any(|schema| schema.function.name == "Bash"));
-    assert!(child_schemas
-        .iter()
-        .find(|schema| schema.function.name == "SubAgent")
-        .unwrap()
-        .function
-        .description
-        .contains("Discoverable"));
+    assert_eq!(
+        child_schemas
+            .iter()
+            .find(|schema| schema.function.name == "SubAgent")
+            .unwrap()
+            .function
+            .description,
+        schema("SubAgent").function.description
+    );
     root.set_root_orchestration_only(false).unwrap();
     assert!(!effective_guide_activation(&ordinary_config, &root).contains("SubAgent"));
 }
@@ -1698,11 +2073,11 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
 #[test]
 fn default_delegation_prompts_use_the_compact_subagent_contract() {
     let base = crate::runtime::context::DEFAULT_BASE_PROMPT;
-    for field in ["intent", "target", "role", "message", "reply_to"] {
-        assert!(base.contains(&format!("`{field}`")), "missing {field}");
-    }
-    assert!(base.contains("workspace paths and files"));
-    assert!(base.contains("runtime manages activation and waiting"));
+    assert!(
+        !base.contains("SubAgent"),
+        "the schema supplies the SubAgent call contract"
+    );
+    assert!(crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("delegate independent work"));
     for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
         for stale in [
             "set `workspace`",
@@ -1730,7 +2105,6 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
             "default::ask_agent",
             "default::deploy_agent",
             "default::cluster",
-            "Plan",
             "exec_command",
             "write_stdin",
             "load_skill",
@@ -1758,7 +2132,6 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
         assert!(!names.contains(hidden), "{hidden}");
     }
     for ordinary in [
-        "Plan",
         "exec_command",
         "write_stdin",
         "load_skill",
@@ -1850,7 +2223,7 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
 
     assert_eq!(
         effective.execution_names().collect::<Vec<_>>(),
-        vec!["Read"]
+        vec!["Edit", "Read"]
     );
     for denied in [
         "Bash",
@@ -1858,8 +2231,6 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         "exec_command",
         "default::exec_command",
         "write_stdin",
-        "Edit",
-        "apply_patch",
         "mcp__x__run",
     ] {
         assert_eq!(
@@ -1868,6 +2239,13 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
             "{denied}"
         );
     }
+    assert_eq!(
+        effective.resolve_callable_reference("Edit"),
+        Some("Edit".into())
+    );
+    assert!(!catalog
+        .iter()
+        .any(|entry| entry.execution_name() == "apply_patch"));
     assert_eq!(
         effective.resolve_callable_reference("default::Read"),
         Some("Read".to_string())
@@ -2147,16 +2525,16 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
         .map(|item| item.function.name.as_str())
         .collect();
 
-    // All tools are available; inactive discoverable ones get shortened descriptions
+    // Guide activation does not change the callable schema.
     assert_eq!(names, vec!["Write", "session_history"]);
     let session_history = resolved
         .iter()
         .find(|s| s.function.name == "session_history")
         .unwrap();
-    assert!(session_history
-        .function
-        .description
-        .contains("Discoverable"));
+    assert_eq!(
+        session_history.function.description,
+        schema("session_history").function.description
+    );
     assert_eq!(
         session.metadata.get("existing").map(String::as_str),
         Some("value")
@@ -2657,9 +3035,7 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
         .content
         .contains(&format!("Workspace path: {}", workspace.display())));
     assert!(instruction_context.content.contains("Workspace policy"));
-    assert!(env_context
-        .content
-        .contains("environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(env_context.content.contains("available to tool processes."));
     let expected_layout = format!(
         "base_prompt:core_static:static:1:{};project_context:environment_project:static:0:0;workspace_context:environment_workspace:dynamic:1:{};instruction_context:environment_instruction:dynamic:1:{};env_context:environment_configuration:dynamic:1:{};skill_context:skill_metadata:dynamic:1:{};tool_guide_context:capability_tool:dynamic:1:{}",
         base_prompt.len(),
@@ -2837,7 +3213,7 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
         .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
     assert!(!stable
         .stable_instructions
-        .contains("environment variables were explicitly configured by the user inside Bodhi"));
+        .contains("available to tool processes."));
     assert!(!stable.stable_instructions.contains("## Skill"));
     assert!(!stable
         .stable_instructions
@@ -2848,7 +3224,9 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     assert!(stable
         .stable_instructions
         .contains("Investigate before you conclude"));
-    assert!(stable.stable_instructions.contains("Verify your own work"));
+    assert!(stable
+        .stable_instructions
+        .contains("Verify the work against the user's acceptance criteria."));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 
@@ -3062,7 +3440,7 @@ fn cached_tool_descriptions_stay_stable_while_live_disables_still_apply() {
 }
 
 #[test]
-fn disabling_cache_freeze_restores_live_guide_expansion() {
+fn disabling_cache_freeze_keeps_descriptions_and_uses_live_custom_guide_activation() {
     use super::tool_schemas::resolve_tool_schemas_for_round;
     let mut config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
@@ -3073,7 +3451,11 @@ fn disabling_cache_freeze_restores_live_guide_expansion() {
     bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
     config.freeze_tool_exposure_for_cache = false;
     let live = resolve_tool_schemas_for_round(&config, &tools, &mut session);
-    assert!(!live[0].function.description.contains("Discoverable"));
+    assert_eq!(
+        serde_json::to_value(&live).unwrap(),
+        serde_json::to_value(&tools.schemas).unwrap()
+    );
+    assert!(super::tool_schemas::effective_guide_activation(&config, &session).contains("Sleep"));
     assert!(!session
         .metadata
         .contains_key("prompt_tool_exposure_activated"));
@@ -3155,27 +3537,32 @@ async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_
 }
 
 #[test]
-fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract() {
+fn supervisor_task_routing_appears_once_in_role_context() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
     let config = crate::runtime::config::AgentLoopConfig::default();
-    let tools = StaticToolExecutor {
-        schemas: vec![schema("SubAgent")],
-    };
+    let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+        "SubAgent",
+        "session_control",
+        "session_message",
+    ]);
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
         incarnation_id: uuid::Uuid::new_v4(),
     };
     for ultra in [false, true] {
         supervisor.set_root_orchestration_only(ultra).unwrap();
-        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor);
-        assert!(schemas[0]
+        let schemas =
+            resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor);
+        assert_eq!(schemas.len(), 3);
+        assert!(schemas.iter().all(|schema| !schema
             .function
             .description
-            .contains("existing managed Sessions"));
-        assert!(schemas[0]
-            .function
-            .description
-            .contains("auxiliary planning"));
+            .contains(SUPERVISOR_SESSION_ROUTING_GUIDANCE)));
+        assert!(schemas
+            .iter()
+            .any(|schema| schema.function.name == "SubAgent"
+                && schema.function.description.contains("auxiliary planning")));
         let guide = super::prompt_setup::build_tool_guide_context(
             &config,
             &schemas,
@@ -3183,13 +3570,23 @@ fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract
             &supervisor.id,
             &super::tool_schemas::effective_guide_activation(&config, &supervisor),
         );
-        assert!(guide.contains("session_history list"));
-        assert!(guide.contains("auxiliary planning"));
+        assert!(!guide.contains("session_history list"));
+        assert!(!guide.contains("auxiliary planning"));
+        let role =
+            super::prompt_envelope::build_root_orchestration_context_block(&supervisor).unwrap();
+        assert_eq!(
+            role.content
+                .matches(SUPERVISOR_SESSION_ROUTING_GUIDANCE)
+                .count(),
+            1
+        );
     }
     let ordinary = Session::new("ordinary-policy", "model");
-    let ordinary_schemas = resolve_available_tool_schemas_for_session(&config, &tools, &ordinary);
-    assert!(!ordinary_schemas[0]
+    assert!(super::prompt_envelope::build_root_orchestration_context_block(&ordinary).is_none());
+    let ordinary_schemas =
+        resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &ordinary);
+    assert!(ordinary_schemas.iter().all(|schema| !schema
         .function
         .description
-        .contains("existing managed Sessions"));
+        .contains(SUPERVISOR_SESSION_ROUTING_GUIDANCE)));
 }

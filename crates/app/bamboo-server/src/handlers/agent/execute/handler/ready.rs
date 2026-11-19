@@ -360,6 +360,33 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     };
     let execution_persistence = execution_reservation.execution_persistence();
 
+    // Checked Ready already owns the new execution. A Child's generic Host
+    // startup save precedes common spawn, so bind its actual reserved identity
+    // before publishing running rather than reopening the predecessor's UUID.
+    let startup_expected = session.clone();
+    if session.kind == bamboo_domain::SessionKind::Child {
+        if let Err(error) = execution_reservation
+            .arm_child_host_startup(
+                &state.agent,
+                &startup_expected,
+                state.sessions.clone(),
+                session_tx.clone(),
+            )
+            .await
+        {
+            execution_reservation.abandon().await;
+            return internal_server_error_response(error.to_string());
+        }
+    }
+    let host_binding = if session.kind == bamboo_domain::SessionKind::Child {
+        state.storage.begin_host_run(&session, &run_id).await
+    } else {
+        Ok(())
+    };
+    if host_binding.is_ok() && session.kind == bamboo_domain::SessionKind::Child {
+        session.set_host_run_id(&run_id);
+    }
+
     // The reservation owns this exact turn now. Moving the owned marker out of
     // `pending` before persistence prevents an old terminal runner from being
     // used to classify the newly-starting turn.
@@ -368,31 +395,45 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     crate::handlers::agent::events::clear_pending_turn(&mut session);
 
     // ---- Save session before spawn (metadata-group merge) ----
-    let saved = match (
-        ready.scheduled_startup_expected.as_deref(),
-        execution_persistence.as_ref(),
-    ) {
-        (Some(expected), Some(persistence)) => {
-            persistence
-                .save_bound_startup_session(&mut session, expected)
-                .await
+    let saved = {
+        #[cfg(test)]
+        let _fault = host_binding
+            .is_ok()
+            .then(|| super::super::tests::ready_startup_fault::inject(session_id))
+            .flatten();
+        match host_binding {
+            Err(error) => Err(error),
+            Ok(()) => match (
+                ready.scheduled_startup_expected.as_deref(),
+                execution_persistence.as_ref(),
+            ) {
+                (Some(expected), Some(persistence)) => {
+                    persistence
+                        .save_bound_startup_session(&mut session, expected)
+                        .await
+                }
+                (Some(expected), None) => {
+                    bamboo_domain::RuntimeSessionPersistence::save_bound_startup_session(
+                        state.persistence.as_ref(),
+                        &mut session,
+                        expected,
+                    )
+                    .await
+                }
+                (None, Some(persistence)) => persistence.save_runtime_session(&mut session).await,
+                (None, None) => state.persistence.merge_save_runtime(&mut session).await,
+            },
         }
-        (Some(expected), None) => {
-            bamboo_domain::RuntimeSessionPersistence::save_bound_startup_session(
-                state.persistence.as_ref(),
-                &mut session,
-                expected,
-            )
-            .await
-        }
-        (None, Some(persistence)) => persistence.save_runtime_session(&mut session).await,
-        (None, None) => state.persistence.merge_save_runtime(&mut session).await,
     };
     if let Err(error) = saved {
+        execution_reservation
+            .fail_child_host_startup(&error.to_string())
+            .await;
         execution_reservation.abandon().await;
         rollback_startup(
             state,
             session_id,
+            &startup_expected,
             &run_id,
             ready.startup_turn_id.as_deref(),
             &error.to_string(),
@@ -424,10 +465,14 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // Title generation and forwarder/spawn then share one uninterrupted Ready
     // handoff. Ordinary reservations remain a synchronous no-op here.
     if let Err(error) = execution_reservation.retain_selected_run_output().await {
+        execution_reservation
+            .fail_child_host_startup(&error.to_string())
+            .await;
         execution_reservation.abandon().await;
         rollback_startup(
             state,
             session_id,
+            &startup_expected,
             &run_id,
             ready.startup_turn_id.as_deref(),
             &error.to_string(),
@@ -535,6 +580,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
 async fn rollback_startup(
     state: &web::Data<AppState>,
     session_id: &str,
+    expected: &bamboo_domain::Session,
     run_id: &str,
     expected_turn_id: Option<&str>,
     detail: &str,
@@ -554,6 +600,11 @@ async fn rollback_startup(
         .await;
     }
     drop(runners);
+
+    if expected.kind == bamboo_domain::SessionKind::Child {
+        // A stale B must never fall back to a work-id-only rollback of C.
+        return;
+    }
 
     let Some(expected_turn_id) = expected_turn_id else {
         return;

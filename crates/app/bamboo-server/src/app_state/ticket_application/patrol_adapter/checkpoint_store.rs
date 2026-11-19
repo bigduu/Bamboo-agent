@@ -1,6 +1,7 @@
 //! Single-writer, CAS Host policy metadata. All actual file I/O lives here,
 //! outside orchestration/Ticket locks. Never stores Task/lease/stop/budget facts.
 
+use super::checkpoint_record::NoticeSource;
 #[cfg(unix)]
 use bamboo_orchestration::patrol::checkpoint::{self, MAX_CHECKPOINT_BYTES};
 use bamboo_orchestration::patrol::{
@@ -8,10 +9,38 @@ use bamboo_orchestration::patrol::{
 };
 use std::path::Path;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointRead {
+    NotChecked,
+    Busy,
+    Available(Box<StoredCheckpoint>),
+    Corrupt,
+    Unavailable,
+    Unsupported,
+}
+
+/// Opens existing state only; unlike the writer this never initializes a tree.
+pub(crate) fn read_existing(root: &Path, scope: &Scope) -> CheckpointRead {
+    if !cfg!(unix) {
+        return CheckpointRead::Unsupported;
+    }
+    #[cfg(unix)]
+    {
+        physical::read_existing(root, scope)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, scope);
+        CheckpointRead::Unavailable
+    }
+}
+
 #[cfg(unix)]
 mod physical {
+    use super::super::checkpoint_record::{self, Record};
     use super::*;
     use fs2::FileExt;
+    use std::os::unix::ffi::OsStrExt;
     use std::{
         ffi::CString,
         fs::{File, Metadata, OpenOptions},
@@ -23,6 +52,157 @@ mod physical {
         path::{Component, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    // Walk every existing component relative to its retained parent descriptor.
+    // A missing component is absence, never permission to mkdir or follow a link.
+    fn existing_directory(path: &Path) -> std::io::Result<File> {
+        if !path.is_absolute() {
+            return Err(std::io::Error::other("absolute namespace required"));
+        }
+        let mut directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")?;
+        for component in path.components() {
+            let Component::Normal(part) = component else {
+                if component == Component::RootDir {
+                    continue;
+                }
+                return Err(std::io::Error::other("noncanonical namespace"));
+            };
+            let name = CString::new(part.as_bytes()).map_err(std::io::Error::other)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(directory)
+    }
+
+    struct Reader {
+        root: PathBuf,
+        directory: LockedDirectory,
+        writer: File,
+    }
+
+    impl Reader {
+        fn open(root: &Path) -> Result<Self, CheckpointRead> {
+            let directory = existing_directory(root).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    CheckpointRead::NotChecked
+                } else {
+                    CheckpointRead::Unavailable
+                }
+            })?;
+            FileExt::try_lock_shared(&directory).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    CheckpointRead::Busy
+                } else {
+                    CheckpointRead::Unavailable
+                }
+            })?;
+            let directory = LockedDirectory(directory);
+            let writer = open_at(&directory, "patrol-writer.lock", libc::O_RDONLY, 0)
+                .map_err(|_| CheckpointRead::Unavailable)?;
+            let reader = Self {
+                root: root.into(),
+                directory,
+                writer,
+            };
+            reader.current()?;
+            Ok(reader)
+        }
+
+        fn current(&self) -> Result<(), CheckpointRead> {
+            let root = existing_directory(&self.root).map_err(|_| CheckpointRead::Unavailable)?;
+            let lock = open_at(&self.directory, "patrol-writer.lock", libc::O_RDONLY, 0)
+                .map_err(|_| CheckpointRead::Unavailable)?;
+            let named = lock.metadata().map_err(|_| CheckpointRead::Unavailable)?;
+            if !same(
+                &root.metadata().map_err(|_| CheckpointRead::Unavailable)?,
+                &self
+                    .directory
+                    .metadata()
+                    .map_err(|_| CheckpointRead::Unavailable)?,
+            ) || !plain(&named)
+                || !same(
+                    &named,
+                    &self
+                        .writer
+                        .metadata()
+                        .map_err(|_| CheckpointRead::Unavailable)?,
+                )
+            {
+                return Err(CheckpointRead::Unavailable);
+            }
+            Ok(())
+        }
+
+        fn read(&self, scope: &Scope) -> Result<CheckpointRead, CheckpointRead> {
+            self.current()?;
+            let name = format!(
+                "{}.json",
+                checkpoint::scope_key(scope).map_err(|_| CheckpointRead::Unavailable)?
+            );
+            let mut file = match open_at(&self.directory, &name, libc::O_RDONLY, 0) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.current()?;
+                    return Ok(CheckpointRead::NotChecked);
+                }
+                Err(_) => return Err(CheckpointRead::Unavailable),
+            };
+            let original = file.metadata().map_err(|_| CheckpointRead::Unavailable)?;
+            if !plain(&original) || original.len() > MAX_CHECKPOINT_BYTES as u64 {
+                return Err(CheckpointRead::Unavailable);
+            }
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(MAX_CHECKPOINT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| CheckpointRead::Unavailable)?;
+            let observed = open_at(&self.directory, &name, libc::O_RDONLY, 0)
+                .and_then(|file| file.metadata())
+                .map_err(|_| CheckpointRead::Unavailable)?;
+            if !plain(&observed) || !same(&original, &observed) {
+                return Err(CheckpointRead::Unavailable);
+            }
+            let result = checkpoint_record::decode(scope, &bytes)
+                .map(|record| CheckpointRead::Available(Box::new(record.stored)))
+                .unwrap_or_else(|_| {
+                    let future = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .is_some_and(|value| {
+                            value["format"] == "bamboo/patrol-checkpoint"
+                                && value["schema"].as_u64().is_some_and(|schema| schema > 2)
+                        });
+                    if future {
+                        CheckpointRead::Unsupported
+                    } else {
+                        CheckpointRead::Corrupt
+                    }
+                });
+            self.current()?;
+            Ok(result)
+        }
+    }
+
+    pub(super) fn read_existing(root: &Path, scope: &Scope) -> CheckpointRead {
+        Reader::open(root)
+            .and_then(|reader| reader.read(scope))
+            .unwrap_or_else(|state| state)
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Boundary {
@@ -137,6 +317,19 @@ mod physical {
             Ok(())
         }
 
+        #[cfg(test)]
+        pub(crate) fn reject_next_ack(&mut self) {
+            self.fault = Some(Box::new(|phase| {
+                if phase == Boundary::BeforeRename {
+                    Err(std::io::Error::other(
+                        "native fixture: ACK publication interrupted",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }));
+        }
+
         fn publish(&mut self, name: &str, bytes: &[u8]) -> Result<(), PortError> {
             static SERIAL: AtomicU64 = AtomicU64::new(0);
             let temporary = format!(
@@ -180,8 +373,8 @@ mod physical {
         }
     }
 
-    impl CheckpointPort for PatrolCheckpointStore {
-        fn load(&mut self, scope: &Scope) -> Result<Option<StoredCheckpoint>, PortError> {
+    impl PatrolCheckpointStore {
+        fn load_record(&mut self, scope: &Scope) -> Result<Option<Record>, PortError> {
             self.check_root()?;
             let name = format!("{}.json", checkpoint::scope_key(scope)?);
             let file = match open_at(&self.directory, &name, libc::O_RDONLY, 0) {
@@ -197,28 +390,75 @@ mod physical {
             file.take(MAX_CHECKPOINT_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| PortError::Unavailable)?;
-            let record = checkpoint::decode(scope, &bytes)?;
+            let record = checkpoint_record::decode(scope, &bytes)?;
             self.check_root()?;
             Ok(Some(record))
         }
 
-        fn save(&mut self, expected: Option<u64>, next: &Checkpoint) -> Result<u64, PortError> {
+        pub(crate) fn notice_source(
+            &mut self,
+            scope: &Scope,
+        ) -> Result<Option<NoticeSource>, PortError> {
+            Ok(self.load_record(scope)?.and_then(|record| record.source))
+        }
+
+        pub(crate) fn save_with_source(
+            &mut self,
+            expected: Option<u64>,
+            next: &Checkpoint,
+            source: Option<NoticeSource>,
+        ) -> Result<u64, PortError> {
             self.check_root()?;
-            let previous = self.load(&next.scope)?;
-            if previous.as_ref().map(|r| r.version) != expected {
+            let previous = self.load_record(&next.scope)?;
+            if previous.as_ref().map(|r| r.stored.version) != expected {
                 return Err(PortError::Conflict);
             }
-            if let Some(previous) = previous {
-                checkpoint::validate_update(&previous.checkpoint, next)?;
+            if let Some(previous) = &previous {
+                checkpoint::validate_update(&previous.stored.checkpoint, next)?;
+            }
+            let is_new = checkpoint_record::new_escalation(
+                previous.as_ref().map(|r| &r.stored.checkpoint),
+                next,
+            );
+            // Recovered legacy escalations never gain a source, even before
+            // their first attempt. Generic CheckpointPort writes preserve an
+            // existing source; a permitted new incident drops the old witness.
+            let source = if is_new {
+                source
+            } else {
+                if source.is_some() {
+                    return Err(PortError::Conflict);
+                }
+                previous
+                    .and_then(|record| record.source)
+                    .filter(|source| source.validate(next).is_ok())
+            };
+            if let Some(source) = &source {
+                source.validate(next)?;
             }
             let version = expected
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or(PortError::Unavailable)?;
-            let bytes = checkpoint::encode(version, next)?;
+            let bytes = checkpoint_record::encode(&Record {
+                stored: StoredCheckpoint {
+                    version,
+                    checkpoint: next.clone(),
+                },
+                source,
+            })?;
             let name = format!("{}.json", checkpoint::scope_key(&next.scope)?);
             self.publish(&name, &bytes)?;
             Ok(version)
+        }
+    }
+
+    impl CheckpointPort for PatrolCheckpointStore {
+        fn load(&mut self, scope: &Scope) -> Result<Option<StoredCheckpoint>, PortError> {
+            Ok(self.load_record(scope)?.map(|record| record.stored))
+        }
+        fn save(&mut self, expected: Option<u64>, next: &Checkpoint) -> Result<u64, PortError> {
+            self.save_with_source(expected, next, None)
         }
     }
 
@@ -362,6 +602,287 @@ mod physical {
         }
         fn canonical(root: &tempfile::TempDir) -> PathBuf {
             root.path().canonicalize().unwrap()
+        }
+
+        #[test]
+        fn status_read_never_initializes_and_exclusive_writer_is_busy() {
+            let root = root();
+            let parent = canonical(&root);
+            let path = parent.join("missing/nested");
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::NotChecked);
+            assert!(!parent.join("missing").exists());
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::Busy);
+            writer.save(None, &checkpoint()).unwrap();
+            drop(writer);
+            let expected = CheckpointRead::Available(Box::new(StoredCheckpoint {
+                version: 1,
+                checkpoint: checkpoint(),
+            }));
+            let record = path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap()));
+            let before = std::fs::read(&record).unwrap();
+            for _ in 0..3 {
+                assert_eq!(read_existing(&path, &scope()), expected);
+            }
+            assert_eq!(std::fs::read(&record).unwrap(), before);
+            let reader = Reader::open(&path).ok().unwrap();
+            assert!(matches!(
+                PatrolCheckpointStore::open(&path),
+                Err(PortError::Conflict)
+            ));
+            drop(reader);
+            assert!(PatrolCheckpointStore::open(&path).is_ok());
+        }
+
+        #[test]
+        fn status_read_rejects_corrupt_future_oversized_and_linked_records() {
+            use std::os::unix::fs::symlink;
+            let root = root();
+            let path = canonical(&root);
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            writer.save(None, &checkpoint()).unwrap();
+            drop(writer);
+            let record = path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap()));
+            let bytes = std::fs::read(&record).unwrap();
+            for (bytes, state) in [
+                (b"{bad".to_vec(), CheckpointRead::Corrupt),
+                (
+                    br#"{"format":"bamboo/patrol-checkpoint","schema":99}"#.to_vec(),
+                    CheckpointRead::Unsupported,
+                ),
+                (
+                    vec![b'x'; MAX_CHECKPOINT_BYTES + 1],
+                    CheckpointRead::Unavailable,
+                ),
+            ] {
+                std::fs::write(&record, &bytes).unwrap();
+                assert_eq!(read_existing(&path, &scope()), state);
+                assert_eq!(std::fs::read(&record).unwrap(), bytes);
+            }
+            std::fs::remove_file(&record).unwrap();
+            let external = path.join("outside");
+            std::fs::write(&external, &bytes).unwrap();
+            symlink(&external, &record).unwrap();
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::Unavailable);
+            std::fs::remove_file(&record).unwrap();
+            std::fs::hard_link(&external, &record).unwrap();
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::Unavailable);
+        }
+
+        #[test]
+        fn status_shared_lease_rejects_root_lock_and_intermediate_path_replacement() {
+            use std::os::unix::fs::symlink;
+            let root = root();
+            let parent = canonical(&root);
+            let path = parent.join("namespace");
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            writer.save(None, &checkpoint()).unwrap();
+            drop(writer);
+            let reader = Reader::open(&path).ok().unwrap();
+            let lock = path.join("patrol-writer.lock");
+            let retained = path.join("retained.lock");
+            std::fs::rename(&lock, &retained).unwrap();
+            std::fs::write(&lock, []).unwrap();
+            assert_eq!(reader.read(&scope()), Err(CheckpointRead::Unavailable));
+            std::fs::remove_file(&lock).unwrap();
+            std::fs::rename(retained, &lock).unwrap();
+            let moved = parent.join("moved");
+            std::fs::rename(&path, &moved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert_eq!(reader.read(&scope()), Err(CheckpointRead::Unavailable));
+            drop(reader);
+            std::fs::remove_dir(&path).unwrap();
+            symlink(&moved, &path).unwrap();
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::Unavailable);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&moved, &path).unwrap();
+            std::fs::remove_file(path.join("patrol-writer.lock")).unwrap();
+            assert_eq!(read_existing(&path, &scope()), CheckpointRead::Unavailable);
+            assert!(!path.join("patrol-writer.lock").exists());
+        }
+
+        #[test]
+        fn status_reads_the_same_v2_codec_and_rejects_copied_scope() {
+            let root = root();
+            let path = canonical(&root);
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            let (cp, source) = escalate(checkpoint());
+            writer.save_with_source(None, &cp, Some(source)).unwrap();
+            drop(writer);
+            assert_eq!(
+                read_existing(&path, &scope()),
+                CheckpointRead::Available(Box::new(StoredCheckpoint {
+                    version: 1,
+                    checkpoint: cp
+                }))
+            );
+            let mut other = scope();
+            other.project_id = "foreign".into();
+            std::fs::copy(
+                path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap())),
+                path.join(format!("{}.json", checkpoint::scope_key(&other).unwrap())),
+            )
+            .unwrap();
+            assert_eq!(read_existing(&path, &other), CheckpointRead::Corrupt);
+        }
+
+        fn escalate(mut cp: Checkpoint) -> (Checkpoint, NoticeSource) {
+            use bamboo_orchestration::patrol::{
+                Escalation, OperationId, OperationKind, SupervisorReason,
+            };
+            let incident = cp.incident.as_mut().unwrap();
+            let operation = OperationId {
+                incident: incident.id.clone(),
+                kind: OperationKind::Escalation,
+            };
+            incident.escalation = Some(Escalation {
+                operation: operation.clone(),
+                reason: SupervisorReason::DeterministicAnomaly,
+                source_revision: cp.source_revision,
+                cursor: cp.cursor,
+                deliveries: 0,
+                queued: false,
+                next_delivery_ms: 100,
+            });
+            let source = NoticeSource {
+                operation,
+                commit: "a".repeat(64),
+                cursor: cp.cursor,
+                execution_facts_revision: cp.source_revision,
+            };
+            (cp, source)
+        }
+
+        #[test]
+        fn witnessed_escalation_and_ack_reopen_keep_the_original_source() {
+            let root = root();
+            let path = canonical(&root);
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            writer.save(None, &checkpoint()).unwrap();
+            let (mut cp, source) = escalate(checkpoint());
+            writer
+                .save_with_source(Some(1), &cp, Some(source.clone()))
+                .unwrap();
+            let file = path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap()));
+            assert!(
+                checkpoint::decode(&scope(), &std::fs::read(&file).unwrap()).is_err(),
+                "old reader must reject v2"
+            );
+            cp.cursor = 9;
+            cp.source_revision = 9;
+            let escalation = cp.incident.as_mut().unwrap().escalation.as_mut().unwrap();
+            escalation.deliveries = 1;
+            escalation.queued = true;
+            writer.save(Some(2), &cp).unwrap();
+            drop(writer);
+            let mut restarted = PatrolCheckpointStore::open(&path).unwrap();
+            assert_eq!(restarted.notice_source(&scope()).unwrap(), Some(source));
+            assert_eq!(restarted.load(&scope()).unwrap().unwrap().checkpoint, cp);
+        }
+
+        #[test]
+        fn legacy_escalation_cannot_gain_a_witness_and_keeps_v1_bytes() {
+            let root = root();
+            let path = canonical(&root);
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            let (cp, source) = escalate(checkpoint());
+            writer.save(None, &cp).unwrap();
+            let file = path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap()));
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                checkpoint::encode(1, &cp).unwrap()
+            );
+            assert_eq!(
+                writer.save_with_source(Some(1), &cp, Some(source)),
+                Err(PortError::Conflict)
+            );
+            writer.save(Some(1), &cp).unwrap();
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                checkpoint::encode(2, &cp).unwrap()
+            );
+            assert_eq!(writer.notice_source(&scope()).unwrap(), None);
+        }
+
+        #[test]
+        fn v2_faults_reopen_only_the_actual_atomic_source_and_tampering_fails() {
+            for boundary in [Boundary::BeforeRename, Boundary::AfterRename] {
+                let root = root();
+                let path = canonical(&root);
+                let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+                writer.save(None, &checkpoint()).unwrap();
+                let (cp, source) = escalate(checkpoint());
+                if boundary == Boundary::BeforeRename {
+                    writer.reject_next_ack();
+                } else {
+                    writer.fault = Some(Box::new(move |phase| {
+                        if phase == boundary {
+                            Err(std::io::Error::other("fault"))
+                        } else {
+                            Ok(())
+                        }
+                    }));
+                }
+                assert!(writer
+                    .save_with_source(Some(1), &cp, Some(source.clone()))
+                    .is_err());
+                drop(writer);
+                let mut restarted = PatrolCheckpointStore::open(&path).unwrap();
+                assert_eq!(
+                    restarted.notice_source(&scope()).unwrap(),
+                    if boundary == Boundary::AfterRename {
+                        Some(source)
+                    } else {
+                        None
+                    }
+                );
+                if boundary == Boundary::AfterRename {
+                    let file =
+                        path.join(format!("{}.json", checkpoint::scope_key(&scope()).unwrap()));
+                    let bytes = std::fs::read(&file).unwrap();
+                    for field in ["commit", "cursor", "schema"] {
+                        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        match field {
+                            "commit" => {
+                                value["source"]["commit"] = serde_json::json!("b".repeat(64))
+                            }
+                            "cursor" => value["source"]["cursor"] = serde_json::json!(9),
+                            _ => value["schema"] = serde_json::json!(99),
+                        }
+                        std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+                        assert!(restarted.load(&scope()).is_err());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn only_a_legitimate_new_incident_replaces_the_witness() {
+            use bamboo_orchestration::patrol::Phase;
+            let root = root();
+            let path = canonical(&root);
+            let mut writer = PatrolCheckpointStore::open(&path).unwrap();
+            let (mut cp, source) = escalate(checkpoint());
+            writer
+                .save_with_source(None, &cp, Some(source.clone()))
+                .unwrap();
+            let mut next = checkpoint();
+            next.incident.as_mut().unwrap().id.progress_sequence = 1;
+            let (next, mut replacement) = escalate(next);
+            replacement.commit = "b".repeat(64);
+            assert_eq!(
+                writer.save_with_source(Some(1), &next, Some(replacement.clone())),
+                Err(PortError::Conflict)
+            );
+            cp.incident.as_mut().unwrap().phase = Phase::Resolved {
+                at_ms: 100,
+                cursor: 4,
+            };
+            writer.save(Some(1), &cp).unwrap();
+            writer
+                .save_with_source(Some(2), &next, Some(replacement.clone()))
+                .unwrap();
+            assert_eq!(writer.notice_source(&scope()).unwrap(), Some(replacement));
         }
 
         #[test]
@@ -651,6 +1172,20 @@ pub struct PatrolCheckpointStore;
 #[cfg(not(unix))]
 impl PatrolCheckpointStore {
     pub fn open(_root: &Path) -> Result<Self, PortError> {
+        Err(PortError::Unavailable)
+    }
+    pub(super) fn notice_source(
+        &mut self,
+        _scope: &Scope,
+    ) -> Result<Option<NoticeSource>, PortError> {
+        Err(PortError::Unavailable)
+    }
+    pub(super) fn save_with_source(
+        &mut self,
+        _expected: Option<u64>,
+        _next: &Checkpoint,
+        _source: Option<NoticeSource>,
+    ) -> Result<u64, PortError> {
         Err(PortError::Unavailable)
     }
 }

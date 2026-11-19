@@ -14,8 +14,8 @@ async fn test_execute_tool_endpoint_exists() {
     let req = test::TestRequest::post()
         .uri("/v1/tools/execute")
         .set_json(json!({
-            "tool_name": "get_current_dir",
-            "parameters": []
+            "tool_name": "GetFileInfo",
+            "parameters": [{"name":"path","value":"."}]
         }))
         .to_request();
 
@@ -37,8 +37,8 @@ async fn test_execute_tool_with_valid_input() {
     let req = test::TestRequest::post()
         .uri("/v1/tools/execute")
         .set_json(json!({
-            "tool_name": "get_current_dir",
-            "parameters": [],
+            "tool_name": "GetFileInfo",
+            "parameters": [{"name":"path","value":"."}],
             "session_id": "test-session"
         }))
         .to_request();
@@ -171,8 +171,8 @@ async fn test_execute_tool_response_format() {
     let req = test::TestRequest::post()
         .uri("/v1/tools/execute")
         .set_json(json!({
-            "tool_name": "get_current_dir",
-            "parameters": [],
+            "tool_name": "GetFileInfo",
+            "parameters": [{"name":"path","value":"."}],
             "session_id": "test-session"
         }))
         .to_request();
@@ -191,5 +191,7 @@ async fn test_execute_tool_response_format() {
 
     assert!(inner.get("tool_name").is_some());
     assert!(inner.get("result").is_some());
-    assert_eq!(inner["display_preference"], "Default");
+    assert_eq!(inner["tool_name"], "GetFileInfo");
+    assert_eq!(inner["success"], true);
+    assert_eq!(inner["display_preference"], "json");
 }

@@ -345,26 +345,20 @@ async fn entrypoint_routing_sdk_default_constructor_keeps_chat_role_account_and_
         .await
         .unwrap()
         .unwrap();
-        let requests_a = a
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.body_json::<serde_json::Value>().unwrap()["model"].clone())
-            .collect::<Vec<_>>();
-        let requests_b = b
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.body_json::<serde_json::Value>().unwrap()["model"].clone())
-            .collect::<Vec<_>>();
-        let expected = if flag {
-            (Vec::new(), vec![serde_json::json!("main-b")])
+        let (selected, inactive, expected) = if flag {
+            (&b, &a, "main-b")
         } else {
-            (vec![serde_json::json!("main-a")], Vec::new())
+            (&a, &b, "main-a")
         };
-        assert_eq!((requests_a, requests_b), expected, "flag={flag}");
+        let requests = selected.received_requests().await.unwrap();
+        let models = chat_completion_requests(&requests)
+            .map(|r| r.body_json::<serde_json::Value>().unwrap()["model"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(models, [serde_json::json!(expected)], "flag={flag}");
+        assert!(
+            inactive.received_requests().await.unwrap().is_empty(),
+            "flag={flag}"
+        );
     }
 }
 
@@ -454,6 +448,14 @@ pub(crate) async fn vision_server(status: u16) -> wiremock::MockServer {
         .mount(&server)
         .await;
     server
+}
+
+fn chat_completion_requests(
+    requests: &[wiremock::Request],
+) -> impl Iterator<Item = &wiremock::Request> {
+    requests.iter().filter(|request| {
+        request.method.as_str() == "POST" && request.url.path() == "/chat/completions"
+    })
 }
 
 #[tokio::test]
@@ -1313,8 +1315,9 @@ async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
     .unwrap()
     .unwrap();
     let first_requests = server.received_requests().await.unwrap();
-    assert_eq!(first_requests.len(), 1);
-    let first_body = first_requests[0].body_json::<serde_json::Value>().unwrap();
+    let completions: Vec<_> = chat_completion_requests(&first_requests).collect();
+    assert_eq!(completions.len(), 1);
+    let first_body = completions[0].body_json::<serde_json::Value>().unwrap();
     assert_eq!(first_body["model"], "main-a");
     assert_eq!(first_body["reasoning_effort"], "low");
 
@@ -1340,7 +1343,10 @@ async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
         error.to_string().contains("sdk_provider_binding:"),
         "{error}"
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        first_requests.len()
+    );
 }
 
 /// A default-on capture supports the synthetic Vision model but leaves
@@ -1861,12 +1867,16 @@ async fn entrypoint_routing_legacy_same_key_changed_origin_never_reuses_native_c
 }
 
 #[tokio::test]
-async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
-    let mut config = config(false, "copilot");
-    config.provider = "copilot".into();
+async fn entrypoint_routing_legacy_live_snapshot_keeps_openai_default() {
+    let mut config = config(false, "openai");
+    config.provider = "openai".into();
     config.default_provider_instance = None;
     config.provider_instances.clear();
     config.defaults = None;
+    config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        model: Some("gpt-4o".into()),
+        ..Default::default()
+    });
     config.hooks.image_fallback.enabled = true;
     config.hooks.image_fallback.mode = "vision".into();
     assert_eq!(config.get_vision_model().as_deref(), Some("gpt-4o"));
@@ -1874,20 +1884,20 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
     let main = Arc::new(Capture::default());
     let main_provider: Arc<dyn LLMProvider> = main.clone();
     let registry = Arc::new(bamboo_llm::ProviderRegistry::new(
-        std::collections::HashMap::from([("copilot".to_string(), main_provider)]),
-        "copilot".to_string(),
+        std::collections::HashMap::from([("openai".to_string(), main_provider)]),
+        "openai".to_string(),
     ));
     let snapshot =
         bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
             &config,
             &registry,
-            &Session::new("synthetic-copilot-snapshot", "main-a"),
+            &Session::new("synthetic-openai-snapshot", "main-a"),
             None,
         );
     let fallback = snapshot.image_fallback.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (agent, _config) = config_derived_agent(config, main.clone(), dir.path()).await;
-    let mut session = Session::new("synthetic-copilot-fallback", "main-a");
+    let mut session = Session::new("synthetic-openai-fallback", "main-a");
     let user = Message::user_with_parts(
         "Inspect synthetic pixel",
         vec![bamboo_domain::MessagePart::ImageUrl {
@@ -1904,7 +1914,7 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
     let request =
         ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
             .model("main-a")
-            .provider_name("copilot")
+            .provider_name("openai")
             .image_fallback(fallback)
             .app_data_dir(dir.path().to_path_buf())
             .build();
@@ -1913,7 +1923,7 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
         agent.execute(&mut session, request),
     )
     .await
-    .expect("controlled Copilot fallback must finish")
+    .expect("controlled OpenAI fallback must finish")
     .unwrap();
     drain.abort();
     let calls = main.calls.lock().unwrap().clone();
@@ -1994,7 +2004,8 @@ async fn entrypoint_routing_sdk_native_overlay_keeps_selected_client_in_both_bui
         .await
         .unwrap()
         .unwrap();
-        let requests = server.received_requests().await.unwrap();
+        let calls = server.received_requests().await.unwrap();
+        let requests: Vec<_> = chat_completion_requests(&calls).collect();
         assert_eq!(
             requests.len(),
             1,
@@ -2087,7 +2098,8 @@ async fn entrypoint_routing_sdk_named_provider_new_session_is_independent_of_bui
             .await
             .unwrap()
             .unwrap();
-            let requests = a.received_requests().await.unwrap();
+            let calls = a.received_requests().await.unwrap();
+            let requests: Vec<_> = chat_completion_requests(&calls).collect();
             assert_eq!(requests.len(), 1);
             assert_eq!(
                 requests[0].body_json::<serde_json::Value>().unwrap()["model"],

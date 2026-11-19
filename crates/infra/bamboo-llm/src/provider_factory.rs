@@ -3,17 +3,19 @@
 //! Creates LLM providers based on configuration.
 
 use crate::provider::{LLMError, LLMProvider};
-use crate::providers::common::llm_error_kind;
-use crate::providers::{
-    AnthropicProvider, BodhiProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
-};
+use crate::providers::{AnthropicProvider, BodhiProvider, GeminiProvider, OpenAIProvider};
 use bamboo_config::paths::bamboo_dir;
 use bamboo_config::{Config, ProviderInstanceConfig};
 use reqwest::Client;
 use std::sync::Arc;
 
-/// Available provider types
-pub const AVAILABLE_PROVIDERS: &[&str] = &["copilot", "openai", "anthropic", "gemini", "bodhi"];
+/// Provider types offered when creating a new instance.
+pub const AVAILABLE_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini"];
+
+/// Supported configured types, including the existing Bodhi gateway adapter.
+pub fn is_configured_provider_type(provider_type: &str) -> bool {
+    AVAILABLE_PROVIDERS.contains(&provider_type) || provider_type == "bodhi"
+}
 
 fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     crate::http_client::build_http_client(config)
@@ -40,13 +42,13 @@ pub async fn create_provider_with_dir(
 
 /// Create a single named provider.
 ///
-/// The name must be one of [`AVAILABLE_PROVIDERS`].
+/// The name must be a supported configured provider type.
 pub async fn create_provider_by_name(
     config: &Config,
     provider_name: &str,
     app_data_dir: std::path::PathBuf,
 ) -> Result<Arc<dyn LLMProvider>, LLMError> {
-    if !AVAILABLE_PROVIDERS.contains(&provider_name) {
+    if !is_configured_provider_type(provider_name) {
         return Err(LLMError::Auth(format!(
             "Unknown provider: {provider_name}. Available providers: {}",
             AVAILABLE_PROVIDERS.join(", ")
@@ -61,24 +63,6 @@ pub async fn create_provider_by_name(
     let mut instance = bamboo_config::synthesize_legacy_instances(&legacy)
         .into_iter()
         .find_map(|(_, instance)| (instance.provider_type == provider_name).then_some(instance))
-        .or_else(|| {
-            (provider_name == "copilot").then(|| ProviderInstanceConfig {
-                provider_type: "copilot".to_string(),
-                label: None,
-                api_key: String::new(),
-                api_key_encrypted: None,
-                credential_ref: None,
-                base_url: None,
-                model: None,
-                fast_model: None,
-                vision_model: None,
-                reasoning_effort: None,
-                responses_only_models: Vec::new(),
-                request_overrides: None,
-                enabled: true,
-                extra: Default::default(),
-            })
-        })
         .ok_or_else(|| {
             LLMError::Auth(format!(
                 "{} configuration required",
@@ -98,12 +82,18 @@ pub async fn create_provider_by_name(
 pub async fn create_provider_from_instance(
     config: &Config,
     instance: &ProviderInstanceConfig,
-    app_data_dir: std::path::PathBuf,
+    _app_data_dir: std::path::PathBuf,
 ) -> Result<Arc<dyn LLMProvider>, LLMError> {
     if !instance.enabled {
         return Err(LLMError::Auth(format!(
             "Provider instance of type '{}' is disabled",
             instance.provider_type
+        )));
+    }
+    if instance.base_url.as_deref() == Some(bamboo_config::INVALID_RUNTIME_PROVIDER_BASE_URL) {
+        return Err(LLMError::Api(format!(
+            "Invalid BAMBOO_{}_BASE_URL",
+            instance.provider_type.to_ascii_uppercase()
         )));
     }
 
@@ -115,43 +105,6 @@ pub async fn create_provider_from_instance(
         .provider_type
         .as_str()
     {
-        "copilot" => {
-            let headless_auth = instance
-                .extra
-                .get("headless_auth")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(config.headless_auth);
-
-            let mut provider = CopilotProvider::with_auth_handler(
-                http_client.clone(),
-                app_data_dir,
-                headless_auth,
-            );
-
-            if !instance.responses_only_models.is_empty() {
-                provider =
-                    provider.with_responses_only_models(instance.responses_only_models.clone());
-            }
-            provider = provider.with_reasoning_effort(instance.reasoning_effort);
-            provider = provider.with_request_overrides(instance.request_overrides.clone());
-
-            // Try to authenticate (using cache if available)
-            match provider.try_authenticate_silent().await {
-                Ok(true) => {
-                    tracing::info!("Copilot authenticated using cached token");
-                }
-                Ok(false) => {
-                    tracing::warn!("Copilot not authenticated. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
-                    // Provider is created but not authenticated - will fail on first use
-                    // This allows the user to see the authentication error and know what to do
-                }
-                Err(e) => {
-                    tracing::warn!(error_kind = llm_error_kind(&e), "Copilot silent authentication failed. Use POST /v1/bamboo/copilot/auth/start to authenticate.");
-                }
-            }
-            Ok(Arc::new(provider.with_masking(masking_config.clone())))
-        }
-
         "openai" => {
             if instance.api_key.is_empty() {
                 return Err(LLMError::Auth("OpenAI API key is required".to_string()));
@@ -181,15 +134,6 @@ pub async fn create_provider_from_instance(
             if let Some(tool_search_execution) = tool_search_execution {
                 provider = provider.with_tool_search_execution(tool_search_execution);
             }
-            if instance
-                .extra
-                .get("sticky_tool_loading")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                provider = provider.with_sticky_tool_loading(true);
-            }
-
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_explicit_prompt_cache(
                 instance
@@ -281,7 +225,8 @@ pub async fn create_provider_from_instance(
 
             provider = provider
                 .with_target_provider(target_provider)
-                .with_reasoning_effort(instance.reasoning_effort);
+                .with_reasoning_effort(instance.reasoning_effort)
+                .with_request_overrides(instance.request_overrides.clone());
 
             Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
@@ -301,6 +246,12 @@ pub async fn create_provider_from_instance(
 
 /// Validate provider configuration without creating the provider
 pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
+    let provider_name = config.effective_default_provider();
+    if config.is_retired_provider_alias(provider_name) {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{provider_name}' was retired"
+        )));
+    }
     if let Some(instance_id) = config.default_provider_instance.as_deref() {
         if let Some(instance) = config.provider_instances.get(instance_id) {
             if !instance.enabled {
@@ -309,7 +260,6 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
                 )));
             }
             return match instance.provider_type.as_str() {
-                "copilot" => Ok(()),
                 "openai" | "anthropic" | "gemini" | "bodhi" => {
                     if instance.api_key.is_empty() {
                         Err(LLMError::Auth(format!(
@@ -325,20 +275,14 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
                 ))),
             };
         }
-        if !AVAILABLE_PROVIDERS.contains(&instance_id) {
+        if !is_configured_provider_type(instance_id) {
             return Err(LLMError::Auth(format!(
                 "Default provider instance '{instance_id}' configuration required"
             )));
         }
     }
 
-    let provider_name = config
-        .default_provider_instance
-        .as_deref()
-        .unwrap_or(&config.provider);
     match provider_name {
-        "copilot" => Ok(()),
-
         "openai" => {
             let openai_config = config
                 .providers()
@@ -421,11 +365,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_copilot_provider() {
+    async fn retired_copilot_cannot_be_created_by_name_or_instance() {
         let config = config_with_provider("copilot", ProviderConfigs::default());
 
-        let result = create_provider(&config).await;
-        assert!(result.is_ok());
+        assert!(create_provider(&config).await.is_err());
+        assert!(validate_provider_config(&config).is_err());
+
+        let instance = serde_json::from_value(serde_json::json!({
+            "provider_type": "copilot",
+            "api_key": "unused",
+            "enabled": true
+        }))
+        .unwrap();
+        assert!(
+            create_provider_from_instance(&config, &instance, Default::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -498,8 +454,11 @@ mod tests {
             },
         );
 
-        let result = create_provider(&config).await;
-        assert!(result.is_ok());
+        let provider = create_provider(&config).await.unwrap();
+        assert_eq!(
+            provider.capability_loading_mode("gpt-4o", None).await,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        );
     }
 
     #[tokio::test]
@@ -582,13 +541,10 @@ mod tests {
     #[tokio::test]
     async fn openai_tool_search_execution_requires_a_valid_explicit_instance_value() {
         for (execution, expected) in [
-            (
-                None,
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
+            (None, bamboo_domain::CapabilityLoadingMode::StickyFallback),
             (
                 Some("invalid"),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                bamboo_domain::CapabilityLoadingMode::StickyFallback,
             ),
             (
                 Some("client"),
@@ -623,19 +579,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_sticky_tool_loading_requires_literal_true_and_preserves_native_precedence() {
+    async fn openai_legacy_sticky_setting_keeps_on_demand_loading_and_native_precedence() {
         for (configured, expected) in [
-            (
-                None,
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
-            ),
+            (None, bamboo_domain::CapabilityLoadingMode::StickyFallback),
             (
                 Some(serde_json::json!(false)),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                bamboo_domain::CapabilityLoadingMode::StickyFallback,
             ),
             (
                 Some(serde_json::json!("true")),
-                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+                bamboo_domain::CapabilityLoadingMode::StickyFallback,
+            ),
+            (
+                Some(serde_json::Value::Null),
+                bamboo_domain::CapabilityLoadingMode::StickyFallback,
             ),
             (
                 Some(serde_json::json!(true)),
@@ -658,7 +615,9 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 provider.capability_loading_mode("gpt-4o-mini", None).await,
-                expected
+                expected,
+                "sticky_tool_loading={:?}",
+                instance.extra.get("sticky_tool_loading")
             );
             assert_eq!(
                 provider
@@ -703,13 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_copilot_config() {
-        let config = config_with_provider("copilot", ProviderConfigs::default());
-
-        assert!(validate_provider_config(&config).is_ok());
-    }
-
-    #[test]
     fn test_validate_openai_config_missing() {
         let config = config_with_provider("openai", ProviderConfigs::default());
 
@@ -749,7 +701,7 @@ mod tests {
         config.provider_instances.insert(
             "work".to_string(),
             serde_json::from_value(serde_json::json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": true
             }))
             .unwrap(),
@@ -761,16 +713,16 @@ mod tests {
 
     #[test]
     fn test_validate_instance_default_requires_existing_enabled_instance() {
-        let mut missing = config_with_provider("copilot", ProviderConfigs::default());
+        let mut missing = config_with_provider("gemini", ProviderConfigs::default());
         missing.default_provider_instance = Some("missing".to_string());
         let error = validate_provider_config(&missing).unwrap_err().to_string();
         assert!(error.contains("Default provider instance 'missing' configuration required"));
 
-        let mut disabled = config_with_provider("copilot", ProviderConfigs::default());
+        let mut disabled = config_with_provider("gemini", ProviderConfigs::default());
         disabled.provider_instances.insert(
             "work".to_string(),
             serde_json::from_value(serde_json::json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": false
             }))
             .unwrap(),

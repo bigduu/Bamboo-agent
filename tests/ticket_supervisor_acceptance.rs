@@ -87,10 +87,23 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
             "actual provider prompt missing {required}"
         );
     }
-    assert_eq!(prompt.contains("Ultra Root thinking mode"), ultra);
+    assert_eq!(
+        prompt.contains("In Ultra, prefer parallel auxiliary planning and verification"),
+        ultra
+    );
+    assert!(!prompt.contains("Ultra Root thinking mode"));
+    assert!(!prompt.contains("Make authorized file edits directly"));
     assert!(tools.iter().all(|t| !matches!(
         t["function"]["name"].as_str(),
-        Some("Write" | "Edit" | "exec_command" | "load_skill" | "workflow_run")
+        Some(
+            "Write"
+                | "Edit"
+                | "bash"
+                | "exec_command"
+                | "write_stdin"
+                | "load_skill"
+                | "workflow_run"
+        )
     )));
     let prefix = format!("acceptance-{round}-");
     let id = |name: &str| format!("{prefix}{name}");

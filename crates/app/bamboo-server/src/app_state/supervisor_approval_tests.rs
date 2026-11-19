@@ -961,6 +961,36 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
         assert_eq!(fixture.decision().await.expected_policy_revision, Some(0));
         decision.expected_policy_revision = Some(refreshed.policy_revision);
         *fixture.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
+        if !corrupt {
+            fixture
+                .state
+                .session_store
+                .interrupt_full_save_at_main_for_test(&fixture.session_id, false);
+            let failed = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .set_json(&decision)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                failed.status(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let control = fixture
+                .state
+                .storage
+                .load_runtime_control_plane(&fixture.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(control.pending_question.is_some());
+            assert!(control.messages.is_empty());
+            assert!(permissions
+                .decision_receipt(&fixture.session_id, CALL, &decision.request_generation)
+                .is_none());
+        }
         let response = test::call_service(
             &app,
             test::TestRequest::post()
@@ -969,6 +999,18 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
                 .to_request(),
         )
         .await;
+        if corrupt {
+            assert_eq!(
+                response.status(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            fixture.settled(0, true).await;
+            let saved = fixture.reload().await;
+            assert!(saved
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+            continue;
+        }
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["success"], true);
@@ -982,7 +1024,7 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
         // The HTTP reply only confirms that auto-resume started. A concurrent
         // Supervisor save may briefly hold a Prepared proof, which readers
         // correctly reject until the final runtime/proof commit completes.
-        fixture.settled(usize::from(!corrupt), corrupt).await;
+        fixture.settled(1, false).await;
         let completed = fixture.reload().await;
         let result = completed
             .messages

@@ -88,6 +88,17 @@ pub(crate) fn execute_startup_is_in_flight(state: &AppState, session_id: &str) -
 }
 
 pub(crate) fn mark_pending_turn(session: &mut Session) {
+    if session.kind == bamboo_domain::SessionKind::Child
+        && matches!(
+            session.last_run_status().as_deref(),
+            Some("completed" | "cancelled" | "error" | "failed" | "timeout" | "skipped")
+        )
+    {
+        // A new User turn is a new queued Child launch, before it has a Host
+        // UUID. Keep the predecessor's captured generation so its late finish
+        // cannot close this work. Repeating the same pending handoff is a no-op.
+        let _ = session.advance_child_launch_generation();
+    }
     if let Some(message) = session.messages.last() {
         session
             .metadata
@@ -139,10 +150,16 @@ pub(crate) fn mark_startup_failed_if_owned(
     if startup_work_id(session).as_deref() != Some(expected_turn_id) {
         return false;
     }
+    if session.kind == bamboo_domain::SessionKind::Child && !session.host_run_matches_launch() {
+        session.cancel_child_launch_generation();
+    }
     session.set_last_run_status("error");
     session.set_last_run_error(format!("{STARTUP_FAILURE_PREFIX}{detail}"));
     clear_pending_turn(session);
     consume_pending_clarification_resume(session);
+    if session.kind == bamboo_domain::SessionKind::Child {
+        session.synchronize_terminal_runtime_status();
+    }
     true
 }
 

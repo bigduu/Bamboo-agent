@@ -50,9 +50,8 @@ impl SupervisorDirectoryRequest {
     }
 }
 
-/// Where a directory entry came from. `SupervisorCreated` roots carry a live
-/// or tombstoned management link minted at creation; `UserOpened` sessions
-/// exist in a Host-authorized Project without any management link.
+/// Where a directory entry came from. The Host records `SupervisorCreated`
+/// at creation. Project-bound sessions without that origin are `UserOpened`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionDirectoryOrigin {
@@ -69,7 +68,7 @@ pub struct SessionDirectoryEntry {
     /// Whether a live management link exists (followup/loop control routes
     /// remain available). Tombstoned or never-linked entries are `false`.
     pub linked: bool,
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub title: String,
     pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,

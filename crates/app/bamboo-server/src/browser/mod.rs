@@ -757,6 +757,7 @@ impl BrowserSession {
             .and_then(|lease| lease.storage.as_ref());
         if let Some(storage) = bounded {
             storage.configure(&mut command);
+            command.env("BAMBOO_BROWSER_PERSIST_CLOSE_V1", "1");
         }
         let temporary_parent = bounded.map(|storage| storage.temporary.as_path());
         let temp_dir = create_host_temporary_directory(temporary_parent).map_err(|_| {

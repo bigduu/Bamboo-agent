@@ -24,9 +24,14 @@ pub struct TicketApplication {
     root: PathBuf,
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
+    managed_work_host: OnceLock<managed_work::ManagedWorkHost>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
+    ready_owner: tokio::sync::Mutex<ready_owner::ReadyOwnerControl>,
+    patrol_sources: OnceLock<patrol_adapter::EvidenceSources>,
+    patrol_calls: Arc<bamboo_orchestration::patrol::calls::Calls>,
+    work_reviews: bamboo_orchestration::work_review::WorkReviews,
     // Registration and close share a short, synchronous gate. TaskTracker's
     // close alone does not prevent a new task from retaining the writer.
     cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
@@ -47,16 +52,28 @@ struct CancellationProbe {
 
 mod admission;
 mod initialization;
+mod managed_work;
 mod memory_sources;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
-pub use patrol_adapter::PatrolCheckpointStore;
+pub use patrol_adapter::{
+    PatrolCheckpointStore, PreparedPatrolDiagnostic, UnmeteredWorkPatrolEvidence,
+    WorkPatrolAdoptedContextEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
+    WorkPatrolRequestEvidence, WorkPatrolSourceEvidence, WorkPatrolSourceOutcome,
+    WorkPatrolTicketEvidence, MAX_WORK_PATROL_EVIDENCE_BYTES, MAX_WORK_PATROL_EVIDENCE_REFS,
+};
+mod ready_owner;
 mod ready_retry_store;
 mod resolution;
 mod scheduling;
+pub use ready_owner::{
+    ReadyPolicyAction, ReadyPolicyGrant, ReadyPolicyInstall, ReadyPolicyRequest,
+};
 mod sprints;
+mod token_budget;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
+pub use token_budget::WorkTokenBudgetSetup;
 #[cfg(test)]
 mod tests;
 
@@ -76,6 +93,7 @@ impl TicketApplication {
             root: root.to_path_buf(),
             unavailable,
             adapter: OnceLock::new(),
+            managed_work_host: OnceLock::new(),
             messenger: OnceLock::new(),
             workspace: root
                 .join("workspaces")
@@ -86,6 +104,10 @@ impl TicketApplication {
                 Arc::new(FileReadyRetryStore::new(root)),
                 Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
             )),
+            ready_owner: tokio::sync::Mutex::new(ready_owner::ReadyOwnerControl::default()),
+            patrol_sources: OnceLock::new(),
+            patrol_calls: Arc::default(),
+            work_reviews: Default::default(),
             cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
             #[cfg(test)]
             cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),
@@ -294,6 +316,22 @@ impl TicketApplication {
         let Some(receipt) = &assignment.runtime else {
             return Ok(());
         };
+        let snapshot = service.published()?.1;
+        let intent = &snapshot.intents[&assignment.dispatch_key];
+        if intent.immutable_spec.managed_root.is_some() {
+            if assignment.process_stopped {
+                if let Some(main) = self
+                    .storage
+                    .load_execution_admission_snapshot(&receipt.session_id)
+                    .await?
+                {
+                    bamboo_orchestration::managed_work::reconcile_stopped_result(
+                        service, receipt, &main,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
         let Some(child) = self.storage.load_runtime_control_plane(&child_id).await? else {
             return Ok(());
@@ -653,9 +691,6 @@ impl TicketApplication {
     }
 
     fn cancel_after_commit(&self, service: &Arc<TicketService>, command: &Command) {
-        let Some(adapter) = self.adapter.get() else {
-            return;
-        };
         let Ok((_, snapshot)) = service.published() else {
             return;
         };
@@ -686,6 +721,22 @@ impl TicketApplication {
                                         == "accepted dependency input revoked; review required"
                                 }))))
         }) {
+            let intent = &snapshot.intents[&assignment.dispatch_key];
+            if intent.immutable_spec.managed_root.is_some() {
+                if let Some(host) = self.managed_work_host.get().cloned() {
+                    let service = service.clone();
+                    let key = assignment.dispatch_key.clone();
+                    tasks.spawn(async move {
+                        if let Err(error) = host.cancel(&service, &key).await {
+                            tracing::warn!(%key, %error, "managed Work cancellation retained for reconciliation");
+                        }
+                    });
+                }
+                continue;
+            }
+            let Some(adapter) = self.adapter.get() else {
+                continue;
+            };
             let assignment = assignment.clone();
             let service = service.clone();
             let adapter = adapter.clone();
@@ -805,6 +856,14 @@ impl TicketApplication {
         fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
+        if spec.managed_root.is_some() {
+            if max_rounds.is_some() || fence.is_some() {
+                return Err(Error::ScopeDenied(
+                    "managed Work requires its explicit dispatch route".into(),
+                ));
+            }
+            return self.ensure_managed_work(&service, key, spec).await;
+        }
         let enabled = self.config.read().await.features.ticket_dispatch;
         if enabled {
             // All paths, including semantic resolution and recovered pending
@@ -858,5 +917,34 @@ impl TicketApplication {
             .immutable_spec
             .clone();
         ticket_runtime::query_dispatch(self.storage.as_ref(), &service, key, &spec).await
+    }
+
+    pub(crate) async fn inspect_handoff(
+        &self,
+        service: &TicketService,
+        authority: &Authority,
+        request: bamboo_orchestration::handoff::Request<'_>,
+    ) -> Result<Value> {
+        let facts = service.work_submission_facts(
+            authority,
+            request.work_id,
+            request.submission_id,
+            request.fixed_commit,
+        )?;
+        let session = match ticket_runtime::load_handoff_session(self.storage.as_ref(), &facts.data)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(submission_id = %request.submission_id, %error, "Work handoff execution evidence unavailable");
+                None
+            }
+        };
+        bamboo_orchestration::handoff::project(
+            &facts,
+            session.as_ref(),
+            request.source_path,
+            request.budget_bytes,
+        )
     }
 }

@@ -5,21 +5,6 @@
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_provider_types_exist() {
-        use bamboo_llm::AVAILABLE_PROVIDERS;
-        use std::collections::HashSet;
-
-        let providers = AVAILABLE_PROVIDERS;
-        let provider_set: HashSet<&str> = providers.iter().copied().collect();
-
-        assert!(provider_set.contains("openai"));
-        assert!(provider_set.contains("anthropic"));
-        assert!(provider_set.contains("gemini"));
-        assert!(provider_set.contains("copilot"));
-        assert_eq!(provider_set.len(), providers.len());
-    }
-
-    #[test]
     fn test_message_conversion() {
         use bamboo_agent::agent::Message;
         use bamboo_llm::api::models::ChatMessage as OpenAIChatMessage;
@@ -91,14 +76,10 @@ mod tests {
 
     #[test]
     fn test_available_providers() {
-        // Verify that AVAILABLE_PROVIDERS is accessible
-        let providers = bamboo_llm::AVAILABLE_PROVIDERS;
-
-        // Should include at least these providers
-        assert!(providers.contains(&"openai"));
-        assert!(providers.contains(&"anthropic"));
-        assert!(providers.contains(&"gemini"));
-        assert!(providers.contains(&"copilot"));
+        assert_eq!(
+            bamboo_llm::AVAILABLE_PROVIDERS,
+            ["openai", "anthropic", "gemini"]
+        );
     }
 
     #[test]

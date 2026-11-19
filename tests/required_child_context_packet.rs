@@ -18,9 +18,6 @@ use std::{
     time::Duration,
 };
 
-#[path = "support/delegated_planner.rs"]
-mod delegated_planner;
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Case {
     Complete,

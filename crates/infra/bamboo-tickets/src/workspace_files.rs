@@ -9,17 +9,26 @@ use std::{
     collections::BTreeMap,
     path::{Component, Path},
 };
+mod read_page;
+pub use read_page::{ReadPageInfo, READ_SOURCE_BYTES_LIMIT};
 
 pub const FILE_BYTES_LIMIT: usize = 16384;
 // Includes the HostBridge's result envelope and JSON escaping. A raw file
 // within FILE_BYTES_LIMIT can still exceed the existing SubAgent reply budget.
 const FILE_REPLY_BYTES_LIMIT: usize = 16384;
+const WRITE_PROGRESS_AT_MS: &str = "workspace_write_progress_at_ms";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "tool", deny_unknown_fields)]
 pub enum FileOperation {
     Read {
         file_path: String,
+    },
+    ReadPage {
+        file_path: String,
+        offset_bytes: u64,
+        max_bytes: usize,
+        expected_sha256: Option<String>,
     },
     Write {
         file_path: String,
@@ -30,13 +39,15 @@ pub enum FileOperation {
 impl FileOperation {
     pub fn tool(&self) -> &'static str {
         match self {
-            Self::Read { .. } => "Read",
+            Self::Read { .. } | Self::ReadPage { .. } => "Read",
             Self::Write { .. } => "Write",
         }
     }
     fn path(&self) -> &str {
         match self {
-            Self::Read { file_path } | Self::Write { file_path, .. } => file_path,
+            Self::Read { file_path }
+            | Self::ReadPage { file_path, .. }
+            | Self::Write { file_path, .. } => file_path,
         }
     }
 }
@@ -46,10 +57,52 @@ pub struct FileReply {
     pub content: Option<String>,
     pub sha256: String,
     pub artifact: Option<Artifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<ReadPageInfo>,
 }
 
 struct FileContents {
     bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Sequence and physical completion time of the latest qualifying write
+    /// for a current Assignment, bounded by the live Task's observation window.
+    pub fn latest_workspace_write_progress(
+        &self,
+        assignment_id: &str,
+        started_at_ms: u64,
+        cutoff_ms: u64,
+    ) -> Option<(u64, u64)> {
+        let assignment = self.assignments.get(assignment_id)?;
+        active_permit(self, assignment).ok()?;
+        assignment
+            .effects
+            .iter()
+            .filter_map(|(id, effect)| {
+                let intent = effect.file_intent.as_ref()?;
+                let artifact = effect.artifact.as_ref()?;
+                let receipt = self.receipts.get(id)?;
+                let at_ms = receipt.ids.get(WRITE_PROGRESS_AT_MS)?.parse::<u64>().ok()?;
+                let confirmed_hash = effect
+                    .provider_receipt
+                    .as_deref()?
+                    .strip_prefix("local-file:")?;
+                (effect.state == EffectState::Succeeded
+                    && confirmed_hash == artifact.sha256
+                    && receipt.operation_id == *id
+                    && receipt.principal == intent.principal
+                    && receipt.request_hash == effect.action_fingerprint
+                    && receipt.canonical_request == intent.canonical_request
+                    && receipt.ids.get("artifact") == Some(&artifact.uri)
+                    && receipt.ids.get("sha256") == Some(&artifact.sha256)
+                    && (1..=assignment.updated_seq).contains(&receipt.committed_seq)
+                    && at_ms > 0
+                    && (started_at_ms..=cutoff_ms).contains(&at_ms))
+                .then_some((receipt.committed_seq, at_ms))
+            })
+            .max_by_key(|(sequence, _)| *sequence)
+    }
 }
 
 impl TicketService {
@@ -97,6 +150,7 @@ impl TicketService {
                     uri: receipt.ids["artifact"].clone(),
                     sha256: receipt.ids["sha256"].clone(),
                 }),
+                page: None,
             });
         }
         if store.health != Health::Writable {
@@ -129,6 +183,23 @@ impl TicketService {
             ));
         }
         let (dir, name) = physical::parent(root, path)?;
+        if let FileOperation::ReadPage {
+            offset_bytes,
+            max_bytes,
+            expected_sha256,
+            ..
+        } = op
+        {
+            read_page::validate(*offset_bytes, *max_bytes, expected_sha256.as_deref())?;
+            let source = physical::read_source(&dir, &name)?
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            return read_page::reply(
+                source.bytes,
+                *offset_bytes,
+                *max_bytes,
+                expected_sha256.as_deref(),
+            );
+        }
         let prior = physical::read(&dir, &name)?;
         if let FileOperation::Read { .. } = op {
             let bytes = prior
@@ -141,6 +212,7 @@ impl TicketService {
                 content: Some(content),
                 sha256,
                 artifact: None,
+                page: None,
             };
             if canonical_bytes(&serde_json::json!({"result": &reply}))?.len()
                 > FILE_REPLY_BYTES_LIMIT
@@ -197,6 +269,7 @@ impl TicketService {
         // IO can fail after installation. Retain Started and the resource claim until
         // an actual stopped Run and explicit reconciliation are confirmed.
         physical::create_absent(&dir, &name, content.as_bytes())?;
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
         let mut next = store.published.as_ref().expect("published start").1.clone();
         next.seq += 1;
         let a = next
@@ -205,19 +278,29 @@ impl TicketService {
             .expect("verified Assignment");
         a.record_revision += 1;
         a.updated_seq = next.seq;
+        // A second path with identical bytes adds no new managed Artifact.
+        let already_produced = a.effects.values().any(|effect| {
+            effect.file_intent.is_some()
+                && effect.state == EffectState::Succeeded
+                && effect.artifact.as_ref() == Some(&artifact)
+        });
         let effect = a.effects.get_mut(&operation_id).expect("durable intent");
         effect.state = EffectState::Succeeded;
         effect.provider_receipt = Some(format!("local-file:{}", artifact.sha256));
+        let mut ids = BTreeMap::from([
+            ("sha256".into(), artifact.sha256.clone()),
+            ("artifact".into(), artifact.uri.clone()),
+        ]);
+        if !already_produced && observed_at_ms > 0 {
+            ids.insert(WRITE_PROGRESS_AT_MS.into(), observed_at_ms.to_string());
+        }
         let receipt = OperationReceipt {
             operation_id: operation_id.clone(),
             principal: authority.identity(),
             request_hash,
             canonical_request: String::from_utf8(canonical_bytes(op)?).expect("JSON UTF-8"),
             committed_seq: next.seq,
-            ids: BTreeMap::from([
-                ("sha256".into(), artifact.sha256.clone()),
-                ("artifact".into(), artifact.uri.clone()),
-            ]),
+            ids,
         };
         next.receipts.insert(operation_id.clone(), receipt);
         validate_snapshot(&next)?;
@@ -229,6 +312,7 @@ impl TicketService {
             content: None,
             sha256: artifact.sha256.clone(),
             artifact: Some(artifact),
+            page: None,
         })
     }
 }
@@ -238,17 +322,33 @@ fn file_root<'a>(
     workspace: &'a ExecutionWorkspace,
     path: &Path,
 ) -> Result<&'a Path> {
+    let worktree = Path::new(&workspace.worktree);
+    let relative = path
+        .strip_prefix(worktree)
+        .map_err(|_| Error::ScopeDenied("file outside Assignment worktree".into()))?;
+    let is_control_name = |name: &std::ffi::OsStr| {
+        name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".bamboo")
+        })
+    };
     if !path.is_absolute()
         || path
             .components()
             .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        // The frozen worktree may live under the Host's .bamboo/worktrees.
+        // Protect controls relative to that worktree, not the narrower write
+        // root: declaring a nested control directory must not authorize it.
+        || worktree.file_name().is_some_and(is_control_name)
+        || relative
+            .components()
+            .any(|c| matches!(c, Component::Normal(name) if is_control_name(name)))
         || path.components().any(|c| {
             matches!(c, Component::Normal(n) if n.to_str().is_some_and(|name|
-                name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".bamboo")))
+                name.eq_ignore_ascii_case(".git")))
         })
     {
         return Err(Error::ScopeDenied(
-            "file path must be absolute without traversal, .git or .bamboo control directories"
+            "file path must be absolute without traversal, .git or workspace .bamboo controls"
                 .into(),
         ));
     }
@@ -339,6 +439,17 @@ mod physical {
         Err(Error::ScopeDenied("file path is a write root".into()))
     }
     pub(super) fn read(dir: &File, name: &CString) -> Result<Option<FileContents>> {
+        read_bounded(dir, name, FILE_BYTES_LIMIT, false)
+    }
+    pub(super) fn read_source(dir: &File, name: &CString) -> Result<Option<FileContents>> {
+        read_bounded(dir, name, READ_SOURCE_BYTES_LIMIT, true)
+    }
+    fn read_bounded(
+        dir: &File,
+        name: &CString,
+        limit: usize,
+        stable: bool,
+    ) -> Result<Option<FileContents>> {
         let file = match open(dir, name, libc::O_RDONLY | libc::O_NONBLOCK) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             other => other?,
@@ -349,14 +460,35 @@ mod physical {
                 "only regular unlinked files are supported".into(),
             ));
         }
-        if meta.len() > FILE_BYTES_LIMIT as u64 {
+        if meta.len() > limit as u64 {
             return Err(Error::ContextBudgetExceeded);
         }
         let mut bytes = Vec::new();
-        file.take((FILE_BYTES_LIMIT + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > FILE_BYTES_LIMIT {
+        (&file).take((limit + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
             return Err(Error::ContextBudgetExceeded);
+        }
+        if stable {
+            let after = file.metadata()?;
+            if !after.is_file()
+                || after.nlink() != 1
+                || after.len() != bytes.len() as u64
+                || (
+                    meta.len(),
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                ) != (
+                    after.len(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec(),
+                )
+            {
+                return Err(Error::RevisionConflict);
+            }
         }
         Ok(Some(FileContents { bytes }))
     }
@@ -452,6 +584,9 @@ mod physical {
     pub(super) fn read(_: &(), _: &()) -> Result<Option<FileContents>> {
         Err(unavailable())
     }
+    pub(super) fn read_source(_: &(), _: &()) -> Result<Option<FileContents>> {
+        Err(unavailable())
+    }
     pub fn create_absent(_: &(), _: &(), _: &[u8]) -> Result<()> {
         Err(unavailable())
     }
@@ -475,6 +610,10 @@ mod physical {
             }
             assert!(matches!(
                 read(&(), &()),
+                Err(Error::AuthorityUnavailable(_))
+            ));
+            assert!(matches!(
+                read_source(&(), &()),
                 Err(Error::AuthorityUnavailable(_))
             ));
             assert!(matches!(

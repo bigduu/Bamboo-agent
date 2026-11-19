@@ -182,6 +182,10 @@ impl GeminiProviderUsage {
 }
 
 impl GeminiStreamState {
+    pub(crate) fn pending_provider_usage(&self) -> Option<ProviderUsageReplacement> {
+        self.pending_replacement
+    }
+
     /// Generate a unique tool call ID.
     fn generate_tool_id(&mut self) -> String {
         let id = format!("gemini_{}", self.next_tool_id);
@@ -411,16 +415,17 @@ pub fn parse_gemini_sse_event(
     let mut tool_calls = Vec::new();
 
     for part in parts {
-        // Best-effort thinking signal detection (per part).
+        // Signatures can accompany ordinary text and tool parts. Only a
+        // thinking marker classifies text as reasoning.
         let is_thinking_part = part
             .get("thought")
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
-            || part.get("thoughtSignature").is_some()
             || part.get("thinking").is_some();
+        state.observed_thinking_signal |=
+            is_thinking_part || part.get("thoughtSignature").is_some();
 
         if is_thinking_part {
-            state.observed_thinking_signal = true;
             state.thinking_parts_count = state.thinking_parts_count.saturating_add(1);
             let text_len = part
                 .get("text")

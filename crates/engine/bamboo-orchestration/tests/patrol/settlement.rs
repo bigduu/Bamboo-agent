@@ -270,14 +270,18 @@ fn assert_unpaid_checkpoint_cannot_replace_receipt_usage_or_incident(probe: &Set
         checkpoint::encode(10, &orphan_usage),
         Err(PortError::Unavailable)
     );
-    let mut over_cap = old.clone();
-    over_cap.incident.as_mut().unwrap().pending_settlement_usage = Some(Usage::Known {
+    let mut changed_usage = old.clone();
+    changed_usage
+        .incident
+        .as_mut()
+        .unwrap()
+        .pending_settlement_usage = Some(Usage::Known {
         input_tokens: model().max_input_tokens + 1,
         output_tokens: 0,
     });
     assert_eq!(
-        checkpoint::encode(10, &over_cap),
-        Err(PortError::Unavailable)
+        checkpoint::validate_update(&old, &changed_usage),
+        Err(PortError::Conflict)
     );
     let mut next_incident = old.clone();
     let next = next_incident.incident.as_mut().unwrap();

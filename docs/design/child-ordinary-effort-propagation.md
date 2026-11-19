@@ -4,9 +4,8 @@ Bamboo #1346 fills the existing local `BambooRuntime` RunSpec field. It introduc
 no transport field or persistence protocol. External Claude/Codex and remote
 actor adapters retain their existing behavior.
 
-SubAgent creation already resolves explicit effort before the selected role's
-model preference; Plan resolves its own planner preference. Both save the result
-in the Child's `Session.reasoning_effort`. The actor adapter sends that field,
+SubAgent creation resolves explicit effort before the selected role's model
+preference and saves it in the Child's `Session.reasoning_effort`. The actor adapter sends that field,
 without deriving effort from a potentially inherited parent model reference.
 Root ordinary effort and product Ultra do not supply a Child default.
 
@@ -30,11 +29,10 @@ does not claim native Ultra or support for every effort on every provider.
 
 ## Acceptance evidence
 
-`tests/child_ordinary_effort.rs` uses the production Root route, Plan scheduler,
+`tests/child_ordinary_effort.rs` uses the production Root route, SubAgent scheduler,
 local actor adapter and same-source `CARGO_BIN_EXE_bamboo` child, replacing only
-the remote model with a loopback SSE endpoint. It observes Root High and a
-distinct planner model's Low at the actual HTTP provider boundary. The existing
-Plan workspace selector is supplied explicitly (#1347 remains separate).
+the remote model with a loopback SSE endpoint. It observes Root High and an
+explorer model's Low at the actual HTTP provider boundary.
 
 The same test also provisions one real reusable Bamboo worker and connects for
 successive Runs of independent logical Children using Low, High, Disabled and

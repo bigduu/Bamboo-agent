@@ -8,10 +8,8 @@
 //! [`BuiltinTool::tool`]. Custom tools (your own `impl Tool`) can be passed the
 //! same way.
 //!
-//! For model shell access, select both [`BuiltinTool::ExecCommand`] and
-//! [`BuiltinTool::WriteStdin`]. An explicit legacy [`BuiltinTool::Bash`]
-//! selection retains that host implementation only; it does not register the
-//! replacement pair. The legacy Bash family is hidden from model catalogs.
+//! For model shell access, select [`BuiltinTool::ExecCommand`] with
+//! [`BuiltinTool::WriteStdin`].
 //!
 //! The canonical source of truth for built-in tool *names* is
 //! [`bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`]; [`BuiltinTool`] is kept in
@@ -105,9 +103,6 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 /// drift-guard test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinTool {
-    Bash,
-    BashInput,
-    BashOutput,
     ExecCommand,
     WriteStdin,
     Edit,
@@ -115,8 +110,7 @@ pub enum BuiltinTool {
     GetFileInfo,
     Glob,
     Grep,
-    KillShell,
-    SessionNote,
+    Memory,
     Read,
     RequestPermissions,
     Sleep,
@@ -131,10 +125,7 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in tool, in the canonical order of [`BUILTIN_TOOL_NAMES`].
-    pub const ALL: [BuiltinTool; 22] = [
-        BuiltinTool::Bash,
-        BuiltinTool::BashInput,
-        BuiltinTool::BashOutput,
+    pub const ALL: [BuiltinTool; 18] = [
         BuiltinTool::ExecCommand,
         BuiltinTool::WriteStdin,
         BuiltinTool::Edit,
@@ -142,8 +133,7 @@ impl BuiltinTool {
         BuiltinTool::GetFileInfo,
         BuiltinTool::Glob,
         BuiltinTool::Grep,
-        BuiltinTool::KillShell,
-        BuiltinTool::SessionNote,
+        BuiltinTool::Memory,
         BuiltinTool::Read,
         BuiltinTool::RequestPermissions,
         BuiltinTool::Sleep,
@@ -159,9 +149,6 @@ impl BuiltinTool {
     /// The canonical runtime name for this tool (matches [`BUILTIN_TOOL_NAMES`]).
     pub const fn name(self) -> &'static str {
         match self {
-            BuiltinTool::Bash => "Bash",
-            BuiltinTool::BashInput => "BashInput",
-            BuiltinTool::BashOutput => "BashOutput",
             BuiltinTool::ExecCommand => "exec_command",
             BuiltinTool::WriteStdin => "write_stdin",
             BuiltinTool::Edit => "Edit",
@@ -169,8 +156,7 @@ impl BuiltinTool {
             BuiltinTool::GetFileInfo => "GetFileInfo",
             BuiltinTool::Glob => "Glob",
             BuiltinTool::Grep => "Grep",
-            BuiltinTool::KillShell => "KillShell",
-            BuiltinTool::SessionNote => "session_note",
+            BuiltinTool::Memory => "memory",
             BuiltinTool::Read => "Read",
             BuiltinTool::RequestPermissions => "request_permissions",
             BuiltinTool::Sleep => "Sleep",
@@ -261,14 +247,21 @@ mod tests {
     }
 
     #[test]
-    fn exec_session_catalog_preserves_legacy_shell_variants() {
+    fn exec_session_catalog_exposes_only_the_current_shell_tools() {
+        for name in [
+            "bash",
+            "Bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+            "execute_command",
+        ] {
+            assert_eq!(BuiltinTool::from_name(name), None);
+            assert!(default_builtin_executor().registry().get(name).is_none());
+        }
         for (name, variant) in [
             ("exec_command", BuiltinTool::ExecCommand),
             ("write_stdin", BuiltinTool::WriteStdin),
-            ("Bash", BuiltinTool::Bash),
-            ("BashInput", BuiltinTool::BashInput),
-            ("BashOutput", BuiltinTool::BashOutput),
-            ("KillShell", BuiltinTool::KillShell),
         ] {
             assert_eq!(BuiltinTool::from_name(name), Some(variant));
             assert_eq!(variant.tool().name(), name);
@@ -278,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn explicit_builder_shell_selection_registers_only_requested_tools() {
         for (selected, expected) in [
-            (vec![BuiltinTool::Bash], vec!["Bash".to_owned()]),
+            (
+                vec![BuiltinTool::WriteStdin],
+                vec!["write_stdin".to_owned()],
+            ),
             (
                 vec![BuiltinTool::ExecCommand, BuiltinTool::WriteStdin],
                 vec!["exec_command".to_owned(), "write_stdin".to_owned()],

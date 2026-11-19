@@ -4,7 +4,7 @@
 //! enabling support for multiple LLM backends through a common trait.
 
 use crate::prompt_ir::PromptIR;
-use crate::types::LLMChunk;
+use crate::types::{LLMChunk, ProviderUsageReplacement};
 use async_trait::async_trait;
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
@@ -157,10 +157,10 @@ pub struct ProviderVisibleToolFootprint {
 pub struct ProviderModelInfo {
     /// Model identifier.
     pub id: String,
-    /// Maximum total context window (input + output) in tokens when known.
-    /// Provider adapters that receive an input-only limit must add the model's
-    /// output capacity before populating this field.
+    /// Joint input/output window, when explicitly reported.
     pub max_context_tokens: Option<u32>,
+    /// Maximum input tokens, when independently reported.
+    pub max_input_tokens: Option<u32>,
     /// Maximum output/completion tokens when known.
     pub max_output_tokens: Option<u32>,
 }
@@ -171,6 +171,7 @@ impl ProviderModelInfo {
         Self {
             id: id.into(),
             max_context_tokens: None,
+            max_input_tokens: None,
             max_output_tokens: None,
         }
     }
@@ -239,15 +240,108 @@ pub struct ResponsesRequestOptions {
 /// Request-scoped, payload-free completion diagnostics. Provider strings are
 /// untrusted: only recognized reason codes are retained, never arbitrary text.
 #[derive(Debug, Clone, Default)]
-pub struct CompletionDiagnostics(Arc<Mutex<Option<&'static str>>>);
+pub struct CompletionDiagnostics {
+    state: Arc<Mutex<CompletionDiagnosticState>>,
+    agent_round: bool,
+    recovery: Option<OutputLimitRecovery>,
+    model_window_limit: Option<u32>,
+    provider_default_output: bool,
+}
+
+pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
+    "Bamboo runtime recovery: use the work already completed. Keep this step small. \
+     If you can answer now, give the concise answer. If more work is needed, make only the \
+     single next useful tool call. Otherwise, report confirmed progress and what remains.";
+pub const REASONING_REPETITION_FINISH_REASON: &str = "reasoning_repetition";
+
+/// An attempt authorized by a completed request's wire controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimitRecovery {
+    controls: OutputLimitRecoveryControls,
+    step: OutputLimitStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputLimitStep {
+    LowerEffort,
+    Converge,
+    Split { lower_effort: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputLimitRecoveryControls {
+    pub(crate) endpoint: &'static str,
+    pub(crate) lowerable_effort: Option<ReasoningEffort>,
+    pub(crate) output_limit: u64,
+    pub(crate) allows_convergence: bool,
+    pub(crate) compatible_messages: bool,
+}
+
+impl OutputLimitRecovery {
+    pub fn is_convergence(self) -> bool {
+        self.step == OutputLimitStep::Converge
+    }
+
+    pub fn output_limit(self) -> u64 {
+        self.controls.output_limit
+    }
+
+    pub fn tighten_output_limit(mut self, limit: u32) -> Self {
+        self.controls.output_limit = self.controls.output_limit.min(u64::from(limit));
+        self
+    }
+
+    pub fn allows_task_split(self) -> bool {
+        self.controls.allows_convergence
+    }
+
+    pub fn prefers_task_split(self) -> bool {
+        self.controls.compatible_messages && self.allows_task_split()
+    }
+
+    pub fn for_task_split(self) -> Self {
+        Self {
+            step: OutputLimitStep::Split {
+                lower_effort: self.is_convergence() && !self.controls.compatible_messages,
+            },
+            ..self
+        }
+    }
+
+    fn lowers_effort(self) -> bool {
+        self.controls
+            .lowerable_effort
+            .is_some_and(|effort| effort != ReasoningEffort::Low)
+            && !matches!(
+                self.step,
+                OutputLimitStep::Split {
+                    lower_effort: false
+                }
+            )
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompletionDiagnosticState {
+    finish_reason: Option<&'static str>,
+    messages_stopped: bool,
+    provider_tool_seen: bool,
+    response_progress_seen: bool,
+    pending_usage: Option<ProviderUsageReplacement>,
+    compatible_messages: bool,
+    endpoint: Option<&'static str>,
+    changed_protocol: bool,
+    output_limit: Option<u64>,
+    recovery: Option<OutputLimitRecovery>,
+}
 
 tokio::task_local! {
     static COMPLETION_DIAGNOSTICS: CompletionDiagnostics;
 }
 
 /// Scope diagnostics to the inline construction of one provider stream.
-/// Built-in adapters capture this handle in their stream parser; no payload or
-/// mutable global state is shared between concurrent requests.
+/// Built-in adapters capture this handle in their stream parser. Diagnostics
+/// and usage counters belong to this request alone.
 pub async fn scope_completion_diagnostics<F: Future>(
     diagnostics: CompletionDiagnostics,
     future: F,
@@ -259,12 +353,226 @@ pub(crate) fn current_completion_diagnostics() -> Option<CompletionDiagnostics> 
     COMPLETION_DIAGNOSTICS.try_with(Clone::clone).ok()
 }
 
+pub(crate) fn optional_protocol_output_limit(limit: Option<u32>) -> Option<u32> {
+    if current_completion_diagnostics()
+        .is_some_and(|diagnostics| diagnostics.allows_provider_default_output())
+    {
+        None
+    } else {
+        limit
+    }
+}
+
 impl CompletionDiagnostics {
-    /// The sanitized provider reason, or `unavailable` if none was reported.
-    pub fn finish_reason(&self) -> &'static str {
-        self.0
+    pub fn for_agent_round(recovery: Option<OutputLimitRecovery>) -> Self {
+        Self {
+            agent_round: true,
+            recovery,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_model_window_limit(mut self, limit: Option<u32>) -> Self {
+        self.model_window_limit = limit;
+        self
+    }
+
+    pub fn with_provider_default_output(mut self, enabled: bool) -> Self {
+        self.provider_default_output = enabled;
+        self
+    }
+
+    pub(crate) fn allows_provider_default_output(&self) -> bool {
+        self.provider_default_output && !crate::retry::work_request_budget_active()
+    }
+
+    pub(crate) fn model_window_limit(&self) -> Option<u32> {
+        self.model_window_limit
+    }
+
+    pub(crate) fn is_agent_round(&self) -> bool {
+        self.agent_round
+    }
+
+    pub(crate) fn is_output_limit_recovery(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    pub(crate) fn is_task_split(&self) -> bool {
+        self.recovery
+            .is_some_and(|retry| matches!(retry.step, OutputLimitStep::Split { .. }))
+    }
+
+    pub(crate) fn mark_compatible_messages(&self) {
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .compatible_messages = true;
+    }
+
+    pub fn is_compatible_messages(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .compatible_messages
+    }
+
+    pub fn try_stop_for_reasoning_repetition(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finish_reason.is_some()
+            || state.messages_stopped
+            || state.response_progress_seen
+            || state.provider_tool_seen
+        {
+            return false;
+        }
+        state.finish_reason = Some(REASONING_REPETITION_FINISH_REASON);
+        true
+    }
+
+    pub(crate) fn record_response_progress(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .response_progress_seen = true;
+    }
+
+    pub(crate) fn record_pending_usage(&self, usage: ProviderUsageReplacement) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage = Some(usage);
+    }
+
+    pub fn take_pending_usage(&self) -> Option<LLMChunk> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_usage
+            .take()
+            .and_then(ProviderUsageReplacement::legacy_chunk)
+    }
+
+    pub(crate) fn record_messages_stop(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages_stopped = true;
+    }
+
+    pub(crate) fn record_provider_tool(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_tool_seen = true;
+    }
+
+    pub fn saw_provider_tool(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_tool_seen
+    }
+
+    /// Gemini's legacy usage chunks report candidates and thoughts separately.
+    pub fn legacy_counts_reasoning_separately(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .endpoint
+            == Some(crate::providers::common::request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT)
+    }
+
+    /// A recovery step needs a confirmed successful protocol boundary.
+    pub fn has_recovery_completion(&self) -> bool {
+        use crate::providers::common::request_overrides::{
+            ENDPOINT_CHAT_COMPLETIONS, ENDPOINT_MESSAGES, ENDPOINT_RESPONSES,
+            ENDPOINT_STREAM_GENERATE_CONTENT,
+        };
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !state.provider_tool_seen
+            && match (state.endpoint, state.finish_reason) {
+                (Some(ENDPOINT_MESSAGES), Some("end_turn" | "tool_use" | "stop_sequence")) => {
+                    state.messages_stopped
+                }
+                (
+                    Some(ENDPOINT_CHAT_COMPLETIONS),
+                    Some("stop" | "tool_calls" | "function_call"),
+                )
+                | (Some(ENDPOINT_RESPONSES), Some("completed"))
+                | (Some(ENDPOINT_STREAM_GENERATE_CONTENT), Some("STOP")) => true,
+                _ => false,
+            }
+    }
+
+    pub fn output_limit(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .output_limit
+    }
+
+    pub fn output_limit_recovery(&self) -> Option<OutputLimitRecovery> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recovery
+    }
+
+    pub(crate) fn observe_agent_round_request(
+        &self,
+        endpoint: &'static str,
+        output_limit: Option<u64>,
+        candidate: Option<OutputLimitRecoveryControls>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_output_limit_recovery() && state.endpoint.is_some() {
+            return Err(LLMError::RequestFailed(
+                "output-limit recovery permits one provider send per request".into(),
+            ));
+        }
+        state.output_limit = output_limit;
+        state.changed_protocol |= state.endpoint.is_some_and(|previous| previous != endpoint);
+        state.endpoint = Some(endpoint);
+        if let Some(expected) = self.recovery {
+            if candidate != Some(expected.controls) || state.changed_protocol {
+                return Err(LLMError::RequestFailed(
+                    "Output-limit recovery no longer matches the original request controls".into(),
+                ));
+            }
+            state.recovery = (expected.step == OutputLimitStep::LowerEffort
+                && expected.controls.allows_convergence)
+                .then_some(OutputLimitRecovery {
+                    step: OutputLimitStep::Converge,
+                    ..expected
+                });
+            return Ok(expected.lowers_effort());
+        }
+        if !state.changed_protocol {
+            state.recovery = candidate.and_then(|controls| {
+                let step = if controls
+                    .lowerable_effort
+                    .is_none_or(|effort| effort == ReasoningEffort::Low)
+                {
+                    OutputLimitStep::Converge
+                } else {
+                    OutputLimitStep::LowerEffort
+                };
+                (step != OutputLimitStep::Converge || controls.allows_convergence)
+                    .then_some(OutputLimitRecovery { controls, step })
+            });
+        } else {
+            state.recovery = None;
+        }
+        Ok(false)
+    }
+
+    /// The normalized completion reason, or `unavailable` if none was observed.
+    pub fn finish_reason(&self) -> &'static str {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_reason
             .unwrap_or("unavailable")
     }
 
@@ -274,6 +582,29 @@ impl CompletionDiagnostics {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(event);
+        // Responses can announce a tool before producing a normalized call
+        // or transcript item. Its pending work takes priority over a cutoff
+        // even if the next frame contains only reasoning.
+        if matches!(
+            event,
+            "response.output_item.added" | "response.output_item.done"
+        ) {
+            if let Some(kind) = value
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| kind.ends_with("_call"))
+            {
+                self.record_response_progress();
+                if kind != "function_call"
+                    && value
+                        .pointer("/item/execution")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("client")
+                {
+                    self.record_provider_tool();
+                }
+            }
+        }
         let reason = [
             "/choices/0/finish_reason",
             "/delta/stop_reason",
@@ -320,7 +651,10 @@ impl CompletionDiagnostics {
                 "completed" => "completed",
                 _ => "other",
             };
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(safe);
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish_reason = Some(safe);
         }
     }
 
@@ -381,6 +715,61 @@ pub(crate) fn required_tool_from_options<'a>(
     }
 }
 
+pub(crate) const DEFAULT_COMPRESSION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+
+/// A provider request override can narrow the tools the session may offer.
+/// Names use the exact function identities in the provider's declarations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum RequestToolSelection {
+    #[default]
+    Automatic,
+    Required,
+    Disabled,
+    Forced {
+        name: String,
+        exactly_one: bool,
+    },
+    Named {
+        names: Vec<String>,
+        required: bool,
+    },
+}
+
+impl RequestToolSelection {
+    pub fn restricts_names(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled | Self::Forced { .. } | Self::Named { .. }
+        )
+    }
+
+    pub fn requires_call(&self) -> bool {
+        matches!(
+            self,
+            Self::Required | Self::Forced { .. } | Self::Named { required: true, .. }
+        )
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Forced { name, .. } => std::slice::from_ref(name),
+            Self::Named { names, .. } => names,
+            _ => &[],
+        }
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::Automatic | Self::Required => true,
+            Self::Disabled => false,
+            Self::Forced {
+                name: candidate, ..
+            } => candidate == name,
+            Self::Named { names, .. } => names.iter().any(|candidate| candidate == name),
+        }
+    }
+}
+
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -410,6 +799,14 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Built-in effort for a compression request before any role override.
+    /// A provider can leave the setting to the upstream when its transport
+    /// cannot reserve a small output budget separately from reasoning.
+    #[doc(hidden)]
+    fn default_compression_reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
+        Some(DEFAULT_COMPRESSION_REASONING_EFFORT)
+    }
+
     /// An immutable downstream handle through which this wrapper sends every
     /// chat request. This is separate from queue and allocation identity.
     ///
@@ -495,14 +892,20 @@ pub trait LLMProvider: Send + Sync {
 
     /// Select the provider's callable-catalog policy for one model request.
     ///
-    /// Providers must opt in explicitly. The default preserves the complete
-    /// legacy function catalog for compatibility endpoints and unknown models.
+    /// Configured generation adapters select native or compatibility loading.
+    /// The default preserves the catalog supplied to existing custom Rust adapters.
     async fn capability_loading_mode(
         &self,
         _model: &str,
         _required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
         CapabilityLoadingMode::LegacyFullCatalog
+    }
+
+    /// Resolve the generation endpoint's configured tool choice before the
+    /// agent projects the role's eligible catalog for this request.
+    async fn request_tool_selection(&self, _model: &str) -> Result<RequestToolSelection> {
+        Ok(RequestToolSelection::Automatic)
     }
 
     /// Lower the tool definitions visible to the model at this request.
@@ -641,6 +1044,19 @@ pub trait LLMProvider: Send + Sync {
             .map(ProviderModelInfo::from_id)
             .collect())
     }
+
+    /// Look up limits for a model selected for an actual request. Routing
+    /// guards must check the selected model before delegating the lookup.
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        if let Some(error) = self.known_pre_dispatch_error() {
+            return Err(error);
+        }
+        Ok(self
+            .list_model_info()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == model))
+    }
 }
 
 /// Produce a stable, process-local identity for a known wrapper's inner Arc.
@@ -662,6 +1078,7 @@ pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLM
             require_current: provider.queue_requires_current_route(),
             original: provider,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })),
         None => Ok(provider),
     }
@@ -676,6 +1093,7 @@ pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProv
         original: provider,
         require_current: true,
         fixed_inner: false,
+        main_dispatch_origin: None,
     })
 }
 
@@ -693,6 +1111,7 @@ pub fn fixed_provider_with_identity(
         original,
         require_current: true,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
 }
 
@@ -710,7 +1129,22 @@ pub fn fixed_injected_provider_with_identity(
         original,
         require_current: false,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
+}
+
+/// Retain a forwarding boundary's chosen provider across preparation and send.
+/// The dispatch observer still receives the selected Arc at that same boundary.
+#[doc(hidden)]
+pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    let inner = queued_snapshot_for(selected.clone())?;
+    Ok(Arc::new(QueuedBudgetProvider {
+        require_current: inner.queue_requires_current_route(),
+        inner,
+        original: selected.clone(),
+        fixed_inner: true,
+        main_dispatch_origin: Some(selected),
+    }))
 }
 
 struct QueuedBudgetProvider {
@@ -719,6 +1153,7 @@ struct QueuedBudgetProvider {
     require_current: bool,
     // A receipt-bound delegate must not later resnapshot a mutable wrapper.
     fixed_inner: bool,
+    main_dispatch_origin: Option<Arc<dyn LLMProvider>>,
 }
 
 #[async_trait]
@@ -746,6 +1181,7 @@ impl LLMProvider for QueuedBudgetProvider {
             original: self.original.clone(),
             require_current: self.require_current,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })))
     }
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
@@ -776,6 +1212,10 @@ impl LLMProvider for QueuedBudgetProvider {
             .capability_loading_mode(model, required_tool)
             .await
     }
+    async fn request_tool_selection(&self, model: &str) -> Result<RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,
@@ -818,6 +1258,11 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        if let Some(origin) = self.main_dispatch_origin.as_ref().filter(|_| {
+            options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop")
+        }) {
+            observe_main_dispatch(origin.clone());
+        }
         self.inner
             .chat_stream_ir(ir, tools, max_output_tokens, model, options)
             .await
@@ -827,6 +1272,9 @@ impl LLMProvider for QueuedBudgetProvider {
     }
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.inner.list_model_info().await
+    }
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.inner.model_info_for_request(model).await
     }
 }
 

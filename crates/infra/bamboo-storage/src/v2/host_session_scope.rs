@@ -304,15 +304,22 @@ impl SessionStoreV2 {
         scope: Option<HostSessionScopeUse>,
         extra_root_ids: &[String],
     ) -> io::Result<HostScopedSessionGuards> {
-        self.lock_host_scope_observations_view(observations, scope, extra_root_ids, false)
-            .await
+        self.lock_host_scope_observations_view(
+            observations,
+            scope,
+            extra_root_ids,
+            false,
+            super::SessionLockWait::Wait,
+        )
+        .await
     }
 
     pub(super) async fn lock_host_scope_control_observations(
         &self,
         observations: &[HostScopeSessionObservation],
+        wait: super::SessionLockWait,
     ) -> io::Result<HostScopedSessionGuards> {
-        self.lock_host_scope_observations_view(observations, None, &[], true)
+        self.lock_host_scope_observations_view(observations, None, &[], true, wait)
             .await
     }
 
@@ -322,6 +329,7 @@ impl SessionStoreV2 {
         scope: Option<HostSessionScopeUse>,
         extra_root_ids: &[String],
         control_only: bool,
+        wait: super::SessionLockWait,
     ) -> io::Result<HostScopedSessionGuards> {
         // Only a reserved Root birth needs exclusive lifecycle. Ordinary
         // scoped reads keep their existing shared concurrency contract.
@@ -375,12 +383,20 @@ impl SessionStoreV2 {
         }
         let mut sessions = Vec::with_capacity(ordered.len());
         for (_, id) in ordered {
-            sessions.push(self.acquire_session_maintenance_lock(&id).await?);
+            sessions.push(match wait {
+                super::SessionLockWait::Wait => self.acquire_session_maintenance_lock(&id).await?,
+                super::SessionLockWait::Try => {
+                    self.try_acquire_session_maintenance_lock(&id).await?
+                }
+            });
         }
         let mut trees = Vec::with_capacity(roots.len());
         let mut tree_roots = BTreeSet::new();
         for root in roots {
-            trees.push(self.acquire_actor_tree_write_guard(&root).await?);
+            trees.push(
+                self.acquire_actor_tree_write_guard_with_wait(&root, wait)
+                    .await?,
+            );
             tree_roots.insert(root);
         }
         let guards = HostScopedSessionGuards {

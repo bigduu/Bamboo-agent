@@ -147,6 +147,54 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    async fn owns_current_native_work(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.supports_native_ticket_budget()
+            && self.runners[0]
+                .owns_current_native_work(session_id, run_id, child_birth)
+                .await
+    }
+
+    fn native_task_start(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskStart> {
+        if !self.supports_native_ticket_budget() {
+            return None;
+        }
+        self.runners[0].native_task_start(session_id, run_id, child_birth)
+    }
+
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskLiveness> {
+        if !self.supports_native_ticket_budget() {
+            return None;
+        }
+        self.runners[0].native_task_liveness(session_id, run_id, child_birth)
+    }
+
+    fn shell_wait_activity_at(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.runners
+            .iter()
+            .find_map(|runner| runner.shell_wait_activity_at(session_id, run_id, child_birth, now))
+    }
+
     fn supports_native_ticket_budget(&self) -> bool {
         // Deliberately conservative for this native-only first slice. Mixed
         // process/remote routers retain their existing explicit dispatch path.
@@ -1130,8 +1178,7 @@ pub fn extract_provider_credentials(
     }
 
     // Legacy single-instance slots: providers.anthropic / openai / gemini /
-    // bodhi. `copilot` is intentionally omitted — it authenticates via device
-    // flow and has no `api_key` field to extract.
+    // the legacy Bodhi gateway.
     let mut push_legacy =
         |name: &str, api_key: &str, base_url: Option<String>, credential_ref: Option<String>| {
             let api_key = api_key.trim().to_string();

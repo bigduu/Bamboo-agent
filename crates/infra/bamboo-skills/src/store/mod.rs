@@ -54,11 +54,12 @@ pub mod storage;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod codex_frontmatter;
 
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use tokio::io::AsyncReadExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -74,9 +75,9 @@ use crate::progressive::source::{
 use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_skill_bundles};
 use crate::store::parser::render_skill_markdown;
 use crate::store::storage::{
-    discover_plugin_skill_dirs, ensure_skills_dir, load_captured_records,
-    open_skill_file_no_follow, write_skill_file, FailedSkillRecord, LoadedSkillRecord,
-    SkillDirectorySource, SkillDiscoveryDir,
+    discover_plugin_skill_dirs, ensure_skills_dir, load_captured_records, read_skill_file_bounded,
+    write_skill_file, FailedSkillRecord, LoadedSkillRecord, SkillDirectorySource,
+    SkillDiscoveryDir,
 };
 use crate::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
@@ -175,7 +176,8 @@ impl PreparedSkillInputStore {
         let store = &self.store;
         let _operation = store.retained_budget.selected.operation()?;
         let _publication = store.snapshot_publish_lock.read().await;
-        let catalog = store.skill_catalog.read().await;
+        let skill_catalog = store.skill_catalog.read().await;
+        let catalog = &skill_catalog.snapshot;
         let definitions = store.skills.read().await;
         let bindings = store.instruction_sources.read().await;
         let resources = store.skill_resources.read().await;
@@ -330,9 +332,60 @@ struct RetainedResourceBudget {
     state: Mutex<RetainedResourceBudgetState>,
     sources: Arc<SourcePool>,
     selected: Arc<crate::progressive::read::SelectedBudget>,
+    scoped_admission: tokio::sync::Mutex<()>,
+    publication_revision: AtomicU64,
+    instruction_revisions: Mutex<HashMap<[u8; 32], Weak<u64>>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("global workflow snapshot budget exceeded ({projected} > {limit} bytes)")]
+struct PublicationBudgetExceeded {
+    projected: usize,
+    limit: usize,
 }
 
 impl RetainedResourceBudget {
+    fn next_publication_revision(&self) -> u64 {
+        self.publication_revision.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn share_instruction_revisions(
+        &self,
+        entries: &mut [WorkflowCatalogEntry],
+        bindings: &HashMap<SkillId, SourceBinding>,
+    ) -> Vec<Arc<u64>> {
+        let mut revisions = self
+            .instruction_revisions
+            .lock()
+            .expect("Instruction revision lock");
+        revisions.retain(|_, revision| revision.strong_count() != 0);
+        entries
+            .iter_mut()
+            .filter(|entry| {
+                entry.winner
+                    && !entry.legacy
+                    && entry.kind == WorkflowKind::Instruction
+                    && entry.status == WorkflowStatus::Valid
+            })
+            .filter_map(|entry| {
+                let binding = bindings.get(&entry.id)?;
+                let identity = Sha256::new()
+                    .chain_update(binding.metadata_identity())
+                    .chain_update(entry.content_digest.as_bytes())
+                    .finalize()
+                    .into();
+                let shared = revisions.entry(identity).or_default();
+                let revision = shared.upgrade().unwrap_or_else(|| {
+                    let revision = Arc::new(entry.revision);
+                    *shared = Arc::downgrade(&revision);
+                    revision
+                });
+                entry.revision = *revision;
+                Some(revision)
+            })
+            .collect()
+    }
+
     fn replace(
         &self,
         activation_id: &str,
@@ -439,9 +492,9 @@ impl RetainedResourceBudget {
         &self,
         store_token: u64,
         definition_bytes: usize,
-        resources: Vec<(usize, usize)>,
+        resources: &[(usize, usize)],
         limit: usize,
-    ) -> SkillResult<()> {
+    ) -> Result<(), PublicationBudgetExceeded> {
         let mut state = self.state.lock().expect("workflow retained budget lock");
         let old = state.publications.get(&store_token);
         let old_definition_bytes = old.map(|charge| charge.definition_bytes).unwrap_or(0);
@@ -459,7 +512,7 @@ impl RetainedResourceBudget {
             }
         }
         projected = projected.saturating_add(definition_bytes);
-        for (resource_id, bytes) in &resources {
+        for (resource_id, bytes) in resources {
             let remains = state.resources.get(resource_id).is_some_and(|(_, refs)| {
                 *refs > usize::from(old_resource_ids.contains(resource_id))
             });
@@ -468,22 +521,28 @@ impl RetainedResourceBudget {
             }
         }
         if projected > limit {
-            return Err(SkillError::Storage(format!(
-                "global workflow snapshot budget exceeded ({projected} > {limit} bytes)"
-            )));
+            return Err(PublicationBudgetExceeded { projected, limit });
         }
         if let Some(old) = state.publications.remove(&store_token) {
             Self::remove_charge(&mut state, old);
         }
-        Self::add_charge(&mut state, definition_bytes, &resources);
+        Self::add_charge(&mut state, definition_bytes, resources);
         state.publications.insert(
             store_token,
             ActivationBudgetCharge {
                 definition_bytes,
-                resources,
+                resources: resources.to_vec(),
             },
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("workflow retained budget lock")
+            .total_bytes
     }
 
     fn release_publication(&self, store_token: u64) {
@@ -662,118 +721,122 @@ fn stable_workspace_hash(path: &Path) -> u64 {
         })
 }
 
+#[derive(Debug, Clone, Default)]
+struct SkillCatalogPublication {
+    snapshot: WorkflowCatalogSnapshot,
+    legacy_resource_fallbacks: HashSet<SkillId>,
+    /// Other scoped publications reuse a revision only while its exact
+    /// captured source and content have a live publication owner.
+    _instruction_revisions: Vec<Arc<u64>>,
+}
+
+struct PreviousCatalog<'a> {
+    roots: &'a HashMap<SkillId, PathBuf>,
+    definitions: &'a HashMap<SkillId, SkillDefinition>,
+    resources: &'a HashMap<SkillId, SkillResourceSnapshot>,
+    catalog: &'a WorkflowCatalogSnapshot,
+    legacy_resource_fallbacks: &'a HashSet<SkillId>,
+}
+
+impl PreviousCatalog<'_> {
+    fn bundle(
+        &self,
+        entry: &WorkflowCatalogEntry,
+        root: &Path,
+    ) -> Option<(
+        &WorkflowCatalogEntry,
+        &SkillDefinition,
+        &SkillResourceSnapshot,
+    )> {
+        let id = &entry.id;
+        if self.roots.get(id)?.as_path() != root {
+            return None;
+        }
+        let old_entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|old| old.id == *id && old.source == entry.source)?;
+        Some((
+            old_entry,
+            self.definitions.get(id)?,
+            self.resources.get(id)?,
+        ))
+    }
+}
+
+fn definition_bytes(definition: Option<&SkillDefinition>) -> usize {
+    definition
+        .and_then(|definition| serde_json::to_vec(definition).ok())
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
 async fn snapshot_skill_resources(
-    roots: &HashMap<SkillId, PathBuf>,
-    definitions: &HashMap<SkillId, SkillDefinition>,
-    catalog_entries: &[WorkflowCatalogEntry],
-    previous: &HashMap<SkillId, SkillResourceSnapshot>,
+    roots: &mut HashMap<SkillId, PathBuf>,
+    definitions: &mut HashMap<SkillId, SkillDefinition>,
+    catalog_entries: &mut [WorkflowCatalogEntry],
+    previous: PreviousCatalog<'_>,
     limits: SkillSnapshotLimits,
     captures: &HashMap<SkillId, Arc<CapturedSkill>>,
-) -> SkillResult<HashMap<SkillId, SkillResourceSnapshot>> {
+    authored_headers: &storage::AuthoredHeaders,
+) -> SkillResult<(HashMap<SkillId, SkillResourceSnapshot>, HashSet<SkillId>)> {
     let mut snapshots = HashMap::with_capacity(roots.len());
+    let mut legacy_resource_fallbacks = HashSet::new();
     let mut publication_bytes = 0usize;
     let mut publication_resource_count = 0usize;
-    for (skill_id, root) in roots {
-        let definition_bytes = definitions
-            .get(skill_id)
-            .and_then(|definition| serde_json::to_vec(definition).ok())
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
-        let reuses_last_known_good = catalog_entries
-            .iter()
-            .find(|entry| entry.id == *skill_id)
-            .is_some_and(|entry| entry.status == WorkflowStatus::Invalid);
-        if reuses_last_known_good {
-            if let Some(resources) = previous.get(skill_id) {
-                let resource_bytes = resources.values().map(|bytes| bytes.len()).sum::<usize>();
-                let skill_bytes = definition_bytes.saturating_add(resource_bytes);
-                if skill_bytes > limits.max_skill_bytes {
-                    return Err(SkillError::Storage(format!(
-                        "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
-                        limits.max_skill_bytes
-                    )));
+    for entry in catalog_entries {
+        let skill_id = entry.id.clone();
+        let Some(root) = roots.get(&skill_id) else {
+            continue;
+        };
+        let captured = if entry.status == WorkflowStatus::Valid {
+            Some(
+                snapshot_bundle_resources(
+                    root,
+                    definition_bytes(definitions.get(&skill_id)),
+                    limits,
+                    captures.get(&skill_id).map(Arc::as_ref),
+                    authored_headers.get(root),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (resources, skill_bytes) = match captured {
+            Some(Ok(snapshot)) => snapshot,
+            rejected => {
+                // An invalid winner still shadows lower-priority sources. Only
+                // the same source's complete last-known-good bundle may be reused.
+                let old_bundle = previous.bundle(entry, root);
+                if let Some(Err(error)) = rejected {
+                    if let Some((old_entry, definition, _)) = old_bundle {
+                        // Preserve legacy admission only when the last publication
+                        // could already admit this exact bundle.
+                        if old_entry.status == WorkflowStatus::Valid
+                            || previous.legacy_resource_fallbacks.contains(&skill_id)
+                        {
+                            legacy_resource_fallbacks.insert(skill_id.clone());
+                        }
+                        let shadowed = std::mem::take(&mut entry.shadowed_candidates);
+                        *entry = old_entry.clone();
+                        entry.shadowed_candidates = shadowed;
+                        definitions.insert(skill_id.clone(), definition.clone());
+                    }
+                    entry.status = WorkflowStatus::Invalid;
+                    entry.last_error = Some(error.to_string());
                 }
-                publication_bytes = publication_bytes.saturating_add(skill_bytes);
-                publication_resource_count =
-                    publication_resource_count.saturating_add(resources.len());
-                if publication_bytes > limits.max_publication_bytes
-                    || publication_resource_count > MAX_WORKFLOW_RESOURCES_PER_PUBLICATION
-                {
-                    return Err(SkillError::Storage(
-                        "workflow catalog publication exceeds snapshot limits".to_string(),
-                    ));
-                }
-                snapshots.insert(skill_id.clone(), resources.clone());
-                continue;
+                let Some((_, definition, resources)) = old_bundle else {
+                    roots.remove(&skill_id);
+                    definitions.remove(&skill_id);
+                    continue;
+                };
+                let bytes = definition_bytes(Some(definition))
+                    .saturating_add(resources.values().map(|bytes| bytes.len()).sum());
+                (resources.clone(), bytes)
             }
-        }
-        let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
-            .await
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or(0);
-        if skill_markdown_bytes > limits.max_file_bytes {
-            return Err(SkillError::Storage(format!(
-                "workflow '{skill_id}' SKILL.md exceeds per-file limit ({skill_markdown_bytes} > {} bytes)",
-                limits.max_file_bytes
-            )));
-        }
-        let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
-            root,
-            MAX_WORKFLOW_RESOURCES_PER_SKILL,
-            MAX_WORKFLOW_RESOURCE_PATH_BYTES,
-        )?;
-        let mut resources = HashMap::with_capacity(paths.len());
-        let mut resource_bytes = 0usize;
-        for relative_path in paths {
-            if let Some(bytes) = captures
-                .get(skill_id)
-                .and_then(|capture| capture.policies.get(&relative_path))
-            {
-                resource_bytes = resource_bytes.saturating_add(bytes.len());
-                resources.insert(relative_path, bytes.clone());
-                continue;
-            }
-            let resource = root.join(&relative_path);
-            let file_bytes = tokio::fs::metadata(&resource).await?.len() as usize;
-            if file_bytes > limits.max_file_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({file_bytes} > {} bytes)",
-                    limits.max_file_bytes
-                )));
-            }
-            let file = open_skill_file_no_follow(&resource).await?;
-            let mut bytes = Vec::with_capacity(file_bytes.min(limits.max_file_bytes));
-            file.take(limits.max_file_bytes.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            if bytes.len() > limits.max_file_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({} > {} bytes)",
-                    bytes.len(),
-                    limits.max_file_bytes
-                )));
-            }
-            resource_bytes = resource_bytes.saturating_add(bytes.len());
-            let projected_skill_bytes = definition_bytes
-                .saturating_add(skill_markdown_bytes)
-                .saturating_add(resource_bytes);
-            if projected_skill_bytes > limits.max_skill_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' snapshot exceeds per-skill limit ({projected_skill_bytes} > {} bytes)",
-                    limits.max_skill_bytes
-                )));
-            }
-            resources.insert(relative_path, std::sync::Arc::new(bytes));
-        }
-        let skill_bytes = definition_bytes
-            .saturating_add(skill_markdown_bytes)
-            .saturating_add(resource_bytes);
-        if skill_bytes > limits.max_skill_bytes {
-            return Err(SkillError::Storage(format!(
-                "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
-                limits.max_skill_bytes
-            )));
-        }
+        };
         publication_bytes = publication_bytes.saturating_add(skill_bytes);
         if publication_bytes > limits.max_publication_bytes {
             return Err(SkillError::Storage(format!(
@@ -787,9 +850,74 @@ async fn snapshot_skill_resources(
                 "workflow catalog resource count exceeds limit ({publication_resource_count} > {MAX_WORKFLOW_RESOURCES_PER_PUBLICATION})"
             )));
         }
-        snapshots.insert(skill_id.clone(), std::sync::Arc::new(resources));
+        snapshots.insert(skill_id, resources);
     }
-    Ok(snapshots)
+    Ok((snapshots, legacy_resource_fallbacks))
+}
+
+async fn snapshot_bundle_resources(
+    root: &Path,
+    definition_bytes: usize,
+    limits: SkillSnapshotLimits,
+    capture: Option<&CapturedSkill>,
+    authored_header: Option<&std::fs::Metadata>,
+) -> SkillResult<(SkillResourceSnapshot, usize)> {
+    let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
+        .await
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    if skill_markdown_bytes > limits.max_file_bytes {
+        return Err(SkillError::Storage(format!(
+            "SKILL.md exceeds per-file limit ({skill_markdown_bytes} > {} bytes)",
+            limits.max_file_bytes
+        )));
+    }
+    let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
+        root,
+        MAX_WORKFLOW_RESOURCES_PER_SKILL,
+        MAX_WORKFLOW_RESOURCE_PATH_BYTES,
+    )?;
+    let mut resources = HashMap::with_capacity(paths.len());
+    let mut resource_bytes = 0usize;
+    for relative_path in paths {
+        if let Some(bytes) = capture.and_then(|capture| capture.policies.get(&relative_path)) {
+            resource_bytes = resource_bytes.saturating_add(bytes.len());
+            resources.insert(relative_path, bytes.clone());
+            continue;
+        }
+        let bytes = read_skill_file_bounded(
+            &root.join(&relative_path),
+            "resource",
+            limits.max_file_bytes,
+        )
+        .await?;
+        resource_bytes = resource_bytes.saturating_add(bytes.len());
+        let projected_skill_bytes = definition_bytes
+            .saturating_add(skill_markdown_bytes)
+            .saturating_add(resource_bytes);
+        if projected_skill_bytes > limits.max_skill_bytes {
+            return Err(SkillError::Storage(format!(
+                "snapshot exceeds per-skill limit ({projected_skill_bytes} > {} bytes)",
+                limits.max_skill_bytes
+            )));
+        }
+        resources.insert(relative_path, std::sync::Arc::new(bytes));
+    }
+    let skill_bytes = definition_bytes
+        .saturating_add(skill_markdown_bytes)
+        .saturating_add(resource_bytes);
+    if skill_bytes > limits.max_skill_bytes {
+        return Err(SkillError::Storage(format!(
+            "snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
+            limits.max_skill_bytes
+        )));
+    }
+    // A directory exchange during discovery can leave an old header and new
+    // resources. Route that bundle through the same isolated fallback as a bad resource.
+    if let Some(header) = authored_header {
+        storage::verify_authored_header(root, header).await?;
+    }
+    Ok((Arc::new(resources), skill_bytes))
 }
 
 fn skill_metadata_flag(skill: &SkillDefinition, name: &str) -> bool {
@@ -882,6 +1010,88 @@ fn preserve_catalog_entry_revisions(
 /// ```
 type ProjectWorkspaceStoreKey = (String, PathBuf, Option<PathBuf>);
 type SharedSkillStore = std::sync::Arc<SkillStore>;
+type SharedScopedSkillStores = Arc<RwLock<ScopedSkillStores>>;
+
+#[derive(Clone, Copy)]
+enum CachePressure {
+    Slots,
+    PublicationBytes,
+}
+
+#[derive(Default)]
+struct ScopedSkillStores {
+    modes: HashMap<String, SharedSkillStore>,
+    workspaces: HashMap<PathBuf, SharedSkillStore>,
+    projects: HashMap<ProjectWorkspaceStoreKey, SharedSkillStore>,
+}
+
+impl ScopedSkillStores {
+    fn is_empty(&self) -> bool {
+        self.modes.is_empty() && self.workspaces.is_empty() && self.projects.is_empty()
+    }
+
+    fn reclaim_one(&mut self, pressure: CachePressure) -> bool {
+        reclaim_idle_store(&mut self.modes, pressure)
+            || reclaim_idle_store(&mut self.workspaces, pressure)
+            || reclaim_idle_store(&mut self.projects, pressure)
+    }
+}
+
+/// Keep aliases of a store together. The cache write guard excludes normal
+/// lookups and owned pin/child guards keep their state fixed through retirement.
+fn reclaim_idle_store<K: Eq + Hash>(
+    stores: &mut HashMap<K, SharedSkillStore>,
+    pressure: CachePressure,
+) -> bool {
+    let mut aliases = BTreeMap::<_, usize>::new();
+    for store in stores.values() {
+        *aliases.entry(store.store_token).or_default() += 1;
+    }
+    for (token, alias_count) in aliases {
+        let store = stores
+            .values()
+            .find(|store| store.store_token == token)
+            .expect("cached scope must have a key");
+        let pins = if Arc::strong_count(store) == alias_count {
+            store.pinned_activations.clone().try_read_owned().ok()
+        } else {
+            None
+        };
+        let parent_is_idle = pins.as_ref().is_some_and(|pins| pins.by_id.is_empty());
+        // Children of a protected store cannot free a slot in this cache.
+        // Their independent publications can still return shared bytes.
+        if !parent_is_idle && matches!(pressure, CachePressure::Slots) {
+            continue;
+        }
+        let Ok(mut children) = store.scoped_stores.clone().try_write_owned() else {
+            continue;
+        };
+        if children.reclaim_one(pressure) {
+            return true;
+        }
+        // A descendant can be retained by a session or a caller even when
+        // its parent has no references outside the cache.
+        if !parent_is_idle || !children.is_empty() {
+            continue;
+        }
+
+        let mut entries = stores.extract_if(|_, store| store.store_token == token);
+        let (key, store) = entries.next().expect("cached scope must have a key");
+        let keys = std::iter::once(key)
+            .chain(entries.map(|(key, _)| key))
+            .collect::<Vec<_>>();
+        match Arc::try_unwrap(store) {
+            Ok(store) => {
+                drop(store);
+                return true;
+            }
+            // A watcher can upgrade its weak reference after the initial
+            // count check. Retain the same instance when that happens.
+            Err(store) => stores.extend(keys.into_iter().map(|key| (key, store.clone()))),
+        }
+    }
+    false
+}
 
 const SKILL_WATCH_CHANNEL_CAPACITY: usize = 256;
 const SKILL_WATCH_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
@@ -1143,7 +1353,7 @@ pub struct SkillStore {
     /// Activations retain these snapshots after a watcher publishes a newer bundle.
     skill_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
     /// Policy metadata for prompt/explicit Skill activation only.
-    skill_catalog: RwLock<WorkflowCatalogSnapshot>,
+    skill_catalog: RwLock<SkillCatalogPublication>,
     /// Current valid Instruction source bindings, committed with the catalog.
     instruction_sources: RwLock<HashMap<SkillId, SourceBinding>>,
     #[cfg(test)]
@@ -1159,19 +1369,18 @@ pub struct SkillStore {
     catalog: RwLock<WorkflowCatalogSnapshot>,
     /// Session/activation-scoped immutable workflow generations. The cache is bounded,
     /// and normal runtime finalization explicitly removes completed activations.
-    pinned_activations: RwLock<PinnedSkillActivations>,
-    next_revision: AtomicU64,
+    pinned_activations: Arc<RwLock<PinnedSkillActivations>>,
     watcher_started: AtomicBool,
     watcher_counters: Arc<SkillWatcherCounters>,
+    watcher_lifetime: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     processed_watcher_batches: tokio::sync::broadcast::Sender<ProcessedWatcherBatch>,
     #[cfg(test)]
     watcher_test_state: tokio::sync::watch::Sender<SkillWatcherTestState>,
     catalog_events: tokio::sync::broadcast::Sender<WorkflowCatalogEvent>,
     reload_lock: tokio::sync::Mutex<()>,
-    mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
-    workspace_stores: RwLock<HashMap<PathBuf, std::sync::Arc<SkillStore>>>,
-    project_workspace_stores: RwLock<HashMap<ProjectWorkspaceStoreKey, SharedSkillStore>>,
+    scoped_stores: SharedScopedSkillStores,
+    root_scoped_stores: Option<Weak<RwLock<ScopedSkillStores>>>,
     retained_budget: Arc<RetainedResourceBudget>,
     snapshot_limits: SkillSnapshotLimits,
     project_home_dir: Option<PathBuf>,
@@ -1408,6 +1617,7 @@ impl SkillStore {
         workspace_overlay_dir: Option<PathBuf>,
     ) -> Self {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
+        let (watcher_lifetime, _) = tokio::sync::watch::channel(());
         #[cfg(test)]
         let (processed_watcher_batches, _) = tokio::sync::broadcast::channel(128);
         #[cfg(test)]
@@ -1418,7 +1628,7 @@ impl SkillStore {
             skills: RwLock::new(HashMap::new()),
             skill_roots: RwLock::new(HashMap::new()),
             skill_resources: RwLock::new(HashMap::new()),
-            skill_catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
+            skill_catalog: RwLock::new(SkillCatalogPublication::default()),
             instruction_sources: RwLock::new(HashMap::new()),
             #[cfg(test)]
             projection_hook: Mutex::new(None),
@@ -1428,19 +1638,18 @@ impl SkillStore {
             workflow_roots: RwLock::new(HashMap::new()),
             workflow_resources: RwLock::new(HashMap::new()),
             catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
-            pinned_activations: RwLock::new(PinnedSkillActivations::default()),
-            next_revision: AtomicU64::new(1),
+            pinned_activations: Arc::default(),
             watcher_started: AtomicBool::new(false),
             watcher_counters: Arc::new(SkillWatcherCounters::default()),
+            watcher_lifetime,
             #[cfg(test)]
             processed_watcher_batches,
             #[cfg(test)]
             watcher_test_state,
             catalog_events,
             reload_lock: tokio::sync::Mutex::new(()),
-            mode_stores: RwLock::new(HashMap::new()),
-            workspace_stores: RwLock::new(HashMap::new()),
-            project_workspace_stores: RwLock::new(HashMap::new()),
+            scoped_stores: Arc::default(),
+            root_scoped_stores: None,
             retained_budget,
             snapshot_limits,
             project_home_dir,
@@ -1523,11 +1732,11 @@ impl SkillStore {
     /// Returns `SkillError` if the skills directory cannot be read.
     async fn load(&self) -> SkillResult<usize> {
         let _reload_guard = self.reload_lock.lock().await;
-        self.load_locked().await
+        self.load_locked(None).await
     }
 
-    async fn load_locked(&self) -> SkillResult<usize> {
-        let result = self.prepare_publication().await;
+    async fn load_locked(&self, scope_owner: Option<&SkillStore>) -> SkillResult<usize> {
+        let result = self.prepare_publication(scope_owner).await;
         if result.is_err() {
             // Management retains its old publication on refresh failure. It
             // cannot authorize progressive readers of newly observed files.
@@ -1538,13 +1747,13 @@ impl SkillStore {
         result
     }
 
-    async fn prepare_publication(&self) -> SkillResult<usize> {
+    async fn prepare_publication(&self, scope_owner: Option<&SkillStore>) -> SkillResult<usize> {
         self.retained_budget.sources.prune();
         let dirs = self.discovery_dirs_for_mode(None);
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let (mut report, captures) = load_captured_records(
+        let (mut report, captures, authored_headers) = load_captured_records(
             &dirs,
             self.snapshot_limits.max_file_bytes,
             MAX_WORKFLOWS_PER_PUBLICATION,
@@ -1621,19 +1830,20 @@ impl SkillStore {
             }
         }
 
-        let revision = self.next_revision.load(Ordering::SeqCst);
+        // A recreated scoped store cannot reissue an older selection's revision.
+        let revision = self.retained_budget.next_publication_revision();
         let (mut resolved_skills, mut resolved_roots, mut skill_entries, winner_captures) = self
             .resolve_catalog(
                 skill_loaded,
                 skill_failed,
                 &previous_skills,
                 &previous_roots,
-                &previous_skill_catalog,
+                &previous_skill_catalog.snapshot,
                 revision,
                 Some(&captures),
             )
             .await;
-        let (resolved_workflows, resolved_workflow_roots, mut workflow_entries, _) = self
+        let (mut resolved_workflows, mut resolved_workflow_roots, mut workflow_entries, _) = self
             .resolve_catalog(
                 workflow_loaded,
                 workflow_failed,
@@ -1656,26 +1866,43 @@ impl SkillStore {
         if let Some(hook) = self.source_snapshot_hook.lock().unwrap().take() {
             hook();
         }
-        let mut resolved_resources = snapshot_skill_resources(
-            &resolved_roots,
-            &resolved_skills,
-            &skill_entries,
-            &previous_resources,
+        let (mut resolved_resources, legacy_resource_fallbacks) = snapshot_skill_resources(
+            &mut resolved_roots,
+            &mut resolved_skills,
+            &mut skill_entries,
+            PreviousCatalog {
+                roots: &previous_roots,
+                definitions: &previous_skills,
+                resources: &previous_resources,
+                catalog: &previous_skill_catalog.snapshot,
+                legacy_resource_fallbacks: &previous_skill_catalog.legacy_resource_fallbacks,
+            },
             self.snapshot_limits,
             &winner_captures,
+            &authored_headers,
         )
         .await?;
-        let resolved_workflow_resources = snapshot_skill_resources(
-            &resolved_workflow_roots,
-            &resolved_workflows,
-            &workflow_entries,
-            &previous_workflow_resources,
+        let (resolved_workflow_resources, _) = snapshot_skill_resources(
+            &mut resolved_workflow_roots,
+            &mut resolved_workflows,
+            &mut workflow_entries,
+            PreviousCatalog {
+                roots: &previous_workflow_roots,
+                definitions: &previous_workflows,
+                resources: &previous_workflow_resources,
+                catalog: &previous_catalog,
+                legacy_resource_fallbacks: &HashSet::new(),
+            },
             self.snapshot_limits,
             &HashMap::new(),
+            &authored_headers,
         )
         .await?;
         let mut resolved_sources = HashMap::new();
         for entry in &mut skill_entries {
+            if entry.status != WorkflowStatus::Valid {
+                continue;
+            }
             let Some(captured) = winner_captures.get(&entry.id) else {
                 continue;
             };
@@ -1708,6 +1935,7 @@ impl SkillStore {
                             resolved_resources.remove(&entry.id);
                         }
                         if let Some(previous) = previous_skill_catalog
+                            .snapshot
                             .entries
                             .iter()
                             .find(|previous| previous.id == entry.id)
@@ -1764,7 +1992,7 @@ impl SkillStore {
         // namespaces across unrelated updates.
         preserve_catalog_entry_revisions(
             &mut skill_entries,
-            &previous_skill_catalog,
+            &previous_skill_catalog.snapshot,
             &skill_definition_changed,
         );
         preserve_catalog_entry_revisions(
@@ -1772,6 +2000,16 @@ impl SkillStore {
             &previous_catalog,
             &workflow_definition_changed,
         );
+        let instruction_revisions = self
+            .retained_budget
+            .share_instruction_revisions(&mut skill_entries, &resolved_sources);
+        // Another scope can validate the identical definition after our
+        // proposal but before this publication reaches the shared index.
+        let revision = if instruction_revisions.iter().any(|entry| **entry > revision) {
+            self.retained_budget.next_publication_revision()
+        } else {
+            revision
+        };
         let next_skill_catalog = WorkflowCatalogSnapshot {
             revision,
             entries: skill_entries,
@@ -1780,7 +2018,7 @@ impl SkillStore {
             revision,
             entries: workflow_entries,
         };
-        let mut comparable_previous_skill_catalog = previous_skill_catalog.clone();
+        let mut comparable_previous_skill_catalog = previous_skill_catalog.snapshot.clone();
         comparable_previous_skill_catalog.revision = revision;
         let mut comparable_previous = previous_catalog.clone();
         comparable_previous.revision = revision;
@@ -1788,6 +2026,7 @@ impl SkillStore {
             && resolved_roots == previous_roots
             && resolved_resources == previous_resources
             && next_skill_catalog == comparable_previous_skill_catalog
+            && legacy_resource_fallbacks == previous_skill_catalog.legacy_resource_fallbacks
             && resolved_sources == previous_sources
             && resolved_workflows == previous_workflows
             && resolved_workflow_roots == previous_workflow_roots
@@ -1816,6 +2055,12 @@ impl SkillStore {
                     .or_insert(bytes.len());
             }
         }
+        let publication_resources = publication_resources.into_iter().collect::<Vec<_>>();
+        let publication_bytes = publication_resources
+            .iter()
+            .fold(publication_definition_bytes, |total, (_, bytes)| {
+                total.saturating_add(*bytes)
+            });
         // Acquire every async publication guard before changing the synchronous
         // shared budget. After `replace_publication` succeeds there are no await
         // points until all correlated maps and the revision are committed.
@@ -1829,17 +2074,32 @@ impl SkillStore {
         let mut workflow_roots_guard = self.workflow_roots.write().await;
         let mut workflow_resources_guard = self.workflow_resources.write().await;
         let mut catalog_guard = self.catalog.write().await;
-        self.retained_budget.replace_publication(
+        while let Err(error) = self.retained_budget.replace_publication(
             self.store_token,
             publication_definition_bytes,
-            publication_resources.into_iter().collect(),
+            &publication_resources,
             self.snapshot_limits.max_retained_bytes,
-        )?;
-        self.next_revision.fetch_add(1, Ordering::SeqCst);
+        ) {
+            let Some(owner) = scope_owner else {
+                return Err(SkillError::Storage(error.to_string()));
+            };
+            // The incoming publication is still private and its captured bytes
+            // stay the same on retry. The admission guard prevents cache growth
+            // while each retry removes one actual store.
+            if publication_bytes > self.snapshot_limits.max_retained_bytes
+                || !owner.reclaim_one_scoped_store().await
+            {
+                return Err(SkillError::Storage(error.to_string()));
+            }
+        }
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
-        *skill_catalog_guard = next_skill_catalog.clone();
+        *skill_catalog_guard = SkillCatalogPublication {
+            snapshot: next_skill_catalog.clone(),
+            legacy_resource_fallbacks,
+            _instruction_revisions: instruction_revisions,
+        };
         *sources_guard = resolved_sources;
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
@@ -1856,7 +2116,7 @@ impl SkillStore {
         drop(skills_guard);
         drop(_snapshot_guard);
         self.publish_catalog_events(
-            &previous_skill_catalog,
+            &previous_skill_catalog.snapshot,
             &next_skill_catalog,
             &skill_definition_changed,
         );
@@ -2119,15 +2379,20 @@ impl SkillStore {
         self: &Arc<Self>,
         mode: Option<&str>,
     ) -> SkillResult<PreparedSkillInputStore> {
-        let store = self
-            .skill_store_for_mode(mode)
-            .await?
-            .unwrap_or_else(|| self.clone());
+        let store = self.retain_mode_store(mode).await?;
         store.reload().await?;
         Ok(PreparedSkillInputStore {
             store,
             mode: mode.map(str::to_owned),
         })
+    }
+
+    /// Retain the effective catalog store for the lifetime of a host operation.
+    pub async fn retain_mode_store(self: &Arc<Self>, mode: Option<&str>) -> SkillResult<Arc<Self>> {
+        Ok(self
+            .skill_store_for_mode(mode)
+            .await?
+            .unwrap_or_else(|| self.clone()))
     }
 
     /// Fresh, source-bound ordinary Instruction metadata for a trusted host view.
@@ -2138,8 +2403,35 @@ impl SkillStore {
         mode: Option<&str>,
         access: &crate::progressive::SkillCatalogEligibility,
     ) -> SkillResult<crate::progressive::SkillCatalogSnapshot> {
-        self.progressive_projection(mode, access, |_, snapshot, _, _| Ok(snapshot.clone()))
+        self.progressive_projection(mode, access, |_, snapshot, _, _, _| Ok(snapshot.clone()))
             .await
+    }
+
+    /// Match against the same validated publication used to authorize the
+    /// advertised entries. Denied metadata stays inside the projection.
+    pub async fn progressive_automatic_catalog_for_mode(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        query: &str,
+    ) -> SkillResult<(
+        crate::progressive::SkillCatalogSnapshot,
+        Vec<crate::progressive::SkillCatalogMetadata>,
+        crate::capability_discovery::AutomaticSkillOutcome,
+    )> {
+        self.progressive_projection(mode, access, |_, snapshot, _, _, published| {
+            let (candidates, outcome) = crate::progressive::automatic_skill_prompt_candidates(
+                published,
+                &snapshot.entries,
+                query,
+            );
+            Ok((
+                snapshot.clone(),
+                candidates.into_iter().cloned().collect(),
+                outcome,
+            ))
+        })
+        .await
     }
 
     async fn progressive_projection<T>(
@@ -2151,13 +2443,15 @@ impl SkillStore {
             &crate::progressive::SkillCatalogSnapshot,
             &HashMap<SkillId, SourceBinding>,
             &HashMap<SkillId, SkillResourceSnapshot>,
+            &[crate::progressive::SkillCatalogMetadata],
         ) -> SkillResult<T>,
     ) -> SkillResult<T> {
         let mode_store = self.skill_store_for_mode(mode).await?;
         let store = mode_store.as_deref().unwrap_or(self);
         store.reload().await?;
         let _publication = store.snapshot_publish_lock.read().await;
-        let catalog = store.skill_catalog.read().await;
+        let skill_catalog = store.skill_catalog.read().await;
+        let catalog = &skill_catalog.snapshot;
         let definitions = store.skills.read().await;
         let bindings = store.instruction_sources.read().await;
         let resources = store.skill_resources.read().await;
@@ -2211,7 +2505,7 @@ impl SkillStore {
             catalog.revision,
             entries,
         )?;
-        project(store, &snapshot, &bindings, &resources)
+        project(store, &snapshot, &bindings, &resources, &metadata)
     }
 
     /// Trusted-host foundation: current eligibility/publication must agree with
@@ -2268,7 +2562,7 @@ impl SkillStore {
             ));
         }
         let _operation = self.retained_budget.selected.operation()?;
-        self.progressive_projection(mode, access, |store, catalog, bindings, resources| {
+        self.progressive_projection(mode, access, |store, catalog, bindings, resources, _| {
             if expected.identity != catalog.identity {
                 return Err(SkillError::Validation(
                     "selected catalog generation changed".into(),
@@ -2396,7 +2690,7 @@ impl SkillStore {
     /// the public Workflow catalog, but from its independent namespace.
     pub async fn skill_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
-        self.skill_catalog.read().await.clone()
+        self.skill_catalog.read().await.snapshot.clone()
     }
 
     #[cfg(test)]
@@ -2441,7 +2735,7 @@ impl SkillStore {
     ) -> (WorkflowCatalogSnapshot, WorkflowCatalogSnapshot) {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         (
-            self.skill_catalog.read().await.clone(),
+            self.skill_catalog.read().await.snapshot.clone(),
             self.catalog.read().await.clone(),
         )
     }
@@ -2575,7 +2869,16 @@ impl SkillStore {
         skills.sort_by_key(|skill| skill.name.clone());
         let roots = store.skill_roots.read().await.clone();
         let resources = store.skill_resources.read().await.clone();
-        let catalog = store.skill_catalog.read().await.clone();
+        let skill_catalog = store.skill_catalog.read().await;
+        let mut catalog = skill_catalog.snapshot.clone();
+        for entry in &mut catalog.entries {
+            // Keep the live resource diagnostic separate from the previously
+            // admitted identity stored in a restorable legacy activation.
+            if skill_catalog.legacy_resource_fallbacks.contains(&entry.id) {
+                entry.status = WorkflowStatus::Valid;
+                entry.last_error = None;
+            }
+        }
         Ok((skills, roots, resources, catalog))
     }
 
@@ -2801,14 +3104,36 @@ impl SkillStore {
         &self,
         activation_id: &str,
     ) -> Option<SkillActivationSnapshot> {
+        self.export_activation_snapshot_for(activation_id, None)
+            .await
+    }
+
+    pub async fn export_selected_skill_snapshot(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+    ) -> Option<SkillActivationSnapshot> {
+        self.export_activation_snapshot_for(activation_id, Some(skill_id))
+            .await
+    }
+
+    async fn export_activation_snapshot_for(
+        &self,
+        activation_id: &str,
+        selected_skill_id: Option<&str>,
+    ) -> Option<SkillActivationSnapshot> {
         let activations = self.pinned_activations.read().await;
         let activation = activations.by_id.get(activation_id)?;
+        if selected_skill_id.is_some_and(|id| !activation.skills.contains_key(id)) {
+            return None;
+        }
         Some(SkillActivationSnapshot {
             catalog_revision: activation.catalog_revision,
             selected_skill_mode: activation.selected_skill_mode.clone(),
             skills: activation
                 .skills
                 .iter()
+                .filter(|(id, _)| selected_skill_id.is_none_or(|selected| id.as_str() == selected))
                 .map(|(id, skill)| {
                     (
                         id.clone(),
@@ -3157,6 +3482,71 @@ impl SkillStore {
         self.catalog_events.subscribe()
     }
 
+    fn new_scoped_store(
+        &self,
+        config: SkillStoreConfig,
+        project_home: Option<PathBuf>,
+        workspace: Option<PathBuf>,
+    ) -> SharedSkillStore {
+        let mut store = Self::new_with_resource_scope(
+            config,
+            self.retained_budget.clone(),
+            self.snapshot_limits,
+            project_home,
+            workspace,
+        );
+        store.root_scoped_stores = Some(
+            self.root_scoped_stores
+                .clone()
+                .unwrap_or_else(|| Arc::downgrade(&self.scoped_stores)),
+        );
+        Arc::new(store)
+    }
+
+    /// Called with the shared scoped-admission guard, outside every cache
+    /// lock. A budget error leaves the accounting unchanged.
+    async fn load_scoped_store(&self, store: &SkillStore) -> SkillResult<()> {
+        let _reload_guard = store.reload_lock.lock().await;
+        store.load_locked(Some(self)).await?;
+        Ok(())
+    }
+
+    async fn reclaim_one_scoped_store(&self) -> bool {
+        if self
+            .scoped_stores
+            .write()
+            .await
+            .reclaim_one(CachePressure::PublicationBytes)
+        {
+            return true;
+        }
+        let Some(root) = self.root_scoped_stores.as_ref().and_then(Weak::upgrade) else {
+            return false;
+        };
+        let mut stores = root.write().await;
+        stores.reclaim_one(CachePressure::PublicationBytes)
+    }
+
+    fn start_scoped_store(&self, store: &SharedSkillStore, scope: Option<String>) {
+        store.start_live_reload();
+        let mut events = store.subscribe_workflow_catalog();
+        let aggregate = self.catalog_events.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(mut event) => {
+                        if let Some(scope) = &scope {
+                            event.scope.clone_from(scope);
+                        }
+                        let _ = aggregate.send(event);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     /// Resolve a cached catalog/store for a per-session mode override. This keeps mode-specific
     /// selection on the same validated snapshot/LKG path as the default catalog instead of
     /// bypassing workflow metadata through a parallel directory scan.
@@ -3170,46 +3560,40 @@ impl SkillStore {
         if Self::normalize_mode(self.config.active_mode.as_deref()).as_deref() == Some(&mode) {
             return Ok(None);
         }
-        if let Some(store) = self.mode_stores.read().await.get(&mode).cloned() {
+        if let Some(store) = self.scoped_stores.read().await.modes.get(&mode).cloned() {
             return Ok(Some(store));
         }
-        let mut stores = self.mode_stores.write().await;
-        if let Some(store) = stores.get(&mode).cloned() {
-            return Ok(Some(store));
+        let _admission = self.retained_budget.scoped_admission.lock().await;
+        {
+            let mut scoped = self.scoped_stores.write().await;
+            let stores = &mut scoped.modes;
+            if let Some(store) = stores.get(&mode) {
+                return Ok(Some(store.clone()));
+            }
+            while stores.len() >= MAX_CACHED_MODE_STORES {
+                if !reclaim_idle_store(stores, CachePressure::Slots) {
+                    return Err(SkillError::Storage(format!(
+                        "cached workflow mode store capacity ({MAX_CACHED_MODE_STORES}) reached"
+                    )));
+                }
+            }
         }
-        if stores.len() >= MAX_CACHED_MODE_STORES {
-            return Err(SkillError::Storage(format!(
-                "cached workflow mode store capacity ({MAX_CACHED_MODE_STORES}) reached"
-            )));
-        }
-        let store = std::sync::Arc::new(SkillStore::new_with_resource_scope(
+        let store = self.new_scoped_store(
             SkillStoreConfig {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: self.config.project_dir.clone(),
                 active_mode: Some(mode.clone()),
             },
-            self.retained_budget.clone(),
-            self.snapshot_limits,
             self.project_home_dir.clone(),
             self.workspace_overlay_dir.clone(),
-        ));
-        store.load().await?;
-        store.start_live_reload();
-
-        let mut events = store.subscribe_workflow_catalog();
-        let aggregate = self.catalog_events.clone();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        let _ = aggregate.send(event);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        stores.insert(mode, store.clone());
+        );
+        self.load_scoped_store(&store).await?;
+        self.start_scoped_store(&store, None);
+        self.scoped_stores
+            .write()
+            .await
+            .modes
+            .insert(mode, store.clone());
         Ok(Some(store))
     }
 
@@ -3281,85 +3665,66 @@ impl SkillStore {
         // immutable bytes, deleting the workspace must not make its store
         // unreachable merely because canonicalization now fails.
         if let Some(store) = self
-            .workspace_stores
+            .scoped_stores
             .read()
             .await
+            .workspaces
             .get(&requested_workspace)
             .cloned()
         {
             return Ok(store);
         }
         let workspace = tokio::fs::canonicalize(workspace).await?;
-        let cached_canonical = self.workspace_stores.read().await.get(&workspace).cloned();
-        if let Some(store) = cached_canonical {
-            let mut stores = self.workspace_stores.write().await;
-            if !stores.contains_key(&requested_workspace)
-                && stores.len() >= MAX_CACHED_WORKSPACE_ALIASES
-            {
-                return Err(SkillError::Storage(format!(
-                    "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
-                )));
+        let _admission = self.retained_budget.scoped_admission.lock().await;
+        {
+            let mut scoped = self.scoped_stores.write().await;
+            let stores = &mut scoped.workspaces;
+            if let Some(store) = stores.get(&requested_workspace) {
+                return Ok(store.clone());
             }
-            stores.insert(requested_workspace, store.clone());
-            return Ok(store);
-        }
-        let mut stores = self.workspace_stores.write().await;
-        if let Some(store) = stores.get(&workspace).cloned() {
-            if !stores.contains_key(&requested_workspace)
-                && stores.len() >= MAX_CACHED_WORKSPACE_ALIASES
-            {
-                return Err(SkillError::Storage(format!(
-                    "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
-                )));
+            loop {
+                let new_store = !stores.contains_key(&workspace);
+                let new_aliases = 1 + usize::from(new_store && requested_workspace != workspace);
+                let store_count = stores
+                    .values()
+                    .map(|store| store.store_token)
+                    .collect::<HashSet<_>>()
+                    .len();
+                let pressure = if new_store && store_count >= MAX_CACHED_WORKSPACE_STORES {
+                    format!(
+                        "cached workflow workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
+                    )
+                } else if stores.len() + new_aliases > MAX_CACHED_WORKSPACE_ALIASES {
+                    format!(
+                        "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
+                    )
+                } else {
+                    break;
+                };
+                if !reclaim_idle_store(stores, CachePressure::Slots) {
+                    return Err(SkillError::Storage(pressure));
+                }
             }
-            stores.insert(requested_workspace, store.clone());
-            return Ok(store);
+            if let Some(store) = stores.get(&workspace).cloned() {
+                stores.insert(requested_workspace, store.clone());
+                return Ok(store);
+            }
         }
-        let unique_store_count = stores
-            .values()
-            .map(Arc::as_ptr)
-            .collect::<HashSet<_>>()
-            .len();
-        if unique_store_count >= MAX_CACHED_WORKSPACE_STORES {
-            return Err(SkillError::Storage(format!(
-                "cached workflow workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
-            )));
-        }
-        let new_aliases = 1 + usize::from(requested_workspace != workspace);
-        if stores.len().saturating_add(new_aliases) > MAX_CACHED_WORKSPACE_ALIASES {
-            return Err(SkillError::Storage(format!(
-                "cached workflow workspace alias capacity ({MAX_CACHED_WORKSPACE_ALIASES}) reached"
-            )));
-        }
-        let store = std::sync::Arc::new(SkillStore::new_with_shared_snapshot_state(
+        let store = self.new_scoped_store(
             SkillStoreConfig {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: Some(workspace.clone()),
                 active_mode: self.config.active_mode.clone(),
             },
-            self.retained_budget.clone(),
-            self.snapshot_limits,
-        ));
-        store.load().await?;
-        store.start_live_reload();
-
+            None,
+            Some(workspace.clone()),
+        );
+        self.load_scoped_store(&store).await?;
         let scope = format!("workspace:{:016x}", stable_workspace_hash(&workspace));
-        let mut events = store.subscribe_workflow_catalog();
-        let aggregate = self.catalog_events.clone();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(mut event) => {
-                        event.scope = scope.clone();
-                        let _ = aggregate.send(event);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        stores.insert(workspace, store.clone());
-        stores.insert(requested_workspace, store.clone());
+        self.start_scoped_store(&store, Some(scope));
+        let mut scoped = self.scoped_stores.write().await;
+        scoped.workspaces.insert(workspace, store.clone());
+        scoped.workspaces.insert(requested_workspace, store.clone());
         Ok(store)
     }
 
@@ -3385,39 +3750,36 @@ impl SkillStore {
             project_home.clone(),
             workspace.clone(),
         );
-        if let Some(store) = self
-            .project_workspace_stores
-            .read()
-            .await
-            .get(&key)
-            .cloned()
+        if let Some(store) = self.scoped_stores.read().await.projects.get(&key).cloned() {
+            return Ok(store);
+        }
+
+        let _admission = self.retained_budget.scoped_admission.lock().await;
         {
-            return Ok(store);
+            let mut scoped = self.scoped_stores.write().await;
+            let stores = &mut scoped.projects;
+            if let Some(store) = stores.get(&key) {
+                return Ok(store.clone());
+            }
+            while stores.len() >= MAX_CACHED_WORKSPACE_STORES {
+                if !reclaim_idle_store(stores, CachePressure::Slots) {
+                    return Err(SkillError::Storage(format!(
+                        "cached Project/workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
+                    )));
+                }
+            }
         }
 
-        let mut stores = self.project_workspace_stores.write().await;
-        if let Some(store) = stores.get(&key).cloned() {
-            return Ok(store);
-        }
-        if stores.len() >= MAX_CACHED_WORKSPACE_STORES {
-            return Err(SkillError::Storage(format!(
-                "cached Project/workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
-            )));
-        }
-
-        let store = std::sync::Arc::new(SkillStore::new_with_resource_scope(
+        let store = self.new_scoped_store(
             SkillStoreConfig {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: None,
                 active_mode: self.config.active_mode.clone(),
             },
-            self.retained_budget.clone(),
-            self.snapshot_limits,
             Some(project_home),
             workspace.clone(),
-        ));
-        store.load().await?;
-        store.start_live_reload();
+        );
+        self.load_scoped_store(&store).await?;
 
         let scope = match workspace.as_deref() {
             Some(workspace) => format!(
@@ -3427,60 +3789,38 @@ impl SkillStore {
             ),
             None => format!("project:{project_id}"),
         };
-        let mut events = store.subscribe_workflow_catalog();
-        let aggregate = self.catalog_events.clone();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(mut event) => {
-                        event.scope = scope.clone();
-                        let _ = aggregate.send(event);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        stores.insert(key, store.clone());
+        self.start_scoped_store(&store, Some(scope));
+        self.scoped_stores
+            .write()
+            .await
+            .projects
+            .insert(key, store.clone());
         Ok(store)
     }
 
     pub(crate) async fn cached_workspace_stores(&self) -> Vec<std::sync::Arc<SkillStore>> {
-        let mut unique = Vec::new();
-        let workspace_stores = self.workspace_stores.read().await;
-        let project_workspace_stores = self.project_workspace_stores.read().await;
-        for store in workspace_stores
+        let scoped = self.scoped_stores.read().await;
+        let mut seen = HashSet::new();
+        scoped
+            .workspaces
             .values()
-            .chain(project_workspace_stores.values())
-        {
-            if !unique
-                .iter()
-                .any(|existing| std::sync::Arc::ptr_eq(existing, store))
-            {
-                unique.push(store.clone());
-            }
-        }
-        unique
+            .chain(scoped.projects.values())
+            .filter(|store| seen.insert(store.store_token))
+            .cloned()
+            .collect()
     }
 
     async fn cached_dependent_stores(&self) -> Vec<std::sync::Arc<SkillStore>> {
-        let mut unique = HashMap::<u64, std::sync::Arc<SkillStore>>::new();
-        for store in self.mode_stores.read().await.values() {
-            unique
-                .entry(store.store_token)
-                .or_insert_with(|| store.clone());
-        }
-        for store in self.workspace_stores.read().await.values() {
-            unique
-                .entry(store.store_token)
-                .or_insert_with(|| store.clone());
-        }
-        for store in self.project_workspace_stores.read().await.values() {
-            unique
-                .entry(store.store_token)
-                .or_insert_with(|| store.clone());
-        }
-        unique.into_values().collect()
+        let scoped = self.scoped_stores.read().await;
+        let mut seen = HashSet::new();
+        scoped
+            .modes
+            .values()
+            .chain(scoped.workspaces.values())
+            .chain(scoped.projects.values())
+            .filter(|store| seen.insert(store.store_token))
+            .cloned()
+            .collect()
     }
 
     /// Publish a global Workflow source mutation synchronously to every cached
@@ -3697,11 +4037,19 @@ impl SkillStore {
         );
         #[cfg(test)]
         let watcher_test_state = self.watcher_test_state.clone();
+        // The native watcher owns the event sender. Store drop must wake the
+        // receiving task even when no further filesystem events are emitted.
+        let mut lifetime = self.watcher_lifetime.subscribe();
 
         tokio::spawn(async move {
             // Keep the native watcher alive for exactly as long as the receiver loop.
             let mut watcher = watcher;
-            while let Some(first) = receiver.recv().await {
+            'watcher: loop {
+                let first = tokio::select! {
+                    first = receiver.recv() => first,
+                    _ = lifetime.changed() => break,
+                };
+                let Some(first) = first else { break };
                 let mut batch = vec![first];
                 let quiet = tokio::time::sleep(SKILL_WATCH_QUIET_PERIOD);
                 let maximum = tokio::time::sleep(SKILL_WATCH_MAX_BATCH);
@@ -3720,6 +4068,7 @@ impl SkillStore {
                         },
                         _ = &mut quiet => break,
                         _ = &mut maximum => break,
+                        _ = lifetime.changed() => break 'watcher,
                     }
                 }
 
@@ -3900,7 +4249,7 @@ impl SkillStore {
                 tracing::warn!("Legacy YAML migration: {}", diagnostic.message);
             }
         }
-        self.load_locked().await
+        self.load_locked(None).await
     }
 
     /// Remove a legacy workflow source and, when present, only the historical
@@ -3927,7 +4276,7 @@ impl SkillStore {
             }
             return Err(error.into());
         }
-        self.load_locked().await?;
+        self.load_locked(None).await?;
         Ok(true)
     }
 
@@ -3977,7 +4326,7 @@ impl SkillStore {
 
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let skills = self.skills.read().await;
-        let catalog = self.skill_catalog.read().await.clone();
+        let catalog = self.skill_catalog.read().await.snapshot.clone();
 
         let mut result: Vec<SkillDefinition> = skills
             .values()
@@ -5665,6 +6014,21 @@ Use this skill for testing.
         )
         .await
         .expect("unrelated workflow yaml");
+        let invalid = write_skill(&skills_dir, "invalid-flow", "invalid", "Unavailable")
+            .await
+            .expect("invalid workflow skill");
+        fs::write(
+            invalid.join("workflow.yaml"),
+            orchestration_yaml("invalid-flow", 5),
+        )
+        .await
+        .expect("valid definition with oversized resource");
+        fs::File::create(invalid.join("large.bin"))
+            .await
+            .unwrap()
+            .set_len((super::MAX_WORKFLOW_FILE_BYTES + 1) as u64)
+            .await
+            .unwrap();
         let store = SkillStore::new(SkillStoreConfig {
             skills_dir,
             ..Default::default()
@@ -5672,6 +6036,17 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
 
         let catalog = store.workflow_catalog_snapshot().await;
+        let invalid = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "invalid-flow")
+            .unwrap();
+        assert_eq!(invalid.status, WorkflowStatus::Invalid);
+        assert!(invalid
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("per-file limit"));
         let entry = catalog
             .entries
             .iter()
@@ -5742,6 +6117,72 @@ Use this skill for testing.
             .await
             .expect("LKG remains executable");
         assert_eq!(pinned.root(), original.root());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authored_workflow_refresh_rejects_a_bundle_replaced_after_discovery() {
+        const ID: &str = "authored-review";
+        let directory = tempfile::tempdir().unwrap();
+        let skills_dir = directory.path().join("skills");
+        let root = skills_dir.join(ID);
+        let replacement = directory.path().join("replacement");
+        let retained = directory.path().join("retained");
+        for (path, revision, description) in [
+            (&root, 1, "Original description"),
+            (&replacement, 2, "Revised description"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("SKILL.md"), format!("---\nname: {ID}\ndescription: {description}\nmetadata:\n  workflow_definition_authoring: 1\n---\n\nInstructions\n")).unwrap();
+            std::fs::write(path.join("workflow.yaml"), orchestration_yaml(ID, revision)).unwrap();
+        }
+        let unaffected = write_skill(&skills_dir, "unaffected-flow", "Ready", "Instructions")
+            .await
+            .unwrap();
+        fs::write(
+            unaffected.join("workflow.yaml"),
+            orchestration_yaml("unaffected-flow", 1),
+        )
+        .await
+        .unwrap();
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.unwrap();
+        store.set_source_snapshot_hook(move || {
+            std::fs::rename(&root, retained).unwrap();
+            std::fs::rename(replacement, root).unwrap();
+        });
+
+        store.reload().await.unwrap();
+        let catalog = store.workflow_catalog_snapshot().await;
+        let entry = catalog.entries.iter().find(|entry| entry.id == ID).unwrap();
+        assert_eq!(entry.status, WorkflowStatus::Invalid);
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (1, "Original description")
+        );
+        assert_eq!(
+            store.workflow_resources.read().await[ID]["workflow.yaml"].as_slice(),
+            orchestration_yaml(ID, 1).as_bytes()
+        );
+        assert!(catalog.entries.iter().any(|entry| {
+            entry.id == "unaffected-flow" && entry.status == WorkflowStatus::Valid
+        }));
+        store.reload().await.unwrap();
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == ID)
+            .unwrap();
+        assert_eq!(entry.status, WorkflowStatus::Valid);
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (2, "Revised description")
+        );
     }
 
     #[tokio::test]
@@ -6350,6 +6791,99 @@ Use this skill for testing.
     }
 
     #[tokio::test]
+    async fn scoped_typed_selection_uses_the_current_shared_source_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let skills_dir = directory.path().join("data/skills");
+        let id = "shared-proof";
+        write_skill(&skills_dir, id, "Shared Proof", "Original instructions")
+            .await
+            .unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).await.unwrap();
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            ..Default::default()
+        });
+        store.reload().await.unwrap();
+        let global = store.skill_catalog_snapshot().await.entries.remove(0);
+        let mut selection = crate::WorkflowSelection {
+            id: global.id.clone(),
+            source: global.source,
+            revision: global.revision,
+            args: serde_json::json!({}),
+        };
+        let access = crate::progressive::SkillCatalogEligibility {
+            ceiling: None,
+            explicit: std::collections::BTreeSet::from([selection.id.clone()]),
+            disabled: std::collections::BTreeSet::new(),
+            deny_all: false,
+        };
+        let scoped = store.skill_store_for_workspace(&workspace).await.unwrap();
+        let mode = scoped.retain_mode_store(Some("code")).await.unwrap();
+        let prepared = scoped
+            .prepare_current_input_store(Some("code"))
+            .await
+            .unwrap();
+        prepared
+            .with_current_inputs(&access, std::slice::from_ref(&selection), |publication| {
+                Box::pin(async move {
+                    assert_eq!(
+                        publication.inputs()[0].definition.prompt,
+                        "Original instructions"
+                    );
+                    Ok(())
+                })
+            })
+            .await
+            .expect("fresh mode store accepts the exact global selection");
+
+        write_skill(&skills_dir, id, "Shared Proof", "Changed instructions")
+            .await
+            .unwrap();
+        let prepared = scoped
+            .prepare_current_input_store(Some("code"))
+            .await
+            .unwrap();
+        assert!(prepared
+            .with_current_inputs(&access, std::slice::from_ref(&selection), |_| {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .is_err());
+        let changed_mode = mode.skill_catalog_snapshot().await;
+        let changed_revision = changed_mode.entries[0].revision;
+        assert!(changed_revision > selection.revision);
+        assert!(changed_mode.revision >= changed_revision);
+
+        store.reload().await.unwrap();
+        scoped.reload().await.unwrap();
+        for current in [
+            store.skill_catalog_snapshot().await,
+            scoped.skill_catalog_snapshot().await,
+        ] {
+            assert_eq!(current.entries[0].revision, changed_revision);
+            assert!(current.revision >= changed_revision);
+            assert_eq!(
+                current.entries[0].content_digest,
+                changed_mode.entries[0].content_digest
+            );
+        }
+        selection.revision = changed_revision;
+        prepared
+            .with_current_inputs(&access, &[selection], |publication| {
+                Box::pin(async move {
+                    assert_eq!(
+                        publication.inputs()[0].definition.prompt,
+                        "Changed instructions"
+                    );
+                    Ok(())
+                })
+            })
+            .await
+            .expect("the shared new revision authorizes the changed bytes");
+    }
+
+    #[tokio::test]
     async fn current_input_borrow_does_not_clone_auxiliary_map_or_create_an_activation_owner() {
         let directory = tempfile::tempdir().unwrap();
         let skills_dir = directory.path().join("skills");
@@ -6677,6 +7211,14 @@ Use this skill for testing.
             .pin_current_activation("invalid-new", &ids, None)
             .await
             .expect("pin retained LKG");
+        let pinned = store
+            .export_activation_snapshot("invalid-new")
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.skills["lkg-demo"].catalog_entry.status,
+            WorkflowStatus::Invalid
+        );
         assert_eq!(
             store
                 .get_pinned_skill_with_root("invalid-new", "lkg-demo")
@@ -6944,7 +7486,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn oversized_reload_keeps_previous_publication_and_retained_budget_is_reusable() {
+    async fn oversized_reload_isolates_bundle_and_preserves_last_known_good_bytes() {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("skills");
         let skill_dir = write_skill(&skills_dir, "bounded-bytes", "bounded", "prompt N")
@@ -6978,9 +7520,39 @@ Use this skill for testing.
         fs::write(skill_dir.join("references/value.txt"), vec![b'b'; 129])
             .await
             .expect("oversize resource");
-        let error = store.reload().await.expect_err("oversize reload rejected");
-        assert!(error.to_string().contains("per-file limit"));
-        assert_eq!(store.skill_catalog_snapshot().await, catalog_n);
+        let skills_root = skill_dir.parent().unwrap();
+        write_skill(skills_root, "bounded-bytes", "bounded", "prompt N+1")
+            .await
+            .expect("replacement definition paired with oversized resource");
+        write_skill(skills_root, "healthy", "healthy", "ready")
+            .await
+            .expect("unrelated skill");
+        store.reload().await.expect("publish healthy entries");
+        let invalid = store.skill_catalog_snapshot().await;
+        let invalid_entry = invalid
+            .entries
+            .iter()
+            .find(|entry| entry.id == "bounded-bytes")
+            .unwrap();
+        assert_eq!(invalid_entry.status, WorkflowStatus::Invalid);
+        assert!(invalid_entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("per-file limit"));
+        let original = catalog_n
+            .entries
+            .iter()
+            .find(|entry| entry.id == "bounded-bytes")
+            .unwrap();
+        assert_eq!(invalid_entry.content_digest, original.content_digest);
+        assert_eq!(
+            store.get_skill("bounded-bytes").await.unwrap().prompt,
+            "prompt N"
+        );
+        assert_eq!(store.get_skill("healthy").await.unwrap().prompt, "ready");
+        store.reload().await.expect("repeat invalid reload");
+        assert_eq!(store.skill_catalog_snapshot().await, invalid);
         assert_eq!(
             store
                 .get_pinned_skill_with_root("bounded-active", "bounded-bytes")
@@ -6995,7 +7567,7 @@ Use this skill for testing.
         store
             .pin_current_activation("bounded-lkg", &ids, None)
             .await
-            .expect("new activation uses live LKG after failed reload");
+            .expect("new legacy activation uses only the published LKG");
         assert_eq!(
             store
                 .read_pinned_skill_resource(
@@ -7012,6 +7584,10 @@ Use this skill for testing.
             .await
             .expect("bounded resource");
         store.reload().await.expect("recovered publication");
+        assert_eq!(
+            store.get_skill("bounded-bytes").await.unwrap().prompt,
+            "prompt N+1"
+        );
         store
             .pin_current_activation("bounded-reused", &ids, None)
             .await
@@ -7112,10 +7688,13 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn workspace_publications_share_one_global_retained_budget() {
+    async fn project_workspace_admission_reclaims_idle_workspace_at_global_budget() {
         let directory = tempfile::tempdir().expect("tempdir");
         let workspace_a = directory.path().join("workspace-a");
         let workspace_b = directory.path().join("workspace-b");
+        let project_home = directory.path().join("project");
+        let project_id = bamboo_domain::ProjectId::new();
+        fs::create_dir(&project_home).await.expect("project home");
         for workspace in [&workspace_a, &workspace_b] {
             let root = write_skill(
                 &workspace.join(".bamboo/skills"),
@@ -7145,18 +7724,189 @@ Use this skill for testing.
             },
         );
         store.reload().await.expect("empty root publication");
-        store
+        let first = store
             .skill_store_for_workspace(&workspace_a)
             .await
             .expect("first workspace publication fits");
+        let old = first.skill_catalog_snapshot().await.entries.remove(0);
+        let first_weak = Arc::downgrade(&first);
+        let mut watcher = first.subscribe_watcher_test_state();
         let error = store
-            .skill_store_for_workspace(&workspace_b)
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&workspace_b))
             .await
             .err()
-            .expect("second workspace publication must share the same budget");
+            .expect("a held workspace publication still counts against the shared budget");
         assert!(error
             .to_string()
             .contains("global workflow snapshot budget"));
+        drop(first);
+
+        let second = store
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&workspace_b))
+            .await
+            .expect("Project/workspace can reclaim the idle workspace");
+        assert!(first_weak.upgrade().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while watcher.borrow_and_update().phase != SkillWatcherTestPhase::Stopped {
+                watcher.changed().await.expect("watcher stopped");
+            }
+        })
+        .await
+        .expect("native watcher exits without another filesystem event");
+        let second_weak = Arc::downgrade(&second);
+        drop(second);
+
+        write_skill(
+            &workspace_a.join(".bamboo/skills"),
+            "publication-demo",
+            "publication",
+            "replacement",
+        )
+        .await
+        .expect("edit retired workspace");
+        let recreated = store
+            .skill_store_for_workspace(&workspace_a)
+            .await
+            .expect("workspace can reclaim the idle Project/workspace");
+        assert!(second_weak.upgrade().is_none());
+        let current = recreated.skill_catalog_snapshot().await.entries.remove(0);
+        assert_eq!(old.id, current.id);
+        assert_eq!(old.source, current.source);
+        assert_ne!(old.content_digest, current.content_digest);
+        assert!(current.revision > old.revision);
+    }
+
+    #[tokio::test]
+    async fn budget_pressure_preserves_a_pinned_mode_and_its_project_scope() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first_path = directory.path().join("pinned");
+        let second_path = directory.path().join("incoming");
+        for (workspace, value) in [(&first_path, b'1'), (&second_path, b'2')] {
+            let root = write_skill(
+                &workspace.join(".bamboo/skills"),
+                "pressure-skill",
+                "Pressure Skill",
+                "Instructions",
+            )
+            .await
+            .unwrap();
+            fs::write(root.join("data.bin"), vec![value; 128])
+                .await
+                .unwrap();
+        }
+        let project_home = directory.path().join("project");
+        fs::create_dir(&project_home).await.unwrap();
+        let project_id = bamboo_domain::ProjectId::new();
+        let mut store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        let project = store
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&first_path))
+            .await
+            .unwrap();
+        let mode = project.retain_mode_store(Some("code")).await.unwrap();
+        let original_project = Arc::downgrade(&project);
+        let original_mode = Arc::downgrade(&mode);
+        store.snapshot_limits.max_retained_bytes = store.retained_budget.retained_bytes();
+        drop(project);
+
+        assert!(store.skill_store_for_workspace(&second_path).await.is_err());
+        assert!(original_project.upgrade().is_some());
+        let pinned = mode
+            .pin_current_activation("suspended", &["pressure-skill".into()], None)
+            .await
+            .unwrap();
+        // Leave enough budget for the existing publications and suspended
+        // activation, then make the next scope admission cross that limit.
+        store.snapshot_limits.max_retained_bytes = store.retained_budget.retained_bytes();
+        drop(mode);
+        assert!(store.skill_store_for_workspace(&second_path).await.is_err());
+        let project = original_project
+            .upgrade()
+            .expect("pinned mode retains parent");
+        let mode = project.retain_mode_store(Some("code")).await.unwrap();
+        assert!(Arc::ptr_eq(&mode, &original_mode.upgrade().unwrap()));
+        assert_eq!(mode.activation_descriptor("suspended").await, Some(pinned));
+        assert_eq!(
+            mode.read_pinned_skill_resource("suspended", "pressure-skill", Path::new("data.bin"))
+                .await
+                .unwrap(),
+            vec![b'1'; 128]
+        );
+
+        drop(mode);
+        drop(project);
+        store
+            .release_activation_across_cached_scopes("suspended")
+            .await;
+        store
+            .skill_store_for_workspace(&second_path)
+            .await
+            .expect("released scope can make room for the new workspace");
+        assert!(original_mode.upgrade().is_none());
+        assert!(store.retained_budget.retained_bytes() <= store.snapshot_limits.max_retained_bytes);
+    }
+
+    #[tokio::test]
+    async fn budget_pressure_reclaims_idle_mode_under_protected_project() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_workspace = directory.path().join("pinned");
+        let incoming_workspace = directory.path().join("incoming");
+        for (workspace, value) in [(&project_workspace, b'1'), (&incoming_workspace, b'2')] {
+            let root = write_skill(
+                &workspace.join(".bamboo/skills"),
+                "pressure-skill",
+                "Pressure Skill",
+                "Instructions",
+            )
+            .await
+            .unwrap();
+            fs::write(root.join("data.bin"), vec![value; 128])
+                .await
+                .unwrap();
+        }
+        let project_home = directory.path().join("project");
+        fs::create_dir(&project_home).await.unwrap();
+        let project_id = bamboo_domain::ProjectId::new();
+        let mut store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        let project = store
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&project_workspace))
+            .await
+            .unwrap();
+        let pinned = project
+            .pin_current_activation("suspended", &["pressure-skill".into()], None)
+            .await
+            .unwrap();
+        let mode = project.retain_mode_store(Some("code")).await.unwrap();
+        let original_mode = Arc::downgrade(&mode);
+        drop(mode);
+        store.snapshot_limits.max_retained_bytes = store.retained_budget.retained_bytes();
+
+        store
+            .skill_store_for_workspace(&incoming_workspace)
+            .await
+            .expect("reclaim idle mode bytes through the held and pinned parent");
+        assert!(original_mode.upgrade().is_none());
+        let current_project = store
+            .skill_store_for_project_workspace(&project_id, &project_home, Some(&project_workspace))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&project, &current_project));
+        assert_eq!(
+            current_project.activation_descriptor("suspended").await,
+            Some(pinned)
+        );
+        assert_eq!(
+            current_project
+                .read_pinned_skill_resource("suspended", "pressure-skill", Path::new("data.bin"))
+                .await
+                .unwrap(),
+            vec![b'1'; 128]
+        );
     }
 
     #[tokio::test]
@@ -7166,24 +7916,42 @@ Use this skill for testing.
             skills_dir: directory.path().join("data/skills"),
             ..Default::default()
         });
-        for index in 0..super::MAX_CACHED_WORKSPACE_STORES {
-            let workspace = directory.path().join(format!("workspace-{index}"));
-            fs::create_dir_all(&workspace).await.expect("workspace");
-            store
-                .skill_store_for_workspace(&workspace)
-                .await
-                .expect("bounded workspace store slot");
-        }
         let overflow = directory.path().join("workspace-overflow");
         fs::create_dir_all(&overflow)
             .await
             .expect("overflow workspace");
+        let paths = (0..super::MAX_CACHED_WORKSPACE_STORES)
+            .map(|index| directory.path().join(format!("workspace-{index}")))
+            .collect::<Vec<_>>();
+        for workspace in &paths {
+            fs::create_dir_all(workspace).await.expect("workspace");
+        }
+        let mut held = Vec::new();
+        for workspace in &paths {
+            held.push(
+                store
+                    .skill_store_for_workspace(workspace)
+                    .await
+                    .expect("bounded workspace store slot"),
+            );
+        }
         let error = store
             .skill_store_for_workspace(&overflow)
             .await
             .err()
             .expect("empty workspace stores must be capped");
         assert!(error.to_string().contains("workspace store capacity"));
+        let retired = Arc::downgrade(held.last().unwrap());
+        held.pop();
+        store
+            .skill_store_for_workspace(&overflow)
+            .await
+            .expect("count pressure can reuse an idle slot");
+        assert!(retired.upgrade().is_none());
+        assert_eq!(
+            store.cached_workspace_stores().await.len(),
+            super::MAX_CACHED_WORKSPACE_STORES
+        );
     }
 
     #[tokio::test]
@@ -7598,11 +8366,11 @@ Use this skill for testing.
             skills_dir: directory.path().join("data/skills"),
             ..Default::default()
         });
-        store
+        let held = store
             .skill_store_for_workspace(&target)
             .await
             .expect("canonical target");
-        let initial_aliases = store.workspace_stores.read().await.len();
+        let initial_aliases = store.scoped_stores.read().await.workspaces.len();
         for index in 0..(super::MAX_CACHED_WORKSPACE_ALIASES - initial_aliases) {
             let alias = directory.path().join(format!("alias-{index}"));
             symlink(&target, &alias).expect("alias");
@@ -7619,6 +8387,18 @@ Use this skill for testing.
             .err()
             .expect("aliases must be capped");
         assert!(error.to_string().contains("workspace alias capacity"));
+        let retired = Arc::downgrade(&held);
+        drop(held);
+        let reopened = store
+            .skill_store_for_workspace(&overflow)
+            .await
+            .expect("alias pressure can reclaim all entries of an idle store");
+        assert!(retired.upgrade().is_none());
+        assert_eq!(store.scoped_stores.read().await.workspaces.len(), 2);
+        assert!(Arc::ptr_eq(
+            &reopened,
+            &store.skill_store_for_workspace(&target).await.unwrap()
+        ));
     }
 }
 

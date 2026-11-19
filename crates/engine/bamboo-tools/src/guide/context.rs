@@ -3,8 +3,6 @@
 //! This module provides language detection and context building for generating
 //! localized tool usage guidelines that match the language of the system prompt.
 
-const GIT_TOOL_GUIDANCE: &str = "For Git work, prefer available dedicated Git tools over reconstructing repository state by reading files one by one. Start with status and staged/unstaged diff; for branch comparison or conflicts, inspect the merge base, unique commits, and unmerged index before reading the necessary diff hunks and surrounding source to resolve intent. Batch independent read-only queries. Preserve dirty user work and unique commits; verify the resolved diff and relevant checks. Use exec_command only when a dedicated tool cannot provide the needed operation and your role permits shell execution. A Supervisor without shell access delegates Git execution to an authorized worker and reviews its evidence; missing tools never expand permissions.";
-
 /// Language options for guide generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuideLanguage {
@@ -37,8 +35,8 @@ pub struct GuideBuildContext {
     /// Maximum number of examples to include per tool
     pub max_examples_per_tool: usize,
     /// Discoverable tools that are currently activated for the session.
-    /// Activated discoverable tools render with full guides; inactive ones
-    /// render with short summaries only.
+    /// Activated tools render their explicitly registered guides; inactive
+    /// guides are omitted.
     pub activated_discoverable_tools: std::collections::BTreeSet<String>,
 }
 
@@ -66,48 +64,13 @@ impl GuideBuildContext {
         }
     }
 
-    /// Returns best practices appropriate for the configured language.
+    /// Shared rules that apply across tool schemas.
     pub fn best_practices(&self) -> &'static [&'static str] {
-        match self.language {
-            GuideLanguage::Chinese => &[
-                "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
-                "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
-                "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
-                "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
-                "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
-                "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
-                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                GIT_TOOL_GUIDANCE,
-                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
-                "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
-                "When referencing code locations in responses, use file_path:line_number format.",
-                "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
-            ],
-            GuideLanguage::English => &[
-                "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
-                "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
-                "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
-                "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
-                "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
-                "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
-                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
-                "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                GIT_TOOL_GUIDANCE,
-                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
-                "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
-                "When referencing code locations in responses, use file_path:line_number format.",
-                "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
-            ],
-        }
+        &[
+            "Assist only with defensive security. Refuse offensive activity, credential harvesting, and malware-oriented changes.",
+            "Batch independent read-only calls. Narrow searches by path or pattern before requesting content.",
+            "Prefer dedicated file and Git tools when available. For Git, start with status and relevant diffs. Inspect the merge base and unmerged index for conflicts, preserve user changes and unique commits, and verify the resolved diff. Commit or publish only with user authorization.",
+        ]
     }
 }
 
@@ -131,56 +94,19 @@ mod tests {
     }
 
     #[test]
-    fn best_practices_prefer_delegated_plan_without_legacy_mode_switch() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let context = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            };
-            let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("delegate planning to its read-only child"));
-            assert!(guidance.contains("already-active legacy plan-mode session"));
+    fn shared_rules_keep_security_and_git_boundaries_without_tool_names() {
+        let guidance = GuideBuildContext::default().best_practices().join("\n");
+        for required in [
+            "defensive security",
+            "Batch independent read-only calls",
+            "merge base and unmerged index",
+            "preserve user changes and unique commits",
+            "only with user authorization",
+        ] {
+            assert!(guidance.contains(required), "missing {required}");
         }
-    }
-
-    #[test]
-    fn best_practices_teach_model_owned_exec_polling() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let context = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            };
-            let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("exec_command"));
-            assert!(guidance.contains("write_stdin with empty chars"));
-            assert!(guidance.contains("does not send an automatic user notification"));
-            assert!(guidance.contains("follow its advisory"));
-            assert!(guidance.contains("does not prove completion"));
-            assert!(!guidance.contains("Bash"));
-        }
-    }
-
-    #[test]
-    fn best_practices_prefer_git_tools_and_preserve_role_and_work_boundaries() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let guidance = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            }
-            .best_practices()
-            .join("\n");
-            for required in [
-                "prefer available dedicated Git tools",
-                "status and staged/unstaged diff",
-                "merge base, unique commits, and unmerged index",
-                "necessary diff hunks and surrounding source",
-                "Preserve dirty user work and unique commits",
-                "Supervisor without shell access delegates Git execution to an authorized worker",
-                "missing tools never expand permissions",
-                "current or standing user authorization",
-            ] {
-                assert!(guidance.contains(required), "missing {required}");
-            }
+        for name in ["FileExists", "GetCurrentDir", "BashOutput", "exec_command"] {
+            assert!(!guidance.contains(name), "unexpected {name}");
         }
     }
 

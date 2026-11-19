@@ -49,6 +49,7 @@ impl LlmManager for DefaultLlmManager {
             // coverage, not a zero-exposure observation; #1077 covers the
             // canonical runner pipeline only.
             None,
+            None,
         )
         .await?;
 
@@ -85,21 +86,12 @@ impl LlmManager for DefaultLlmManager {
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<bool, AgentError> {
         let model_name = config.model_name.as_deref().unwrap_or("unknown");
-        let request_tool_schemas =
-            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
-                session,
-                &self.llm,
-                model_name,
-                tool_schemas,
-            )
-            .await;
-
         crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
             session,
             config,
             model_name,
             session_id,
-            request_tool_schemas.as_ref(),
+            tool_schemas,
             &self.llm,
             Some(event_tx),
         )

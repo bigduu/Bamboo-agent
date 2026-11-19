@@ -19,7 +19,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::warn;
 
 use super::exec_command::{pump_polled_stream, PolledShellState};
@@ -54,6 +54,7 @@ pub struct ShellSession {
     /// Pull-based exec sessions retain their owner but do not participate in
     /// legacy Bash completion notifications or end-of-turn suspension.
     pub(crate) polled: Option<Arc<PolledShellState>>,
+    resource_owner_id: Option<uuid::Uuid>,
     pub(crate) initial_handoff: Option<Arc<InitialHandoff>>,
     initial_cancelled: Arc<AtomicBool>,
     /// Kill request for the still-running child. The child handle itself is owned
@@ -75,6 +76,22 @@ pub struct ShellSession {
 }
 
 impl ShellSession {
+    pub(crate) async fn wait_for_polled_output(&self, yield_time_ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(yield_time_ms);
+        let wait = self
+            .polled
+            .as_ref()
+            .expect("validated exec session")
+            .wait_until(deadline);
+        let resources = LocalTaskResources::current()
+            .filter(|scope| self.resource_owner_id == Some(scope.identity().owner_id));
+        if let Some(resources) = resources {
+            resources.observe_shell_wait(deadline, wait).await;
+        } else {
+            wait.await;
+        }
+    }
+
     pub fn is_model_polled(&self) -> bool {
         self.polled.is_some()
     }
@@ -207,6 +224,10 @@ impl ShellSession {
     /// stdin was still open), `false` otherwise, so callers can distinguish.
     pub async fn close_stdin(&self) -> bool {
         self.stdin.lock().await.take().is_some()
+    }
+
+    pub(super) async fn stdin_is_open(&self) -> bool {
+        self.stdin.lock().await.is_some()
     }
 }
 
@@ -368,6 +389,7 @@ async fn spawn_background_with_capture(
         session_id,
         environment: prepared_env.diagnostics.clone(),
         polled: polled.clone(),
+        resource_owner_id: LocalTaskResources::current().map(|scope| scope.identity().owner_id),
         initial_handoff,
         initial_cancelled: initial_cancelled.clone(),
         kill_notify: kill_notify.clone(),
@@ -772,6 +794,7 @@ pub(crate) async fn adopt_managed_child(
         session_id,
         environment,
         polled: None,
+        resource_owner_id: None,
         initial_handoff: None,
         initial_cancelled: Arc::new(AtomicBool::new(false)),
         kill_notify: kill_notify.clone(),

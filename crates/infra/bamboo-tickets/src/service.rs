@@ -9,6 +9,14 @@ use crate::{
     Result,
 };
 
+pub(crate) type ManagedRootSelection<'a> = dyn Fn(&DispatchSpec) -> Result<ManagedWorkRoot> + 'a;
+pub(crate) type ManagedInputValidation<'a> = dyn Fn(&crate::WorkContextPacket) -> Result<()> + 'a;
+
+pub(crate) struct ManagedStart<'a> {
+    pub select_root: &'a ManagedRootSelection<'a>,
+    pub validate_input: &'a ManagedInputValidation<'a>,
+}
+
 /// Constructed only by the embedding trusted host after validating its current
 /// Supervisor/Runtime proof. Deliberately has no Deserialize implementation.
 #[derive(Clone, Debug)]
@@ -340,6 +348,15 @@ impl TicketService {
     }
 
     pub fn execute(&self, authority: &Authority, command: &Command) -> Result<OperationReceipt> {
+        self.execute_with_root_selection(authority, command, None)
+    }
+
+    pub(crate) fn execute_with_root_selection(
+        &self,
+        authority: &Authority,
+        command: &Command,
+        managed_start: Option<ManagedStart<'_>>,
+    ) -> Result<OperationReceipt> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -390,9 +407,20 @@ impl TicketService {
         }
         let mut next = snapshot.clone();
         next.seq += 1;
-        let ids = apply_operations(&mut next, authority, &command.operations, store.root())?;
+        let ids = apply_operations(
+            &mut next,
+            authority,
+            &command.operations,
+            store.root(),
+            managed_start.as_ref().map(|start| start.select_root),
+        )?;
         validate_snapshot(&next)?;
-        validate_new_assignment_contexts(snapshot, &next, &store)?;
+        validate_new_assignment_contexts(
+            snapshot,
+            &next,
+            &store,
+            managed_start.map(|start| start.validate_input),
+        )?;
         validate_answer_contexts(snapshot, &next, &store)?;
         let receipt = OperationReceipt {
             operation_id: command.operation_id.clone(),
@@ -744,6 +772,7 @@ fn apply(
     authority: &Authority,
     operation: &Operation,
     ids: &mut BTreeMap<String, String>,
+    select_root: Option<&ManagedRootSelection<'_>>,
 ) -> Result<()> {
     use Operation::*;
     let seq = snapshot.seq;
@@ -973,8 +1002,9 @@ fn apply(
             let id = allocate(temp_id, ids)?;
             let generation = work.generation + 1;
             let dispatch_key = format!("{}/{}/{generation}", snapshot.binding.scope_id, id);
-            let spec = DispatchSpec {
+            let mut spec = DispatchSpec {
                 project_context_hash: context_ref.clone(),
+                managed_root: None,
                 binding: snapshot.binding.clone(),
                 work_id: work_id.clone(),
                 assignment_id: id.clone(),
@@ -985,6 +1015,32 @@ fn apply(
                 dependency_inputs: inputs.clone(),
                 workspace: workspace.clone(),
             };
+            if let Some(select_root) = select_root {
+                let target = select_root(&spec)?;
+                let source = target
+                    .supervisor()
+                    .ok_or_else(|| invalid("managed Root source"))?;
+                if !matches!(authority.principal(), Principal::Supervisor { session_id }
+                    if *session_id == source.session_id
+                        && snapshot.binding.scope_id == format!("supervisor/{}", source.incarnation_id))
+                    || target.session_id().is_err()
+                {
+                    return Err(Error::ScopeDenied(
+                        "managed Root source differs from Work scope".into(),
+                    ));
+                }
+                if snapshot
+                    .project
+                    .links
+                    .get(&work_id)
+                    .is_some_and(|project_id| project_id != &target.project_id)
+                {
+                    return Err(Error::ScopeDenied(
+                        "managed Root Project differs from the Work Project".into(),
+                    ));
+                }
+                spec.managed_root = Some(target);
+            }
             let spec_hash = content_hash(&canonical_bytes(&spec)?);
             snapshot.assignments.insert(
                 id.clone(),
@@ -1025,6 +1081,7 @@ fn apply(
                     immutable_spec: spec,
                     spec_hash,
                     receipt: None,
+                    managed_admission: None,
                 },
             );
             let work = snapshot.tickets.get_mut(&work_id).expect("work");
@@ -1037,6 +1094,11 @@ fn apply(
         Admitted {
             assignment_id,
             receipt,
+        }
+        | ManagedAdmitted {
+            assignment_id,
+            receipt,
+            ..
         } => {
             authority.runtime()?;
             let a = assignment(snapshot, assignment_id)?.clone();
@@ -1051,8 +1113,22 @@ fn apply(
             {
                 return Err(invalid("Runtime receipt does not match immutable dispatch"));
             }
+            let managed = match operation {
+                ManagedAdmitted { admission, .. } => Some(admission),
+                _ => None,
+            };
+            match (&intent.immutable_spec.managed_root, managed) {
+                (None, None) => {}
+                (Some(target), Some(admission)) if target.matches_admission(receipt, admission) => {
+                }
+                _ => {
+                    return Err(invalid(
+                        "Runtime receipt lacks its exact managed Root input",
+                    ))
+                }
+            }
             if let Some(previous) = &a.runtime {
-                if previous != receipt {
+                if previous != receipt || intent.managed_admission.as_ref() != managed {
                     return Err(Error::IdempotencyConflict);
                 }
                 return Ok(());
@@ -1094,11 +1170,9 @@ fn apply(
             a.state = AssignmentState::Admitted;
             a.record_revision += 1;
             a.updated_seq = seq;
-            snapshot
-                .intents
-                .get_mut(&a.dispatch_key)
-                .expect("intent")
-                .receipt = Some(receipt.clone());
+            let intent = snapshot.intents.get_mut(&a.dispatch_key).expect("intent");
+            intent.receipt = Some(receipt.clone());
+            intent.managed_admission = managed.cloned();
         }
         Running { assignment_id } => {
             authority.runtime()?;
@@ -1927,17 +2001,27 @@ pub(crate) fn validate_new_assignment_contexts(
     before: &Snapshot,
     next: &Snapshot,
     store: &FileStore,
+    validate_managed_input: Option<&ManagedInputValidation<'_>>,
 ) -> Result<()> {
     for assignment in next.assignments.values().filter(|a| {
         !before.assignments.contains_key(&a.id)
             && next.tickets[&a.work_id].active_assignment.as_deref() == Some(a.id.as_str())
     }) {
-        crate::query::build_context_packet(
+        let packet = crate::query::build_context_packet(
             next,
             assignment,
             crate::WORK_CONTEXT_BYTES_LIMIT,
             |artifact, budget| store.read_artifact(artifact, budget),
         )?;
+        if next.intents[&assignment.dispatch_key]
+            .immutable_spec
+            .managed_root
+            .is_some()
+        {
+            let validate = validate_managed_input
+                .ok_or_else(|| invalid("managed Work input validation missing"))?;
+            validate(&packet)?;
+        }
     }
     Ok(())
 }
@@ -2270,6 +2354,19 @@ pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
         {
             return Err(invalid("DispatchIntent mismatch"));
         }
+        match (
+            &intent.immutable_spec.managed_root,
+            &intent.managed_admission,
+        ) {
+            (None, None) => {}
+            (Some(_), None) if intent.receipt.is_none() && a.runtime.is_none() => {}
+            (Some(target), Some(admission))
+                if intent.receipt == a.runtime
+                    && a.runtime
+                        .as_ref()
+                        .is_some_and(|r| target.matches_admission(r, admission)) => {}
+            _ => return Err(invalid("managed DispatchIntent admission mismatch")),
+        }
     }
     Ok(())
 }
@@ -2279,6 +2376,7 @@ pub(crate) fn apply_operations(
     authority: &Authority,
     operations: &[Operation],
     root: &Path,
+    select_root: Option<&ManagedRootSelection<'_>>,
 ) -> Result<BTreeMap<String, String>> {
     let mut ids = BTreeMap::new();
     for operation in operations {
@@ -2296,7 +2394,7 @@ pub(crate) fn apply_operations(
                 }
             }
         }
-        apply(snapshot, authority, operation, &mut ids)?;
+        apply(snapshot, authority, operation, &mut ids, select_root)?;
     }
     Ok(ids)
 }

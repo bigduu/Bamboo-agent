@@ -406,6 +406,13 @@ struct ConfigRuntimeEffectContext {
     config_application: Arc<std::sync::RwLock<ConfigApplicationState>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigUpdate<'a> {
+    Credential,
+    Metadata,
+    DeleteInstance(&'a str),
+}
+
 fn capture_application_inputs(
     state: &std::sync::RwLock<ConfigApplicationState>,
     candidate: &Config,
@@ -711,6 +718,7 @@ fn project_dependent_section_candidate(
             candidate.keyword_masking = section.keyword_masking;
             candidate.anthropic_model_mapping = section.anthropic_model_mapping;
             candidate.gemini_model_mapping = section.gemini_model_mapping;
+            candidate.patrol_model = section.patrol_model;
         }
         _ => unreachable!("only dependent ordinary sections are projected here"),
     }
@@ -2307,6 +2315,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.default_provider_instance = source.default_provider_instance.clone();
             target.features = source.features.clone();
             *target.providers_mut() = source.providers().clone();
+            target.preserve_provider_retirement(source);
         }
         SectionId::Mcp => target.mcp = source.mcp.clone(),
         SectionId::ToolsSkills => {
@@ -2335,6 +2344,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
             target.gemini_model_mapping = source.gemini_model_mapping.clone();
+            target.patrol_model = source.patrol_model.clone();
         }
         SectionId::ModelLimits | SectionId::Credentials => {}
     }
@@ -2717,14 +2727,26 @@ async fn prepare_provider_candidate(
     candidate_config
         .hydrate_provider_credentials_from_store(data_dir)
         .map_err(|_| ProviderCandidateError::invalid("provider credential is unavailable"))?;
+    candidate_config.apply_runtime_provider_metadata_overrides();
     let candidate_registry =
         bamboo_llm::ProviderRegistry::from_config(&candidate_config, data_dir.to_path_buf())
             .await
             .map_err(|_| ProviderCandidateError::runtime())?;
     let candidate_provider = candidate_registry
         .get_default()
+        .or_else(|| {
+            candidate_config
+                .has_retired_provider_default()
+                .then(unconfigured_provider)
+        })
         .ok_or_else(ProviderCandidateError::runtime)?;
     Ok((candidate_config, candidate_registry, candidate_provider))
+}
+
+fn unconfigured_provider() -> Arc<dyn LLMProvider> {
+    Arc::new(UnconfiguredProvider {
+        message: "No default provider is configured".to_string(),
+    })
 }
 
 struct ProviderCandidate {
@@ -3345,7 +3367,8 @@ impl AppState {
         let _io = self.config_io_lock.lock().await;
         ensure_provider_mcp_migration_ready(&self.app_data_dir)
             .map_err(ConfigSectionMutationError::Store)?;
-        let current = self.config.read().await.clone();
+        let mut current = self.config.read().await.clone();
+        current.restore_saved_provider_metadata();
         retain_provider_credentials(current.providers(), &mut providers);
         let mut candidate = current;
         *candidate.providers_mut() = providers.clone();
@@ -3470,7 +3493,8 @@ impl AppState {
                     "provider settings require the modular configuration facade".to_string(),
                 )
             })?;
-            let current = config.read().await.clone();
+            let mut current = config.read().await.clone();
+            current.restore_saved_provider_metadata();
             let mut candidate = current.clone();
             let (provider_intents, provider_instance_intents) = update(&current, &mut candidate)?;
 
@@ -3618,8 +3642,19 @@ impl AppState {
                 "bodhi".to_string(),
             ]);
             let provider_instance_intents = current.provider_instances.keys().cloned().collect();
+            let mut defaults = Config::default();
+            defaults.preserve_provider_retirement(&current);
+            if defaults
+                .providers()
+                .retired_provider_aliases
+                .contains(&defaults.provider)
+                || current.has_saved_retired_provider_default()
+            {
+                defaults.provider = "copilot".to_owned();
+                defaults.providers_mut().copilot_default_retired = true;
+            }
             let mut candidate = current;
-            apply_runtime_section(SectionId::Providers, &Config::default(), &mut candidate);
+            apply_runtime_section(SectionId::Providers, &defaults, &mut candidate);
 
             let transaction_dir = app_data_dir.clone();
             let commit_facade = facade.clone();
@@ -3677,7 +3712,11 @@ impl AppState {
             {
                 Ok(registry) => {
                     inputs.verify_provider_registry(&candidate, &registry);
-                    if let Some(candidate_provider) = registry.get_default() {
+                    if let Some(candidate_provider) = registry.get_default().or_else(|| {
+                        candidate
+                            .has_retired_provider_default()
+                            .then(unconfigured_provider)
+                    }) {
                         provider_registry.replace_with(registry);
                         *provider.write().await = candidate_provider;
                         record_application_success(
@@ -4641,6 +4680,8 @@ fn provider_durable_document(
 
 fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut ProviderConfigs) {
     candidate.extra = current.extra.clone();
+    candidate.retired_provider_aliases = current.retired_provider_aliases.clone();
+    candidate.copilot_default_retired = current.copilot_default_retired;
     macro_rules! retain {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (&current.$field, &mut candidate.$field) {
@@ -4672,10 +4713,6 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
             candidate.api_key.clear();
             candidate.api_key_encrypted = None;
         }
-        candidate.extra = current.extra.clone();
-    }
-    if let (Some(current), Some(candidate)) = (&current.copilot, &mut candidate.copilot) {
-        candidate.request_overrides = current.request_overrides.clone();
         candidate.extra = current.extra.clone();
     }
 }
@@ -5235,25 +5272,32 @@ impl AppState {
             "Reloading provider runtime from current config"
         );
 
-        let new_provider = candidate_registry.get_default().ok_or_else(|| {
-            record_application_failure(
-                &self.config_application,
-                ConfigConsumer::ProviderRuntime,
-                ConfigApplyError::ProviderInitializationFailed,
-            );
-            let message = if config.has_provider_instances() {
-                format!(
-                    "Default provider instance '{}' is not available or failed to initialize",
-                    default_provider_name
-                )
-            } else {
-                format!(
-                    "Provider '{}' is not available or failed to initialize",
-                    config.provider
-                )
-            };
-            bamboo_llm::LLMError::Auth(message)
-        })?;
+        let new_provider = candidate_registry
+            .get_default()
+            .or_else(|| {
+                config
+                    .has_retired_provider_default()
+                    .then(unconfigured_provider)
+            })
+            .ok_or_else(|| {
+                record_application_failure(
+                    &self.config_application,
+                    ConfigConsumer::ProviderRuntime,
+                    ConfigApplyError::ProviderInitializationFailed,
+                );
+                let message = if config.has_provider_instances() {
+                    format!(
+                        "Default provider instance '{}' is not available or failed to initialize",
+                        default_provider_name
+                    )
+                } else {
+                    format!(
+                        "Provider '{}' is not available or failed to initialize",
+                        config.provider
+                    )
+                };
+                bamboo_llm::LLMError::Auth(message)
+            })?;
 
         #[cfg(test)]
         run_generic_before_provider_publish_test_hook(&self.app_data_dir);
@@ -5358,7 +5402,7 @@ impl AppState {
                 let previous = config.read().await;
                 preserve_runtime_broker(&mut new_config, &previous);
             }
-            if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
+            if let Err(error) = crate::config_manager::validate_provider_settings(&new_config) {
                 tracing::warn!("reloaded provider config is invalid");
                 let message =
                     "provider configuration is invalid; retaining last-known-good generation"
@@ -5687,6 +5731,7 @@ impl AppState {
                         config_application,
                     },
                     forced_mcp_replacements,
+                    false,
                 )
                 .await?;
                 snapshot
@@ -5717,7 +5762,7 @@ impl AppState {
             provider_intents,
             provider_instance_intents,
             effects,
-            false,
+            ProviderConfigUpdate::Credential,
         )
         .await
     }
@@ -5738,7 +5783,29 @@ impl AppState {
             BTreeSet::new(),
             BTreeSet::new(),
             effects,
-            true,
+            ProviderConfigUpdate::Metadata,
+        )
+        .await
+    }
+
+    /// Validate the primary Providers document before staging a deletion.
+    pub(crate) async fn delete_provider_instance_with_credentials<F>(
+        &self,
+        instance_id: String,
+        update: F,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config, &str) -> Result<(), AppError>,
+    {
+        self.update_config_with_provider_credentials_inner(
+            |config| update(config, &instance_id),
+            BTreeSet::new(),
+            BTreeSet::from([instance_id.clone()]),
+            ConfigUpdateEffects {
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+            },
+            ProviderConfigUpdate::DeleteInstance(&instance_id),
         )
         .await
     }
@@ -5749,15 +5816,13 @@ impl AppState {
         provider_intents: BTreeSet<String>,
         provider_instance_intents: BTreeSet<String>,
         effects: ConfigUpdateEffects,
-        exact_provider_metadata: bool,
+        kind: ProviderConfigUpdate<'_>,
     ) -> Result<Config, AppError>
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
-        let exact_provider_metadata = exact_provider_metadata
-            && provider_intents.is_empty()
-            && provider_instance_intents.is_empty()
-            && self.config_facade.is_some();
+        let exact_provider_metadata =
+            kind == ProviderConfigUpdate::Metadata && self.config_facade.is_some();
         if provider_intents.is_empty()
             && provider_instance_intents.is_empty()
             && !exact_provider_metadata
@@ -5767,6 +5832,25 @@ impl AppState {
         let io = self.config_io_lock.clone().lock_owned().await;
         let config_facade = self.config_facade.clone();
         let config_application = self.config_application.clone();
+        let deleting_instance = matches!(kind, ProviderConfigUpdate::DeleteInstance(_));
+        let deletion_base = match (kind, config_facade.as_ref()) {
+            (ProviderConfigUpdate::DeleteInstance(id), Some(_)) => {
+                let data_dir = self.app_data_dir.clone();
+                let id = id.to_owned();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    bamboo_config::read_provider_instance_deletion_base(data_dir, id)
+                })
+                .await
+                .map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "provider deletion snapshot task failed: {error}"
+                    ))
+                })?
+                .map_err(map_exact_credential_store_error)?;
+                Some(snapshot)
+            }
+            _ => None,
+        };
         let (mut candidate, live_base, enforcement_newly_off, provider_expected_revision) = {
             let cfg = self.config.read().await;
             reject_if_recovery_pending(&cfg)?;
@@ -5774,6 +5858,9 @@ impl AppState {
             let live_base = cfg.clone();
             let mut candidate = cfg.clone();
             restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
+            if let Some(base) = deletion_base.as_ref() {
+                base.install_into(&mut candidate);
+            }
             update(&mut candidate)?;
             bamboo_config::validate_runtime_model_admission(&candidate)
                 .map_err(AppError::BadRequest)?;
@@ -5843,7 +5930,14 @@ impl AppState {
                 let commit_facade = config_facade.clone();
                 let (candidate, commit) = tokio::task::spawn_blocking(move || {
                     let result = if let Some(facade) = commit_facade {
-                        let commit = if let Some(expected_revision) = provider_expected_revision {
+                        let commit = if let Some(base) = deletion_base.as_ref() {
+                            bamboo_config::persist_provider_instance_deletion_with_adoption(
+                                &data_dir,
+                                &mut candidate,
+                                base,
+                                facade.as_ref(),
+                            )?
+                        } else if let Some(expected_revision) = provider_expected_revision {
                             bamboo_config::persist_provider_credential_transaction_at_revision_with_adoption(
                                 &data_dir,
                                 &mut candidate,
@@ -5925,7 +6019,7 @@ impl AppState {
                 if enforcement_newly_off {
                     warn_plugin_trust_enforcement_off();
                 }
-                Self::apply_config_effects_owned(
+                Self::apply_config_effects_owned_after_forcing(
                     snapshot.clone(),
                     effects,
                     ConfigRuntimeEffectContext {
@@ -5939,6 +6033,13 @@ impl AppState {
                         mcp_config_live_health,
                         config_application,
                     },
+                    HashSet::new(),
+                    deleting_instance
+                        && snapshot.default_provider_instance.is_none()
+                        && snapshot
+                            .provider_instances
+                            .values()
+                            .all(|instance| !instance.enabled),
                 )
                 .await?;
                 snapshot
@@ -7136,8 +7237,14 @@ impl AppState {
         effects: ConfigUpdateEffects,
         context: ConfigRuntimeEffectContext,
     ) -> Result<(), AppError> {
-        Self::apply_config_effects_owned_after_forcing(new_config, effects, context, HashSet::new())
-            .await
+        Self::apply_config_effects_owned_after_forcing(
+            new_config,
+            effects,
+            context,
+            HashSet::new(),
+            false,
+        )
+        .await
     }
 
     async fn apply_config_effects_owned_after_forcing(
@@ -7145,6 +7252,7 @@ impl AppState {
         effects: ConfigUpdateEffects,
         context: ConfigRuntimeEffectContext,
         forced_mcp_replacements: HashSet<String>,
+        allow_unconfigured_provider: bool,
     ) -> Result<(), AppError> {
         let ConfigRuntimeEffectContext {
             app_data_dir,
@@ -7173,7 +7281,11 @@ impl AppState {
                     bamboo_llm::ProviderRegistry::from_config(&new_config, app_data_dir.clone())
                         .await?;
                 let default_provider_name = candidate_registry.default_provider_name();
-                let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
+                let candidate_provider = if let Some(provider) = candidate_registry.get_default() {
+                    provider
+                } else if allow_unconfigured_provider || new_config.has_retired_provider_default() {
+                    unconfigured_provider()
+                } else {
                     let message = if new_config.has_provider_instances() {
                         format!(
                             "Default provider instance '{}' is not available or failed to initialize",
@@ -7185,8 +7297,8 @@ impl AppState {
                             new_config.provider
                         )
                     };
-                    bamboo_llm::LLMError::Auth(message)
-                })?;
+                    return Err(bamboo_llm::LLMError::Auth(message));
+                };
                 Ok::<_, bamboo_llm::LLMError>((
                     candidate_registry,
                     candidate_provider,
@@ -9515,6 +9627,15 @@ for line in sys.stdin:
             })
             .expect("a Python interpreter is required for the MCP ordering fixture");
 
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "provider": "openai",
+                "providers": {"openai": {"api_key": "fixture-key", "model": "fixture-model"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
         let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
         stop_config_watcher(&mut state);
         let state = Arc::new(state);
@@ -9530,7 +9651,7 @@ for line in sys.stdin:
                 state
                     .update_config(
                         |config| {
-                            config.provider = "copilot".to_string();
+                            config.server.port += 1;
                             Ok(())
                         },
                         ConfigUpdateEffects {
@@ -9541,9 +9662,13 @@ for line in sys.stdin:
                     .await
             })
         };
-        tokio::task::spawn_blocking(move || provider_ready_rx.recv().unwrap())
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            provider_ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+        })
+        .await
+        .unwrap();
         assert!(
             state.config_io_lock.try_lock().is_err(),
             "the first writer must retain config_io_lock until its runtime effects finish"

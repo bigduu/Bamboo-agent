@@ -559,6 +559,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: sub_agent.map(|(p, m)| bamboo_domain::ProviderModelRef::new(p, m)),
             subagent_models: std::collections::HashMap::new(),
         }

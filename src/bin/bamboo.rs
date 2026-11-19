@@ -23,7 +23,12 @@ struct Cli {
     /// Run a full headless agent on this prompt and print the result. Boots
     /// the complete server runtime (root tool surface incl. SubAgent, so it
     /// CAN spawn actor children), finishes when the whole tree finishes.
-    #[arg(short = 'p', long = "prompt", global = false)]
+    #[arg(
+        short = 'p',
+        long = "prompt",
+        global = false,
+        allow_hyphen_values = true
+    )]
     prompt: Option<String>,
 
     /// With -p: continue this existing session instead of creating a new one.
@@ -31,15 +36,15 @@ struct Cli {
     session: Option<String>,
 
     /// With -p: model as 'provider:model' OR a bare model id (bound to
-    /// --provider, else the configured default provider). Defaults to the
-    /// session/config default.
+    /// --provider, else the configured default provider). The model must be
+    /// admitted for that provider. Defaults to the session/config selection.
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// With -p: provider name (e.g. `anthropic`, `openai`, `gemini`). Combine
-    /// with a bare `-m <model>` to pin `provider:model`, or use alone to select
-    /// that provider (its configured default model). Conflicts with the
-    /// `provider:model` form of `-m` only when the providers differ.
+    /// With -p: provider instance ID or protocol (anthropic, openai, gemini,
+    /// or bodhi for configured gateways). Uses that provider's default
+    /// model unless -m is given. For a one-shot custom endpoint, set the
+    /// matching BAMBOO_<PROVIDER>_API_KEY, _BASE_URL and _MODEL variables.
     #[arg(long)]
     provider: Option<String>,
 
@@ -52,7 +57,7 @@ struct Cli {
     #[arg(long = "project-id")]
     project_id: Option<String>,
 
-    /// With -p: data directory holding config.json (defaults to ~/.bamboo).
+    /// With -p: data directory for settings and sessions (BAMBOO_DATA_DIR, then ~/.bamboo).
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -61,11 +66,16 @@ struct Cli {
     #[arg(long)]
     echo: bool,
 
-    /// With -p: NDJSON streaming on stdout — one JSON object per line:
-    /// {"type":"session_started",...}, every agent event verbatim, then a
-    /// final {"type":"result",...} envelope. Pipe-safe (logs go to stderr).
+    /// With -p: NDJSON on stdout. Streams session and agent events, then a
+    /// result with cumulative token usage. Startup errors also emit a result.
+    /// Logs go to stderr.
     #[arg(long = "stream-json", alias = "raw")]
     stream_json: bool,
+
+    /// Write one terminal result object as JSON to stdout for a full -p run.
+    /// Logs go to stderr.
+    #[arg(long = "json", requires = "prompt", conflicts_with_all = ["stream_json", "echo"])]
+    headless_json: bool,
 
     /// With -p: permission mode for the headless run, which has no interactive
     /// approver. One of: default | plan | accept-edits | dont-ask | bypass.
@@ -252,7 +262,7 @@ enum Commands {
         no_auto_serve: bool,
     },
 
-    /// First-run setup: write `config.json` with a provider + API key.
+    /// Save a default provider, model, and encrypted API key.
     ///
     /// Interactive by default (prompts for anything not given as a flag). Pass
     /// `--non-interactive` for CI/scripts (then `--provider` + `--api-key` are
@@ -270,9 +280,13 @@ enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Default chat model. A sensible provider default is used if omitted.
+        /// Default chat model ID. Required for a new custom endpoint.
         #[arg(long)]
         model: Option<String>,
+
+        /// Save a custom HTTP(S) API base URL, including its version path (for example /v1).
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
 
         /// Overwrite an existing provider key without prompting.
         #[arg(long)]
@@ -283,7 +297,7 @@ enum Commands {
         non_interactive: bool,
     },
 
-    /// Diagnose the local install: config presence, provider credential, and
+    /// Diagnose the local install: default model, provider credential, and
     /// whether a server is reachable. Exits non-zero if a blocking problem is found.
     Doctor {
         /// Data directory holding config.json (defaults to ~/.bamboo).
@@ -1251,6 +1265,9 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    if let Some(code) = bamboo_agent::server::tailscale_serve_helper_entry() {
+        std::process::exit(code);
+    }
     // AppKit's views run on the initial main thread in a UI-only own-executable
     // helper. It cannot initialize configuration, AppState, sockets or model work.
     if let Some(code) = bamboo_agent::server::native_scope_confirmation_helper_entry() {
@@ -1300,8 +1317,28 @@ fn exit_after_telemetry(
     std::process::exit(code)
 }
 
+fn exit_cli_startup_error(
+    telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard,
+    json_output: bool,
+    error: &str,
+    code: i32,
+) -> ! {
+    if json_output {
+        bamboo_agent::headless::print_stream_startup_error(error);
+    }
+    eprintln!("{error}");
+    exit_after_telemetry(telemetry, code);
+}
+
 async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     let cli = Cli::parse();
+    if cli.headless_json && cli.command.is_some() {
+        exit_cli_startup_error(telemetry, true, "--json requires a headless -p run", 2);
+    }
+    let headless_json_output = cli.command.is_none()
+        && cli.prompt.is_some()
+        && (cli.stream_json || cli.headless_json)
+        && !cli.echo;
 
     // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
     // directory it resolves to, so every flow that falls back to
@@ -1323,8 +1360,12 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 }
             }
             Err(e) => {
-                eprintln!("invalid --config '{}': {e}", path.display());
-                exit_after_telemetry(telemetry, 2);
+                exit_cli_startup_error(
+                    telemetry,
+                    headless_json_output,
+                    &format!("invalid --config '{}': {e}", path.display()),
+                    2,
+                );
             }
         }
     }
@@ -1338,11 +1379,15 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     if let Some(level) = requested_log_level {
         const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
         if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
-            eprintln!(
-                "invalid --log-level '{level}' (expected: {})",
-                LEVELS.join(" | ")
+            exit_cli_startup_error(
+                telemetry,
+                headless_json_output,
+                &format!(
+                    "invalid --log-level '{level}' (expected: {})",
+                    LEVELS.join(" | ")
+                ),
+                2,
             );
-            exit_after_telemetry(telemetry, 2);
         }
     }
     if let Some(level) =
@@ -1441,13 +1486,21 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 use std::io::Read as _;
                 let mut buf = String::new();
                 if std::io::stdin().read_to_string(&mut buf).is_err() {
-                    eprintln!("failed to read prompt from stdin");
-                    exit_after_telemetry(telemetry, 1);
+                    exit_cli_startup_error(
+                        telemetry,
+                        headless_json_output,
+                        "failed to read prompt from stdin",
+                        1,
+                    );
                 }
                 let trimmed = buf.trim().to_string();
                 if trimmed.is_empty() {
-                    eprintln!("empty prompt on stdin");
-                    exit_after_telemetry(telemetry, 1);
+                    exit_cli_startup_error(
+                        telemetry,
+                        headless_json_output,
+                        "empty prompt on stdin",
+                        1,
+                    );
                 }
                 trimmed
             } else {
@@ -1497,7 +1550,12 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 provider: cli.provider,
                 timeout_secs: cli.timeout,
             };
-            if let Err(e) = bamboo_agent::headless::run(args).await {
+            let result = if cli.headless_json {
+                bamboo_agent::headless::run_json(args).await
+            } else {
+                bamboo_agent::headless::run(args).await
+            };
+            if let Err(e) = result {
                 eprintln!("run failed: {e}");
                 exit_after_telemetry(telemetry, 1);
             }
@@ -1955,6 +2013,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             provider,
             api_key,
             model,
+            base_url,
             force,
             non_interactive,
         } => {
@@ -1963,6 +2022,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
                 provider,
                 api_key,
                 model,
+                base_url,
                 force,
                 non_interactive,
             });
@@ -2278,6 +2338,24 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headless_prompt_accepts_hyphen_prefixed_task_text() {
+        use clap::Parser;
+
+        let prompt = "- First requirement\n- Second requirement";
+        for flag in ["-p", "--prompt"] {
+            let parsed =
+                super::Cli::try_parse_from(["bamboo", flag, prompt, "--permission-mode", "auto"])
+                    .unwrap();
+            assert_eq!(parsed.prompt.as_deref(), Some(prompt));
+            assert_eq!(parsed.permission_mode.as_deref(), Some("auto"));
+        }
+
+        let stdin = super::Cli::try_parse_from(["bamboo", "-p", "-"]).unwrap();
+        assert_eq!(stdin.prompt.as_deref(), Some("-"));
+        assert!(super::Cli::try_parse_from(["bamboo", "--prompt"]).is_err());
+    }
+
     #[test]
     fn native_supervisor_confirmation_is_explicit_serve_only_opt_in() {
         use clap::Parser;

@@ -2,9 +2,9 @@
 //!
 //! Merges two authoritative sources under the caller's verified Supervisor
 //! authority: (1) `SupervisorManagementState.links` — roots this Supervisor
-//! created, each entry `origin=supervisor_created`; (2) the global session
-//! index filtered to `allowed_projects` — sessions the user opened, each entry
-//! `origin=user_opened`. Entries carry the persisted progress mirror and the
+//! created, each entry `origin=supervisor_created`; (2) Project-bound sessions
+//! the user opened, each entry `origin=user_opened`. Standalone roots created by
+//! the Supervisor are also discoverable. Entries carry the persisted progress mirror and the
 //! canonical Human UI engagement mark. Observation only: no entry grants
 //! followup/loop/attach authority, and no transcript content is exposed.
 
@@ -132,13 +132,13 @@ impl SupervisorSessionDirectory {
         // deliberately attaches no link, and attaching an existing user
         // session must not relabel its origin.
         for index in self.session_store.list_index_entries().await {
-            if index.project_id.as_deref().is_none() {
-                continue;
-            }
             if index.parent_session_id.is_some() || index.id == caller.session_id {
                 continue;
             }
             let supervisor_created = index.session_origin.as_deref() == Some("supervisor_created");
+            if index.project_id.is_none() && !supervisor_created {
+                continue;
+            }
             let link = state.and_then(|state| state.links.get(&index.id));
             if let Some(link) = link {
                 // A retained link must still match the target's CURRENT row:
@@ -187,7 +187,7 @@ fn entry_from_index(
         session_id: index.id,
         origin,
         linked,
-        project_id: index.project_id.unwrap_or_default(),
+        project_id: index.project_id,
         title: index.title.chars().take(256).collect(),
         created_at: index.created_at,
         last_activity_at: index.last_activity_at,

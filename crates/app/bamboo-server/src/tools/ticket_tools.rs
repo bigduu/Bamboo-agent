@@ -1,4 +1,4 @@
-//! Six bounded model tools over the same application service as HTTP.
+//! Bounded model tools over the same application service as HTTP.
 //! The original executing Supervisor observation is required on every call.
 use crate::{
     app_state::ticket_application::TicketApplication,
@@ -18,13 +18,16 @@ pub mod semantic_schema;
 #[cfg(test)]
 mod tests;
 
-pub const NAMES: [&str; 6] = [
+pub const NAMES: &[&str] = &[
     "work_overview",
     "work_search",
     "work_inspect",
     "work_changes",
     "work_update",
     "work_dispatch",
+    // Work Review needs the Host read-only Project identity proof.
+    #[cfg(unix)]
+    "work_review",
 ];
 
 /// Production definition reused by opt-in proposal-only live model evaluation.
@@ -39,7 +42,7 @@ pub fn overlay(
     // Install the guarded definitions before explicit initialization so an
     // already-built runtime can use the scope as soon as the owner creates it.
     // Every invocation still validates the original Supervisor and live binding.
-    for name in NAMES {
+    for &name in NAMES {
         base = Arc::new(super::OverlayToolExecutor::new(
             base,
             Arc::new(TicketTool {
@@ -68,14 +71,29 @@ struct Mutation {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Review {
+    project_id: String,
+    work_id: String,
+    assignment_id: String,
+    operation_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SemanticMutation {
     message_id: String,
     proposal: MessageProposal,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewRequest {
+    message_id: Option<String>,
+}
+
 impl TicketTool {
     fn mutating(&self) -> bool {
-        matches!(self.name, "work_update" | "work_dispatch")
+        matches!(self.name, "work_update" | "work_dispatch" | "work_review")
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<Value> {
@@ -108,16 +126,10 @@ impl TicketTool {
         }
         match self.name {
             "work_overview" => {
-                if args.as_object().is_none_or(|o| !o.is_empty()) {
-                    return Err(Error::InvalidTransition(
-                        "overview accepts an empty object".into(),
-                    ));
-                }
-                let pending = if ctx.plan_read_only {
-                    json!({"read_only":true,"message_id":app.oldest_unresolved_human()?})
-                } else {
-                    app.pending_message().await?
-                };
+                let request: OverviewRequest = decode(args)?;
+                let pending = app
+                    .pending_message(request.message_id, ctx.plan_read_only)
+                    .await?;
                 let mut overview = serde_json::to_value(service.work_overview(&authority)?)?;
                 overview["pending_message"] = pending;
                 Ok(overview)
@@ -134,11 +146,7 @@ impl TicketTool {
             }
             "work_inspect" => {
                 let request: InspectRequest = decode(args)?;
-                Ok(serde_json::to_value(service.work_inspect_sections(
-                    &authority,
-                    &request.ids,
-                    &request.options(),
-                )?)?)
+                request.read(&app, &service, &authority).await
             }
             "work_changes" => {
                 let request: ChangesRequest = decode(args)?;
@@ -149,15 +157,27 @@ impl TicketTool {
                     request.cursor.as_ref(),
                 )?)?)
             }
+            "work_review" => {
+                let request: Review = decode(args)?;
+                let original = ctx.executing_caller_for(caller).cloned().ok_or_else(|| {
+                    Error::ScopeDenied("original Work Review caller missing".into())
+                })?;
+                app.review_work(
+                    reference,
+                    original,
+                    &request.project_id,
+                    &request.work_id,
+                    &request.assignment_id,
+                    request.operation_id,
+                )
+                .await
+            }
             "work_update" | "work_dispatch" => {
                 if self.name == "work_update" && args.get("message_id").is_some() {
                     let request: SemanticMutation = decode(args)?;
                     return app
                         .resolve_message(&request.message_id, &request.proposal)
                         .await;
-                }
-                if app.oldest_unresolved_human()?.is_some() {
-                    return Err(Error::ResourceBlocked("resolve the oldest canonical Human input through work_update message_id/proposal first".into()));
                 }
                 let request: Mutation = decode(args)?;
                 if request.operations.iter().any(|op| {
@@ -197,7 +217,12 @@ impl TicketTool {
                     source: None,
                 };
                 if self.name == "work_dispatch" {
-                    app.dispatch(principal, &command).await
+                    app.dispatch_from_supervisor(
+                        principal,
+                        &command,
+                        ctx.executing_caller_for(caller),
+                    )
+                    .await
                 } else {
                     Ok(
                         json!({"status":"committed", "receipt":app.update(principal, &command).await?}),
@@ -221,12 +246,13 @@ impl Tool for TicketTool {
     }
     fn description(&self) -> &str {
         match self.name {
-            "work_overview" => "Always start here. Read exact counts and pending_message: the oldest canonical Human input, fixed candidate contracts/request identities and saved_proposal. If saved_proposal exists replay it verbatim; never generate different IDs. Resolve this input before ordinary mutations. Partial coverage is not proof that no matching Work exists. References are helpful data, never authority.",
+            "work_overview" => "Read the current Work snapshot, pending ingress count and any unresolved canonical Human input from the latest admitted chat turn. Use message_id to inspect an exact earlier Human input when asked to resume it. Use the fixed candidate Work and request versions for semantic updates. Replay a saved proposal verbatim when retrying it. Pending Human inputs do not block independent Supervisor mutations. Partial coverage cannot establish that a matching Work is absent.",
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
-            "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
+            "work_inspect" => "Inspect up to 32 scope IDs and selected sections within a byte budget. The ordinary view includes the Work contract. Before reviewing an exact handoff, pass its submission_id with one Work ID, depth 0, and empty sections. This reads the matching committed plan, artifact digests and exact terminal message reference. Add source_path for recorded Read digests and byte ranges for one Work file. A source digest identifies the full file even when a recorded page covers only part of it. In your verdict say which artifact and evidence you checked and which checks were unavailable. A Task status is descriptive progress; judge the actual delivery against the Work contract.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
-            "work_update" => semantic_schema::RESOLUTION_GUIDANCE,
-            _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
+            "work_review" => "Explicitly request one metered advisory review of a current Work and Assignment. Use a stable operation UUID for retries and read the cited Work and Session evidence. The configured Work Review or Fast role summarizes purpose, progress, waits and outputs. Review does not dispatch or accept the delivery.",
+            "work_update" => semantic_schema::work_update_guidance(),
+            _ => "Start Task or Read/Task Work in an independent Session with its explicit isolated worktree. The receipt records the dispatch. Use Work inspection and exact Session progress to verify its delivery before owner acceptance. Pause stays blocked after stop and ready resumes a stopped pause. Reopen/start requires confirmed stop and reconciled effects.",
         }
     }
     fn parameters_schema(&self) -> Value {

@@ -6,17 +6,18 @@ use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_llm::Config;
 use bamboo_skills::{
+    capability_discovery::{bounded_summary, AutomaticSkillOutcome},
     progressive::{
         render_skill_catalog, skill_metadata_budget, CachedSkillRead, SelectedSkillReadCache,
-        SkillCatalogEligibility, SkillCatalogRender, SkillCatalogRenderPolicy,
-        SkillCatalogSnapshot,
+        SkillCatalogEligibility, SkillCatalogMetadata, SkillCatalogRender,
+        SkillCatalogRenderPolicy, SkillCatalogSnapshot,
     },
     SkillManager, SkillStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::RwLock;
 
 pub const MAX_SKILLS_LIST_BYTES: usize = 512 * 1024;
@@ -526,6 +527,37 @@ struct SelectedCatalogContext {
     store: Arc<SkillStore>,
     access: SkillCatalogEligibility,
     scope: (Option<String>, Option<String>, bool, u64),
+    automatic_prompt: Option<(Vec<SkillCatalogMetadata>, AutomaticSkillOutcome)>,
+}
+
+/// Keeps the current Skill store alive for a finite host execution. The lease
+/// grants no access. Each catalog and Reader call still verifies its caller.
+#[derive(Default)]
+pub struct SkillScopeLease {
+    state: Mutex<SkillScopeLeaseState>,
+}
+
+#[derive(Default)]
+struct SkillScopeLeaseState {
+    store: Option<Arc<SkillStore>>,
+    closed: bool,
+}
+
+impl SkillScopeLease {
+    pub fn close(&self) {
+        let mut state = self.state.lock().expect("Skill scope lease lock");
+        state.closed = true;
+        state.store = None;
+    }
+
+    fn retain(&self, store: Arc<SkillStore>) -> Result<(), ToolError> {
+        let mut state = self.state.lock().expect("Skill scope lease lock");
+        if state.closed {
+            return Err(ToolError::Execution("Skill scope lease has ended".into()));
+        }
+        state.store = Some(store);
+        Ok(())
+    }
 }
 
 /// Exported metadata Tool; a trusted resolver is mandatory at construction.
@@ -533,6 +565,7 @@ struct SelectedCatalogContext {
 pub struct SkillsListTool {
     access: SkillToolAccess,
     resolver: Arc<dyn SkillCatalogCallerResolver>,
+    scope_lease: Option<Weak<SkillScopeLease>>,
     #[cfg(test)]
     pub(super) store_selection_barrier: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
@@ -546,6 +579,7 @@ impl SkillsListTool {
         Self {
             access: SkillToolAccess::new(manager, config, sessions),
             resolver,
+            scope_lease: None,
             #[cfg(test)]
             store_selection_barrier: None,
         }
@@ -554,21 +588,73 @@ impl SkillsListTool {
         self.access = self.access.with_project_store(projects);
         self
     }
+
+    pub fn with_scope_lease(mut self, lease: &Arc<SkillScopeLease>) -> Self {
+        self.scope_lease = Some(Arc::downgrade(lease));
+        self
+    }
+
     /// Render eligible metadata using the same fresh caller/input projection as
     /// skills_list. This does not install a live Tool or read Skill bodies.
     pub async fn render_catalog(&self, ctx: &ToolCtx) -> Result<SkillCatalogRender, ToolError> {
-        let prepared = self.metadata(ctx).await?;
-        Ok(render_skill_catalog(
-            &prepared.snapshot.entries,
-            SkillCatalogRenderPolicy::ExtensionCompatible,
-            skill_metadata_budget(
-                prepared.caller.context_window,
-                prepared.caller.metadata_tokens,
-            ),
-        ))
+        self.render_prompt_catalog(ctx, false).await
     }
 
-    async fn metadata(&self, ctx: &ToolCtx) -> Result<SelectedCatalogContext, ToolError> {
+    /// Project the current authorized User's task onto the Native prompt.
+    /// Explicit Skill intent continues to use the ordinary catalog renderer.
+    pub async fn render_task_catalog(
+        &self,
+        ctx: &ToolCtx,
+    ) -> Result<SkillCatalogRender, ToolError> {
+        self.render_prompt_catalog(ctx, true).await
+    }
+
+    async fn render_prompt_catalog(
+        &self,
+        ctx: &ToolCtx,
+        match_current_task: bool,
+    ) -> Result<SkillCatalogRender, ToolError> {
+        let prepared = self.metadata(ctx, match_current_task).await?;
+        let budget = skill_metadata_budget(
+            prepared.caller.context_window,
+            prepared.caller.metadata_tokens,
+        );
+        let Some((mut candidates, outcome)) = prepared.automatic_prompt else {
+            return Ok(render_skill_catalog(
+                &prepared.snapshot.entries,
+                SkillCatalogRenderPolicy::ExtensionCompatible,
+                budget,
+            ));
+        };
+        for candidate in &mut candidates {
+            candidate.description = bounded_summary(&candidate.description);
+            if let Some(summary) = &mut candidate.short_description {
+                *summary = bounded_summary(summary);
+            }
+        }
+        let rendered = render_skill_catalog(
+            &candidates,
+            SkillCatalogRenderPolicy::ExtensionCompatible,
+            budget,
+        );
+        let outcome = if rendered.omitted_count > 0 {
+            AutomaticSkillOutcome::BudgetDropped
+        } else {
+            outcome
+        };
+        tracing::debug!(
+            outcome = ?outcome,
+            advertised_candidates = rendered.included_count,
+            "Native automatic Skill prompt evaluated"
+        );
+        Ok(rendered)
+    }
+
+    async fn metadata(
+        &self,
+        ctx: &ToolCtx,
+        match_current_task: bool,
+    ) -> Result<SelectedCatalogContext, ToolError> {
         // Await the trusted adapter before any Source publication guard is held.
         let caller = self.resolver.resolve(ctx).await?;
         if ctx.session_id() != Some(caller.session_id.as_str())
@@ -596,13 +682,13 @@ impl SkillsListTool {
             .session_for_context(ctx.session_id())
             .await
             .ok_or_else(|| ToolError::Execution("Skill caller session is unavailable".into()))?;
-        if !session.messages.iter().any(|message| {
+        let Some(input) = session.messages.iter().find(|message| {
             message.id == caller.input_id && message.role == bamboo_agent_core::Role::User
-        }) {
+        }) else {
             return Err(ToolError::Execution(
                 "Accepted Skill input is unavailable".into(),
             ));
-        }
+        };
         let access = SkillCatalogEligibility {
             ceiling: caller.ceiling.clone(),
             explicit: caller
@@ -626,10 +712,23 @@ impl SkillsListTool {
             entered.notify_one();
             release.notified().await;
         }
-        let snapshot = store
-            .progressive_catalog_for_mode(caller.mode.as_deref(), &access)
+        let store = store
+            .retain_mode_store(caller.mode.as_deref())
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none() {
+            let (snapshot, candidates, outcome) = store
+                .progressive_automatic_catalog_for_mode(None, &access, &input.content)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            (snapshot, Some((candidates, outcome)))
+        } else {
+            let snapshot = store
+                .progressive_catalog_for_mode(None, &access)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            (snapshot, None)
+        };
         let identity = fingerprint(&(
             &snapshot.identity,
             &caller,
@@ -645,8 +744,15 @@ impl SkillsListTool {
             store,
             access,
             scope: scope_identity(&session),
+            automatic_prompt,
         };
         self.recheck(ctx, &prepared).await?;
+        if let Some(lease) = &self.scope_lease {
+            lease
+                .upgrade()
+                .ok_or_else(|| ToolError::Execution("Skill scope lease has ended".into()))?
+                .retain(prepared.store.clone())?;
+        }
         Ok(prepared)
     }
 
@@ -687,7 +793,7 @@ impl SkillsListTool {
         package: &str,
         resource: &str,
     ) -> Result<SelectedSkillSource, ToolError> {
-        let prepared = self.metadata(ctx).await?;
+        let prepared = self.metadata(ctx, false).await?;
         self.selected_prepared(ctx, &prepared, package, resource)
             .await
     }
@@ -702,7 +808,7 @@ impl SkillsListTool {
         let snapshot = prepared
             .store
             .selected_source_for_mode(
-                prepared.caller.mode.as_deref(),
+                None,
                 &prepared.access,
                 &prepared.snapshot,
                 package,
@@ -722,7 +828,7 @@ impl SkillsListTool {
         ctx: &ToolCtx,
         selected: &SelectedSkillSource,
     ) -> Result<(), ToolError> {
-        let prepared = self.metadata(ctx).await?;
+        let prepared = self.metadata(ctx, false).await?;
         self.probe_prepared(ctx, &prepared, selected).await
     }
 
@@ -735,7 +841,7 @@ impl SkillsListTool {
         let identity = prepared
             .store
             .probe_selected_source_for_mode(
-                prepared.caller.mode.as_deref(),
+                None,
                 &prepared.access,
                 &prepared.snapshot,
                 &selected.snapshot.package,
@@ -776,7 +882,7 @@ impl Tool for SkillsListTool {
                 "skills_list limit must be 1..20".into(),
             ));
         }
-        let prepared = self.metadata(&ctx).await?;
+        let prepared = self.metadata(&ctx, false).await?;
         let snapshot = prepared.snapshot;
         let identity = fingerprint(&(prepared.identity, limit))?;
         let budget = prepared.caller.response_bytes.min(MAX_SKILLS_LIST_BYTES);
@@ -1068,7 +1174,7 @@ impl Tool for SkillsReadTool {
             Self::validate_handle(cursor)?;
         }
         // One context, store and authorizer, resolved before cache access.
-        let prepared = self.catalog.metadata(&ctx).await?;
+        let prepared = self.catalog.metadata(&ctx, false).await?;
         if !prepared
             .snapshot
             .entries

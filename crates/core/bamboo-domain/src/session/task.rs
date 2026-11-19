@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 /// Task item status.
@@ -230,6 +231,43 @@ impl TaskItem {
         self.depends_on
             .iter()
             .all(|dependency_id| completed_ids.contains(dependency_id))
+    }
+}
+
+/// A material blocker committed with its Task revision by a fenced Root writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTaskBlocker {
+    pub run_id: String,
+    pub cursor: u64,
+    pub task_version: u64,
+    pub task_id: String,
+    task_list_sha256: String,
+}
+
+impl ManagedTaskBlocker {
+    pub fn from_committed_revision(
+        run_id: String,
+        cursor: u64,
+        task_version: u64,
+        task_id: String,
+        tasks: &TaskList,
+    ) -> serde_json::Result<Self> {
+        Ok(Self {
+            run_id,
+            cursor,
+            task_version,
+            task_id,
+            task_list_sha256: hex::encode(Sha256::digest(serde_json::to_vec(tasks)?)),
+        })
+    }
+
+    pub fn matches_revision(&self, version: u64, tasks: &TaskList) -> bool {
+        self.cursor != 0
+            && self.cursor <= version
+            && self.task_version == version
+            && serde_json::to_vec(tasks)
+                .is_ok_and(|bytes| self.task_list_sha256 == hex::encode(Sha256::digest(bytes)))
     }
 }
 

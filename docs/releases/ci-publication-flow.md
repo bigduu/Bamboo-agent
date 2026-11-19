@@ -40,12 +40,10 @@ The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 reusing compatible compiled output and running the shared serde case once. The
 original subscription workflow remains available for manual diagnosis.
 
-The canonical feature driver owns Planner's 12 Plan and 10 artifact library
-cases. It excludes only those ordinary library cases from the parallel run and
-executes each once with one test thread from the same package's already compiled
-binary. Each library keeps its own default dependency graph; no second Cargo
-compile is introduced. The independent Delegated Planner workflow still owns
-the distinct API-only real CLI pair and its original Clippy graphs.
+The canonical feature driver runs the nine retained Planner artifact and
+recovery cases serially from its compiled default engine test binary. Retained
+Planner Analysis runs the two original API-only Clippy configurations. The
+CLI cases that invoked the retired `Plan` tool remain historical evidence.
 
 ## Release: build the final artifacts
 
@@ -68,6 +66,11 @@ The controller checks `release/<cut-sha>` and builds that source, even if `dev`
 has advanced. It does not build or test the controller revision. The allocator
 chooses the release version; use the resulting tag and original artifacts for
 promotion.
+
+The frozen publisher fills the GitHub Release body with change subjects and
+linked commit SHAs. It compares the accepted source with the previous published
+stable ancestor and links the full Git history. The existing signed provenance
+block continues to supply the machine-readable receipt.
 
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
@@ -119,7 +122,65 @@ retry the original publisher's failed crate job and its dependent finalizer;
 they reuse the three successful native attempt-1 outputs. Do not rerun all jobs
 or treat a local/policy check as completed production recovery.
 
+### Fixed v2026.11.22 crate recovery
+
+Issue #2762 binds draft 446034086 and source
+`13336567999504a8c7deb89fba94f7907b04c3ee` to [publisher 43712198357](https://github.com/bigduu/Bamboo-agent/actions/runs/43712198357).
+Attempt 1 received HTTP 503 during the readback of the eighth crate,
+`bamboo-infrastructure`, after retaining its original archive and checksum.
+The fixed controller verifies the failed job log, eight published checksums,
+the sealed frontend and all five native transports from attempt 1. It
+applies bounded backoff to transient registry reads. The signed checkpoint
+tracks first verification and archive retention for the remaining 22 crates.
+
+Dispatch this controller after its reviewed PR merges into protected Dev:
+
+```bash
+gh workflow run recover-crate-2026-11-22.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+The recovery succeeds when authenticated readback shows
+`recovery20261122.completed=true`, no pending compilation, `receipt.completed=false`,
+the original draft and `publisherRunId=43712198357`. Retry only the failed jobs
+of that publisher after the recovery completes. Its finalizer uses the
+attempt-1 native outputs and publishes the v3 manifest for the same tag and
+source. The procedure requires the original retained transports and their
+unexpired identities.
+
+### Fixed v2026.11.31 crate recovery
+
+Issue #2840 binds draft 450766353 and source
+`1387680f8ce96d808ba48b7b570fba5dded4e021` to [publisher 44437436231](https://github.com/bigduu/Bamboo-agent/actions/runs/44437436231).
+The attempt-1 registry read terminated with an incomplete HTTP response body.
+The original publisher retains the crate archive and signs its checksum before
+it reads the registry again. The signed prefix ends at `bamboo-sdk`. The fixed
+controller binds that failure, the 26 original crate checksums, the sealed
+frontend and five original native transports. It retries bounded registry reads
+through full body consumption and verifies the exact Cargo download path.
+The four crates starting with `bamboo-server` use the existing signed
+first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev:
+
+```bash
+gh workflow run recover-crate-2026-11-31.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Verify signed readback of `recovery20261131.completed=true` with no pending
+compilation, `receipt.completed=false` and `publisherRunId=44437436231`. Retry
+only the original run's failed jobs. The original pipeline publishes its
+retained v3 executables with the existing draft, source and tag.
+
 ## Main and consumers
+
+The frozen source selects the native executable contract. The five-target v3
+contract requires Linux ARM64 and Windows ARM64 feature evidence through the
+existing feature aggregate and requires both binaries in the completed Release.
+Verify each architecture and the original output identity. The v2 contract
+keeps its existing three targets. See [shared executable assets](shared-executable-assets.md)
+for the complete target and recovery rules.
 
 Promote the release only after its required artifacts are published and checked.
 Main stores the stable source and version/tag references without another product
@@ -127,9 +188,70 @@ build, Unit/E2E run or publication. Documentation and Docker consumers use the
 original release or feature artifacts where applicable; they must not rebuild a
 successful output simply to consume it.
 
-After publication completes, Docker consumes the original Linux x64 binary.
-Linux ARM64 remains a separate image architecture and is built once from the
-same frozen source. Retried image jobs reuse their verified candidate digests.
+Docker uses the executable contract recorded in the frozen source. For v3 it
+binds the downloaded manifest hash to the original successful verification step
+of the exact protected Dev Publish Crate run and attempt. Both Linux images
+package their exact original release executables in the Bookworm runtime. The
+consumer verifies both binary hashes, runs their version and loader checks,
+and starts each image to check health
+and the embedded frontend before accepting its platform digest. The versioned
+index binds the verified digest for each architecture and the scan uses the
+verified index digest. Retried image jobs verify and reuse the original candidate
+by digest, including any digest already retained by that run. Historical v2 releases
+supply the original Linux x64 executable and keep their frozen ARM64 image
+build path. Run `node --test scripts/docker-publish.test.cjs` for the focused
+release-selection and Docker packaging contracts.
+
+## npm CLI package
+
+[Publish Bamboo CLI to npm](../../.github/workflows/publish-npm.yml) runs by manual
+dispatch on protected Dev. Supply a completed v3 release version and frozen
+source, plus the original successful Publish Crate run and attempt.
+The preparation job checks the publisher's authenticated manifest and the
+asset digests for all five executables. It packages the launcher, the exact
+manifest, and the verified Browser Host. On first invocation the launcher
+downloads and verifies the executable selected for the client's platform.
+
+The `verify` operation exercises the live Release proof and package file
+selection. The `stage` and `publish` operations retain one npm tarball from
+the preparation job. Both upload jobs verify its SHA-256 before sending it to
+npm. The publish job checks that the exact public version reports the
+prepared archive's integrity. If a registry request fails with an uncertain
+outcome, inspect the public version or the npm staging area before retrying
+only the failed job with the retained archive.
+
+### Authorize the first npm version
+
+1. In [npm Access Tokens](https://www.npmjs.com/settings/~/tokens), sign in as
+   an account with publish access to `@bigduu`. Generate a granular access
+   token limited to that package scope with **Read and write (stage only)**.
+   [npm token instructions](https://docs.npmjs.com/creating-and-viewing-access-tokens/)
+2. Add the token as the `BAMBOO_NPM_STAGE_TOKEN` secret in Bamboo-agent's
+   [`bamboo-release` environment](https://github.com/bigduu/Bamboo-agent/settings/environments).
+3. Run the workflow with `operation=stage`. npm creates a public
+   `0.0.0-stage` placeholder for a new package while the real version is staged.
+   In the npm website's **Staged Packages** tab, review
+   `@bigduu/bamboo-agent` at the exact version and approve it with 2FA.
+   [npm staged publishing](https://docs.npmjs.com/staged-publishing/)
+
+Run the following command to stage Bamboo v2026.11.22.
+
+~~~bash
+gh workflow run publish-npm.yml -R bigduu/Bamboo-agent --ref dev \
+  -f operation=stage -f version=2026.11.22 \
+  -f source=13336567999504a8c7deb89fba94f7907b04c3ee \
+  -f publisher_run_id=43712198357 -f publisher_attempt=2
+~~~
+
+### Authorize subsequent npm versions
+
+On npmjs.com, open `@bigduu/bamboo-agent` → **Settings** → **Trusted Publishing**
+and choose **GitHub Actions**. Enter owner `bigduu`, repository `Bamboo-agent`,
+workflow filename `publish-npm.yml`, and environment `bamboo-release`. Enable
+**Allow npm publish**. Dispatch `operation=publish` against each subsequent
+completed v3 release. npm supplies the workflow with short-lived OIDC
+credentials and a provenance attestation.
+[npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
 
 ## Rollout and historical releases
 
@@ -154,7 +276,17 @@ or a missing candidate for an already completed image stops recovery.
 
 If the expected automatic run is confirmed missing, or the failed-controller
 recovery above applies, recheck the live default branch and installed listener.
-Use the existing recovery flow for its exact version and source:
+For v3, provide the successful Publish Crate run and exact attempt whose
+verification step completed for that version and source. The original Actions
+check and step log must still be available.
+
+```bash
+gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "version=$RELEASE_VERSION" -f "source=$CUT_SHA" \
+  -f "publisher_run_id=$PUBLISHER_RUN_ID" -f "publisher_attempt=$PUBLISHER_ATTEMPT"
+```
+
+For historical v2, provide only the exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
@@ -188,7 +320,7 @@ From the main merge to complete assets, elapsed time was about 2 hours 24 minute
 excluding pre-merge acceptance.
 
 That historical source required all four v1 targets; its longest native job was
-macOS Intel. New v2 releases have three targets. Compare each source contract
+macOS Intel. The v2 contract has three targets and v3 has five. Compare each source contract
 separately and retain exact source/run/attempt/platform details when measuring
 the new workflow. These timings explain the optimization; they do not claim a
 measured speedup for an unpublished candidate.

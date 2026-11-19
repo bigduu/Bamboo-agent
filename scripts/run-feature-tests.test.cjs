@@ -35,8 +35,21 @@ test("feature shards partition package targets and additive owners exactly once"
   const agentFirst = integrationTargets(agent, "agent-tests-0");
   for (const name of ["ticket_runtime_files", "ticket_runtime_publication"]) assert.ok(agentFirst.includes(name));
   const server = packages.find(item => item.name === "bamboo-server");
+  assert.deepEqual(["server-tests-0", "server-tests-1"].filter(shard =>
+    integrationTargets(server, shard).includes("ready_work_scheduler")), ["server-tests-1"]);
+  assert.ok(!FEATURE_CONTEXTS.filter(context => context.package === server.name)
+    .some(context => context.targets.some(target => target.name === "ready_work_scheduler")),
+  "Ready owner cases use their existing default integration owner, without additive repetition");
+  assert.deepEqual(["server-tests-0", "server-tests-1"].filter(shard =>
+    integrationTargets(server, shard).includes("native_work_token_budget")), ["server-tests-0"]);
+  assert.ok(!FEATURE_CONTEXTS.filter(context => context.package === server.name)
+    .some(context => context.targets.some(target => target.name === "native_work_token_budget")),
+  "Budget owner HTTP cases use their default integration owner without additive repetition");
+  assert.equal(packageShard("bamboo-tickets"), "packages-0");
   for (const name of ["browser::one", "handlers::agent::chat::browser::two", "handlers::agent::execute::x",
-    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other"]) {
+    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other",
+    "handlers::agent::tickets::token_budget::tests::verified_worker_credentials_cannot_read_or_configure_owner_budget",
+    "handlers::agent::tickets::ready_policy::tests::verified_worker_credentials_cannot_observe_or_install_owner_policy"]) {
     const matches = SERVER_LIB_SHARDS.filter((shard, index) => {
       const positive = index >= SERVER_FILTERS.length || name.includes(SERVER_FILTERS[index]);
       return positive && !SERVER_FILTERS.slice(0, index).some(filter => name.includes(filter));
@@ -534,7 +547,7 @@ sourceCatalogSha:r.sourceFeatureHash(r.selectedPackages(metadata),root),execute:
   assert.equal(progress.source.event.GITHUB_SHA, null, "unknown local event identity stays explicit");
 });
 
-test("Planner22 default cases are excluded once and run serially from the same owned package binaries", t => {
+test("Retained Planner cases are excluded once and run serially from the owned engine binary", t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-planner-owner-")))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const owners = Object.entries(PLANNER_SERIAL).map(([name, recipe]) => ({ ...packageMetadata(name,
@@ -578,8 +591,8 @@ test("Planner22 default cases are excluded once and run serially from the same o
         return { status: 0 }
       } })
     assert.deepEqual(compiled.sort(), [...owners, recorder].map(owner => owner.name).sort(), "One Cargo test invocation per original default package")
-    assert.equal(runtime.length, 2, "Both library serial owners run even when one fails")
-    assert.equal(new Set(runtime.map(call => call.command)).size, 2)
+    assert.equal(runtime.length, 1, "Run the owned engine library once even on failure")
+    assert.equal(runtime[0].command.endsWith("bamboo_engine"), true)
     assert.ok(runtime.every(call => call.args.includes("--test-threads=1")))
     assert.equal(result.status === 0, !failure)
     if (!failure) for (const owner of owners) {
@@ -595,8 +608,8 @@ test("Planner serial catalog rejects missing or duplicate cases, failed summarie
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const owner = { name: "bamboo-engine" }, recipe = PLANNER_SERIAL[owner.name]
   const binary = path.join(root, "engine-test"), names = [...recipe.names].sort()
-  const success = "running 10 tests\n" + names.map(name => "test " + name + " ... ok\n").join("") +
-    "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s\n"
+  const success = "running " + names.length + " tests\n" + names.map(name => "test " + name + " ... ok\n").join("") +
+    "test result: ok. " + names.length + " passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s\n"
   const run = (change = {}) => {
     fs.writeFileSync(binary, "original compiled fixture")
     return runPlannerSerial(binary, owner, { ["lib/" + recipe.target]: [...names, "ordinary"], ...(change.catalog || {}) },
@@ -607,7 +620,7 @@ test("Planner serial catalog rejects missing or duplicate cases, failed summarie
         return { status: change.status || 0 }
       })
   }
-  assert.equal(run().cases.length, 10)
+  assert.equal(run().cases.length, names.length)
   for (const change of [{ names: names.slice(1) }, { names: [...names, "planner_artifact_unowned"] }, { names: [...names, names[0]] },
     { status: 23 }, { log: success.replace("0 ignored", "1 ignored") }, { log: success + "test " + names[0] + " ... ok\n" },
     { bytes: true }, { catalog: { "test/other": [names[0]] } }]) assert.throws(() => run(change))

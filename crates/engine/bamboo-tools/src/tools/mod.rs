@@ -1,8 +1,5 @@
 // NOTE: apply_patch, file_exists, get_current_dir, set_workspace have been
 // removed.  They are now aliases routed via BUILTIN_TOOL_ALIASES in executor.rs.
-pub mod bash;
-pub mod bash_input;
-pub mod bash_output;
 pub mod bash_runtime;
 pub mod content_diagnostics;
 pub mod edit;
@@ -13,9 +10,8 @@ pub mod get_file_info;
 pub mod glob;
 pub mod goal;
 pub mod grep;
-pub mod kill_shell;
 pub mod loop_control;
-pub mod memory_note;
+pub mod memory;
 mod parameter_schema;
 pub mod read;
 pub mod read_tracker;
@@ -32,9 +28,6 @@ pub mod workspace_state;
 pub mod write;
 pub mod write_stdin;
 
-pub use bash::BashTool;
-pub use bash_input::BashInputTool;
-pub use bash_output::BashOutputTool;
 pub use edit::EditTool;
 pub use exec_command::ExecCommandTool;
 pub use exit_plan_mode::ExitPlanModeTool;
@@ -42,11 +35,10 @@ pub use get_file_info::GetFileInfoTool;
 pub use glob::GlobTool;
 pub use goal::{UpdateGoalTool, UPDATE_GOAL_TOOL_NAME};
 pub use grep::GrepTool;
-pub use kill_shell::KillShellTool;
 pub use loop_control::{
     parse_loop_control_request, LoopControlRequest, LoopControlTool, LOOP_CONTROL_TOOL_NAME,
 };
-pub use memory_note::{MemoryNoteTool, SessionNoteTool};
+pub use memory::SessionMemoryTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use request_permissions::RequestPermissionsTool;

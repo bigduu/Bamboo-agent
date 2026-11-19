@@ -1,5 +1,9 @@
 # Explicit native Ready Work runtime slice
 
+This records the initial trusted Rust slice. Later canonical cumulative-token
+accounting is described by #2262, and the explicit owner HTTP control and current
+remaining gaps are documented in [owner Ready control](ticket-ready-owner-control.md).
+
 Part of #2042, workspace/failure isolation in #2046, and the first bounded crate
 extraction in #2050, after #2044 and #2045. Semantic patrol remains in #2049.
 This is a trusted Rust Host embedding port, not an HTTP auto-run switch. Normal

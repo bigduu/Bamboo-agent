@@ -16,7 +16,11 @@ pub fn parameters(name: &str) -> Value {
     let cursor = json!({"anyOf":[{"type":"null"},object(json!({"commit":id,"query_hash":id,"offset":{"type":"integer","minimum":0}}), &["commit","query_hash","offset"])]});
     let limit = json!({"type":"integer", "minimum":1, "maximum":100});
     match name {
-        "work_overview" => object(json!({}), &[]),
+        "work_overview" => object(
+            json!({"message_id":{"type":"string","minLength":1,"maxLength":128,
+                "description":"Select an exact earlier canonical Human input. Omit to inspect the latest admitted Human turn."}}),
+            &[],
+        ),
         "work_search" => object(
             json!({"filter":object(json!({
             "query":{"type":"string","maxLength":512}, "kind":{"type":["string","null"],"enum":["goal","work","step",null]},
@@ -29,8 +33,15 @@ pub fn parameters(name: &str) -> Value {
         "work_inspect" => object(
             json!({"ids":ids,"depth":{"type":"integer","minimum":0,"maximum":4},
             "sections":{"type":"array","uniqueItems":true,"maxItems":3,"items":{"type":"string","enum":["assignments","requests","submissions"]}},
-            "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id}),
+            "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id,
+            "submission_id":{"type":["string","null"],"description":"Exact handoff. Use one Work ID, depth 0, and empty sections."},
+            "source_path":{"type":["string","null"],"maxLength":1024,"description":"One recorded Work file path for the selected submission."}}),
             &["ids", "sections", "depth", "budget_bytes", "fixed_commit"],
+        ),
+        "work_review" => object(
+            json!({"project_id":id, "work_id":id, "assignment_id":id,
+                "operation_id":{"type":"string","format":"uuid","description":"Stable for this explicit review, including retry."}}),
+            &["project_id", "work_id", "assignment_id", "operation_id"],
         ),
         "work_changes" => object(
             json!({"since_seq":{"type":"integer","minimum":0},"limit":limit,"cursor":cursor}),
@@ -134,8 +145,8 @@ pub fn parameters(name: &str) -> Value {
                 result["properties"]["proposal"] = super::semantic_schema::proposal();
                 result["required"] = json!([]);
                 result["oneOf"] = json!([
-                    {"required":["message_id","proposal"]},
-                    {"required":["operation_id","expected_seq","expected_epoch","operations"]}
+                    {"required":["message_id","proposal"],"maxProperties":2},
+                    {"required":["operation_id","expected_seq","expected_epoch","operations"],"maxProperties":4}
                 ]);
             }
             result

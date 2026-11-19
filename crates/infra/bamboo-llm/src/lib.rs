@@ -20,6 +20,8 @@ pub mod resolved_model;
 pub mod retry;
 pub mod router;
 pub mod types;
+pub mod work_text;
+pub mod work_usage;
 
 pub mod api {
     pub mod models {
@@ -34,7 +36,9 @@ pub mod api {
 pub use bamboo_config::Config;
 pub use cache::{CacheTtl, PromptCachePlan};
 pub use error::ProxyAuthRequiredError;
-pub use image_budget::{validate_tool_image_budget, validate_tool_result_images};
+pub use image_budget::{
+    validate_tool_image_budget, validate_tool_result_images, MAX_TOOL_IMAGE_URL_BYTES,
+};
 pub use model_catalog::ModelCatalogService;
 pub use models::*;
 pub use prompt_ir::{Continuation, PromptIR, Segment, SegmentRole};
@@ -47,11 +51,11 @@ pub use provider::{
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
 };
 pub use provider_factory::{
-    create_provider, create_provider_by_name, create_provider_with_dir, validate_provider_config,
-    AVAILABLE_PROVIDERS,
+    create_provider, create_provider_by_name, create_provider_with_dir,
+    is_configured_provider_type, validate_provider_config, AVAILABLE_PROVIDERS,
 };
 pub use provider_registry::ProviderRegistry;
-pub use providers::{AnthropicProvider, CopilotProvider, GeminiProvider, OpenAIProvider};
+pub use providers::{AnthropicProvider, GeminiProvider, OpenAIProvider};
 pub use resolved_model::ResolvedModel;
 pub use router::ProviderModelRouter;
 pub use types::LLMChunk;

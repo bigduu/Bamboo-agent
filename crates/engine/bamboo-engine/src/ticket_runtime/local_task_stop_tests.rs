@@ -440,3 +440,5 @@ async fn legacy_pid_stop_receipt_still_replays_without_task_metadata() {
 
 #[path = "local_task_stop_tests/sdk_publication.rs"]
 mod sdk_publication;
+#[path = "local_task_stop_tests/work_lifetime.rs"]
+mod work_lifetime;

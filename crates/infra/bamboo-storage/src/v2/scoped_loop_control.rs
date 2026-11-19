@@ -588,6 +588,7 @@ impl SessionStoreV2 {
                             &claim,
                             Utc::now(),
                             filesystem,
+                            None,
                         )
                         .await
                         .map_err(conflict)?,

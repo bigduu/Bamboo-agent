@@ -63,7 +63,7 @@ impl LocalChildTools {
                 subagent_denied |= name == "SubAgent";
                 disabled_names.insert(name.clone());
                 allowed.remove(&name);
-                if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+                for replacement in bamboo_domain::legacy_shell_replacements(&name) {
                     allowed.remove(replacement);
                 }
             }

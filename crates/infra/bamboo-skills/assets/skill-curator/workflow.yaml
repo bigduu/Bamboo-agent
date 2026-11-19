@@ -1,0 +1,34 @@
+workflow_schema: 1
+id: skill-curator
+revision: 1
+input_schema:
+  type: object
+  required: [project_id, prompt, base]
+  additionalProperties: false
+  properties:
+    project_id: {type: string}
+    prompt: {type: string}
+    base: {type: [object, "null"]}
+steps:
+  - id: draft
+    type: agent
+    agent: reviewer
+    prompt: {from: args, pointer: /prompt}
+    capabilities: [read]
+    structured_output_attempts: 1
+    output_schema:
+      type: object
+      required: [version, outcome, summary]
+      properties:
+        version: {enum: [1]}
+        outcome: {enum: [completed, blocked]}
+        summary: {type: string}
+plan: {type: step, step: draft}
+budgets:
+  max_concurrency: 1
+  max_agents: 1
+  max_steps: 1
+  max_retries: 0
+  max_nesting_depth: 1
+  wall_time_ms: 90000
+  max_tokens: 12000

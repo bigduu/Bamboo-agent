@@ -52,6 +52,7 @@ fn parse_warning_log_details<'a>(
             "work_changes",
             "work_update",
             "work_dispatch",
+            "work_review",
         ]
         .iter()
         .any(|name| execution_name.eq_ignore_ascii_case(name))
@@ -76,6 +77,9 @@ fn tool_start_name_for_display(tool_name: &str) -> String {
 }
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
+    /// Continue an empty poll within the active runner when the model has
+    /// requested only that poll and there is no interactive approver.
+    pub await_quiet_exec: bool,
     pub vision_support: bool,
     pub session_behavior_version: Option<u32>,
     pub tool_call: &'a ToolCall,
@@ -150,6 +154,10 @@ impl PortableToolExecution {
     pub(super) fn execution_name(&self) -> &str {
         &self.name
     }
+
+    pub(super) fn input(&self) -> &serde_json::Value {
+        &self.input
+    }
 }
 
 #[cfg(test)]
@@ -157,9 +165,13 @@ impl PortableToolExecution {
     /// Declare an already-selected executor identity for result-contract tests.
     /// Model catalog admission is covered separately by the promotion tests.
     pub(super) fn selected_identity_fixture(execution_name: &str) -> Self {
+        Self::with_input_fixture(execution_name, serde_json::json!({}))
+    }
+
+    pub(super) fn with_input_fixture(execution_name: &str, input: serde_json::Value) -> Self {
         Self {
             name: execution_name.to_owned(),
-            input: serde_json::json!({}),
+            input,
         }
     }
 }
@@ -217,6 +229,21 @@ pub(super) struct ToolExecutionOutcome {
     pub tool_duration: std::time::Duration,
 }
 
+impl ToolExecutionOutcome {
+    fn rejected_before_dispatch(error: String) -> Self {
+        Self {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Err(error),
+            needs_human: None,
+            portable_tool: None,
+            post_tool_hook_eligible: false,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        }
+    }
+}
+
 pub(super) enum ShellAccountingOutcome {
     Ordinary,
     Pending,
@@ -227,14 +254,12 @@ pub(super) fn shell_accounting_outcome(
     outcome: &ToolExecutionOutcome,
     admitted_execution_name: Option<&str>,
 ) -> ShellAccountingOutcome {
-    if !matches!(
-        outcome
-            .portable_tool
-            .as_ref()
-            .map(|tool| tool.execution_name())
-            .or(admitted_execution_name),
-        Some("exec_command" | "write_stdin")
-    ) {
+    let execution_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(|tool| tool.execution_name())
+        .or(admitted_execution_name);
+    if !matches!(execution_name, Some("exec_command" | "write_stdin")) {
         return ShellAccountingOutcome::Ordinary;
     }
     if outcome.needs_human.is_some() {
@@ -314,16 +339,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
             ctx.tool_call.id,
             ctx.tool_call.function.name,
         );
-        return Ok(ToolExecutionOutcome {
-            output_cap: None,
-            permission_replay_origin: None,
-            result: Err(message),
-            needs_human: None,
-            portable_tool: None,
-            post_tool_hook_eligible: false,
-            managed_running_violation: false,
-            tool_duration: std::time::Duration::ZERO,
-        });
+        return Ok(ToolExecutionOutcome::rejected_before_dispatch(message));
     };
 
     execute_tool_call_only_with_execution_name(&execution_name, ctx).await
@@ -406,7 +422,10 @@ async fn execute_tool_call_only_with_execution_name_inner(
             .tools
             .framework_session_tool_for_exact(execution_name)
             .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
+    let work_unavailable =
+        bamboo_domain::supervisor_work_tool(execution_name) && !executing_supervisor;
     if framework_unavailable
+        || work_unavailable
         || ((ctx.root_orchestration_only || executing_supervisor)
             && (exact_owner_shadowed
                 || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
@@ -436,6 +455,8 @@ async fn execute_tool_call_only_with_execution_name_inner(
                     "session_framework_port_unavailable"
                 };
                 format!("{code}: {execution_name} requires an installed concrete Host instance; names/contracts grant no capability and no operation was started")
+            } else if work_unavailable {
+                "Work tools require a trusted Supervisor session".into()
             } else if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {
@@ -459,41 +480,27 @@ async fn execute_tool_call_only_with_execution_name_inner(
             ctx.tool_call.function.name,
             policy_error
         );
-        return Ok(ToolExecutionOutcome {
-            output_cap: None,
-            permission_replay_origin: None,
-            needs_human: None,
-            portable_tool: None,
-            post_tool_hook_eligible: false,
-            managed_running_violation: false,
-            result: Err(policy_error),
-            tool_duration: std::time::Duration::ZERO,
-        });
+        return Ok(ToolExecutionOutcome::rejected_before_dispatch(policy_error));
     }
-
-    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
-        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
-            Ok(target) => Some(target),
-            Err(error) => {
-                return Ok(ToolExecutionOutcome {
-                    output_cap: None,
-                    permission_replay_origin: None,
-                    result: Err(error.to_string()),
-                    needs_human: None,
-                    portable_tool: None,
-                    post_tool_hook_eligible: false,
-                    managed_running_violation: false,
-                    tool_duration: std::time::Duration::ZERO,
-                })
-            }
-        }
-    } else {
-        None
-    };
 
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
+        // An explicit empty object is valid for no-argument tools. An empty
+        // fallback after malformed input cannot authorize a default action.
+        if args.as_object().is_some_and(|object| object.is_empty()) {
+            tracing::warn!(
+                "[{}][round:{}] Unrecoverable tool arguments rejected before ToolStart: tool_call_id={}, tool_name={}, args_len={}",
+                ctx.session_id,
+                ctx.round,
+                ctx.tool_call.id,
+                execution_name,
+                raw_arguments.len()
+            );
+            return Ok(ToolExecutionOutcome::rejected_before_dispatch(format!(
+                "Invalid JSON arguments for tool '{execution_name}'. Rewrite the call with a complete JSON object."
+            )));
+        }
         let (args_preview, warning) =
             parse_warning_log_details(execution_name, raw_arguments, &warning);
         tracing::warn!(
@@ -507,6 +514,19 @@ async fn execute_tool_call_only_with_execution_name_inner(
             warning
         );
     }
+
+    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
+        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(ToolExecutionOutcome::rejected_before_dispatch(
+                    error.to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     tracing::debug!(
         "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",
@@ -755,14 +775,38 @@ async fn execute_tool_call_only_with_execution_name_inner(
         ctx.session_id,
         ctx.round_id,
     );
-    let observed_dispatch = observation
-        .scope(bamboo_tools::with_hook_permission_override(
-            permission_override,
-            &ctx.tool_call.id,
-            dispatch,
-        ))
-        .await
-        .map(ToolOutcome::enforce_suspension_restriction);
+    let dispatch = observation.scope(bamboo_tools::with_hook_permission_override(
+        permission_override,
+        &ctx.tool_call.id,
+        dispatch,
+    ));
+    let await_quiet_exec = ctx.await_quiet_exec && execution_name == "write_stdin";
+    let observed_dispatch = if await_quiet_exec {
+        bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await
+    } else {
+        dispatch.await
+    }
+    .map(ToolOutcome::enforce_suspension_restriction);
+    // Await the same admitted command before completing the tool lifecycle.
+    // The outer runner's cancellation still covers this tool future.
+    let observed_dispatch = match observed_dispatch {
+        Ok(ToolOutcome::Completed(previous)) if await_quiet_exec => {
+            let elapsed = tool_timer.elapsed();
+            let remaining = std::time::Duration::from_secs(ctx.config.per_tool_timeout_secs)
+                .saturating_sub(elapsed);
+            let result = bamboo_tools::tools::write_stdin::continue_empty_poll(
+                ctx.session_id,
+                &ctx.tool_call.id,
+                &args,
+                previous,
+                elapsed,
+                remaining,
+            )
+            .await;
+            Ok(result)
+        }
+        outcome => outcome,
+    };
     use bamboo_infrastructure::telemetry::Outcome as TraceOutcome;
     let trace_outcome = match &observed_dispatch {
         Ok(ToolOutcome::Completed(result)) if !result.success => TraceOutcome::ToolError,
@@ -1138,10 +1182,11 @@ where
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     outcome: ToolExecutionOutcome,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
     let control = ctx.config.loop_control.as_ref();
-    let apply = apply_tool_execution_outcome_inner(ctx, outcome);
+    let apply = apply_tool_execution_outcome_inner(ctx, outcome, raw_fingerprint);
     if let Some(control) = control {
         let (result, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(noninteractive, apply).await;
@@ -1167,6 +1212,7 @@ pub(super) async fn apply_tool_execution_outcome(
 async fn apply_tool_execution_outcome_inner(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
+    mut raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     // Normalize before post hooks, policy accounting or any question/wait write.
     // An already checkpointed loop receipt never has a waiting result shape.
@@ -1218,6 +1264,9 @@ async fn apply_tool_execution_outcome_inner(
         )
         .await?);
         loop_result_checkpointed = true;
+        // The dispatch acknowledgement only validated the command. The
+        // checkpoint's owner result is the first real outcome to compare.
+        raw_fingerprint = policy::dispatched_tool_fingerprint(ctx.tool_call, &outcome);
     }
     // Start can install its generation during owner apply above. Re-enter
     // the restriction now, before even its own native AfterTool hook runs.
@@ -1227,6 +1276,7 @@ async fn apply_tool_execution_outcome_inner(
         outcome,
         feedback_cap,
         loop_result_checkpointed,
+        raw_fingerprint,
     );
     if noninteractive {
         apply_without_suspension(apply).await
@@ -1240,6 +1290,7 @@ async fn apply_completed_tool_execution_outcome(
     mut outcome: ToolExecutionOutcome,
     feedback_cap: u32,
     loop_result_checkpointed: bool,
+    raw_fingerprint: Option<[u8; 32]>,
 ) -> Result<bool, AgentError> {
     let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
@@ -1355,6 +1406,11 @@ async fn apply_completed_tool_execution_outcome(
         ctx.admitted_execution_name,
     );
 
+    let repeated_tool_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(PortableToolExecution::execution_name)
+        .unwrap_or(&ctx.tool_call.function.name);
     let running_violation = outcome.managed_running_violation;
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
@@ -1518,6 +1574,8 @@ async fn apply_completed_tool_execution_outcome(
             crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
         ));
     }
+    ctx.policy_guard
+        .observe_repeated_call(repeated_tool_name, raw_fingerprint);
     Ok(result)
 }
 
@@ -1627,6 +1685,7 @@ mod task_progress_tests {
                 state: &mut RoundExecutionState::default(),
             },
             outcome,
+            None,
         )
         .await
         .unwrap();
@@ -1722,11 +1781,13 @@ mod task_progress_tests {
                 bamboo_tools::BuiltinToolExecutor::new_with_permissions(checker),
             );
             let schemas = tools.list_tools();
-            let args = if execution_name == "exec_command" {
-                serde_json::json!({"cmd":format!("printf forbidden > '{}'", sentinel.display())})
-            } else {
+            let command = format!("printf forbidden > '{}'", sentinel.display());
+            let args = match execution_name {
+                "exec_command" => serde_json::json!({"cmd":command}),
                 // The gate must pause before the actual tool rejects this unknown handle.
-                serde_json::json!({"session_id":"00000000-0000-0000-0000-000000000000", "chars":""})
+                _ => {
+                    serde_json::json!({"session_id":"00000000-0000-0000-0000-000000000000", "chars":""})
+                }
             };
             let call = ToolCall {
                 id: format!("real-pending-{cap}-{requested}"),
@@ -1753,6 +1814,7 @@ mod task_progress_tests {
                 execute_tool_call_only_with_execution_name(
                     execution_name,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -1875,6 +1937,7 @@ mod task_progress_tests {
                     state: &mut RoundExecutionState::default(),
                 },
                 outcome,
+                None,
             )
             .await
             .unwrap();
@@ -2598,6 +2661,7 @@ mod hook_tests {
         let outcome = execute_model_requested_tool_call_only(
             callable,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -2787,6 +2851,7 @@ mod hook_tests {
             let execution = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
                     session_behavior_version: None,
                     vision_support: true,
                     output_cap: cap,
@@ -2934,6 +2999,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3066,6 +3132,57 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn stale_work_catalog_cannot_grant_supervisor_authority_to_roots_or_children() {
+        let names = ["work_overview", "work_dispatch", "work_review"];
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        let root = Session::new("ordinary", "model");
+        let mut ultra = root.clone();
+        ultra.set_root_orchestration_only(true).unwrap();
+        let child = Session::new_child_of("child", &root, "model", "worker");
+        for session in [root, ultra, child] {
+            let concrete = Arc::new(NameRecordingExecutor::new(&names));
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            let (tx, mut rx) = mpsc::channel(16);
+            for name in names {
+                let call = probe_call(name);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
+                        session_behavior_version: None,
+                        vision_support: true,
+                        output_cap: None,
+                        executing_caller: None,
+                        executing_supervisor: None,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: &session.id,
+                        root_session_id: &session.root_session_id,
+                        root_orchestration_only: session.root_orchestration_only_enabled(),
+                        round_id: "work-role-scope",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&session),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(outcome.result.unwrap_err().contains("trusted Supervisor"));
+                assert!(!outcome.post_tool_hook_eligible);
+            }
+            assert!(concrete.entered().is_empty());
+            assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_delegation_first_final_gate_rejects_stale_execution_schemas_in_both_modes()
     {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
@@ -3108,6 +3225,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -3133,12 +3251,7 @@ mod hook_tests {
                 .unwrap();
                 let allowed = matches!(
                     name,
-                    "SubAgent"
-                        | "Plan"
-                        | "Task"
-                        | "session_control"
-                        | "session_history"
-                        | "work_dispatch"
+                    "SubAgent" | "Task" | "session_control" | "session_history" | "work_dispatch"
                 );
                 assert_eq!(outcome.result.is_ok(), allowed, "ultra={ultra}: {name}");
                 if !allowed {
@@ -3148,7 +3261,6 @@ mod hook_tests {
             }
             let expected = vec![
                 "SubAgent",
-                "Plan",
                 "Task",
                 "session_control",
                 "session_history",
@@ -3199,6 +3311,7 @@ mod hook_tests {
                     let outcome = execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            await_quiet_exec: false,
                             session_behavior_version: None,
                             vision_support: true,
                             output_cap: None,
@@ -3283,7 +3396,6 @@ mod hook_tests {
             "exec_command",
             "default::exec_command",
             "write_stdin",
-            "Edit",
             "apply_patch",
             "default::Read",
         ] {
@@ -3301,31 +3413,33 @@ mod hook_tests {
             ));
             assert!(!outcome.post_tool_hook_eligible);
         }
-        let allowed = execute_without_hooks_with_root_authority(
-            &stale,
-            &tools,
-            &probe_call("read_file"),
-            &event_tx,
-            true,
-        )
-        .await;
-        assert!(allowed.result.is_ok());
-        assert_eq!(concrete_tools.entered(), ["Read"]);
+        for name in ["read_file", "Edit"] {
+            let allowed = execute_without_hooks_with_root_authority(
+                &stale,
+                &tools,
+                &probe_call(name),
+                &event_tx,
+                true,
+            )
+            .await;
+            assert!(allowed.result.is_ok());
+        }
+        assert_eq!(concrete_tools.entered(), ["Read", "Edit"]);
         let starts = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
             .count();
-        assert_eq!(starts, 1);
+        assert_eq!(starts, 2);
     }
 
     #[tokio::test]
-    async fn malformed_namespaced_browser_call_starts_with_fixed_display_name() {
+    async fn repairable_namespaced_browser_call_starts_with_fixed_display_name() {
         let concrete_tools = Arc::new(NameRecordingExecutor::new(&["browser"]));
         let tools: Arc<dyn ToolExecutor> = concrete_tools;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let callable =
             effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
         let mut call = probe_call("private-selector::browser");
-        call.function.arguments = "{malformed".to_string();
+        call.function.arguments = r#"{"action":"inspect""#.into();
         let _ = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| matches!(
@@ -3334,6 +3448,100 @@ mod hook_tests {
                 if tool_name == "browser" && !arguments.to_string().contains("private-selector")
         )));
         assert_eq!(call.function.name, "private-selector::browser");
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_tool_arguments_never_dispatch_defaults() {
+        let executor = Arc::new(NameRecordingExecutor::new(&["probe"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable =
+            effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+
+        for (arguments, should_dispatch) in [
+            ("{malformed", false),
+            ("{", false),
+            ("{}", true),
+            ("", true),
+            (r#"{"flag":true"#, true),
+        ] {
+            let mut call = probe_call("probe");
+            call.function.arguments = arguments.into();
+            let outcome = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
+            let started = std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::ToolStart { .. }));
+            assert_eq!(started, should_dispatch, "{arguments:?}");
+            assert_eq!(outcome.result.is_ok(), should_dispatch, "{arguments:?}");
+            if !should_dispatch {
+                assert!(!outcome.post_tool_hook_eligible);
+                assert!(outcome.result.unwrap_err().contains("complete JSON object"));
+            }
+        }
+        assert_eq!(executor.entered(), ["probe", "probe", "probe"]);
+    }
+
+    #[tokio::test]
+    async fn malformed_view_image_is_rejected_before_resolving_vision_provider() {
+        let executor = Arc::new(NameRecordingExecutor::new(&["ViewImage"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable = effective_callable_set(
+            &["ViewImage"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = resolutions.clone();
+        let config = AgentLoopConfig {
+            vision_model_resolver: Some(Arc::new(move || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(AgentError::LLM("unavailable test Vision provider".into())) })
+            })),
+            ..Default::default()
+        };
+        let session = Session::new("vision-arguments", "text-only");
+        for (arguments, expected_error, expected_resolutions) in [
+            ("{malformed", "complete JSON object", 0),
+            (
+                r#"{"path":"test.png"}"#,
+                "unavailable test Vision provider",
+                1,
+            ),
+        ] {
+            let mut call = probe_call("ViewImage");
+            call.function.arguments = arguments.into();
+            let outcome = execute_model_requested_tool_call_only(
+                &callable,
+                ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
+                    session_behavior_version: None,
+                    vision_support: false,
+                    output_cap: None,
+                    executing_caller: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: &session.id,
+                    root_session_id: &session.id,
+                    root_orchestration_only: false,
+                    round_id: "vision-arguments",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(outcome.result.unwrap_err().contains(expected_error));
+            assert_eq!(resolutions.load(Ordering::SeqCst), expected_resolutions);
+        }
+        assert!(executor.entered().is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3365,6 +3573,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3533,6 +3742,7 @@ mod hook_tests {
                 state: &mut state,
             },
             outcome,
+            None,
         )
         .await
     }
@@ -3729,6 +3939,7 @@ mod hook_tests {
         let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
         let outcome = trace
             .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3798,6 +4009,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -3882,6 +4094,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -3942,6 +4155,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -4507,6 +4721,7 @@ mod hook_tests {
                     execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            await_quiet_exec: false,
                             session_behavior_version: Some(2),
                             vision_support: true,
                             output_cap: None,
@@ -4747,6 +4962,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: Some(97),
@@ -4812,6 +5028,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -4901,6 +5118,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             &callable,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -5166,6 +5384,7 @@ mod hook_tests {
                         let outcome = execute_model_requested_tool_call_only(
                             &callable,
                             ToolExecutionOnlyContext {
+                                await_quiet_exec: false,
                                 session_behavior_version: version,
                                 vision_support: true,
                                 output_cap: None,
@@ -5248,6 +5467,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -5328,6 +5548,7 @@ mod hook_tests {
             let outcome = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
                     session_behavior_version: Some(2),
                     vision_support: true,
                     output_cap: None,

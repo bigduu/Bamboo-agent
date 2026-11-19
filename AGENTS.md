@@ -10,7 +10,8 @@ Every agent follows the same feature/dev/release/main workflow. The shared
 review documents include historical snapshots; use the local guide and actual
 workflow files for the current implementation and rollout status.
 
-- Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
+- Session memory is continuity for the current session. Section memory holds durable facts within the server-assigned Section. Project memory holds project-wide decisions. Global memory holds cross-project user context.
+- Use Section when the Host can resolve the current Root's stable Section assignment. A verified Child shares its Root's Section. When Section is unavailable, continue with the existing scopes and keep Section-only context in Session notes.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
 - Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
 - Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.
@@ -48,12 +49,11 @@ aggregates require it to pass. Do not add a second automatic owner for those
 tests.
 Keep the standalone default storage authority families' serial selection in its
 owning shard, reusing its compiled library-test executable without repeating cases.
-Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
-parallel harness and run once serially using each package's same compiled
-canonical test executable. Preserve each default dependency graph and fail the
-existing feature gate on a missing, repeated or failed case. The independent
-Delegated Planner workflow retains its distinct API-only real CLI and original
-Clippy configurations; it does not repeat these library cases.
+The nine retained Planner artifact and recovery library cases run once
+serially from the canonical engine test executable, outside its ordinary
+parallel harness. Fail the feature gate on a missing, repeated or failed
+case. Retained Planner Analysis owns the original API-only Clippy
+configurations. The retired `Plan` tool's CLI acceptance is historical.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 For root and docs Markdown-only PRs, run Quick Checks and skip product tests;
 Markdown under source packages may be compiled into the application and must
@@ -74,7 +74,9 @@ contexts remain distinct from canonical embedded feature tests.
 #2319 gives Windows and macOS one diagnostic job, workspace and owned target each.
 `native-feature-tests` runs `node scripts/native-test-owner.cjs` on manual
 dispatch, not on every feature PR. Its separate workflows remain available for
-explicit diagnosis or historical recovery.
+explicit diagnosis or historical recovery. Non-documentation feature changes
+also run the existing embedded-frontend integration case on Linux ARM64 and
+Windows ARM64. Both native jobs are required by the feature aggregate.
 
 Preserve these configurations; a shared directory is not permission to unify
 their features or reuse an incompatible executable:
@@ -155,7 +157,10 @@ source fixed through version reservation, native builds and publication; normal
 dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
-unchanged during the explicitly documented cutover dependency.
+unchanged during the explicitly documented cutover dependency. The v3 native
+publication contract requires macOS ARM64, Linux x64 and ARM64, and Windows x64
+and ARM64. Use the source-selected manifest and native job outputs for each
+frozen contract.
 
 For the fixed `v2026.10.19` infrastructure failure, #2371 adds the manual
 `recover-frozen-crate-release.yml` controller. It requires the exact reviewed
@@ -175,3 +180,23 @@ readback, resume the original publisher's failed crate job and its finalizer usi
 the attempt-1 native outputs. Keep the recovery run's real `GITHUB_*` identity;
 never impersonate the original run. See the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261019-crate-recovery).
 Reviewed source alone does not establish a successful recovery or publication.
+
+The fixed `v2026.11.22` recovery in #2762 uses
+`recover-crate-2026-11-22.yml` on the exact reviewed protected Dev controller.
+It authenticates the failed attempt of publisher 43712198357, draft 446034086,
+the eight retained crate originals and the five native transports. The
+22 proven-unstarted crates use the signed write-ahead protocol. After
+authenticated readback of `recovery20261122.completed=true`, the original
+publisher owns finalization. Follow the
+[fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261122-crate-recovery).
+
+The fixed `v2026.11.31` recovery in #2840 verifies the original failed registry
+read, 26 signed crate originals and all five successful native transports.
+The four unstarted crates use the same signed first-compilation checkpoint.
+Follow the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261131-crate-recovery).
+
+The Bamboo npm workflow is a consumer of the completed v3 Release. Use its
+exact source, manifest and publisher attempt. The preparation job owns npm
+packing and the publishing job uses that verified tarball. See the
+[npm section of the publication guide](docs/releases/ci-publication-flow.md#npm-cli-package)
+for first-version staging and npm Trusted Publishing.

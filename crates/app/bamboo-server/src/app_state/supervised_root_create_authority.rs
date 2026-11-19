@@ -111,7 +111,7 @@ impl SupervisedRootCreator {
         })
     }
 
-    async fn check_original_caller(
+    pub(in crate::app_state) async fn check_original_caller(
         &self,
         caller: &SessionCallerReference,
     ) -> Result<Session, ToolError> {
@@ -205,11 +205,15 @@ impl SessionRootCreatePort for CallerRootCreator {
                 "This Host has no canonical create-purpose first-input port; no Root creation was started"));
         }
         let service = self.creator.clone();
-        tokio::spawn(async move { service.create_authorized_inner(&authority, request).await })
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("caller Root creation task failed: {error}"))
-            })?
+        tokio::spawn(async move {
+            service
+                .create_authorized_inner(&authority, request, None)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            ToolError::Execution(format!("caller Root creation task failed: {error}"))
+        })?
     }
 }
 
@@ -354,7 +358,9 @@ impl CreationAuthority {
                 original_caller,
             } => {
                 self.current_revision(creator).await?;
-                let result = SupervisedRootCreatePort::scope(creator, reference).await?;
+                let result = creator
+                    .creation_scope(reference, original_caller.is_some())
+                    .await?;
                 if let Some(caller) = original_caller {
                     creator.check_original_caller(caller).await?;
                 }
@@ -371,6 +377,7 @@ impl CreationAuthority {
                 Ok(ToolResult::text(available, json!({
                     "action":"scope", "authority":"host_finite", "state_revision":revision,
                     "create_route_exposed":available, "creation_permits":creates,
+                    "create_material_notifications":false,
                     "code":if !self.first_input_available() { "host_root_first_input_unavailable" }
                         else if creates.is_empty() { "host_root_create_not_granted" }
                         else if !available { "host_created_target_rights_unsupported" }
@@ -386,6 +393,20 @@ impl CreationAuthority {
         creator: &SupervisedRootCreator,
         request: &SupervisedRootCreateRequest,
     ) -> Result<u64, CreationAuthorizationError> {
+        if request.notify_on_material_event
+            && !matches!(
+                self,
+                Self::Supervisor {
+                    original_caller: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(CreationAuthorizationError::blocked(
+                "notification_scope_unavailable",
+                "First-input notifications require the original executing Supervisor",
+            ));
+        }
         match self {
             Self::Supervisor {
                 reference,
@@ -398,6 +419,11 @@ impl CreationAuthority {
                         .map_err(|error| {
                             CreationAuthorizationError::blocked("scope_denied", error)
                         })?;
+                } else if request.project_id.is_none() {
+                    return Err(CreationAuthorizationError::blocked(
+                        "scope_denied",
+                        "Standalone creation requires the original executing Supervisor",
+                    ));
                 }
                 let scope = creator
                     .store
@@ -421,7 +447,7 @@ impl CreationAuthority {
                     .binding()
                     .creates
                     .get(&request.operation_id)
-                    .filter(|scope| scope.project_id == request.project_id)
+                    .filter(|scope| Some(&scope.project_id) == request.project_id.as_ref())
                     .ok_or_else(|| {
                         CreationAuthorizationError::blocked(
                             "scope_denied",
@@ -448,9 +474,15 @@ impl CreationAuthority {
             // Keep the original request bytes for idempotency. A legacy retry
             // may use an alias of the same already-bound physical workspace.
             let workspace = bamboo_config::paths::path_to_display_string(canonical_workspace);
+            let project = request.project_id.as_ref().ok_or_else(|| {
+                CreationAuthorizationError::blocked(
+                    "scope_denied",
+                    "Host creation requires a Project",
+                )
+            })?;
             token
                 .binding()
-                .create(request.operation_id, &request.project_id, &workspace)
+                .create(request.operation_id, project, &workspace)
                 .map_err(|error| CreationAuthorizationError::blocked("scope_denied", error))?;
         }
         Ok(())
@@ -537,6 +569,7 @@ impl CreationAuthority {
                             request.operation_id,
                             candidate,
                             &request.message,
+                            request.notify_on_material_event,
                         )
                         .await
                 }

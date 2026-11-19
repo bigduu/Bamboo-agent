@@ -6,6 +6,28 @@ creates a direct durable Child of the current Root and keeps the complete task
 body. A target chat delivers corrective input through the existing SessionInbox.
 Runtime continues to own activation and parent waiting.
 
+The compact intents are `chat`, `inspect`, `control`, and `ask_parent`; the
+legacy explicit `action=wait` remains an internal compatibility route. A trusted
+Supervisor that repeats the same unchanged targeted Child observation three
+times during an inspection-only stretch enters the existing durable wait
+automatically. Alternating targets cannot refund the same observation. A batch
+with new evidence is delivered to the model before any automatic wait.
+This compares successful raw observations before compression and ignores only
+transport timestamps, heartbeat, elapsed-time guidance and diagnostics lease
+renewal bookkeeping (directory revision and lease expiry). Diagnostics keeps
+attempt/status, expired flags, queue generations and failure/question/permission
+changes in the observation version. New evidence and
+pagination get fresh observation counters; a non-inspection call, failure or
+newly admitted human input resets the tracker. It imposes no task or round timeout.
+
+Wait admission re-observes active ordinary direct Children under the existing
+completion lock. Terminal/foreign targets cannot create a wait; an existing
+Planner/Work wait retains its targets, policy, originating call and deadline.
+Completion, failure and direct-parent questions use the existing Inbox and
+activation paths. No background command or Child is cancelled to stop polling.
+Independent Root discovery/followup retains its separate exact target identity;
+the Root crash-window outcome protocol remains #1053, outside this Child gate.
+
 Only a new Child can select `role`: the shipped defaults are `explorer`,
 `implementer`, and `reviewer`, with the existing Project → Global → builtin
 catalog precedence. Omission keeps `worker`; unknown names retain the existing

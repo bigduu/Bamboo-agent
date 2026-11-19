@@ -77,6 +77,18 @@ fn inspection_message_id(message: &Message) -> String {
     }
 }
 
+/// Bind the first page of a retained report to the exact persisted message.
+pub(super) fn initial_message_cursor(child_id: &str, index: usize, message: &Message) -> String {
+    encode_cursor(InspectionCursor::Content {
+        child_session_id: child_id.into(),
+        result: false,
+        message_index: index,
+        message_id: inspection_message_id(message),
+        content_sha256: sha256(message.content.as_bytes()),
+        offset: 0,
+    })
+}
+
 fn update_field(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
@@ -654,10 +666,17 @@ mod tests {
         let message_id = child.messages[0].id.clone();
         let first = content_slice(&child, false, Some(&message_id), None, Some(99)).unwrap();
         assert!(first["text"].as_str().unwrap().len() <= 99);
+        let initial = initial_message_cursor(&child.id, 0, &child.messages[0]);
+        child.add_message(Message::assistant("Result of a later run", None));
+        assert_eq!(
+            content_slice(&child, false, None, Some(&initial), Some(99)).unwrap(),
+            first,
+        );
         let cursor = first["next_cursor"].as_str().unwrap();
         let next = content_slice(&child, false, Some(&message_id), Some(cursor), Some(99)).unwrap();
         assert_eq!(next["byte_start"], first["byte_end"]);
         child.messages[0].content = "changed".to_string();
+        assert!(content_slice(&child, false, None, Some(&initial), Some(99)).is_err());
         assert!(matches!(
             content_slice(&child, false, Some(&message_id), Some(cursor), Some(99)),
             Err(ChildSessionError::InvalidArguments(_))

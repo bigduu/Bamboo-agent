@@ -3,6 +3,9 @@ use super::super::{
     AgentError,
 };
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn message_summary_session() -> Session {
     let mut session = Session::new("message-summary-1827", "test-model");
@@ -58,6 +61,14 @@ async fn run_message_summary(
     session: &mut Session,
     config: &AgentLoopConfig,
 ) -> Result<bool, AgentError> {
+    run_message_summary_with_events(session, config, None).await
+}
+
+async fn run_message_summary_with_events(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    events: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
+) -> Result<bool, AgentError> {
     let budget = session.token_budget.clone().unwrap();
     maybe_apply_summary_context_compression_with_budget(
         session,
@@ -67,8 +78,9 @@ async fn run_message_summary(
         &[],
         &noop_llm(),
         &budget,
-        None,
+        events,
         "pre-turn",
+        None,
         None,
     )
     .await
@@ -205,22 +217,38 @@ async fn message_summary_excludes_tools_and_metadata_from_summary_and_next_reque
 #[tokio::test]
 async fn message_summary_waits_for_every_result_in_the_active_batch() {
     let mut session = message_summary_session();
-    session.messages[2]
-        .tool_calls
-        .as_mut()
-        .unwrap()
-        .push(ToolCall {
-            id: "second-call".into(),
-            tool_type: "function".into(),
-            function: FunctionCall {
-                name: "Read".into(),
-                arguments: "{}".into(),
-            },
-        });
+    let mut calls = session.messages[2].tool_calls.clone().unwrap();
+    calls[0].id = "first-call".into();
+    calls.push(ToolCall {
+        id: "second-call".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Read".into(),
+            arguments: "{}".into(),
+        },
+    });
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result("first-call", "FIRST_PRIVATE_RESULT"));
     let before = archive_state(&session);
     let (provider, requests) = prompt_capture_llm();
     let config = message_summary_config(provider);
-    assert!(!run_message_summary(&mut session, &config).await.unwrap());
+    let (tx, mut rx) = mpsc::channel(8);
+    assert!(!maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        Some(&tx),
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AgentEvent::ContextCompressionStatus { status, .. }) if status == "deferred_tool_protocol"
+    ));
     assert_eq!(archive_state(&session), before);
     assert!(requests.lock().unwrap().is_empty());
     assert!(session.force_manual_compression.is_some());
@@ -231,6 +259,144 @@ async fn message_summary_waits_for_every_result_in_the_active_batch() {
         .iter()
         .filter(|message| !message.compressed)
         .all(|message| message.role != Role::Tool && message.tool_calls.is_none()));
+}
+
+#[tokio::test]
+async fn automatic_message_summary_compresses_once_after_the_last_tool_result() {
+    use super::super::super::maybe_apply_mid_turn_context_compression;
+    use bamboo_agent_core::Storage;
+
+    let mut session = message_summary_session();
+    session.force_manual_compression = None;
+    let mut calls = session.messages[2].tool_calls.clone().unwrap();
+    let abandoned_poll = Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "abandoned-poll".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "write_stdin".into(),
+                arguments: r#"{"session_id":"previous-shell","chars":""}"#.into(),
+            },
+        }]),
+    );
+    let previous_turn_end = session.messages.len() - 1;
+    session
+        .messages
+        .insert(previous_turn_end, abandoned_poll.clone());
+    let mut second = calls[0].clone();
+    second.id = "last-call".into();
+    calls.push(second);
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result(
+        "private-tool-call",
+        "tool output ".repeat(14_500),
+    ));
+    let before = archive_state(&session);
+    let budget = session.token_budget.as_ref().unwrap();
+    assert!(
+        TiktokenTokenCounter::default().count_messages(&session.messages)
+            > budget.compression_trigger_context_tokens()
+    );
+    let (provider, requests) = prompt_capture_llm();
+    let mut config = message_summary_config(provider);
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    storage.save_session(&session).await.unwrap();
+    config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
+        storage.clone(),
+    )));
+    let llm = noop_llm();
+    let (tx, mut rx) = mpsc::channel(32);
+
+    assert!(!maybe_apply_mid_turn_context_compression(
+        &mut session,
+        &config,
+        &llm,
+        &tx,
+        "message-summary-1827",
+        "test-model",
+        &[],
+    )
+    .await
+    .unwrap());
+    assert_eq!(archive_state(&session), before);
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(
+        rx.try_recv().is_err(),
+        "no compaction attempt for a partial batch"
+    );
+
+    session.add_message(Message::tool_result("last-call", "LAST_PRIVATE_RESULT"));
+    assert!(maybe_apply_mid_turn_context_compression(
+        &mut session,
+        &config,
+        &llm,
+        &tx,
+        "message-summary-1827",
+        "test-model",
+        &[],
+    )
+    .await
+    .unwrap());
+    let summary_requests = requests.lock().unwrap().len();
+    assert!(summary_requests > 0);
+    assert!(!maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &llm,
+        Some(&tx),
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert_eq!(requests.lock().unwrap().len(), summary_requests);
+    assert_eq!(session.compression_events.len(), 1);
+    let applied = &session.compression_events[0];
+    assert!(applied.usage_after_percent <= config.context_management.target_usage_ratio * 100.0);
+    assert!(session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .all(|message| message.role != Role::Tool && message.tool_calls.is_none()));
+    let statuses = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextCompressionStatus { status, .. }
+                if matches!(
+                    status.as_str(),
+                    "started" | "completed" | "deferred_tool_protocol"
+                ) =>
+            {
+                Some(status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["started", "completed"]);
+
+    let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(saved.compression_events.len(), 1);
+    assert_eq!(saved.compression_events[0].id, applied.id);
+    assert_eq!(saved.messages.len(), session.messages.len());
+    let mut saved_poll = saved.messages[previous_turn_end].clone();
+    assert!(saved_poll.compressed);
+    assert_eq!(
+        saved_poll.compressed_by_event_id.take(),
+        Some(applied.id.clone())
+    );
+    saved_poll.compressed = false;
+    assert_eq!(
+        serde_json::to_value(&saved_poll).unwrap(),
+        serde_json::to_value(&abandoned_poll).unwrap(),
+        "archive the exact historical call without fabricating a result"
+    );
 }
 
 #[tokio::test]
@@ -311,6 +477,250 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
     assert!(session
         .metadata
         .contains_key("responses.previous_response_id"));
+}
+
+#[tokio::test]
+async fn chat_message_summary_recovers_when_reasoning_exhausts_the_output_limit() {
+    for unlimited_output in [true, false] {
+        for effort in [None, Some(bamboo_domain::ReasoningEffort::High)] {
+            assert_chat_reasoning_cutoff_recovers(unlimited_output, effort).await;
+        }
+    }
+}
+
+async fn assert_chat_reasoning_cutoff_recovers(
+    unlimited_output: bool,
+    effort: Option<bamboo_domain::ReasoningEffort>,
+) {
+    const MODEL_OUTPUT_LIMIT: u64 = 1_000;
+    const SUMMARY: &str = "The chosen design is recorded.";
+    const REASONING: &str = "Private fixture reasoning";
+    let model = "summary-secondary";
+    let limit_field = if effort.is_some() {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "max_input_tokens": 16_000, "max_output_tokens": MODEL_OUTPUT_LIMIT}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            if body[limit_field].as_u64() == Some(MODEL_OUTPUT_LIMIT) {
+                return chat_summary_stream(SUMMARY);
+            }
+            chat_completion_stream(
+                serde_json::json!({"reasoning_content": REASONING}),
+                "length",
+            )
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        directory.path().join("model_limits.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "model_pattern": "",
+            "max_context_tokens": 262_144,
+            "unlimited_output": unlimited_output,
+        }]))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let provider = bamboo_llm::OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+    let mut target = bamboo_domain::ProviderModelRef::new("openai", model);
+    target.reasoning_effort = effort;
+    let resolved = bamboo_llm::ResolvedModel::from_ref(Arc::new(provider), &target);
+    let mut config = message_summary_config(resolved.provider);
+    config.app_data_dir = Some(directory.path().to_path_buf());
+    config.summarization_model_name = Some(resolved.model_name);
+    let mut session = message_summary_session();
+    assert!(run_message_summary(&mut session, &config).await.unwrap());
+    assert_eq!(session.compression_events.len(), 1);
+    assert_eq!(session.conversation_summary.unwrap().content, SUMMARY);
+
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .map(|request| request.body_json::<serde_json::Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies.len(),
+        4,
+        "one retry for each of map and final reduce"
+    );
+    let expected_effort = effort.map(|value| serde_json::json!(value.as_str()));
+    for pair in bodies.chunks_exact(2) {
+        let first_limit = pair[0][limit_field].as_u64().unwrap();
+        assert!((1..MODEL_OUTPUT_LIMIT).contains(&first_limit));
+        assert_eq!(pair[0].get("reasoning_effort"), expected_effort.as_ref());
+        let mut expected_retry = pair[0].clone();
+        expected_retry[limit_field] = MODEL_OUTPUT_LIMIT.into();
+        assert_eq!(pair[1], expected_retry);
+        assert!(!pair[1].to_string().contains(REASONING));
+    }
+}
+
+#[tokio::test]
+async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
+    for effort in [None, Some(bamboo_domain::ReasoningEffort::Low)] {
+        assert_chat_empty_reduce_preserves_history(effort).await;
+    }
+}
+
+async fn assert_chat_empty_reduce_preserves_history(
+    effort: Option<bamboo_domain::ReasoningEffort>,
+) {
+    use bamboo_agent_core::Storage;
+
+    let model = "summary-secondary";
+    let mut session = message_summary_session();
+    session.messages[1].compressed = true;
+    session.conversation_summary = Some(bamboo_domain::ConversationSummary::new(
+        "Previous accepted summary",
+        1,
+        10,
+    ));
+    let messages = serde_json::to_value(&session.messages).unwrap();
+    let summary = serde_json::to_value(&session.conversation_summary).unwrap();
+    let pending = session.force_manual_compression.clone();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": model, "max_input_tokens": 16_000, "max_output_tokens": 2_000}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let calls = AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            move |_: &Request| match calls.fetch_add(1, Ordering::Relaxed) {
+                0 => chat_summary_stream("The chosen design is recorded."),
+                1 => chat_completion_stream(
+                    serde_json::json!({"reasoning_content": "Reasoning without a summary"}),
+                    "stop",
+                ),
+                _ => ResponseTemplate::new(400)
+                    .set_body_string("Unexpected retry after the model returned an empty summary"),
+            },
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        directory.path().join("model_limits.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "model_pattern": model,
+            "max_context_tokens": 32_000,
+            "max_output_tokens": 1_000,
+        }]))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let storage = Arc::new(
+        bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    storage.save_session(&session).await.unwrap();
+    let provider = bamboo_llm::OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+    let mut target = bamboo_domain::ProviderModelRef::new("openai", model);
+    target.reasoning_effort = effort;
+    let resolved = bamboo_llm::ResolvedModel::from_ref(Arc::new(provider), &target);
+    let mut config = message_summary_config(resolved.provider);
+    config.app_data_dir = Some(directory.path().to_path_buf());
+    config.summarization_model_name = Some(resolved.model_name);
+    config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
+        storage.clone(),
+    )));
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(16);
+    let error = run_message_summary_with_events(&mut session, &config, Some(&event_tx))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::EmptyContextSummary));
+    drop(event_tx);
+    let mut last_status = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::ContextCompressionStatus { status, .. } => last_status = Some(status),
+            AgentEvent::ContextSummarized { .. } => panic!("An empty summary was committed"),
+            _ => {}
+        }
+    }
+    assert_eq!(last_status.as_deref(), Some("failed_empty_summary"));
+    let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "one catalog lookup and two completions");
+    let bodies = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/chat/completions"
+        })
+        .map(|request| request.body_json::<serde_json::Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 2, "one map and one empty reduce completion");
+    let (limit, other_limit) = if effort.is_some() {
+        ("max_completion_tokens", "max_tokens")
+    } else {
+        ("max_tokens", "max_completion_tokens")
+    };
+    let expected_effort = effort.map(|value| serde_json::json!(value.as_str()));
+    for body in &bodies {
+        assert_eq!(body["model"], model);
+        assert_eq!(body.get("reasoning_effort"), expected_effort.as_ref());
+        assert!(body[limit]
+            .as_u64()
+            .is_some_and(|tokens| (1..=1_000).contains(&tokens)));
+        assert!(body.get(other_limit).is_none());
+        assert!(body.get("enable_thinking").is_none());
+    }
+    assert_eq!(session.force_manual_compression, pending);
+    for state in [&session, &saved] {
+        assert_eq!(serde_json::to_value(&state.messages).unwrap(), messages);
+        assert_eq!(
+            serde_json::to_value(&state.conversation_summary).unwrap(),
+            summary
+        );
+        assert!(state.compression_events.is_empty());
+    }
+}
+
+fn chat_summary_stream(text: &str) -> ResponseTemplate {
+    chat_completion_stream(serde_json::json!({"content": text}), "stop")
+}
+
+fn chat_completion_stream(delta: serde_json::Value, finish_reason: &str) -> ResponseTemplate {
+    let chunk = serde_json::json!({
+        "choices": [{"delta": delta, "finish_reason": finish_reason}],
+    });
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
 }
 
 #[tokio::test]

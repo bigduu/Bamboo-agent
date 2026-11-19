@@ -110,6 +110,10 @@ impl ChildSessionAdapter {
                     TICKET_DISPATCH_KEY.into(),
                     serde_json::to_string(&dispatch)?,
                 );
+                // Use the same saved role selection as ordinary SubAgent/Plan.
+                // The engine resolver owns fallback policy; this Host only
+                // passes the full selection to the canonical Work creator.
+                let model_ref = self.resolve_subagent_model(&policy.worker_role).await;
                 if let Some(fence) = &policy.admission_fence {
                     fence.check()?;
                 }
@@ -127,8 +131,8 @@ impl ChildSessionAdapter {
                             .as_ref()
                             .map_or_else(|| policy.workspace.clone(), |w| w.worktree.clone()),
                         workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
-                        model_override: None,
-                        model_ref_override: None,
+                        model_override: model_ref.as_ref().map(|model| model.model.clone()),
+                        model_ref_override: model_ref,
                         runtime_metadata: metadata,
                         read_only: false,
                         auto_run: false,

@@ -40,9 +40,10 @@ use crate::provider::{
 };
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
+use crate::providers::common::tool_schema::sanitize_anthropic_tool_input_schema;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
-use bamboo_domain::ReasoningEffort;
+use bamboo_domain::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 
 fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
     let guidance = if status == reqwest::StatusCode::FORBIDDEN {
@@ -58,6 +59,8 @@ fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
 
 const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
 const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+pub(super) const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 /// Per-response resource ceilings for the optional provider-native transcript
 /// lane. The normalized token/tool stream is intentionally independent of
 /// these budgets and continues when native capture is discarded.
@@ -90,6 +93,88 @@ fn is_official_anthropic_base_url(base_url: &str) -> bool {
         || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
 }
 
+fn remove_legacy_thinking_budget(body: &mut Value, selected_effort: Option<ReasoningEffort>) {
+    let Some(fields) = body.as_object_mut() else {
+        return;
+    };
+    let had_legacy_budget = fields.remove("thinking_budget").is_some();
+    let had_nested_budget = fields
+        .get_mut("thinking")
+        .and_then(Value::as_object_mut)
+        .and_then(|thinking| thinking.remove("budget_tokens"))
+        .is_some();
+    if !had_legacy_budget && !had_nested_budget {
+        return;
+    }
+
+    let thinking_mode = fields
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+    let replace_legacy_mode =
+        thinking_mode == Some("enabled") || (had_nested_budget && thinking_mode.is_none());
+    let wire_effort = fields
+        .get("output_config")
+        .and_then(|output| output.get("effort"))
+        .and_then(Value::as_str);
+    let replacement_mode = match wire_effort.or(selected_effort.map(ReasoningEffort::as_str)) {
+        Some("none") => Some("disabled"),
+        Some(_) => Some("adaptive"),
+        None => None,
+    };
+
+    // An old override may have removed the modern effort together with
+    // installing the numeric budget. Restore the selected tier in that case.
+    if wire_effort.is_none() && thinking_mode != Some("disabled") {
+        if let Some(effort) = selected_effort.filter(|effort| *effort != ReasoningEffort::Disabled)
+        {
+            let output = fields.entry("output_config").or_insert_with(|| json!({}));
+            if !output.is_object() {
+                *output = json!({});
+            }
+            output["effort"] = json!(effort.as_str());
+        }
+    }
+
+    if replace_legacy_mode {
+        if let Some(mode) = replacement_mode {
+            body["thinking"]["type"] = json!(mode);
+        } else {
+            fields.remove("thinking");
+        }
+    }
+}
+
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let model_id = model
+        .rsplit_once(".deepseek-")
+        .map_or(model.as_str(), |(namespace, _)| {
+            &model[namespace.len() + 1..]
+        });
+    [
+        "deepseek-flash",
+        "deepseek-v4",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4.1-flash",
+    ]
+    .iter()
+    .any(|known| {
+        model_id.strip_prefix(known).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('-').is_some_and(|revision| {
+                    matches!(revision.len(), 4 | 8) && revision.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+    })
+}
+
 fn supports_anthropic_tool_search(model: &str) -> bool {
     let model = model.trim();
     ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES.iter().any(|prefix| {
@@ -112,9 +197,35 @@ pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option
     }
 }
 
+pub(super) fn apply_cache_ttl_header(headers: &mut HeaderMap, plan: Option<&PromptCachePlan>) {
+    if !plan.is_some_and(|plan| plan.ttl == CacheTtl::Extended) {
+        return;
+    }
+    let already_present = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim() == EXTENDED_CACHE_TTL_BETA);
+    if !already_present {
+        let value = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .chain(std::iter::once(EXTENDED_CACHE_TTL_BETA))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&value) {
+            headers.insert("anthropic-beta", value);
+        }
+    }
+}
+
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     max_tokens: u32,
@@ -145,7 +256,8 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
@@ -211,7 +323,10 @@ impl AnthropicProvider {
             HeaderValue::from_str(&self.api_key)
                 .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
         );
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(ANTHROPIC_API_VERSION),
+        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         request_overrides::apply_overrides_to_header_map(
             &mut headers,
@@ -231,14 +346,29 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
-        if required_tool.is_none()
-            && is_official_anthropic_base_url(&self.base_url)
+        let choice = self.request_tool_selection(model).await;
+        if required_tool.is_some() || choice.as_ref().is_ok_and(|choice| choice.restricts_names()) {
+            return CapabilityLoadingMode::LegacyFullCatalog;
+        }
+        if is_official_anthropic_base_url(&self.base_url)
             && supports_anthropic_tool_search(model)
+            && choice.is_ok()
         {
             CapabilityLoadingMode::Progressive
         } else {
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
         }
+    }
+
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )
     }
 
     async fn provider_visible_tool_footprint(
@@ -249,7 +379,7 @@ impl LLMProvider for AnthropicProvider {
         required_tool: Option<&str>,
     ) -> Result<ProviderVisibleToolFootprint> {
         let mode = self.capability_loading_mode(model, required_tool).await;
-        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+        if mode != CapabilityLoadingMode::Progressive {
             let projected = tools_to_anthropic_json(tools, mode);
             if projected.is_empty() {
                 return Ok(ProviderVisibleToolFootprint::default());
@@ -374,6 +504,26 @@ impl LLMProvider for AnthropicProvider {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
     }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "Anthropic",
+                model_fetcher::ModelListFormat::Messages,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_MESSAGES],
+        ))
+    }
 }
 
 impl AnthropicProvider {
@@ -406,20 +556,34 @@ impl AnthropicProvider {
             });
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
-        let reasoning_effort = options
-            .and_then(|o| o.reasoning_effort)
-            .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let compatible_gateway = !is_official_anthropic_base_url(&self.base_url);
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let cache_plan = options.and_then(|o| o.cache.as_ref());
-        let extended_cache_ttl = cache_plan
-            .map(|plan| plan.ttl == CacheTtl::Extended)
-            .unwrap_or(false);
-        let reasoning_source = if request_reasoning_effort.is_some() {
-            "request"
-        } else if self.default_reasoning_effort.is_some() {
-            "provider_default"
+        let (reasoning_effort, reasoning_source) = if let Some(effort) = request_reasoning_effort {
+            (Some(effort), "request")
+        } else if let Some(effort) = self.default_reasoning_effort {
+            (Some(effort), "provider_default")
+        } else if compatible_gateway
+            && is_deepseek_v4_model(model)
+            && completion_diagnostics
+                .as_ref()
+                .is_some_and(|d| d.is_agent_round())
+            && required_tool.is_none()
+            && !crate::retry::work_request_budget_active()
+            && !request_overrides::messages_controls_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            )
+            && self.masking_config.apply_masking("adaptive") == "adaptive"
+            && self
+                .masking_config
+                .apply_masking(DEFAULT_REASONING_EFFORT.as_str())
+                == DEFAULT_REASONING_EFFORT.as_str()
+        {
+            (Some(DEFAULT_REASONING_EFFORT), "agent_default")
         } else {
-            "none"
+            (None, "none")
         };
 
         let request_purpose = options
@@ -459,9 +623,24 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
+        remove_legacy_thinking_budget(&mut body, reasoning_effort);
         apply_required_tool_choice(&mut body, required_tool);
+        // A compatible gateway can enforce reasoning without advertising it
+        // on the request. This identifies the wire controls for recovery.
+        if let Some(diagnostics) = completion_diagnostics
+            .as_ref()
+            .filter(|_| compatible_gateway)
+        {
+            diagnostics.mark_compatible_messages();
+        }
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )?;
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
         // body (top-level content blocks AND inside tool_result content arrays), so
         // we can tell with certainty whether a screenshot reaches the wire vs being
@@ -500,12 +679,8 @@ impl AnthropicProvider {
             .pointer("/thinking/type")
             .and_then(Value::as_str)
             .is_some_and(|mode| mode != "disabled");
-        let thinking_budget_tokens = body
-            .get("thinking")
-            .and_then(|thinking| thinking.get("budget_tokens"))
-            .and_then(|value| value.as_u64());
         tracing::info!(
-            "[session_hash={}] Anthropic request model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} purpose_hash={}",
+            "[session_hash={}] Anthropic request model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} max_tokens={} purpose_hash={}",
             log_identity(session_log_id),
             log_identity(model),
             applied_reasoning_effort
@@ -514,20 +689,11 @@ impl AnthropicProvider {
             reasoning_source,
             applied_reasoning_effort.is_some(),
             thinking_enabled,
-            thinking_budget_tokens
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string()),
             max_tokens,
             log_identity(request_purpose)
         );
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
-        if extended_cache_ttl {
-            // 1-hour prompt cache TTL is gated behind a beta header.
-            headers.insert(
-                "anthropic-beta",
-                reqwest::header::HeaderValue::from_static("extended-cache-ttl-2025-04-11"),
-            );
-        }
+        apply_cache_ttl_header(&mut headers, cache_plan);
 
         // Retry the *initial* request establishment on transient failures
         // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
@@ -564,8 +730,7 @@ impl AnthropicProvider {
         let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
-            request_thinking_budget_tokens: thinking_budget_tokens,
-            completion_diagnostics: crate::provider::current_completion_diagnostics(),
+            completion_diagnostics,
             ..Default::default()
         }));
         Ok(anthropic_stream_with_usage_on_error(
@@ -832,9 +997,11 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     }
 
     if let Some(effort) = reasoning_effort {
-        // Effort controls depth, not activation. Enable the protocol's adaptive
-        // mode without deriving a budget or changing the selected effort.
-        body["output_config"] = json!({"effort": effort.as_str()});
+        // Messages represents explicit disable with thinking.type. The effort
+        // field is reserved for the enabled reasoning levels.
+        if effort != ReasoningEffort::Disabled {
+            body["output_config"] = json!({"effort": effort.as_str()});
+        }
         body["thinking"] = json!({
             "type": if effort == ReasoningEffort::Disabled { "disabled" } else { "adaptive" }
         });
@@ -871,7 +1038,7 @@ fn apply_anthropic_native_groups(
         items: Vec<Value>,
     }
 
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return;
     }
 
@@ -1523,7 +1690,7 @@ fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
     json!({
         "name": tool.function.name,
         "description": tool.function.description,
-        "input_schema": crate::providers::common::tool_schema::canonicalize_json_value(&tool.function.parameters),
+        "input_schema": sanitize_anthropic_tool_input_schema(&tool.function.parameters),
     })
 }
 
@@ -1531,7 +1698,7 @@ pub(crate) fn tools_to_anthropic_json(
     tools: &[ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> Vec<Value> {
-    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+    if capability_loading_mode != CapabilityLoadingMode::Progressive {
         return tools.iter().map(tool_to_anthropic_json).collect();
     }
 
@@ -1683,7 +1850,6 @@ pub struct AnthropicStreamState {
     saw_thinking_signal: bool,
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
-    request_thinking_budget_tokens: Option<u64>,
     native_blocks_by_index: HashMap<usize, Value>,
     native_input_json_by_index: HashMap<usize, String>,
     /// Thinking blocks that have received a signature delta. This ordering
@@ -1759,28 +1925,23 @@ impl AnthropicUsageSnapshot {
         if std::mem::replace(&mut self.emitted, true) {
             return None;
         }
+        self.usage().legacy_chunk()
+    }
+
+    fn usage(&self) -> crate::types::ProviderUsageReplacement {
         let input_tokens = self.fresh_input.and_then(|fresh| {
             fresh
                 .checked_add(self.cache_creation?)?
                 .checked_add(self.cache_read?)
         });
-        if input_tokens.is_none()
-            && self.output.is_none()
-            && self.reasoning.is_none()
-            && self.cache_creation.is_none()
-            && self.cache_read.is_none()
-        {
-            return None;
-        }
-        Some(LLMChunk::ProviderUsage {
+        crate::types::ProviderUsageReplacement {
             input_tokens,
             output_tokens: self.output,
-            total_tokens: None,
             reasoning_tokens: self.reasoning,
             cache_creation_input_tokens: self.cache_creation,
             cache_read_input_tokens: self.cache_read,
-            cache_write_input_tokens: None,
-        })
+            ..Default::default()
+        }
     }
 }
 
@@ -1796,13 +1957,13 @@ fn anthropic_stream_with_usage_on_error(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             parse_anthropic_sse_event_multi(&mut state, event, data)
         });
-    usage_before_anthropic_stream_error(stream, state)
+    finish_anthropic_stream(stream, state)
 }
 
-// Preserve the latest presence-aware snapshot before propagating an actual
-// stream error. Success remains terminal-only, so a later malformed field can
-// invalidate an earlier value without changing the shared chunk contract.
-fn usage_before_anthropic_stream_error(
+// Preserve known usage when the body errors. The message_start event can
+// already contain all three prompt components.
+// Success remains terminal-only so later fields can still invalidate a value.
+fn finish_anthropic_stream(
     upstream: LLMStream,
     state: Arc<Mutex<AnthropicStreamState>>,
 ) -> LLMStream {
@@ -1814,8 +1975,9 @@ fn usage_before_anthropic_stream_error(
             if let Some(error) = pending_error {
                 return Some((Err(error), (upstream, state, None)));
             }
-            match upstream.next().await {
-                Some(Err(error)) => {
+            let item = upstream.next().await?;
+            match item {
+                Err(error) => {
                     let snapshot = {
                         let mut state = state
                             .lock()
@@ -1828,8 +1990,7 @@ fn usage_before_anthropic_stream_error(
                         Some((Err(error), (upstream, state, None)))
                     }
                 }
-                Some(item) => Some((item, (upstream, state, None))),
-                None => None,
+                Ok(chunk) => Some((Ok(chunk), (upstream, state, None))),
             }
         },
     ))
@@ -2289,7 +2450,6 @@ fn parse_anthropic_sse_event_multi(
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
     capture_anthropic_native_event(state, event_type, data);
-    state.usage_snapshot.observe(event_type, data);
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {
         take_anthropic_provider_transcript_items(state)
@@ -2314,6 +2474,12 @@ pub fn parse_anthropic_sse_event(
     event_type: &str,
     data: &str,
 ) -> Result<Option<LLMChunk>> {
+    state.usage_snapshot.observe(event_type, data);
+    if matches!(event_type, "message_start" | "message_delta") {
+        if let Some(diagnostics) = &state.completion_diagnostics {
+            diagnostics.record_pending_usage(state.usage_snapshot.usage());
+        }
+    }
     match event_type {
         "ping" => Ok(None),
         "message_start" => {
@@ -2449,23 +2615,23 @@ pub fn parse_anthropic_sse_event(
         "message_stop" => {
             if state.request_thinking_enabled || state.saw_thinking_signal {
                 tracing::info!(
-                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} request_thinking_budget_tokens={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
+                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
                     state
                         .requested_reasoning_effort
                         .map(ReasoningEffort::as_str)
                         .unwrap_or("none"),
                     state.request_thinking_enabled,
-                    state
-                        .request_thinking_budget_tokens
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
                     state.saw_thinking_signal,
                     state.thinking_blocks_started,
                     state.thinking_chars_streamed
                 );
             }
 
-            if !state.tool_uses_by_index.is_empty() {
+            if state.tool_uses_by_index.is_empty() {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_messages_stop();
+                }
+            } else {
                 tracing::warn!(
                     open_tool_count = state.tool_uses_by_index.len(),
                     "Anthropic message_stop received with open tool_use blocks (possible incomplete tool arguments)"
@@ -2507,6 +2673,11 @@ pub fn parse_anthropic_sse_event(
                 .get("type")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
+            if block_type == "server_tool_use" || block_type.ends_with("_tool_result") {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.record_provider_tool();
+                }
+            }
 
             if block_type == "thinking" || block_type == "redacted_thinking" {
                 let index = index as usize;
@@ -2874,12 +3045,16 @@ mod anthropic_request_building {
 
     #[tokio::test]
     async fn progressive_footprint_keeps_initial_array_and_each_reference_occurrence_ordered() {
-        let tools = vec![
+        let mut tools = vec![
             tool_schema("Read"),
             tool_schema("alpha_tool"),
             tool_schema("beta_tool"),
             tool_schema("Workspace"),
         ];
+        tools[2].function.parameters = json!({
+            "type": "object",
+            "allOf": [{"properties": {"query": {"type": "string"}}, "required": ["query"]}]
+        });
         let ir = anthropic_ir_with_reference_groups(&[
             ("search_1", &["beta_tool", "Read", "alpha_tool"]),
             ("search_2", &["beta_tool"]),
@@ -2925,6 +3100,15 @@ mod anthropic_request_building {
         assert_eq!(
             expanded,
             vec!["beta_tool", "Read", "alpha_tool", "beta_tool"]
+        );
+        let beta: Value = serde_json::from_str(&footprint.segments[2].serialized).unwrap();
+        assert_eq!(
+            beta["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            })
         );
     }
 
@@ -3251,7 +3435,7 @@ mod anthropic_request_building {
 
     #[test]
     fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
-        let tools = [
+        let mut tools = [
             "exec_command",
             "Read",
             "Glob",
@@ -3263,6 +3447,13 @@ mod anthropic_request_building {
         .into_iter()
         .map(tool_schema)
         .collect::<Vec<_>>();
+        tools[2].function.parameters = json!({
+            "type": "object",
+            "anyOf": [
+                {"properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+                {"properties": {"prefix": {"type": "string"}}, "required": ["prefix"]}
+            ]
+        });
         let body = super::build_anthropic_request_with_cache_blocks_native_mode(
             &[Message::user("inspect")],
             &[],
@@ -3288,6 +3479,13 @@ mod anthropic_request_building {
         assert_eq!(rendered[1]["name"], "Read");
         assert_eq!(rendered[2]["name"], "Glob");
         assert_eq!(rendered[2]["defer_loading"], true);
+        assert_eq!(
+            rendered[2]["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}, "prefix": {"type": "string"}}
+            })
+        );
         assert_eq!(rendered[3]["name"], "Exec_Command");
         assert_eq!(
             rendered[3]["defer_loading"], true,
@@ -3313,6 +3511,10 @@ mod anthropic_request_building {
         );
         assert_eq!(legacy["tools"].as_array().unwrap().len(), tools.len());
         assert_eq!(legacy["tools"][5]["name"], "discover_capabilities");
+        assert_eq!(
+            legacy["tools"][2]["input_schema"],
+            rendered[2]["input_schema"]
+        );
         assert!(legacy.to_string().find("defer_loading").is_none());
         assert!(legacy
             .to_string()
@@ -4691,7 +4893,12 @@ mod anthropic_request_building {
                     Some(effort),
                     None,
                 );
-                assert_eq!(body["output_config"]["effort"], effort.as_str());
+                let wire_effort = (effort != ReasoningEffort::Disabled).then(|| effort.as_str());
+                assert_eq!(
+                    body.pointer("/output_config/effort")
+                        .and_then(Value::as_str),
+                    wire_effort
+                );
                 assert_eq!(body["max_tokens"], max_tokens);
                 assert_eq!(
                     body["thinking"]["type"],
@@ -6092,7 +6299,7 @@ mod anthropic_stream_parse {
             let upstream: super::LLMStream = Box::pin(futures::stream::iter(vec![Err(
                 super::LLMError::Stream("synthetic interruption".into()),
             )]));
-            let mut stream = super::usage_before_anthropic_stream_error(upstream, state);
+            let mut stream = super::finish_anthropic_stream(upstream, state);
             assert!(matches!(
                 stream.next().await.unwrap().unwrap(),
                 LLMChunk::ProviderUsage {
@@ -7085,6 +7292,109 @@ mod anthropic_provider_tests {
         r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#;
     const ANTHROPIC_SSE_OK: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
+    #[tokio::test]
+    async fn messages_preserve_configured_header_values_with_extended_cache_ttl() {
+        let server = MockServer::start().await;
+        for endpoint in ["/messages", "/proxy/anthropic/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(ANTHROPIC_SSE_OK),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+
+        for (provider_type, configured_beta, expected_beta) in [
+            (
+                "anthropic",
+                "feature-one, extended-cache-ttl-2025-04-11, feature-two",
+                "feature-one, extended-cache-ttl-2025-04-11, feature-two",
+            ),
+            (
+                "bodhi",
+                "feature-one, feature-two",
+                "feature-one, feature-two, extended-cache-ttl-2025-04-11",
+            ),
+        ] {
+            let instance = serde_json::from_value(json!({
+                "provider_type": provider_type,
+                "target_provider": "anthropic",
+                "api_key": "fixture-key",
+                "base_url": server.uri(),
+                "enabled": true,
+                "request_overrides": {
+                    "common": { "headers": { "User-Agent": "Fixture/1.0" } },
+                    "endpoints": { "messages": { "headers": { "user-agent": "Fixture/2.0" } } },
+                    "rules": [{
+                        "model_pattern": "claude-test",
+                        "endpoint": "messages",
+                        "scope": { "headers": {
+                            "User-Agent": "Fixture/3.0",
+                            "Anthropic-Version": "2026-10-21",
+                            "anthropic-beta": configured_beta
+                        } }
+                    }]
+                }
+            }))
+            .unwrap();
+            let provider = crate::provider_factory::create_provider_from_instance(
+                &bamboo_config::Config::default(),
+                &instance,
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+            let _stream = provider
+                .chat_stream_with_options(
+                    &[Message::user("hello")],
+                    &[load_skill_tool()],
+                    Some(64),
+                    "claude-test",
+                    Some(&LLMRequestOptions {
+                        cache: Some(PromptCachePlan {
+                            cache_tools: true,
+                            ttl: CacheTtl::Extended,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let _stream = provider
+                .chat_stream(&[Message::user("hello")], &[], Some(64), "other-model")
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let [configured, other_model] = &requests[requests.len() - 2..] else {
+                unreachable!("each provider sends two requests");
+            };
+            assert_eq!(configured.headers["user-agent"], "Fixture/3.0");
+            assert_eq!(configured.headers["anthropic-version"], "2026-10-21");
+            assert_eq!(configured.headers["anthropic-beta"], expected_beta);
+            assert_eq!(other_model.headers["user-agent"], "Fixture/2.0");
+            assert_eq!(other_model.headers["anthropic-version"], "2023-06-01");
+            assert!(!other_model.headers.contains_key("anthropic-beta"));
+            let body: Value = serde_json::from_slice(&configured.body).unwrap();
+            assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+            match provider_type {
+                "anthropic" => {
+                    assert_eq!(configured.headers["x-api-key"], "fixture-key");
+                    assert!(!configured.headers.contains_key("authorization"));
+                }
+                _ => {
+                    assert_eq!(configured.headers["authorization"], "Bearer fixture-key");
+                    assert!(!configured.headers.contains_key("x-api-key"));
+                }
+            }
+        }
+    }
+
     struct ThinkingToolChoiceResponder;
 
     impl Respond for ThinkingToolChoiceResponder {
@@ -7109,6 +7419,93 @@ mod anthropic_provider_tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn direct_and_bodhi_anthropic_requests_accept_composed_tool_schemas() {
+        let server = MockServer::start().await;
+        for endpoint in ["/messages", "/proxy/anthropic/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(|request: &Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    let schema = &body["tools"][0]["input_schema"];
+                    if ["oneOf", "anyOf", "allOf"]
+                        .iter()
+                        .any(|keyword| schema.get(keyword).is_some())
+                    {
+                        return ResponseTemplate::new(400).set_body_json(json!({
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level"
+                            }
+                        }));
+                    }
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(ANTHROPIC_SSE_OK)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let parameters = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                },
+                {
+                    "properties": {"zip_code": {"type": "string"}},
+                    "required": ["zip_code"]
+                }
+            ],
+            "allOf": [{
+                "properties": {"units": {"type": "string", "enum": ["metric", "imperial"]}},
+                "required": ["units"]
+            }]
+        });
+        let tools = [ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: "mcp__example__get_weather".into(),
+                description: "Read the weather by location or zip code.".into(),
+                parameters: parameters.clone(),
+            },
+        }];
+        let messages = [Message::user("Check the weather")];
+        let direct = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let proxy = crate::providers::bodhi::BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic");
+        for provider in [&direct as &dyn LLMProvider, &proxy] {
+            let _stream = provider
+                .chat_stream(&messages, &tools, Some(64), "claude-opus-5-5")
+                .await
+                .expect("the endpoint accepts the compatible schema");
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let tool = &body["tools"][0];
+            assert_eq!(tool["name"], "mcp__example__get_weather");
+            assert_eq!(
+                tool["input_schema"],
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "zip_code": {"type": "string"},
+                        "units": {"type": "string", "enum": ["metric", "imperial"]}
+                    },
+                    "required": ["units"]
+                })
+            );
+        }
+        assert_eq!(tools[0].function.parameters, parameters);
     }
 
     #[tokio::test]
@@ -7140,7 +7537,7 @@ mod anthropic_provider_tests {
         ] {
             assert_eq!(
                 provider.capability_loading_mode(model, None).await,
-                CapabilityLoadingMode::LegacyFullCatalog,
+                CapabilityLoadingMode::StickyFallback,
                 "{model}"
             );
         }
@@ -7155,7 +7552,24 @@ mod anthropic_provider_tests {
                 .with_base_url("https://compatible.example/v1")
                 .capability_loading_mode("claude-sonnet-4-6", None)
                 .await,
-            CapabilityLoadingMode::LegacyFullCatalog
+            CapabilityLoadingMode::StickyFallback
+        );
+    }
+
+    #[tokio::test]
+    async fn any_tool_choice_retains_native_messages_tool_search() {
+        let overrides = serde_json::from_value(json!({
+            "endpoints":{"messages":{"body_patch":[
+                {"path":"tool_choice","value":{"type":"any"}}
+            ]}}
+        }))
+        .unwrap();
+        let provider = AnthropicProvider::new("fixture").with_request_overrides(Some(overrides));
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::Progressive
         );
     }
 
@@ -7239,6 +7653,269 @@ mod anthropic_provider_tests {
             ),
             Message::tool_result("call_1", r#"{"ok":true}"#),
         ]
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_agent_requests_send_explicit_reasoning() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let model = "dashscope.deepseek-v4.1-flash-1017";
+        let cases = [
+            (true, model, None, None, Some("adaptive"), Some("medium")),
+            (
+                true,
+                model,
+                None,
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("high"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some("adaptive"),
+                Some("low"),
+            ),
+            (
+                true,
+                model,
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::High),
+                Some("disabled"),
+                None,
+            ),
+            (false, model, None, None, None, None),
+            (true, "other-compatible-model", None, None, None, None),
+            (
+                true,
+                "router.deepseek-v4-pro.claude-sonnet-4-6",
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(cases.len() as u64)
+            .mount(&server)
+            .await;
+        for (agent_round, model, request_effort, provider_effort, mode, effort) in cases {
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_reasoning_effort(provider_effort);
+            let diagnostics = if agent_round {
+                CompletionDiagnostics::for_agent_round(None)
+            } else {
+                CompletionDiagnostics::default()
+            };
+            let options = LLMRequestOptions {
+                reasoning_effort: request_effort,
+                ..Default::default()
+            };
+            drop(
+                scope_completion_diagnostics(
+                    diagnostics,
+                    provider.chat_stream_with_options(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        model,
+                        Some(&options),
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
+            assert_eq!(body["max_tokens"], 4096);
+        }
+    }
+
+    #[tokio::test]
+    async fn deepseek_messages_default_respects_modern_effort_and_ignores_retired_budget() {
+        use crate::provider::{scope_completion_diagnostics, CompletionDiagnostics};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        for (patch, mode, effort) in [
+            (
+                json!({"op":"set","path":"/output_config/effort","value":"none"}),
+                None,
+                Some("none"),
+            ),
+            (
+                json!({"op":"set","path":"/thinking/budget_tokens","value":16384}),
+                Some("adaptive"),
+                Some(DEFAULT_REASONING_EFFORT.as_str()),
+            ),
+            (
+                json!({"op":"set","path":"/thinking/type","value":"enabled"}),
+                Some("enabled"),
+                None,
+            ),
+        ] {
+            let overrides =
+                serde_json::from_value(json!({"common":{"body_patch":[patch]}})).unwrap();
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_request_overrides(Some(overrides));
+            drop(
+                scope_completion_diagnostics(
+                    CompletionDiagnostics::for_agent_round(None),
+                    provider.chat_stream(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        "deepseek-flash",
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                effort
+            );
+            assert_eq!(body.pointer("/thinking/type").and_then(Value::as_str), mode);
+            assert!(body.pointer("/thinking/budget_tokens").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_never_send_retired_budgets_from_saved_overrides() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(|request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                if body.get("thinking_budget").is_some()
+                    || body.pointer("/thinking/budget_tokens").is_some()
+                {
+                    return ResponseTemplate::new(400)
+                        .set_body_string("Parameter thinking_budget is not supported.");
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK)
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        for (selected_effort, override_effort, expected_mode, expected_effort) in [
+            (
+                Some(ReasoningEffort::Max),
+                None,
+                Some("adaptive"),
+                Some("max"),
+            ),
+            (None, None, None, None),
+            (
+                Some(ReasoningEffort::Disabled),
+                None,
+                Some("disabled"),
+                None,
+            ),
+            (
+                Some(ReasoningEffort::Max),
+                Some("medium"),
+                Some("adaptive"),
+                Some("medium"),
+            ),
+        ] {
+            let mut patches = vec![
+                json!({"op":"set","path":"/thinking","value":{"type":"enabled","budget_tokens":16384}}),
+                json!({"op":"remove","path":"/output_config"}),
+                json!({"op":"set","path":"/stop_sequences","value":["done"]}),
+            ];
+            if let Some(effort) = override_effort {
+                patches.push(json!({"op":"set","path":"/output_config/effort","value":effort}));
+            }
+            let overrides = serde_json::from_value(json!({
+                "common":{"body_patch":[{"op":"set","path":"/thinking_budget","value":32768}]},
+                "endpoints":{"messages":{"body_patch":patches}}
+            }))
+            .unwrap();
+            let provider = AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_request_overrides(Some(overrides));
+            let options = LLMRequestOptions {
+                reasoning_effort: selected_effort,
+                ..Default::default()
+            };
+            drop(
+                provider
+                    .chat_stream_with_options(
+                        &[Message::user("Inspect the fixture.")],
+                        &[],
+                        Some(4096),
+                        "custom-route",
+                        Some(&options),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = requests.last().unwrap().body_json().unwrap();
+            assert!(body.get("thinking_budget").is_none());
+            assert!(body.pointer("/thinking/budget_tokens").is_none());
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                expected_mode
+            );
+            assert_eq!(
+                body.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                expected_effort
+            );
+            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["stop_sequences"], json!(["done"]));
+        }
+    }
+
+    #[test]
+    fn retiring_a_budget_keeps_other_output_config_and_thinking_settings() {
+        let mut body = json!({
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "thinking_budget": 16_384,
+            "output_config": {"format": {"type": "json_schema"}}
+        });
+        remove_legacy_thinking_budget(&mut body, Some(ReasoningEffort::Xhigh));
+        assert_eq!(
+            body,
+            json!({
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"format": {"type": "json_schema"}, "effort": "xhigh"}
+            })
+        );
     }
 
     #[tokio::test]

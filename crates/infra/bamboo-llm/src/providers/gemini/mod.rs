@@ -41,6 +41,7 @@ pub(crate) fn apply_generation_config(
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
 ) {
+    let max_output_tokens = crate::provider::optional_protocol_output_limit(max_output_tokens);
     if max_output_tokens.is_none() && reasoning_effort.is_none() {
         return;
     }
@@ -61,6 +62,7 @@ use bamboo_domain::ToolSchema;
 /// Google Gemini API provider.
 pub struct GeminiProvider {
     client: Client,
+    model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
     default_reasoning_effort: Option<ReasoningEffort>,
@@ -72,7 +74,8 @@ impl GeminiProvider {
     /// Create a new Gemini provider with an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
+            model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_reasoning_effort: None,
@@ -160,6 +163,29 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> Result<crate::provider::RequestToolSelection> {
+        request_overrides::configured_tool_selection(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )
+    }
+
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        required_tool: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        if required_tool.is_some() {
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        } else {
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        }
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         _ir: &crate::prompt_ir::PromptIR,
@@ -253,7 +279,13 @@ impl LLMProvider for GeminiProvider {
         );
         apply_required_tool_choice(&mut request_json, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut request_json,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )?;
         tracing::info!(
             "[session_hash={}] Gemini request protocol=streamGenerateContent model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),
@@ -357,6 +389,26 @@ impl LLMProvider for GeminiProvider {
         let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
         let url = self.list_models_url();
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.list_models_url();
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "Gemini",
+                model_fetcher::ModelListFormat::Gemini,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+        ))
     }
 }
 

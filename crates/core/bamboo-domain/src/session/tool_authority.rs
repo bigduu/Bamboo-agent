@@ -51,13 +51,12 @@ impl RootThinkingMode {
     }
 }
 
-/// Exact execution identities admitted for an orchestration-only Root.
+/// Exact execution identities admitted for an ordinary Ultra Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 18] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 13] = [
     "SubAgent",
     "spawn_session",
-    "Plan",
     "Task",
     "session_history_current",
     "session_history",
@@ -67,12 +66,8 @@ pub const ROOT_ORCHESTRATION_TOOLS: [&str; 18] = [
     "Glob",
     "GetFileInfo",
     "ViewImage",
-    "work_overview",
-    "work_search",
-    "work_inspect",
-    "work_changes",
-    "work_update",
-    "work_dispatch",
+    "Edit",
+    "Write",
 ];
 
 pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
@@ -86,7 +81,6 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
     "SubAgent",
     "spawn_session",
-    "Plan",
     "Task",
     "session_history_current",
     "session_history",
@@ -98,7 +92,13 @@ pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
     "work_changes",
     "work_update",
     "work_dispatch",
+    "work_review",
 ];
+
+/// Server Work operations are exposed only to the trusted Supervisor.
+pub fn supervisor_work_tool(execution_name: &str) -> bool {
+    execution_name.starts_with("work_") && SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name)
+}
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
@@ -196,11 +196,12 @@ impl Session {
 
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
+        let supervisor = self.supervisor_incarnation_id().is_some();
+        if supervisor_work_tool(execution_name) {
+            return supervisor;
+        }
         !self.model_orchestration_only_enabled()
-            || orchestration_only_allows_execution_name_for_supervisor(
-                execution_name,
-                self.supervisor_incarnation_id().is_some(),
-            )
+            || orchestration_only_allows_execution_name_for_supervisor(execution_name, supervisor)
     }
 
     /// Refresh a running snapshot from the durable control plane before tool
@@ -295,19 +296,14 @@ mod tests {
                 "mcp__vendor__Read",
                 "default::Read",
                 "vendor::Read",
+                "Plan",
             ] {
                 assert!(
                     !restored.allows_model_tool_execution(name),
                     "Supervisor mode={ultra} must delegate {name}"
                 );
             }
-            for name in [
-                "SubAgent",
-                "Plan",
-                "Task",
-                "session_control",
-                "session_history",
-            ] {
+            for name in ["SubAgent", "Task", "session_control", "session_history"] {
                 assert!(restored.allows_model_tool_execution(name), "{name}");
             }
             let child = Session::new_child_of("worker", &restored, "model", "worker");
@@ -538,9 +534,9 @@ mod tests {
             "exec_command",
             "write_stdin",
             "Bash",
-            "Edit",
-            "Write",
             "WebFetch",
+            "work_overview",
+            "work_dispatch",
             "workflow_run",
             "mcp__x__read",
             "read_file",

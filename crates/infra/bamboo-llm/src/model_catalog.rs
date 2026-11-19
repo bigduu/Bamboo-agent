@@ -67,6 +67,7 @@ impl ModelCatalogService {
                         capabilities: ModelCapabilities {
                             supports_vision: provider.as_ref().unwrap().supports_vision(&id).await,
                             max_context_tokens: upstream.and_then(|info| info.max_context_tokens),
+                            max_input_tokens: upstream.and_then(|info| info.max_input_tokens),
                             max_output_tokens: upstream.and_then(|info| info.max_output_tokens),
                             ..ModelCapabilities::default()
                         },
@@ -118,6 +119,7 @@ impl ModelCatalogService {
                 capabilities: ModelCapabilities {
                     supports_vision: provider.supports_vision(&info.id).await,
                     max_context_tokens: info.max_context_tokens,
+                    max_input_tokens: info.max_input_tokens,
                     max_output_tokens: info.max_output_tokens,
                     ..ModelCapabilities::default()
                 },
@@ -171,7 +173,7 @@ fn display_name_for_provider(id: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "gemini" => "Gemini".to_string(),
-        "copilot" => "GitHub Copilot".to_string(),
+        "bodhi" => "Bodhi".to_string(),
         other => other.to_string(),
     }
 }
@@ -270,11 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn display_name_copilot() {
-        assert_eq!(display_name_for_provider("copilot"), "GitHub Copilot");
-    }
-
-    #[test]
     fn display_name_unknown_passthrough() {
         assert_eq!(display_name_for_provider("custom-llm"), "custom-llm");
     }
@@ -339,14 +336,15 @@ mod tests {
     async fn catalog_preserves_dynamic_model_token_limits() {
         let registry = make_registry(
             vec![(
-                "copilot",
+                "openai",
                 vec![ProviderModelInfo {
                     id: "dynamic-model".to_string(),
                     max_context_tokens: Some(264_000),
+                    max_input_tokens: Some(250_000),
                     max_output_tokens: Some(64_000),
                 }],
             )],
-            "copilot",
+            "openai",
         );
         let service = ModelCatalogService::new(registry);
         let models = service.get_catalog().await.models;
@@ -354,6 +352,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].capabilities.max_context_tokens, Some(264_000));
         assert_eq!(models[0].capabilities.max_output_tokens, Some(64_000));
+        assert_eq!(models[0].capabilities.max_input_tokens, Some(250_000));
     }
 
     #[tokio::test]

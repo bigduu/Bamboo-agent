@@ -7,9 +7,9 @@ use std::{future::Future, pin::Pin};
 
 use super::helpers::{
     append_subagent_delegation_contract, compute_status_guidance,
-    format_child_assignment_with_background, map_child_entry, metadata_text,
-    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
-    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
+    format_child_assignment_with_background, metadata_text, normalize_non_empty_optional,
+    normalize_required_text, render_forked_parent_context, replace_or_append_last_user_message,
+    truncate_after_index, truncate_after_last_user,
 };
 use super::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
@@ -72,8 +72,11 @@ pub async fn create_ticket_child_action(
             "Ticket child requires fresh one-shot, exact Supervisor and explicit dispatch".into(),
         ));
     }
-    input.assignment_prompt =
-        serde_json::to_string(&packet).map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    // Required human text keeps its per-line and aggregate bounds. Preserve
+    // the complete Host packet without making all of its fields one line.
+    let packet_text = serde_json::to_string_pretty(&packet)
+        .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    input.assignment_prompt = packet_text.clone();
     input.runtime_metadata.insert(
         crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
         assignment_id.into(),
@@ -93,8 +96,7 @@ pub async fn create_ticket_child_action(
             "Do not change the Work contract, Supervisor TaskList or any sibling plan".into(),
         ],
         necessary_user_instructions: Vec::new(),
-        recorded_decisions: vec![serde_json::to_string(&packet)
-            .map_err(|e| ChildSessionError::Execution(e.to_string()))?],
+        recorded_decisions: vec![packet_text],
         source_user_message_ids: Vec::new(),
         background_message_ids: Vec::new(),
     };
@@ -152,6 +154,28 @@ async fn create_child_action_inner(
                 .await?
         }
     };
+    if shared_workspace
+        && input
+            .runtime_metadata
+            .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
+    {
+        if profile.is_some()
+            || input
+                .runtime_metadata
+                .get("external.agent_id")
+                .map(String::as_str)
+                != Some(crate::external_agents::config::LOCAL_ACTOR_AGENT_ID)
+        {
+            return Err(ChildSessionError::ModelNotAdmitted(
+                "compact model selection requires an unprofiled built-in Bamboo route".into(),
+            ));
+        }
+        // The local-actor label alone can also select a legacy executor.
+        // Required context already preflights the actual built-in Bamboo route.
+        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type)
+            .await
+            .map_err(|error| ChildSessionError::ModelNotAdmitted(error.to_string()))?;
+    }
     if let Some(profile) = &profile {
         if input.lifecycle.as_deref() == Some("resident")
             || input.resident_name.is_some()
@@ -298,9 +322,48 @@ async fn create_child_action_inner(
                 )));
             }
         };
+    // A native Work retains the Supervisor's tree identity. Its explicit
+    // execution workspace is authorized by the frozen Work Project instead.
+    let ticket_workspace = ticket_context
+        .as_ref()
+        .and_then(|packet| packet.workspace.as_ref());
+    let workspace_project_id = if let (Some(workspace), Some(context)) = (
+        ticket_workspace,
+        ticket_context
+            .as_ref()
+            .and_then(|packet| packet.project_context.as_ref()),
+    ) {
+        if inherited_project_id
+            .as_ref()
+            .is_some_and(|id| id != &context.project_id)
+            || std::path::Path::new(&input.workspace)
+                .canonicalize()
+                .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+                != std::path::Path::new(&workspace.worktree)
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "Work workspace differs from its frozen Project or execution path".into(),
+            ));
+        }
+        Some(context.project_id.clone())
+    } else {
+        inherited_project_id.clone()
+    };
     let final_workspace = port
-        .validate_child_workspace(inherited_project_id.as_ref(), &input.workspace)
+        .validate_child_workspace(workspace_project_id.as_ref(), &input.workspace)
         .await?;
+    if ticket_workspace.is_some_and(|workspace| {
+        let actual = std::path::Path::new(&final_workspace);
+        // Host display paths omit Windows verbatim prefixes. Normalize the
+        // candidate, keeping the frozen canonical spec as the authority.
+        !actual.is_absolute()
+            || actual.canonicalize().ok().as_deref()
+                != Some(std::path::Path::new(&workspace.worktree))
+    }) {
+        return Err(ChildSessionError::InvalidArguments(
+            "Work workspace validation relocated the frozen execution path".into(),
+        ));
+    }
     if shared_workspace {
         // Host policy can change across the async preparation above. Retain
         // the second validation, but never accept its relocation as sharing.
@@ -343,12 +406,14 @@ async fn create_child_action_inner(
         child.set_provider_name(parent_provider);
     }
 
-    // Apply explicit reasoning_effort override if the LLM passed one;
-    // otherwise leave at `None` (provider default). Per CreateChildInput
-    // contract, children do NOT inherit the parent's reasoning_effort.
-    if let Some(effort) = input.reasoning_effort {
-        child.reasoning_effort = Some(effort);
-    }
+    // Work has no model-facing effort argument. Use its final selected ref,
+    // after any named profile override, rather than borrowing the discarded
+    // role's effort for another account/model. Ordinary children retain their
+    // explicit-override/provider-default contract and never inherit parent effort.
+    child.reasoning_effort = input.reasoning_effort.or_else(|| {
+        ticket_context.as_ref()?;
+        input.model_ref_override.as_ref()?.reasoning_effort
+    });
 
     // Children inherit the parent's exact permission posture. Auto must remain
     // distinct from legacy Bypass so forced confirmations do not reappear at a
@@ -474,7 +539,14 @@ async fn create_child_action_inner(
 
     // Profile selection and runtime metadata now contain the final model
     // authority. Reject it before publishing workspace or persisting a child.
-    port.validate_child_model(&child).await?;
+    port.validate_child_model(&child)
+        .await
+        .map_err(|error| match error {
+            ChildSessionError::InvalidArguments(detail) => {
+                ChildSessionError::ModelNotAdmitted(detail)
+            }
+            other => other,
+        })?;
 
     // Publish the path that already passed the host's confinement and Project
     // ownership checks without applying process-global policy a second time.
@@ -621,18 +693,6 @@ async fn create_child_action_inner(
     Ok(CreateChildResult {
         child_session_id: child.id,
         model,
-    })
-}
-
-pub async fn list_children_action(
-    port: &dyn ChildSessionPort,
-    parent_id: &str,
-) -> serde_json::Value {
-    let children = port.list_children(parent_id).await;
-    json!({
-        "parent_session_id": parent_id,
-        "children": children.iter().map(map_child_entry).collect::<Vec<_>>(),
-        "count": children.len(),
     })
 }
 
@@ -799,6 +859,8 @@ pub async fn get_child_action(
         "child_session_id": child.id,
         "title": title,
         "model": model,
+        "model_ref": child.model_ref,
+        "reasoning_effort": child.reasoning_effort,
         "pinned": child.pinned,
         "message_count": child.messages.len(),
         "is_running": port.is_child_running(&child.id).await,
@@ -1445,6 +1507,7 @@ async fn cancel_child_action_inner(
     }
     child.set_last_run_status("cancelled");
     child.set_last_run_error("Cancelled by parent");
+    child.synchronize_terminal_runtime_status();
     port.save_child_session(&mut child).await?;
     Ok(json!({
         "child_session_id": child_session_id,

@@ -1,8 +1,9 @@
 # Ultra Root thinking mode
 
 Ultra is an independent Root product policy. It increases task-wide reasoning
-through read-only planning, narrow child execution and Root verification and
-synthesis. Each model call retains its separately resolved ordinary reasoning
+through parallel delegation of independent work, Root verification and
+synthesis. An ordinary Ultra Root can also write and edit files with its
+normal workspace and permission checks. Each model call retains its separately resolved ordinary reasoning
 effort. Ultra is not an alias for Max or a claimed provider-native budget.
 
 ## Authority and wire contract
@@ -33,12 +34,12 @@ The existing birth token, terminal epoch/receipt and dispatch fences are kept.
 
 ## Delegated execution evidence and limits
 
-The focused acceptance uses the production server and Root runner, Plan tool,
-wait-before-enqueue scheduler, actor provisioning and real `bamboo subagent-worker`
+The focused acceptance uses the production server and Root runner, SubAgent,
+the durable Child wait, actor provisioning and a real `bamboo subagent-worker`
 with `BambooRuntime`. Only the model endpoint is a loopback scripted SSE server.
 It observes an actual worker provider request while the Root durably waits,
 then permits the child to finish and observes Root resume/synthesis. It also
-attempts a Root Write and checks the real dispatch authority denies it.
+checks that an authorized Root can create and edit a file through real dispatch.
 
 Root ordinary High is explicit. The planner uses an independent model and its
 own ordinary provider default (no effort override); it receives neither Root
@@ -47,6 +48,6 @@ reach the worker: that pre-existing propagation gap is tracked in #1346.
 
 Ultra guidance reuses existing tools; it does not enforce a persistent N-agent,
 Plan or Review stage gate for every task. Required user goals, constraints and
-acceptance criteria remain part of the assignment. Existing unsupported Plan
-executor/placement routes fail closed; this slice adds no native Ultra, remote
+acceptance criteria remain part of the assignment. Unsupported Child
+executor and placement routes fail closed; this slice adds no native Ultra, remote
 propagation, new role, ContextPacket or lifecycle/recovery protocol.

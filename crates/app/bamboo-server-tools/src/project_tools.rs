@@ -863,6 +863,7 @@ impl Tool for ProjectTool {
                     }
                     None => ("unavailable", None),
                 };
+                let project = project.into_public_view();
                 Ok(completed(
                     true,
                     json!({
@@ -1020,6 +1021,7 @@ mod tests {
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::ToolExecutionContext;
     use bamboo_agent_core::Session;
+    use bamboo_domain::{ProjectSidebar, ProjectSidebarSection, ProjectSidebarSectionBinding};
     use bamboo_storage::LockedSessionStore;
     use tokio::sync::RwLock;
 
@@ -1688,6 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_inspect_reports_redacted_resources_and_workspace_binding_contract() {
+        const SECTION: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1712,6 +1715,26 @@ mod tests {
         let mut session = Session::new("project-inspect-contract", "model");
         session.set_project_id_meta(project.id.to_string());
         session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        let project = store
+            .update(&project.id, project.revision, |manifest| {
+                manifest.sidebar = Some(ProjectSidebar {
+                    sections: vec![ProjectSidebarSection {
+                        id: SECTION.into(),
+                        name: "Inspect".into(),
+                    }],
+                    session_sections: [(session.id.clone(), Some(SECTION.into()))].into(),
+                    hidden_legacy: false,
+                });
+                manifest.sidebar_section_bindings.insert(
+                    session.id.clone(),
+                    ProjectSidebarSectionBinding {
+                        section_id: SECTION.into(),
+                        root_birth_token: session.root_mode_birth_token(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
         let tool = ProjectTool::new(repository(session).await, store);
 
         let output = result(
@@ -1727,6 +1750,11 @@ mod tests {
         assert!(!output.result.contains("api_key"));
         let value: Value = serde_json::from_str(&output.result).unwrap();
         assert_eq!(value["project"]["id"], project.id.to_string());
+        assert_eq!(
+            value["project"]["sidebar"]["session_sections"]["project-inspect-contract"],
+            SECTION
+        );
+        assert!(value["project"].get("sidebar_section_bindings").is_none());
         assert_eq!(value["resource_revision"], project.resource_revision);
         assert_eq!(
             value["resource_summary"]["resource_revision"],

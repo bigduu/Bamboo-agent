@@ -176,6 +176,13 @@ impl LLMProvider for GuardedGoldProvider {
         self.delegate.capability_loading_mode(model, required).await
     }
 
+    async fn request_tool_selection(
+        &self,
+        model: &str,
+    ) -> crate::provider::Result<crate::provider::RequestToolSelection> {
+        self.delegate.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,
@@ -235,6 +242,10 @@ impl LLMProvider for GuardedGoldProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
         self.validate()?;
         self.delegate.list_model_info().await
+    }
+
+    async fn model_info_for_request(&self, model: &str) -> Result<Option<ProviderModelInfo>> {
+        self.dispatch(model)?.model_info_for_request(model).await
     }
 }
 

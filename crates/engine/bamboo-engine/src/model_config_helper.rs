@@ -130,13 +130,18 @@ pub fn resolve_provider_routing_key(
         }
         return require_live(requested);
     }
+    if config.is_retired_provider_alias(requested) {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{requested}' was retired; select a configured provider instance"
+        )));
+    }
 
     // Legacy and hybrid aliases are registered under their exact type key.
     if provider_registry.get(requested).is_some() {
         return Ok(requested.to_string());
     }
 
-    if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested) {
+    if !bamboo_llm::is_configured_provider_type(requested) {
         return Err(LLMError::Auth(format!(
             "Unknown provider instance or type '{requested}'"
         )));
@@ -222,24 +227,12 @@ pub fn get_default_model_for_provider(
         {
             return Ok(model.to_string());
         }
-        if instance.provider_type == "copilot" {
-            return Ok("gpt-4o".to_string());
-        }
         return Err(LLMError::Auth(format!(
             "Model must be specified for provider instance '{provider_name}'"
         )));
     }
 
     match provider_name {
-        "copilot" => {
-            let provider_model = config
-                .providers()
-                .copilot
-                .as_ref()
-                .and_then(|c| c.model.clone());
-
-            Ok(provider_model.unwrap_or_else(|| "gpt-4o".to_string()))
-        }
         "openai" => {
             let openai_config = config
                 .providers()
@@ -328,11 +321,6 @@ pub fn get_fast_model_for_provider(config: &Config, provider_name: &str) -> Opti
         "gemini" => config
             .providers()
             .gemini
-            .as_ref()
-            .and_then(|c| c.fast_model.clone()),
-        "copilot" => config
-            .providers()
-            .copilot
             .as_ref()
             .and_then(|c| c.fast_model.clone()),
         _ => None,
@@ -514,6 +502,14 @@ pub fn try_resolve_primary_model(
     }
     let mut target = requested.clone();
     target.provider = resolve_provider_routing_key(config, &target.provider, registry)?;
+    try_admit_primary_target(config, registry, target)
+}
+
+fn try_admit_primary_target(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    target: bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedPrimaryModel, LLMError> {
     // Primary reasoning is carried by the run request; using a role wrapper
     // here would hide the selected registry Arc from managed Gold admission.
     let mut raw_target = target.clone();
@@ -928,6 +924,20 @@ pub fn resolve_code_review_model(
     resolve_fast_model(config, provider_name, provider_registry)
 }
 
+/// Select Work review from its saved role or the explicitly configured Fast
+/// role. Admission errors on a selected reference remain visible to callers.
+pub fn try_resolve_work_review_model(
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<ResolvedPrimaryModel>, LLMError> {
+    config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.work_review.as_ref().or(defaults.fast.as_ref()))
+        .map(|target| try_admit_primary_target(config, provider_registry, target.clone()))
+        .transpose()
+}
+
 /// Resolve the provider+model reference for a specific subagent type.
 ///
 /// Fallback chain: `defaults.subagent_models[type]` → `defaults.sub_agent` →
@@ -968,7 +978,6 @@ pub fn resolve_subagent_model_ref(
                     .filter(|model| !model.is_empty())
             })
             .map(ToString::to_string)
-            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
     } else {
         // Legacy provider entries historically treated a blank fast selection
         // as unset and inherited the parent rather than selecting an empty ID.
@@ -1075,7 +1084,6 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolSchema;
     use bamboo_agent_core::Message;
-    use bamboo_config::CopilotConfig;
     use bamboo_config::DefaultsConfig;
     use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::ProviderModelRef;
@@ -1411,6 +1419,18 @@ mod tests {
             resolve_provider_routing_key(&config, "openai", &registry).unwrap(),
             "a-openai"
         );
+        config
+            .providers_mut()
+            .retired_provider_aliases
+            .insert("openai".into());
+        assert!(resolve_provider_routing_key(&config, "openai", &registry)
+            .unwrap_err()
+            .to_string()
+            .contains("was retired"));
+        assert_eq!(
+            resolve_provider_routing_key(&config, "a-openai", &registry).unwrap(),
+            "a-openai"
+        );
         assert!(resolve_provider_routing_key(&config, "typo", &registry).is_err());
     }
 
@@ -1550,43 +1570,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_model_from_copilot_provider_config() {
-        let config = test_config! {
-            provider: "copilot".to_string(),
-            providers: ProviderConfigs {
-                copilot: Some(CopilotConfig {
-                    enabled: true,
-                    headless_auth: false,
-                    model: Some("gpt-4o-mini".to_string()),
-                    fast_model: None,
-                    vision_model: None,
-                    reasoning_effort: None,
-                    responses_only_models: vec![],
-                    request_overrides: None,
-                    extra: Default::default(),
-                }),
-                ..ProviderConfigs::default()
-            },
-        };
-
-        let result = get_default_model_from_config(&config);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "gpt-4o-mini");
-    }
-
-    #[test]
-    fn test_get_model_from_copilot_default_fallback() {
-        let config = test_config! {
-            provider: "copilot".to_string(),
-            providers: ProviderConfigs::default(),
-        };
-
-        let result = get_default_model_from_config(&config);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "gpt-4o");
-    }
-
-    #[test]
     fn test_get_default_model_for_specific_provider() {
         let config = test_config! {
             provider: "anthropic".to_string(),
@@ -1709,6 +1692,40 @@ mod tests {
     }
 
     #[test]
+    fn work_review_prefers_its_role_and_uses_only_configured_fast_as_fallback() {
+        let registry = test_registry();
+        let mut config = Config::default();
+        config.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider":"openai","model":"chat"},
+                "fast": {"provider":"openai","model":"fast"},
+                "work_review": {"provider":"openai","model":"review","reasoning_effort":"low"}
+            }))
+            .unwrap(),
+        );
+        let resolve = |config: &Config| try_resolve_work_review_model(config, &registry);
+        let selected = resolve(&config).unwrap().unwrap().target;
+        assert_eq!(selected.provider, "openai");
+        assert_eq!(selected.model, "review");
+        assert_eq!(
+            selected.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Low)
+        );
+
+        let defaults = config.defaults.as_mut().unwrap();
+        defaults.work_review = Some(ProviderModelRef::new("missing-provider", "review"));
+        assert!(resolve(&config).is_err());
+
+        config.defaults.as_mut().unwrap().work_review = None;
+        assert_eq!(resolve(&config).unwrap().unwrap().target.model, "fast");
+
+        config.defaults.as_mut().unwrap().fast = None;
+        assert!(resolve(&config).unwrap().is_none());
+        let serialized = serde_json::to_value(config.defaults.as_ref().unwrap()).unwrap();
+        assert!(serialized.get("work_review").is_none());
+    }
+
+    #[test]
     fn test_get_schedule_model_from_config_prefers_defaults_fast_over_chat() {
         let config = test_config! {
             provider: "openai".to_string(),
@@ -1725,6 +1742,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1780,6 +1798,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
                 subagent_models: HashMap::new(),
             }),
@@ -1808,6 +1827,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1836,6 +1856,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1875,6 +1896,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),

@@ -2,7 +2,6 @@ use actix_web::{web, HttpResponse, Result};
 
 use super::types::to_task_list_response;
 use crate::app_state::AppState;
-use bamboo_agent_core::SessionKind;
 
 /// Get task list for a session.
 pub async fn get_task_list(
@@ -16,22 +15,15 @@ pub async fn get_task_list(
         })));
     };
 
-    let shared_session = if session.kind == SessionKind::Child {
-        state
-            .load_session(&session.root_session_id)
-            .await
-            .unwrap_or_else(|| session.clone())
-    } else {
-        session.clone()
-    };
+    let task_session = super::session::task_session(&state, session).await;
 
-    let version = shared_session
+    let version = task_session
         .task_list_version_meta()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let Some(task_list) = shared_session.task_list.as_ref() else {
+    let Some(task_list) = task_session.task_list.as_ref() else {
         return Ok(HttpResponse::Ok().json(super::types::TaskListResponse {
-            session_id: shared_session.id.clone(),
+            session_id: task_session.id,
             title: None,
             items: Vec::new(),
             progress: super::types::TaskProgress {
@@ -60,18 +52,11 @@ pub async fn has_task_list(
         })));
     };
 
-    let shared_session = if session.kind == SessionKind::Child {
-        state
-            .load_session(&session.root_session_id)
-            .await
-            .unwrap_or_else(|| session.clone())
-    } else {
-        session.clone()
-    };
+    let task_session = super::session::task_session(&state, session).await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
-        "has_task_list": shared_session.task_list.is_some(),
-        "session_id": shared_session.id
+        "has_task_list": task_session.task_list.is_some(),
+        "session_id": task_session.id
     })))
 }
 

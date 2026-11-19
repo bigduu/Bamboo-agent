@@ -447,7 +447,7 @@ pub fn build_gold_messages(
     let mut messages = Vec::new();
 
     let mut system_prompt = String::from(
-        "You are a gold progress evaluator. Judge whether the agent has already achieved the user's goal, should continue execution, needs user input, is blocked, or is exhausted.\n\nRules:\n1. This phase is observe-only: do not mutate state or invent actions.\n2. You must call report_gold_evaluation exactly once.\n3. Use achieved only when the user's actual goal is satisfied.\n4. Use continue when more agent work is still appropriate.\n5. Use need_input only when missing user input is the true next blocker.\n6. Use blocked only for a concrete blocking condition.\n7. Use exhausted for loops, budget exhaustion, or clear inability to make progress.\n8. Keep reasoning short, concrete, and evidence-based."
+        "You are a gold progress evaluator. Judge whether the agent has already achieved the user's goal, should continue execution, needs user input, is blocked, or is exhausted.\n\nRules:\n1. This phase is observe-only: do not mutate state or invent actions.\n2. Call report_gold_evaluation exactly once.\n3. Use achieved only when the user's actual goal is satisfied.\n4. Use continue when the agent can check available evidence, use a reasonable and reversible assumption, or do other useful work. Give a concrete next_action.\n5. Use need_input only when no safe, useful work can proceed without a specific answer from the user. Name the required input in missing_information and omit next_action.\n6. Use blocked only for a concrete blocking condition.\n7. Use exhausted for loops, budget exhaustion, or clear inability to make progress.\n8. Keep reasoning short, concrete, and evidence-based."
     );
 
     if let Some(extra) = config
@@ -521,7 +521,7 @@ pub fn build_gold_messages(
         });
 
     let user_prompt = format!(
-        "## Gold Checkpoint\ncheckpoint={}\n\n{}\n\n## Runtime\n{}\n\n## Pending Question\n{}\n\n{}\n\n## Recent Conversation\n{}\n\n## Instruction\nReport the best current Gold judgment for this checkpoint by measuring progress against the goal above. Remember: Phase 1 is observe-only, so only report decision/confidence/reasoning.",
+        "## Gold Checkpoint\ncheckpoint={}\n\n{}\n\n## Runtime\n{}\n\n## Pending Question\n{}\n\n{}\n\n## Recent Conversation\n{}\n\n## Instruction\nReport the best current Gold judgment for this checkpoint by measuring progress against the goal above. Use report_gold_evaluation and include the details required by the decision.",
         checkpoint.as_str(),
         goal_section,
         runtime_summary,
@@ -588,11 +588,11 @@ pub fn get_gold_evaluation_tools() -> Vec<ToolSchema> {
                     "missing_information": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Concrete pieces of information still missing to achieve the goal. Empty when nothing is missing."
+                        "description": "Concrete missing information. For need_input, list the specific information or decision that only the user can provide."
                     },
                     "next_action": {
                         "type": "string",
-                        "description": "The single most useful next action the agent should take. Provide when decision is continue."
+                        "description": "The most useful independent step the agent can take. Provide only when decision is continue."
                     }
                 },
                 "required": ["decision", "confidence", "reasoning"],

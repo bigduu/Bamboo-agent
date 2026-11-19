@@ -1,62 +1,14 @@
-//! Real SDK -> Agent -> BuiltinToolExecutor -> Bash ownership, including the
+//! Real SDK -> Agent -> BuiltinToolExecutor -> exec_command ownership, including the
 //! final publication barrier. The controlled provider only chooses the tool;
 //! it neither launches nor terminates the process on behalf of the runtime.
 use super::*;
-use bamboo_agent_core::tools::{FunctionCall, ToolExecutionContext, ToolOutcome};
-
-const LEGACY_BASH_FIXTURE: &str = "legacy_bash_host_fixture";
-
-/// The model catalog hides Bash. This test-only host compatibility adapter
-/// preserves coverage of its actual SDK cancellation/publication lifecycle.
-/// Only the exposed fixture name changes; the builtin receives the same call
-/// arguments and execution context, including its LocalTask resource owner.
-struct LegacyBashHostFixture(bamboo_tools::BuiltinToolExecutor);
-
-impl LegacyBashHostFixture {
-    fn builtin_call(call: &ToolCall) -> Result<ToolCall, ToolError> {
-        if call.function.name != LEGACY_BASH_FIXTURE {
-            return Err(ToolError::NotFound(call.function.name.clone()));
-        }
-        let mut builtin_call = call.clone();
-        builtin_call.function.name = "Bash".into();
-        Ok(builtin_call)
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for LegacyBashHostFixture {
-    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        self.0.execute(&Self::builtin_call(call)?).await
-    }
-
-    async fn execute_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        self.0
-            .execute_with_context_outcome(&Self::builtin_call(call)?, ctx)
-            .await
-    }
-
-    fn list_tools(&self) -> Vec<ToolSchema> {
-        self.0
-            .list_tools()
-            .into_iter()
-            .filter(|schema| schema.function.name == "Bash")
-            .map(|mut schema| {
-                schema.function.name = LEGACY_BASH_FIXTURE.into();
-                schema
-            })
-            .collect()
-    }
-}
+use bamboo_agent_core::tools::FunctionCall;
 
 struct BashCeiling;
 #[async_trait]
 impl NativeToolCeilingSource for BashCeiling {
     async fn observe(&self, _: &Session) -> Result<Vec<String>, String> {
-        Ok(vec![LEGACY_BASH_FIXTURE.into()])
+        Ok(vec!["exec_command".into(), "write_stdin".into()])
     }
 }
 
@@ -69,28 +21,36 @@ struct BashProvider {
 impl LLMProvider for BashProvider {
     async fn chat_stream(
         &self,
-        _: &[Message],
+        messages: &[Message],
         tools: &[ToolSchema],
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
         assert_eq!(model, MODEL);
-        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+        assert_eq!(
+            self.calls.fetch_add(1, Ordering::SeqCst),
+            0,
+            "unexpected retry after tool result: {:?}",
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Tool)
+                .map(|message| message.content.chars().take(600).collect::<String>())
+        );
         assert!(tools
             .iter()
-            .any(|tool| tool.function.name == LEGACY_BASH_FIXTURE));
+            .any(|tool| tool.function.name == "exec_command"));
         assert!(!tools.iter().any(|tool| tool.function.name == "Bash"));
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(LLMChunk::ToolCalls(vec![ToolCall {
                 id: "owned-builtin-bash".into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: LEGACY_BASH_FIXTURE.into(),
+                    name: "exec_command".into(),
                     arguments: serde_json::json!({
-                        "command": self.command,
+                        "cmd": self.command,
                         "workdir": self.workspace,
-                        "run_in_background": false,
-                        "timeout": 60000,
+                        "yield_time_ms": 1000,
                     })
                     .to_string(),
                 },
@@ -123,15 +83,16 @@ async fn sdk_owned_bash_stops_before_publication(shutdown: bool) {
         &root_id(),
         provider.clone(),
         1,
-        Arc::new(LegacyBashHostFixture(
-            bamboo_tools::BuiltinToolExecutor::new(),
-        )),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
         Arc::new(BashCeiling),
     )
     .await;
-    let child = harness
-        .child("owned-bash", "Run the owned Bash command.")
+    let mut child = harness
+        .child("owned-bash", "Run the owned shell command.")
         .await;
+    child.set_workspace_path_meta(workspace.to_string_lossy());
+    harness.store.save_session(&child).await.unwrap();
+    bamboo_agent_core::workspace_state::set_workspace(&child.id, workspace.canonicalize().unwrap());
     let mut events = {
         let mut senders = harness.ctx.session_event_senders.write().await;
         let sender = senders[&harness.parent.id].clone();
@@ -280,4 +241,139 @@ async fn production_sdk_cancel_reaps_real_bash_before_terminal_publication() {
 #[tokio::test]
 async fn production_sdk_shutdown_reaps_real_bash_before_terminal_publication() {
     sdk_owned_bash_stops_before_publication(true).await;
+}
+
+struct QuietCommandProvider(AtomicUsize);
+
+#[async_trait]
+impl LLMProvider for QuietCommandProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst);
+        let last_result = || {
+            let result = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == Role::Tool)
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&result.content).unwrap()
+        };
+        let (name, args) = match call {
+            0 => (
+                "exec_command",
+                serde_json::json!({
+                    "cmd": "i=0; while [ ! -f release ] && [ \"$i\" -lt 280 ]; do i=$((i + 1)); sleep 0.05; done; test -f release && printf verified",
+                    "yield_time_ms": 250,
+                }),
+            ),
+            1 => {
+                let result = last_result();
+                assert_eq!(result["status"], "running");
+                (
+                    "write_stdin",
+                    serde_json::json!({
+                        "session_id": result["session_id"],
+                        "chars": "",
+                        "yield_time_ms": 10000,
+                    }),
+                )
+            }
+            2 => {
+                let result = last_result();
+                assert_eq!(result["status"], "completed");
+                assert_eq!(result["exit_code"], 0);
+                assert_eq!(result["output"], "verified");
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(LLMChunk::Token("The command was verified.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            _ => panic!("the same command must finish without another launch or poll"),
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                id: format!("quiet-command-{call}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: args.to_string(),
+                },
+            }])),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn production_sdk_quiet_owned_command_outlives_child_idle_limit() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = home.path().join("quiet-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let provider = Arc::new(QuietCommandProvider(AtomicUsize::new(0)));
+    let mut harness = Harness::open_with_tools(
+        home.path(),
+        &root_id(),
+        provider.clone(),
+        1,
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        Arc::new(BashCeiling),
+    )
+    .await;
+    let mut child = harness
+        .child("quiet-command", "Wait for the command result.")
+        .await;
+    child.set_workspace_path_meta(workspace.to_string_lossy());
+    child
+        .metadata
+        .insert("child_watchdog.check_interval_secs".into(), "1".into());
+    child
+        .metadata
+        .insert("child_watchdog.max_idle_secs".into(), "2".into());
+    harness.store.save_session(&child).await.unwrap();
+    bamboo_agent_core::workspace_state::set_workspace(&child.id, workspace.canonicalize().unwrap());
+    let mut events = harness.child_events(&child).await;
+    harness.launch(&child).await.unwrap();
+
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if matches!(events.recv().await.unwrap(), AgentEvent::ToolStart { tool_name, .. } if tool_name == "write_stdin") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the Child must poll its original process");
+    let runner = harness.ctx.agent_runners.read().await[&child.id].clone();
+    // Hold a silent, real process past the Child watchdog's idle window and
+    // at least one watchdog tick, then let the same command exit normally.
+    tokio::time::sleep(Duration::from_millis(3400)).await;
+    let cancelled_while_waiting = runner.cancel_token.is_cancelled();
+    let sample = chrono::Utc::now();
+    let live_wait =
+        harness
+            .runner
+            .shell_wait_activity_at(&child.id, &runner.run_id, child.created_at, sample);
+    let foreign_wait =
+        harness
+            .runner
+            .shell_wait_activity_at(&child.id, "different-run", child.created_at, sample);
+    std::fs::write(workspace.join("release"), []).unwrap();
+    let (id, status, error) = harness.completion().await;
+    harness.runner.shutdown().await.unwrap();
+
+    assert_eq!(id, child.id);
+    assert_eq!(live_wait, Some(sample));
+    assert_eq!(foreign_wait, None);
+    assert!(
+        !cancelled_while_waiting,
+        "idle watchdog cancelled the command owner: {error:?}"
+    );
+    assert_eq!(status, "completed", "{error:?}");
+    assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+    harness.assert_terminal(&child, "completed").await;
 }

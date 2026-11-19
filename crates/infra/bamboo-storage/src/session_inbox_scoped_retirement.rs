@@ -517,6 +517,7 @@ impl FileSessionInbox {
                     Some(lease) => AckAuthority::Owned {
                         lease,
                         filesystem: &filesystem,
+                        post_receipt_cleanup: None,
                     },
                     None => AckAuthority::ScopedLegacy(&filesystem),
                 };

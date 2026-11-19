@@ -319,7 +319,11 @@ async fn ticket_task_projection_never_patches_root_or_session_authority() {
     assert_eq!(persistence.task_patches.load(Ordering::SeqCst), 0);
     assert_eq!(persistence.control_plane_saves.load(Ordering::SeqCst), 0);
     assert_eq!(persistence.full_saves.load(Ordering::SeqCst), 0);
-    assert!(context.as_ref().unwrap().task_list_dirty);
+    assert!(context.is_none(), "Work status changes only via LocalPlan");
+    assert!(
+        TaskLoopContext::from_session(&fixture.session).is_none(),
+        "reloading the committed plan does not enable automatic progress"
+    );
     assert!(matches!(
         rx.try_recv(),
         Ok(AgentEvent::TaskListUpdated {
@@ -485,6 +489,22 @@ async fn child_taskwrite_saves_child_and_shared_root_control_planes_without_full
         rx.recv().await,
         Some(AgentEvent::TaskListUpdated { .. })
     ));
+    let mut read = tool_call;
+    read.function.name = "Read".into();
+    for round in 1..=4 {
+        super::track_task_progress(&mut task_context, &tx, "child-1", &read, &result, round).await;
+    }
+    let mut last_progress = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::TaskListItemProgress {
+            session_id, status, ..
+        } = event
+        {
+            assert_eq!(session_id, "child-1");
+            last_progress = Some(status);
+        }
+    }
+    assert_eq!(last_progress, Some(TaskItemStatus::Completed));
 }
 
 #[tokio::test]
