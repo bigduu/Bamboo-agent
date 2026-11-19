@@ -287,3 +287,1231 @@ async fn background_exec_cache_publication_holds_the_same_lock_as_human_append()
         .iter()
         .any(|message| message.content == "new Human append after completion"));
 }
+
+#[derive(Default)]
+struct ExactStartupProvider(StdMutex<Vec<Vec<String>>>);
+
+#[async_trait]
+impl bamboo_llm::LLMProvider for ExactStartupProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(messages.iter().map(|message| message.id.clone()).collect());
+        CompletedTestProvider
+            .chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+}
+
+struct PausedExactStartup {
+    coordinator: Arc<ChildCompletionCoordinator>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl SessionActivationSpawner for PausedExactStartup {
+    async fn reserve_activation(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        self.coordinator
+            .reserve_activation(target, generation)
+            .await
+    }
+
+    async fn reserve_runtime_activation(
+        &self,
+        target: &str,
+        startup: bamboo_domain::SessionRuntimeStartup,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        let result = self
+            .coordinator
+            .reserve_runtime_activation(target, startup)
+            .await;
+        self.entered.notify_one();
+        self.release.notified().await;
+        result
+    }
+}
+
+fn fixture_exec_result(target: &str) -> BashCompletionInfo {
+    BashCompletionInfo {
+        session_id: target.into(),
+        bash_id: "fixture-command".into(),
+        command: String::new(),
+        status: "completed".into(),
+        exit_code: Some(0),
+        output_tail: r#"{"status":"completed","exit_code":0,"output":"fixture"}"#.into(),
+    }
+}
+
+async fn actor_exec_fixture() -> (
+    tempfile::TempDir,
+    Arc<bamboo_storage::SessionStoreV2>,
+    Arc<dyn SessionInboxPort>,
+    Arc<ChildCompletionCoordinator>,
+    Arc<ExactStartupProvider>,
+) {
+    let (temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+    let mut coordinator = Arc::try_unwrap(coordinator).ok().unwrap();
+    let router = coordinator.agent.activation_router().unwrap().clone();
+    router.set_inbox(inbox.clone());
+    let host = crate::SessionRepository::new(
+        coordinator.sessions.clone(),
+        store.clone(),
+        coordinator.persistence.clone(),
+    )
+    .with_root_actor_directory(store.clone());
+    coordinator.agent = Arc::new(coordinator.agent.with_execution_persistence(Arc::new(host)));
+    let provider = Arc::new(ExactStartupProvider::default());
+    let providers = HashMap::from([(
+        "test".to_string(),
+        provider.clone() as Arc<dyn bamboo_llm::LLMProvider>,
+    )]);
+    coordinator.config.write().await.provider = "test".into();
+    coordinator.provider_registry = Arc::new(ProviderRegistry::new(providers, "test".into()));
+    coordinator.provider_router = Arc::new(ProviderModelRouter::new(
+        coordinator.provider_registry.clone(),
+    ));
+    coordinator.root_account_sink =
+        Some(crate::events::AccountEventSink::new(temp.path().join("events")).unwrap());
+    coordinator.set_root_tools(Arc::new(EmptyTools)).await;
+    let coordinator = Arc::new(coordinator);
+    router.set_spawner(coordinator.clone()).await;
+    (temp, store, inbox, coordinator, provider)
+}
+
+async fn wait_for_actor_startup_to_settle(coordinator: &ChildCompletionCoordinator, target: &str) {
+    let router = coordinator.agent.activation_router().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while router.has_activation_owner_or_reservation(target).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_calls_provider_only_after_exact_receipt() {
+    use bamboo_domain::{is_matching_session_message, ActorActivationFinish};
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    for case in ["producer", "recovery"] {
+        let mut root = Session::new(format!("exact-background-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        let info = fixture_exec_result(&root.id);
+        let mut envelope = shell_completion_envelope(&info, ShellCompletionKind::Exec);
+        let mut runtime = AgentRuntimeState::new("prior-background-run");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_bash = Some(bamboo_domain::WaitingForBashState::for_bash(
+            vec![info.bash_id.clone()],
+            Utc::now(),
+        ));
+        write_runtime_state(&mut root, &runtime);
+        root.metadata
+            .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+        store.save_session(&root).await.unwrap();
+        let mut prior = coordinator
+            .agent
+            .persistence()
+            .bind_root_actor_execution(&root, &runtime.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        prior
+            .directory
+            .finish_activation(
+                &prior.owner.fence,
+                Utc::now(),
+                ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        prior.disarm_abandonment();
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
+
+        match case {
+            "producer" => {
+                coordinator
+                    .deliver_shell_completion_for_lifetime(
+                        info,
+                        ShellCompletionKind::Exec,
+                        Some(root.created_at),
+                    )
+                    .await
+            }
+            "recovery" => {
+                let receipt = inbox
+                    .deliver_runtime_for_target(&envelope, root.created_at)
+                    .await
+                    .unwrap();
+                inbox
+                    .mark_message_activation_eligible(
+                        &root.id,
+                        &receipt,
+                        SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+                clear_completed_exec_wait(&coordinator.persistence, &root, &info.bash_id, |_| {})
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let selected = inbox
+                    .inspect_wake_readiness(&root.id, Utc::now())
+                    .await
+                    .unwrap()
+                    .ready
+                    .unwrap()
+                    .runtime_startup()
+                    .unwrap();
+                assert_eq!(selected.target_created_at, root.created_at);
+                assert_eq!(selected.receipt, receipt);
+                router.reconcile_wake(&root.id, Utc::now()).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+
+        assert!(inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+        let saved = store.load_session(&root.id).await.unwrap().unwrap();
+        let message = saved
+            .messages
+            .iter()
+            .find(|message| message.id == envelope.id.as_str())
+            .unwrap();
+        // Producer retries keep the stable ID while stamping the arrival time.
+        envelope.created_at = message.created_at;
+        assert!(is_matching_session_message(message, &envelope));
+        let mut appended = 0;
+        let mut saw_provider_token = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::MessageAppended {
+                    message_id,
+                    session_id,
+                    content,
+                    ..
+                } if message_id == message.id => {
+                    assert!(
+                        !saw_provider_token,
+                        "{case}: input was announced after provider output"
+                    );
+                    assert_eq!(session_id, root.id);
+                    assert_eq!(content, message.content);
+                    appended += 1;
+                }
+                AgentEvent::Token { .. } => saw_provider_token = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            appended, 1,
+            "{case}: the committed input must stream exactly once"
+        );
+        assert!(
+            saw_provider_token,
+            "{case}: provider output was missing from the stream"
+        );
+        {
+            let mut calls = provider.0.lock().unwrap();
+            assert_eq!(calls.len(), 1, "{case}: {:?}", saved.last_run_error());
+            assert!(calls[0].iter().any(|id| id == envelope.id.as_str()));
+            calls.clear();
+        }
+
+        coordinator
+            .deliver_shell_completion_for_lifetime(
+                fixture_exec_result(&root.id),
+                ShellCompletionKind::Exec,
+                Some(root.created_at),
+            )
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::MessageAppended { message_id, .. } if message_id == message.id),
+                "{case}: replay published the already committed input",
+            );
+        }
+        assert!(provider.0.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_startup() {
+    use bamboo_domain::{
+        SessionActivationPort, SessionInboxConsumerId, SessionInboxLeaseRequest,
+        SessionRuntimeStartup,
+    };
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap().clone();
+
+    for case in [
+        "missing",
+        "coalesced-missing",
+        "leased-other-run",
+        "human-after-reserve",
+        "foreign-lifetime",
+    ] {
+        let mut root = Session::new(format!("exact-background-{case}"), "model");
+        root.add_message(Message::user(
+            "prior transcript must not start a model call",
+        ));
+        store.save_session(&root).await.unwrap();
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
+        let envelope =
+            shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+        let delivery = inbox
+            .deliver_runtime_for_target(&envelope, root.created_at)
+            .await
+            .unwrap();
+        inbox
+            .mark_message_activation_eligible(
+                &root.id,
+                &delivery,
+                SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        router
+            .set_spawner(Arc::new(PausedExactStartup {
+                coordinator: coordinator.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+        let mut startup = SessionRuntimeStartup {
+            receipt: delivery.clone(),
+            target_created_at: root.created_at,
+        };
+        if matches!(case, "missing" | "coalesced-missing") {
+            startup.receipt.id = bamboo_domain::SessionMessageId::new();
+        } else if case == "foreign-lifetime" {
+            startup.target_created_at = root.created_at - chrono::Duration::seconds(1);
+        }
+        let previous = if case == "coalesced-missing" {
+            Some(
+                router
+                    .register_session_run(&root, "earlier-logical-owner")
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let target = root.id.clone();
+        let act = router.clone();
+        let activating = tokio::spawn(async move {
+            let outcome = act.request_runtime_startup(&target, startup).await.unwrap();
+            if let Some(previous) = previous {
+                assert_eq!(
+                    outcome,
+                    bamboo_domain::SessionActivationDisposition::ActiveNotified
+                );
+                previous.finish(0).await.unwrap().unwrap()
+            } else {
+                outcome
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(8), entered.notified())
+            .await
+            .unwrap();
+        match case {
+            "leased-other-run" => {
+                let lease = SessionInboxLeaseRequest {
+                    consumer: SessionInboxConsumerId::new(),
+                    now: Utc::now(),
+                    duration: chrono::Duration::seconds(15),
+                };
+                let selected = inbox
+                    .claim_owned_receipt(&root.id, &delivery, Some("another-run"), &lease)
+                    .await
+                    .unwrap();
+                assert!(selected.is_some());
+            }
+            "human-after-reserve" => {
+                let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+                latest.pending_question = Some(bamboo_domain::PendingQuestion {
+                    tool_call_id: "latest-human-interaction".into(),
+                    tool_name: "AskUserQuestion".into(),
+                    question: "Choose whether to continue".into(),
+                    options: vec!["Continue".into(), "Stop".into()],
+                    allow_custom: false,
+                    source: Default::default(),
+                });
+                store.save_session(&latest).await.unwrap();
+            }
+            _ => {}
+        }
+        release.notify_one();
+        let disposition = activating.await.unwrap();
+        assert_eq!(
+            disposition,
+            if case == "foreign-lifetime" {
+                bamboo_domain::SessionActivationDisposition::ActivationCoalesced
+            } else {
+                bamboo_domain::SessionActivationDisposition::ActivationReserved
+            },
+            "{case}"
+        );
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert!(provider.0.lock().unwrap().is_empty(), "{case}");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::MessageAppended { message_id, .. } if message_id == envelope.id.as_str()),
+                "{case}: rejected input was published",
+            );
+        }
+        assert!(
+            !inbox.was_admitted(&root.id, &envelope.id).await.unwrap(),
+            "{case}"
+        );
+        let saved = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(saved.messages.len(), 1, "{case}");
+        assert_eq!(saved.has_pending_question(), case == "human-after-reserve");
+    }
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_preserves_existing_runtime_waits() {
+    use bamboo_domain::{
+        PlanModeState, PlanModeStatus, SessionActivationDisposition, SessionActivationPort,
+        SessionRuntimeStartup, SuspensionState,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    for case in ["legacy-reason", "structured-suspension", "plan-approval"] {
+        let mut root = Session::new(format!("background-gate-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        let mut runtime = AgentRuntimeState::new("previous-run");
+        match case {
+            "legacy-reason" => {
+                runtime.status = AgentStatusState::Suspended;
+                root.metadata.insert(
+                    "runtime.suspend_reason".into(),
+                    "awaiting_parent_approval".into(),
+                );
+            }
+            "structured-suspension" => {
+                runtime.status = AgentStatusState::Suspended;
+                runtime.suspension = Some(SuspensionState {
+                    reason: "unrelated-runtime-hook".into(),
+                    suspended_at: Utc::now(),
+                    resumable: false,
+                    hook_point: None,
+                });
+            }
+            "plan-approval" => {
+                runtime.plan_mode = Some(PlanModeState {
+                    entered_at: Utc::now(),
+                    pre_permission_mode: "default".into(),
+                    plan_file_path: None,
+                    status: PlanModeStatus::AwaitingApproval,
+                });
+            }
+            _ => unreachable!(),
+        }
+        write_runtime_state(&mut root, &runtime);
+        store.save_session(&root).await.unwrap();
+        let before = store.load_session(&root.id).await.unwrap().unwrap();
+        assert!(before.has_runtime_wait(), "{case}");
+        let envelope =
+            shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+        let receipt = inbox
+            .deliver_runtime_for_target(&envelope, root.created_at)
+            .await
+            .unwrap();
+        inbox
+            .mark_message_activation_eligible(
+                &root.id,
+                &receipt,
+                SessionActivationPolicy::RespectSpecificWait,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            router
+                .request_runtime_startup(
+                    &root.id,
+                    SessionRuntimeStartup {
+                        receipt,
+                        target_created_at: root.created_at,
+                    }
+                )
+                .await
+                .unwrap(),
+            SessionActivationDisposition::ActivationCoalesced,
+            "{case}",
+        );
+        assert!(!router.has_activation_owner_or_reservation(&root.id).await);
+        let latest = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_runtime_state(&latest),
+            read_runtime_state(&before),
+            "{case}"
+        );
+        assert_eq!(
+            latest.metadata.get("runtime.suspend_reason"),
+            before.metadata.get("runtime.suspend_reason"),
+            "{case}",
+        );
+        assert_eq!(latest.messages.len(), 1, "{case}");
+        assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+    }
+    assert!(provider.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_cannot_pre_admit_managed_work_input() {
+    use bamboo_domain::{
+        ActorActivationFinish, SessionActivationDisposition, SessionActivationPort,
+        SessionRuntimeStartup,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    let mut root = Session::new("managed-work-background-fixture", "model");
+    root.add_message(Message::user("prior transcript"));
+    root.metadata.insert(
+        crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+        "{}".into(),
+    );
+    let mut state = AgentRuntimeState::new("prior-work-run");
+    state.status = AgentStatusState::Initializing;
+    write_runtime_state(&mut root, &state);
+    store.save_session(&root).await.unwrap();
+    let envelope =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let receipt = inbox
+        .deliver_runtime_for_target(&envelope, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &receipt,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let startup = SessionRuntimeStartup {
+        receipt,
+        target_created_at: root.created_at,
+    };
+    assert_eq!(
+        router
+            .request_runtime_startup(&root.id, startup.clone())
+            .await
+            .unwrap(),
+        SessionActivationDisposition::ActivationCoalesced,
+    );
+    let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+    assert!(crate::ticket_runtime::is_managed_work_root(&latest));
+    assert!(!latest.has_runtime_wait());
+    assert_eq!(
+        read_runtime_state(&latest).status,
+        AgentStatusState::Initializing
+    );
+
+    // The exact persistence path also enforces the canonical Work identity
+    // before claim, even if a caller reaches it with a bound Root Actor.
+    let run_id = "managed-work-actor-fixture";
+    let mut binding = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&latest, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(binding
+        .persistence
+        .admit_root_runtime_startup(&mut latest, inbox.clone(), &startup, run_id,)
+        .await
+        .is_err());
+    binding
+        .directory
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Cancelled,
+        )
+        .await
+        .unwrap();
+    binding.disarm_abandonment();
+
+    assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+    assert!(provider.0.lock().unwrap().is_empty());
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn coalesced_background_startup_never_substitutes_an_earlier_ready_input() {
+    use bamboo_domain::{
+        ActorActivationFinish, SessionActivationDisposition, SessionInboxConsumerId,
+        SessionInboxLeaseRequest,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    let mut root = Session::new("coalesced-background-selection", "model");
+    root.add_message(Message::user("prior transcript"));
+    store.save_session(&root).await.unwrap();
+
+    let prior_run = "prior-owner-before-producer-notification";
+    let mut actor = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&root, prior_run)
+        .await
+        .unwrap()
+        .unwrap();
+    actor
+        .directory
+        .finish_activation(
+            &actor.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    actor.disarm_abandonment();
+    let owner = router.register_session_run(&root, prior_run).await.unwrap();
+
+    let human = bamboo_domain::SessionMessageEnvelope::user_input(&root.id, "Earlier ready input");
+    inbox
+        .deliver_with_activation_intent(
+            &human,
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let runtime =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let selected = inbox
+        .deliver_runtime_for_target(&runtime, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &selected,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let lease = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: chrono::Duration::seconds(60),
+    };
+    assert!(inbox
+        .claim_owned_receipt(&root.id, &selected, Some("other-consumer"), &lease)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        inbox.inspect(&root.id).await.unwrap().activation_generation,
+        selected.generation,
+    );
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .unwrap()
+            .id,
+        human.id,
+    );
+
+    // Both permissions are durable, but neither producer signaled the Router.
+    // Terminal handoff must keep the highest generation bound to its own input.
+    assert_eq!(
+        owner.finish(0).await.unwrap(),
+        Some(SessionActivationDisposition::ActivationReserved)
+    );
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert!(!inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.messages.len(), 1);
+
+    // An independent reconcile still selects the ready Human input.
+    router.reconcile_wake(&root.id, Utc::now()).await.unwrap();
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let calls = provider.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].iter().any(|id| id == human.id.as_str()));
+}
+
+#[tokio::test]
+async fn background_exec_owned_actor_preserves_native_human_receipt_selection() {
+    use bamboo_domain::{ActorActivationFinish, SessionRuntimeStartup};
+    let (_temp, store, inbox, coordinator, _) = actor_exec_fixture().await;
+    let mut root = Session::new("exact-native-and-runtime", "model");
+    store.save_session(&root).await.unwrap();
+    let runtime =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let deferred = inbox
+        .deliver_runtime_for_target(&runtime, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &deferred,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let human = bamboo_domain::SessionMessageEnvelope::user_input(&root.id, "Selected Human input");
+    let selected = inbox
+        .deliver_with_activation_intent(
+            &human,
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut binding = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&root, "native-selection-run")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let startup = SessionRuntimeStartup {
+        receipt: deferred,
+        target_created_at: binding.owner.created_at,
+    };
+    assert!(binding
+        .persistence
+        .admit_root_runtime_startup(&mut root, inbox.clone(), &startup, "other-run")
+        .await
+        .is_err());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+
+    let exact = binding
+        .persistence
+        .bind_root_inbox_receipt(selected)
+        .unwrap();
+    assert!(exact
+        .admit_root_runtime_startup(&mut root, inbox.clone(), &startup, "native-selection-run")
+        .await
+        .is_err());
+    let admission = exact
+        .admit_root_inbox(&mut root, inbox.clone(), Some("native-selection-run"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admission.admission_error.is_none(), "{admission:?}");
+    assert_eq!(admission.merged, 1);
+    assert!(inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    binding
+        .directory
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    binding.disarm_abandonment();
+}
+
+#[tokio::test]
+async fn owned_child_wait_expiry_survives_commit_before_activation() {
+    use bamboo_domain::{
+        ActorActivationFinish, ChildWaitExpiry, CommittedChildWaitExpiry, PlanModeState,
+        PlanModeStatus, SuspensionState,
+    };
+
+    let (temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    for case in [
+        "committed",
+        "promoted_stale",
+        "promoted_malformed",
+        "changed_wait",
+        "live_actor",
+        "changed_attempt",
+        "failed_actor",
+        "cancelled_actor",
+        "missing_receipt",
+        "removed_receipt",
+        "wrong_generation",
+        "wrong_record",
+        "wrong_envelope",
+        "human_gate",
+        "legacy_hook_gate",
+        "structured_hook_gate",
+        "plan_gate",
+        "managed_work",
+    ] {
+        let promoted_case = matches!(case, "promoted_stale" | "promoted_malformed");
+        let should_commit = case == "committed" || promoted_case;
+        let now = Utc::now();
+        let mut root = Session::new(format!("expired-wait-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        root.set_last_run_status("suspended");
+        let mut runtime = AgentRuntimeState::new(format!("prior-{case}"));
+        let wait = WaitingForChildrenState::for_children(
+            vec![format!("still-running-{case}")],
+            ChildWaitPolicy::All,
+            now - chrono::Duration::hours(7),
+        );
+        runtime.status = AgentStatusState::Suspended;
+        if case == "committed" {
+            runtime.suspension = Some(SuspensionState {
+                reason: "waiting_for_children".into(),
+                suspended_at: wait.registered_at,
+                resumable: true,
+                hook_point: None,
+            });
+        }
+        let mut recorded_wait = wait.clone();
+        if case == "changed_wait" {
+            recorded_wait.child_session_ids.push("new-child".into());
+        }
+        runtime.waiting_for_children = Some(recorded_wait.clone());
+        write_runtime_state(&mut root, &runtime);
+        root.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        store.save_session(&root).await.unwrap();
+        let child_id = format!("still-running-{case}");
+        let mut child = Session::new_child(&child_id, &root.id, "model", "Child");
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        let main = store
+            .sessions_root_dir()
+            .join(&root.id)
+            .join("session.json");
+
+        let mut prior = coordinator
+            .agent
+            .persistence()
+            .bind_root_actor_execution(&root, &runtime.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if case != "live_actor" {
+            let finish = match case {
+                "failed_actor" => ActorActivationFinish::Failed,
+                "cancelled_actor" => ActorActivationFinish::Cancelled,
+                _ => ActorActivationFinish::Succeeded,
+            };
+            prior
+                .directory
+                .finish_activation(&prior.owner.fence, Utc::now(), finish)
+                .await
+                .unwrap();
+            prior.disarm_abandonment();
+        }
+        let observed = store
+            .observe_root_child_wait_expiry_activation(&root, &runtime.run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.as_deref(),
+            match case {
+                "live_actor" | "failed_actor" | "cancelled_actor" => None,
+                _ => Some(prior.owner.fence.activation_id.as_str()),
+            },
+            "{case}",
+        );
+        let activation_id = if case == "changed_attempt" {
+            "older-attempt".into()
+        } else {
+            prior.owner.fence.activation_id.clone()
+        };
+        let expiry =
+            ChildWaitExpiry::observe(&root, &runtime, activation_id, wait.clone()).unwrap();
+        let envelope = expiry.envelope(&root.id).unwrap();
+        let mut receipt = if case == "missing_receipt" {
+            bamboo_domain::SessionInboxReceipt {
+                id: envelope.id.clone(),
+                generation: 1,
+            }
+        } else {
+            let receipt = inbox
+                .deliver_runtime_for_target(&envelope, root.created_at)
+                .await
+                .unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &root.id,
+                    receipt.generation,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            receipt
+        };
+        assert!(inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .is_none());
+        assert!(
+            inbox
+                .claim_for_turn(&root.id, 1, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}: a generic legacy prefix consumed the private expiry",
+        );
+        if case == "committed" {
+            // Before the wait commits, retrying the producer recovers the same
+            // receipt without granting generic wake or inserting history.
+            let retry = inbox
+                .deliver_runtime_for_target(&envelope, root.created_at)
+                .await
+                .unwrap();
+            assert_eq!(retry, receipt);
+            assert!(provider.0.lock().unwrap().is_empty());
+        }
+        if case == "wrong_generation" {
+            receipt.generation += 1;
+        }
+        if matches!(case, "removed_receipt" | "wrong_record" | "wrong_envelope") {
+            let mut rows = tokio::fs::read_dir(main.parent().unwrap().join("inbox/new"))
+                .await
+                .unwrap();
+            let path = rows.next_entry().await.unwrap().unwrap().path();
+            if case == "removed_receipt" {
+                tokio::fs::remove_file(path).await.unwrap();
+            } else {
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                let mut row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if case == "wrong_envelope" {
+                    row["body"]["created_at"] = serde_json::json!(Utc::now());
+                } else {
+                    row["from"]["role"] = serde_json::json!("unexpected-transport-metadata");
+                }
+                tokio::fs::write(path, serde_json::to_vec(&row).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        if matches!(
+            case,
+            "human_gate"
+                | "legacy_hook_gate"
+                | "structured_hook_gate"
+                | "plan_gate"
+                | "managed_work"
+        ) {
+            let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+            let mut current = read_runtime_state(&latest);
+            match case {
+                "human_gate" => {
+                    latest.pending_question = Some(bamboo_domain::PendingQuestion {
+                        tool_call_id: "later-human-question".into(),
+                        tool_name: "AskUserQuestion".into(),
+                        question: "Choose whether to continue".into(),
+                        options: vec!["Continue".into(), "Stop".into()],
+                        allow_custom: false,
+                        source: Default::default(),
+                    });
+                }
+                "legacy_hook_gate" => {
+                    latest
+                        .metadata
+                        .insert("runtime.suspend_reason".into(), "hook_suspended".into());
+                }
+                "structured_hook_gate" => {
+                    current.suspension = Some(SuspensionState {
+                        reason: "hook_suspended".into(),
+                        suspended_at: now,
+                        resumable: false,
+                        hook_point: None,
+                    });
+                }
+                "plan_gate" => {
+                    current.plan_mode = Some(PlanModeState {
+                        entered_at: now,
+                        pre_permission_mode: "default".into(),
+                        plan_file_path: None,
+                        status: PlanModeStatus::AwaitingApproval,
+                    });
+                }
+                "managed_work" => {
+                    latest.metadata.insert(
+                        crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+                        "{}".into(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            write_runtime_state(&mut latest, &current);
+            store.save_session(&latest).await.unwrap();
+        }
+        let prior_history = tokio::fs::read(&main).await.unwrap();
+        let committed = CommittedChildWaitExpiry::new(expiry, &receipt);
+        assert_eq!(
+            store
+                .expire_root_child_wait_control_plane(
+                    &root,
+                    &committed,
+                    inbox.as_ref(),
+                    now,
+                    Arc::new(|_| {})
+                )
+                .await
+                .unwrap(),
+            should_commit,
+            "{case}",
+        );
+        assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+
+        let reopened = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let control = reopened
+            .load_runtime_control_plane(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if !should_commit {
+            assert_eq!(
+                read_runtime_state(&control).waiting_for_children,
+                Some(recorded_wait)
+            );
+            assert!(CommittedChildWaitExpiry::from_session(&control).is_none());
+            match case {
+                "human_gate" => {
+                    let full = reopened.load_session(&root.id).await.unwrap().unwrap();
+                    assert!(full.has_pending_question());
+                }
+                "legacy_hook_gate" => {
+                    assert_eq!(
+                        control
+                            .metadata
+                            .get("runtime.suspend_reason")
+                            .map(String::as_str),
+                        Some("hook_suspended"),
+                    );
+                }
+                "structured_hook_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).suspension.unwrap().reason,
+                        "hook_suspended",
+                    );
+                }
+                "plan_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).plan_mode.unwrap().status,
+                        PlanModeStatus::AwaitingApproval,
+                    );
+                }
+                _ => {}
+            }
+            assert!(inbox
+                .inspect_wake_readiness(&root.id, now)
+                .await
+                .unwrap()
+                .ready
+                .is_none());
+            continue;
+        }
+
+        assert!(read_runtime_state(&control).waiting_for_children.is_none());
+        assert_eq!(
+            CommittedChildWaitExpiry::from_session(&control),
+            Some(committed)
+        );
+        assert!(inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .is_none());
+        if promoted_case {
+            let calls = provider.0.lock().unwrap().len();
+            inbox
+                .mark_message_activation_eligible(
+                    &root.id,
+                    &receipt,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                inbox
+                    .inspect_runtime_startup(&root.id, receipt.generation)
+                    .await
+                    .unwrap(),
+                Some(bamboo_domain::SessionRuntimeStartup {
+                    receipt: receipt.clone(),
+                    target_created_at: root.created_at,
+                }),
+                "{case}",
+            );
+
+            if case == "promoted_stale" {
+                let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+                let mut current = read_runtime_state(&latest);
+                current.run_id = "newer-suspended-run".into();
+                write_runtime_state(&mut latest, &current);
+                store.save_runtime_state(&latest).await.unwrap();
+                let latest = store
+                    .load_runtime_control_plane(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read_runtime_state(&latest).run_id, current.run_id);
+                assert!(read_runtime_state(&latest).waiting_for_children.is_none());
+            } else {
+                let mut rows = tokio::fs::read_dir(main.parent().unwrap().join("inbox/new"))
+                    .await
+                    .unwrap();
+                let path = rows.next_entry().await.unwrap().unwrap().path();
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                let mut row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                row["body"]["created_at"] = serde_json::json!(Utc::now());
+                tokio::fs::write(path, serde_json::to_vec(&row).unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(inbox
+                .inspect_wake_readiness(&root.id, now)
+                .await
+                .unwrap()
+                .ready
+                .is_none());
+            assert!(
+                matches!(
+                    inbox
+                        .inspect_runtime_startup(&root.id, receipt.generation)
+                        .await,
+                    Err(bamboo_domain::SessionInboxError::InvalidClaim(_)),
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                inbox.inspect(&root.id).await.unwrap().activation_generation,
+                receipt.generation,
+            );
+            let router = coordinator.agent.activation_router().unwrap();
+            let owner = router
+                .register_session_run(&root, "prior-logical-owner")
+                .await
+                .unwrap();
+            let result = owner.finish(0).await;
+            assert!(
+                matches!(result, Err(ref error) if error.to_string().contains("lacks a current disposition")),
+                "{case}: {result:?}"
+            );
+            wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+            assert_eq!(provider.0.lock().unwrap().len(), calls, "{case}");
+            assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+            assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+            continue;
+        }
+
+        assert_eq!(provider.0.lock().unwrap().len(), 0);
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
+
+        // A crash here would leave the exact receipt staged and the wait
+        // retired. The ordinary watchdog pass performs the recovery.
+        coordinator
+            .sweep_one_suspended_session(&root.id, None)
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+        let saved = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("running"),
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| {
+                    bamboo_domain::is_matching_session_message(message, &envelope)
+                })
+                .count(),
+            1
+        );
+
+        coordinator
+            .sweep_one_suspended_session(&root.id, None)
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+
+        let message = saved
+            .messages
+            .iter()
+            .find(|message| message.id == envelope.id.as_str())
+            .unwrap();
+        let mut appended = 0;
+        let mut saw_provider_token = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::MessageAppended {
+                    message_id,
+                    session_id,
+                    content,
+                    ..
+                } if message_id == message.id => {
+                    assert!(
+                        !saw_provider_token,
+                        "expiry was announced after provider output"
+                    );
+                    assert_eq!(session_id, root.id);
+                    assert_eq!(content, message.content);
+                    appended += 1;
+                }
+                AgentEvent::Token { .. } => saw_provider_token = true,
+                _ => {}
+            }
+        }
+        assert_eq!(appended, 1, "the recovered expiry must stream exactly once");
+        assert!(
+            saw_provider_token,
+            "provider output was missing from the stream"
+        );
+    }
+}

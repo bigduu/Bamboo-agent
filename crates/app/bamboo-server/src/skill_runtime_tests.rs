@@ -254,6 +254,10 @@ pub(crate) fn write_skill(home: &Path, id: &str, automatic: bool) -> String {
 }
 
 async fn state(home: &Path, provider: Arc<dyn LLMProvider>) -> web::Data<AppState> {
+    web::Data::new(app_state(home, provider).await)
+}
+
+async fn app_state(home: &Path, provider: Arc<dyn LLMProvider>) -> AppState {
     let mut config = bamboo_llm::Config::from_data_dir(Some(home.into()));
     config.provider = "openai".into();
     config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
@@ -268,7 +272,7 @@ async fn state(home: &Path, provider: Arc<dyn LLMProvider>) -> web::Data<AppStat
         "openai".into(),
     ));
     state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
-    web::Data::new(state)
+    state
 }
 async fn http(state: &web::Data<AppState>, path: &str, body: Value) -> (StatusCode, Value) {
     let app = test::init_service(
@@ -645,6 +649,307 @@ async fn native_http_execute_reaches_model_after_idle_workspace_cache_fills() {
     let terminal = done(&state, id).await;
     assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
     assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+}
+
+#[derive(Default)]
+struct SkillPressureProvider(Mutex<Vec<Vec<Message>>>);
+
+#[async_trait]
+impl LLMProvider for SkillPressureProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push(messages.to_vec());
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Workspace run completed".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[actix_web::test]
+async fn native_http_ordinary_root_continues_when_pinned_workspaces_exhaust_snapshot_budget() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let held = root.join("held");
+    let workspace = root.join("cold");
+    for (workspace, skill, byte) in [
+        (&held, "held-skill", b'h'),
+        (&workspace, "cold-skill", b'c'),
+    ] {
+        let skills_home = workspace.join(".bamboo");
+        write_skill(&skills_home, skill, true);
+        std::fs::write(
+            skills_home
+                .join("skills")
+                .join(skill)
+                .join("references/large.bin"),
+            vec![byte; 2 * 1024 * 1024],
+        )
+        .unwrap();
+    }
+    let provider = Arc::new(SkillPressureProvider::default());
+    let mut state = app_state(&root, provider.clone()).await;
+    state.skill_manager = Arc::new(bamboo_skills::SkillManager::with_snapshot_budget_for_test(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: root.join("skills"),
+            ..Default::default()
+        },
+        3 * 1024 * 1024,
+    ));
+    state.skill_manager.initialize().await.unwrap();
+    let state = web::Data::new(state);
+    let owner = state
+        .skill_manager
+        .store_for_workspace(Some(&held))
+        .await
+        .unwrap();
+    let pinned = owner
+        .pin_current_activation("held-cold-start", &["held-skill".into()], None)
+        .await
+        .unwrap();
+    drop(owner);
+    let capacity_error = state
+        .skill_manager
+        .store_for_workspace(Some(&workspace))
+        .await
+        .err()
+        .expect("the cold publication must exceed the shared budget");
+    assert!(capacity_error
+        .to_string()
+        .contains("global workflow snapshot budget"));
+
+    for (id, selected) in [
+        ("native-cold-ordinary", false),
+        ("native-cold-selected", true),
+    ] {
+        let mut session = Session::new(id, "test-model");
+        session.title_generated = true;
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+            "explicit".into(),
+        );
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .workspace_resolver
+            .publish_resolved_workspace(id, workspace.clone(), "test_initial");
+        let mut request = json!({"session_id":id,"message":"Do the normal workspace task"});
+        if selected {
+            request["selected_skill_ids"] = json!(["cold-skill"]);
+        }
+        let (status, receipt) = http(&state, "/api/v1/chat", request).await;
+        assert_eq!(status, StatusCode::CREATED, "{receipt}");
+        if selected {
+            let saved = state.storage.load_session(id).await.unwrap().unwrap();
+            assert_eq!(saved.selected_skill_ids(), Some(vec!["cold-skill".into()]));
+        }
+        let (status, receipt) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{receipt}");
+        let terminal = done(&state, id).await;
+        if selected {
+            assert!(
+                matches!(&terminal, AgentStatus::Error(error) if error.contains("global workflow snapshot budget")),
+                "{terminal:?}"
+            );
+        } else {
+            assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+        }
+    }
+    {
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].iter().any(|message| message.role == Role::User
+            && message.content == "Do the normal workspace task"));
+        assert!(requests[0].iter().all(|message| !message
+            .content
+            .contains("Check Skill applicability.")
+            && !message.content.contains("cold-skill")
+            && !message.content.contains("held-skill")));
+    }
+    let owner = state
+        .skill_manager
+        .store_for_workspace(Some(&held))
+        .await
+        .unwrap();
+    assert_eq!(
+        owner.activation_descriptor("held-cold-start").await,
+        Some(pinned)
+    );
+    owner.release_activation("held-cold-start").await;
+    drop(owner);
+    let recovered = state
+        .skill_manager
+        .store_for_workspace(Some(&workspace))
+        .await
+        .unwrap();
+    assert!(recovered
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .iter()
+        .any(|entry| entry.id == "cold-skill"));
+}
+
+#[actix_web::test]
+async fn native_http_ordinary_root_continues_when_cold_mode_exceeds_snapshot_budget() {
+    assert_root_mode_pressure(false).await;
+}
+
+#[actix_web::test]
+async fn native_http_ordinary_root_continues_when_progressive_refresh_exceeds_snapshot_budget() {
+    assert_root_mode_pressure(true).await;
+}
+
+async fn assert_root_mode_pressure(warm_mode: bool) {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let held = root.join("held");
+    let workspace = root.join("workspace");
+    write_skill(&held.join(".bamboo"), "held-skill", true);
+    write_skill(&workspace.join(".bamboo"), "base-skill", true);
+    write_skill(&workspace.join(".bamboo"), "mode-skill", true);
+    let mode_bundle = workspace.join(".bamboo/skills-code/mode-skill");
+    std::fs::create_dir_all(mode_bundle.parent().unwrap()).unwrap();
+    std::fs::rename(workspace.join(".bamboo/skills/mode-skill"), &mode_bundle).unwrap();
+    std::fs::write(
+        held.join(".bamboo/skills/held-skill/references/large.bin"),
+        vec![b'h'; 2 * 1024 * 1024],
+    )
+    .unwrap();
+
+    let provider = Arc::new(SkillPressureProvider::default());
+    let mut state = app_state(&root, provider.clone()).await;
+    state.skill_manager = Arc::new(bamboo_skills::SkillManager::with_snapshot_budget_for_test(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: root.join("skills"),
+            ..Default::default()
+        },
+        4 * 1024 * 1024,
+    ));
+    state.skill_manager.initialize().await.unwrap();
+    let state = web::Data::new(state);
+    let owner = state
+        .skill_manager
+        .store_for_workspace(Some(&held))
+        .await
+        .unwrap();
+    let pinned = owner
+        .pin_current_activation("held-mode-start", &["held-skill".into()], None)
+        .await
+        .unwrap();
+    let base = state
+        .skill_manager
+        .store_for_workspace(Some(&workspace))
+        .await
+        .unwrap();
+    let mode = if warm_mode {
+        Some(base.retain_mode_store(Some("code")).await.unwrap())
+    } else {
+        None
+    };
+    std::fs::write(
+        mode_bundle.join("references/large.bin"),
+        vec![b'm'; 2 * 1024 * 1024],
+    )
+    .unwrap();
+    let error = match &mode {
+        Some(mode) => {
+            assert!(Arc::ptr_eq(
+                mode,
+                &base.retain_mode_store(Some("code")).await.unwrap()
+            ));
+            mode.progressive_automatic_catalog_for_mode(
+                None,
+                &bamboo_skills::progressive::SkillCatalogEligibility {
+                    ceiling: None,
+                    explicit: Default::default(),
+                    disabled: Default::default(),
+                    deny_all: false,
+                },
+                "Inspect the proof task",
+            )
+            .await
+            .err()
+        }
+        None => base.retain_mode_store(Some("code")).await.err(),
+    };
+    assert!(matches!(
+        error,
+        Some(bamboo_skills::SkillError::PublicationBudgetExceeded { .. })
+    ));
+
+    for (id, selected) in [
+        ("native-mode-ordinary", false),
+        ("native-mode-selected", true),
+    ] {
+        let mut session = Session::new(id, "test-model");
+        session.title_generated = true;
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+            "explicit".into(),
+        );
+        session.metadata.insert("skill_mode".into(), "code".into());
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .workspace_resolver
+            .publish_resolved_workspace(id, workspace.clone(), "test_initial");
+        let mut request =
+            json!({"session_id":id,"message":"Inspect the proof task in the workspace"});
+        if selected {
+            request["selected_skill_ids"] = json!(["mode-skill"]);
+        }
+        let (status, response) = http(&state, "/api/v1/chat", request).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let terminal = done(&state, id).await;
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(super::mode(&saved).as_deref(), Some("code"));
+        if selected {
+            assert_eq!(saved.selected_skill_ids(), Some(vec!["mode-skill".into()]));
+            assert!(
+                matches!(&terminal, AgentStatus::Error(error) if error.contains("global workflow snapshot budget")),
+                "{terminal:?}"
+            );
+        } else {
+            assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+        }
+    }
+    {
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].iter().any(|message| message.role == Role::User
+            && message.content == "Inspect the proof task in the workspace"));
+        assert!(requests[0].iter().all(|message| !message
+            .content
+            .contains("Check Skill applicability.")
+            && !message.content.contains("mode-skill")
+            && !message.content.contains("base-skill")));
+    }
+    assert_eq!(
+        owner.activation_descriptor("held-mode-start").await,
+        Some(pinned)
+    );
+    owner.release_activation("held-mode-start").await;
+    std::fs::remove_file(held.join(".bamboo/skills/held-skill/references/large.bin")).unwrap();
+    owner.reload().await.unwrap();
+    drop(owner);
+    let mode = base.retain_mode_store(Some("code")).await.unwrap();
+    mode.reload().await.unwrap();
+    assert!(mode
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .iter()
+        .any(|entry| entry.id == "mode-skill"));
 }
 
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
