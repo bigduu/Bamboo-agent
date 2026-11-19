@@ -197,6 +197,35 @@ struct MainIdentity {
 }
 
 impl SessionStoreV2 {
+    /// Read current owner consent and retain its profile lock through the fresh
+    /// dispatch reservation. The callback must not reenter the Session store.
+    pub async fn with_supervisor_dispatch_consent<T, F, Fut>(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        reserve: F,
+    ) -> io::Result<T>
+    where
+        F: FnOnce(bool) -> Fut,
+        Fut: std::future::Future<Output = io::Result<T>>,
+    {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self
+            .acquire_session_maintenance_lock(&caller.session_id)
+            .await?;
+        let current = self
+            .load_execution_admission_unchecked(&caller.session_id)
+            .await?
+            .filter(|session| {
+                session.supervisor_incarnation_id().is_some() && caller.matches_session(session)
+            })
+            .ok_or_else(|| invalid("Supervisor dispatch caller authority changed"))?;
+        current
+            .check_execution_compatibility()
+            .map_err(|error| invalid(&error.to_string()))?;
+        reserve(current.supervisor_auto_dispatch()).await
+    }
+
     /// Apply a Host profile edit to the current Supervisor under the physical
     /// writer lock. The callback validates and edits the requested config
     /// fields. It must not reenter storage. The observed lifetime and
@@ -217,7 +246,8 @@ impl SessionStoreV2 {
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session_lock = self.acquire_session_write_lock(id, SaveKind::Full).await?;
-        let guards = DefaultWriterGuards::shared(lifecycle, task, session_lock);
+        let guards =
+            DefaultWriterGuards::supervisor_execution_profile(lifecycle, task, session_lock);
         let mut current = self
             .load_execution_admission_unchecked(id)
             .await?

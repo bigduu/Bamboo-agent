@@ -131,6 +131,18 @@ impl BodhiProvider {
 
 #[async_trait]
 impl LLMProvider for BodhiProvider {
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        required_tool: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        if required_tool.is_some() {
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        } else {
+            bamboo_domain::CapabilityLoadingMode::StickyFallback
+        }
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         _ir: &crate::prompt_ir::PromptIR,

@@ -186,6 +186,14 @@ pub async fn get_session(
                 Some(durable_session.root_orchestration_only_enabled());
             summary.thinking_mode = Some(durable_session.root_thinking_mode());
             summary.reasoning_effort = durable_session.reasoning_effort;
+            if let Some(runtime) = durable_session.agent_runtime_state.as_ref() {
+                summary.permission_mode = runtime.effective_permission_mode();
+                summary.bypass_permissions =
+                    summary.permission_mode != bamboo_domain::SessionPermissionMode::Default;
+            }
+            summary.supervisor_auto_dispatch = durable_session
+                .supervisor_incarnation_id()
+                .map(|_| durable_session.supervisor_auto_dispatch());
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
             {
@@ -248,6 +256,9 @@ pub async fn get_session(
             // Surface the session ETag (`metadata_version`) so clients can send
             // it back as `If-Match` on metadata writes (optimistic concurrency).
             let etag = durable_session.metadata_version;
+            if summary.supervisor_auto_dispatch.is_some() {
+                summary.supervisor_permission_etag = Some(format!("\"{etag}\""));
+            }
 
             let mut response = HttpResponse::Ok();
             response.insert_header((actix_web::http::header::ETAG, format!("\"{etag}\"")));

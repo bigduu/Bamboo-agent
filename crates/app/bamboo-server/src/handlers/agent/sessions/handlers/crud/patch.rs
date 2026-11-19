@@ -235,6 +235,21 @@ pub async fn patch_session(
             "session_id": session_id,
         })));
     }
+    if req.supervisor_auto_dispatch.is_some() {
+        if session_id != bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+            || req.permission_mode != Some(bamboo_domain::SessionPermissionMode::Auto)
+        {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value(
+                    "supervisor_auto_dispatch requires an explicit Supervisor Auto permission mode"
+                ),
+                "session_id": session_id,
+            })));
+        }
+        crate::handlers::agent::tickets::user(&state, &http_req)
+            .await
+            .map_err(|failure| crate::error::AppError::Forbidden(failure.to_string()))?;
+    }
     let request_precondition = parse_if_match(&http_req);
     if req.permission_mode.is_some() && request_precondition.is_none() {
         return Ok(HttpResponse::build(
@@ -765,6 +780,12 @@ pub async fn patch_session(
         )
         .await;
         let supervisor = session.supervisor_incarnation_id().is_some();
+        if req.supervisor_auto_dispatch.is_some() && !supervisor {
+            return Ok(HttpResponse::Forbidden().json(serde_json::json!({
+                "error": crate::error::error_value("A canonical Supervisor is required"),
+                "session_id": session_id,
+            })));
+        }
         let edit = |session: &mut bamboo_domain::Session| {
             if let Some(expected) = config_expected_version {
                 if session.metadata_version != expected {
@@ -807,6 +828,10 @@ pub async fn patch_session(
                 .map(|(previous, effective)| {
                     (previous, effective, chrono::Utc::now().to_rfc3339())
                 });
+            let auto_dispatch_changed = supervisor
+                && requested_permission_mode.is_some()
+                && session
+                    .set_supervisor_auto_dispatch(req.supervisor_auto_dispatch.unwrap_or(false));
             if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
                 let audit = if let Some(config) = state.permission_checker.permission_config() {
                     record_bamboo_runtime_permission_transition_metadata(
@@ -833,8 +858,10 @@ pub async fn patch_session(
                 || session.model_ref != prev_model_ref
                 || (supervisor && session.provider_name() != prev_provider);
             let reasoning_changed = session.reasoning_effort != prev_reasoning;
-            let config_changed =
-                model_changed || reasoning_changed || permission_transition.is_some();
+            let config_changed = model_changed
+                || reasoning_changed
+                || permission_transition.is_some()
+                || auto_dispatch_changed;
             if config_changed {
                 session.metadata_version = match session.metadata_version.checked_add(1) {
                     Some(version) => version,
@@ -934,27 +961,8 @@ pub async fn patch_session(
         }
     }
 
-    // Advertise the new ETag (metadata_version) so clients can send it back as
-    // `If-Match` on their next write.
-    let etag = state
-        .persistence
-        .storage()
-        .load_session(&session_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|s| s.metadata_version);
-
-    let mut response = get_session(state, web::Path::from(session_id)).await?;
-    if let Some(version) = etag {
-        if let Ok(value) = actix_web::http::header::HeaderValue::from_str(&format!("\"{version}\""))
-        {
-            response
-                .headers_mut()
-                .insert(actix_web::http::header::ETAG, value);
-        }
-    }
-    Ok(response)
+    // Report the permission posture and its ETag from the same durable read.
+    get_session(state, web::Path::from(session_id)).await
 }
 
 #[cfg(test)]

@@ -717,6 +717,59 @@ pub(crate) fn required_tool_from_options<'a>(
 
 pub(crate) const DEFAULT_COMPRESSION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
+/// A provider request override can narrow the tools the session may offer.
+/// Names use the exact function identities in the provider's declarations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum RequestToolSelection {
+    #[default]
+    Automatic,
+    Required,
+    Disabled,
+    Forced {
+        name: String,
+        exactly_one: bool,
+    },
+    Named {
+        names: Vec<String>,
+        required: bool,
+    },
+}
+
+impl RequestToolSelection {
+    pub fn restricts_names(&self) -> bool {
+        matches!(
+            self,
+            Self::Disabled | Self::Forced { .. } | Self::Named { .. }
+        )
+    }
+
+    pub fn requires_call(&self) -> bool {
+        matches!(
+            self,
+            Self::Required | Self::Forced { .. } | Self::Named { required: true, .. }
+        )
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Forced { name, .. } => std::slice::from_ref(name),
+            Self::Named { names, .. } => names,
+            _ => &[],
+        }
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::Automatic | Self::Required => true,
+            Self::Disabled => false,
+            Self::Forced {
+                name: candidate, ..
+            } => candidate == name,
+            Self::Named { names, .. } => names.iter().any(|candidate| candidate == name),
+        }
+    }
+}
+
 /// Trait for LLM provider implementations
 ///
 /// This trait defines the interface that all LLM providers must implement
@@ -839,14 +892,20 @@ pub trait LLMProvider: Send + Sync {
 
     /// Select the provider's callable-catalog policy for one model request.
     ///
-    /// Providers must opt in explicitly. The default preserves the complete
-    /// legacy function catalog for compatibility endpoints and unknown models.
+    /// Configured generation adapters select native or compatibility loading.
+    /// The default preserves the catalog supplied to existing custom Rust adapters.
     async fn capability_loading_mode(
         &self,
         _model: &str,
         _required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
         CapabilityLoadingMode::LegacyFullCatalog
+    }
+
+    /// Resolve the generation endpoint's configured tool choice before the
+    /// agent projects the role's eligible catalog for this request.
+    async fn request_tool_selection(&self, _model: &str) -> Result<RequestToolSelection> {
+        Ok(RequestToolSelection::Automatic)
     }
 
     /// Lower the tool definitions visible to the model at this request.
@@ -1019,6 +1078,7 @@ pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLM
             require_current: provider.queue_requires_current_route(),
             original: provider,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })),
         None => Ok(provider),
     }
@@ -1033,6 +1093,7 @@ pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProv
         original: provider,
         require_current: true,
         fixed_inner: false,
+        main_dispatch_origin: None,
     })
 }
 
@@ -1050,6 +1111,7 @@ pub fn fixed_provider_with_identity(
         original,
         require_current: true,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
 }
 
@@ -1067,7 +1129,22 @@ pub fn fixed_injected_provider_with_identity(
         original,
         require_current: false,
         fixed_inner: true,
+        main_dispatch_origin: None,
     })
+}
+
+/// Retain a forwarding boundary's chosen provider across preparation and send.
+/// The dispatch observer still receives the selected Arc at that same boundary.
+#[doc(hidden)]
+pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    let inner = queued_snapshot_for(selected.clone())?;
+    Ok(Arc::new(QueuedBudgetProvider {
+        require_current: inner.queue_requires_current_route(),
+        inner,
+        original: selected.clone(),
+        fixed_inner: true,
+        main_dispatch_origin: Some(selected),
+    }))
 }
 
 struct QueuedBudgetProvider {
@@ -1076,6 +1153,7 @@ struct QueuedBudgetProvider {
     require_current: bool,
     // A receipt-bound delegate must not later resnapshot a mutable wrapper.
     fixed_inner: bool,
+    main_dispatch_origin: Option<Arc<dyn LLMProvider>>,
 }
 
 #[async_trait]
@@ -1103,6 +1181,7 @@ impl LLMProvider for QueuedBudgetProvider {
             original: self.original.clone(),
             require_current: self.require_current,
             fixed_inner: false,
+            main_dispatch_origin: None,
         })))
     }
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
@@ -1133,6 +1212,10 @@ impl LLMProvider for QueuedBudgetProvider {
             .capability_loading_mode(model, required_tool)
             .await
     }
+    async fn request_tool_selection(&self, model: &str) -> Result<RequestToolSelection> {
+        self.inner.request_tool_selection(model).await
+    }
+
     async fn provider_visible_tool_footprint(
         &self,
         ir: &PromptIR,
@@ -1175,6 +1258,11 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        if let Some(origin) = self.main_dispatch_origin.as_ref().filter(|_| {
+            options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop")
+        }) {
+            observe_main_dispatch(origin.clone());
+        }
         self.inner
             .chat_stream_ir(ir, tools, max_output_tokens, model, options)
             .await

@@ -14,6 +14,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         // but the newly added typed field deserializes to its default.
         bypass_permissions: true,
         permission_mode: bamboo_domain::SessionPermissionMode::Default,
+        supervisor_profile_revision: None,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-1".to_string(),
         title: "Child Session".to_string(),
@@ -81,6 +82,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         id: "child-2".to_string(),
         bypass_permissions: false,
         permission_mode: bamboo_domain::SessionPermissionMode::Default,
+        supervisor_profile_revision: None,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-2".to_string(),
         title: "Plan Child".to_string(),

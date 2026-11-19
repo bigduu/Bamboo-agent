@@ -10,7 +10,7 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
   command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
-  resumePrepared, assertAdmissionCompatibility } = require('./crate-release.cjs')
+  resumePrepared, assertAdmissionCompatibility, waitForCargoArchive } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -23,6 +23,32 @@ const checksum = 'f'.repeat(64)
 const now = new Date('2026-10-07T12:00:00Z')
 const signingKey = '7'.repeat(64)
 const signingKeyDigest = sha256(Buffer.from(signingKey, 'hex'))
+
+test('wait for the exact Cargo download route before accepting the archived crate', async () => {
+  const archive = new Response('crate bytes')
+  const requests = []
+  const delays = []
+  const response = await waitForCargoArchive('bamboo-skills', '2026.11.30', async (url, allowMissing) => {
+    requests.push([url, allowMissing])
+    return requests.length === 1 ? null : archive
+  }, async (seconds) => { delays.push(seconds) })
+  const request = ['https://static.crates.io/crates/bamboo-skills/2026.11.30/download', true]
+  assert.deepEqual(requests, [request, request])
+  assert.deepEqual(delays, [10])
+  assert.equal(response, archive)
+})
+
+test('a permanently missing Cargo download fails after the bounded wait', async () => {
+  let reads = 0
+  const delays = []
+  await assert.rejects(waitForCargoArchive('bamboo-skills', '2026.11.30', async () => {
+    reads++
+    return null
+  }, async (seconds) => { delays.push(seconds) }), /Timed out waiting for Cargo download: bamboo-skills@2026\.11\.30/)
+  assert.equal(reads, 60)
+  assert.deepEqual(delays, Array(59).fill(10))
+})
+
 // Public original payload; authentication below always uses the inert test key.
 const original2371 = {
   "schemaVersion": 1,

@@ -255,6 +255,37 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
 }
 
 #[tokio::test]
+async fn finite_host_permit_cannot_create_an_ultra_root() {
+    let f = Fixture::new().await;
+    let (source, ancestors) = caller(&f, "root").await;
+    let original = SessionCallerReference::from(&source);
+    let mut request = request(&f);
+    request.thinking_mode = Some(bamboo_domain::RootThinkingMode::Ultra);
+    let token = install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+    let mock = Arc::new(FirstInputMock::default());
+    let port = f.creator.with_host_first_input(mock.clone());
+    let original_record = reserved_record(&f, &original, &token, &request).await;
+
+    let result = port.create(&original, request).await;
+    assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    assert!(f
+        .creator
+        .operations
+        .load_for_status(&original_record.key_digest)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f
+        .creator
+        .store
+        .load_session(&original_record.session_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn absent_create_input_port_blocks_ordinary_host_before_reservation() {
     let f = Fixture::new().await;
     let (source, ancestors) = caller(&f, "root").await;

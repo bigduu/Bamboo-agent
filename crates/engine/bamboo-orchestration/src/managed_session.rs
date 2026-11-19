@@ -50,6 +50,8 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
     "When a new assignment requires a specific Project, use session_control create with its verified Project and bound workspace. ",
+    "Honor an explicit request to start the execution Session in Ultra by setting thinking_mode to ultra on creation. ",
+    "An Ultra execution Session is an Ordinary Root that can delegate shell work to SubAgents. Standard is the default for a new assignment. ",
     "On a new user request, dispatch and report only the requested assignments. ",
     "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
     "Conversation history alone does not reactivate old work. ",

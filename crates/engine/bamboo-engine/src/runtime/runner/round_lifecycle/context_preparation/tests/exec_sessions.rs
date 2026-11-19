@@ -234,7 +234,7 @@ async fn dispatch_and_pull_from_context(
     assert!(requests.lock().unwrap().is_empty());
     // Exactly fit the projected input plus output reservation. The dynamic
     // snapshot must participate in both projection and the final dispatch gate.
-    let (output, _, _, _completion) = execute_llm_stream(
+    let (output, _, _, _completion, _) = execute_llm_stream(
         session,
         config,
         &llm,

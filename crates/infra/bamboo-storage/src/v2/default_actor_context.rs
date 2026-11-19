@@ -36,6 +36,7 @@ pub(crate) struct DefaultWriterPhysicalGuards {
 }
 
 enum RetainedWriterAuthority {
+    SupervisorExecutionProfile,
     SupervisedCreation {
         _guard: Arc<super::supervisor_management::SupervisorManagementGuards>,
     },
@@ -86,6 +87,28 @@ impl DefaultWriterGuards {
             task,
             session,
             root_actor,
+            None,
+        )
+    }
+
+    pub(super) fn supervisor_execution_profile(
+        lifecycle: SessionLifecycleReadGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        session: SessionWriteGuard,
+    ) -> Arc<Self> {
+        Self::with_shared_task(
+            LifecycleGuard::Shared { _guard: lifecycle },
+            task,
+            session,
+            None,
+            Some(RetainedWriterAuthority::SupervisorExecutionProfile),
+        )
+    }
+
+    pub(super) fn writes_supervisor_execution_profile(&self) -> bool {
+        matches!(
+            self.physical.authority.as_ref(),
+            Some(RetainedWriterAuthority::SupervisorExecutionProfile)
         )
     }
 
@@ -99,6 +122,7 @@ impl DefaultWriterGuards {
             task,
             session,
             None,
+            None,
         )
     }
 
@@ -107,6 +131,7 @@ impl DefaultWriterGuards {
         task: RuntimeTaskTransactionReadGuard,
         session: SessionWriteGuard,
         root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+        authority: Option<RetainedWriterAuthority>,
     ) -> Arc<Self> {
         Arc::new(Self {
             root_mode_context: None,
@@ -126,7 +151,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
-                authority: None,
+                authority,
                 _task: Some(TaskGuard::Shared { _guard: task }),
                 _lifecycle: Some(lifecycle),
             }),

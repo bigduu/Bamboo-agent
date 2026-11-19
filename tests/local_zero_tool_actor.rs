@@ -6,7 +6,7 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorActivationStatus, ActorDirectoryPort, ActorSnapshotLimits, ActorSnapshotPort,
-    ActorSnapshotPrincipal,
+    ActorSnapshotPrincipal, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
 };
 use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
@@ -24,6 +24,7 @@ use std::{
 // Keep this binary's other listeners out of that handoff; only startup is
 // serialized, while the actual Actor/provider scenarios still run together.
 static FIXTURE_LISTENER_ADMISSION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const GLOB_DISCOVERY_ID: &str = "owned-discover-glob";
 
 struct Probe {
     root_calls: AtomicUsize,
@@ -587,8 +588,19 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         } else if (probe.correction || probe.recovery) && child_call == 0 {
             (json!({"content":"INITIAL_BEFORE_CORRECTION"}), "stop")
         } else if probe.glob && child_call == 0 {
-            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            (
+                json!({"tool_calls":[{"index":0,"id":GLOB_DISCOVERY_ID,"type":"function","function":{
+                    "name":DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,"arguments":r#"{"query":"Glob","limit":1}"#
+                }}]}),
+                "tool_calls",
+            )
+        } else if probe.glob && child_call == 1 {
+            assert_eq!(body["tools"].as_array().unwrap().len(), 2);
             assert_eq!(body["tools"][0]["function"]["name"], "Glob");
+            assert_eq!(
+                body["tools"][1]["function"]["name"],
+                DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+            );
             (
                 json!({"tool_calls":[{"index":0,"id":"owned-glob-once","type":"function","function":{"name":"Glob","arguments":json!({"pattern":"owned-marker.txt","limit":1}).to_string()}}]}),
                 "tool_calls",
@@ -1459,9 +1471,10 @@ async fn fixture_with_followups(
         .unwrap();
     assert!(
         (glob
-            && child_wire["tools"]
-                .as_array()
-                .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Glob"))
+            && child_wire["tools"].as_array().is_some_and(|tools| {
+                tools.len() == 1
+                    && tools[0]["function"]["name"] == DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+            }))
             || (!glob
                 && (child_wire["tools"].is_null()
                     || child_wire["tools"].as_array().is_some_and(Vec::is_empty)))
@@ -1710,7 +1723,9 @@ async fn fixture_with_followups(
         return;
     }
     let child_calls = probe.child_calls.load(Ordering::SeqCst);
-    let expected_calls = if correction || retry || recovery || (glob && !reasoning) {
+    let expected_calls = if glob && !reasoning {
+        3
+    } else if correction || retry || recovery {
         2
     } else {
         1
@@ -1824,6 +1839,14 @@ async fn fixture_with_followups(
         serde_json::to_value(&completed.messages).unwrap()
     );
     if glob && !reasoning {
+        assert!(!cold.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some(GLOB_DISCOVERY_ID)
+                || message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .any(|call| call.id == GLOB_DISCOVERY_ID)
+        }));
         let tail = &cold.messages[cold.messages.len() - 3..];
         assert_eq!(tail[0].role, bamboo_domain::Role::Assistant);
         let calls = tail[0].tool_calls.as_ref().unwrap();

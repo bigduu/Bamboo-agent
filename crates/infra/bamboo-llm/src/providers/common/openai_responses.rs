@@ -620,6 +620,84 @@ pub fn retain_provider_transcript_family(
     });
 }
 
+/// A resumed search may reference functions removed from the current agent
+/// catalog. Keep the protocol's call/output pairing while excluding those
+/// definitions from replay, including a request constrained to named tools.
+pub(crate) fn scope_agent_tool_search_history(
+    body: &mut Value,
+    eligible_tools: &[ToolSchema],
+    mode: CapabilityLoadingMode,
+) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let allowed = eligible_tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<HashSet<_>>();
+    input.retain_mut(|item| match item["type"].as_str() {
+        Some("tool_search_call") => mode == CapabilityLoadingMode::Progressive,
+        Some("tool_search_output" | "additional_tools") => {
+            if mode != CapabilityLoadingMode::Progressive {
+                return false;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                tools.retain(|tool| {
+                    tool["type"] == "function"
+                        && tool["name"]
+                            .as_str()
+                            .is_some_and(|name| allowed.contains(name))
+                });
+            }
+            item["type"] != "additional_tools"
+                || item["tools"]
+                    .as_array()
+                    .is_some_and(|tools| !tools.is_empty())
+        }
+        _ => true,
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn replay_preserves_native_pairs_and_filters_search_results_by_exact_identity() {
+    let mut body = json!({"input":[
+        {"type":"tool_search_call","call_id":"search","execution":"server"},
+        {"type":"tool_search_output","call_id":"search","execution":"server","tools":[
+            {"type":"function","name":"Glob"},
+            {"type":"function","name":"browser"},
+            {"type":"function","name":"vendor::Glob"}
+        ]},
+        {"type":"additional_tools","tools":[{"type":"function","name":"browser"}]},
+        {"type":"message","role":"assistant"}
+    ]});
+    let eligible = vec![ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_domain::FunctionSchema {
+            name: "Glob".into(),
+            description: "Find paths".into(),
+            parameters: json!({"type":"object"}),
+        },
+    }];
+    scope_agent_tool_search_history(&mut body, &eligible, CapabilityLoadingMode::Progressive);
+    let retained = body["input"].as_array().unwrap();
+    assert_eq!(retained.len(), 3);
+    assert_eq!(retained[0]["call_id"], retained[1]["call_id"]);
+    assert_eq!(
+        retained[1]["tools"],
+        json!([{"type":"function","name":"Glob"}])
+    );
+    scope_agent_tool_search_history(
+        &mut body,
+        &eligible,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert_eq!(
+        body["input"],
+        json!([{"type":"message","role":"assistant"}])
+    );
+}
+
 /// Build a standard Responses API streaming request body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_responses_body(
