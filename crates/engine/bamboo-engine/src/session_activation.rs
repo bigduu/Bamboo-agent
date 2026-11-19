@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use async_trait::async_trait;
 use bamboo_domain::{
     SessionActivationDisposition, SessionActivationError, SessionActivationPort, SessionInboxPort,
-    SessionInboxWakeCandidate,
+    SessionInboxWakeCandidate, SessionRuntimeStartup,
 };
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
@@ -197,6 +197,15 @@ pub trait SessionActivationSpawner: Send + Sync {
         target_session_id: &str,
         inbox_generation: u64,
     ) -> Result<SessionActivationReserveOutcome, SessionActivationError>;
+    async fn reserve_runtime_activation(
+        &self,
+        _target_session_id: &str,
+        _startup: SessionRuntimeStartup,
+    ) -> Result<SessionActivationReserveOutcome, SessionActivationError> {
+        Err(SessionActivationError::Internal(
+            "exact Runtime Inbox reservation unsupported".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +255,7 @@ impl bamboo_domain::SessionRunDeliveryGuard for SupervisorLoopDeliveryGuard {
 #[derive(Debug)]
 struct TargetActivationState {
     latest_generation: u64,
+    runtime_startup: Option<SessionRuntimeStartup>,
     /// Delivery notification only. Never participates in successor scheduling.
     latest_delivery_generation: u64,
     /// Highest generation for which this process already launched an execution.
@@ -282,6 +292,7 @@ impl Default for TargetActivationState {
         let (notify, _receiver) = watch::channel(0);
         Self {
             latest_generation: 0,
+            runtime_startup: None,
             latest_delivery_generation: 0,
             last_dispatched_generation: 0,
             last_dispatched_coordinator_generation: 0,
@@ -1160,6 +1171,7 @@ impl SessionActivationRouter {
                     token,
                     false,
                     Some((candidate, now)),
+                    None,
                 )
                 .await?;
             return Ok(SessionWakeReconcileResult {
@@ -1753,6 +1765,13 @@ impl SessionActivationRouter {
             if state.owner.take().is_some() {
                 state.owner_completion_epoch = state.owner_completion_epoch.wrapping_add(1);
             }
+            if state
+                .runtime_startup
+                .as_ref()
+                .is_some_and(|startup| startup.receipt.generation <= admitted_generation)
+            {
+                state.runtime_startup = None;
+            }
             let pending = durable_pending
                 .as_ref()
                 .is_some_and(|backlog| backlog.activation_pending());
@@ -1861,7 +1880,14 @@ impl SessionActivationRouter {
 
         if let Some((generation, token)) = reservation_to_dispatch {
             if let Err(error) = self
-                .dispatch_reserved_with_recovery(target_session_id, generation, token, false, None)
+                .dispatch_reserved_with_recovery(
+                    target_session_id,
+                    generation,
+                    token,
+                    false,
+                    None,
+                    None,
+                )
                 .await
             {
                 tracing::error!(
@@ -1885,6 +1911,7 @@ impl SessionActivationRouter {
             reservation_token,
             true,
             None,
+            None,
         )
         .await
     }
@@ -1896,6 +1923,7 @@ impl SessionActivationRouter {
         reservation_token: u64,
         recover_on_drop: bool,
         recovery: Option<(SessionInboxWakeCandidate, DateTime<Utc>)>,
+        runtime_startup: Option<SessionRuntimeStartup>,
     ) -> Result<SessionActivationDisposition, SessionActivationError> {
         let mut lease = ActivationReservationLease::new(
             self.clone(),
@@ -1918,9 +1946,50 @@ impl SessionActivationRouter {
         // release arriving later remains fresh work for finalization.
         let coordinator_generation = self.coordinator_generation(target_session_id).await?;
 
-        let outcome = spawner
-            .reserve_activation(target_session_id, generation)
-            .await;
+        let coalesced_startup = self
+            .states
+            .lock()
+            .await
+            .get_mut(target_session_id)
+            .and_then(|state| {
+                state
+                    .runtime_startup
+                    .take_if(|item| item.receipt.generation == generation)
+            });
+        let runtime_startup = runtime_startup.or(coalesced_startup);
+        let runtime_startup = match (runtime_startup, recovery.as_ref()) {
+            (Some(startup), _) => Some(startup),
+            (None, Some((candidate, _))) => candidate.runtime_startup(),
+            (None, None) => {
+                // A terminal owner may have observed a prepared delivery
+                // before its producer signaled us. Inspect this generation
+                // before falling back to the ordinary aggregate startup.
+                let inbox = self
+                    .inbox
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                match inbox.filter(|inbox| inbox.supports_runtime_target_lifetime()) {
+                    Some(inbox) => inbox
+                        .inspect_runtime_startup(target_session_id, generation)
+                        .await
+                        .map_err(inbox_activation_error)?,
+                    None => None,
+                }
+            }
+        };
+        let outcome = match runtime_startup {
+            Some(startup) => {
+                spawner
+                    .reserve_runtime_activation(target_session_id, startup)
+                    .await
+            }
+            None => {
+                spawner
+                    .reserve_activation(target_session_id, generation)
+                    .await
+            }
+        };
         if let Ok(SessionActivationReserveOutcome::Reserved(launch)) = &outcome {
             lease.wait_for_rollback(launch.rollback_completion());
         }
@@ -2256,6 +2325,27 @@ impl SessionActivationPort for SessionActivationRouter {
         target_session_id: &str,
         inbox_generation: u64,
     ) -> Result<SessionActivationDisposition, SessionActivationError> {
+        self.request_inbox_activation(target_session_id, inbox_generation, None)
+            .await
+    }
+
+    async fn request_runtime_startup(
+        &self,
+        target_session_id: &str,
+        startup: SessionRuntimeStartup,
+    ) -> Result<SessionActivationDisposition, SessionActivationError> {
+        self.request_inbox_activation(target_session_id, startup.receipt.generation, Some(startup))
+            .await
+    }
+}
+
+impl SessionActivationRouter {
+    async fn request_inbox_activation(
+        &self,
+        target_session_id: &str,
+        inbox_generation: u64,
+        runtime_startup: Option<SessionRuntimeStartup>,
+    ) -> Result<SessionActivationDisposition, SessionActivationError> {
         let previous_prefix = {
             let states = self.states.lock().await;
             states
@@ -2276,6 +2366,12 @@ impl SessionActivationPort for SessionActivationRouter {
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(inbox_generation);
                 if let Some(owner) = state.owner.as_mut() {
+                    if let Some(startup) = runtime_startup
+                        .as_ref()
+                        .filter(|startup| startup.receipt.generation == state.latest_generation)
+                    {
+                        state.runtime_startup = Some(startup.clone());
+                    }
                     if !owner.finalizing {
                         state.notify.send_replace(inbox_generation);
                         if owner
@@ -2331,6 +2427,7 @@ impl SessionActivationPort for SessionActivationRouter {
                     reservation_token,
                     false,
                     None,
+                    runtime_startup,
                 )
                 .await;
         }

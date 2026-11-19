@@ -332,7 +332,8 @@ struct RetainedResourceBudget {
     state: Mutex<RetainedResourceBudgetState>,
     sources: Arc<SourcePool>,
     selected: Arc<crate::progressive::read::SelectedBudget>,
-    scoped_admission: tokio::sync::Mutex<()>,
+    // Cold admission may add cached stores. Hot reloads can only reclaim them.
+    scoped_admission: RwLock<()>,
     publication_revision: AtomicU64,
     instruction_revisions: Mutex<HashMap<[u8; 32], Weak<u64>>>,
 }
@@ -3561,7 +3562,7 @@ impl SkillStore {
         if let Some(store) = self.scoped_stores.read().await.modes.get(&mode).cloned() {
             return Ok(Some(store));
         }
-        let _admission = self.retained_budget.scoped_admission.lock().await;
+        let _admission = self.retained_budget.scoped_admission.write().await;
         {
             let mut scoped = self.scoped_stores.write().await;
             let stores = &mut scoped.modes;
@@ -3673,7 +3674,7 @@ impl SkillStore {
             return Ok(store);
         }
         let workspace = tokio::fs::canonicalize(workspace).await?;
-        let _admission = self.retained_budget.scoped_admission.lock().await;
+        let _admission = self.retained_budget.scoped_admission.write().await;
         {
             let mut scoped = self.scoped_stores.write().await;
             let stores = &mut scoped.workspaces;
@@ -3752,7 +3753,7 @@ impl SkillStore {
             return Ok(store);
         }
 
-        let _admission = self.retained_budget.scoped_admission.lock().await;
+        let _admission = self.retained_budget.scoped_admission.write().await;
         {
             let mut scoped = self.scoped_stores.write().await;
             let stores = &mut scoped.projects;
@@ -4232,6 +4233,7 @@ impl SkillStore {
     /// ```
     pub async fn reload(&self) -> SkillResult<usize> {
         info!("Reloading skills from disk...");
+        let _admission = self.retained_budget.scoped_admission.read().await;
         let _reload_guard = self.reload_lock.lock().await;
         let workflows_dir = self
             .config
@@ -4247,7 +4249,7 @@ impl SkillStore {
                 tracing::warn!("Legacy YAML migration: {}", diagnostic.message);
             }
         }
-        self.load_locked(None).await
+        self.load_locked(Some(self)).await
     }
 
     /// Remove a legacy workflow source and, when present, only the historical
@@ -7776,6 +7778,109 @@ Use this skill for testing.
         assert_eq!(old.source, current.source);
         assert_ne!(old.content_digest, current.content_digest);
         assert!(current.revision > old.revision);
+    }
+
+    #[tokio::test]
+    async fn hot_reload_reclaims_idle_shared_budget_without_retiring_held_or_pinned_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let skills_dir = directory.path().join("global-skills");
+        let workspace_root = write_skill(
+            &workspace.join(".bamboo/skills"),
+            "pressure-skill",
+            "Pressure Skill",
+            "Instructions",
+        )
+        .await
+        .unwrap();
+        fs::write(workspace_root.join("data.bin"), vec![b'x'; 128])
+            .await
+            .unwrap();
+        let mut store = SkillStore::new(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            ..Default::default()
+        });
+        store.reload().await.unwrap();
+        let original = store.skill_catalog_snapshot().await;
+        let workspace_store = store.new_scoped_store(
+            SkillStoreConfig {
+                skills_dir: skills_dir.clone(),
+                project_dir: Some(workspace.clone()),
+                active_mode: None,
+            },
+            None,
+            Some(workspace.clone()),
+        );
+        // Populate the real cache under the admission guard without starting a
+        // filesystem watcher that could reload between the assertions.
+        {
+            let _admission = store.retained_budget.scoped_admission.write().await;
+            store.load_scoped_store(&workspace_store).await.unwrap();
+            store
+                .scoped_stores
+                .write()
+                .await
+                .workspaces
+                .insert(workspace, workspace_store.clone());
+        }
+        let workspace_bytes = store.retained_budget.retained_bytes();
+        let cached = Arc::downgrade(&workspace_store);
+        let global_root = write_skill(
+            &skills_dir,
+            "pressure-skill",
+            "Pressure Skill",
+            "Instructions",
+        )
+        .await
+        .unwrap();
+        let resource = global_root.join("data.bin");
+        fs::write(&resource, vec![b'y'; 128]).await.unwrap();
+
+        store.snapshot_limits.max_retained_bytes = workspace_bytes + 32;
+        assert!(store.reload().await.is_err());
+        assert_eq!(store.skill_catalog_snapshot().await, original);
+
+        let pin = workspace_store
+            .pin_current_activation("hot-reload-pin", &["pressure-skill".into()], None)
+            .await
+            .unwrap();
+        store.snapshot_limits.max_retained_bytes = store.retained_budget.retained_bytes();
+        drop(workspace_store);
+        assert!(store.reload().await.is_err());
+        assert_eq!(
+            cached
+                .upgrade()
+                .unwrap()
+                .activation_descriptor("hot-reload-pin")
+                .await,
+            Some(pin)
+        );
+        assert_eq!(store.skill_catalog_snapshot().await, original);
+
+        store
+            .release_activation_across_cached_scopes("hot-reload-pin")
+            .await;
+        store.snapshot_limits.max_retained_bytes = workspace_bytes + 32;
+        fs::write(&resource, vec![b'y'; workspace_bytes + 32])
+            .await
+            .unwrap();
+        assert!(store.reload().await.is_err());
+        assert!(cached.upgrade().is_some());
+        assert_eq!(store.skill_catalog_snapshot().await, original);
+
+        fs::write(&resource, vec![b'y'; 128]).await.unwrap();
+        store
+            .reload()
+            .await
+            .expect("hot reload can reclaim the now-idle workspace publication");
+        assert!(cached.upgrade().is_none());
+        let published = store.skill_catalog_snapshot().await;
+        assert_eq!(published.entries.len(), 1);
+        assert!(published.revision > original.revision);
+        assert!(store.retained_budget.retained_bytes() <= store.snapshot_limits.max_retained_bytes);
+
+        store.reload().await.unwrap();
+        assert_eq!(store.skill_catalog_snapshot().await, published);
     }
 
     #[tokio::test]
