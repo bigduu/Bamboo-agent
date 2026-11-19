@@ -312,7 +312,8 @@ const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 2;
 /// must remove every target projection before exposing the store.
 const SESSION_COPY_TRANSACTION_DIR: &str = ".session-copy-transactions";
 const SESSION_COPY_TRANSACTION_VERSION: u32 = 1;
-const SESSIONS_INDEX_VERSION: u32 = 4;
+// The rebuild reprojects wait presence for sessions saved before it was indexed.
+const SESSIONS_INDEX_VERSION: u32 = 5;
 
 /// Filename of the append-only per-LLM-call token-usage log, stored alongside
 /// `session.json` in each session directory. One JSON line per call.
@@ -1142,6 +1143,19 @@ pub struct SessionIndexEntry {
     /// Absent on older index rows or Sessions with no pending question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_material_run: Option<bool>,
+    /// Whether this session has yielded to a delegated child, mirrored from
+    /// `session.agent_runtime_state.waiting_for_children`. A yielding Root stops
+    /// counting as a running runner, so without this mirror a list read cannot
+    /// tell "delegating" apart from "idle" — the two windows are the delegation
+    /// wait itself and the gap between the last child finishing and this Root
+    /// resuming. Only presence is mirrored; the awaited ids stay in session.json.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_children: bool,
+    /// Whether this session has yielded to a background shell, mirrored from
+    /// `session.agent_runtime_state.waiting_for_bash`. The shell's result resumes
+    /// the run, so the wait is live work even though no runner is executing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_bash: bool,
     /// Latest canonical Human UI engagement mark, mirrored from
     /// `session.agent_runtime_state.last_human_input`. Absent means no human
     /// input was admitted through the interactive route since creation. This is
@@ -6032,6 +6046,7 @@ impl SessionStoreV2 {
                     .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
             })
         });
+        let (waiting_for_children, waiting_for_bash) = session.persisted_wait_presence();
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -6060,6 +6075,8 @@ impl SessionStoreV2 {
             has_attachments,
             has_pending_question,
             pending_material_run,
+            waiting_for_children,
+            waiting_for_bash,
             last_human_input,
             plan_mode,
             bypass_permissions,
@@ -7669,18 +7686,25 @@ impl SessionStoreV2 {
             .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
-        // Workspace and Project ownership are part of the list/index API
-        // contract. Runtime updates must therefore be reflected without waiting
-        // for a later full session save. Avoid rewriting the global index when
-        // neither normalized value changed.
+        // Reflect runtime-only changes to fields exposed by the list API.
         let workspace_path = session
             .workspace_path_meta()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
-            entry.workspace_path != workspace_path || entry.project_id != project_id
-        });
+        let waits = runtime_snapshot.persisted_wait_presence();
+        // A different store may have registered a wait after this store
+        // cached its index. Compare the previous durable sidecar too, so a
+        // clear still updates the shared row when our cached row says no wait.
+        let waits_changed = previous
+            .as_ref()
+            .is_none_or(|saved| saved.persisted_wait_presence() != waits);
+        let runtime_index_changed = waits_changed
+            || self.get_index_entry(&session.id).await.is_none_or(|entry| {
+                entry.workspace_path != workspace_path
+                    || entry.project_id != project_id
+                    || (entry.waiting_for_children, entry.waiting_for_bash) != waits
+            });
         if runtime_index_changed {
             let index_started = Instant::now();
             let index_updated = self
@@ -7688,6 +7712,7 @@ impl SessionStoreV2 {
                     if let Some(entry) = index.sessions.get_mut(&session.id) {
                         entry.workspace_path = workspace_path;
                         entry.project_id = project_id;
+                        (entry.waiting_for_children, entry.waiting_for_bash) = waits;
                         return Ok(true);
                     }
                     Ok(false)
@@ -11488,6 +11513,67 @@ mod tests {
         let persisted: SessionsIndex = serde_json::from_slice(&tokio::fs::read(index_path).await?)
             .map_err(|error| other_io_error(error.to_string()))?;
         assert_eq!(persisted.version, SESSIONS_INDEX_VERSION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v4_index_rebuilds_session_activity_waits_from_runtime_sidecars() -> io::Result<()> {
+        use bamboo_domain::{
+            AgentRuntimeState, ChildWaitPolicy, WaitingForBashState, WaitingForChildrenState,
+        };
+
+        let home = TempDir::new()?;
+        let path = home.path().to_path_buf();
+        let now = Utc::now();
+        {
+            let storage = SessionStoreV2::new(path.clone()).await?;
+            let mut shell = Session::new("shell-wait", "m");
+            storage.save_session(&shell).await?;
+            let mut shell_runtime = AgentRuntimeState::new("shell-run");
+            shell_runtime.waiting_for_bash =
+                Some(WaitingForBashState::for_bash(vec!["shell".into()], now));
+            shell.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(&shell_runtime)?,
+            );
+            storage.save_runtime_state(&shell).await?;
+            assert!(
+                storage
+                    .get_index_entry("shell-wait")
+                    .await
+                    .unwrap()
+                    .waiting_for_bash
+            );
+
+            let mut parent = Session::new("child-wait", "m");
+            let mut parent_runtime = AgentRuntimeState::new("child-run");
+            parent_runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                vec!["child".into()],
+                ChildWaitPolicy::All,
+                now,
+            ));
+            parent.agent_runtime_state = Some(parent_runtime);
+            storage.save_session(&parent).await?;
+        }
+
+        let index_path = path.join("sessions.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index_path).await?)?;
+        index["version"] = serde_json::json!(4);
+        for entry in index["sessions"].as_object_mut().unwrap().values_mut() {
+            let fields = entry.as_object_mut().unwrap();
+            fields.remove("waiting_for_children");
+            fields.remove("waiting_for_bash");
+        }
+        tokio::fs::write(&index_path, serde_json::to_vec(&index)?).await?;
+
+        let storage = SessionStoreV2::new(path).await?;
+        let shell = storage.get_index_entry("shell-wait").await.unwrap();
+        let parent = storage.get_index_entry("child-wait").await.unwrap();
+        assert!(shell.waiting_for_bash);
+        assert!(!shell.waiting_for_children);
+        assert!(parent.waiting_for_children);
+        assert!(!parent.waiting_for_bash);
         Ok(())
     }
 

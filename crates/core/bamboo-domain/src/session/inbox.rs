@@ -1799,6 +1799,19 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Inspect the authorized Runtime input at one exact generation, without
+    /// selecting the queue's next wake candidate or proving claimability.
+    /// A competing input or a live lease must not change the startup mode.
+    async fn inspect_runtime_startup(
+        &self,
+        _target_session_id: &str,
+        _generation: u64,
+    ) -> Result<Option<SessionRuntimeStartup>, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "exact Runtime Inbox startup inspection unsupported".into(),
+        ))
+    }
+
     /// Only an exact, live owner may report a processing failure. An explicit
     /// report is distinct from expiry/reclaim and can schedule bounded retry.
     async fn fail_owned(

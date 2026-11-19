@@ -2144,6 +2144,104 @@ impl FileSessionInbox {
         Ok(result)
     }
 
+    fn wake_envelope(
+        wrapper: &InboxMessage,
+        target: &str,
+    ) -> Result<SessionMessageEnvelope, SessionInboxError> {
+        let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        envelope
+            .validate()
+            .map_err(|_| invalid("invalid Inbox envelope"))?;
+        if envelope.target_session_id != target {
+            return Err(invalid("Inbox target mismatch"));
+        }
+        Ok(envelope)
+    }
+
+    /// The caller retains Inbox and lifecycle authority. This is only a
+    /// nomination: admission still checks the exact receipt against the Actor.
+    async fn runtime_startup_target_birth(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        generation: u64,
+        original_intent: Option<&SessionInboxActivationIntent>,
+        coordinator_policy: Option<SessionActivationPolicy>,
+    ) -> Result<Option<DateTime<Utc>>, SessionInboxError> {
+        if original_intent.is_some()
+            || coordinator_policy != Some(SessionActivationPolicy::RespectSpecificWait)
+        {
+            return Ok(None);
+        }
+        let birth = if envelope.is_child_wait_expiry_notice() {
+            self.sessions
+                .child_wait_expiry_birth_under_lifecycle(envelope, generation)
+                .await
+        } else if envelope.background_exec_completion_handle().is_some() {
+            self.sessions
+                .actor_inbox_target_birth_under_lifecycle(&envelope.target_session_id)
+                .await
+        } else {
+            return Ok(None);
+        };
+        birth.map_err(|error| SessionInboxError::Storage(error.to_string()))
+    }
+
+    pub(super) async fn inspect_runtime_startup_impl(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> Result<Option<bamboo_domain::SessionRuntimeStartup>, SessionInboxError> {
+        if generation == 0 {
+            return Ok(None);
+        }
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let mut entries = Self::owned_queue_entries(&dir, "cur", &filesystem).await?;
+        entries.extend(Self::owned_queue_entries(&dir, "new", &filesystem).await?);
+        let mut matches = entries
+            .into_iter()
+            .filter(|(found, _, _)| *found == generation);
+        let Some((_, _, path)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(invalid("ambiguous Inbox startup generation"));
+        }
+        let (wrapper, _) = self.read_owned_transport(&path).await?;
+        let envelope = Self::wake_envelope(&wrapper, target)?;
+        let original_intent = Self::activation_intent(&wrapper.body)?;
+        let coordinator_policy =
+            Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                .map(|intent| intent.policy())
+                .transpose()?;
+        // Identity is independent of which candidate is ready, lease expiry,
+        // and whether a permanent ACK still needs to remove its transport.
+        let target_created_at = self
+            .runtime_startup_target_birth(
+                &envelope,
+                generation,
+                original_intent.as_ref(),
+                coordinator_policy,
+            )
+            .await?;
+        if target_created_at.is_none() && envelope.is_child_wait_expiry_notice() {
+            // This generation belongs to the expiry protocol even if its
+            // durable disposition is missing or a newer wait superseded it.
+            return Err(invalid(
+                "child wait expiry startup lacks a current disposition",
+            ));
+        }
+        Ok(
+            target_created_at.map(|target_created_at| bamboo_domain::SessionRuntimeStartup {
+                receipt: SessionInboxReceipt {
+                    id: envelope.id,
+                    generation,
+                },
+                target_created_at,
+            }),
+        )
+    }
+
     /// Read the first item that a fresh consumer could claim now, or the
     /// earliest eligible lease transition. This holds the same lifecycle,
     /// process and cross-process Inbox locks as `claim_owned_impl` throughout
@@ -2179,14 +2277,7 @@ impl FileSessionInbox {
             if !Self::wake_eligible(generation, prefix, activation.clone()) {
                 continue;
             }
-            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            envelope
-                .validate()
-                .map_err(|_| invalid("invalid Inbox envelope"))?;
-            if envelope.target_session_id != target {
-                return Err(invalid("Inbox target mismatch"));
-            }
+            let envelope = Self::wake_envelope(&wrapper, target)?;
             if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
                 if receipt.delivery.generation != generation
                     || receipt.intent != intent
@@ -2227,34 +2318,21 @@ impl FileSessionInbox {
                 Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
                     .map(|intent| intent.policy())
                     .transpose()?;
-            let requires_runtime_startup = intent.is_none()
-                && coordinator_message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
-                && policy == SessionActivationPolicy::RespectSpecificWait
-                && envelope.is_exact_runtime_startup();
-            let runtime_startup_target_birth = if envelope.is_child_wait_expiry_notice() {
-                if !requires_runtime_startup {
-                    continue;
-                }
-                let Some(birth) = self
-                    .sessions
-                    .child_wait_expiry_birth_under_lifecycle(&envelope, generation)
-                    .await
-                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?
-                else {
-                    continue;
+            let runtime_startup_target_birth =
+                if policy == SessionActivationPolicy::RespectSpecificWait {
+                    self.runtime_startup_target_birth(
+                        &envelope,
+                        generation,
+                        intent.as_ref(),
+                        coordinator_message_policy,
+                    )
+                    .await?
+                } else {
+                    None
                 };
-                Some(birth)
-            } else if requires_runtime_startup {
-                // This is only a nomination. The retained lifecycle scope
-                // prevents a recreated Session from supplying this birth, and
-                // the consumer must still claim under its exact Actor writer.
-                self.sessions
-                    .actor_inbox_target_birth_under_lifecycle(target)
-                    .await
-                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?
-            } else {
-                None
-            };
+            if runtime_startup_target_birth.is_none() && envelope.is_child_wait_expiry_notice() {
+                continue;
+            }
             let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,

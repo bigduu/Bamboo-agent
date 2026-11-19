@@ -630,6 +630,111 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
 }
 
 #[tokio::test]
+async fn coalesced_background_startup_never_substitutes_an_earlier_ready_input() {
+    use bamboo_domain::{
+        ActorActivationFinish, SessionActivationDisposition, SessionInboxConsumerId,
+        SessionInboxLeaseRequest,
+    };
+
+    let (_temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    let router = coordinator.agent.activation_router().unwrap();
+    let mut root = Session::new("coalesced-background-selection", "model");
+    root.add_message(Message::user("prior transcript"));
+    store.save_session(&root).await.unwrap();
+
+    let prior_run = "prior-owner-before-producer-notification";
+    let mut actor = coordinator
+        .agent
+        .persistence()
+        .bind_root_actor_execution(&root, prior_run)
+        .await
+        .unwrap()
+        .unwrap();
+    actor
+        .directory
+        .finish_activation(
+            &actor.owner.fence,
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    actor.disarm_abandonment();
+    let owner = router.register_session_run(&root, prior_run).await.unwrap();
+
+    let human = bamboo_domain::SessionMessageEnvelope::user_input(&root.id, "Earlier ready input");
+    inbox
+        .deliver_with_activation_intent(
+            &human,
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let runtime =
+        shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
+    let selected = inbox
+        .deliver_runtime_for_target(&runtime, root.created_at)
+        .await
+        .unwrap();
+    inbox
+        .mark_message_activation_eligible(
+            &root.id,
+            &selected,
+            SessionActivationPolicy::RespectSpecificWait,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let lease = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: chrono::Duration::seconds(60),
+    };
+    assert!(inbox
+        .claim_owned_receipt(&root.id, &selected, Some("other-consumer"), &lease)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        inbox.inspect(&root.id).await.unwrap().activation_generation,
+        selected.generation,
+    );
+    assert_eq!(
+        inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .unwrap()
+            .id,
+        human.id,
+    );
+
+    // Both permissions are durable, but neither producer signaled the Router.
+    // Terminal handoff must keep the highest generation bound to its own input.
+    assert_eq!(
+        owner.finish(0).await.unwrap(),
+        Some(SessionActivationDisposition::ActivationReserved)
+    );
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert!(!inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.messages.len(), 1);
+
+    // An independent reconcile still selects the ready Human input.
+    router.reconcile_wake(&root.id, Utc::now()).await.unwrap();
+    wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+    assert!(inbox.was_admitted(&root.id, &human.id).await.unwrap());
+    assert!(!inbox.was_admitted(&root.id, &runtime.id).await.unwrap());
+    let calls = provider.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].iter().any(|id| id == human.id.as_str()));
+}
+
+#[tokio::test]
 async fn background_exec_owned_actor_preserves_native_human_receipt_selection() {
     use bamboo_domain::{ActorActivationFinish, SessionRuntimeStartup};
     let (_temp, store, inbox, coordinator, _) = actor_exec_fixture().await;
@@ -713,6 +818,8 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
     let (temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
     for case in [
         "committed",
+        "promoted_stale",
+        "promoted_malformed",
         "changed_wait",
         "live_actor",
         "changed_attempt",
@@ -726,6 +833,8 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
         "human_gate",
         "managed_work",
     ] {
+        let promoted_case = matches!(case, "promoted_stale" | "promoted_malformed");
+        let should_commit = case == "committed" || promoted_case;
         let now = Utc::now();
         let mut root = Session::new(format!("expired-wait-{case}"), "model");
         root.add_message(Message::user("prior transcript"));
@@ -896,7 +1005,7 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
                 )
                 .await
                 .unwrap(),
-            case == "committed",
+            should_commit,
             "{case}",
         );
         assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
@@ -909,7 +1018,7 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
             .await
             .unwrap()
             .unwrap();
-        if case != "committed" {
+        if !should_commit {
             assert_eq!(
                 read_runtime_state(&control).waiting_for_children,
                 Some(recorded_wait)
@@ -939,6 +1048,89 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
             .unwrap()
             .ready
             .is_none());
+        if promoted_case {
+            let calls = provider.0.lock().unwrap().len();
+            inbox
+                .mark_message_activation_eligible(
+                    &root.id,
+                    &receipt,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                inbox
+                    .inspect_runtime_startup(&root.id, receipt.generation)
+                    .await
+                    .unwrap(),
+                Some(bamboo_domain::SessionRuntimeStartup {
+                    receipt: receipt.clone(),
+                    target_created_at: root.created_at,
+                }),
+                "{case}",
+            );
+
+            if case == "promoted_stale" {
+                let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+                let mut current = read_runtime_state(&latest);
+                current.run_id = "newer-suspended-run".into();
+                write_runtime_state(&mut latest, &current);
+                store.save_runtime_state(&latest).await.unwrap();
+                let latest = store
+                    .load_runtime_control_plane(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read_runtime_state(&latest).run_id, current.run_id);
+                assert!(read_runtime_state(&latest).waiting_for_children.is_none());
+            } else {
+                let mut rows = tokio::fs::read_dir(main.parent().unwrap().join("inbox/new"))
+                    .await
+                    .unwrap();
+                let path = rows.next_entry().await.unwrap().unwrap().path();
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                let mut row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                row["body"]["created_at"] = serde_json::json!(Utc::now());
+                tokio::fs::write(path, serde_json::to_vec(&row).unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(inbox
+                .inspect_wake_readiness(&root.id, now)
+                .await
+                .unwrap()
+                .ready
+                .is_none());
+            assert!(
+                matches!(
+                    inbox
+                        .inspect_runtime_startup(&root.id, receipt.generation)
+                        .await,
+                    Err(bamboo_domain::SessionInboxError::InvalidClaim(_)),
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                inbox.inspect(&root.id).await.unwrap().activation_generation,
+                receipt.generation,
+            );
+            let router = coordinator.agent.activation_router().unwrap();
+            let owner = router
+                .register_session_run(&root, "prior-logical-owner")
+                .await
+                .unwrap();
+            let result = owner.finish(0).await;
+            assert!(
+                matches!(result, Err(ref error) if error.to_string().contains("lacks a current disposition")),
+                "{case}: {result:?}"
+            );
+            wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+            assert_eq!(provider.0.lock().unwrap().len(), calls, "{case}");
+            assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+            assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+            continue;
+        }
+
         assert_eq!(provider.0.lock().unwrap().len(), 0);
 
         // A crash here would leave the exact receipt staged and the wait
