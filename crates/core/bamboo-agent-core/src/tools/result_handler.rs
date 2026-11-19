@@ -46,17 +46,21 @@ pub fn parse_tool_args(arguments: &str) -> std::result::Result<serde_json::Value
 }
 
 /// Project a tool-start event for observers without changing authoritative
-/// execution arguments. Browser uploads and downloads can carry private page
-/// data before permission and schema validation complete.
+/// execution arguments. Some tools carry private input before permission and
+/// schema validation complete.
 pub fn tool_start_arguments_for_display(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    let browser = tool_name
-        .trim()
-        .rsplit("::")
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case("browser"));
+    let name = tool_name.trim().rsplit("::").next().unwrap_or_default();
+    if name.eq_ignore_ascii_case("session_loop") {
+        let action = args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .filter(|action| matches!(*action, "start" | "stop" | "resume" | "status"));
+        return serde_json::json!({"action":action});
+    }
+    let browser = name.eq_ignore_ascii_case("browser");
     if browser
         && args
             .get("action")
@@ -814,6 +818,26 @@ mod tests {
         assert_eq!(args, original);
         assert_eq!(tool_start_arguments_for_display("other", &args), args);
         assert_eq!(tool_start_name_for_display("default::browser"), "browser");
+    }
+
+    #[test]
+    fn session_loop_start_event_only_displays_the_operation() {
+        let args = serde_json::json!({
+            "action":"start",
+            "prompt":"private task",
+            "user_excerpt":"private instruction",
+        });
+        assert_eq!(
+            tool_start_arguments_for_display("session_loop", &args),
+            serde_json::json!({"action":"start"})
+        );
+        assert_eq!(
+            tool_start_arguments_for_display(
+                "session_loop",
+                &serde_json::json!({"action": {"prompt":"private task"}})
+            ),
+            serde_json::json!({"action":null})
+        );
     }
 
     #[test]

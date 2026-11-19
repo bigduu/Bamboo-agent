@@ -329,6 +329,8 @@ pub struct AppState {
     /// Coordinates child completion notifications into parent resume.
     pub child_completion_coordinator: Arc<bamboo_engine::ChildCompletionCoordinator>,
 
+    paced_loops: Arc<paced_loop::PacedLoops>,
+
     /// Spawner for the guardian adversarial-review child, injected into each run
     /// so the terminal gate can create a read-only reviewer (the engine runner
     /// cannot construct a child directly — see [`bamboo_engine::GuardianSpawner`]).
@@ -616,6 +618,7 @@ pub mod parent_approval_reviewer;
 mod parent_permission_outcome;
 mod parent_permission_reconcile;
 pub(crate) use parent_permission_reconcile::pending_for_child as pending_permissions_for_child;
+pub(crate) mod paced_loop;
 mod parent_permission_request;
 mod parent_question_outcome;
 mod parent_question_reconcile;
