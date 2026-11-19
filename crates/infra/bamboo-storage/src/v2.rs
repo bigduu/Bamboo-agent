@@ -312,7 +312,8 @@ const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 2;
 /// must remove every target projection before exposing the store.
 const SESSION_COPY_TRANSACTION_DIR: &str = ".session-copy-transactions";
 const SESSION_COPY_TRANSACTION_VERSION: u32 = 1;
-const SESSIONS_INDEX_VERSION: u32 = 4;
+// The rebuild reprojects wait presence for sessions saved before it was indexed.
+const SESSIONS_INDEX_VERSION: u32 = 5;
 
 /// Filename of the append-only per-LLM-call token-usage log, stored alongside
 /// `session.json` in each session directory. One JSON line per call.
@@ -990,25 +991,6 @@ fn normalized_project_id(session: &Session) -> Option<String> {
             None
         }
     }
-}
-
-/// Whether the session has yielded to a delegated child.
-///
-/// Read through the same typed-or-legacy path as the rest of the runtime state
-/// so a row written before the typed sidecar existed still mirrors correctly.
-fn session_waiting_for_children(session: &Session) -> bool {
-    session
-        .agent_runtime_state
-        .as_ref()
-        .is_some_and(|state| state.waiting_for_children.is_some())
-}
-
-/// Whether the session has yielded to a background shell whose result resumes it.
-fn session_waiting_for_bash(session: &Session) -> bool {
-    session
-        .agent_runtime_state
-        .as_ref()
-        .is_some_and(|state| state.waiting_for_bash.is_some())
 }
 
 /// Exactly the Session-owned inputs to PublicActorSnapshotNode, plus the
@@ -6056,8 +6038,14 @@ impl SessionStoreV2 {
             has_attachments,
             has_pending_question,
             pending_material_run,
-            waiting_for_children: session_waiting_for_children(session),
-            waiting_for_bash: session_waiting_for_bash(session),
+            waiting_for_children: session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.waiting_for_children.is_some()),
+            waiting_for_bash: session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.waiting_for_bash.is_some()),
             last_human_input,
             plan_mode,
             bypass_permissions,
@@ -11463,6 +11451,56 @@ mod tests {
         let persisted: SessionsIndex = serde_json::from_slice(&tokio::fs::read(index_path).await?)
             .map_err(|error| other_io_error(error.to_string()))?;
         assert_eq!(persisted.version, SESSIONS_INDEX_VERSION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v4_index_rebuilds_session_activity_waits_from_runtime_sidecars() -> io::Result<()> {
+        use bamboo_domain::{
+            AgentRuntimeState, ChildWaitPolicy, WaitingForBashState, WaitingForChildrenState,
+        };
+
+        let home = TempDir::new()?;
+        let path = home.path().to_path_buf();
+        let now = Utc::now();
+        {
+            let storage = SessionStoreV2::new(path.clone()).await?;
+            let mut shell = Session::new("shell-wait", "m");
+            let mut shell_runtime = AgentRuntimeState::new("shell-run");
+            shell_runtime.waiting_for_bash =
+                Some(WaitingForBashState::for_bash(vec!["shell".into()], now));
+            shell.agent_runtime_state = Some(shell_runtime);
+            storage.save_session(&shell).await?;
+
+            let mut parent = Session::new("child-wait", "m");
+            let mut parent_runtime = AgentRuntimeState::new("child-run");
+            parent_runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                vec!["child".into()],
+                ChildWaitPolicy::All,
+                now,
+            ));
+            parent.agent_runtime_state = Some(parent_runtime);
+            storage.save_session(&parent).await?;
+        }
+
+        let index_path = path.join("sessions.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index_path).await?)?;
+        index["version"] = serde_json::json!(4);
+        for entry in index["sessions"].as_object_mut().unwrap().values_mut() {
+            let fields = entry.as_object_mut().unwrap();
+            fields.remove("waiting_for_children");
+            fields.remove("waiting_for_bash");
+        }
+        tokio::fs::write(&index_path, serde_json::to_vec(&index)?).await?;
+
+        let storage = SessionStoreV2::new(path).await?;
+        let shell = storage.get_index_entry("shell-wait").await.unwrap();
+        let parent = storage.get_index_entry("child-wait").await.unwrap();
+        assert!(shell.waiting_for_bash);
+        assert!(!shell.waiting_for_children);
+        assert!(parent.waiting_for_children);
+        assert!(!parent.waiting_for_bash);
         Ok(())
     }
 

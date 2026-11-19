@@ -381,10 +381,12 @@ impl SessionSummary {
         );
     }
 
-    /// Take the wait discriminants from the authoritative session instead of the
-    /// index mirror, then re-derive. Detail reads already load that session, so
-    /// they never have to trust the rebuildable index row.
+    /// Use the same durable Session for each persisted activity input on detail reads.
     pub(crate) fn adopt_activity_waits(&mut self, session: &bamboo_domain::Session) {
+        self.has_pending_question = session.has_pending_question();
+        self.last_run_status = session
+            .last_run_status()
+            .filter(|value| !value.trim().is_empty());
         let runtime = session.agent_runtime_state.as_ref();
         self.wait_for_children = runtime.is_some_and(|state| state.waiting_for_children.is_some());
         self.wait_for_bash = runtime.is_some_and(|state| state.waiting_for_bash.is_some());
