@@ -5902,9 +5902,6 @@ impl App {
                 if let Some(watch) = self.chat.loop_watch.as_mut() {
                     watch.attached_run = Some(run_id.clone());
                     watch.draining = draining;
-                    // The run can suspend after the summary read and before
-                    // this late subscription gets its first pending snapshot.
-                    watch.question_recovery = LoopQuestionRecovery::Requested;
                 }
                 self.chat
                     .run_status
@@ -11574,8 +11571,14 @@ impl App {
         let recover_loop_question = self
             .chat
             .loop_watch
-            .as_ref()
-            .is_some_and(|watch| watch.question_recovery != LoopQuestionRecovery::None);
+            .as_mut()
+            .filter(|watch| watch.attached_run.is_some())
+            .is_some_and(|watch| {
+                // A successful empty snapshot on connect does not cover a
+                // permission request that arrives later on this same stream.
+                watch.question_recovery = LoopQuestionRecovery::Requested;
+                true
+            });
         let client = self.client.clone();
         tokio::spawn(async move {
             let request = client.get_pending_question(&session_id);
@@ -24590,15 +24593,22 @@ mod question_tests {
                 .await
                 .unwrap();
             sse.flush().await.unwrap();
-            // The second run suspended after its running summary, so the
-            // first pending GET after the late attach must be recoverable.
-            let mut failed_pending_read = false;
-            for _ in 0..3 {
+            let mut pending_reads = 0;
+            for _ in 0..4 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_test_http_request(&mut socket).await;
                 let contents = if request.starts_with("GET /api/v1/respond/loop-session/pending ") {
-                    if !failed_pending_read {
-                        failed_pending_read = true;
+                    pending_reads += 1;
+                    if pending_reads == 1 {
+                        respond_test_http(
+                            &mut socket,
+                            "application/json",
+                            r#"{"has_pending_question":false}"#,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if pending_reads == 2 {
                         respond_test_http(&mut socket, "application/json", "{").await;
                         continue;
                     }
@@ -24678,6 +24688,17 @@ mod question_tests {
             app.handle_event(event).await.unwrap();
         }
         assert!(app.pending_question.is_none());
+        app.handle_sse_event(AgentEvent::ToolApprovalRequested {
+            tool_call_id: "loop-approval".into(),
+            tool_name: "exec_command".into(),
+            parameters: serde_json::json!({}),
+        })
+        .unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(failed).await.unwrap();
         app.poll_active_loop_watch();
         let retry = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
