@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -85,6 +86,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
+    /// Shared with result application even when a timeout drops dispatch.
+    pub tool_start_emitted: Option<&'a AtomicBool>,
     pub session_id: &'a str,
     /// Immutable parallel-window projection, used only without a hook Session.
     /// Sequential calls reread the actual Session after all continuing hooks.
@@ -537,6 +540,11 @@ async fn execute_tool_call_only_with_execution_name_inner(
         raw_arguments.len()
     );
 
+    // The event helper records the start before awaiting the event channel.
+    // A policy result produced before this point has no metric to finish.
+    if let Some(tool_start_emitted) = ctx.tool_start_emitted {
+        tool_start_emitted.store(true, Ordering::Relaxed);
+    }
     super::events::send_event_with_metrics(
         ctx.event_tx,
         ctx.metrics_collector,
@@ -1814,6 +1822,7 @@ mod task_progress_tests {
                 execute_tool_call_only_with_execution_name(
                     execution_name,
                     ToolExecutionOnlyContext {
+                        tool_start_emitted: None,
                         await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
@@ -2661,6 +2670,7 @@ mod hook_tests {
         let outcome = execute_model_requested_tool_call_only(
             callable,
             ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -2851,6 +2861,7 @@ mod hook_tests {
             let execution = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    tool_start_emitted: None,
                     await_quiet_exec: false,
                     session_behavior_version: None,
                     vision_support: true,
@@ -2999,6 +3010,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -3149,6 +3161,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        tool_start_emitted: None,
                         await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
@@ -3225,6 +3238,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        tool_start_emitted: None,
                         await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
@@ -3311,6 +3325,7 @@ mod hook_tests {
                     let outcome = execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            tool_start_emitted: None,
                             await_quiet_exec: false,
                             session_behavior_version: None,
                             vision_support: true,
@@ -3513,6 +3528,7 @@ mod hook_tests {
             let outcome = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    tool_start_emitted: None,
                     await_quiet_exec: false,
                     session_behavior_version: None,
                     vision_support: false,
@@ -3573,6 +3589,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -3939,6 +3956,7 @@ mod hook_tests {
         let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
         let outcome = trace
             .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -4009,6 +4027,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            tool_start_emitted: None,
             await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
@@ -4094,6 +4113,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            tool_start_emitted: None,
             await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
@@ -4155,6 +4175,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -4721,6 +4742,7 @@ mod hook_tests {
                     execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            tool_start_emitted: None,
                             await_quiet_exec: false,
                             session_behavior_version: Some(2),
                             vision_support: true,
@@ -4962,6 +4984,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -5028,6 +5051,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            tool_start_emitted: None,
             await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
@@ -5118,6 +5142,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             &callable,
             ToolExecutionOnlyContext {
+                tool_start_emitted: None,
                 await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
@@ -5384,6 +5409,7 @@ mod hook_tests {
                         let outcome = execute_model_requested_tool_call_only(
                             &callable,
                             ToolExecutionOnlyContext {
+                                tool_start_emitted: None,
                                 await_quiet_exec: false,
                                 session_behavior_version: version,
                                 vision_support: true,
@@ -5467,6 +5493,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        tool_start_emitted: None,
                         await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
@@ -5548,6 +5575,7 @@ mod hook_tests {
             let outcome = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    tool_start_emitted: None,
                     await_quiet_exec: false,
                     session_behavior_version: Some(2),
                     vision_support: true,
