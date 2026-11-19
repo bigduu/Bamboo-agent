@@ -635,7 +635,7 @@ impl SkillsListTool {
 
     /// Project the current authorized User's task onto the Native prompt.
     /// An unselected ordinary Root can continue without this optional metadata
-    /// when opening its scoped store encounters snapshot budget pressure.
+    /// when publishing its effective catalog encounters snapshot budget pressure.
     pub async fn render_task_catalog(
         &self,
         ctx: &ToolCtx,
@@ -743,7 +743,28 @@ impl SkillsListTool {
         };
         let scope = scope_identity(&session);
         let resolved_scope = self.access.skill_scope_for_session(&session)?;
-        let store = match self.access.store_for_scope(resolved_scope).await {
+        let projection = async {
+            let store = self.access.store_for_scope(resolved_scope).await?;
+            #[cfg(test)]
+            if let Some((entered, release)) = self.store_selection_barrier.as_deref() {
+                entered.notify_one();
+                release.notified().await;
+            }
+            let store = store.retain_mode_store(caller.mode.as_deref()).await?;
+            let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none()
+            {
+                let (snapshot, candidates, outcome) = store
+                    .progressive_automatic_catalog_for_mode(None, &access, &input.content)
+                    .await?;
+                (snapshot, Some((candidates, outcome)))
+            } else {
+                let snapshot = store.progressive_catalog_for_mode(None, &access).await?;
+                (snapshot, None)
+            };
+            Ok::<_, SkillError>((store, snapshot, automatic_prompt))
+        }
+        .await;
+        let (store, snapshot, automatic_prompt) = match projection {
             Err(error @ SkillError::PublicationBudgetExceeded { .. })
                 if match_current_task
                     && caller.invocation.is_none()
@@ -761,28 +782,6 @@ impl SkillsListTool {
                 return Err(MetadataError::OptionalCapacity(error));
             }
             result => result.map_err(skill_store_error)?,
-        };
-        #[cfg(test)]
-        if let Some((entered, release)) = self.store_selection_barrier.as_deref() {
-            entered.notify_one();
-            release.notified().await;
-        }
-        let store = store
-            .retain_mode_store(caller.mode.as_deref())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let (snapshot, automatic_prompt) = if match_current_task && caller.invocation.is_none() {
-            let (snapshot, candidates, outcome) = store
-                .progressive_automatic_catalog_for_mode(None, &access, &input.content)
-                .await
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-            (snapshot, Some((candidates, outcome)))
-        } else {
-            let snapshot = store
-                .progressive_catalog_for_mode(None, &access)
-                .await
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-            (snapshot, None)
         };
         let identity = fingerprint(&(
             &snapshot.identity,

@@ -651,28 +651,28 @@ async fn native_http_execute_reaches_model_after_idle_workspace_cache_fills() {
     assert_eq!(provider.0.load(Ordering::Relaxed), 1);
 }
 
+#[derive(Default)]
+struct SkillPressureProvider(Mutex<Vec<Vec<Message>>>);
+
+#[async_trait]
+impl LLMProvider for SkillPressureProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push(messages.to_vec());
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Workspace run completed".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
 #[actix_web::test]
 async fn native_http_ordinary_root_continues_when_pinned_workspaces_exhaust_snapshot_budget() {
-    #[derive(Default)]
-    struct Provider(Mutex<Vec<Vec<Message>>>);
-
-    #[async_trait]
-    impl LLMProvider for Provider {
-        async fn chat_stream(
-            &self,
-            messages: &[Message],
-            _: &[ToolSchema],
-            _: Option<u32>,
-            _: &str,
-        ) -> Result<LLMStream, LLMError> {
-            self.0.lock().unwrap().push(messages.to_vec());
-            Ok(Box::pin(futures::stream::iter([
-                Ok(LLMChunk::Token("Workspace run completed".into())),
-                Ok(LLMChunk::Done),
-            ])))
-        }
-    }
-
     let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     let root = home.path().canonicalize().unwrap();
@@ -693,7 +693,7 @@ async fn native_http_ordinary_root_continues_when_pinned_workspaces_exhaust_snap
         )
         .unwrap();
     }
-    let provider = Arc::new(Provider::default());
+    let provider = Arc::new(SkillPressureProvider::default());
     let mut state = app_state(&root, provider.clone()).await;
     state.skill_manager = Arc::new(bamboo_skills::SkillManager::with_snapshot_budget_for_test(
         bamboo_skills::SkillStoreConfig {
@@ -794,6 +794,162 @@ async fn native_http_ordinary_root_continues_when_pinned_workspaces_exhaust_snap
         .entries
         .iter()
         .any(|entry| entry.id == "cold-skill"));
+}
+
+#[actix_web::test]
+async fn native_http_ordinary_root_continues_when_cold_mode_exceeds_snapshot_budget() {
+    assert_root_mode_pressure(false).await;
+}
+
+#[actix_web::test]
+async fn native_http_ordinary_root_continues_when_progressive_refresh_exceeds_snapshot_budget() {
+    assert_root_mode_pressure(true).await;
+}
+
+async fn assert_root_mode_pressure(warm_mode: bool) {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let held = root.join("held");
+    let workspace = root.join("workspace");
+    write_skill(&held.join(".bamboo"), "held-skill", true);
+    write_skill(&workspace.join(".bamboo"), "base-skill", true);
+    write_skill(&workspace.join(".bamboo"), "mode-skill", true);
+    let mode_bundle = workspace.join(".bamboo/skills-code/mode-skill");
+    std::fs::create_dir_all(mode_bundle.parent().unwrap()).unwrap();
+    std::fs::rename(workspace.join(".bamboo/skills/mode-skill"), &mode_bundle).unwrap();
+    std::fs::write(
+        held.join(".bamboo/skills/held-skill/references/large.bin"),
+        vec![b'h'; 2 * 1024 * 1024],
+    )
+    .unwrap();
+
+    let provider = Arc::new(SkillPressureProvider::default());
+    let mut state = app_state(&root, provider.clone()).await;
+    state.skill_manager = Arc::new(bamboo_skills::SkillManager::with_snapshot_budget_for_test(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir: root.join("skills"),
+            ..Default::default()
+        },
+        4 * 1024 * 1024,
+    ));
+    state.skill_manager.initialize().await.unwrap();
+    let state = web::Data::new(state);
+    let owner = state
+        .skill_manager
+        .store_for_workspace(Some(&held))
+        .await
+        .unwrap();
+    let pinned = owner
+        .pin_current_activation("held-mode-start", &["held-skill".into()], None)
+        .await
+        .unwrap();
+    let base = state
+        .skill_manager
+        .store_for_workspace(Some(&workspace))
+        .await
+        .unwrap();
+    let mode = if warm_mode {
+        Some(base.retain_mode_store(Some("code")).await.unwrap())
+    } else {
+        None
+    };
+    std::fs::write(
+        mode_bundle.join("references/large.bin"),
+        vec![b'm'; 2 * 1024 * 1024],
+    )
+    .unwrap();
+    let error = match &mode {
+        Some(mode) => {
+            assert!(Arc::ptr_eq(
+                mode,
+                &base.retain_mode_store(Some("code")).await.unwrap()
+            ));
+            mode.progressive_automatic_catalog_for_mode(
+                None,
+                &bamboo_skills::progressive::SkillCatalogEligibility {
+                    ceiling: None,
+                    explicit: Default::default(),
+                    disabled: Default::default(),
+                    deny_all: false,
+                },
+                "Inspect the proof task",
+            )
+            .await
+            .err()
+        }
+        None => base.retain_mode_store(Some("code")).await.err(),
+    };
+    assert!(matches!(
+        error,
+        Some(bamboo_skills::SkillError::PublicationBudgetExceeded { .. })
+    ));
+
+    for (id, selected) in [
+        ("native-mode-ordinary", false),
+        ("native-mode-selected", true),
+    ] {
+        let mut session = Session::new(id, "test-model");
+        session.title_generated = true;
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+            "explicit".into(),
+        );
+        session.metadata.insert("skill_mode".into(), "code".into());
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .workspace_resolver
+            .publish_resolved_workspace(id, workspace.clone(), "test_initial");
+        let mut request =
+            json!({"session_id":id,"message":"Inspect the proof task in the workspace"});
+        if selected {
+            request["selected_skill_ids"] = json!(["mode-skill"]);
+        }
+        let (status, response) = http(&state, "/api/v1/chat", request).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let terminal = done(&state, id).await;
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(super::mode(&saved).as_deref(), Some("code"));
+        if selected {
+            assert_eq!(saved.selected_skill_ids(), Some(vec!["mode-skill".into()]));
+            assert!(
+                matches!(&terminal, AgentStatus::Error(error) if error.contains("global workflow snapshot budget")),
+                "{terminal:?}"
+            );
+        } else {
+            assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+        }
+    }
+    {
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].iter().any(|message| message.role == Role::User
+            && message.content == "Inspect the proof task in the workspace"));
+        assert!(requests[0].iter().all(|message| !message
+            .content
+            .contains("Check Skill applicability.")
+            && !message.content.contains("mode-skill")
+            && !message.content.contains("base-skill")));
+    }
+    assert_eq!(
+        owner.activation_descriptor("held-mode-start").await,
+        Some(pinned)
+    );
+    owner.release_activation("held-mode-start").await;
+    std::fs::remove_file(held.join(".bamboo/skills/held-skill/references/large.bin")).unwrap();
+    owner.reload().await.unwrap();
+    drop(owner);
+    let mode = base.retain_mode_store(Some("code")).await.unwrap();
+    mode.reload().await.unwrap();
+    assert!(mode
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .iter()
+        .any(|entry| entry.id == "mode-skill"));
 }
 
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
