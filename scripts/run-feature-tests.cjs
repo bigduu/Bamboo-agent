@@ -190,7 +190,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
 // #2850 retires the separate consent check in the default Storage save path.
 // Supervisor inheritance cases use the existing Server test owners.
-const FEATURE_SOURCE_SHA256 = "14ef11aeb8705a1209b99fc8a89d9bf5b225496fd3a97276bd5796c22965e8e9";
+// #2447 keeps session activity API cases in server-handlers and runtime-only
+// wait projection and index rebuild cases in the default Storage packages-0
+// owner. No feature declarations or additive catalog entries changed.
+const FEATURE_SOURCE_SHA256 = "64047f8a69d92cf1cf0a5441b2747c703abc1259d84eef234449648020472034";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
