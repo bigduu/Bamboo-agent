@@ -7,6 +7,109 @@ use crate::types::{MetricsDateFilter, PromptMemoryExposureItem, PromptMemoryReca
 
 use super::*;
 
+#[tokio::test]
+async fn provider_call_identifiers_are_independent_across_rounds() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("metrics.db");
+    let storage = Arc::new(SqliteMetricsStorage::new(&path));
+    let weak = Arc::downgrade(&storage);
+    let collector = MetricsCollector::spawn(storage, 90);
+    let scheduler = collector._scheduler.task.abort_handle();
+    let now = Utc::now();
+
+    for (session, round) in [("one", "r1"), ("two", "r2")] {
+        collector.session_started(session, "model", now);
+        collector.round_started(round, session, "model", now);
+        collector.record_agent_event(
+            session,
+            round,
+            &AgentEvent::ToolStart {
+                tool_call_id: "provider-call-1".into(),
+                tool_name: "fixture".into(),
+                arguments: serde_json::json!({}),
+            },
+        );
+    }
+    collector.record_agent_event(
+        "two",
+        "r2",
+        &AgentEvent::ToolComplete {
+            tool_call_id: "provider-call-1".into(),
+            result: bamboo_domain::ToolResult {
+                success: true,
+                ..Default::default()
+            },
+        },
+    );
+    collector.record_agent_event(
+        "one",
+        "r1",
+        &AgentEvent::ToolError {
+            tool_call_id: "provider-call-1".into(),
+            error: "first failure".into(),
+        },
+    );
+
+    drop(collector);
+    reclaimed(&weak, &scheduler).await;
+    let reopened = SqliteMetricsStorage::new(&path);
+    let ambiguous = reopened
+        .complete_tool_call(
+            "provider-call-1",
+            ToolCallCompletion {
+                completed_at: now,
+                success: false,
+                error: Some("unscoped completion".into()),
+            },
+        )
+        .await;
+    assert!(matches!(
+        ambiguous,
+        Err(MetricsError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    ));
+    assert!(matches!(
+        reopened
+            .insert_tool_start("provider-call-1", "r1", "one", "legacy writer", now)
+            .await,
+        Err(MetricsError::InvalidData(_))
+    ));
+    reopened
+        .upsert_session_start("legacy", "model", now)
+        .await
+        .unwrap();
+    reopened
+        .insert_round_start("r3", "legacy", "model", now)
+        .await
+        .unwrap();
+    reopened
+        .insert_tool_start("provider-call-1", "r3", "legacy", "legacy writer", now)
+        .await
+        .unwrap();
+    reopened
+        .complete_tool_call(
+            "provider-call-1",
+            ToolCallCompletion {
+                completed_at: now,
+                success: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let legacy = reopened.session_detail("legacy").await.unwrap().unwrap();
+    assert_eq!(legacy.session.tool_call_count, 1);
+    assert_eq!(legacy.rounds[0].tool_calls[0].success, Some(true));
+    for (session, error) in [("one", Some("first failure")), ("two", None)] {
+        let detail = reopened.session_detail(session).await.unwrap().unwrap();
+        assert_eq!(detail.session.tool_call_count, 1);
+        let calls = &detail.rounds[0].tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_call_id, "provider-call-1");
+        assert_eq!(calls[0].error.as_deref(), error);
+        assert_eq!(calls[0].success, Some(error.is_none()));
+    }
+}
+
 async fn reclaimed(storage: &Weak<SqliteMetricsStorage>, scheduler: &tokio::task::AbortHandle) {
     tokio::time::timeout(StdDuration::from_secs(30), async {
         while storage.strong_count() != 0 || !scheduler.is_finished() {
@@ -259,7 +362,7 @@ async fn burst_of_256_independent_sessions_drains_complete_rounds_and_tools() {
         collector.round_started(&round, &session, "model", now);
         collector
             .tx
-            .send(CollectorCommand::Mutation(MetricsMutation::ToolStarted {
+            .send(CollectorCommand::ordinary(MetricsMutation::ToolStarted {
                 tool_call_id: tool.clone(),
                 round_id: round.clone(),
                 session_id: session.clone(),
@@ -269,7 +372,7 @@ async fn burst_of_256_independent_sessions_drains_complete_rounds_and_tools() {
             .unwrap();
         collector
             .tx
-            .send(CollectorCommand::Mutation(MetricsMutation::ToolCompleted {
+            .send(CollectorCommand::ordinary(MetricsMutation::ToolCompleted {
                 tool_call_id: tool,
                 completion: ToolCallCompletion {
                     completed_at: now,
