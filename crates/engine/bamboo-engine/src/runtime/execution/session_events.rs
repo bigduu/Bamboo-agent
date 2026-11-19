@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use bamboo_agent_core::AgentEvent;
 
-use super::event_forwarder::AccountFeedInbox;
+use super::event_forwarder::SessionAccountFeed;
 use super::runner_state::AgentRunner;
 
 /// Default broadcast channel capacity for session event senders.
@@ -55,24 +55,42 @@ pub async fn get_or_create_event_sender(
 pub(crate) struct ReplayableSessionEventPublisher {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-    account_feed_inbox: Option<AccountFeedInbox>,
+    account_feed: SessionAccountFeed,
 }
 
 impl ReplayableSessionEventPublisher {
     pub(crate) fn new(
         runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
         senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
-        account_feed_inbox: Option<AccountFeedInbox>,
+        account_feed: SessionAccountFeed,
     ) -> Self {
         Self {
             runners,
             senders,
-            account_feed_inbox,
+            account_feed,
         }
     }
 
     pub(crate) async fn publish(&self, session_id: &str, event: AgentEvent) {
+        self.publish_with_completion_id(session_id, event, None)
+            .await;
+    }
+
+    pub(crate) async fn publish_with_completion_id(
+        &self,
+        session_id: &str,
+        event: AgentEvent,
+        completion_id: Option<String>,
+    ) {
         debug_assert!(event.is_replayable_session_state());
+        let account = self
+            .account_feed
+            .reserve(session_id, &event, completion_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "session event could not enter the account change feed");
+                None
+            });
         // Resolve the sender before the runner lock. The SSE/WS subscription
         // boundary uses the same sender-then-runner lock order.
         let sender = get_or_create_event_sender(&self.senders, session_id).await;
@@ -80,12 +98,68 @@ impl ReplayableSessionEventPublisher {
         if let Some(runner) = runners.get_mut(session_id) {
             runner.push_critical_event(event.clone());
         }
-        if let Some(inbox) = &self.account_feed_inbox {
-            if event.is_durable_change() {
-                let route_session_id = event.session_id().unwrap_or(session_id);
-                let _ = inbox.try_send((Some(route_session_id.to_string()), event.clone()));
-            }
+        if let Some(account) = account {
+            account.enqueue(&event);
         }
         let _ = sender.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn durable_session_publication_waits_for_a_full_account_inbox() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let senders = Arc::new(RwLock::new(HashMap::new()));
+        let mut session_events = get_or_create_event_sender(&senders, "parent")
+            .await
+            .subscribe();
+        let (account, mut account_events) = mpsc::channel(1);
+        account
+            .try_send((
+                Some("queued".into()),
+                AgentEvent::SessionHistoryCommitted {
+                    session_id: "queued".into(),
+                },
+            ))
+            .unwrap();
+        let publisher = ReplayableSessionEventPublisher::new(
+            runners.clone(),
+            senders,
+            SessionAccountFeed::Legacy(Some(account)),
+        );
+        let publication = publisher.publish(
+            "parent",
+            AgentEvent::SubAgentStarted {
+                parent_session_id: "parent".into(),
+                child_session_id: "child".into(),
+                title: None,
+            },
+        );
+        tokio::pin!(publication);
+        assert!(futures::poll!(&mut publication).is_pending());
+        assert!(runners.try_write().is_ok(), "no runner lock while waiting");
+        assert!(matches!(
+            session_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let (first_route, first_event) = account_events.recv().await.unwrap();
+        assert_eq!(first_route.as_deref(), Some("queued"));
+        assert!(matches!(
+            first_event,
+            AgentEvent::SessionHistoryCommitted { .. }
+        ));
+        publication.await;
+        let (second_route, second_event) = account_events.try_recv().unwrap();
+        assert_eq!(second_route.as_deref(), Some("parent"));
+        assert!(matches!(second_event, AgentEvent::SubAgentStarted { .. }));
+        assert!(matches!(
+            session_events.try_recv(),
+            Ok(AgentEvent::SubAgentStarted { .. })
+        ));
     }
 }

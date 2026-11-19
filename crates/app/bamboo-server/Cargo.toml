@@ -207,6 +207,7 @@ zbus = { version = "6", default-features = false }
 [dev-dependencies]
 jsonschema = { version = "0.60.0", default-features = false, features = ["idna"] }
 bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
+bamboo-skills = { path = "../../infra/bamboo-skills", features = ["test-utils"] }
 wiremock = "0.6"
 tokio-test = "0.4"
 mockall = "0.15"

@@ -121,6 +121,272 @@ async fn invoke_json(
 }
 
 #[tokio::test]
+async fn memory_write_rejects_global_project_memory_and_preserves_valid_writes() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let session_id = "memory-guard-source";
+    let project_id = bamboo_domain::ProjectId::parse("project-fixture").unwrap();
+    let mut session = Session::new(session_id, "model");
+    session.set_project_id_meta(project_id.to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let denied = tool
+        .invoke(
+            json!({
+                "action": "write",
+                "scope": "global",
+                "type": "project",
+                "title": "Project display setting",
+                "content": "The Project dashboard uses one column."
+            }),
+            test_context(session_id),
+        )
+        .await
+        .expect_err("a project-typed Global write must fail");
+    assert!(matches!(denied, ToolError::InvalidArguments(_)));
+
+    let memory = MemoryStore::new(dir.path());
+    assert!(memory
+        .list_memory_documents(MemoryScope::Global, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(memory
+        .for_project(&project_id)
+        .list_memory_documents(MemoryScope::Project, Some(project_id.as_str()))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let legacy = memory
+        .write_memory(
+            MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Legacy Project entry",
+            "A previously stored Project entry.",
+            &[],
+            Some(session_id),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let legacy_id = legacy.frontmatter.id;
+    let fetched = invoke_json(&tool, json!({"action": "get", "id": legacy_id}), session_id).await;
+    assert_eq!(fetched["memory"]["frontmatter"]["type"], "project");
+    let archived = invoke_json(
+        &tool,
+        json!({"action": "purge", "id": legacy_id, "mode": "archived"}),
+        session_id,
+    )
+    .await;
+    assert_eq!(archived["status"], "archived");
+
+    for (scope, memory_type, title) in [
+        ("project", "project", "Project display setting"),
+        ("global", "reference", "Cross-project display reference"),
+        ("global", "feedback", "Cross-project display preference"),
+    ] {
+        let written = invoke_json(
+            &tool,
+            json!({
+                "action": "write",
+                "scope": scope,
+                "type": memory_type,
+                "title": title,
+                "content": "Use compact display defaults."
+            }),
+            session_id,
+        )
+        .await;
+        assert_eq!(written["memory"]["scope"], scope);
+        assert_eq!(written["memory"]["type"], memory_type);
+    }
+}
+
+#[tokio::test]
+async fn memory_maintenance_rejects_global_project_type_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "memory-maintenance-fixture";
+    let project_id = bamboo_domain::ProjectId::parse("project-fixture").unwrap();
+    let mut session = Session::new(session_id, "model");
+    session.set_project_id_meta(project_id.to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+    let store = MemoryStore::new(dir.path());
+    let mut ids = Vec::new();
+    for (memory_type, title) in [
+        (DurableMemoryType::Reference, "Cross-project guide"),
+        (DurableMemoryType::Reference, "Cross-project note"),
+        (DurableMemoryType::Project, "Historical Project record"),
+    ] {
+        // Seed a historical Global record that the current write tool rejects.
+        ids.push(
+            store
+                .write_memory(
+                    MemoryScope::Global,
+                    None,
+                    memory_type,
+                    title,
+                    "Synthetic maintenance fixture.",
+                    &[],
+                    Some(session_id),
+                    "test",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap()
+                .frontmatter
+                .id,
+        );
+    }
+    let split = |id: &str, piece: serde_json::Value| {
+        json!({
+            "action": "split",
+            "id": id,
+            "pieces": [
+                {"title": "Valid first piece", "type": "reference", "content": "A cross-project fact."},
+                piece
+            ]
+        })
+    };
+    let consolidate = |first: &str| {
+        json!({
+            "action": "consolidate",
+            "ids": [first, ids[1]],
+            "title": "Consolidated fact",
+            "content": "Synthetic consolidated content."
+        })
+    };
+    let mut explicit_consolidation = consolidate(&ids[0]);
+    explicit_consolidation["type"] = json!("project");
+    let requests = [
+        split(
+            &ids[0],
+            json!({"title": "Explicit type", "type": "project", "content": "A Project fact."}),
+        ),
+        split(
+            &ids[2],
+            json!({"title": "Inherited type", "content": "A Project fact."}),
+        ),
+        explicit_consolidation,
+        consolidate(&ids[2]),
+    ];
+    let mut denials = Vec::new();
+    for request in requests {
+        denials.push(tool.invoke(request, test_context(session_id)).await);
+    }
+    assert!(
+        denials
+            .iter()
+            .all(|result| matches!(result, Err(ToolError::InvalidArguments(message))
+                if message.contains("Project-typed memory requires"))),
+        "explicit and inherited Project types must both be rejected before maintenance: {denials:?}"
+    );
+    let documents = store
+        .list_memory_documents(MemoryScope::Global, None)
+        .await
+        .unwrap();
+    assert_eq!(documents.len(), ids.len());
+    assert!(documents.iter().all(|doc| {
+        ids.contains(&doc.frontmatter.id)
+            && doc.frontmatter.status == DurableMemoryStatus::Active
+            && doc.body.trim() == "Synthetic maintenance fixture."
+    }));
+    let project = store
+        .for_project(&project_id)
+        .list_memory_documents(MemoryScope::Project, Some(project_id.as_str()))
+        .await
+        .unwrap();
+    assert!(project.is_empty());
+
+    let legacy = invoke_json(&tool, json!({"action": "get", "id": ids[2]}), session_id).await;
+    assert_eq!(legacy["memory"]["frontmatter"]["type"], "project");
+    let archived = invoke_json(
+        &tool,
+        json!({"action": "purge", "id": ids[2], "mode": "archived"}),
+        session_id,
+    )
+    .await;
+    assert_eq!(archived["status"], "archived");
+}
+
+#[tokio::test]
+async fn memory_maintenance_preserves_global_and_assigned_project_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "memory-maintenance-allowed";
+    let project_id = bamboo_domain::ProjectId::parse("project-fixture").unwrap();
+    let mut session = Session::new(session_id, "model");
+    session.set_project_id_meta(project_id.to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    for (scope, memory_type) in [("global", "reference"), ("project", "project")] {
+        let source = invoke_json(
+            &tool,
+            json!({
+                "action": "write",
+                "scope": scope,
+                "type": memory_type,
+                "title": "Transport facts",
+                "content": "A local transport and a remote transport exist."
+            }),
+            session_id,
+        )
+        .await;
+        let split_request = json!({
+            "action": "split",
+            "id": source["memory"]["id"],
+            "pieces": [
+                {"title": "Local transport", "content": "The local transport exists."},
+                {"title": "Remote transport", "type": memory_type, "content": "The remote transport exists."}
+            ]
+        });
+        let split = if scope == "global" {
+            let (split, denied) = tokio::join!(
+                invoke_json(&tool, split_request, session_id),
+                tool.invoke(
+                    json!({
+                        "action": "split",
+                        "id": source["memory"]["id"],
+                        "pieces": [{"title": "Project output", "type": "project", "content": "A Project fact."}]
+                    }),
+                    test_context(session_id)
+                )
+            );
+            assert!(matches!(denied, Err(ToolError::InvalidArguments(_))));
+            split
+        } else {
+            invoke_json(&tool, split_request, session_id).await
+        };
+        assert_eq!(split["data"]["target_scope"], scope);
+        for id in split["data"]["new_ids"].as_array().unwrap() {
+            let doc = invoke_json(&tool, json!({"action": "get", "id": id}), session_id).await;
+            assert_eq!(doc["memory"]["frontmatter"]["type"], memory_type);
+        }
+        let consolidated = invoke_json(
+            &tool,
+            json!({
+                "action": "consolidate",
+                "ids": split["data"]["new_ids"],
+                "title": "Confirmed transport",
+                "content": "Both the local and remote transports exist."
+            }),
+            session_id,
+        )
+        .await;
+        let doc = invoke_json(
+            &tool,
+            json!({"action": "get", "id": consolidated["data"]["new_id"]}),
+            session_id,
+        )
+        .await;
+        assert_eq!(doc["memory"]["frontmatter"]["scope"], scope);
+        assert_eq!(doc["memory"]["frontmatter"]["type"], memory_type);
+    }
+}
+
+#[tokio::test]
 async fn memory_session_actions_share_read_shape_and_limits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tool = build_memory_tool(dir.path());
@@ -304,7 +570,7 @@ async fn query_action_filters_by_granularity() {
         json!({
             "action": "write",
             "scope": "global",
-            "type": "project",
+            "type": "reference",
             "title": "This week's sprint priorities",
             "content": "Ship the granularity filter end to end.",
             "granularity": "week"
@@ -317,7 +583,7 @@ async fn query_action_filters_by_granularity() {
         json!({
             "action": "write",
             "scope": "global",
-            "type": "project",
+            "type": "reference",
             "title": "Long-term architecture direction",
             "content": "Move to a modular workspace layout over the year.",
             "granularity": "year"
@@ -665,7 +931,7 @@ async fn lexical_query_defaults_to_compact_top_three_without_bodies() {
             json!({
                 "action": "write",
                 "scope": "global",
-                "type": "project",
+                "type": "reference",
                 "title": format!("Release freeze fact {index}"),
                 "content": format!("Confirmed release freeze detail number {index}."),
                 "keywords": ["release-freeze-alias"]

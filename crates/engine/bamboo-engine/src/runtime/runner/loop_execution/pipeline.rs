@@ -113,7 +113,7 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     }
 
     let mut loaded_names = if uses_sticky_fallback(capability_loading_mode) {
-        validated_sticky_fallback_loaded_tool_names(session)
+        validated_sticky_fallback_loaded_tool_names(session, tool_schemas)
     } else {
         let transcript = &session.provider_transcript;
         let family = transcript.active_family();
@@ -529,7 +529,7 @@ fn sticky_definition_name(definition: &serde_json::Value) -> Option<&str> {
         .flatten()
 }
 
-fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
+fn validated_sticky_fallback_results(session: &Session) -> Vec<(&Message, Vec<serde_json::Value>)> {
     let call_ids = sticky_discovery_call_ids(session);
     session
         .messages
@@ -546,56 +546,95 @@ fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
                         && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
                         && metadata["canonical_new_names"].is_array()
                 })
-                && sticky_result_definition_values(message).is_some()
         })
+        .filter_map(|message| Some((message, sticky_result_definition_values(message)?)))
         .collect()
 }
 
-pub(in crate::runtime::runner) fn validated_sticky_fallback_loaded_tool_names(
-    session: &Session,
-) -> Vec<String> {
-    let mut loaded = Vec::new();
-    for message in validated_sticky_fallback_results(session) {
-        let definition_names = sticky_result_definition_values(message)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|definition| sticky_definition_name(&definition).map(str::to_string))
-            .collect::<BTreeSet<_>>();
-        let Some(names) = message
+fn legacy_scoped_gateway(name: &str) -> bool {
+    matches!(name, "load_skill" | "workflow_run")
+}
+
+fn latest_sticky_fallback_definitions<'a>(
+    results: &'a [(&Message, Vec<serde_json::Value>)],
+) -> BTreeMap<&'a str, &'a serde_json::Value> {
+    let mut loaded = BTreeMap::new();
+    for (message, definitions) in results {
+        let Some(first_loads) = message
             .metadata
             .as_ref()
             .and_then(|metadata| metadata["canonical_new_names"].as_array())
         else {
             continue;
         };
-        for name in names.iter().filter_map(serde_json::Value::as_str) {
-            if definition_names.contains(name) && !loaded.iter().any(|seen| seen == name) {
-                loaded.push(name.to_string());
+        for definition in definitions {
+            let Some(name) = sticky_definition_name(definition) else {
+                continue;
+            };
+            // V1 records only mark first admission. A later successful
+            // discovery can refresh that name without writing another marker.
+            if loaded.contains_key(name)
+                || first_loads.iter().any(|value| value.as_str() == Some(name))
+            {
+                loaded.insert(name, definition);
             }
         }
     }
     loaded
 }
 
-/// Keep persisted discovery results intact. On the wire, hide definitions
-/// removed by the current role or request selection and avoid repeating full
-/// definitions already declared on a compatibility request.
+pub(in crate::runtime::runner) fn validated_sticky_fallback_loaded_tool_names(
+    session: &Session,
+    eligible: &[bamboo_agent_core::tools::ToolSchema],
+) -> Vec<String> {
+    let history = validated_sticky_fallback_results(session);
+    let latest = latest_sticky_fallback_definitions(&history);
+    eligible
+        .iter()
+        .filter_map(|schema| {
+            let name = schema.function.name.as_str();
+            let definition = latest.get(name).copied()?;
+            (legacy_scoped_gateway(name)
+                || serde_json::to_value(schema).as_ref().ok() == Some(definition))
+            .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Project validated discovery history against the current request catalog.
+/// Keep persisted call/result pairs intact and hide obsolete definitions from
+/// the provider. Deliberately narrowed legacy command gateways remain paired
+/// with the command IDs and revisions advertised by their original result.
 pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
     session: &Session,
     eligible: &[bamboo_agent_core::tools::ToolSchema],
     declared: &[bamboo_agent_core::tools::ToolSchema],
     mode: CapabilityLoadingMode,
 ) -> BTreeMap<String, (String, String)> {
-    let eligible_names = eligible
+    let history = validated_sticky_fallback_results(session);
+    if history.is_empty() {
+        return BTreeMap::new();
+    }
+    let latest = latest_sticky_fallback_definitions(&history);
+    let eligible_definitions = eligible
         .iter()
-        .filter(|tool| session.allows_model_tool_execution(&tool.function.name))
-        .map(|tool| tool.function.name.as_str())
-        .collect::<BTreeSet<_>>();
+        .filter(|tool| {
+            let name = tool.function.name.as_str();
+            session.allows_model_tool_execution(name)
+                && (latest.contains_key(name) || legacy_scoped_gateway(name))
+        })
+        .filter_map(|tool| {
+            serde_json::to_value(tool)
+                .ok()
+                .map(|definition| (tool.function.name.as_str(), definition))
+        })
+        .collect::<BTreeMap<_, _>>();
     let declared_definitions = if mode == CapabilityLoadingMode::Progressive {
         BTreeMap::new()
     } else {
         declared
             .iter()
+            .filter(|tool| eligible_definitions.contains_key(tool.function.name.as_str()))
             .filter_map(|tool| {
                 serde_json::to_value(tool)
                     .ok()
@@ -603,10 +642,9 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
             })
             .collect::<BTreeMap<_, _>>()
     };
-    validated_sticky_fallback_results(session)
-        .into_iter()
-        .filter_map(|message| {
-            let definitions = sticky_result_definition_values(message)?;
+    history
+        .iter()
+        .filter_map(|(message, definitions)| {
             let mut duplicate = false;
             let remaining = definitions
                 .iter()
@@ -614,7 +652,13 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
                     let Some(name) = sticky_definition_name(definition) else {
                         return false;
                     };
-                    if !eligible_names.contains(name) {
+                    let Some(current) = eligible_definitions.get(name) else {
+                        return false;
+                    };
+                    if !legacy_scoped_gateway(name)
+                        && (current != *definition
+                            || latest.get(name).copied() != Some(*definition))
+                    {
                         return false;
                     }
                     if declared_definitions.get(name) == Some(*definition) {
@@ -647,24 +691,27 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
         .collect()
 }
 
-fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
-    validated_sticky_fallback_results(session)
-        .into_iter()
-        .filter_map(sticky_result_definition_values)
-        .flatten()
-        .collect()
-}
-
 fn sticky_fallback_definition_delta(
     session: &Session,
     schemas: &[bamboo_agent_core::tools::ToolSchema],
 ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
-    let previous = prior_sticky_fallback_definitions(session);
+    let history = validated_sticky_fallback_results(session);
+    let latest = latest_sticky_fallback_definitions(&history);
     let mut definitions = schemas
         .iter()
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()?;
-    definitions.retain(|definition| !previous.contains(definition));
+    definitions.retain(|definition| {
+        let Some(name) = sticky_definition_name(definition) else {
+            return true;
+        };
+        if legacy_scoped_gateway(name) {
+            return !history
+                .iter()
+                .any(|(_, previous)| previous.contains(definition));
+        }
+        latest.get(name).copied() != Some(definition)
+    });
     Ok(definitions)
 }
 
@@ -784,12 +831,11 @@ async fn commit_sticky_fallback_discovery_round(
         };
         let (content, success, new_names) = match definitions {
             Ok(definitions) => {
-                let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
+                let history = validated_sticky_fallback_results(session);
+                let already_loaded = latest_sticky_fallback_definitions(&history);
                 let mut canonical_new_names = Vec::new();
                 for name in definitions.iter().filter_map(sticky_definition_name) {
-                    if !already_loaded.contains(name)
+                    if !already_loaded.contains_key(name)
                         && !canonical_new_names.iter().any(|seen| seen == name)
                     {
                         canonical_new_names.push(name.to_string());
@@ -5960,7 +6006,10 @@ mod tests {
             "repeating the same scoped Skill B definition emits an empty delta"
         );
         assert_eq!(
-            super::prior_sticky_fallback_definitions(&session),
+            super::validated_sticky_fallback_results(&session)
+                .into_iter()
+                .flat_map(|(_, definitions)| definitions)
+                .collect::<Vec<_>>(),
             vec![
                 serde_json::to_value(&skill_a).unwrap(),
                 serde_json::to_value(&skill_b).unwrap()
@@ -6073,7 +6122,7 @@ mod tests {
             browser.function.parameters
         );
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&first_chat),
+            validated_sticky_fallback_loaded_tool_names(&first_chat, &tools),
             vec!["browser"]
         );
         let first_after = effective_callable_set_for_round(
@@ -6137,7 +6186,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            validated_sticky_fallback_loaded_tool_names(&second_chat, &tools),
             vec!["Glob"]
         );
 
@@ -6154,7 +6203,7 @@ mod tests {
             true,
         ));
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            validated_sticky_fallback_loaded_tool_names(&second_chat, &tools),
             vec!["Glob"]
         );
         assert!(!effective_callable_set_for_round(
@@ -6216,7 +6265,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&session),
+            validated_sticky_fallback_loaded_tool_names(&session, &tools),
             vec!["browser"]
         );
         assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
@@ -7336,7 +7385,7 @@ mod tests {
             serde_json::json!(["ReadArchive"])
         );
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&session),
+            validated_sticky_fallback_loaded_tool_names(&session, &tools),
             vec!["ReadArchive"]
         );
 
@@ -7372,7 +7421,7 @@ mod tests {
             true,
         ));
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&resumed),
+            validated_sticky_fallback_loaded_tool_names(&resumed, &tools),
             vec!["ReadArchive"],
             "an ordinary function call/result cannot manufacture loaded state"
         );
@@ -7399,8 +7448,166 @@ mod tests {
         );
         assert!(resumed.messages[4].never_compress && repeated.never_compress);
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&resumed),
+            validated_sticky_fallback_loaded_tool_names(&resumed, &tools),
             vec!["ReadArchive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_discovery_revalidates_changed_schema_after_reopening_store() {
+        use crate::runtime::runner::round_lifecycle::request_tool_schemas_for_loading_mode;
+
+        let home = tempfile::tempdir().unwrap();
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut session = Session::new("schema-drift-fixture", "fixture-model");
+        let config = AgentLoopConfig::default();
+        let tool_name = "ReadArchive";
+        let mut old_schema =
+            loading_test_schema_with_description(tool_name, "Read a synthetic archive");
+        old_schema.function.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let mut changed_schema = old_schema.clone();
+        changed_schema.function.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {"archive_id": {"type": "integer"}},
+            "required": ["archive_id"]
+        });
+        let discover = |id: &str| {
+            stream_output_with_tool_call(activation_call(
+                id,
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"ReadArchive","kinds":["tool"],"limit":1}"#,
+            ))
+        };
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-v1"),
+            &mut session,
+            &config,
+            std::slice::from_ref(&old_schema),
+        )
+        .await
+        .unwrap();
+        let original_result = session.messages.last().unwrap().clone();
+        storage.save_session(&session).await.unwrap();
+        drop(storage);
+
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut restored = storage.load_session(&session.id).await.unwrap().unwrap();
+        let mode = CapabilityLoadingMode::StickyFallback;
+        let old_catalog = std::slice::from_ref(&old_schema);
+        let unchanged = request_tool_schemas_for_loading_mode(&restored, old_catalog, mode, true);
+        assert_eq!(
+            unchanged
+                .iter()
+                .filter(|schema| schema.function.name == tool_name)
+                .count(),
+            1
+        );
+        assert!(
+            effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+
+        let changed_catalog = std::slice::from_ref(&changed_schema);
+        let changed = request_tool_schemas_for_loading_mode(&restored, changed_catalog, mode, true);
+        assert!(
+            changed
+                .iter()
+                .all(|schema| schema.function.name != tool_name),
+            "an updated definition is not declared by a persisted discovery of its old schema"
+        );
+        assert!(
+            !effective_callable_set_for_round(&restored, changed_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        let projection = super::projected_sticky_fallback_results(
+            &restored,
+            changed_catalog,
+            changed.as_ref(),
+            mode,
+        );
+        let (original, replacement) = &projection[&original_result.id];
+        assert_eq!(original, &original_result.content);
+        assert_eq!(
+            replacement,
+            "The previously discovered tools are unavailable for this request."
+        );
+        assert_eq!(
+            restored.messages.last().unwrap().content,
+            original_result.content
+        );
+
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-v2"),
+            &mut restored,
+            &config,
+            changed_catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sticky_result_definition_values(restored.messages.last().unwrap()).unwrap(),
+            vec![serde_json::to_value(&changed_schema).unwrap()]
+        );
+        assert_eq!(
+            restored.messages.last().unwrap().metadata.as_ref().unwrap()["canonical_new_names"],
+            serde_json::json!([]),
+            "V1 stores only the first name admission even when a definition is refreshed"
+        );
+        storage.save_session(&restored).await.unwrap();
+        drop(storage);
+
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut restored = storage.load_session(&restored.id).await.unwrap().unwrap();
+        assert!(
+            effective_callable_set_for_round(&restored, changed_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        assert!(
+            !effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        let reverted = request_tool_schemas_for_loading_mode(&restored, old_catalog, mode, true);
+        assert!(reverted
+            .iter()
+            .all(|schema| schema.function.name != tool_name));
+        let rollback_history = super::projected_sticky_fallback_results(
+            &restored,
+            old_catalog,
+            reverted.as_ref(),
+            mode,
+        );
+        assert_eq!(
+            rollback_history[&original_result.id].1,
+            "The previously discovered tools are unavailable for this request."
+        );
+        assert!(sticky_fallback_definition_delta(&restored, changed_catalog)
+            .unwrap()
+            .is_empty());
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-reverted"),
+            &mut restored,
+            &config,
+            old_catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sticky_result_definition_values(restored.messages.last().unwrap()).unwrap(),
+            vec![serde_json::to_value(&old_schema).unwrap()]
+        );
+        assert!(
+            effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
         );
     }
 

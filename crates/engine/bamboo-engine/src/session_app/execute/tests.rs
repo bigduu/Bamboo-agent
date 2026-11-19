@@ -389,6 +389,43 @@ fn pending_user_message_false_when_last_is_assistant() {
 }
 
 #[test]
+fn paced_loop_runtime_input_cannot_be_resumed_as_a_human_turn() {
+    use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
+    use bamboo_domain::{
+        SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+        SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+    };
+
+    let mut session = make_session("test-model");
+    let delivery = SessionMessageEnvelope {
+        id: SessionMessageId::new(),
+        source: SessionMessageSource::Runtime {
+            subsystem: PACED_LOOP_SUBSYSTEM.into(),
+        },
+        target_session_id: session.id.clone(),
+        kind: SessionMessageKind::RuntimeInstruction,
+        body: SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+            instruction: PACED_LOOP_INSTRUCTION.into(),
+            content: Some(SessionMessageContent::text("Check the build")),
+            data: None,
+            provider_message: None,
+        }),
+        created_at: chrono::Utc::now(),
+        thread_id: None,
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: None,
+    };
+    let message = delivery.to_provider_message().unwrap();
+    assert!(bamboo_domain::session::is_system_resume_message(&message));
+    assert!(!delivery.is_human_interactive_input());
+    session.add_message(message);
+    assert!(!has_pending_user_message(&session));
+    session.add_message(Message::user("Check test results instead"));
+    assert!(has_pending_user_message(&session));
+}
+
+#[test]
 fn pending_user_message_false_when_empty() {
     let session = Session::new("test", "gpt-4");
     assert!(!has_pending_user_message(&session));

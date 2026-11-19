@@ -24,7 +24,7 @@ use bamboo_llm::ProviderModelRouter;
 use crate::runtime::Agent;
 
 use super::agent_spawn::SessionExecutionReservation;
-use super::child_completion::{ChildCompletion, ChildCompletionHandler};
+use super::child_completion::{ChildCompletion, ChildCompletionHandler, ChildCompletionSource};
 use super::runner_state::AgentRunner;
 
 /// A process-local Host admission check, evaluated at the synchronous queue
@@ -465,13 +465,22 @@ pub struct SpawnContext {
 }
 
 impl SpawnContext {
+    pub(crate) fn session_account_feed(&self) -> super::event_forwarder::SessionAccountFeed {
+        super::event_forwarder::SessionAccountFeed::for_host(
+            self.account_feed_inbox.clone(),
+            self.completion_handler
+                .as_deref()
+                .and_then(|handler| handler.child_completion_account_sink()),
+        )
+    }
+
     pub(crate) fn replayable_event_publisher(
         &self,
     ) -> super::session_events::ReplayableSessionEventPublisher {
         super::session_events::ReplayableSessionEventPublisher::new(
             self.agent_runners.clone(),
             self.session_event_senders.clone(),
-            self.account_feed_inbox.clone(),
+            self.session_account_feed(),
         )
     }
 }
@@ -1078,8 +1087,13 @@ pub(crate) async fn publish_child_completion(
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
 ) {
+    let completion_id = completion
+        .source
+        .as_ref()
+        .filter(|source| source.matches_completion(&completion))
+        .and_then(ChildCompletionSource::account_event_id);
     publisher
-        .publish(
+        .publish_with_completion_id(
             &completion.parent_session_id,
             AgentEvent::SubAgentCompleted {
                 parent_session_id: completion.parent_session_id.clone(),
@@ -1087,6 +1101,7 @@ pub(crate) async fn publish_child_completion(
                 status: completion.status.clone(),
                 error: completion.error.clone(),
             },
+            completion_id,
         )
         .await;
 
@@ -1636,7 +1651,9 @@ mod launch_hook_tests {
         let (sender, mut receiver) = broadcast::channel(4);
         senders.write().await.insert("parent".to_string(), sender);
         let publisher = super::super::session_events::ReplayableSessionEventPublisher::new(
-            runners, senders, None,
+            runners,
+            senders,
+            super::super::event_forwarder::SessionAccountFeed::Legacy(None),
         );
         // Reproduce the precise post-publish, pre-ack producer loss: the
         // worker observes a closed announcement channel, but Start is already

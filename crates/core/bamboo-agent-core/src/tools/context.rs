@@ -22,6 +22,29 @@ use uuid::Uuid;
 tokio::task_local! {
     static ROOT_ACTOR_TOOL_WRITER: Option<bamboo_domain::RootActorRuntimeWrite>;
     static EXECUTING_SESSION_CALLER: Option<Arc<SessionCallerReference>>;
+    static ROOT_HUMAN_TOOL_INPUT: std::cell::RefCell<Option<bamboo_domain::SessionInboxReceipt>>;
+}
+
+pub use bamboo_domain::SESSION_LOOP_TOOL_NAME;
+
+/// Lend one freshly admitted Human receipt to its exact provider tool dispatch.
+#[doc(hidden)]
+pub async fn with_root_human_tool_input<F: std::future::Future>(
+    receipt: Option<bamboo_domain::SessionInboxReceipt>,
+    dispatch: F,
+) -> F::Output {
+    ROOT_HUMAN_TOOL_INPUT
+        .scope(std::cell::RefCell::new(receipt), dispatch)
+        .await
+}
+
+/// Take the one receipt in this call's scope. Host code must still validate
+/// its original Root writer and canonical input before applying a mutation.
+pub fn root_human_tool_input() -> Option<bamboo_domain::SessionInboxReceipt> {
+    ROOT_HUMAN_TOOL_INPUT
+        .try_with(|receipt| receipt.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 /// Carry the observation captured by real dispatch, never an authorization.
@@ -839,6 +862,29 @@ mod session_flags_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn root_human_tool_input_is_single_use_and_does_not_escape_dispatch() {
+        let receipt = bamboo_domain::SessionInboxReceipt {
+            id: bamboo_domain::SessionMessageId::parse("human-input").unwrap(),
+            generation: 7,
+        };
+        assert!(root_human_tool_input().is_none());
+        with_root_human_tool_input(Some(receipt.clone()), async {
+            with_root_human_tool_input(None, async {
+                assert!(root_human_tool_input().is_none());
+            })
+            .await;
+            assert!(tokio::spawn(async { root_human_tool_input() })
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(root_human_tool_input(), Some(receipt));
+            assert!(root_human_tool_input().is_none());
+        })
+        .await;
+        assert!(root_human_tool_input().is_none());
+    }
 
     #[tokio::test]
     async fn emit_does_not_block_when_channel_is_full() {
