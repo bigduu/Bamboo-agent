@@ -510,6 +510,18 @@ impl SessionStoreV2 {
                 .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
             || latest.last_run_status().as_deref() != Some("suspended")
             || state.waiting_for_bash.is_some()
+            || latest
+                .metadata
+                .get("runtime.suspend_reason")
+                .is_some_and(|reason| reason != "waiting_for_children")
+            || state
+                .suspension
+                .as_ref()
+                .is_some_and(|suspension| suspension.reason != "waiting_for_children")
+            || state
+                .plan_mode
+                .as_ref()
+                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval)
             || state.run_id != expiry.run_id
             || state.waiting_for_children.as_ref() != Some(&expiry.wait)
             || !expiry.matches_lifetime(&latest)

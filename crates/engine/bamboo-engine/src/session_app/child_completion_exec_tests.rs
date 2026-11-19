@@ -1050,7 +1050,10 @@ async fn background_exec_owned_actor_preserves_native_human_receipt_selection() 
 
 #[tokio::test]
 async fn owned_child_wait_expiry_survives_commit_before_activation() {
-    use bamboo_domain::{ActorActivationFinish, ChildWaitExpiry, CommittedChildWaitExpiry};
+    use bamboo_domain::{
+        ActorActivationFinish, ChildWaitExpiry, CommittedChildWaitExpiry, PlanModeState,
+        PlanModeStatus, SuspensionState,
+    };
 
     let (temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
     for case in [
@@ -1068,6 +1071,9 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
         "wrong_record",
         "wrong_envelope",
         "human_gate",
+        "legacy_hook_gate",
+        "structured_hook_gate",
+        "plan_gate",
         "managed_work",
     ] {
         let promoted_case = matches!(case, "promoted_stale" | "promoted_malformed");
@@ -1083,6 +1089,14 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
             now - chrono::Duration::hours(7),
         );
         runtime.status = AgentStatusState::Suspended;
+        if case == "committed" {
+            runtime.suspension = Some(SuspensionState {
+                reason: "waiting_for_children".into(),
+                suspended_at: wait.registered_at,
+                resumable: true,
+                hook_point: None,
+            });
+        }
         let mut recorded_wait = wait.clone();
         if case == "changed_wait" {
             recorded_wait.child_session_ids.push("new-child".into());
@@ -1210,23 +1224,57 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
                     .unwrap();
             }
         }
-        if matches!(case, "human_gate" | "managed_work") {
+        if matches!(
+            case,
+            "human_gate"
+                | "legacy_hook_gate"
+                | "structured_hook_gate"
+                | "plan_gate"
+                | "managed_work"
+        ) {
             let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
-            if case == "human_gate" {
-                latest.pending_question = Some(bamboo_domain::PendingQuestion {
-                    tool_call_id: "later-human-question".into(),
-                    tool_name: "AskUserQuestion".into(),
-                    question: "Choose whether to continue".into(),
-                    options: vec!["Continue".into(), "Stop".into()],
-                    allow_custom: false,
-                    source: Default::default(),
-                });
-            } else {
-                latest.metadata.insert(
-                    crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
-                    "{}".into(),
-                );
+            let mut current = read_runtime_state(&latest);
+            match case {
+                "human_gate" => {
+                    latest.pending_question = Some(bamboo_domain::PendingQuestion {
+                        tool_call_id: "later-human-question".into(),
+                        tool_name: "AskUserQuestion".into(),
+                        question: "Choose whether to continue".into(),
+                        options: vec!["Continue".into(), "Stop".into()],
+                        allow_custom: false,
+                        source: Default::default(),
+                    });
+                }
+                "legacy_hook_gate" => {
+                    latest
+                        .metadata
+                        .insert("runtime.suspend_reason".into(), "hook_suspended".into());
+                }
+                "structured_hook_gate" => {
+                    current.suspension = Some(SuspensionState {
+                        reason: "hook_suspended".into(),
+                        suspended_at: now,
+                        resumable: false,
+                        hook_point: None,
+                    });
+                }
+                "plan_gate" => {
+                    current.plan_mode = Some(PlanModeState {
+                        entered_at: now,
+                        pre_permission_mode: "default".into(),
+                        plan_file_path: None,
+                        status: PlanModeStatus::AwaitingApproval,
+                    });
+                }
+                "managed_work" => {
+                    latest.metadata.insert(
+                        crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+                        "{}".into(),
+                    );
+                }
+                _ => unreachable!(),
             }
+            write_runtime_state(&mut latest, &current);
             store.save_session(&latest).await.unwrap();
         }
         let prior_history = tokio::fs::read(&main).await.unwrap();
@@ -1261,9 +1309,33 @@ async fn owned_child_wait_expiry_survives_commit_before_activation() {
                 Some(recorded_wait)
             );
             assert!(CommittedChildWaitExpiry::from_session(&control).is_none());
-            if case == "human_gate" {
-                let full = reopened.load_session(&root.id).await.unwrap().unwrap();
-                assert!(full.has_pending_question());
+            match case {
+                "human_gate" => {
+                    let full = reopened.load_session(&root.id).await.unwrap().unwrap();
+                    assert!(full.has_pending_question());
+                }
+                "legacy_hook_gate" => {
+                    assert_eq!(
+                        control
+                            .metadata
+                            .get("runtime.suspend_reason")
+                            .map(String::as_str),
+                        Some("hook_suspended"),
+                    );
+                }
+                "structured_hook_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).suspension.unwrap().reason,
+                        "hook_suspended",
+                    );
+                }
+                "plan_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).plan_mode.unwrap().status,
+                        PlanModeStatus::AwaitingApproval,
+                    );
+                }
+                _ => {}
             }
             assert!(inbox
                 .inspect_wake_readiness(&root.id, now)
