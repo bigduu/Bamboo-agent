@@ -43,6 +43,25 @@ impl Session {
         }
     }
 
+    /// Project child and command waits from the current field or legacy mirror.
+    pub fn persisted_wait_presence(&self) -> (bool, bool) {
+        let presence = |state: &AgentRuntimeState| {
+            (
+                state.waiting_for_children.is_some(),
+                state.waiting_for_bash.is_some(),
+            )
+        };
+        self.agent_runtime_state
+            .as_ref()
+            .map(presence)
+            .or_else(|| {
+                let state: AgentRuntimeState =
+                    serde_json::from_str(self.metadata.get("agent.runtime.state")?).ok()?;
+                Some(presence(&state))
+            })
+            .unwrap_or_default()
+    }
+
     /// A completed activation may have handed execution to a durable wait.
     /// Neither a successful Worker return nor an absent runner clears it.
     pub fn has_runtime_wait(&self) -> bool {

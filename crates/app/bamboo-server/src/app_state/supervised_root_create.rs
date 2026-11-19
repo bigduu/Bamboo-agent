@@ -10,8 +10,7 @@ use bamboo_agent_core::workspace_state::{
     preview_default_session_workspace_dir, preview_pin_workspace_path,
 };
 use bamboo_domain::{
-    RootThinkingMode, Session, SessionActivationDisposition, SessionPermissionMode, Storage,
-    SupervisorReference,
+    RootThinkingMode, Session, SessionActivationDisposition, Storage, SupervisorReference,
 };
 use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
 use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
@@ -176,7 +175,7 @@ impl SupervisedRootCreator {
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. Workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. An observed dispatch starts the new Session in the Supervisor's current permission mode. After creation each worker owns its tool and approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
@@ -357,7 +356,14 @@ impl SupervisedRootCreator {
         let mut operation = existing.unwrap_or_else(|| {
             let mut operation =
                 SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id);
-            if !authority.is_host() && managed.is_none() {
+            if matches!(
+                authority,
+                CreationAuthority::Supervisor {
+                    original_caller: None,
+                    ..
+                }
+            ) && managed.is_none()
+            {
                 operation.supervisor_execution_permission_mode = Some(
                     bamboo_orchestration::managed_session::DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
                 );
@@ -455,16 +461,14 @@ impl SupervisedRootCreator {
                     let reserved = &mut operation;
                     let worker = &mut candidate;
                     self.store
-                        .with_supervisor_dispatch_consent(caller, |auto| async move {
-                            if auto {
-                                reserved.supervisor_execution_permission_mode =
-                                    Some(SessionPermissionMode::Auto);
-                                worker
-                                    .agent_runtime_state
-                                    .get_or_insert_with(Default::default)
-                                    .set_permission_mode(SessionPermissionMode::Auto);
-                            }
-                            self.operations.save(reserved).await
+                        .with_supervisor_dispatch_permission_mode(caller, |mode| async move {
+                            reserved.supervisor_execution_permission_mode = Some(mode);
+                            self.operations.save(reserved).await?;
+                            worker
+                                .agent_runtime_state
+                                .get_or_insert_with(Default::default)
+                                .set_permission_mode(mode);
+                            Ok(())
                         })
                         .await
                 }

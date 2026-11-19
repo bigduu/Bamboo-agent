@@ -2901,7 +2901,8 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// - records are created `Open`, tagged `suggested`, attributed to
 ///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
 ///   reminders are created for suggested records (no schedule-bridge
-///   involvement) — the agenda renders them for confirmation.
+///   involvement). Confirmation removes the `suggested` tag before the agenda
+///   includes the record.
 async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
