@@ -5902,11 +5902,9 @@ impl App {
                 if let Some(watch) = self.chat.loop_watch.as_mut() {
                     watch.attached_run = Some(run_id.clone());
                     watch.draining = draining;
-                    watch.question_recovery = if has_pending_question {
-                        LoopQuestionRecovery::Requested
-                    } else {
-                        LoopQuestionRecovery::None
-                    };
+                    // The run can suspend after the summary read and before
+                    // this late subscription gets its first pending snapshot.
+                    watch.question_recovery = LoopQuestionRecovery::Requested;
                 }
                 self.chat
                     .run_status
@@ -24570,11 +24568,11 @@ mod question_tests {
                 ("/api/v1/sessions/loop-session", completed),
                 (
                     "/api/v1/sessions/loop-session/loop",
-                    r#"{"session_id":"loop-session","loop":{"id":"loop-1","state":"scheduled","last_run_id":"second","last_run_status":"suspended"}}"#,
+                    r#"{"session_id":"loop-session","loop":{"id":"loop-1","state":"scheduled","last_run_id":"second","last_run_status":"running"}}"#,
                 ),
                 (
                     "/api/v1/sessions/loop-session",
-                    r#"{"session":{"id":"loop-session","has_pending_question":true,"last_run_status":"suspended"}}"#,
+                    r#"{"session":{"id":"loop-session","is_running":true}}"#,
                 ),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -24592,6 +24590,8 @@ mod question_tests {
                 .await
                 .unwrap();
             sse.flush().await.unwrap();
+            // The second run suspended after its running summary, so the
+            // first pending GET after the late attach must be recoverable.
             let mut failed_pending_read = false;
             for _ in 0..3 {
                 let (mut socket, _) = listener.accept().await.unwrap();
