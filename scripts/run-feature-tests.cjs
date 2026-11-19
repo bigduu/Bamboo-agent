@@ -188,9 +188,22 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2807 changes guidance assembly in the feature-sensitive stream runner.
 // Guide/cache cases stay in default Engine/packages-3. The token-usage-log
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
-// #2831 changes the default Storage save path. Supervisor dispatch consent
-// cases stay in the default Server owners; all 20 additive cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "55611f5e748bb53f8f14eba71acfdabc7547c1961e47755d3a18c1c52cc385d5";
+// #2850 retires the separate consent check in the default Storage save path.
+// Supervisor inheritance cases use the existing Server test owners.
+// #2447 keeps session activity API cases in server-handlers and runtime-only
+// wait projection and index rebuild cases in the default Storage packages-0
+// owner. No feature declarations or additive catalog entries changed.
+// #2868 binds deferred Runtime startup to its exact Inbox generation.
+// The real Actor regressions use default Engine packages-3. Storage and
+// Domain remain on their existing owners. The additive catalog is unchanged.
+// #2867 keeps reserved expiry receipts private through staging and startup.
+// Its expiry, interruption and rejection coverage belongs to the default
+// Engine packages-3 owner. Storage's feature-sensitive closure changes,
+// while its default owner and the additive cases stay unchanged.
+// #2851 keeps paced Loop host/HTTP tests in default server-app-state and
+// server-handlers. The #2875 Runtime append and wait regressions belong
+// to the existing Engine packages-3 owner.
+const FEATURE_SOURCE_SHA256 = "c1bdfa876a4a6c515e1f38b8b193a96baed27c5e80c3b32411d27fe294c18eb8";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

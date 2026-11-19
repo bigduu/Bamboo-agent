@@ -312,7 +312,8 @@ const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 2;
 /// must remove every target projection before exposing the store.
 const SESSION_COPY_TRANSACTION_DIR: &str = ".session-copy-transactions";
 const SESSION_COPY_TRANSACTION_VERSION: u32 = 1;
-const SESSIONS_INDEX_VERSION: u32 = 4;
+// The rebuild reprojects wait presence for sessions saved before it was indexed.
+const SESSIONS_INDEX_VERSION: u32 = 5;
 
 /// Filename of the append-only per-LLM-call token-usage log, stored alongside
 /// `session.json` in each session directory. One JSON line per call.
@@ -763,6 +764,10 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     snapshot
         .metadata
         .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    // A paced outcome must commit with its final transcript in Main.
+    snapshot
+        .metadata
+        .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
     // Native transcript groups are committed atomically with the ordinary
     // message that anchors them. Never let runtime.json expose a load/search
     // item without the corresponding session.json history boundary.
@@ -791,6 +796,16 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
         Some(mut side) => {
             side.observe_main_session_version(main.session_version);
             crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+            let paced_outcome_key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
+            match main.metadata.get(paced_outcome_key) {
+                Some(outcome) => {
+                    side.metadata
+                        .insert(paced_outcome_key.into(), outcome.clone());
+                }
+                None => {
+                    side.metadata.remove(paced_outcome_key);
+                }
+            }
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1142,6 +1157,19 @@ pub struct SessionIndexEntry {
     /// Absent on older index rows or Sessions with no pending question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_material_run: Option<bool>,
+    /// Whether this session has yielded to a delegated child, mirrored from
+    /// `session.agent_runtime_state.waiting_for_children`. A yielding Root stops
+    /// counting as a running runner, so without this mirror a list read cannot
+    /// tell "delegating" apart from "idle" — the two windows are the delegation
+    /// wait itself and the gap between the last child finishing and this Root
+    /// resuming. Only presence is mirrored; the awaited ids stay in session.json.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_children: bool,
+    /// Whether this session has yielded to a background shell, mirrored from
+    /// `session.agent_runtime_state.waiting_for_bash`. The shell's result resumes
+    /// the run, so the wait is live work even though no runner is executing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_bash: bool,
     /// Latest canonical Human UI engagement mark, mirrored from
     /// `session.agent_runtime_state.last_human_input`. Absent means no human
     /// input was admitted through the interactive route since creation. This is
@@ -1855,7 +1883,10 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    bamboo_domain::CHILD_WAIT_EXPIRY_RECEIPT_KEY,
     bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
+    bamboo_domain::session::PACED_LOOP_METADATA_KEY,
+    bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY,
     "runtime.host_run_id",
     "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
@@ -3933,6 +3964,41 @@ impl SessionStoreV2 {
         Ok(())
     }
 
+    /// Scheduling hint read by the Inbox under its retained lifecycle scope.
+    /// It must not acquire Task or Session guards in reverse Inbox order.
+    pub(crate) async fn actor_inbox_target_birth_under_lifecycle(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<DateTime<Utc>>> {
+        let Some(session) = self
+            .load_runtime_control_plane_unchecked(session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .root_actor_input_required(&session)
+            .await?
+            .then_some(session.created_at))
+    }
+
+    pub(crate) async fn child_wait_expiry_birth_under_lifecycle(
+        &self,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+        generation: u64,
+    ) -> io::Result<Option<DateTime<Utc>>> {
+        let Some(session) = self
+            .load_runtime_control_plane_unchecked(&envelope.target_session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            bamboo_domain::CommittedChildWaitExpiry::matches_input(&session, envelope, generation)
+                .then_some(session.created_at),
+        )
+    }
+
     async fn load_runtime_control_plane_unchecked(
         &self,
         session_id: &str,
@@ -5996,6 +6062,7 @@ impl SessionStoreV2 {
                     .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
             })
         });
+        let (waiting_for_children, waiting_for_bash) = session.persisted_wait_presence();
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -6024,6 +6091,8 @@ impl SessionStoreV2 {
             has_attachments,
             has_pending_question,
             pending_material_run,
+            waiting_for_children,
+            waiting_for_bash,
             last_human_input,
             plan_mode,
             bypass_permissions,
@@ -6457,6 +6526,77 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Compare and set only the paced-loop record of an existing ordinary Root.
+    /// Reload under the same writer locks as normal Session saves so another
+    /// Host cannot replace the record or change the Session before publication.
+    pub async fn save_paced_loop_metadata(
+        &self,
+        expected: &Session,
+        value: String,
+    ) -> io::Result<Session> {
+        self.save_paced_loop_metadata_with_owner(expected, value, None)
+            .await
+    }
+
+    /// Apply a model-initiated loop change under its executing Root writer.
+    pub async fn save_paced_loop_metadata_with_owner(
+        &self,
+        expected: &Session,
+        value: String,
+        owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> io::Result<Session> {
+        use bamboo_domain::session::{SessionCallerReference, PACED_LOOP_METADATA_KEY};
+
+        let caller = SessionCallerReference::from(expected);
+        if !caller.is_ordinary_root() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "paced loop requires an ordinary Root",
+            ));
+        }
+        let id = &expected.id;
+        validate_session_id(id)?;
+        let missing = || io::Error::new(io::ErrorKind::NotFound, "paced loop Session not found");
+        let started = Instant::now();
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        if !self.root_has_birth_files(id).await? {
+            return Err(missing());
+        }
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self.acquire_session_write_lock(id, SaveKind::Full).await?;
+        let directory = self.sessions_dir.join(id);
+        let proof = owner.map(|owner| {
+            root_actor_runtime::RootActorWriteProof::new(directory.clone(), owner.clone())
+        });
+        let guards =
+            DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        let current = self
+            .load_session_from_dir_strict(&directory, id, SessionKind::Root, id)
+            .await?
+            .ok_or_else(missing)?;
+        if !caller.matches_session(&current)
+            || current.project_id_meta() != expected.project_id_meta()
+            || current.metadata.get(PACED_LOOP_METADATA_KEY)
+                != expected.metadata.get(PACED_LOOP_METADATA_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "paced loop Session authority or record changed",
+            ));
+        }
+        self.save_session_after_lock_with_presentation_intent(
+            &current,
+            started,
+            &guards,
+            None,
+            None,
+            Some(value),
+        )
+        .await?;
+        self.load_session_from_dir_strict(&directory, id, SessionKind::Root, id)
+            .await?
+            .ok_or_else(missing)
+    }
+
     pub async fn clear_session(&self, session_id: &str) -> io::Result<bool> {
         validate_session_id(session_id)?;
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
@@ -6520,6 +6660,13 @@ impl SessionStoreV2 {
         // Clearing history invalidates derived context state.
         session.token_usage = None;
         session.conversation_summary = None;
+        // A scheduled prompt belongs to the conversation that authorized it.
+        session
+            .metadata
+            .remove(bamboo_domain::session::PACED_LOOP_METADATA_KEY);
+        session
+            .metadata
+            .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
         session.updated_at = Utc::now();
 
         // One started job owns cleanup and the resulting canonical files.
@@ -7633,18 +7780,25 @@ impl SessionStoreV2 {
             .await?;
         stages.filesystem_commit = filesystem_started.elapsed();
 
-        // Workspace and Project ownership are part of the list/index API
-        // contract. Runtime updates must therefore be reflected without waiting
-        // for a later full session save. Avoid rewriting the global index when
-        // neither normalized value changed.
+        // Reflect runtime-only changes to fields exposed by the list API.
         let workspace_path = session
             .workspace_path_meta()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
-            entry.workspace_path != workspace_path || entry.project_id != project_id
-        });
+        let waits = runtime_snapshot.persisted_wait_presence();
+        // A different store may have registered a wait after this store
+        // cached its index. Compare the previous durable sidecar too, so a
+        // clear still updates the shared row when our cached row says no wait.
+        let waits_changed = previous
+            .as_ref()
+            .is_none_or(|saved| saved.persisted_wait_presence() != waits);
+        let runtime_index_changed = waits_changed
+            || self.get_index_entry(&session.id).await.is_none_or(|entry| {
+                entry.workspace_path != workspace_path
+                    || entry.project_id != project_id
+                    || (entry.waiting_for_children, entry.waiting_for_bash) != waits
+            });
         if runtime_index_changed {
             let index_started = Instant::now();
             let index_updated = self
@@ -7652,6 +7806,7 @@ impl SessionStoreV2 {
                     if let Some(entry) = index.sessions.get_mut(&session.id) {
                         entry.workspace_path = workspace_path;
                         entry.project_id = project_id;
+                        (entry.waiting_for_children, entry.waiting_for_bash) = waits;
                         return Ok(true);
                     }
                     Ok(false)
@@ -7721,6 +7876,7 @@ impl SessionStoreV2 {
             guards,
             answer_permit,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -7733,6 +7889,7 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
         mutation: Option<SessionPresentationMutation>,
+        paced_loop: Option<String>,
     ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
@@ -7747,9 +7904,15 @@ impl SessionStoreV2 {
 
         self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
-        let normalized = self
+        let mut normalized = self
             .normalize_terminal_runtime_write(session, &intended_rel, guards)
             .await?;
+        if let Some(value) = paced_loop {
+            normalized.metadata.insert(
+                bamboo_domain::session::PACED_LOOP_METADATA_KEY.into(),
+                value,
+            );
+        }
         let session = &normalized;
         self.check_default_or_root_actor_context(
             session,
@@ -7759,11 +7922,7 @@ impl SessionStoreV2 {
         )
         .await?;
         self.validate_authority_for_save(session).await?;
-        self.validate_root_context_for_full_save(
-            session,
-            guards.writes_supervisor_execution_profile(),
-        )
-        .await?;
+        self.validate_root_context_for_full_save(session).await?;
         self.validate_child_project_for_write(session, true, None)
             .await?;
         self.reject_regressing_runtime_task(session).await?;
@@ -7833,6 +7992,31 @@ impl SessionStoreV2 {
         };
 
         if let Some(previous) = previous_main.as_ref() {
+            let key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
+            let owns_paced_outcome = guards.root_outcome_finalized
+                && guards.root_actor.as_ref().is_some_and(|actor| {
+                    normalized
+                        .metadata
+                        .get(key)
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|outcome| {
+                            outcome["run_id"].as_str() == Some(actor.owner().fence.run_id.as_str())
+                        })
+                });
+            if !owns_paced_outcome {
+                match previous.metadata.get(key) {
+                    Some(outcome) => {
+                        normalized.metadata.insert(key.into(), outcome.clone());
+                    }
+                    None => {
+                        normalized.metadata.remove(key);
+                    }
+                }
+            }
+        }
+        let session = &normalized;
+
+        if let Some(previous) = previous_main.as_ref() {
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
             let prior = previous.metadata.get(marker_key);
             let proposed = session.metadata.get(marker_key);
@@ -7892,8 +8076,11 @@ impl SessionStoreV2 {
             })?;
             let mut outcomes = if let Some(input) = guards.input.clone() {
                 let durable = durable.clone();
-                Self::default_writer_job(guards, move || input.outcomes_after_input(&durable))
-                    .await?
+                let runtime = previous_sidecar.clone();
+                Self::default_writer_job(guards, move || {
+                    input.outcomes_after_input(&durable, runtime.as_ref())
+                })
+                .await?
             } else {
                 durable_outcomes.cloned()
             };
@@ -8334,6 +8521,7 @@ impl Storage for SessionStoreV2 {
                 &guards,
                 None,
                 Some(mutation),
+                None,
             )
             .await?;
         Ok(committed.expect("presentation transaction returns its committed candidate"))
@@ -9154,6 +9342,30 @@ impl Storage for SessionStoreV2 {
         publish: bamboo_domain::RootActorRuntimePublisher,
     ) -> io::Result<bool> {
         self.compare_exchange_child_wait(expected, updated, runtime_only, publish)
+            .await
+    }
+
+    async fn root_child_wait_requires_owned_expiry(&self, session: &Session) -> io::Result<bool> {
+        self.root_actor_input_required(session).await
+    }
+
+    async fn observe_root_child_wait_expiry_activation(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<String>> {
+        self.child_wait_expiry_activation_id(session, run_id).await
+    }
+
+    async fn expire_root_child_wait_control_plane(
+        &self,
+        expected: &Session,
+        committed: &bamboo_domain::CommittedChildWaitExpiry,
+        inbox: &dyn bamboo_domain::SessionInboxPort,
+        now: DateTime<Utc>,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        self.expire_root_child_wait(expected, committed, inbox, now, publish)
             .await
     }
 
@@ -11433,6 +11645,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v4_index_rebuilds_session_activity_waits_from_runtime_sidecars() -> io::Result<()> {
+        use bamboo_domain::{
+            AgentRuntimeState, ChildWaitPolicy, WaitingForBashState, WaitingForChildrenState,
+        };
+
+        let home = TempDir::new()?;
+        let path = home.path().to_path_buf();
+        let now = Utc::now();
+        {
+            let storage = SessionStoreV2::new(path.clone()).await?;
+            let mut shell = Session::new("shell-wait", "m");
+            storage.save_session(&shell).await?;
+            let mut shell_runtime = AgentRuntimeState::new("shell-run");
+            shell_runtime.waiting_for_bash =
+                Some(WaitingForBashState::for_bash(vec!["shell".into()], now));
+            shell.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(&shell_runtime)?,
+            );
+            storage.save_runtime_state(&shell).await?;
+            assert!(
+                storage
+                    .get_index_entry("shell-wait")
+                    .await
+                    .unwrap()
+                    .waiting_for_bash
+            );
+
+            let mut parent = Session::new("child-wait", "m");
+            let mut parent_runtime = AgentRuntimeState::new("child-run");
+            parent_runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                vec!["child".into()],
+                ChildWaitPolicy::All,
+                now,
+            ));
+            parent.agent_runtime_state = Some(parent_runtime);
+            storage.save_session(&parent).await?;
+        }
+
+        let index_path = path.join("sessions.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index_path).await?)?;
+        index["version"] = serde_json::json!(4);
+        for entry in index["sessions"].as_object_mut().unwrap().values_mut() {
+            let fields = entry.as_object_mut().unwrap();
+            fields.remove("waiting_for_children");
+            fields.remove("waiting_for_bash");
+        }
+        tokio::fs::write(&index_path, serde_json::to_vec(&index)?).await?;
+
+        let storage = SessionStoreV2::new(path).await?;
+        let shell = storage.get_index_entry("shell-wait").await.unwrap();
+        let parent = storage.get_index_entry("child-wait").await.unwrap();
+        assert!(shell.waiting_for_bash);
+        assert!(!shell.waiting_for_children);
+        assert!(parent.waiting_for_children);
+        assert!(!parent.waiting_for_bash);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn v3_index_migrates_project_ids_from_root_and_child_sessions() -> io::Result<()> {
         let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
@@ -12127,6 +12400,169 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let entry = storage.get_index_entry("nonexistent").await;
         assert!(entry.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_metadata_cas_preserves_a_live_actor_and_rejects_a_stale_host(
+    ) -> io::Result<()> {
+        use bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+
+        let (storage, home) = create_temp_storage().await?;
+        let mut root = Session::new("paced-loop-live", "test-model");
+        root.add_message(Message::user("existing history"));
+        storage.save_session(&root).await?;
+        let other_host = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        let now = Utc::now();
+        let activation = storage
+            .claim_activation(&ActorActivationClaim {
+                actor_id: root.id.clone(),
+                run_id: "live-run".into(),
+                lease_owner: "owner".into(),
+                lease_expires_at: now + chrono::Duration::minutes(5),
+                inbox_generation: 0,
+                placement_ref: None,
+                now,
+            })
+            .await
+            .map_err(io::Error::other)?;
+        storage
+            .start_activation(&activation.fence(), now)
+            .await
+            .map_err(io::Error::other)?;
+
+        let (first, second) = tokio::join!(
+            storage.save_paced_loop_metadata(&root, "first".into()),
+            other_host.save_paced_loop_metadata(&root, "second".into())
+        );
+        let (saved, stale) = match (first, second) {
+            (Ok(saved), Err(stale)) | (Err(stale), Ok(saved)) => (saved, stale),
+            result => panic!("one writer must win the exact compare-and-set: {result:?}"),
+        };
+        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(saved.messages[0].content, "existing history");
+        let stopped = storage
+            .save_paced_loop_metadata(&saved, "stopped".into())
+            .await?;
+        assert_eq!(
+            stopped
+                .metadata
+                .get(PACED_LOOP_METADATA_KEY)
+                .map(String::as_str),
+            Some("stopped")
+        );
+        assert_eq!(stopped.metadata_version, root.metadata_version);
+        // Bypass the process-local merge and submit the older snapshot to a
+        // separate V2 owner. Both physical save paths must keep the stop.
+        other_host.save_session(&saved).await?;
+        other_host.save_runtime_state(&saved).await?;
+        let durable = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(
+            durable.metadata.get(PACED_LOOP_METADATA_KEY),
+            stopped.metadata.get(PACED_LOOP_METADATA_KEY)
+        );
+        let current = storage
+            .inspect_actor(&root.id)
+            .await
+            .map_err(io::Error::other)?;
+        assert_eq!(current.activation.unwrap().fence(), activation.fence());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_outcome_follows_the_main_transcript_checkpoint() -> io::Result<()> {
+        use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY as OUTCOME;
+
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut root = Session::new("paced-loop-main-outcome", "test-model");
+        root.add_message(Message::user("scheduled prompt"));
+        let previous = serde_json::json!({ "run_id": "previous-run", "status": "failed" });
+        root.metadata.insert(OUTCOME.into(), previous.to_string());
+        storage.save_session(&root).await?;
+
+        let completed = serde_json::json!({ "run_id": "scheduled-run", "status": "completed" });
+        root.metadata.insert(OUTCOME.into(), completed.to_string());
+        root.add_message(Message::assistant("scheduled result", None));
+        storage.save_runtime_state(&root).await?;
+
+        let directory = storage.sessions_dir.join(&root.id);
+        let runtime = SessionStoreV2::read_runtime_sidecar_at(
+            &directory.join(RUNTIME_SIDECAR_FILE),
+            &root.id,
+        )
+        .await?
+        .unwrap();
+        assert!(!runtime.metadata.contains_key(OUTCOME));
+        let before_main = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(before_main.metadata[OUTCOME], previous.to_string());
+        assert_eq!(before_main.messages.len(), 1);
+
+        // Cross the existing Main publication boundary without refreshing the
+        // sidecar. Compact Main must carry both the outcome and its transcript.
+        fs::write(
+            directory.join("session.json"),
+            compact_main::serialize_main(&root)?,
+        )
+        .await?;
+        let after_main = storage.load_session(&root.id).await?.unwrap();
+        assert_eq!(after_main.metadata[OUTCOME], completed.to_string());
+        assert_eq!(after_main.messages[1].content, "scheduled result");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_loop_is_removed_from_copied_and_cleared_sessions() -> io::Result<()> {
+        use bamboo_domain::session::{PACED_LOOP_METADATA_KEY, PACED_LOOP_OUTCOME_METADATA_KEY};
+
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut source = Session::new("paced-loop-source", "test-model");
+        source.add_message(Message::user("original context"));
+        source.metadata.insert(
+            PACED_LOOP_OUTCOME_METADATA_KEY.into(),
+            serde_json::json!({ "run_id": "scheduled-run", "status": "completed" }).to_string(),
+        );
+        storage.save_session(&source).await?;
+        storage
+            .save_paced_loop_metadata(&source, "registered".into())
+            .await?;
+
+        let copy = storage
+            .copy_session(&source.id, "paced-loop-copy")
+            .await?
+            .unwrap();
+        assert!(!copy.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(!copy.metadata.contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+        let original = storage.load_session(&source.id).await?.unwrap();
+        assert!(original.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(original
+            .metadata
+            .contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+
+        assert!(storage.clear_session(&source.id).await?);
+        let cleared = storage.load_session(&source.id).await?.unwrap();
+        assert!(!cleared.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert!(!cleared
+            .metadata
+            .contains_key(PACED_LOOP_OUTCOME_METADATA_KEY));
+        assert_eq!(cleared.metadata_version, original.metadata_version);
+        let stale = storage
+            .save_paced_loop_metadata(&original, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::WouldBlock);
+
+        assert!(storage.clear_session(&source.id).await?);
+        let cleared_again = storage.load_session(&source.id).await?.unwrap();
+        assert_eq!(cleared_again.metadata_version, cleared.metadata_version);
+
+        assert!(storage.delete_session_recursive(&source.id, true).await?);
+        let deleted = storage
+            .save_paced_loop_metadata(&cleared_again, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(deleted.kind(), io::ErrorKind::NotFound);
+        assert!(storage.load_session(&source.id).await?.is_none());
         Ok(())
     }
 
