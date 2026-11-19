@@ -44,6 +44,26 @@ pub fn new_record_id() -> String {
     format!("rec_{nanos:x}{seq:03x}")
 }
 
+/// Exact identity for extractor suggestions within one Ledger scope.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct LedgerSuggestionIdentity {
+    title: String,
+    kind: RecordKind,
+    due_at: Option<DateTime<Utc>>,
+    starts_at: Option<DateTime<Utc>>,
+}
+
+impl From<&LedgerRecord> for LedgerSuggestionIdentity {
+    fn from(record: &LedgerRecord) -> Self {
+        Self {
+            title: record.title.trim().to_lowercase(),
+            kind: record.kind.clone(),
+            due_at: record.time.due_at,
+            starts_at: record.time.starts_at,
+        }
+    }
+}
+
 /// Filter for [`LedgerStore::list_records`]. Empty filter = every non-terminal
 /// record.
 #[derive(Debug, Clone, Default)]
@@ -291,9 +311,49 @@ impl LedgerStore {
     /// always bumps `updated_at`.
     pub async fn write_record(
         &self,
-        mut record: LedgerRecord,
+        record: LedgerRecord,
         body: Option<String>,
     ) -> io::Result<LedgerRecordDocument> {
+        let path = self.validated_record_path(&record)?;
+        let lock = self.scope_lock(record.scope, record.project_key.as_deref());
+        let _guard = lock.lock().await;
+        let existing = self.load_record_at(&path).await?;
+        self.write_record_locked(record, body, path, existing).await
+    }
+
+    /// Insert a suggestion only once in this scope. The caller assigns an
+    /// exact source id so that retries still recognize a terminal or edited
+    /// record. Distinct source ids compete only with nonterminal matches.
+    pub async fn insert_extracted_suggestion(&self, record: LedgerRecord) -> io::Result<bool> {
+        let path = self.validated_record_path(&record)?;
+        let scope = record.scope;
+        let project_key = record.project_key.as_deref();
+        let lock = self.scope_lock(scope, project_key);
+        let _guard = lock.lock().await;
+        if self.load_record_at(&path).await?.is_some() {
+            // The original write may have committed the record before a
+            // refresh failed. Repair derived artifacts without rewriting it.
+            self.refresh_scope_artifacts(scope, project_key).await?;
+            return Ok(false);
+        }
+
+        let identity = LedgerSuggestionIdentity::from(&record);
+        let duplicate = self
+            .load_scope_records(scope, project_key)
+            .await?
+            .iter()
+            .any(|existing| {
+                !existing.record.status.is_terminal()
+                    && LedgerSuggestionIdentity::from(&existing.record) == identity
+            });
+        if duplicate {
+            return Ok(false);
+        }
+        self.write_record_locked(record, None, path, None).await?;
+        Ok(true)
+    }
+
+    fn validated_record_path(&self, record: &LedgerRecord) -> io::Result<PathBuf> {
         validate_record_id(&record.id)?;
         validate_record_title(&record.title)?;
         if record.scope == LedgerScope::Project && record.project_key.is_none() {
@@ -302,16 +362,20 @@ impl LedgerStore {
                 "project-scoped records require a project_key",
             ));
         }
-
-        let scope = record.scope;
-        let project_key = record.project_key.clone();
-        let lock = self.scope_lock(scope, project_key.as_deref());
-        let _guard = lock.lock().await;
-
-        let path = self
+        Ok(self
             .resolver
-            .record_path(scope, project_key.as_deref(), &record.id);
-        let existing = self.load_record_at(&path).await?;
+            .record_path(record.scope, record.project_key.as_deref(), &record.id))
+    }
+
+    async fn write_record_locked(
+        &self,
+        mut record: LedgerRecord,
+        body: Option<String>,
+        path: PathBuf,
+        existing: Option<LedgerRecordDocument>,
+    ) -> io::Result<LedgerRecordDocument> {
+        let scope = record.scope;
+        let project_key = record.project_key.as_deref();
         let action = if existing.is_some() {
             "update"
         } else {
@@ -329,16 +393,9 @@ impl LedgerStore {
 
         let rendered = render_record_document(&record, &body)?;
         atomic_write(&path, rendered.as_bytes()).await?;
-        self.refresh_scope_artifacts(scope, project_key.as_deref())
+        self.refresh_scope_artifacts(scope, project_key).await?;
+        self.append_audit(scope, project_key, &record.id, action, &record.title)
             .await?;
-        self.append_audit(
-            scope,
-            project_key.as_deref(),
-            &record.id,
-            action,
-            &record.title,
-        )
-        .await?;
 
         Ok(LedgerRecordDocument { record, body, path })
     }
@@ -682,6 +739,37 @@ mod tests {
             .await
             .unwrap();
         assert!(noop.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_suggestions_share_one_scope_admission() {
+        let dir = tempdir().unwrap();
+        let first_writer = LedgerStore::new(dir.path());
+        let second_writer = LedgerStore::new(dir.path());
+        let suggestion = |id: &str, title: &str| {
+            let mut record = todo(id, title, Some(utc(2026, 8, 1, 9)));
+            record.scope = LedgerScope::Project;
+            record.project_key = Some("project-fixture".into());
+            record.source.created_by = bamboo_domain::ledger::RecordActor::Extractor;
+            record.tags = vec!["suggested".into()];
+            record
+        };
+        let first = suggestion("rec_source_a", "Check the schedule");
+        let second = suggestion("rec_source_b", "  CHECK the schedule  ");
+        let (a, b) = tokio::join!(
+            first_writer.insert_extracted_suggestion(first),
+            second_writer.insert_extracted_suggestion(second)
+        );
+        assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1);
+        let records = first_writer
+            .list_records(
+                LedgerScope::Project,
+                Some("project-fixture"),
+                &RecordFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]
