@@ -423,6 +423,38 @@ impl SessionStoreV2 {
         Ok(!permits_unfenced_context(&record, &marker, Some(session)))
     }
 
+    /// Project the installed, successful attempt. A read outside the physical
+    /// writer only supplies an observation for the definitive check under lock.
+    pub(super) async fn child_wait_expiry_activation_id(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<String>> {
+        let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
+        let (ObservedFile::Bytes(record), ObservedFile::Bytes(marker)) =
+            self.default_actor_observation(&directory).await
+        else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice::<ActorDirectoryEntry>(&record)?;
+        let marker = serde_json::from_slice::<InitializedMarker>(&marker)?;
+        if record.validate().is_err()
+            || !record.actor.matches_session(session)
+            || marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+            || marker.actor_id != session.id
+            || marker.session_created_at != session.created_at
+        {
+            return Ok(None);
+        }
+        Ok(record
+            .activation
+            .filter(|activation| {
+                activation.run_id == run_id
+                    && activation.status == bamboo_domain::ActorActivationStatus::Succeeded
+            })
+            .map(|activation| activation.activation_id))
+    }
+
     /// File presence only selects a lock mode. It grants no identity, repair,
     /// permission or vacancy: the ordinary canonical pair/proof checks remain
     /// mandatory under the final physical writer guards.

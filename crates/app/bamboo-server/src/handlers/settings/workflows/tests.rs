@@ -1353,6 +1353,178 @@ async fn global_workflow_create_update_delete_is_immediate_in_cached_session_vie
 }
 
 #[actix_web::test]
+async fn legacy_workflow_writes_report_file_outcome_when_catalog_refresh_is_under_pressure() {
+    use actix_web::{http::StatusCode, test, web, App};
+    use bamboo_skills::{SkillManager, SkillStoreConfig};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut state = crate::app_state::AppState::new(data.path().to_path_buf())
+        .await
+        .expect("app state");
+    let directory = data.path().join("workflows");
+    std::fs::create_dir_all(&directory).unwrap();
+    let old = "---\ndescription: Published version.\n---\nPrior body\n";
+    let new = "---\ndescription: Committed version.\n---\nCurrent body\n";
+    std::fs::write(directory.join("update.md"), old).unwrap();
+    std::fs::write(directory.join("remove.md"), old).unwrap();
+
+    // Use the normal store without a live watcher so only the HTTP mutations
+    // and explicit reloads below can change this fixture's publication.
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: data.path().join("skills"),
+        project_dir: None,
+        active_mode: None,
+    }));
+    state.skill_manager = manager.clone();
+    let store = manager.store();
+    store.reload_global_workflow_views().await.unwrap();
+    let published = store.workflow_catalog_snapshot().await;
+    for id in ["update", "remove"] {
+        assert!(published.entries.iter().any(|entry| entry.id == id));
+    }
+
+    // Exhaust the real candidate bound with small inputs. It remains exceeded
+    // even after successfully removing one authoritative file.
+    let pressure: Vec<_> = (0..1025)
+        .map(|index| directory.join(format!("pressure-{index}.md")))
+        .collect();
+    for path in &pressure {
+        std::fs::write(path, old).unwrap();
+    }
+    assert!(store
+        .reload_global_workflow_views()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("legacy workflow candidate count exceeds limit"));
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/workflows", web::post().to(super::save_workflow))
+            .route("/workflows/{name}", web::get().to(super::get_workflow))
+            .route(
+                "/workflows/{name}",
+                web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+    let mut save_statuses = Vec::new();
+    for _ in 0..2 {
+        let saved = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/workflows")
+                .set_json(json!({ "name": "update", "content": new }))
+                .to_request(),
+        )
+        .await;
+        save_statuses.push(saved.status());
+        if saved.status().is_success() {
+            let saved: Value = test::read_body_json(saved).await;
+            assert_eq!(saved["success"], true);
+            assert_eq!(saved.get("catalog_revision"), Some(&Value::Null));
+        }
+        let result: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/workflows/update")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(result["content"], new);
+        assert_eq!(store.workflow_catalog_snapshot().await, published);
+    }
+
+    let mut delete_statuses = Vec::new();
+    for _ in 0..2 {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/workflows/remove")
+                .to_request(),
+        )
+        .await;
+        delete_statuses.push(response.status());
+        if response.status().is_success() {
+            let response: Value = test::read_body_json(response).await;
+            assert_eq!(response["success"], true);
+        }
+        assert!(!directory.join("remove.md").exists());
+        assert_eq!(store.workflow_catalog_snapshot().await, published);
+    }
+    assert_eq!(
+        (save_statuses, delete_statuses),
+        (
+            vec![StatusCode::OK; 2],
+            vec![StatusCode::OK, StatusCode::NOT_FOUND]
+        ),
+        "source mutations committed even when the catalog could not refresh",
+    );
+    let removed = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/workflows/remove")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+
+    let blocked = directory.join("blocked.md");
+    std::fs::create_dir(&blocked).unwrap();
+    let failed_write = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/workflows")
+            .set_json(json!({ "name": "blocked", "content": new }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(failed_write.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(blocked.is_dir());
+    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".blocked.")
+    }));
+    assert_eq!(store.workflow_catalog_snapshot().await, published);
+
+    // An I/O error while checking the owned historical adapter prevents the
+    // authoritative delete. The caller still receives a commit failure.
+    let unreadable_adapter = data.path().join("skills/update/SKILL.md");
+    std::fs::create_dir_all(&unreadable_adapter).unwrap();
+    let failed_delete = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri("/workflows/update")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(failed_delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        std::fs::read_to_string(directory.join("update.md")).unwrap(),
+        new
+    );
+    std::fs::remove_dir(&unreadable_adapter).unwrap();
+
+    for path in pressure {
+        std::fs::remove_file(path).unwrap();
+    }
+    store.reload_global_workflow_views().await.unwrap();
+    let recovered = store.workflow_catalog_snapshot().await;
+    assert!(recovered.revision > published.revision);
+    assert!(recovered
+        .entries
+        .iter()
+        .any(|entry| { entry.id == "update" && entry.description == "Committed version." }));
+    assert!(!recovered.entries.iter().any(|entry| entry.id == "remove"));
+}
+
+#[actix_web::test]
 async fn historical_legacy_import_remains_a_workflow_without_rewriting_its_bundle() {
     let data = tempfile::tempdir().expect("data dir");
     let source = data.path().join("workflows/legacy.md");
