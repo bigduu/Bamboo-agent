@@ -847,7 +847,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
-    // Host-owned context (recalled memory, task list, plan state, summary) is
+    // Host-owned context (task list, plan state, summary) is
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
     // Session identity leads this run so a newly seeded ledger places it
