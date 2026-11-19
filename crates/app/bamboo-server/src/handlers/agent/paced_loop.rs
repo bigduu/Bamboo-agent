@@ -150,7 +150,8 @@ pub(crate) fn parse_chat_command(message: &str) -> Option<LoopChatInput> {
     let arg_end = args.find(char::is_whitespace).unwrap_or(args.len());
     let (action, prompt) = args.split_at(arg_end);
     let prompt = prompt.trim_start();
-    let control = match action.to_ascii_lowercase().as_str() {
+    let control_token = action.trim_end_matches(['.', '!', '?', '。', '！', '？']);
+    let control = match control_token.to_ascii_lowercase().as_str() {
         "status" => Some(PacedLoopCommand::Status),
         "stop" => Some(PacedLoopCommand::Stop),
         "resume" => Some(PacedLoopCommand::Resume),
@@ -344,6 +345,7 @@ mod tests {
             "/loop 1h30m check",
             "/loop 18446744073709551615m check",
             "/loop stop extra",
+            "/loop stop! extra",
         ] {
             assert!(
                 matches!(
@@ -353,6 +355,22 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn punctuated_loop_controls_are_not_adaptive_tasks() {
+        assert!(matches!(
+            parse_chat_command("/loop stop!"),
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Stop)))
+        ));
+        assert!(matches!(
+            parse_chat_command("/loop STATUS？"),
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Status)))
+        ));
+        assert!(matches!(
+            parse_chat_command("/loop resume."),
+            Some(LoopChatInput::Control(Ok(PacedLoopCommand::Resume)))
+        ));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
 use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
-use bamboo_domain::{AgentStatusState, PACED_LOOP_WAKEUP_TOOL_NAME};
+use bamboo_domain::{ActorDirectoryEntry, AgentStatusState, PACED_LOOP_WAKEUP_TOOL_NAME};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use chrono::TimeDelta;
 use serde_json::{json, Value};
@@ -346,6 +346,11 @@ impl Fixture {
     }
 
     async fn settled(&self, expected_requests: usize) -> Session {
+        self.wait_for_settle(expected_requests).await;
+        self.session().await
+    }
+
+    async fn wait_for_settle(&self, expected_requests: usize) {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let requested = self.probe.requests.lock().unwrap().len() >= expected_requests;
@@ -367,7 +372,7 @@ impl Fixture {
                         .await
                         .is_none()
                 {
-                    break self.session().await;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -632,6 +637,90 @@ async fn host_paced_loop_rejects_stopped_generations_and_expired_due_occurrences
         .current_run_id(SESSION_ID)
         .await
         .is_none());
+}
+
+#[actix_web::test]
+async fn host_paced_loop_recovers_after_final_save_and_actor_closure_fail() {
+    let fixture = Fixture::new().await;
+    fixture.human_turn(CONTEXT, true).await;
+    fixture.settled(1).await;
+    fixture.probe.requests.lock().unwrap().clear();
+
+    let initial = fixture.start().await;
+    let loops = &fixture.state.paced_loops;
+    loops.tick(initial.next_fire_at).await;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        fixture.probe.first_entered.notified(),
+    )
+    .await
+    .expect("first scheduled turn did not enter the provider");
+    let running = fixture.session().await;
+    let active = PacedLoopState::read(&running).unwrap().unwrap();
+    let failed_run = active.last_run_id.as_deref().unwrap();
+    assert_eq!(active.committed_run(&running), Some(failed_run));
+    assert!(super::reports_active_execution(&running));
+    assert!(loops.waiting_for_existing_turn(&running, &active).await);
+
+    // Temporarily make the exact Actor unavailable on this fixture's real
+    // filesystem so both fenced completion writes fail. Restore the record
+    // after the local runner settles, with its lease already expired.
+    let actor_file = fixture
+        .state
+        .app_data_dir
+        .join("sessions")
+        .join(SESSION_ID)
+        .join("actor-authority.json");
+    let offline = actor_file.with_extension("offline");
+    tokio::fs::rename(&actor_file, &offline).await.unwrap();
+    fixture.probe.release_first.notify_one();
+    fixture.wait_for_settle(1).await;
+    let mut actor: ActorDirectoryEntry =
+        serde_json::from_slice(&tokio::fs::read(&offline).await.unwrap()).unwrap();
+    let activation = actor.activation.as_mut().unwrap();
+    assert_eq!(activation.run_id, failed_run);
+    assert!(activation.status.is_live());
+    activation.lease_expires_at = chrono::Utc::now() - TimeDelta::seconds(1);
+    tokio::fs::write(&offline, serde_json::to_vec(&actor).unwrap())
+        .await
+        .unwrap();
+    tokio::fs::rename(&offline, &actor_file).await.unwrap();
+
+    let stale = fixture.session().await;
+    assert_eq!(active.committed_run(&stale), Some(failed_run));
+    assert!(super::reports_active_execution(&stale));
+    assert!(active.outcome(&stale).is_none());
+    assert!(super::waiting_for_existing_work(&stale));
+    assert!(!loops.waiting_for_existing_turn(&stale, &active).await);
+
+    let mut waiting = stale.clone();
+    waiting.set_pending_question(
+        "pending-tool-call".into(),
+        "pause".into(),
+        "Waiting for the user".into(),
+        vec![],
+        true,
+    );
+    assert!(loops.waiting_for_existing_turn(&waiting, &active).await);
+    let mut other_run = stale.clone();
+    other_run.set_host_run_id("another-run");
+    assert!(loops.waiting_for_existing_turn(&other_run, &active).await);
+    actor.activation.as_mut().unwrap().run_id = "another-run".into();
+    tokio::fs::write(&actor_file, serde_json::to_vec(&actor).unwrap())
+        .await
+        .unwrap();
+    assert!(loops.waiting_for_existing_turn(&stale, &active).await);
+    actor.activation.as_mut().unwrap().run_id = failed_run.into();
+    tokio::fs::write(&actor_file, serde_json::to_vec(&actor).unwrap())
+        .await
+        .unwrap();
+
+    loops.tick(active.next_fire_at).await;
+    let recovered = fixture.settled(2).await;
+    let successor = PacedLoopState::read(&recovered).unwrap().unwrap();
+    assert_eq!(successor.iteration, 2);
+    assert_ne!(successor.last_run_id, active.last_run_id);
+    assert_eq!(successor.last_run_status(&recovered), Some("completed"));
 }
 
 #[actix_web::test]

@@ -3,8 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use bamboo_domain::session::PACED_LOOP_METADATA_KEY;
-use bamboo_domain::{AgentStatusState, Session, SessionInboxPort, SessionKind, Storage};
+use bamboo_domain::session::{inbox::PACED_LOOP_INSTRUCTION, PACED_LOOP_METADATA_KEY};
+use bamboo_domain::{
+    is_matching_session_message, ActorDirectoryPort, ActorLogicalState, AgentStatusState, Session,
+    SessionInboxPort, SessionKind, SessionMessageEnvelope, SessionMessageId, Storage,
+};
 use bamboo_engine::{ChildCompletionCoordinator, SessionCache, SessionSnapshot};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -188,6 +191,34 @@ impl PacedLoopState {
         (self.last_run_id.as_deref() == Some(outcome.run_id.as_str())).then_some(outcome)
     }
 
+    fn committed_run(&self, session: &Session) -> Option<&str> {
+        let run_id = self.last_run_id.as_deref()?;
+        // Ordinary Root executions use fenced Inbox admission instead of a
+        // Child's host-run marker. Verify the exact published occurrence.
+        let message_id = SessionMessageId::stable(
+            PACED_LOOP_INSTRUCTION,
+            &serde_json::json!({
+                "generation": self.id,
+                "occurrence": self.iteration,
+                "run_id": run_id,
+            }),
+        );
+        session
+            .session_inbox_admission()?
+            .receipt_for(message_id.as_str())?;
+        let message = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.id == message_id.as_str())?;
+        let marker = message.metadata.as_ref()?.get("session_message")?;
+        let envelope = SessionMessageEnvelope::deserialize(marker).ok()?;
+        (envelope.target_session_id == session.id
+            && envelope.paced_loop_run_id() == Some(run_id)
+            && is_matching_session_message(message, &envelope))
+        .then_some(run_id)
+    }
+
     fn next_wakeup(&self, session: &Session) -> NextWakeup<'_> {
         let fallback = NextWakeup {
             at: self.next_fire_at,
@@ -299,24 +330,27 @@ pub(crate) fn supported_root(session: &Session) -> bool {
 }
 
 pub(crate) fn waiting_for_existing_work(session: &Session) -> bool {
-    session.has_pending_question()
+    waiting_for_pending_work(session) || reports_active_execution(session)
+}
+
+fn waiting_for_pending_work(session: &Session) -> bool {
+    session.has_runtime_wait()
         || session.metadata.contains_key("runtime.suspend_reason")
         || session
             .metadata
             .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
         || bamboo_engine::session_app::execute::has_pending_user_message(session)
-        || session.agent_runtime_state.as_ref().is_some_and(|runtime| {
-            runtime.suspension.is_some()
-                || runtime.waiting_for_children.is_some()
-                || runtime.waiting_for_bash.is_some()
-                || matches!(
-                    runtime.status,
-                    AgentStatusState::Initializing
-                        | AgentStatusState::Running
-                        | AgentStatusState::Finalizing
-                        | AgentStatusState::Suspended
-                )
-        })
+}
+
+fn reports_active_execution(session: &Session) -> bool {
+    session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+        matches!(
+            runtime.status,
+            AgentStatusState::Initializing
+                | AgentStatusState::Running
+                | AgentStatusState::Finalizing
+        )
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -615,6 +649,41 @@ impl PacedLoops {
         }
     }
 
+    async fn waiting_for_existing_turn(&self, session: &Session, state: &PacedLoopState) -> bool {
+        if waiting_for_pending_work(session) {
+            return true;
+        }
+        if !reports_active_execution(session) {
+            return false;
+        }
+        // A storage outage may interrupt both the terminal Session save and
+        // Actor finalization. Only the loop's own preceding run can leave an
+        // active diagnostic that the scheduler is allowed to disregard.
+        let Some(run_id) = state.committed_run(session) else {
+            return true;
+        };
+        if session.host_run_id().is_some_and(|id| id != run_id)
+            || session.last_run_status().as_deref() == Some("pending")
+        {
+            return true;
+        }
+        let Ok(Ok(entry)) =
+            tokio::time::timeout(ADMISSION_WAIT, self.store.inspect_actor(&session.id)).await
+        else {
+            return true;
+        };
+        // The runtime diagnostic grants no execution authority. Even after
+        // confirmed termination or lease expiry, the runner slot and the
+        // regular Actor claim still have to succeed.
+        !(entry.actor.matches_session(session)
+            && entry.actor.project_id == session.project_id_meta()
+            && entry.actor.state != ActorLogicalState::Retired
+            && entry.activation.is_some_and(|activation| {
+                activation.run_id == run_id
+                    && (!activation.status.is_live() || activation.lease_expires_at <= Utc::now())
+            }))
+    }
+
     async fn fire(&self, id: &str, due: Due, now: DateTime<Utc>) -> Result<bool, PacedLoopError> {
         // Read behind any provisional start/resume under the same lock. This
         // keeps a slow, unacknowledged write from losing its only wake hint.
@@ -652,7 +721,7 @@ impl PacedLoops {
             }
             return Ok(false);
         }
-        if !supported_root(&initial) || waiting_for_existing_work(&initial) {
+        if !supported_root(&initial) || self.waiting_for_existing_turn(&initial, &state).await {
             return Ok(true);
         }
         // An unrelated in-progress router handoff must not pin the Host's
@@ -702,7 +771,7 @@ impl PacedLoops {
             };
             if state.iteration != previous_iteration
                 || !supported_root(&session)
-                || waiting_for_existing_work(&session)
+                || self.waiting_for_existing_turn(&session, &state).await
             {
                 return Ok(None);
             }

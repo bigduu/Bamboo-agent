@@ -30,9 +30,23 @@ static TASK_REQUEST: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("fixed task request pattern")
 });
-static QUESTION_BEFORE_CADENCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:whether|why|how|when|if)\b|是否|为什么|原因|怎么|如何|有没有")
-        .expect("fixed cadence question pattern")
+static DESCRIPTIVE_BEFORE_CADENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:whether|why|how|when|if|that|which|who|whose|once|one[- ]time)\b|\b(?:running|refreshing|updating|restarting|firing|executing)$|是否|为什么|原因|怎么|如何|有没有|(?:只|仅)[^，。；、！？]*一次|一次性")
+        .expect("fixed descriptive cadence pattern")
+});
+static ONCE_BEFORE_EVERY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bonce\s+$").expect("fixed once-every cadence pattern"));
+static SINGLE_OCCURRENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)\b(?: (?:just|only)\s+this\s+(?:once|time)
+            | for\s+(?:one|a\s+single)\s+(?:run|occurrence) )\b
+          | (?:只|仅)(?:做|运行|执行|检查)?(?:这一次|这次|本次)",
+    )
+    .expect("fixed single-occurrence qualifier pattern")
+});
+static NON_RECURRING_AFTER_CADENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:(?:but\s+)?(?:just|only)\s+once\b|once[.!?。！？]*$|(?:one[- ]time|this time only)\b|这次就好|只这一次|仅此一次|(?:会|自动)?(?:运行|执行|启动|触发|刷新|更新|发生)[^，。；、！？,.!?;]*的)")
+        .expect("fixed non-recurring cadence suffix pattern")
 });
 static ALTERNATIVE_AFTER_CADENCE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:or\b|或|还是)").expect("fixed cadence alternative pattern")
@@ -80,13 +94,28 @@ pub(super) fn interval(text: &str, quote: &str) -> Option<u64> {
         .chain(CHINESE_INTERVAL.captures_iter(work));
     let cadence = cadences.next()?;
     let phrase = cadence.get(0)?;
-    let before = work[..phrase.start()].trim_start();
+    let before = &work[..phrase.start()];
+    // "Once every…" states a recurring rate. A separate "once" can instead
+    // limit the user's request to a single action about a recurring subject.
+    let before = if phrase
+        .as_str()
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|start| start.eq_ignore_ascii_case(b"every"))
+    {
+        ONCE_BEFORE_EVERY
+            .find(before)
+            .map_or(before, |once| &before[..once.start()])
+    } else {
+        before
+    };
+    let before = before.trim_start();
     let before = strip_polite_prefix(before).trim_end_matches([' ', ',', '，', '、']);
     let after = work[phrase.end()..].trim_start_matches([' ', ',', '，', '、']);
     let affirmative = if before.is_empty() {
         TASK_REQUEST.is_match(strip_polite_prefix(after))
     } else {
-        TASK_REQUEST.is_match(before) && !QUESTION_BEFORE_CADENCE.is_match(before)
+        TASK_REQUEST.is_match(before) && !DESCRIPTIVE_BEFORE_CADENCE.is_match(before)
     };
     // Spelling the slash command explicitly also selects the scheduling
     // operation for tasks outside the conversational request patterns.
@@ -94,7 +123,10 @@ pub(super) fn interval(text: &str, quote: &str) -> Option<u64> {
         && [before, after]
             .iter()
             .any(|part| part.chars().any(char::is_alphabetic));
-    if !(affirmative || explicit)
+    if !(explicit
+        || (affirmative
+            && !SINGLE_OCCURRENCE.is_match(work)
+            && (before.is_empty() || !NON_RECURRING_AFTER_CADENCE.is_match(after))))
         || cadences.next().is_some()
         || ALTERNATIVE_AFTER_CADENCE.is_match(after)
         || !quote.contains(phrase.as_str())
@@ -197,6 +229,26 @@ mod tests {
             ("Check CI every 2 hours", "every 2 hours", 7200),
             ("Please check CI every hour", "every hour", 3600),
             ("Every hour, summarize CI logs", "Every hour", 3600),
+            (
+                "Once every five minutes, check CI",
+                "every five minutes",
+                300,
+            ),
+            (
+                "Check CI once every five minutes",
+                "once every five minutes",
+                300,
+            ),
+            (
+                "Check CI every five minutes and notify me once the build passes",
+                "every five minutes",
+                300,
+            ),
+            (
+                "/loop Check the job that runs every five minutes",
+                "every five minutes",
+                300,
+            ),
             ("请每隔五分钟检查构建", "每隔五分钟", 300),
             ("检查构建每隔五分钟", "每隔五分钟", 300),
         ] {
@@ -210,6 +262,18 @@ mod tests {
             "CI checks currently run every five minutes.",
             "Can you explain why CI runs every five minutes?",
             "Check whether CI already runs every five minutes",
+            "Check the job that runs every five minutes",
+            "Check the job that runs every five minutes once",
+            "Check the job running every five minutes",
+            "Check CI every five minutes, just once",
+            "Check CI just once, every five minutes",
+            "Check CI every five minutes, but just this once",
+            "Check CI every five minutes, only this time",
+            "Check CI every five minutes for one run only",
+            "Every five minutes, check CI, but just this once",
+            "检查每隔五分钟运行的构建",
+            "检查每隔五分钟运行的构建一次",
+            "检查构建每隔五分钟，不过只做这一次",
             "Check CI every five minutes or ten minutes.",
             "请不要每隔五分钟检查构建",
             "看看构建是否每隔五分钟执行一次",

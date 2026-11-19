@@ -1095,6 +1095,7 @@ pub struct ChatState {
     pub project_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
+    pending_loop_composer: Option<ComposerSnapshot>,
     pub scroll_offset: u16,
     /// Largest meaningful `scroll_offset` for the transcript as last rendered
     /// (`total_lines - visible_height`), refreshed every frame by
@@ -1228,6 +1229,7 @@ impl ChatState {
             project_id: None,
             messages: Vec::new(),
             textarea,
+            pending_loop_composer: None,
             scroll_offset: 0,
             max_scroll: Cell::new(0),
             auto_scroll: true,
@@ -4140,6 +4142,7 @@ const MAX_SESSION_SUBSCRIPTIONS: usize = 8;
 const MAX_SSE_EVENTS_PER_TICK: usize = 512;
 const MAX_SSE_EVENTS_PER_SUBSCRIPTION: usize = MAX_SSE_EVENTS_PER_TICK / MAX_SESSION_SUBSCRIPTIONS;
 const BACKGROUND_STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOOP_CHAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn model_key(model: &CatalogModel) -> (String, String) {
     (
@@ -6472,6 +6475,9 @@ impl App {
                 message,
                 result,
             } => {
+                let Some(submitted) = self.chat.pending_loop_composer.take() else {
+                    return Ok(());
+                };
                 if self.chat.session_id != session_id {
                     return Ok(());
                 }
@@ -6481,6 +6487,9 @@ impl App {
                             reply.loop_command.filter(|command| !command.should_execute)
                         {
                             if session_id.as_deref() == Some(reply.response.session_id.as_str()) {
+                                if submitted.still_matches(&self.chat.textarea) {
+                                    self.clear_chat_composer();
+                                }
                                 self.notify(NoticeLevel::Info, acknowledgment.status_text());
                             } else {
                                 self.notify(
@@ -6491,7 +6500,10 @@ impl App {
                         } else if self.chat.streaming {
                             self.notify(NoticeLevel::Error, "The server did not acknowledge /loop");
                         } else {
-                            // An older server accepted this as ordinary chat.
+                            // Bamboo accepted spoken loop wording as a user turn.
+                            if submitted.still_matches(&self.chat.textarea) {
+                                self.clear_chat_composer();
+                            }
                             let turn_id = self.begin_chat_turn(message);
                             self.accept_chat_start(reply.response.session_id, turn_id);
                         }
@@ -10583,10 +10595,9 @@ impl App {
                 if input.is_empty() {
                     return Ok(());
                 }
-                self.chat.textarea = TextArea::default();
-                let placeholder = self.chat_placeholder();
-                self.chat.textarea.set_placeholder_text(placeholder);
-                apply_textarea_palette(&mut self.chat.textarea, self.theme);
+                if !Self::is_loop_chat_command(&input) {
+                    self.clear_chat_composer();
+                }
                 self.send_message(input);
             }
             None => {
@@ -10630,6 +10641,13 @@ impl App {
         }
     }
 
+    fn clear_chat_composer(&mut self) {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text(self.chat_placeholder());
+        apply_textarea_palette(&mut textarea, self.theme);
+        self.chat.textarea = textarea;
+    }
+
     /// Send a chat message WITHOUT blocking the event loop: the user turn is
     /// shown immediately (optimistic), and the `chat` POST runs on a task that
     /// posts `ChatStarted` back — the handler then opens the SSE stream and
@@ -10658,12 +10676,25 @@ impl App {
             reasoning_effort: self.chat.reasoning_effort,
         };
         if Self::is_loop_chat_command(&message) {
+            if self.chat.pending_loop_composer.is_some() {
+                self.status_message = "Loop command is still pending — draft preserved".to_string();
+                return;
+            }
+            self.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&self.chat.textarea));
             let session_id = req.session_id.clone();
             tokio::spawn(async move {
-                let result = client
-                    .submit_chat(req)
-                    .await
-                    .map_err(|error| error.to_string());
+                let result = match tokio::time::timeout(
+                    LOOP_CHAT_TIMEOUT,
+                    client.submit_loop_chat(req),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err(
+                        "Loop command confirmation timed out. Check /loop status before retrying."
+                            .to_string(),
+                    ),
+                };
                 let _ = tx.send(AppEvent::LoopChatFinished {
                     context_id,
                     session_id,
@@ -24046,13 +24077,49 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn rejected_loop_command_preserves_the_exact_composer_draft() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current-session".to_string());
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("current-turn".to_string());
+        app.install_command_draft("  /loop 每五分钟检查 CI\n这行也要保留".to_string());
+        let original = ComposerSnapshot::capture(&app.chat.textarea);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(original.still_matches(&app.chat.textarea));
+        assert_eq!(
+            app.status_message,
+            "Loop command is still pending — draft preserved"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &result,
+            AppEvent::LoopChatFinished { result: Err(_), .. }
+        ));
+        app.handle_event(result).await.unwrap();
+
+        assert!(original.still_matches(&app.chat.textarea));
+        assert!(app.chat.pending_loop_composer.is_none());
+        assert_eq!(app.chat.current_turn_id.as_deref(), Some("current-turn"));
+        assert!(app.chat.streaming);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn acknowledged_loop_command_preserves_the_current_turn() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("current-session".to_string());
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("current-turn".to_string());
         app.chat.current_response = "response in progress".to_string();
-        let result = serde_json::from_value(serde_json::json!({
+        let reply = serde_json::json!({
             "session_id": "current-session",
             "stream_url": "/api/v1/events/current-session",
             "status": "accepted",
@@ -24061,17 +24128,23 @@ mod question_tests {
                 "should_execute": false,
                 "loop": {"state": "stopped", "last_run_status": "running"}
             }
-        }))
-        .unwrap();
-
-        app.handle_event(AppEvent::LoopChatFinished {
-            context_id: app.chat.context_id,
-            session_id: app.chat.session_id.clone(),
-            message: "/loop stop".to_string(),
-            result: Ok(result),
-        })
-        .await
-        .unwrap();
+        });
+        for newer_draft in [None, Some("A newer draft")] {
+            app.install_command_draft("/loop stop".to_string());
+            app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+            if let Some(draft) = newer_draft {
+                app.install_command_draft(draft.to_string());
+            }
+            app.handle_event(AppEvent::LoopChatFinished {
+                context_id: app.chat.context_id,
+                session_id: app.chat.session_id.clone(),
+                message: "/loop stop".to_string(),
+                result: Ok(serde_json::from_value(reply.clone()).unwrap()),
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.chat.textarea.lines(), [newer_draft.unwrap_or_default()]);
+        }
 
         assert!(app.chat.streaming);
         assert_eq!(app.chat.current_turn_id.as_deref(), Some("current-turn"));
