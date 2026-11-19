@@ -174,9 +174,9 @@ pub struct SessionSummary {
     /// this distinguishes legacy Bypass from zero-prompt Auto.
     #[serde(default)]
     pub permission_mode: bamboo_domain::SessionPermissionMode,
-    /// The current setting on a supported Supervisor, reported in detail.
+    /// Independent Sessions dispatched by this Supervisor inherit its mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_auto_dispatch: Option<bool>,
+    pub supervisor_dispatch_inherits_permission_mode: Option<bool>,
     /// An index hint to refresh the Supervisor's permission detail. Use the
     /// exact ETag encoding to preserve revisions beyond JS's safe integer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,7 +269,9 @@ impl SessionSummary {
             bypass_permissions: entry.bypass_permissions
                 || permission_mode != bamboo_domain::SessionPermissionMode::Default,
             permission_mode,
-            supervisor_auto_dispatch: None,
+            supervisor_dispatch_inherits_permission_mode: entry
+                .supervisor_profile_revision
+                .map(|_| true),
             supervisor_permission_etag: entry
                 .supervisor_profile_revision
                 .map(|revision| format!("\"{revision}\"")),
@@ -513,9 +515,9 @@ pub struct PatchSessionRequest {
     /// or the legacy boolean, never both in the same request.
     #[serde(default)]
     pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
-    /// Explicit opt-in to Auto on future independent Supervisor dispatches.
+    /// Optional precondition for the dispatch scope shown by the client.
     #[serde(default)]
-    pub supervisor_auto_dispatch: Option<bool>,
+    pub expected_supervisor_dispatch_inheritance: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,7 +709,7 @@ mod tests {
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
-            supervisor_auto_dispatch: None,
+            supervisor_dispatch_inherits_permission_mode: None,
             supervisor_permission_etag: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
@@ -767,7 +769,7 @@ mod tests {
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
-            supervisor_auto_dispatch: None,
+            supervisor_dispatch_inherits_permission_mode: None,
             supervisor_permission_etag: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Child,
@@ -914,7 +916,7 @@ mod tests {
             project_id: None,
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
-            supervisor_auto_dispatch: None,
+            supervisor_dispatch_inherits_permission_mode: None,
             supervisor_permission_etag: None,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
