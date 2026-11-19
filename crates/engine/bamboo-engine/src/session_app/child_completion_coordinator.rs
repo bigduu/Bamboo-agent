@@ -3974,6 +3974,7 @@ impl ChildCompletionCoordinator {
             ("waiting_for_children", None) | ("", None) => {
                 if let Some(expiry) =
                     bamboo_domain::CommittedChildWaitExpiry::from_session(&session)
+                        .filter(|expiry| expiry.expiry.run_id == runtime_state.run_id)
                 {
                     if let Err(error) = self
                         .request_expired_child_wait_startup(&session, &expiry)
@@ -4414,6 +4415,7 @@ impl ChildCompletionCoordinator {
             .expire_root_child_wait_control_plane(
                 parent,
                 &expiry,
+                messenger.inbox().as_ref(),
                 now,
                 Arc::new(move |saved| {
                     cache.insert(

@@ -313,6 +313,46 @@ impl OwnedFilesystem {
         &self.guards.dir
     }
 
+    pub(super) async fn has_staged_child_wait_expiry(
+        &self,
+        dir: &Path,
+        expected: InboxMessage,
+        admitted: PathBuf,
+        max_bytes: usize,
+    ) -> std::io::Result<bool> {
+        let name = FileSessionInbox::pending_transport_name(&expected);
+        let pending = dir.join("new").join(&name);
+        let claimed = dir.join("cur").join(name);
+        self.job(
+            "prove-staged-child-wait-expiry",
+            &pending,
+            move |filesystem, path| {
+                let anchor = filesystem.anchor();
+                let bytes = match anchor.read_existing(path, max_bytes) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => return Ok(false),
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                require_unique_json(&bytes)
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                if serde_json::from_slice::<InboxMessage>(&bytes)? != expected {
+                    return Ok(false);
+                }
+                for path in [&claimed, &admitted] {
+                    match anchor.entry_exists(path) {
+                        Ok(true) => return Ok(false),
+                        Ok(false) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(true)
+            },
+        )
+        .await
+    }
+
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         self.job("mkdir", path, |filesystem, path| {
             filesystem.anchor().create_dir_all(path)
@@ -426,8 +466,7 @@ impl OwnedFilesystem {
             };
             // The same 20-digit time prefix, hidden temp name and implicit
             // queue creation as the Maildir writer.
-            let nanos = wrapper.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
-            let name = format!("{nanos:020}-{}.json", wrapper.id.0);
+            let name = FileSessionInbox::pending_transport_name(&wrapper);
             let queue = dir.join("new");
             let path = queue.join(&name);
             let temp = queue.join(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
@@ -1376,12 +1415,13 @@ impl FileSessionInbox {
             if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
                 continue;
             }
-            if envelope.child_wait_expiry().is_some()
+            if envelope.is_child_wait_expiry_notice()
                 && (receipt.is_none()
                     || self.root_owner.is_none()
                     || intent.is_some()
                     || activation.as_ref().and_then(|intent| intent.policy().ok())
-                        != Some(SessionActivationPolicy::RespectSpecificWait))
+                        != Some(SessionActivationPolicy::RespectSpecificWait)
+                    || envelope.child_wait_expiry().is_none())
             {
                 continue;
             }
@@ -2191,7 +2231,7 @@ impl FileSessionInbox {
                 && coordinator_message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
                 && policy == SessionActivationPolicy::RespectSpecificWait
                 && envelope.is_exact_runtime_startup();
-            let runtime_startup_target_birth = if envelope.child_wait_expiry().is_some() {
+            let runtime_startup_target_birth = if envelope.is_child_wait_expiry_notice() {
                 if !requires_runtime_startup {
                     continue;
                 }

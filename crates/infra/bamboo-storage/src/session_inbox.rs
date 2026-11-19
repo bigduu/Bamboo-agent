@@ -2106,6 +2106,50 @@ impl FileSessionInbox {
             .await
     }
 
+    /// Prove the exact, unclaimed notice under the physical Session and Inbox
+    /// locks. Hold the returned Inbox authority until the wait is committed.
+    pub(crate) async fn retain_staged_child_wait_expiry(
+        &self,
+        sessions_dir: &Path,
+        envelope: &SessionMessageEnvelope,
+        receipt: &SessionInboxReceipt,
+        physical: Arc<crate::v2::DefaultWriterPhysicalGuards>,
+    ) -> Result<Option<OwnedFilesystem>, SessionInboxError> {
+        if envelope.id != receipt.id
+            || receipt.generation == 0
+            || receipt.generation > i64::MAX as u64
+        {
+            return Ok(None);
+        }
+        if self.sessions.root_sessions_directory() != sessions_dir {
+            return Err(SessionInboxError::InvalidClaim(
+                "Root child wait expiry Inbox belongs to another store".into(),
+            ));
+        }
+        let (dir, filesystem) = self
+            .filesystem_with_authority(
+                &envelope.target_session_id,
+                InboxAuthority::Root { _guard: physical },
+            )
+            .await?;
+        if dir
+            != sessions_dir
+                .join(&envelope.target_session_id)
+                .join(INBOX_DIR)
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Root child wait expiry Inbox directory changed".into(),
+            ));
+        }
+        let expected = Self::wrapper(envelope, receipt.generation, None);
+        let admitted = Self::admitted_path(&dir, &receipt.id);
+        let found = filesystem
+            .has_staged_child_wait_expiry(&dir, expected, admitted, self.max_transport_bytes())
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        Ok(found.then_some(filesystem))
+    }
+
     pub(crate) async fn lock_unowned_actor_claims(
         &self,
         target: &str,
@@ -2436,6 +2480,11 @@ impl FileSessionInbox {
                 .as_ref()
                 .map(|value| MsgId(value.clone())),
         }
+    }
+
+    fn pending_transport_name(wrapper: &InboxMessage) -> String {
+        let nanos = wrapper.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+        format!("{nanos:020}-{}.json", wrapper.id.0)
     }
 
     fn activation_intent(
@@ -3775,7 +3824,9 @@ impl FileSessionInbox {
                             if let Ok(envelope) =
                                 serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
                             {
-                                if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only
+                                if envelope.is_child_wait_expiry_notice()
+                                    || bamboo_domain::is_scoped_loop_control(&envelope)
+                                        != scoped_only
                                     || active_run_id.is_some_and(|run_id| {
                                         envelope.waits_for_successor_of_run(run_id)
                                     })

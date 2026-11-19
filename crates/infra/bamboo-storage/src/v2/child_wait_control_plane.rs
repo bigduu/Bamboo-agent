@@ -407,11 +407,23 @@ impl SessionStoreV2 {
         &self,
         expected: &Session,
         committed: &bamboo_domain::CommittedChildWaitExpiry,
+        inbox: &dyn bamboo_domain::SessionInboxPort,
         now: DateTime<Utc>,
         publish: RootActorRuntimePublisher,
     ) -> io::Result<bool> {
+        use crate::session_inbox::FileSessionInbox;
+
+        let inbox = inbox
+            .as_any()
+            .and_then(|any| any.downcast_ref::<FileSessionInbox>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Root child wait expiry requires the concrete Inbox",
+                )
+            })?;
         let started = Instant::now();
-        let guards = self.child_wait_guards(&expected.id).await?;
+        let mut guards = self.child_wait_guards(&expected.id).await?;
         let Some(mut latest) = self.load_session_unlocked(&expected.id).await? else {
             return Ok(false);
         };
@@ -421,6 +433,7 @@ impl SessionStoreV2 {
         let mut state = runtime(&latest);
         if latest.kind != SessionKind::Root
             || !latest.authority_identity.is_ordinary()
+            || latest.metadata.contains_key("ticket.runtime.dispatch.v1")
             || latest.has_pending_question()
             || latest
                 .metadata
@@ -431,8 +444,6 @@ impl SessionStoreV2 {
             || state.waiting_for_children.as_ref() != Some(&expiry.wait)
             || !expiry.matches_lifetime(&latest)
             || !expiry.is_due(now)
-            || receipt.generation == 0
-            || receipt.id != expiry.envelope(&latest.id)?.id
             || self
                 .child_wait_expiry_activation_id(&latest, &state.run_id)
                 .await?
@@ -441,6 +452,24 @@ impl SessionStoreV2 {
         {
             return Ok(false);
         }
+        let envelope = expiry.envelope(&latest.id)?;
+        let Some(filesystem) = inbox
+            .retain_staged_child_wait_expiry(
+                &self.sessions_dir,
+                &envelope,
+                &receipt,
+                guards.physical.clone(),
+            )
+            .await
+            .map_err(io::Error::other)?
+        else {
+            return Ok(false);
+        };
+        // Keep the staged receipt protected through the blocking runtime write.
+        Arc::get_mut(&mut guards)
+            .expect("new child wait guards are private")
+            ._input_filesystem = Some(filesystem);
+
         state.waiting_for_children = None;
         state.status = bamboo_domain::AgentStatusState::Idle;
         state.suspension = None;

@@ -9208,10 +9208,11 @@ impl Storage for SessionStoreV2 {
         &self,
         expected: &Session,
         committed: &bamboo_domain::CommittedChildWaitExpiry,
+        inbox: &dyn bamboo_domain::SessionInboxPort,
         now: DateTime<Utc>,
         publish: bamboo_domain::RootActorRuntimePublisher,
     ) -> io::Result<bool> {
-        self.expire_root_child_wait(expected, committed, now, publish)
+        self.expire_root_child_wait(expected, committed, inbox, now, publish)
             .await
     }
 

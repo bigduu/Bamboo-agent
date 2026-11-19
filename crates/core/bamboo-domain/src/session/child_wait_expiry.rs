@@ -91,14 +91,25 @@ impl ChildWaitExpiry {
 }
 
 impl SessionMessageEnvelope {
-    pub fn child_wait_expiry(&self) -> Option<ChildWaitExpiry> {
-        if !matches!(&self.source, SessionMessageSource::Runtime { subsystem } if subsystem == SUBSYSTEM)
-        {
-            return None;
+    fn child_wait_expiry_instruction(&self) -> Option<&SessionRuntimeInstruction> {
+        match (&self.source, &self.body) {
+            (
+                SessionMessageSource::Runtime { subsystem },
+                SessionMessageBody::RuntimeInstruction(instruction),
+            ) if subsystem == SUBSYSTEM && instruction.instruction == INSTRUCTION => {
+                Some(instruction)
+            }
+            _ => None,
         }
-        let SessionMessageBody::RuntimeInstruction(instruction) = &self.body else {
-            return None;
-        };
+    }
+
+    /// Keep an invalid expiry notice out of generic delivery as well.
+    pub fn is_child_wait_expiry_notice(&self) -> bool {
+        self.child_wait_expiry_instruction().is_some()
+    }
+
+    pub fn child_wait_expiry(&self) -> Option<ChildWaitExpiry> {
+        let instruction = self.child_wait_expiry_instruction()?;
         let expiry: ChildWaitExpiry = serde_json::from_value(instruction.data.clone()?).ok()?;
         (expiry.envelope(&self.target_session_id).ok().as_ref() == Some(self)).then_some(expiry)
     }

@@ -653,7 +653,7 @@ pub trait Storage: Send + Sync {
         Ok(false)
     }
 
-    /// Observe the installed finalized attempt for this exact wait run.
+    /// Observe the installed successful attempt for this exact wait run.
     async fn observe_root_child_wait_expiry_activation(
         &self,
         _session: &Session,
@@ -662,16 +662,17 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
-    /// Retire the exact child wait and seal its staged notification together.
+    /// Retire the exact child wait only while its staged notification is held.
     /// This control-plane write never grants execution or mutates transcript.
     async fn expire_root_child_wait_control_plane(
         &self,
         expected: &Session,
         committed: &crate::CommittedChildWaitExpiry,
+        inbox: &dyn crate::SessionInboxPort,
         now: chrono::DateTime<chrono::Utc>,
         publish: RootActorRuntimePublisher,
     ) -> std::io::Result<bool> {
-        let _ = (expected, committed, now, publish);
+        let _ = (expected, committed, inbox, now, publish);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "durable Root child wait expiry is unsupported",

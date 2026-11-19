@@ -125,7 +125,7 @@ impl RootActorInputProof {
                 false,
             )
             .map_err(conflict)?;
-        if envelope.child_wait_expiry().is_some()
+        if envelope.is_child_wait_expiry_notice()
             && (intent.is_some()
                 || message_policy != Some(SessionActivationPolicy::RespectSpecificWait)
                 || !runtime.is_some_and(|latest| {

@@ -423,7 +423,7 @@ impl SessionStoreV2 {
         Ok(!permits_unfenced_context(&record, &marker, Some(session)))
     }
 
-    /// Project the installed, finalized attempt. A read outside the physical
+    /// Project the installed, successful attempt. A read outside the physical
     /// writer only supplies an observation for the definitive check under lock.
     pub(super) async fn child_wait_expiry_activation_id(
         &self,
@@ -448,7 +448,10 @@ impl SessionStoreV2 {
         }
         Ok(record
             .activation
-            .filter(|activation| activation.run_id == run_id && !activation.status.is_live())
+            .filter(|activation| {
+                activation.run_id == run_id
+                    && activation.status == bamboo_domain::ActorActivationStatus::Succeeded
+            })
             .map(|activation| activation.activation_id))
     }
 
