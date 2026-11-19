@@ -3841,6 +3841,18 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Refresh derived views after a committed legacy Workflow mutation.
+    /// Return a revision only once the refresh has completed.
+    pub async fn refresh_legacy_workflow_views_after_commit(&self) -> Option<u64> {
+        match self.reload_global_workflow_views().await {
+            Ok(()) => Some(self.workflow_catalog_snapshot().await.revision),
+            Err(error) => {
+                tracing::warn!(%error, "Legacy Workflow committed with a catalog refresh error");
+                None
+            }
+        }
+    }
+
     /// Resolve an isolated catalog view for a specific session workspace without changing the
     /// server-wide snapshot or consulting the server process current directory.
     pub async fn workflow_catalog_for_workspace(
@@ -4256,7 +4268,7 @@ impl SkillStore {
     /// adapter bundle whose metadata confirms ownership by that source.
     /// Same-id ordinary or explicitly migrated Skills are never removed.
     pub async fn remove_legacy_workflow(&self, source: &Path, id: &str) -> SkillResult<bool> {
-        let _reload_guard = self.reload_lock.lock().await;
+        let reload_guard = self.reload_lock.lock().await;
         let removed_bundle =
             crate::legacy::remove_legacy_markdown_bundle(source, &self.config.skills_dir, id)
                 .await?;
@@ -4276,7 +4288,8 @@ impl SkillStore {
             }
             return Err(error.into());
         }
-        self.load_locked(None).await?;
+        drop(reload_guard);
+        let _ = self.refresh_legacy_workflow_views_after_commit().await;
         Ok(true)
     }
 
