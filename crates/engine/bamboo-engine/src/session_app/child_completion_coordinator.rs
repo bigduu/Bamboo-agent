@@ -3869,9 +3869,7 @@ impl ChildCompletionCoordinator {
         if self.runner_is_running(session_id).await {
             return None;
         }
-        let Some(session) = self.load_control_plane(session_id).await else {
-            return None;
-        };
+        let session = self.load_control_plane(session_id).await?;
         let runtime_state = read_runtime_state(&session);
         let suspend_reason = session
             .metadata
