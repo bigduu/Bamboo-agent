@@ -1069,6 +1069,12 @@ impl SessionInboxAdmissionState {
             })
     }
 
+    pub(super) fn contains_at_sequence(&self, id: &SessionMessageId, sequence: u64) -> bool {
+        self.admitted
+            .iter()
+            .any(|entry| &entry.id == id && entry.sequence == sequence)
+    }
+
     pub fn record(&mut self, id: SessionMessageId, sequence: u64) -> bool {
         self.last_observed_sequence = self.last_observed_sequence.max(sequence);
         if self.contains(&id) {
