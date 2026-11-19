@@ -194,9 +194,10 @@ pub async fn get_session(
                 summary.bypass_permissions =
                     summary.permission_mode != bamboo_domain::SessionPermissionMode::Default;
             }
-            summary.supervisor_auto_dispatch = durable_session
+            summary.supervisor_dispatch_inherits_permission_mode = durable_session
                 .supervisor_incarnation_id()
-                .map(|_| durable_session.supervisor_auto_dispatch());
+                .is_some()
+                .then_some(true);
             summary.adopt_activity_waits(&durable_session);
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
@@ -260,7 +261,10 @@ pub async fn get_session(
             // Surface the session ETag (`metadata_version`) so clients can send
             // it back as `If-Match` on metadata writes (optimistic concurrency).
             let etag = durable_session.metadata_version;
-            if summary.supervisor_auto_dispatch.is_some() {
+            if summary
+                .supervisor_dispatch_inherits_permission_mode
+                .is_some()
+            {
                 summary.supervisor_permission_etag = Some(format!("\"{etag}\""));
             }
 

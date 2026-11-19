@@ -14,7 +14,7 @@ pub use handoff::{
     DISPATCH_CONFIRMATION, SUPERVISOR_HANDOFF_GUIDANCE,
 };
 
-/// New independent execution Sessions keep explicit confirmation policies.
+/// Compatibility fallback for creation without an executing Supervisor observation.
 pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
 
