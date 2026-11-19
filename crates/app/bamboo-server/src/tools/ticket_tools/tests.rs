@@ -10,6 +10,7 @@ mod variants;
 struct Fixture {
     _root: tempfile::TempDir,
     app: Arc<TicketApplication>,
+    storage: Arc<SessionStoreV2>,
     session: Session,
 }
 impl Fixture {
@@ -17,7 +18,7 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
         let config: Config = serde_json::from_value(
-            json!({"provider":"openai","features":{"ticket_mutation":true},
+            json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
             "providers":{"openai":{"api_key":"fixture","model":"fixture-model"}}}),
         )
         .unwrap();
@@ -33,6 +34,7 @@ impl Fixture {
         Self {
             _root: root,
             app,
+            storage,
             session,
         }
     }
@@ -104,6 +106,7 @@ async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
         _root: root,
         app,
         session,
+        ..
     } = fixture;
     let writer_root = root
         .path()
@@ -311,6 +314,135 @@ fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
 }
 
 #[tokio::test]
+async fn registered_chat_does_not_block_typed_work_creation_or_dispatch() {
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    for (seq, id, text) in [(1, "hello", "Hi"), (2, "status", "How is it going?")] {
+        let ingress = VerifiedUserIngress::from_verified_host(
+            id.into(),
+            HumanIngressRecord {
+                user_id: "host-owner".into(),
+                source_ingress_seq: seq,
+                text: text.into(),
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        service.register_user_ingress(&user, &ingress).unwrap();
+    }
+    let create = f.mutation(
+        "create-despite-chat",
+        json!([{
+            "op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],
+            "contract":{"title":"One Work","objective":"One result","constraints":[],
+                "acceptance":["Exact output"],"user_acceptance_required":true,"allowed_tools":["Task"]}
+        }, {"op":"ready","work_id":"work"}]),
+    );
+    let (ok, created) = invoke(&f.tool("work_update"), create, f.ctx()).await;
+    assert!(ok, "{created}");
+    let work = &created["receipt"]["ids"]["work"];
+    let start = f.mutation(
+        "dispatch-despite-chat",
+        json!([{"op":"start","work_id":work,"temp_id":"assignment","workspace":null}]),
+    );
+    let (ok, dispatched) = invoke(&f.tool("work_dispatch"), start, f.ctx()).await;
+    assert!(ok, "{dispatched}");
+    assert_eq!(dispatched["status"], "accepted_for_dispatch");
+    let snapshot = service.published().unwrap().1;
+    let assignment_id = dispatched["receipt"]["ids"]["assignment"].as_str().unwrap();
+    assert!(snapshot.assignments.contains_key(assignment_id));
+    assert!(snapshot.resolutions.values().all(|r| r.proposal.is_none()));
+}
+
+#[tokio::test]
+async fn current_admitted_human_can_create_work_behind_older_chat_and_ahead_of_queued_input() {
+    use bamboo_domain::{
+        SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+        SessionMessageKind, SessionMessageSource,
+    };
+
+    let f = Fixture::new().await;
+    let (service, user) = f
+        .app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let mut admitted = f.session.clone();
+    for (seq, id, text) in [
+        (1, "hello", "Hi"),
+        (2, "draft", "Create a draft"),
+        (3, "queued", "Queued future input"),
+    ] {
+        let ingress = VerifiedUserIngress::from_verified_host(
+            id.into(),
+            HumanIngressRecord {
+                user_id: "host-owner".into(),
+                source_ingress_seq: seq,
+                text: text.into(),
+                thread_id: None,
+                in_reply_to: None,
+                correlation_id: None,
+            },
+        )
+        .unwrap();
+        service.register_user_ingress(&user, &ingress).unwrap();
+        if id != "queued" {
+            let envelope = SessionMessageEnvelope {
+                id: SessionMessageId::parse(id).unwrap(),
+                source: SessionMessageSource::User,
+                target_session_id: admitted.id.clone(),
+                kind: SessionMessageKind::UserInput,
+                body: SessionMessageBody::Content(SessionMessageContent::text(text)),
+                created_at: chrono::Utc::now(),
+                thread_id: None,
+                in_reply_to: None,
+                attempt: None,
+                correlation_id: None,
+            };
+            admitted.add_message(envelope.to_provider_message().unwrap());
+        }
+    }
+    f.storage.save_session(&admitted).await.unwrap();
+    let tool = f.tool("work_overview");
+    let (ok, overview) = invoke(&tool, json!({}), f.ctx()).await;
+    assert!(ok, "{overview}");
+    assert_eq!(overview["pending_message"]["input"]["message_id"], "draft");
+    assert_eq!(
+        overview["data"]["pending_ingress"],
+        json!({"count":3,"oldest":{"message_id":"hello","proposal_saved":false}})
+    );
+    let request = json!({"message_id":"draft","proposal":{"groups":[{
+        "group_id":"create","item_ids":["report"],"source_quote":"Create a draft",
+        "clarification":null,"operations":[{"op":"create","temp_id":"report","kind":"work",
+            "parent":null,"depends_on":[],"contract":{"title":"Report","objective":"A short report",
+            "constraints":[],"acceptance":["Report included"],"user_acceptance_required":true,
+            "allowed_tools":["Task"]}}]
+    }]}});
+    let (ok, resolved) = invoke(&f.tool("work_update"), request, f.ctx()).await;
+    assert!(ok, "{resolved}");
+    assert_eq!(resolved["resolution"]["groups"][0]["status"], "committed");
+    assert!(invoke(&tool, json!({}), f.ctx()).await.1["pending_message"].is_null());
+    let (ok, earlier) = invoke(&tool, json!({"message_id":"hello"}), f.ctx()).await;
+    assert!(ok, "{earlier}");
+    assert_eq!(earlier["pending_message"]["input"]["message_id"], "hello");
+    assert_eq!(earlier["data"]["pending_ingress"]["count"], 2);
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets.len(), 1);
+    assert!(snapshot.resolutions["hello"].proposal.is_none());
+    assert!(snapshot.resolutions["queued"].basis.is_none());
+}
+
+#[tokio::test]
 async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved() {
     let f = Fixture::new().await;
     let (service, user) = f
@@ -336,8 +468,9 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
     let seq = service.published().unwrap().1.seq;
     let mut read_only = f.ctx();
     read_only.plan_read_only = true;
+    let select = json!({"message_id":"hello"});
     assert!(
-        invoke(&f.tool("work_overview"), json!({}), read_only)
+        invoke(&f.tool("work_overview"), select.clone(), read_only)
             .await
             .0
     );
@@ -346,18 +479,11 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
         seq,
         "Plan reads cannot pin/publish a message basis"
     );
-    let overview = invoke(&f.tool("work_overview"), json!({}), f.ctx()).await;
+    let overview = invoke(&f.tool("work_overview"), select, f.ctx()).await;
     assert_eq!(
         overview.1["pending_message"]["input"]["human"]["text"],
         "你好"
     );
-    let bypass = invoke(
-        &f.tool("work_update"),
-        f.mutation("bypass", json!([])),
-        f.ctx(),
-    )
-    .await;
-    assert_eq!(bypass.1["status_code"], 423);
     let args = json!({"message_id":"hello","proposal":{"groups":[]}});
     let resolved = invoke(&f.tool("work_update"), args.clone(), f.ctx()).await;
     assert!(resolved.0);
@@ -367,8 +493,10 @@ async fn canonical_human_requires_whole_proposal_and_zero_groups_remain_resolved
         resolved
     );
     assert_eq!(service.published().unwrap().1.seq, seq);
-    assert!(
-        invoke(&f.tool("work_overview"), json!({}), f.ctx()).await.1["pending_message"].is_null()
+    let (_, overview) = invoke(&f.tool("work_overview"), json!({}), f.ctx()).await;
+    assert_eq!(
+        overview["data"]["pending_ingress"],
+        json!({"count":0,"oldest":null})
     );
     assert_eq!(service.published().unwrap().1.tickets.len(), 0);
 }

@@ -732,7 +732,7 @@ fn exact_targets_allow_unrelated_changes_but_reject_stale_record_and_generation(
 }
 
 #[test]
-fn later_ingress_cannot_overtake_and_two_proposals_cannot_both_mutate_same_revision() {
+fn out_of_order_proposals_cannot_both_mutate_the_same_revision() {
     let (_dir, service) = fixture();
     let a = create(&service, "A");
     let version = target(&service, &a);
@@ -750,18 +750,48 @@ fn later_ingress_cannot_overtake_and_two_proposals_cannot_both_mutate_same_revis
             )],
         );
     }
-    assert!(matches!(
-        service.settle_message(&human(), "second"),
-        Err(Error::ResourceBlocked(_))
-    ));
     assert_eq!(
-        service.settle_message(&human(), "first").unwrap().groups[0].status,
+        service.settle_message(&human(), "second").unwrap().groups[0].status,
         ResolutionStatus::Committed
     );
     assert_eq!(
-        service.settle_message(&human(), "second").unwrap().groups[0].status,
+        service.settle_message(&human(), "first").unwrap().groups[0].status,
         ResolutionStatus::Stale
     );
+}
+
+#[test]
+fn independent_human_answers_can_settle_in_reverse_ingress_order() {
+    let (_dir, service) = fixture();
+    let a = create(&service, "Alpha");
+    let b = create(&service, "Bravo");
+    let qa = ask(&service, &a, "Alpha question", false);
+    let qb = ask(&service, &b, "Bravo question", false);
+    for (seq, id, title, question) in [(1, "first", "Alpha", &qa), (2, "second", "Bravo", &qb)] {
+        let text = format!("Answer {title}: purple");
+        register(&service, id, seq, &text);
+        save(
+            &service,
+            id,
+            vec![group(
+                "answer",
+                &text,
+                vec![SemanticOperation::Answer {
+                    target: RequestReference::from_request(question),
+                    answer: "purple".into(),
+                }],
+            )],
+        );
+    }
+    for id in ["second", "first"] {
+        assert_eq!(
+            service.settle_message(&human(), id).unwrap().groups[0].status,
+            ResolutionStatus::Committed
+        );
+    }
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.requests[&qa.id].status, RequestStatus::Answered);
+    assert_eq!(snapshot.requests[&qb.id].status, RequestStatus::Answered);
 }
 
 #[test]
