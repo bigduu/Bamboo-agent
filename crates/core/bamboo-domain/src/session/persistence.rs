@@ -556,14 +556,15 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     }
 
     /// Consume one selected Runtime receipt with this Root's exact writer.
-    /// A missing, stale or different input cannot authorize startup.
+    /// Return the newly checkpointed message after the owned ACK succeeds.
+    /// A missing, stale or already committed input cannot authorize startup.
     async fn admit_root_runtime_startup(
         &self,
         _session: &mut Session,
         _inbox: Arc<dyn crate::SessionInboxPort>,
         _startup: &crate::SessionRuntimeStartup,
         _run_id: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::Message> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "exact Root Runtime Inbox startup unsupported",
@@ -993,7 +994,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         inbox: Arc<dyn crate::SessionInboxPort>,
         startup: &crate::SessionRuntimeStartup,
         run_id: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::Message> {
         (**self)
             .admit_root_runtime_startup(session, inbox, startup, run_id)
             .await

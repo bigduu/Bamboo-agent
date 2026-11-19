@@ -2125,7 +2125,7 @@ impl ChildCompletionCoordinator {
             execution_reservation.abandon().await;
             return;
         }
-        if let Some(startup) = runtime_startup {
+        let startup_message = if let Some(startup) = runtime_startup {
             let admission = match (
                 execution_reservation.execution_persistence(),
                 self.agent.session_inbox(),
@@ -2144,12 +2144,17 @@ impl ChildCompletionCoordinator {
                     "Runtime Inbox startup is unavailable",
                 )),
             };
-            if let Err(error) = admission {
-                tracing::debug!(%session_id, %error, "selected Runtime Inbox startup was not admitted");
-                execution_reservation.abandon().await;
-                return;
+            match admission {
+                Ok(message) => Some(message),
+                Err(error) => {
+                    tracing::debug!(%session_id, %error, "selected Runtime Inbox startup was not admitted");
+                    execution_reservation.abandon().await;
+                    return;
+                }
             }
-        }
+        } else {
+            None
+        };
         let root_publication = execution_reservation.root_actor_writer().map(|owner| {
             crate::events::RootActorEventPublication::new(
                 self.storage.clone(),
@@ -2312,7 +2317,7 @@ impl ChildCompletionCoordinator {
         )
         .or(config.gold_config.clone());
 
-        let (mpsc_tx, _forwarder, history_commit_barrier) =
+        let (mpsc_tx, _forwarder, mut history_commit_barrier) =
             crate::execution::create_event_forwarder_with_root_actor(
                 session_id.clone(),
                 execution_reservation.run_id().to_string(),
@@ -2321,6 +2326,23 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
                 root_publication,
             );
+        if let Some(message) = startup_message {
+            // The Message and its ACK are durable, so the round prelude
+            // cannot rediscover it. Confirm publication before model startup.
+            let queued = mpsc_tx
+                .send(AgentEvent::message_appended(&session_id, &message))
+                .await
+                .is_ok();
+            if !queued
+                || !history_commit_barrier
+                    .send_and_wait(&mpsc_tx, session_id.clone())
+                    .await
+            {
+                tracing::warn!(%session_id, "Root Runtime input publication was not confirmed");
+                execution_reservation.abandon().await;
+                return;
+            }
+        }
 
         let auxiliary_model_resolver = make_resume_auxiliary_model_resolver(
             self.config.clone(),

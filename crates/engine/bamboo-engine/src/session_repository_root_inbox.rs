@@ -146,7 +146,7 @@ impl SessionRepository {
         inbox: Arc<dyn SessionInboxPort>,
         startup: &SessionRuntimeStartup,
         run_id: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<bamboo_domain::Message> {
         let (directory, owner) = self
             .root_actor_owner
             .as_ref()
@@ -189,9 +189,9 @@ impl SessionRepository {
             )
             .await?
         {
-            InputAdmission::New(_) => {
+            InputAdmission::New(message) => {
                 *session = selected;
-                Ok(())
+                Ok(*message)
             }
             InputAdmission::Empty | InputAdmission::Recovered => Err(io::Error::other(
                 "selected Runtime Inbox startup receipt is no longer pending",

@@ -438,6 +438,10 @@ async fn background_exec_owned_actor_calls_provider_only_after_exact_receipt() {
             .await
             .unwrap();
         prior.disarm_abandonment();
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
 
         match case {
             "producer" => {
@@ -492,10 +496,58 @@ async fn background_exec_owned_actor_calls_provider_only_after_exact_receipt() {
         // Producer retries keep the stable ID while stamping the arrival time.
         envelope.created_at = message.created_at;
         assert!(is_matching_session_message(message, &envelope));
-        let mut calls = provider.0.lock().unwrap();
-        assert_eq!(calls.len(), 1, "{case}: {:?}", saved.last_run_error());
-        assert!(calls[0].iter().any(|id| id == envelope.id.as_str()));
-        calls.clear();
+        let mut appended = 0;
+        let mut saw_provider_token = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::MessageAppended {
+                    message_id,
+                    session_id,
+                    content,
+                    ..
+                } if message_id == message.id => {
+                    assert!(
+                        !saw_provider_token,
+                        "{case}: input was announced after provider output"
+                    );
+                    assert_eq!(session_id, root.id);
+                    assert_eq!(content, message.content);
+                    appended += 1;
+                }
+                AgentEvent::Token { .. } => saw_provider_token = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            appended, 1,
+            "{case}: the committed input must stream exactly once"
+        );
+        assert!(
+            saw_provider_token,
+            "{case}: provider output was missing from the stream"
+        );
+        {
+            let mut calls = provider.0.lock().unwrap();
+            assert_eq!(calls.len(), 1, "{case}: {:?}", saved.last_run_error());
+            assert!(calls[0].iter().any(|id| id == envelope.id.as_str()));
+            calls.clear();
+        }
+
+        coordinator
+            .deliver_shell_completion_for_lifetime(
+                fixture_exec_result(&root.id),
+                ShellCompletionKind::Exec,
+                Some(root.created_at),
+            )
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::MessageAppended { message_id, .. } if message_id == message.id),
+                "{case}: replay published the already committed input",
+            );
+        }
+        assert!(provider.0.lock().unwrap().is_empty(), "{case}");
     }
 }
 
@@ -520,6 +572,10 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
             "prior transcript must not start a model call",
         ));
         store.save_session(&root).await.unwrap();
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
         let envelope =
             shell_completion_envelope(&fixture_exec_result(&root.id), ShellCompletionKind::Exec);
         let delivery = inbox
@@ -619,6 +675,12 @@ async fn background_exec_owned_actor_rejects_missing_stale_and_human_gated_start
         );
         wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
         assert!(provider.0.lock().unwrap().is_empty(), "{case}");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::MessageAppended { message_id, .. } if message_id == envelope.id.as_str()),
+                "{case}: rejected input was published",
+            );
+        }
         assert!(
             !inbox.was_admitted(&root.id, &envelope.id).await.unwrap(),
             "{case}"

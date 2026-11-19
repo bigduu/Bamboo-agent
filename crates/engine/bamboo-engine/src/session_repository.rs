@@ -1178,7 +1178,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
         startup: &bamboo_domain::SessionRuntimeStartup,
         run_id: &str,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bamboo_domain::Message> {
         self.admit_owned_root_runtime_startup(session, inbox, startup, run_id)
             .await
     }
