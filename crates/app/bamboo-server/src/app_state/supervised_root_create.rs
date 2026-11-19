@@ -409,7 +409,7 @@ impl SupervisedRootCreator {
         let model =
             managed.and_then(|managed| managed.spec.managed_root.as_ref().map(|root| &root.model));
         let mut candidate = self
-            .build_candidate(&operation, &request, &workspace, model)
+            .build_candidate(&operation, &request, &workspace, authority, model)
             .await?;
         if let Some(managed) = managed {
             candidate.metadata.insert(
@@ -638,12 +638,19 @@ impl SupervisedRootCreator {
         operation: &SessionCreateOperationRecord,
         request: &SupervisedRootCreateRequest,
         workspace: &std::path::Path,
+        authority: &CreationAuthority,
         model: Option<&bamboo_domain::ProviderModelRef>,
     ) -> Result<Session, ToolError> {
         use bamboo_engine::session_app::session_create::{
             build_new_session, CreateSessionConfig, CreateSessionInput,
         };
         let config = self.config.read().await;
+        let model = model.or_else(|| match authority {
+            CreationAuthority::Supervisor { .. } => {
+                config.defaults.as_ref().map(|defaults| &defaults.chat)
+            }
+            CreationAuthority::Host { .. } => None,
+        });
         let mut candidate = build_new_session(
             &CreateSessionInput {
                 id: operation.session_id.clone(),
