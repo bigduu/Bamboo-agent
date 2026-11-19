@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordKind, RecordStatus};
+use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus};
 use bamboo_domain::TaskPriority;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
@@ -170,8 +170,8 @@ fn agenda_item(record: &LedgerRecord) -> AgendaItem {
     }
 }
 
-/// Bucket records into an agenda. Pure so views, the tool, and the prompt
-/// layer all share one definition of "overdue"/"today".
+/// Bucket confirmed commitments into an agenda shared by the views, tool, and
+/// prompt layer. The record list still exposes extractor suggestions for review.
 pub fn build_agenda_snapshot(
     records: &[LedgerRecord],
     now: DateTime<Utc>,
@@ -185,7 +185,10 @@ pub fn build_agenda_snapshot(
     };
 
     for record in records {
-        if record.status.is_terminal() {
+        if record.status.is_terminal()
+            || (record.source.created_by == RecordActor::Extractor
+                && record.tags.iter().any(|tag| tag == "suggested"))
+        {
             continue;
         }
         match record.time_anchor() {
@@ -868,6 +871,45 @@ mod tests {
         assert!(markdown.contains("## Overdue"));
         assert!(markdown.contains("rec_today"));
         assert!(!markdown.contains("rec_far"));
+    }
+
+    #[tokio::test]
+    async fn agenda_excludes_pending_extractions_until_confirmed() {
+        let dir = tempdir().unwrap();
+        let store = LedgerStore::new(dir.path());
+        let now = utc(2026, 7, 13, 12);
+        let overdue = Some(utc(2026, 7, 12, 9));
+        let scopes = [(LedgerScope::Global, None)];
+
+        let manual = todo("rec_manual", "Renew membership", overdue);
+        store.write_record(manual, None).await.unwrap();
+        let mut pending = todo("rec_pending", "Review a suggested appointment", overdue);
+        pending.source.created_by = RecordActor::Extractor;
+        pending.tags.push("suggested".to_string());
+        store.write_record(pending.clone(), None).await.unwrap();
+
+        let agenda = store.agenda(&scopes, now, 7).await.unwrap();
+        let overdue_ids: Vec<_> = agenda.overdue.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(overdue_ids, ["rec_manual"]);
+        let suggestions = store
+            .list_records(
+                LedgerScope::Global,
+                None,
+                &RecordFilter {
+                    tags: vec!["suggested".to_string()],
+                    ..RecordFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].record.id, "rec_pending");
+
+        pending.tags.clear();
+        store.write_record(pending, None).await.unwrap();
+        let agenda = store.agenda(&scopes, now, 7).await.unwrap();
+        let overdue_ids: Vec<_> = agenda.overdue.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(overdue_ids, ["rec_manual", "rec_pending"]);
     }
 
     #[test]
