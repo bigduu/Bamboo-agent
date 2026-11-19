@@ -3,11 +3,13 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 static ENGLISH_INTERVAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bevery\s+(?:([a-z]+(?:[- ][a-z]+)?|[0-9]+)\s+)?(minutes?|hours?|days?)\b")
-        .expect("fixed English interval pattern")
+    Regex::new(
+        r"(?i)\bevery\s+(?:([a-z]+(?:[- ][a-z]+)?|[0-9]+)\s+)?(seconds?|minutes?|hours?|days?)\b",
+    )
+    .expect("fixed English interval pattern")
 });
 static CHINESE_INTERVAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"每隔?\s*([0-9]+|[一二两三四五六七八九十]+)?\s*个?\s*(分钟|小时|天)")
+    Regex::new(r"每隔?\s*([0-9]+|[一二两三四五六七八九十]+)?\s*个?\s*(秒钟?|分钟|小时|天)")
         .expect("fixed Chinese interval pattern")
 });
 static POLITE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
@@ -58,6 +60,10 @@ pub(super) fn resume(text: &str) -> bool {
     RESUME.is_match(control_text(text))
 }
 
+pub(super) fn has_mentioned_interval(text: &str) -> bool {
+    ENGLISH_INTERVAL.is_match(text) || CHINESE_INTERVAL.is_match(text)
+}
+
 fn control_text(text: &str) -> &str {
     task(text)
         .trim_end_matches(['.', '。', '!', '！', '?', '？'])
@@ -99,6 +105,7 @@ pub(super) fn interval(text: &str, quote: &str) -> Option<u64> {
         .get(1)
         .map_or(Some(1), |value| count(value.as_str()))?;
     let unit = match cadence[2].to_ascii_lowercase().as_str() {
+        "second" | "seconds" | "秒" | "秒钟" => 1,
         "minute" | "minutes" | "分钟" => 60,
         "hour" | "hours" | "小时" => 3600,
         "day" | "days" | "天" => 86400,

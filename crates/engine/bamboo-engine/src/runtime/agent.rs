@@ -606,10 +606,13 @@ impl Agent {
             }))
     }
 
-    /// Only the paced loop's reserved execution receives this system guidance.
-    pub(crate) fn with_paced_loop_system_guidance(&self, guidance: Arc<str>) -> Self {
+    /// Bind paced behavior to the reserved execution that owns the Inbox input.
+    pub(crate) fn with_paced_loop_turn(
+        &self,
+        turn: super::paced_loop_wakeup::PacedLoopTurn,
+    ) -> Self {
         let mut runtime = (*self.runtime).clone();
-        runtime.paced_loop_system_guidance = Some(guidance);
+        runtime.paced_loop_turn = Some(turn);
         Self::from_runtime(Arc::new(runtime))
     }
 

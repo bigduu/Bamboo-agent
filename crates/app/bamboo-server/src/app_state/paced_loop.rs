@@ -1,4 +1,4 @@
-//! Human-owned fixed-interval turns in an existing Session. Each tick reserves
+//! Human-owned scheduled turns in an existing Session. Each tick reserves
 //! the ordinary execution owner and releases it between turns.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,11 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod adaptive;
 mod model_tool;
 mod natural_request;
+pub(super) use adaptive::ScheduleLoopWakeupTool;
+use adaptive::{AdaptiveTurn, LoopMode, NextWakeup, ADAPTIVE_FALLBACK_SECONDS};
 pub(super) use model_tool::SessionLoopTool;
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -22,11 +25,23 @@ const MAX_ATTEMPTS_PER_TICK: usize = 4;
 const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const SYSTEM_GUIDANCE: &str = "This turn was triggered by the user's fixed-interval Bamboo loop. Carry out one occurrence of the scheduled task now. Any timing language in the request is the cadence Bamboo already manages. Use relevant context from this session. Re-check the current state before repeating work with side effects. Use the normal tool and permission policy. If an action fails or requires input, briefly report what happened and what remains. Avoid repeatedly retrying an unavailable action within this turn. Finish the turn normally: Bamboo owns the timer and will attempt later iterations, including after errors. Do not wait for the next tick in this turn or create another schedule to continue this loop.";
+const ADAPTIVE_SYSTEM_GUIDANCE: &str = "This turn was triggered by the user's adaptive Bamboo loop. Carry out one occurrence of the scheduled task now. Use the normal tool and permission policy and re-check state before repeating work with side effects. Before finishing, call schedule_loop_wakeup if available, with a delay between 60 and 3600 seconds and a short reason based on what you observed. Choose a shorter wait for work actively changing and a longer wait when there is little to check. Report blockers and finish normally. Bamboo keeps the schedule after errors or missing wakeup suggestions. Do not sleep, wait for another occurrence, or create a second schedule.";
+
+pub(crate) fn has_mentioned_interval(text: &str) -> bool {
+    natural_request::has_mentioned_interval(text)
+}
+
+pub(crate) fn is_natural_loop_control(text: &str) -> bool {
+    natural_request::stop(text.trim()) || natural_request::resume(text.trim())
+}
 
 pub(crate) enum PacedLoopCommand {
     Status,
     Start {
         interval_seconds: u64,
+        prompt: String,
+    },
+    StartAdaptive {
         prompt: String,
     },
     Stop,
@@ -58,6 +73,7 @@ enum LoopStatus {
 pub(crate) struct PacedLoopRecord {
     id: Uuid,
     prompt: String,
+    mode: LoopMode,
     interval_seconds: u64,
     state: LoopStatus,
     next_fire_at: Option<DateTime<Utc>>,
@@ -65,6 +81,8 @@ pub(crate) struct PacedLoopRecord {
     iteration: u64,
     last_run_id: Option<String>,
     last_run_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_wakeup_reason: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -81,6 +99,17 @@ struct PacedLoopState {
     iteration: u64,
     last_run_id: Option<String>,
     dispatch_failed: bool,
+    #[serde(default, skip_serializing_if = "LoopMode::is_fixed")]
+    mode: LoopMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adaptive_turn: Option<AdaptiveTurn>,
+}
+
+#[derive(Deserialize)]
+struct RecordedOutcome {
+    run_id: String,
+    status: String,
+    finished_at: Option<DateTime<Utc>>,
 }
 
 impl PacedLoopState {
@@ -90,7 +119,16 @@ impl PacedLoopState {
         };
         let state = serde_json::from_str::<Self>(raw)
             .map_err(|_| PacedLoopError::Internal("Stored session loop is unreadable".into()))?;
-        if state.version != 1 || validate_start(state.interval_seconds, &state.prompt).is_err() {
+        if state.version != 1
+            || validate_start(state.interval_seconds, &state.prompt).is_err()
+            || (state.mode.is_fixed() && state.adaptive_turn.is_some())
+            || (!state.mode.is_fixed() && state.interval_seconds != ADAPTIVE_FALLBACK_SECONDS)
+            || state
+                .adaptive_turn
+                .as_ref()
+                .and_then(|turn| turn.advice.as_ref())
+                .is_some_and(|advice| !advice.is_valid())
+        {
             return Err(PacedLoopError::Internal(
                 "Stored session loop is invalid".into(),
             ));
@@ -115,21 +153,15 @@ impl PacedLoopState {
             return Some("dispatch_failed");
         }
         let run_id = self.last_run_id.as_deref()?;
-        let outcome = session
-            .metadata
-            .get(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY)
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-        if let Some(status) = outcome
-            .as_ref()
-            .filter(|outcome| outcome["run_id"].as_str() == Some(run_id))
-            .and_then(|outcome| outcome["status"].as_str())
-            .and_then(|status| match status {
-                "completed" => Some("completed"),
-                "failed" => Some("failed"),
-                "cancelled" => Some("cancelled"),
-                "suspended" => Some("suspended"),
-                _ => None,
-            })
+        if let Some(status) =
+            self.outcome(session)
+                .and_then(|outcome| match outcome.status.as_str() {
+                    "completed" => Some("completed"),
+                    "failed" => Some("failed"),
+                    "cancelled" => Some("cancelled"),
+                    "suspended" => Some("suspended"),
+                    _ => None,
+                })
         {
             return Some(status);
         }
@@ -148,6 +180,57 @@ impl PacedLoopState {
         }
     }
 
+    fn outcome(&self, session: &Session) -> Option<RecordedOutcome> {
+        let raw = session
+            .metadata
+            .get(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY)?;
+        let outcome: RecordedOutcome = serde_json::from_str(raw).ok()?;
+        (self.last_run_id.as_deref() == Some(outcome.run_id.as_str())).then_some(outcome)
+    }
+
+    fn next_wakeup(&self, session: &Session) -> NextWakeup<'_> {
+        let fallback = NextWakeup {
+            at: self.next_fire_at,
+            advice: None,
+            awaiting_outcome: false,
+        };
+        let Some(turn) = self
+            .adaptive_turn
+            .as_ref()
+            .filter(|_| !self.dispatch_failed)
+        else {
+            return fallback;
+        };
+        let Some(outcome) = self.outcome(session) else {
+            return NextWakeup {
+                awaiting_outcome: true,
+                ..fallback
+            };
+        };
+        let Some(finished_at) = outcome.finished_at else {
+            return fallback;
+        };
+        let advice = turn
+            .advice
+            .as_ref()
+            .filter(|_| outcome.status == "completed");
+        // A backwards wall-clock adjustment cannot move this wakeup before
+        // the time when the iteration was admitted.
+        let admitted_at = self
+            .next_fire_at
+            .checked_sub_signed(TimeDelta::seconds(ADAPTIVE_FALLBACK_SECONDS as i64))
+            .unwrap_or(finished_at);
+        let delay = advice.map_or(ADAPTIVE_FALLBACK_SECONDS, |advice| advice.delay_seconds);
+        NextWakeup {
+            at: finished_at
+                .max(admitted_at)
+                .checked_add_signed(TimeDelta::seconds(delay as i64))
+                .unwrap_or(fallback.at),
+            advice,
+            awaiting_outcome: false,
+        }
+    }
+
     fn project(
         &self,
         session: &Session,
@@ -155,26 +238,38 @@ impl PacedLoopState {
         now: DateTime<Utc>,
     ) -> PacedLoopRecord {
         let state = self.status(host_instance, now);
+        let wakeup = self.next_wakeup(session);
         PacedLoopRecord {
             id: self.id,
             prompt: self.prompt.clone(),
-            interval_seconds: self.interval_seconds,
+            mode: self.mode,
+            interval_seconds: wakeup
+                .advice
+                .map_or(self.interval_seconds, |advice| advice.delay_seconds),
             state,
             next_fire_at: matches!(state, LoopStatus::Scheduled)
-                .then_some(self.next_fire_at)
+                .then_some(wakeup.at)
                 .filter(|at| *at < self.expires_at),
             expires_at: self.expires_at,
             iteration: self.iteration,
             last_run_id: self.last_run_id.clone(),
             last_run_status: self.last_run_status(session),
+            next_wakeup_reason: wakeup.advice.map(|advice| advice.reason.clone()),
         }
     }
 
     fn advance(&mut self, now: DateTime<Utc>) {
-        let interval = self.interval_seconds as i64;
-        let elapsed = (now - self.next_fire_at).num_seconds().max(0);
-        let cadence_steps = elapsed / interval + 1;
-        self.next_fire_at += TimeDelta::seconds(cadence_steps * interval);
+        if self.mode.is_fixed() {
+            let interval = self.interval_seconds as i64;
+            let elapsed = (now - self.next_fire_at).num_seconds().max(0);
+            let cadence_steps = elapsed / interval + 1;
+            self.next_fire_at += TimeDelta::seconds(cadence_steps * interval);
+        } else {
+            // Commit a fallback before dispatch so a proposal is never required
+            // in order for this generation to keep running.
+            self.next_fire_at = now + TimeDelta::seconds(ADAPTIVE_FALLBACK_SECONDS as i64);
+            self.adaptive_turn = Some(AdaptiveTurn::default());
+        }
         self.iteration += 1;
     }
 }
@@ -263,11 +358,18 @@ impl PacedLoops {
     fn schedule(&self, id: &str, state: &PacedLoopState, now: DateTime<Utc>) {
         let mut due = self.due.lock().expect("paced loop hints poisoned");
         if matches!(state.status(self.host_instance, now), LoopStatus::Scheduled) {
+            // On an adaptive dispatch, start observing the existing terminal
+            // checkpoint before the durable fallback is due.
+            let at = if state.adaptive_turn.is_some() && !state.dispatch_failed {
+                now + RETRY_DELAY
+            } else {
+                state.next_fire_at
+            };
             due.insert(
                 id.to_owned(),
                 Due {
                     generation: state.id,
-                    at: state.next_fire_at.min(state.expires_at),
+                    at: at.min(state.expires_at),
                 },
             );
         } else {
@@ -277,22 +379,36 @@ impl PacedLoops {
 
     async fn commit(
         &self,
-        session: &Session,
+        session: Session,
         state: &PacedLoopState,
         owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
     ) -> Result<Session, PacedLoopError> {
         let value = serde_json::to_string(state)
             .map_err(|_| PacedLoopError::Internal("Could not serialize session loop".into()))?;
-        let saved = self.store.save_paced_loop_metadata_with_owner(session, value, owner).await.map_err(|error| {
-            match error.kind() {
-                std::io::ErrorKind::NotFound => PacedLoopError::NotFound,
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists => {
-                    PacedLoopError::Conflict("Session changed while updating the loop. Try again.".into())
-                }
-                _ => {
-                    tracing::warn!(session_id = %session.id, %error, "could not persist session loop");
-                    PacedLoopError::Internal("Could not persist the session loop".into())
-                }
+        let store = self.store.clone();
+        let id = session.id.clone();
+        let owner = owner.cloned();
+        // The V2 writer reloads and publishes a full Session. Poll it outside
+        // the nested model-tool stack while retaining the exact Actor fence.
+        let result = tokio::spawn(async move {
+            Box::pin(store.save_paced_loop_metadata_with_owner(&session, value, owner.as_ref()))
+                .await
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(session_id = %id, %error, "session loop storage task did not finish");
+            PacedLoopError::Internal("Session loop storage task did not finish".into())
+        })?;
+        let saved = result.map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => PacedLoopError::NotFound,
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists => {
+                PacedLoopError::Conflict(
+                    "Session changed while updating the loop. Try again.".into(),
+                )
+            }
+            _ => {
+                tracing::warn!(session_id = %id, %error, "could not persist session loop");
+                PacedLoopError::Internal("Could not persist the session loop".into())
             }
         })?;
         self.sessions.insert(
@@ -335,13 +451,59 @@ impl PacedLoops {
         self.apply_to_session(session, command, Some(owner)).await
     }
 
+    fn start(
+        &self,
+        session: &Session,
+        previous: Option<&PacedLoopState>,
+        now: DateTime<Utc>,
+        mode: LoopMode,
+        interval_seconds: u64,
+        prompt: String,
+    ) -> Result<PacedLoopState, PacedLoopError> {
+        validate_start(interval_seconds, &prompt)?;
+        if !supported_root(session) {
+            return Err(PacedLoopError::Conflict(
+                "Loops require a Standard ordinary Root session".into(),
+            ));
+        }
+        if previous.is_some_and(|state| {
+            matches!(
+                state.status(self.host_instance, now),
+                LoopStatus::Scheduled | LoopStatus::Paused
+            )
+        }) {
+            return Err(PacedLoopError::Conflict(
+                "This session already has a loop. Stop or resume it first.".into(),
+            ));
+        }
+        Ok(PacedLoopState {
+            version: 1,
+            id: Uuid::new_v4(),
+            host_instance: self.host_instance,
+            mode,
+            interval_seconds,
+            prompt,
+            next_fire_at: if mode.is_fixed() {
+                now + TimeDelta::seconds(interval_seconds as i64)
+            } else {
+                now
+            },
+            expires_at: now + LIFETIME,
+            stopped: false,
+            iteration: 0,
+            last_run_id: None,
+            dispatch_failed: false,
+            adaptive_turn: None,
+        })
+    }
+
     async fn apply_to_session(
         &self,
         session: Session,
         command: PacedLoopCommand,
         owner: Option<&bamboo_domain::RootActorRuntimeWrite>,
     ) -> Result<Option<PacedLoopRecord>, PacedLoopError> {
-        let id = session.id.as_str();
+        let id = session.id.clone();
         let now = Utc::now();
         let previous = PacedLoopState::read(&session)?;
         let state = match command {
@@ -351,37 +513,22 @@ impl PacedLoops {
             PacedLoopCommand::Start {
                 interval_seconds,
                 prompt,
-            } => {
-                validate_start(interval_seconds, &prompt)?;
-                if !supported_root(&session) {
-                    return Err(PacedLoopError::Conflict(
-                        "Loops require a Standard ordinary Root session".into(),
-                    ));
-                }
-                if previous.as_ref().is_some_and(|state| {
-                    matches!(
-                        state.status(self.host_instance, now),
-                        LoopStatus::Scheduled | LoopStatus::Paused
-                    )
-                }) {
-                    return Err(PacedLoopError::Conflict(
-                        "This session already has a loop. Stop or resume it first.".into(),
-                    ));
-                }
-                PacedLoopState {
-                    version: 1,
-                    id: Uuid::new_v4(),
-                    host_instance: self.host_instance,
-                    interval_seconds,
-                    prompt,
-                    next_fire_at: now + TimeDelta::seconds(interval_seconds as i64),
-                    expires_at: now + LIFETIME,
-                    stopped: false,
-                    iteration: 0,
-                    last_run_id: None,
-                    dispatch_failed: false,
-                }
-            }
+            } => self.start(
+                &session,
+                previous.as_ref(),
+                now,
+                LoopMode::Fixed,
+                interval_seconds,
+                prompt,
+            )?,
+            PacedLoopCommand::StartAdaptive { prompt } => self.start(
+                &session,
+                previous.as_ref(),
+                now,
+                LoopMode::Adaptive,
+                ADAPTIVE_FALLBACK_SECONDS,
+                prompt,
+            )?,
             PacedLoopCommand::Stop => {
                 let Some(mut state) = previous else {
                     return Ok(None);
@@ -393,6 +540,7 @@ impl PacedLoops {
                     return Ok(Some(state.project(&session, self.host_instance, now)));
                 }
                 state.stopped = true;
+                state.adaptive_turn = None;
                 state
             }
             PacedLoopCommand::Resume => {
@@ -409,7 +557,12 @@ impl PacedLoops {
                     ));
                 }
                 state.host_instance = self.host_instance;
-                state.next_fire_at = now + TimeDelta::seconds(state.interval_seconds as i64);
+                state.adaptive_turn = None;
+                state.next_fire_at = if state.mode.is_fixed() {
+                    now + TimeDelta::seconds(state.interval_seconds as i64)
+                } else {
+                    now
+                };
                 state
             }
         };
@@ -417,10 +570,10 @@ impl PacedLoops {
         // acknowledgement could be lost. The tick re-reads the exact canonical
         // generation and Host instance before it can reserve a turn.
         if matches!(state.status(self.host_instance, now), LoopStatus::Scheduled) {
-            self.schedule(id, &state, now);
+            self.schedule(&id, &state, now);
         }
-        let saved = self.commit(&session, &state, owner).await?;
-        self.schedule(id, &state, now);
+        let saved = self.commit(session, &state, owner).await?;
+        self.schedule(&id, &state, now);
         Ok(Some(state.project(&saved, self.host_instance, now)))
     }
 
@@ -480,7 +633,11 @@ impl PacedLoops {
         }) else {
             return Ok(false);
         };
-        if state.next_fire_at > now {
+        let wakeup = state.next_wakeup(&initial);
+        if wakeup.at > now {
+            if wakeup.awaiting_outcome {
+                return Ok(true);
+            }
             // A prior write may have committed before its acknowledgement
             // failed. Rebuild the hint from canonical state, never replay it.
             let mut hints = self.due.lock().expect("paced loop hints poisoned");
@@ -489,7 +646,7 @@ impl PacedLoops {
                     id.to_owned(),
                     Due {
                         generation: state.id,
-                        at: state.next_fire_at.min(state.expires_at),
+                        at: wakeup.at.min(state.expires_at),
                     },
                 );
             }
@@ -525,7 +682,7 @@ impl PacedLoops {
     ) -> Result<Option<PacedLoopState>, PacedLoopError> {
         Ok(PacedLoopState::read(session)?.filter(|state| {
             state.id == due.generation
-                && state.next_fire_at <= now
+                && state.next_wakeup(session).at <= now
                 && matches!(state.status(self.host_instance, now), LoopStatus::Scheduled)
         }))
     }
@@ -584,10 +741,16 @@ impl PacedLoops {
         state.advance(now);
         state.last_run_id = Some(reservation.run_id().to_owned());
         state.dispatch_failed = false;
-        let saved = self.commit(&session, &state, None).await?;
+        let saved = self.commit(session, &state, None).await?;
         self.schedule(id, &state, now);
+        let adaptive = !state.mode.is_fixed();
+        let instructions = if adaptive {
+            ADAPTIVE_SYSTEM_GUIDANCE
+        } else {
+            SYSTEM_GUIDANCE
+        };
         let guidance = format!(
-            "{SYSTEM_GUIDANCE}\n\nScheduled iteration {}. Previous scheduled turn status: {previous}.",
+            "{instructions}\n\nScheduled iteration {}. Previous scheduled turn status: {previous}.",
             state.iteration
         );
         if let Err(error) = self
@@ -599,12 +762,13 @@ impl PacedLoops {
                 state.id,
                 state.iteration,
                 Some(guidance),
+                adaptive,
             )
             .await
         {
             tracing::warn!(session_id = id, %error, "session loop dispatch failed; future iterations stay scheduled");
             state.dispatch_failed = true;
-            self.commit(&saved, &state, None).await?;
+            self.commit(saved, &state, None).await?;
         }
         Ok(false)
     }
@@ -651,7 +815,16 @@ mod tests {
             iteration: 0,
             last_run_id: None,
             dispatch_failed: false,
+            mode: LoopMode::Fixed,
+            adaptive_turn: None,
         };
+        let legacy = serde_json::to_value(&state).unwrap();
+        assert!(legacy.get("mode").is_none());
+        assert!(legacy.get("adaptive_turn").is_none());
+        assert!(serde_json::from_value::<PacedLoopState>(legacy)
+            .unwrap()
+            .mode
+            .is_fixed());
         state.advance(due + TimeDelta::seconds(145));
         assert_eq!(state.iteration, 1);
         assert_eq!(state.next_fire_at, due + TimeDelta::seconds(180));

@@ -559,6 +559,9 @@ async fn execute_tool_call_only_with_execution_name_inner(
             ctx.tools.as_ref(),
         )
         .is_some();
+    let selected_paced_wakeup = execution_name == bamboo_domain::PACED_LOOP_WAKEUP_TOOL_NAME
+        && crate::runtime::paced_loop_wakeup::registered_paced_loop_wakeup_tool(ctx.tools.as_ref())
+            .is_some();
     let loop_status = selected_session_loop
         && args.get("action").and_then(serde_json::Value::as_str) == Some("status");
     let is_mutating = !loop_status
@@ -662,10 +665,16 @@ async fn execute_tool_call_only_with_execution_name_inner(
                 );
                 if ctx.session_flags.auto_approve_permissions {
                     permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
-                } else if selected_session_loop
-                    && bamboo_tools::session_loop_permission::is_session_loop_mutation(&args)
+                } else if selected_paced_wakeup
+                    || (selected_session_loop
+                        && bamboo_tools::session_loop_permission::is_session_loop_mutation(&args))
                 {
-                    let reason = "A tool hook requires approval. Use explicit /loop controls to manage this session loop.".to_string();
+                    let reason = if selected_paced_wakeup {
+                        "A tool hook requires approval. The loop will use its fallback delay."
+                    } else {
+                        "A tool hook requires approval. Use explicit /loop controls to manage this session loop."
+                    }
+                    .to_string();
                     let end_event = emitter.error(reason.clone()).clone();
                     let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
                     return Ok(ToolExecutionOutcome {
@@ -791,6 +800,18 @@ async fn execute_tool_call_only_with_execution_name_inner(
     };
     let dispatch =
         bamboo_agent_core::tools::context::with_root_human_tool_input(human_receipt, dispatch);
+    let wakeup_writer = if selected_paced_wakeup && !ctx.session_flags.plan_read_only {
+        ctx.hook_session.as_deref().and_then(|session| {
+            crate::runtime::paced_loop_wakeup::paced_loop_wakeup_writer(ctx.config, session)
+        })
+    } else {
+        None
+    };
+    let dispatch = crate::runtime::paced_loop_wakeup::scope_paced_loop_wakeup_writer(
+        wakeup_writer,
+        &ctx.tool_call.id,
+        dispatch,
+    );
     let dispatch = bamboo_agent_core::tools::context::with_root_actor_tool_writer(
         ctx.config
             .persistence

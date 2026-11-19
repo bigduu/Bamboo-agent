@@ -1,12 +1,18 @@
-//! Human control of a fixed-interval loop in an existing Session.
+//! Human control of fixed and adaptive loops in an existing Session.
+
+use std::sync::LazyLock;
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, ResponseError};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::app_state::{
     mutation_idempotency,
-    paced_loop::{PacedLoopCommand, PacedLoopError, PacedLoopRecord},
+    paced_loop::{
+        has_mentioned_interval, is_natural_loop_control, PacedLoopCommand, PacedLoopError,
+        PacedLoopRecord,
+    },
     AppState,
 };
 use crate::error::{json_error, ResponseResult};
@@ -14,13 +20,24 @@ use crate::error::{json_error, ResponseResult};
 use super::chat::ChatRequest;
 use super::tickets::{require_supervisor_owner, TicketHttpError};
 
-const CHAT_USAGE: &str = "Use /loop <interval> <prompt> (for example, /loop 5m check the build), /loop status, /loop stop, or /loop resume";
+const CHAT_USAGE: &str = "Use /loop <task> for automatic intervals, /loop 5m <task> for fixed intervals, or /loop status, /loop stop, and /loop resume to manage a loop";
+static LEADING_INTERVAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[0-9]+\s+(?:seconds?|minutes?|hours?|days?)\b")
+        .expect("fixed leading interval pattern")
+});
+static NATURAL_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:when (?:will|does) (?:this|the|my) loop (?:run next|next run)|这个循环下次什么时候运行)[。！!？?]?$")
+        .expect("fixed loop status question pattern")
+});
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum LoopMutationRequest {
     Start {
         interval_seconds: u64,
+        prompt: String,
+    },
+    StartAdaptive {
         prompt: String,
     },
     Stop {},
@@ -37,6 +54,7 @@ impl From<LoopMutationRequest> for PacedLoopCommand {
                 interval_seconds,
                 prompt,
             },
+            LoopMutationRequest::StartAdaptive { prompt } => Self::StartAdaptive { prompt },
             LoopMutationRequest::Stop {} => Self::Stop,
             LoopMutationRequest::Resume {} => Self::Resume,
         }
@@ -119,8 +137,8 @@ pub(crate) enum LoopChatInput {
     Natural,
 }
 
-/// Parse explicit controls, reserving malformed fixed syntax. Other phrases
-/// use ordinary chat admission with their original text.
+/// Parse explicit controls and task-only starts. Spoken timing and management
+/// requests use ordinary chat admission with their original text.
 pub(crate) fn parse_chat_command(message: &str) -> Option<LoopChatInput> {
     let message = message.trim();
     let name_end = message.find(char::is_whitespace).unwrap_or(message.len());
@@ -153,7 +171,18 @@ pub(crate) fn parse_chat_command(message: &str) -> Option<LoopChatInput> {
             .ok_or(CHAT_USAGE);
         return Some(LoopChatInput::Control(command));
     }
-    Some(LoopChatInput::Natural)
+    if has_mentioned_interval(args)
+        || LEADING_INTERVAL.is_match(args)
+        || is_natural_loop_control(args)
+        || NATURAL_STATUS.is_match(args)
+    {
+        return Some(LoopChatInput::Natural);
+    }
+    Some(LoopChatInput::Control(Ok(
+        PacedLoopCommand::StartAdaptive {
+            prompt: args.into(),
+        },
+    )))
 }
 
 fn looks_like_fixed_interval(token: &str) -> bool {
@@ -198,6 +227,7 @@ pub(crate) async fn handle_chat_command(
     let action = match &command {
         PacedLoopCommand::Status => "status",
         PacedLoopCommand::Start { .. } => "start",
+        PacedLoopCommand::StartAdaptive { .. } => "start_adaptive",
         PacedLoopCommand::Stop => "stop",
         PacedLoopCommand::Resume => "resume",
     };
@@ -331,12 +361,26 @@ mod tests {
             "/loop 每隔五分钟检查构建",
             "/loop check the build every 5 minutes",
             "/loop 5 minutes between build checks",
+            "/loop check the build every 90 seconds",
+            "/loop 每隔九十秒检查构建",
+            "/loop 恢复这个循环。",
+            "/loop when will this loop run next?",
         ] {
             assert!(
                 matches!(parse_chat_command(text), Some(LoopChatInput::Natural)),
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn task_only_loop_starts_an_adaptive_schedule_with_the_full_prompt() {
+        let Some(LoopChatInput::Control(Ok(PacedLoopCommand::StartAdaptive { prompt }))) =
+            parse_chat_command("  /LOOP 检查部署\nKeep  spacing  ")
+        else {
+            panic!("expected an adaptive start");
+        };
+        assert_eq!(prompt, "检查部署\nKeep  spacing");
     }
 
     #[test]
@@ -347,6 +391,8 @@ mod tests {
             json!({"action": "resume", "prompt": "unused"}),
             json!({"action": "start", "interval_seconds": 300}),
             json!({"action": "start", "interval_seconds": 300, "prompt": "check", "session_id": "other"}),
+            json!({"action": "start_adaptive"}),
+            json!({"action": "start_adaptive", "prompt": "check", "interval_seconds": 300}),
         ] {
             assert!(serde_json::from_value::<LoopMutationRequest>(payload).is_err());
         }
@@ -519,6 +565,36 @@ mod tests {
             .to_request();
         let repeated_stop: Value = test::call_and_read_body_json(&app, repeated_stop).await;
         assert_eq!(repeated_stop["loop"], stop["loop_command"]["loop"]);
+
+        let adaptive = test::TestRequest::post()
+            .uri("/api/v1/chat")
+            .set_json(json!({"session_id":session_id,"message":"/loop check the build"}))
+            .to_request();
+        let adaptive: Value = test::call_and_read_body_json(&app, adaptive).await;
+        assert_eq!(adaptive["loop_command"]["action"], "start_adaptive");
+        assert_eq!(adaptive["loop_command"]["should_execute"], false);
+        assert_eq!(adaptive["loop_command"]["loop"]["mode"], "adaptive");
+        assert_eq!(
+            adaptive["loop_command"]["loop"]["prompt"],
+            "check the build"
+        );
+        assert!(!cancel.is_cancelled());
+
+        let stop = test::TestRequest::post()
+            .uri(&loop_api)
+            .set_json(json!({"action": "stop"}))
+            .to_request();
+        let stop: Value = test::call_and_read_body_json(&app, stop).await;
+        assert_eq!(stop["loop"]["mode"], "adaptive");
+        assert_eq!(stop["loop"]["state"], "stopped");
+        let start = test::TestRequest::post()
+            .uri(&loop_api)
+            .set_json(json!({"action": "start_adaptive", "prompt": "检查部署"}))
+            .to_request();
+        let start: Value = test::call_and_read_body_json(&app, start).await;
+        assert_eq!(start["loop"]["mode"], "adaptive");
+        assert_eq!(start["loop"]["prompt"], "检查部署");
+
         let durable = state
             .storage
             .load_session(session_id)

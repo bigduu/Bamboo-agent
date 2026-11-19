@@ -28,6 +28,7 @@ use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
 };
+use crate::runtime::paced_loop_wakeup::PacedLoopTurn;
 use crate::Agent;
 use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
@@ -68,10 +69,10 @@ const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
 enum ResumeOrigin {
     Legacy,
     Configured,
-    PacedLoop { system_guidance: Option<String> },
+    PacedLoop(PacedLoopTurn),
 }
 
-fn record_paced_loop_outcome(run_id: String) -> SessionCompletionHook {
+fn record_paced_loop_outcome(run_id: String, adaptive_wakeup: bool) -> SessionCompletionHook {
     Box::new(move |outcome, session| {
         Box::pin(async move {
             let status = if outcome.cancelled {
@@ -83,10 +84,13 @@ fn record_paced_loop_outcome(run_id: String) -> SessionCompletionHook {
             } else {
                 "completed"
             };
-            session.metadata.insert(
-                PACED_LOOP_OUTCOME_METADATA_KEY.into(),
-                serde_json::json!({ "run_id": run_id, "status": status }).to_string(),
-            );
+            let mut record = serde_json::json!({ "run_id": run_id, "status": status });
+            if adaptive_wakeup {
+                record["finished_at"] = serde_json::json!(Utc::now());
+            }
+            session
+                .metadata
+                .insert(PACED_LOOP_OUTCOME_METADATA_KEY.into(), record.to_string());
         })
     })
 }
@@ -1047,6 +1051,7 @@ impl ChildCompletionCoordinator {
         generation: uuid::Uuid,
         occurrence: u64,
         system_guidance: Option<String>,
+        adaptive_wakeup: bool,
     ) -> std::io::Result<()> {
         let writer = reservation
             .root_actor_writer()
@@ -1102,9 +1107,11 @@ impl ChildCompletionCoordinator {
         };
         let coordinator = self.clone();
         tokio::spawn(async move {
-            coordinator
-                .spawn_resume_with_origin(request, ResumeOrigin::PacedLoop { system_guidance })
-                .await;
+            let origin = ResumeOrigin::PacedLoop(PacedLoopTurn {
+                system_guidance: system_guidance.map(Arc::from),
+                adaptive_wakeup,
+            });
+            coordinator.spawn_resume_with_origin(request, origin).await;
         });
         Ok(())
     }
@@ -2236,16 +2243,16 @@ impl ChildCompletionCoordinator {
             event_sender,
             config,
         } = request;
-        let (from_config, system_guidance, on_complete) = match origin {
+        let (from_config, paced_loop_turn, on_complete) = match origin {
             ResumeOrigin::Legacy => (false, None, None),
             ResumeOrigin::Configured => (true, None, None),
-            ResumeOrigin::PacedLoop { system_guidance } => (
-                true,
-                system_guidance,
-                Some(record_paced_loop_outcome(
+            ResumeOrigin::PacedLoop(turn) => {
+                let completion = record_paced_loop_outcome(
                     execution_reservation.run_id().to_owned(),
-                )),
-            ),
+                    turn.adaptive_wakeup,
+                );
+                (true, Some(turn), Some(completion))
+            }
         };
         if let Err(error) = execution_reservation.ensure_registered().await {
             tracing::warn!(
@@ -2416,8 +2423,8 @@ impl ChildCompletionCoordinator {
         };
         let agent =
             Arc::new(agent.with_legacy_vision_provider_source(legacy_vision_provider_source));
-        let agent = if let Some(guidance) = system_guidance {
-            Arc::new(agent.with_paced_loop_system_guidance(Arc::from(guidance)))
+        let agent = if let Some(turn) = paced_loop_turn {
+            Arc::new(agent.with_paced_loop_turn(turn))
         } else {
             agent
         };

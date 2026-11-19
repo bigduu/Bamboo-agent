@@ -190,7 +190,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
 // #2831 changes the default Storage save path. Supervisor dispatch consent
 // cases stay in the default Server owners; all 20 additive cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "2291aa54988ff170a15705ee665bc92794f1f2b28e45076e72b510655052954b";
+const FEATURE_SOURCE_SHA256 = "bf5eb7a8765adc824046263dc6487fbe9b523d1439eaab54f264c9962fe5ecfd";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

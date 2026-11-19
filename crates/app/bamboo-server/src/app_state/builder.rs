@@ -1310,6 +1310,13 @@ impl AppState {
                     &paced_loops,
                 ))),
             ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(super::paced_loop::ScheduleLoopWakeupTool::new(
+                    Arc::downgrade(&paced_loops),
+                )),
+            ));
 
         child_completion_coordinator
             .set_root_tools(tools.clone())

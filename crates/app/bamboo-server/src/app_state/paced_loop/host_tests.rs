@@ -1,7 +1,8 @@
 //! Exercise real Session persistence, Inbox admission, and the Root runner.
 
 use super::{
-    Due, LoopStatus, PacedLoopCommand, PacedLoopState, PacedLoops, RETRY_DELAY, SYSTEM_GUIDANCE,
+    Due, LoopStatus, PacedLoopCommand, PacedLoopState, PacedLoops, ADAPTIVE_FALLBACK_SECONDS,
+    ADAPTIVE_SYSTEM_GUIDANCE, RETRY_DELAY, SYSTEM_GUIDANCE,
 };
 use crate::app_state::{AgentStatus, AppState};
 use actix_web::{test, web, App};
@@ -9,7 +10,7 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::session::inbox::{PACED_LOOP_INSTRUCTION, PACED_LOOP_SUBSYSTEM};
 use bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
-use bamboo_domain::AgentStatusState;
+use bamboo_domain::{AgentStatusState, PACED_LOOP_WAKEUP_TOOL_NAME};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use chrono::TimeDelta;
 use serde_json::{json, Value};
@@ -38,6 +39,7 @@ fn saved_outcome(session: &Session) -> Value {
 struct Probe {
     requests: Mutex<Vec<Vec<Message>>>,
     scripted_loop: bool,
+    scripted_adaptive: bool,
     first_entered: Notify,
     release_first: Notify,
 }
@@ -60,6 +62,69 @@ impl LLMProvider for Probe {
         let paced = messages.iter().any(|message| {
             message.role == Role::System && message.content.contains(SYSTEM_GUIDANCE)
         });
+        let adaptive = messages.iter().find(|message| {
+            message.role == Role::System && message.content.contains(ADAPTIVE_SYSTEM_GUIDANCE)
+        });
+        let wakeup_tool = tools
+            .iter()
+            .any(|tool| tool.function.name == PACED_LOOP_WAKEUP_TOOL_NAME);
+        assert_eq!(
+            wakeup_tool,
+            adaptive.is_some(),
+            "wakeup tool belongs to adaptive turns"
+        );
+        if self.scripted_adaptive {
+            if let Some(message) = adaptive {
+                assert!(!tools
+                    .iter()
+                    .any(|tool| tool.function.name == "session_loop"));
+                let iteration = (1..=5)
+                    .find(|iteration| {
+                        message
+                            .content
+                            .contains(&format!("Scheduled iteration {iteration}."))
+                    })
+                    .expect("expected adaptive occurrence");
+                let id = format!("adaptive-wakeup-{iteration}");
+                let result = messages
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some(id.as_str()));
+                if let Some(delay) = match iteration {
+                    1 => Some(120),
+                    2 => Some(3601),
+                    4 => Some(600),
+                    _ => None,
+                } {
+                    if let Some(result) = result {
+                        assert_eq!(
+                            result.tool_success,
+                            Some(iteration != 2),
+                            "{}",
+                            result.content
+                        );
+                    } else {
+                        return Ok(Box::pin(futures::stream::iter([
+                            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                                id,
+                                tool_type: "function".into(),
+                                function: FunctionCall {
+                                    name: PACED_LOOP_WAKEUP_TOOL_NAME.into(),
+                                    arguments: json!({
+                                        "delay_seconds": delay,
+                                        "reason": "Synthetic build state"
+                                    })
+                                    .to_string(),
+                                },
+                            }])),
+                            Ok(LLMChunk::Done),
+                        ])));
+                    }
+                }
+                if matches!(iteration, 3 | 4) {
+                    return Err(LLMError::RequestFailed("synthetic adaptive failure".into()));
+                }
+            }
+        }
         if self.scripted_loop {
             let latest = messages.iter().rev().find(|message| {
                 message.role == Role::User
@@ -125,6 +190,76 @@ impl LLMProvider for Probe {
             Ok(LLMChunk::Done),
         ])))
     }
+}
+
+#[actix_web::test]
+async fn host_paced_loop_adaptive_uses_model_delay_and_repeats_the_fallback_after_errors() {
+    let fixture = Fixture::with_probe(Probe {
+        scripted_adaptive: true,
+        ..Probe::default()
+    })
+    .await;
+    fixture.human_turn(CONTEXT, true).await;
+    fixture.settled(1).await;
+    fixture
+        .state
+        .apply_paced_loop(
+            SESSION_ID,
+            PacedLoopCommand::StartAdaptive {
+                prompt: PROMPT.into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let initial = fixture.loop_state().await;
+    assert!(!initial.mode.is_fixed());
+    assert!(initial.next_fire_at <= chrono::Utc::now());
+    let mut due_at = initial.next_fire_at;
+
+    for (index, (requests, terminal, delay)) in [
+        (3, "completed", 120),
+        (5, "completed", ADAPTIVE_FALLBACK_SECONDS), // Invalid proposal
+        (6, "failed", ADAPTIVE_FALLBACK_SECONDS),    // No proposal and provider failure
+        (8, "failed", ADAPTIVE_FALLBACK_SECONDS),    // Valid proposal before provider failure
+        (9, "completed", ADAPTIVE_FALLBACK_SECONDS), // No proposal on an otherwise good turn
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fixture
+            .state
+            .paced_loops
+            .tick(due_at - TimeDelta::milliseconds(1))
+            .await;
+        assert_eq!(fixture.loop_state().await.iteration, index as u64);
+        fixture.state.paced_loops.tick(due_at).await;
+        let session = fixture.settled(requests).await;
+        let state = PacedLoopState::read(&session).unwrap().unwrap();
+        assert_eq!(state.iteration, index as u64 + 1);
+        assert_eq!(state.last_run_status(&session), Some(terminal));
+        let outcome = state.outcome(&session).unwrap();
+        let expected = outcome.finished_at.unwrap().max(due_at) + TimeDelta::seconds(delay as i64);
+        let projected = state.project(
+            &session,
+            fixture.state.paced_loops.host_instance,
+            chrono::Utc::now(),
+        );
+        assert_eq!(projected.next_fire_at, Some(expected));
+        assert_eq!(projected.interval_seconds, delay);
+        assert_eq!(
+            projected.next_wakeup_reason.as_deref(),
+            (index == 0).then_some("Synthetic build state")
+        );
+        due_at = expected;
+    }
+    fixture
+        .state
+        .apply_paced_loop(SESSION_ID, PacedLoopCommand::Stop)
+        .await
+        .unwrap();
+    fixture.state.paced_loops.tick(due_at).await;
+    assert_eq!(fixture.probe.requests.lock().unwrap().len(), 9);
 }
 
 struct Fixture {

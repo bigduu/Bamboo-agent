@@ -1,11 +1,14 @@
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::paced_loop_wakeup::{
+    paced_loop_wakeup_writer, registered_paced_loop_wakeup_tool,
+};
 use bamboo_agent_core::tools::{
     FrameworkSessionToolKind as SessionToolKind, Tool, ToolExecutor, ToolSchema,
 };
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_disabled_tool_reference_name, CapabilityLoadingMode, ClassifiedToolSchema,
-    EffectiveCallableSet, SessionKind, SESSION_LOOP_TOOL_NAME,
+    EffectiveCallableSet, SessionKind, PACED_LOOP_WAKEUP_TOOL_NAME, SESSION_LOOP_TOOL_NAME,
 };
 #[cfg(test)]
 use bamboo_skills::runtime_metadata::{
@@ -182,13 +185,21 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
             schema.function.parameters["properties"]["question"] = serde_json::json!({"type":"object","additionalProperties":false,"required":["prompt"],"properties":{"prompt":{"type":"string","minLength":1,"maxLength":2048}}});
         }
     }
-    // A registry or MCP schema cannot supply this reserved Host identity.
+    // A registry or MCP schema cannot supply these reserved Host identities.
     // Project the schema from the concrete local execution owner only.
     tool_schemas.retain(|schema| {
-        bamboo_domain::canonical_tool_name(&schema.function.name) != SESSION_LOOP_TOOL_NAME
+        !matches!(
+            bamboo_domain::canonical_tool_name(&schema.function.name).as_str(),
+            SESSION_LOOP_TOOL_NAME | PACED_LOOP_WAKEUP_TOOL_NAME
+        )
     });
     if crate::runtime::managers::lifecycle::root_human_input_receipt(config, session).is_some() {
         if let Some(tool) = registered_session_loop_tool(tools) {
+            tool_schemas.push(tool.to_schema());
+        }
+    }
+    if let Some(tool) = registered_paced_loop_wakeup_tool(tools) {
+        if paced_loop_wakeup_writer(config, session).is_some() {
             tool_schemas.push(tool.to_schema());
         }
     }
