@@ -613,6 +613,18 @@ async function registryFetch(url, allowMissing = false, retryRead = read => read
   return response
 }
 
+async function waitForCargoArchive(name, version, read, wait) {
+  // The crates.io API download redirect can become available before the
+  // static path Cargo uses when the index's dl URL has no markers.
+  const url = `https://static.crates.io/crates/${name}/${version}/download`
+  for (let attempt = 1; attempt <= 60; attempt++) {
+    const response = await read(url, true)
+    if (response) return response
+    if (attempt < 60) await wait(10)
+  }
+  throw new Error(`Timed out waiting for Cargo download: ${name}@${version} (${url})`)
+}
+
 // A successful queued run does not authorize publication after main advances.
 // Re-read the fixed repository immediately before each external write; failures
 // stop before the write. Historical recovery keeps its existing authority path.
@@ -737,8 +749,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
     const response = await readRegistry(`https://crates.io/api/v1/crates/${name}`, true)
     return response ? (await response.json()).versions.map((version) => version.num) : []
   }
-  const downloadArchive = async (name, version) => {
-    const response = await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}/download`)
+  const downloadArchive = async (name, version, available) => {
+    const response = available ?? await readRegistry(`https://crates.io/api/v1/crates/${name}/${version}/download`)
     const bytes = Buffer.from(await response.arrayBuffer())
     const archive = path.join(directory, `${name}-${version}.crate`)
     fs.writeFileSync(archive, bytes)
@@ -888,7 +900,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       return { status: result.status, output }
     },
     verifyArchive: async (name, receipt, checksum) => {
-      const { bytes, entry } = await downloadArchive(name, receipt.version)
+      const available = frozen && !recovery ? await waitForCargoArchive(name, receipt.version, readRegistry, context.wait) : undefined
+      const { bytes, entry } = await downloadArchive(name, receipt.version, available)
       verifyPackageArchive(bytes, receipt, name, checksum, entry)
     },
     wait: async (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
@@ -948,7 +961,7 @@ function preparationIdentity(context, version, env = process.env) {
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, publishCrates, makeContext, makeRecoveryContext, makeFrozenRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
-  frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
+  frontendIdentity, verifyPackageArchive, waitForCargoArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
   assertAdmissionCompatibility, assertFrozenPublisherRun, assertCrateCompilationAllowed, prepareFrozenCrateOriginal }
