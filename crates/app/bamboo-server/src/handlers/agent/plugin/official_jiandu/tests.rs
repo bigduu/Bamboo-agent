@@ -22,7 +22,7 @@ pub(super) async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> w
 async fn fixture() -> (
     tempfile::TempDir,
     web::Data<AppState>,
-    Release,
+    Catalog,
     InstalledPlugin,
 ) {
     let dir = tempfile::tempdir().unwrap();
@@ -77,7 +77,11 @@ async fn fixture() -> (
         registered: RegisteredCapabilities::default(),
     };
     save(&state, entry.clone()).await;
-    (dir, state, release, entry)
+    let catalog = Catalog {
+        release: Some(release),
+        legacy_release: None,
+    };
+    (dir, state, catalog, entry)
 }
 
 async fn save(state: &AppState, entry: InstalledPlugin) {
@@ -138,6 +142,7 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
     assert_eq!(report["host"]["os"], std::env::consts::OS);
     assert_eq!(report["host"]["arch"], std::env::consts::ARCH);
     assert_eq!(report["installed"]["state"], "missing");
+    assert_eq!(report["release"]["version"], "0.4.0");
     assert!(report["external_client"].is_null());
     assert!(!state.app_data_dir.join("plugins/installed.json").exists());
     for body in [
@@ -178,9 +183,9 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
 
 #[actix_web::test]
 async fn ready_configuration_shares_actual_custom_root_without_registering_mcp() {
-    let (_dir, state, release, _entry) = fixture().await;
+    let (_dir, state, catalog, _entry) = fixture().await;
     let before = serde_json::to_value(&state.config.read().await.mcp).unwrap();
-    let report = setup(&state, mac(), Some(release)).await.unwrap();
+    let report = setup(&state, mac(), &catalog).await.unwrap();
     assert_eq!(report.installed.state, "ready");
     let client = report.external_client.unwrap();
     assert!(Path::new(&client.command).is_absolute());
@@ -200,8 +205,39 @@ async fn ready_configuration_shares_actual_custom_root_without_registering_mcp()
 }
 
 #[actix_web::test]
+async fn verified_legacy_connector_keeps_its_configuration_until_explicit_update() {
+    let (_dir, state, previous, entry) = fixture().await;
+    let mut catalog = accepted_catalog();
+    assert_eq!(
+        catalog.legacy_release.as_ref().unwrap().version,
+        entry.version
+    );
+    catalog.legacy_release = previous.release;
+    let report = setup(&state, mac(), &catalog).await.unwrap();
+    assert_eq!(report.release.unwrap().version, "0.3.2");
+    assert_eq!(report.installed.state, "ready");
+    assert_eq!(report.installed.version.as_deref(), Some("0.3.2"));
+    assert_eq!(report.install.reason, Some("already_installed"));
+    let client = report.external_client.unwrap();
+    assert_eq!(
+        client.args,
+        [
+            "--data-dir",
+            state.memory_store.data_dir().to_str().unwrap()
+        ]
+    );
+
+    tokio::fs::write(entry.plugin_dir.join("bin/macos/jiandu"), b"changed")
+        .await
+        .unwrap();
+    let report = setup(&state, mac(), &catalog).await.unwrap();
+    assert_eq!(report.installed.state, "unverified");
+    assert!(report.external_client.is_none());
+}
+
+#[actix_web::test]
 async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_command() {
-    let (_dir, state, release, original) = fixture().await;
+    let (_dir, state, catalog, original) = fixture().await;
     let mut cases = vec![];
     let mut entry = original.clone();
     entry.status = PluginInstallStatus::Installing;
@@ -237,7 +273,7 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
     }
     for entry in cases {
         save(&state, entry).await;
-        assert!(setup(&state, mac(), Some(release.clone()))
+        assert!(setup(&state, mac(), &catalog)
             .await
             .unwrap()
             .external_client
@@ -250,7 +286,7 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
         .await
         .plugin_trust
         .revoke_official_publisher("jiandu");
-    assert!(setup(&state, mac(), Some(release.clone()))
+    assert!(setup(&state, mac(), &catalog)
         .await
         .unwrap()
         .external_client
@@ -258,7 +294,7 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
     assert!(setup(
         &state,
         Host::for_platform("windows", "aarch64", None),
-        Some(release)
+        &catalog
     )
     .await
     .unwrap()
@@ -268,11 +304,11 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
 
 #[actix_web::test]
 async fn tampered_manifest_binary_and_duplicate_registry_are_refused() {
-    let (_dir, state, release, entry) = fixture().await;
+    let (_dir, state, catalog, entry) = fixture().await;
     let manifest = entry.plugin_dir.join("plugin.json");
     let original = tokio::fs::read(&manifest).await.unwrap();
     tokio::fs::write(&manifest, b"tampered").await.unwrap();
-    assert!(setup(&state, mac(), Some(release.clone()))
+    assert!(setup(&state, mac(), &catalog)
         .await
         .unwrap()
         .external_client
@@ -281,7 +317,7 @@ async fn tampered_manifest_binary_and_duplicate_registry_are_refused() {
     tokio::fs::write(entry.plugin_dir.join("bin/macos/jiandu"), b"tampered")
         .await
         .unwrap();
-    assert!(setup(&state, mac(), Some(release.clone()))
+    assert!(setup(&state, mac(), &catalog)
         .await
         .unwrap()
         .external_client
@@ -292,18 +328,18 @@ async fn tampered_manifest_binary_and_duplicate_registry_are_refused() {
     .save(&state.app_data_dir.join("plugins/installed.json"))
     .await
     .unwrap();
-    assert!(setup(&state, mac(), Some(release)).await.is_err());
+    assert!(setup(&state, mac(), &catalog).await.is_err());
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn symlinked_directory_and_executable_are_refused_even_with_matching_bytes() {
-    let (dir, state, release, entry) = fixture().await;
+    let (dir, state, catalog, entry) = fixture().await;
     let executable = entry.plugin_dir.join("bin/macos/jiandu");
     let outside = dir.path().join("outside");
     tokio::fs::rename(&executable, &outside).await.unwrap();
     std::os::unix::fs::symlink(&outside, &executable).unwrap();
-    assert!(setup(&state, mac(), Some(release.clone()))
+    assert!(setup(&state, mac(), &catalog)
         .await
         .unwrap()
         .external_client
@@ -313,7 +349,7 @@ async fn symlinked_directory_and_executable_are_refused_even_with_matching_bytes
     let bin = entry.plugin_dir.join("bin/macos");
     tokio::fs::rename(&bin, &outside).await.unwrap();
     std::os::unix::fs::symlink(&outside, &bin).unwrap();
-    assert!(setup(&state, mac(), Some(release))
+    assert!(setup(&state, mac(), &catalog)
         .await
         .unwrap()
         .external_client
@@ -392,7 +428,7 @@ async fn equal_or_nested_memory_root_blocks_setup_and_official_install_without_m
 
 #[actix_web::test]
 async fn completed_connector_never_exports_an_overlapping_active_store() {
-    let (_dir, state, release, entry) = fixture().await;
+    let (_dir, state, catalog, entry) = fixture().await;
     let state = isolated_state(
         state.app_data_dir.clone(),
         entry.plugin_dir.join("canonical-store"),
@@ -401,7 +437,7 @@ async fn completed_connector_never_exports_an_overlapping_active_store() {
     let registry = tokio::fs::read(state.app_data_dir.join("plugins/installed.json"))
         .await
         .unwrap();
-    let report = setup(&state, mac(), Some(release)).await.unwrap();
+    let report = setup(&state, mac(), &catalog).await.unwrap();
     assert_eq!(report.installed.state, "unverified");
     assert_eq!(report.installed.reason, Some("memory_root_overlaps_plugin"));
     assert_eq!(report.install.reason, Some("memory_root_overlaps_plugin"));
@@ -424,13 +460,13 @@ async fn memory_alias_overlap_and_unresolvable_alias_are_unavailable() {
     let alias = dir.path().join("selected-memory");
     std::os::unix::fs::symlink(&plugin_dir, &alias).unwrap();
     let state = isolated_state(data_dir.clone(), alias.clone()).await;
-    let report = setup(&state, mac(), accepted_release()).await.unwrap();
+    let report = setup(&state, mac(), &accepted_catalog()).await.unwrap();
     assert_eq!(report.install.reason, Some("memory_root_overlaps_plugin"));
     assert!(report.external_client.is_none());
     tokio::fs::remove_file(&alias).await.unwrap();
     std::os::unix::fs::symlink(dir.path().join("absent-target"), &alias).unwrap();
     let state = isolated_state(data_dir, alias).await;
-    let report = setup(&state, mac(), accepted_release()).await.unwrap();
+    let report = setup(&state, mac(), &accepted_catalog()).await.unwrap();
     assert_eq!(report.install.reason, Some("memory_root_unavailable"));
     assert!(report.external_client.is_none());
 }

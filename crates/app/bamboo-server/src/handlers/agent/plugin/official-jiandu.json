@@ -1,5 +1,16 @@
 {
   "release": {
+    "version": "0.4.0",
+    "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.4.0/jiandu-plugin-v0.4.0.tar.gz",
+    "sha256": "bee190c47afb42d07e6d31d1c6469db6ee190a5f182a14d39af2925cc3ec3553",
+    "manifest_sha256": "297dd2f0c1eec4335e5a940d13dafe0f4bf24e9bb04641f8365241e3f1e8872c",
+    "executable_sha256": {
+      "macos": "94074b770d2412687fa466ba9940fc2dc98af87805fb9be4f2acee3e2bbe4b6e",
+      "windows": "396890762135cd253b507fae13d2b23cb8fe6d7696678725d0dcac6384277e04",
+      "linux": "188d945982f0594e92b1d7a0bd6254924c3e04d5c6cab2d4a098b6d48d109b80"
+    }
+  },
+  "legacy_release": {
     "version": "0.3.2",
     "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.3.2/jiandu-plugin-v0.3.2.tar.gz",
     "sha256": "6c7ccbb36dd4f677ae50ea52019fe68ac9af977aa2108e97d39e88c5c2952ddd",
