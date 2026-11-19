@@ -407,7 +407,7 @@ async fn absent_key_field_keeps_reviewed_defaults_without_adoption() {
     let (_, action) = observe_trust(
         &state,
         &super::super::tests::mac(),
-        accepted_release().as_ref(),
+        accepted_catalog().release.as_ref(),
         None,
         false,
     )
@@ -473,7 +473,7 @@ async fn adoption_rejects_stale_revisions_wrong_identity_and_caller_authority() 
 async fn source_platform_artifact_and_install_state_restrictions_are_not_repaired_by_trust() {
     let (_dir, state) = legacy_state(Some(json!([])), json!(["example.invalid/private/"])).await;
     let before = snapshot(&state);
-    let release = accepted_release();
+    let release = accepted_catalog().release;
     let mac = super::super::tests::mac();
     for (host, release, memory, installing, reason) in [
         (
