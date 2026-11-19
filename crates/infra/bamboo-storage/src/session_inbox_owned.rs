@@ -2174,17 +2174,32 @@ impl FileSessionInbox {
                 result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
                 continue;
             }
+            let coordinator_message_policy =
+                Self::activation_intent_field(&wrapper.body, COORDINATOR_INTENT_KEY)?
+                    .map(|intent| intent.policy())
+                    .transpose()?;
+            let requires_runtime_startup = intent.is_none()
+                && coordinator_message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
+                && policy == SessionActivationPolicy::RespectSpecificWait
+                && envelope.background_exec_completion_handle().is_some();
+            let runtime_startup_target_birth = if requires_runtime_startup {
+                // This is only a nomination. The retained lifecycle scope
+                // prevents a recreated Session from supplying this birth, and
+                // the consumer must still claim under its exact Actor writer.
+                self.sessions
+                    .actor_inbox_target_birth_under_lifecycle(target)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            } else {
+                None
+            };
             let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,
                 activation_policy: policy,
                 coordinator_generation: prefix,
-                coordinator_message_policy: Self::activation_intent_field(
-                    &wrapper.body,
-                    COORDINATOR_INTENT_KEY,
-                )?
-                .map(|intent| intent.policy())
-                .transpose()?,
+                coordinator_message_policy,
+                runtime_startup_target_birth,
                 lease_epoch,
                 ready_after,
             };

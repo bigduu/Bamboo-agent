@@ -124,6 +124,18 @@ impl RootActorInputProof {
                 false,
             )
             .map_err(conflict)?;
+        if intent.is_none()
+            && message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
+            && envelope.background_exec_completion_handle().is_some()
+            && (durable.has_pending_question()
+                || durable
+                    .metadata
+                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY))
+        {
+            return Err(conflict(
+                "background command completion has a newer Human gate",
+            ));
+        }
         let origin = intent
             .as_ref()
             .and_then(bamboo_domain::SessionInboxActivationIntent::supervised_root_origin)

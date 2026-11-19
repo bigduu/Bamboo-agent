@@ -94,6 +94,7 @@ async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
     interrupt_specific_wait: bool,
+    expected_birth: Option<chrono::DateTime<Utc>>,
 ) -> std::io::Result<Option<(Session, bool)>> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ready_for_mutation = ready.clone();
@@ -102,7 +103,8 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if latest.has_pending_question()
+            if expected_birth.is_some_and(|birth| latest.created_at != birth)
+                || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
@@ -2073,16 +2075,21 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
     }
 
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, false).await;
+        self.spawn_resume_with_origin(request, false, None).await;
     }
 
     async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, true).await;
+        self.spawn_resume_with_origin(request, true, None).await;
     }
 }
 
 impl ChildCompletionCoordinator {
-    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
+    async fn spawn_resume_with_origin(
+        &self,
+        request: ResumeSpawnRequest,
+        from_config: bool,
+        runtime_startup: Option<bamboo_domain::SessionRuntimeStartup>,
+    ) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -2117,6 +2124,31 @@ impl ChildCompletionCoordinator {
             tracing::warn!(%session_id, %error, "Root coordinator resume Actor binding rejected");
             execution_reservation.abandon().await;
             return;
+        }
+        if let Some(startup) = runtime_startup {
+            let admission = match (
+                execution_reservation.execution_persistence(),
+                self.agent.session_inbox(),
+            ) {
+                (Some(persistence), Some(inbox)) => {
+                    persistence
+                        .admit_root_runtime_startup(
+                            &mut session,
+                            inbox.clone(),
+                            &startup,
+                            execution_reservation.run_id(),
+                        )
+                        .await
+                }
+                _ => Err(std::io::Error::other(
+                    "Runtime Inbox startup is unavailable",
+                )),
+            };
+            if let Err(error) = admission {
+                tracing::debug!(%session_id, %error, "selected Runtime Inbox startup was not admitted");
+                execution_reservation.abandon().await;
+                return;
+            }
         }
         let root_publication = execution_reservation.root_actor_writer().map(|owner| {
             crate::events::RootActorEventPublication::new(
@@ -2379,6 +2411,25 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         target_session_id: &str,
         _inbox_generation: u64,
     ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        self.reserve_inbox_activation(target_session_id, None).await
+    }
+
+    async fn reserve_runtime_activation(
+        &self,
+        target_session_id: &str,
+        startup: bamboo_domain::SessionRuntimeStartup,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        self.reserve_inbox_activation(target_session_id, Some(startup))
+            .await
+    }
+}
+
+impl ChildCompletionCoordinator {
+    async fn reserve_inbox_activation(
+        &self,
+        target_session_id: &str,
+        runtime_startup: Option<bamboo_domain::SessionRuntimeStartup>,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
         let Some(inbox) = self.agent.session_inbox() else {
             return Err(bamboo_domain::SessionActivationError::Internal(
                 "agent runtime has no SessionInbox".to_string(),
@@ -2396,7 +2447,10 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
         let prepared = prepare_session_inbox_activation(
             &self.persistence,
             target_session_id,
-            backlog.interrupt_pending(),
+            runtime_startup.is_none() && backlog.interrupt_pending(),
+            runtime_startup
+                .as_ref()
+                .map(|startup| startup.target_created_at),
         )
         .await
         .map_err(|error| {
@@ -2412,6 +2466,14 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                 session_id = target_session_id,
                 "SessionInbox backlog is activation-eligible but a specific durable wait remains armed"
             );
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
+        if runtime_startup.is_some()
+            && !self
+                .agent
+                .persistence()
+                .root_actor_execution_required(&session)
+        {
             return Ok(SessionActivationReserveOutcome::NoWork);
         }
         if crate::ticket_runtime::is_managed_work_root(&session)
@@ -2618,11 +2680,9 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             config: *config,
                         };
                         tokio::spawn(async move {
-                            ResumeExecutionPort::spawn_configured_resume_execution(
-                                &coordinator,
-                                request,
-                            )
-                            .await;
+                            coordinator
+                                .spawn_resume_with_origin(request, true, runtime_startup)
+                                .await;
                         });
                     },
                     move || async move {
@@ -3573,7 +3633,19 @@ impl ChildCompletionCoordinator {
             }
             return;
         };
-        match messenger.activate_prepared(&admission).await {
+        let activation = if kind == ShellCompletionKind::Exec
+            && self
+                .agent
+                .persistence()
+                .root_actor_execution_required(&session)
+        {
+            messenger
+                .activate_prepared_runtime(&admission, session.created_at)
+                .await
+        } else {
+            messenger.activate_prepared(&admission).await
+        };
+        match activation {
             Ok(receipt) => tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
@@ -6301,6 +6373,7 @@ mod tests {
             &coordinator.persistence,
             parent_id,
             backlog.interrupt_pending(),
+            None,
         )
         .await
         .unwrap()
@@ -7829,7 +7902,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (prepared, ready) = prepare_session_inbox_activation(&locked, &session.id, false)
+        let (prepared, ready) = prepare_session_inbox_activation(&locked, &session.id, false, None)
             .await
             .unwrap()
             .unwrap();

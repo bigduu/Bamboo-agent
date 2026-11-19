@@ -525,6 +525,33 @@ impl SessionMessageEnvelope {
                 == Some(run_id)
     }
 
+    /// Identify the canonical background command completion input. The
+    /// owned receipt and its target lifetime are verified separately.
+    pub fn background_exec_completion_handle(&self) -> Option<&str> {
+        if self.kind != SessionMessageKind::RuntimeInstruction
+            || !matches!(&self.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "background_exec")
+        {
+            return None;
+        }
+        let SessionMessageBody::RuntimeInstruction(instruction) = &self.body else {
+            return None;
+        };
+        let data = instruction.data.as_ref()?;
+        let handle = data["exec_session_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())?;
+        (instruction.instruction == "background_exec_completed"
+            && data["session_id"].as_str() == Some(self.target_session_id.as_str())
+            && self.correlation_id.as_deref() == Some(handle)
+            && matches!(
+                data["status"].as_str(),
+                Some("completed" | "killed" | "error")
+            )
+            && self.id == SessionMessageId::stable("background_exec_completion", data))
+        .then_some(handle)
+    }
+
     /// A wait-bound child completion may belong to its active parent's
     /// successor. The coordinator keeps wait/Guardian control transitions on
     /// that owner behind this durable fence. Background-only results remain
@@ -1431,10 +1458,31 @@ pub struct SessionInboxWakeCandidate {
     /// Independent per-message coordinator grant, even when an older delivery
     /// is already covered by a broader prefix. This is not the delivery intent.
     pub coordinator_message_policy: Option<SessionActivationPolicy>,
+    pub runtime_startup_target_birth: Option<DateTime<Utc>>,
     pub lease_epoch: Option<u64>,
     /// Durable lease expiry, retry deadline, or manual retry time that made
     /// this incarnation claimable. None means an unleased delivery.
     pub ready_after: Option<DateTime<Utc>>,
+}
+
+/// An exact Runtime receipt nominated for startup. The nomination never
+/// replaces the selected item's owned claim or its target lifetime proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeStartup {
+    pub receipt: SessionInboxReceipt,
+    pub target_created_at: DateTime<Utc>,
+}
+
+impl SessionInboxWakeCandidate {
+    pub fn runtime_startup(&self) -> Option<SessionRuntimeStartup> {
+        Some(SessionRuntimeStartup {
+            receipt: SessionInboxReceipt {
+                id: self.id.clone(),
+                generation: self.generation,
+            },
+            target_created_at: self.runtime_startup_target_birth?,
+        })
+    }
 }
 
 /// Computed under the same queue lock as `claim_owned`. Staged and dead-letter
@@ -2258,6 +2306,18 @@ pub trait SessionActivationPort: Send + Sync {
         _inbox_generation: u64,
     ) -> bool {
         false
+    }
+
+    /// Request a startup tied to one trusted Runtime receipt. Generic
+    /// spawners must not fall back to another item when this is unsupported.
+    async fn request_runtime_startup(
+        &self,
+        _target_session_id: &str,
+        _startup: SessionRuntimeStartup,
+    ) -> Result<SessionActivationDisposition, SessionActivationError> {
+        Err(SessionActivationError::Internal(
+            "exact Runtime Inbox startup unsupported".into(),
+        ))
     }
 
     async fn request_activation(
