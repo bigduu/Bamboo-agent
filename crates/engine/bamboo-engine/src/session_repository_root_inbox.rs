@@ -166,6 +166,7 @@ impl SessionRepository {
             .await?
             .ok_or_else(|| io::Error::other("Runtime Inbox startup target disappeared"))?;
         if latest.created_at != owner.created_at
+            || crate::ticket_runtime::is_managed_work_root(&latest)
             || session.check_conversation_generation(&latest).is_err()
             || latest.has_pending_question()
             || latest

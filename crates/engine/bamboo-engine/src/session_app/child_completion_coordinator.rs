@@ -136,8 +136,9 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if expected_birth.is_some_and(|birth| latest.created_at != birth)
-                || latest.has_pending_question()
+            if expected_birth.is_some_and(|birth| {
+                latest.created_at != birth || crate::ticket_runtime::is_managed_work_root(latest)
+            }) || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
