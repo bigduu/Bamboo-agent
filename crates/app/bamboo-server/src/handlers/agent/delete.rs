@@ -24,6 +24,7 @@ use crate::app_state::AppState;
 ///
 /// - `200 OK` - Session deleted successfully (no body)
 /// - `404 Not Found` - Session does not exist
+/// - `503 Service Unavailable` - The account event queue could not admit the deletion
 /// - `500 Internal Server Error` - Storage deletion or browser cleanup failed;
 ///   cleanup errors include session IDs that can be retried
 ///
@@ -58,6 +59,9 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
         DeleteOutcome::Missing => HttpResponse::NotFound().json(serde_json::json!({
             "error": crate::error::error_value("Session not found")
         })),
+        DeleteOutcome::EventQueueUnavailable(error) => {
+            crate::events::session_event_queue_unavailable(error)
+        }
         DeleteOutcome::StorageFailed(ids) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": crate::error::error_value("Failed to finish session deletion"),
             "storage_deletion_failed": true,
@@ -73,6 +77,7 @@ pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Res
 enum DeleteOutcome {
     Deleted,
     Missing,
+    EventQueueUnavailable(std::io::Error),
     StorageFailed(Vec<String>),
     BrowserCleanupIncomplete(Vec<String>),
 }
@@ -97,6 +102,10 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     if !evidenced {
         return DeleteOutcome::Missing;
     }
+    let event_slot = match state.account_sink.reserve_session_mutation().await {
+        Ok(slot) => slot,
+        Err(error) => return DeleteOutcome::EventQueueUnavailable(error),
+    };
 
     // Best-effort pre-cancellation of the session (and its children if this is a root session).
     let mut ids_to_cancel: Vec<String> =
@@ -263,14 +272,7 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner {
         // Publish onto the account change feed so other clients drop the
         // deleted session(s) from their list without polling.
-        for id in ids_to_cancel.iter() {
-            state.account_sink.record(
-                Some(id),
-                &bamboo_agent_core::AgentEvent::SessionDeleted {
-                    session_id: id.clone(),
-                },
-            );
-        }
+        event_slot.enqueue_deletions(ids_to_cancel);
         tracing::info!(
             "[{}] Session deleted successfully (storage: {}, memory: {}, cancelled: {}, runner_cancelled: {})",
             session_id,

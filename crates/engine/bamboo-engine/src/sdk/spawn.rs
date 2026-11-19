@@ -20,7 +20,7 @@ use bamboo_domain::{
     WaitingForChildrenState,
 };
 
-use crate::runtime::execution::event_forwarder::create_event_forwarder_with_history_commit_barrier;
+use crate::runtime::execution::event_forwarder::create_event_forwarder_for_account;
 use crate::runtime::execution::runner_lifecycle::{
     finalize_runner, finalize_runner_exact, try_reserve_runner,
 };
@@ -741,12 +741,13 @@ async fn run_child_spawn_inner(
 
     // Create mpsc channel for agent loop → session events sender.
     let (mpsc_tx, forwarder_handle, mut history_commit_barrier) =
-        create_event_forwarder_with_history_commit_barrier(
+        create_event_forwarder_for_account(
             job.child_session_id.clone(),
             run_id.clone(),
             child_tx.clone(),
             ctx.agent_runners.clone(),
-            ctx.account_feed_inbox.clone(),
+            ctx.session_account_feed(),
+            None,
         );
 
     // Child liveness is owned by the child runner. The parent wait state can
@@ -1021,6 +1022,15 @@ async fn run_child_spawn_inner(
             }
         }
 
+        // Install the live publication owner before the durable terminal
+        // source can be observed by the watchdog.
+        let _completion_publication = {
+            let mut runners = agent_runners_for_status.write().await;
+            runners
+                .get_mut(&session.id)
+                .filter(|runner| runner.run_id == activation_run_id)
+                .map(|runner| runner.retain_child_completion_publication(session.created_at))
+        };
         // Persist final session snapshot.
         session.set_last_run_status(status.clone());
         session.synchronize_terminal_runtime_status();
@@ -1253,7 +1263,13 @@ async fn run_child_spawn_inner(
         }
         let history_barrier_committed = history_committed
             && history_commit_barrier
-                .send_and_wait(&mpsc_tx, session_id_clone.clone())
+                .send_and_wait_with_child_source(
+                    &mpsc_tx,
+                    session_id_clone.clone(),
+                    completion_source
+                        .as_ref()
+                        .and_then(crate::execution::ChildCompletionSource::account_event_id),
+                )
                 .await;
         if history_committed && !history_barrier_committed {
             tracing::warn!(

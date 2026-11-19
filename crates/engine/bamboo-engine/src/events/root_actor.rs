@@ -1,15 +1,22 @@
 //! One immutable Root execution's actual per-session/account publication.
 
-use super::AccountEventSink;
+use super::{account_sink::ReservedAccountEvent, AccountEventSink};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{RootActorRuntimeWrite, Storage};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 #[derive(Clone)]
 pub struct RootActorEventPublication {
     storage: Arc<dyn Storage>,
     account_sink: Arc<AccountEventSink>,
     owner: RootActorRuntimeWrite,
+}
+
+pub struct PreparedRootActorEvent {
+    storage: Arc<dyn Storage>,
+    owner: RootActorRuntimeWrite,
+    account: Option<(ReservedAccountEvent, oneshot::Receiver<bool>)>,
 }
 
 impl RootActorEventPublication {
@@ -45,15 +52,41 @@ impl RootActorEventPublication {
         event: &AgentEvent,
         publish: Box<dyn FnOnce() -> bool + Send>,
     ) -> std::io::Result<()> {
-        let storage = self.storage.clone();
-        let sink = self.account_sink.clone();
-        let owner_for_queue = self.owner.clone();
-        let event = event.clone();
-        let session_id = session_id.to_owned();
-        let (queued, receipt) = tokio::sync::oneshot::channel();
-        self.storage
+        self.prepare(session_id, event)
+            .await?
+            .publish(publish)
+            .await
+    }
+
+    /// Reserve account capacity before taking any local or physical publication guard.
+    pub async fn prepare(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+    ) -> std::io::Result<PreparedRootActorEvent> {
+        let account = self
+            .account_sink
+            .reserve_root_actor_event(self.storage.clone(), self.owner.clone(), session_id, event)
+            .await?;
+        Ok(PreparedRootActorEvent {
+            storage: self.storage.clone(),
+            owner: self.owner.clone(),
+            account,
+        })
+    }
+}
+
+impl PreparedRootActorEvent {
+    pub async fn publish(self, publish: Box<dyn FnOnce() -> bool + Send>) -> std::io::Result<()> {
+        let Self {
+            storage,
+            owner,
+            account,
+        } = self;
+        let (reservation, confirmation) = account.unzip();
+        storage
             .publish_root_actor_runtime_event(
-                &self.owner,
+                &owner,
                 Box::new(move |check_current| {
                     check_current()?;
                     if !publish() {
@@ -62,33 +95,15 @@ impl RootActorEventPublication {
                         ));
                     }
                     check_current()?;
-                    let confirmation = if event.is_durable_change() {
-                        Some(
-                            sink.record_root_actor(
-                                storage,
-                                owner_for_queue,
-                                Some(&session_id),
-                                &event,
-                            )
-                            .ok_or_else(|| {
-                                std::io::Error::other(
-                                    "Root account event queue rejected publication",
-                                )
-                            })?,
-                        )
-                    } else {
-                        None
-                    };
-                    let _ = queued.send(confirmation);
+                    if let Some(reservation) = reservation {
+                        reservation.enqueue();
+                    }
                     Ok(())
                 }),
             )
             .await?;
         // The account writer needs the same physical Root guards. Await only
         // after the per-session publication job has released those guards.
-        let confirmation = receipt
-            .await
-            .map_err(|_| std::io::Error::other("Root account admission receipt closed"))?;
         if let Some(confirmation) = confirmation {
             if !tokio::time::timeout(std::time::Duration::from_secs(30), confirmation)
                 .await
@@ -101,10 +116,9 @@ impl RootActorEventPublication {
                 // without publishing or writing runtime state before returning the
                 // generic receipt failure; a lost owner must still interrupt
                 // its exact live transport through the event forwarder.
-                if let Err(error) = self
-                    .storage
+                if let Err(error) = storage
                     .publish_root_actor_runtime_event(
-                        &self.owner,
+                        &owner,
                         Box::new(|check_current| check_current()),
                     )
                     .await

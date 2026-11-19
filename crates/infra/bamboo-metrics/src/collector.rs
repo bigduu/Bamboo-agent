@@ -5,7 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::storage::{
-    MetricsError, MetricsMutation, MetricsStorage, ToolCallCompletion, MAX_METRICS_BATCH_SIZE,
+    MetricsError, MetricsMutation, MetricsStorage, MetricsWrite, ToolCallCompletion,
+    MAX_METRICS_BATCH_SIZE,
 };
 use crate::types::{
     ForwardTokenDetails, PromptMemoryExposureObservation, RoundStatus, SessionStatus, TokenUsage,
@@ -13,7 +14,7 @@ use crate::types::{
 
 #[derive(Debug)]
 enum CollectorCommand {
-    Mutation(MetricsMutation),
+    Mutation(MetricsWrite),
     PromptMemoryExposure {
         observation: PromptMemoryExposureObservation,
     },
@@ -35,6 +36,12 @@ enum CollectorCommand {
         awaiting_response_session_ids: Vec<String>,
         completion: oneshot::Sender<Result<(), MetricsError>>,
     },
+}
+
+impl CollectorCommand {
+    fn ordinary(mutation: MetricsMutation) -> Self {
+        Self::Mutation(MetricsWrite::Ordinary(mutation))
+    }
 }
 
 // Shared only by external collector clones. The scheduler itself holds no
@@ -158,12 +165,12 @@ impl MetricsCollector {
         }
     }
 
-    async fn flush_mutations(storage: &dyn MetricsStorage, mutations: Vec<MetricsMutation>) {
+    async fn flush_mutations(storage: &dyn MetricsStorage, mutations: Vec<MetricsWrite>) {
         if mutations.is_empty() {
             return;
         }
         let expected = mutations.len();
-        match storage.apply_batch(mutations).await {
+        match storage.apply_collector_batch(mutations).await {
             Ok(results) => {
                 if results.len() != expected {
                     tracing::error!(
@@ -215,7 +222,7 @@ impl MetricsCollector {
         model: impl Into<String>,
         started_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::SessionStarted {
                 session_id: session_id.into(),
                 model: model.into(),
@@ -230,7 +237,7 @@ impl MetricsCollector {
         message_count: u32,
         updated_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::SessionMessageCount {
                 session_id: session_id.into(),
                 message_count,
@@ -245,7 +252,7 @@ impl MetricsCollector {
         status: SessionStatus,
         completed_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::SessionCompleted {
                 session_id: session_id.into(),
                 status,
@@ -263,7 +270,7 @@ impl MetricsCollector {
     ) {
         let _ = self
             .tx
-            .send(CollectorCommand::Mutation(MetricsMutation::RoundStarted {
+            .send(CollectorCommand::ordinary(MetricsMutation::RoundStarted {
                 round_id: round_id.into(),
                 session_id: session_id.into(),
                 model: model.into(),
@@ -282,7 +289,7 @@ impl MetricsCollector {
         prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::RoundCompleted {
                 round_id: round_id.into(),
                 completed_at,
@@ -307,58 +314,49 @@ impl MetricsCollector {
     }
 
     pub fn record_agent_event(&self, session_id: &str, round_id: &str, event: &AgentEvent) {
-        match event {
+        let write = match event {
             AgentEvent::ToolStart {
                 tool_call_id,
                 tool_name,
                 ..
-            } => {
-                let _ = self
-                    .tx
-                    .send(CollectorCommand::Mutation(MetricsMutation::ToolStarted {
-                        tool_call_id: tool_call_id.clone(),
-                        round_id: round_id.to_string(),
-                        session_id: session_id.to_string(),
-                        tool_name: tool_name.clone(),
-                        started_at: Utc::now(),
-                    }));
-            }
+            } => MetricsWrite::ToolStartedInRound {
+                tool_call_id: tool_call_id.clone(),
+                round_id: round_id.to_string(),
+                session_id: session_id.to_string(),
+                tool_name: tool_name.clone(),
+                started_at: Utc::now(),
+            },
             AgentEvent::ToolComplete {
                 tool_call_id,
                 result,
-            } => {
-                let _ = self
-                    .tx
-                    .send(CollectorCommand::Mutation(MetricsMutation::ToolCompleted {
-                        tool_call_id: tool_call_id.clone(),
-                        completion: ToolCallCompletion {
-                            completed_at: Utc::now(),
-                            success: result.success,
-                            error: if result.success {
-                                None
-                            } else {
-                                Some(result.result.clone())
-                            },
-                        },
-                    }));
-            }
+            } => MetricsWrite::ToolCompletedInRound {
+                round_id: round_id.to_string(),
+                tool_call_id: tool_call_id.clone(),
+                completion: ToolCallCompletion {
+                    completed_at: Utc::now(),
+                    success: result.success,
+                    error: if result.success {
+                        None
+                    } else {
+                        Some(result.result.clone())
+                    },
+                },
+            },
             AgentEvent::ToolError {
                 tool_call_id,
                 error,
-            } => {
-                let _ = self
-                    .tx
-                    .send(CollectorCommand::Mutation(MetricsMutation::ToolCompleted {
-                        tool_call_id: tool_call_id.clone(),
-                        completion: ToolCallCompletion {
-                            completed_at: Utc::now(),
-                            success: false,
-                            error: Some(error.clone()),
-                        },
-                    }));
-            }
-            _ => {}
-        }
+            } => MetricsWrite::ToolCompletedInRound {
+                round_id: round_id.to_string(),
+                tool_call_id: tool_call_id.clone(),
+                completion: ToolCallCompletion {
+                    completed_at: Utc::now(),
+                    success: false,
+                    error: Some(error.clone()),
+                },
+            },
+            _ => return,
+        };
+        let _ = self.tx.send(CollectorCommand::Mutation(write));
     }
 
     pub fn forward_started(
@@ -369,7 +367,7 @@ impl MetricsCollector {
         is_stream: bool,
         started_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::ForwardStarted {
                 forward_id: forward_id.into(),
                 endpoint: endpoint.into(),
@@ -411,7 +409,7 @@ impl MetricsCollector {
         token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::ForwardCompleted {
                 forward_id: forward_id.into(),
                 completed_at,
@@ -425,7 +423,7 @@ impl MetricsCollector {
     }
 
     pub fn execute_sync_mismatch(&self, reason: impl Into<String>, occurred_at: DateTime<Utc>) {
-        let _ = self.tx.send(CollectorCommand::Mutation(
+        let _ = self.tx.send(CollectorCommand::ordinary(
             MetricsMutation::ExecuteSyncMismatch {
                 reason: reason.into(),
                 occurred_at,

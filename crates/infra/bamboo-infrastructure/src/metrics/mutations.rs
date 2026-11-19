@@ -72,6 +72,56 @@ pub enum MetricsMutation {
     },
 }
 
+/// Internal collector writes with a trusted round when it is available.
+///
+/// The legacy mutation and storage methods still accept unqualified tool IDs.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum MetricsWrite {
+    Ordinary(MetricsMutation),
+    ToolStartedInRound {
+        tool_call_id: String,
+        round_id: String,
+        session_id: String,
+        tool_name: String,
+        started_at: DateTime<Utc>,
+    },
+    ToolCompletedInRound {
+        round_id: String,
+        tool_call_id: String,
+        completion: ToolCallCompletion,
+    },
+}
+
+impl MetricsWrite {
+    pub(crate) fn into_legacy(self) -> MetricsMutation {
+        match self {
+            Self::Ordinary(mutation) => mutation,
+            Self::ToolStartedInRound {
+                tool_call_id,
+                round_id,
+                session_id,
+                tool_name,
+                started_at,
+            } => MetricsMutation::ToolStarted {
+                tool_call_id,
+                round_id,
+                session_id,
+                tool_name,
+                started_at,
+            },
+            Self::ToolCompletedInRound {
+                tool_call_id,
+                completion,
+                ..
+            } => MetricsMutation::ToolCompleted {
+                tool_call_id,
+                completion,
+            },
+        }
+    }
+}
+
 impl MetricsMutation {
     pub(crate) async fn apply<S: MetricsStorage + ?Sized>(self, storage: &S) -> MetricsResult<()> {
         match self {

@@ -13,4 +13,4 @@ mod root_actor;
 pub use account_sink::AccountEventSink;
 pub use change_feed::ChangeEvent;
 pub use replayable::publish_replayable_session_event;
-pub use root_actor::RootActorEventPublication;
+pub use root_actor::{PreparedRootActorEvent, RootActorEventPublication};
