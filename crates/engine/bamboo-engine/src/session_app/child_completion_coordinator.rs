@@ -4173,7 +4173,19 @@ impl ChildCompletionCoordinator {
             // Suspended with NO armed wait: either the coordinator cleared the
             // wait but its resume never spawned, or state is half-cleared.
             ("waiting_for_children", None) | ("", None) => {
-                self.rescue_stranded_resume(session_id).await;
+                if let Some(expiry) =
+                    bamboo_domain::CommittedChildWaitExpiry::from_session(&session)
+                        .filter(|expiry| expiry.expiry.run_id == runtime_state.run_id)
+                {
+                    if let Err(error) = self
+                        .request_expired_child_wait_startup(&session, &expiry)
+                        .await
+                    {
+                        tracing::debug!(%session_id, %error, "committed child wait expiry remains pending");
+                    }
+                } else {
+                    self.rescue_stranded_resume(session_id).await;
+                }
                 None
             }
             _ => None,
@@ -4214,23 +4226,42 @@ impl ChildCompletionCoordinator {
                 None
             };
             if let Some(message) = forced_resume {
-                let Err(error) = self
-                    .force_resume_child_wait(parent_session_id, &wait, message)
-                    .await
-                else {
+                let Some(parent) = self.load_control_plane(parent_session_id).await else {
                     return false;
                 };
-                let authority_rejected = error.kind() == std::io::ErrorKind::Unsupported
-                    && error
-                        .get_ref()
-                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>());
-                tracing::warn!(
-                    %parent_session_id,
-                    %error,
-                    authority_rejected,
-                    "child-wait watchdog: force-resume could not persist; durable wait retained"
-                );
-                return authority_rejected;
+                match self
+                    .storage
+                    .root_child_wait_requires_owned_expiry(&parent)
+                    .await
+                {
+                    Ok(true) => {
+                        match self.expire_owned_root_child_wait(&parent, &wait, now).await {
+                            Ok(true) => return false,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::debug!(%parent_session_id, %error, "owned child wait expiry remains pending");
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        let Err(error) = self
+                            .force_resume_child_wait(parent_session_id, &wait, message)
+                            .await
+                        else {
+                            return false;
+                        };
+                        let authority_rejected = error.kind() == std::io::ErrorKind::Unsupported
+                            && error.get_ref().is_some_and(|cause| {
+                                cause.is::<bamboo_domain::SessionAuthorityConflict>()
+                            });
+                        tracing::warn!(%parent_session_id, %error, authority_rejected,
+                            "child-wait watchdog: force-resume could not persist; durable wait retained");
+                        return authority_rejected;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%parent_session_id, %error, "child wait authority could not be verified");
+                    }
+                }
             }
         }
 
@@ -4543,6 +4574,105 @@ impl ChildCompletionCoordinator {
             completion,
         )
         .await;
+    }
+
+    async fn expire_owned_root_child_wait(
+        &self,
+        parent: &Session,
+        wait: &WaitingForChildrenState,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if crate::ticket_runtime::is_managed_work_root(parent) || parent.has_pending_question() {
+            return Ok(false);
+        }
+        let runtime = read_runtime_state(parent);
+        if runtime.waiting_for_children.as_ref() != Some(wait) || runtime.waiting_for_bash.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(messenger) = self.agent.session_messenger() else {
+            return Ok(false);
+        };
+        let Some(actor_activation_id) = self
+            .storage
+            .observe_root_child_wait_expiry_activation(parent, &runtime.run_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let expiry = bamboo_domain::ChildWaitExpiry::observe(
+            parent,
+            &runtime,
+            actor_activation_id,
+            wait.clone(),
+        )?;
+        let admission = messenger
+            .admit_runtime_for_target(expiry.envelope(&parent.id)?, parent.created_at)
+            .await?;
+        let expiry = bamboo_domain::CommittedChildWaitExpiry::new(expiry, &admission.delivery);
+        let cache = self.sessions.clone();
+        let committed = self
+            .storage
+            .expire_root_child_wait_control_plane(
+                parent,
+                &expiry,
+                messenger.inbox().as_ref(),
+                now,
+                Arc::new(move |saved| {
+                    cache.insert(
+                        saved.id.clone(),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                    );
+                }),
+            )
+            .await?;
+        if !committed {
+            return Ok(false);
+        }
+        if let Err(error) = self
+            .request_expired_child_wait_startup(parent, &expiry)
+            .await
+        {
+            tracing::debug!(session_id = %parent.id, %error, "committed child wait expiry remains pending");
+        }
+        Ok(true)
+    }
+
+    async fn request_expired_child_wait_startup(
+        &self,
+        parent: &Session,
+        expiry: &bamboo_domain::CommittedChildWaitExpiry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (Some(messenger), Some(inbox)) =
+            (self.agent.session_messenger(), self.agent.session_inbox())
+        else {
+            return Ok(());
+        };
+        let delivery = expiry.receipt();
+        let admission = crate::session_messaging::SessionMessengerAdmission {
+            envelope_id: delivery.id.as_str().to_owned(),
+            target_session_id: parent.id.clone(),
+            delivery,
+        };
+        messenger
+            .prepare_message_activation(&admission, SessionActivationPolicy::RespectSpecificWait)
+            .await?;
+        let ready = inbox
+            .inspect_wake_readiness(&parent.id, Utc::now())
+            .await?
+            .ready;
+        if ready
+            .and_then(|candidate| candidate.runtime_startup())
+            .is_some_and(|startup| {
+                startup.receipt == admission.delivery
+                    && startup.target_created_at == expiry.expiry.target_birth
+            })
+        {
+            messenger
+                .activate_prepared_runtime(&admission, expiry.expiry.target_birth)
+                .await?;
+        }
+        Ok(())
     }
 
     /// A parent whose wait was already cleared (resume message appended) but

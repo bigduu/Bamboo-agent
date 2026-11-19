@@ -473,6 +473,102 @@ impl SessionStoreV2 {
         Ok((latest, count))
     }
 
+    pub(super) async fn expire_root_child_wait(
+        &self,
+        expected: &Session,
+        committed: &bamboo_domain::CommittedChildWaitExpiry,
+        inbox: &dyn bamboo_domain::SessionInboxPort,
+        now: DateTime<Utc>,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        use crate::session_inbox::FileSessionInbox;
+
+        let inbox = inbox
+            .as_any()
+            .and_then(|any| any.downcast_ref::<FileSessionInbox>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Root child wait expiry requires the concrete Inbox",
+                )
+            })?;
+        let started = Instant::now();
+        let mut guards = self.child_wait_guards(&expected.id).await?;
+        let Some(mut latest) = self.load_session_unlocked(&expected.id).await? else {
+            return Ok(false);
+        };
+        validate_incarnation(expected, &latest)?;
+        let expiry = &committed.expiry;
+        let receipt = committed.receipt();
+        let mut state = runtime(&latest);
+        if latest.kind != SessionKind::Root
+            || !latest.authority_identity.is_ordinary()
+            || latest.metadata.contains_key("ticket.runtime.dispatch.v1")
+            || latest.has_pending_question()
+            || latest
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            || latest.last_run_status().as_deref() != Some("suspended")
+            || state.waiting_for_bash.is_some()
+            || latest
+                .metadata
+                .get("runtime.suspend_reason")
+                .is_some_and(|reason| reason != "waiting_for_children")
+            || state
+                .suspension
+                .as_ref()
+                .is_some_and(|suspension| suspension.reason != "waiting_for_children")
+            || state
+                .plan_mode
+                .as_ref()
+                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval)
+            || state.run_id != expiry.run_id
+            || state.waiting_for_children.as_ref() != Some(&expiry.wait)
+            || !expiry.matches_lifetime(&latest)
+            || !expiry.is_due(now)
+            || self
+                .child_wait_expiry_activation_id(&latest, &state.run_id)
+                .await?
+                .as_deref()
+                != Some(expiry.actor_activation_id.as_str())
+        {
+            return Ok(false);
+        }
+        let envelope = expiry.envelope(&latest.id)?;
+        let Some(filesystem) = inbox
+            .retain_staged_child_wait_expiry(
+                &self.sessions_dir,
+                &envelope,
+                &receipt,
+                guards.physical.clone(),
+            )
+            .await
+            .map_err(io::Error::other)?
+        else {
+            return Ok(false);
+        };
+        // Keep the staged receipt protected through the blocking runtime write.
+        Arc::get_mut(&mut guards)
+            .expect("new child wait guards are private")
+            ._input_filesystem = Some(filesystem);
+
+        state.waiting_for_children = None;
+        state.status = bamboo_domain::AgentStatusState::Idle;
+        state.suspension = None;
+        write_runtime(&mut latest, state)?;
+        latest.metadata.remove("runtime.suspend_reason");
+        latest.metadata.insert(
+            bamboo_domain::CHILD_WAIT_EXPIRY_RECEIPT_KEY.into(),
+            serde_json::to_string(committed)?,
+        );
+        latest.updated_at = now;
+        let rel = Self::default_writer_rel_path(&latest)?;
+        self.save_runtime_state_after_lock(&latest, &rel, started, &guards, None, None)
+            .await?;
+        self.publish_child_wait(&guards, &latest, publish).await?;
+        Ok(true)
+    }
+
     pub(super) async fn compare_exchange_child_wait(
         &self,
         expected: &Session,

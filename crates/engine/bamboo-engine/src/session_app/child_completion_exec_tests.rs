@@ -1047,3 +1047,471 @@ async fn background_exec_owned_actor_preserves_native_human_receipt_selection() 
         .unwrap();
     binding.disarm_abandonment();
 }
+
+#[tokio::test]
+async fn owned_child_wait_expiry_survives_commit_before_activation() {
+    use bamboo_domain::{
+        ActorActivationFinish, ChildWaitExpiry, CommittedChildWaitExpiry, PlanModeState,
+        PlanModeStatus, SuspensionState,
+    };
+
+    let (temp, store, inbox, coordinator, provider) = actor_exec_fixture().await;
+    for case in [
+        "committed",
+        "promoted_stale",
+        "promoted_malformed",
+        "changed_wait",
+        "live_actor",
+        "changed_attempt",
+        "failed_actor",
+        "cancelled_actor",
+        "missing_receipt",
+        "removed_receipt",
+        "wrong_generation",
+        "wrong_record",
+        "wrong_envelope",
+        "human_gate",
+        "legacy_hook_gate",
+        "structured_hook_gate",
+        "plan_gate",
+        "managed_work",
+    ] {
+        let promoted_case = matches!(case, "promoted_stale" | "promoted_malformed");
+        let should_commit = case == "committed" || promoted_case;
+        let now = Utc::now();
+        let mut root = Session::new(format!("expired-wait-{case}"), "model");
+        root.add_message(Message::user("prior transcript"));
+        root.set_last_run_status("suspended");
+        let mut runtime = AgentRuntimeState::new(format!("prior-{case}"));
+        let wait = WaitingForChildrenState::for_children(
+            vec![format!("still-running-{case}")],
+            ChildWaitPolicy::All,
+            now - chrono::Duration::hours(7),
+        );
+        runtime.status = AgentStatusState::Suspended;
+        if case == "committed" {
+            runtime.suspension = Some(SuspensionState {
+                reason: "waiting_for_children".into(),
+                suspended_at: wait.registered_at,
+                resumable: true,
+                hook_point: None,
+            });
+        }
+        let mut recorded_wait = wait.clone();
+        if case == "changed_wait" {
+            recorded_wait.child_session_ids.push("new-child".into());
+        }
+        runtime.waiting_for_children = Some(recorded_wait.clone());
+        write_runtime_state(&mut root, &runtime);
+        root.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "waiting_for_children".into(),
+        );
+        store.save_session(&root).await.unwrap();
+        let child_id = format!("still-running-{case}");
+        let mut child = Session::new_child(&child_id, &root.id, "model", "Child");
+        child.set_last_run_status("running");
+        store.save_session(&child).await.unwrap();
+        let main = store
+            .sessions_root_dir()
+            .join(&root.id)
+            .join("session.json");
+
+        let mut prior = coordinator
+            .agent
+            .persistence()
+            .bind_root_actor_execution(&root, &runtime.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if case != "live_actor" {
+            let finish = match case {
+                "failed_actor" => ActorActivationFinish::Failed,
+                "cancelled_actor" => ActorActivationFinish::Cancelled,
+                _ => ActorActivationFinish::Succeeded,
+            };
+            prior
+                .directory
+                .finish_activation(&prior.owner.fence, Utc::now(), finish)
+                .await
+                .unwrap();
+            prior.disarm_abandonment();
+        }
+        let observed = store
+            .observe_root_child_wait_expiry_activation(&root, &runtime.run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.as_deref(),
+            match case {
+                "live_actor" | "failed_actor" | "cancelled_actor" => None,
+                _ => Some(prior.owner.fence.activation_id.as_str()),
+            },
+            "{case}",
+        );
+        let activation_id = if case == "changed_attempt" {
+            "older-attempt".into()
+        } else {
+            prior.owner.fence.activation_id.clone()
+        };
+        let expiry =
+            ChildWaitExpiry::observe(&root, &runtime, activation_id, wait.clone()).unwrap();
+        let envelope = expiry.envelope(&root.id).unwrap();
+        let mut receipt = if case == "missing_receipt" {
+            bamboo_domain::SessionInboxReceipt {
+                id: envelope.id.clone(),
+                generation: 1,
+            }
+        } else {
+            let receipt = inbox
+                .deliver_runtime_for_target(&envelope, root.created_at)
+                .await
+                .unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &root.id,
+                    receipt.generation,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            receipt
+        };
+        assert!(inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .is_none());
+        assert!(
+            inbox
+                .claim_for_turn(&root.id, 1, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}: a generic legacy prefix consumed the private expiry",
+        );
+        if case == "committed" {
+            // Before the wait commits, retrying the producer recovers the same
+            // receipt without granting generic wake or inserting history.
+            let retry = inbox
+                .deliver_runtime_for_target(&envelope, root.created_at)
+                .await
+                .unwrap();
+            assert_eq!(retry, receipt);
+            assert!(provider.0.lock().unwrap().is_empty());
+        }
+        if case == "wrong_generation" {
+            receipt.generation += 1;
+        }
+        if matches!(case, "removed_receipt" | "wrong_record" | "wrong_envelope") {
+            let mut rows = tokio::fs::read_dir(main.parent().unwrap().join("inbox/new"))
+                .await
+                .unwrap();
+            let path = rows.next_entry().await.unwrap().unwrap().path();
+            if case == "removed_receipt" {
+                tokio::fs::remove_file(path).await.unwrap();
+            } else {
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                let mut row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if case == "wrong_envelope" {
+                    row["body"]["created_at"] = serde_json::json!(Utc::now());
+                } else {
+                    row["from"]["role"] = serde_json::json!("unexpected-transport-metadata");
+                }
+                tokio::fs::write(path, serde_json::to_vec(&row).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        if matches!(
+            case,
+            "human_gate"
+                | "legacy_hook_gate"
+                | "structured_hook_gate"
+                | "plan_gate"
+                | "managed_work"
+        ) {
+            let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+            let mut current = read_runtime_state(&latest);
+            match case {
+                "human_gate" => {
+                    latest.pending_question = Some(bamboo_domain::PendingQuestion {
+                        tool_call_id: "later-human-question".into(),
+                        tool_name: "AskUserQuestion".into(),
+                        question: "Choose whether to continue".into(),
+                        options: vec!["Continue".into(), "Stop".into()],
+                        allow_custom: false,
+                        source: Default::default(),
+                    });
+                }
+                "legacy_hook_gate" => {
+                    latest
+                        .metadata
+                        .insert("runtime.suspend_reason".into(), "hook_suspended".into());
+                }
+                "structured_hook_gate" => {
+                    current.suspension = Some(SuspensionState {
+                        reason: "hook_suspended".into(),
+                        suspended_at: now,
+                        resumable: false,
+                        hook_point: None,
+                    });
+                }
+                "plan_gate" => {
+                    current.plan_mode = Some(PlanModeState {
+                        entered_at: now,
+                        pre_permission_mode: "default".into(),
+                        plan_file_path: None,
+                        status: PlanModeStatus::AwaitingApproval,
+                    });
+                }
+                "managed_work" => {
+                    latest.metadata.insert(
+                        crate::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+                        "{}".into(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            write_runtime_state(&mut latest, &current);
+            store.save_session(&latest).await.unwrap();
+        }
+        let prior_history = tokio::fs::read(&main).await.unwrap();
+        let committed = CommittedChildWaitExpiry::new(expiry, &receipt);
+        assert_eq!(
+            store
+                .expire_root_child_wait_control_plane(
+                    &root,
+                    &committed,
+                    inbox.as_ref(),
+                    now,
+                    Arc::new(|_| {})
+                )
+                .await
+                .unwrap(),
+            should_commit,
+            "{case}",
+        );
+        assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+
+        let reopened = bamboo_storage::SessionStoreV2::new(temp.path().into())
+            .await
+            .unwrap();
+        let control = reopened
+            .load_runtime_control_plane(&root.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if !should_commit {
+            assert_eq!(
+                read_runtime_state(&control).waiting_for_children,
+                Some(recorded_wait)
+            );
+            assert!(CommittedChildWaitExpiry::from_session(&control).is_none());
+            match case {
+                "human_gate" => {
+                    let full = reopened.load_session(&root.id).await.unwrap().unwrap();
+                    assert!(full.has_pending_question());
+                }
+                "legacy_hook_gate" => {
+                    assert_eq!(
+                        control
+                            .metadata
+                            .get("runtime.suspend_reason")
+                            .map(String::as_str),
+                        Some("hook_suspended"),
+                    );
+                }
+                "structured_hook_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).suspension.unwrap().reason,
+                        "hook_suspended",
+                    );
+                }
+                "plan_gate" => {
+                    assert_eq!(
+                        read_runtime_state(&control).plan_mode.unwrap().status,
+                        PlanModeStatus::AwaitingApproval,
+                    );
+                }
+                _ => {}
+            }
+            assert!(inbox
+                .inspect_wake_readiness(&root.id, now)
+                .await
+                .unwrap()
+                .ready
+                .is_none());
+            continue;
+        }
+
+        assert!(read_runtime_state(&control).waiting_for_children.is_none());
+        assert_eq!(
+            CommittedChildWaitExpiry::from_session(&control),
+            Some(committed)
+        );
+        assert!(inbox
+            .inspect_wake_readiness(&root.id, now)
+            .await
+            .unwrap()
+            .ready
+            .is_none());
+        if promoted_case {
+            let calls = provider.0.lock().unwrap().len();
+            inbox
+                .mark_message_activation_eligible(
+                    &root.id,
+                    &receipt,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                inbox
+                    .inspect_runtime_startup(&root.id, receipt.generation)
+                    .await
+                    .unwrap(),
+                Some(bamboo_domain::SessionRuntimeStartup {
+                    receipt: receipt.clone(),
+                    target_created_at: root.created_at,
+                }),
+                "{case}",
+            );
+
+            if case == "promoted_stale" {
+                let mut latest = store.load_session(&root.id).await.unwrap().unwrap();
+                let mut current = read_runtime_state(&latest);
+                current.run_id = "newer-suspended-run".into();
+                write_runtime_state(&mut latest, &current);
+                store.save_runtime_state(&latest).await.unwrap();
+                let latest = store
+                    .load_runtime_control_plane(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read_runtime_state(&latest).run_id, current.run_id);
+                assert!(read_runtime_state(&latest).waiting_for_children.is_none());
+            } else {
+                let mut rows = tokio::fs::read_dir(main.parent().unwrap().join("inbox/new"))
+                    .await
+                    .unwrap();
+                let path = rows.next_entry().await.unwrap().unwrap().path();
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                let mut row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                row["body"]["created_at"] = serde_json::json!(Utc::now());
+                tokio::fs::write(path, serde_json::to_vec(&row).unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(inbox
+                .inspect_wake_readiness(&root.id, now)
+                .await
+                .unwrap()
+                .ready
+                .is_none());
+            assert!(
+                matches!(
+                    inbox
+                        .inspect_runtime_startup(&root.id, receipt.generation)
+                        .await,
+                    Err(bamboo_domain::SessionInboxError::InvalidClaim(_)),
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                inbox.inspect(&root.id).await.unwrap().activation_generation,
+                receipt.generation,
+            );
+            let router = coordinator.agent.activation_router().unwrap();
+            let owner = router
+                .register_session_run(&root, "prior-logical-owner")
+                .await
+                .unwrap();
+            let result = owner.finish(0).await;
+            assert!(
+                matches!(result, Err(ref error) if error.to_string().contains("lacks a current disposition")),
+                "{case}: {result:?}"
+            );
+            wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+            assert_eq!(provider.0.lock().unwrap().len(), calls, "{case}");
+            assert!(!inbox.was_admitted(&root.id, &envelope.id).await.unwrap());
+            assert_eq!(tokio::fs::read(&main).await.unwrap(), prior_history);
+            continue;
+        }
+
+        assert_eq!(provider.0.lock().unwrap().len(), 0);
+        let mut events =
+            ResumeExecutionPort::get_or_create_event_sender(coordinator.as_ref(), &root.id)
+                .await
+                .subscribe();
+
+        // A crash here would leave the exact receipt staged and the wait
+        // retired. The ordinary watchdog pass performs the recovery.
+        coordinator
+            .sweep_one_suspended_session(&root.id, None)
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+        let saved = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("running"),
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| {
+                    bamboo_domain::is_matching_session_message(message, &envelope)
+                })
+                .count(),
+            1
+        );
+
+        coordinator
+            .sweep_one_suspended_session(&root.id, None)
+            .await;
+        wait_for_actor_startup_to_settle(&coordinator, &root.id).await;
+        assert_eq!(provider.0.lock().unwrap().len(), 1);
+
+        let message = saved
+            .messages
+            .iter()
+            .find(|message| message.id == envelope.id.as_str())
+            .unwrap();
+        let mut appended = 0;
+        let mut saw_provider_token = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::MessageAppended {
+                    message_id,
+                    session_id,
+                    content,
+                    ..
+                } if message_id == message.id => {
+                    assert!(
+                        !saw_provider_token,
+                        "expiry was announced after provider output"
+                    );
+                    assert_eq!(session_id, root.id);
+                    assert_eq!(content, message.content);
+                    appended += 1;
+                }
+                AgentEvent::Token { .. } => saw_provider_token = true,
+                _ => {}
+            }
+        }
+        assert_eq!(appended, 1, "the recovered expiry must stream exactly once");
+        assert!(
+            saw_provider_token,
+            "provider output was missing from the stream"
+        );
+    }
+}

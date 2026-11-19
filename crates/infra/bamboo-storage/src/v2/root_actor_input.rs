@@ -125,9 +125,24 @@ impl RootActorInputProof {
                 false,
             )
             .map_err(conflict)?;
+        if envelope.is_child_wait_expiry_notice()
+            && (intent.is_some()
+                || message_policy != Some(SessionActivationPolicy::RespectSpecificWait)
+                || !runtime.is_some_and(|latest| {
+                    bamboo_domain::CommittedChildWaitExpiry::matches_input(
+                        latest,
+                        &envelope,
+                        self.claim.claim.generation,
+                    )
+                }))
+        {
+            return Err(conflict(
+                "child wait expiry receipt lacks a current committed disposition",
+            ));
+        }
         if intent.is_none()
             && message_policy == Some(SessionActivationPolicy::RespectSpecificWait)
-            && envelope.background_exec_completion_handle().is_some()
+            && envelope.is_exact_runtime_startup()
             && std::iter::once(durable).chain(runtime).any(|source| {
                 source.has_pending_question()
                     || source
@@ -135,9 +150,7 @@ impl RootActorInputProof {
                         .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
             })
         {
-            return Err(conflict(
-                "background command completion has a newer Human gate",
-            ));
+            return Err(conflict("Runtime startup has a newer Human gate"));
         }
         let origin = intent
             .as_ref()

@@ -313,6 +313,46 @@ impl OwnedFilesystem {
         &self.guards.dir
     }
 
+    pub(super) async fn has_staged_child_wait_expiry(
+        &self,
+        dir: &Path,
+        expected: InboxMessage,
+        admitted: PathBuf,
+        max_bytes: usize,
+    ) -> std::io::Result<bool> {
+        let name = FileSessionInbox::pending_transport_name(&expected);
+        let pending = dir.join("new").join(&name);
+        let claimed = dir.join("cur").join(name);
+        self.job(
+            "prove-staged-child-wait-expiry",
+            &pending,
+            move |filesystem, path| {
+                let anchor = filesystem.anchor();
+                let bytes = match anchor.read_existing(path, max_bytes) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => return Ok(false),
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                require_unique_json(&bytes)
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                if serde_json::from_slice::<InboxMessage>(&bytes)? != expected {
+                    return Ok(false);
+                }
+                for path in [&claimed, &admitted] {
+                    match anchor.entry_exists(path) {
+                        Ok(true) => return Ok(false),
+                        Ok(false) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(true)
+            },
+        )
+        .await
+    }
+
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         self.job("mkdir", path, |filesystem, path| {
             filesystem.anchor().create_dir_all(path)
@@ -426,8 +466,7 @@ impl OwnedFilesystem {
             };
             // The same 20-digit time prefix, hidden temp name and implicit
             // queue creation as the Maildir writer.
-            let nanos = wrapper.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
-            let name = format!("{nanos:020}-{}.json", wrapper.id.0);
+            let name = FileSessionInbox::pending_transport_name(&wrapper);
             let queue = dir.join("new");
             let path = queue.join(&name);
             let temp = queue.join(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
@@ -1376,6 +1415,16 @@ impl FileSessionInbox {
             if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
                 continue;
             }
+            if envelope.is_child_wait_expiry_notice()
+                && (receipt.is_none()
+                    || self.root_owner.is_none()
+                    || intent.is_some()
+                    || activation.as_ref().and_then(|intent| intent.policy().ok())
+                        != Some(SessionActivationPolicy::RespectSpecificWait)
+                    || envelope.child_wait_expiry().is_none())
+            {
+                continue;
+            }
             if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only {
                 continue;
             }
@@ -2115,19 +2164,27 @@ impl FileSessionInbox {
     async fn runtime_startup_target_birth(
         &self,
         envelope: &SessionMessageEnvelope,
+        generation: u64,
         original_intent: Option<&SessionInboxActivationIntent>,
         coordinator_policy: Option<SessionActivationPolicy>,
     ) -> Result<Option<DateTime<Utc>>, SessionInboxError> {
         if original_intent.is_some()
             || coordinator_policy != Some(SessionActivationPolicy::RespectSpecificWait)
-            || envelope.background_exec_completion_handle().is_none()
         {
             return Ok(None);
         }
-        self.sessions
-            .actor_inbox_target_birth_under_lifecycle(&envelope.target_session_id)
-            .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))
+        let birth = if envelope.is_child_wait_expiry_notice() {
+            self.sessions
+                .child_wait_expiry_birth_under_lifecycle(envelope, generation)
+                .await
+        } else if envelope.background_exec_completion_handle().is_some() {
+            self.sessions
+                .actor_inbox_target_birth_under_lifecycle(&envelope.target_session_id)
+                .await
+        } else {
+            return Ok(None);
+        };
+        birth.map_err(|error| SessionInboxError::Storage(error.to_string()))
     }
 
     pub(super) async fn inspect_runtime_startup_impl(
@@ -2160,8 +2217,20 @@ impl FileSessionInbox {
         // Identity is independent of which candidate is ready, lease expiry,
         // and whether a permanent ACK still needs to remove its transport.
         let target_created_at = self
-            .runtime_startup_target_birth(&envelope, original_intent.as_ref(), coordinator_policy)
+            .runtime_startup_target_birth(
+                &envelope,
+                generation,
+                original_intent.as_ref(),
+                coordinator_policy,
+            )
             .await?;
+        if target_created_at.is_none() && envelope.is_child_wait_expiry_notice() {
+            // This generation belongs to the expiry protocol even if its
+            // durable disposition is missing or a newer wait superseded it.
+            return Err(invalid(
+                "child wait expiry startup lacks a current disposition",
+            ));
+        }
         Ok(
             target_created_at.map(|target_created_at| bamboo_domain::SessionRuntimeStartup {
                 receipt: SessionInboxReceipt {
@@ -2253,6 +2322,7 @@ impl FileSessionInbox {
                 if policy == SessionActivationPolicy::RespectSpecificWait {
                     self.runtime_startup_target_birth(
                         &envelope,
+                        generation,
                         intent.as_ref(),
                         coordinator_message_policy,
                     )
@@ -2260,6 +2330,9 @@ impl FileSessionInbox {
                 } else {
                     None
                 };
+            if runtime_startup_target_birth.is_none() && envelope.is_child_wait_expiry_notice() {
+                continue;
+            }
             let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,

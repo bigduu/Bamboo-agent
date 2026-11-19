@@ -11,6 +11,7 @@ pub mod admission;
 pub mod authority;
 pub mod budget_types;
 pub mod caller;
+mod child_wait_expiry;
 pub mod compatibility;
 pub mod composition;
 pub mod context_block;
@@ -53,6 +54,7 @@ pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
 pub use caller::*;
+pub use child_wait_expiry::*;
 pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;
