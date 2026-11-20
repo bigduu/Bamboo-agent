@@ -15,6 +15,7 @@
 
 pub mod compression_tooling;
 pub mod counter;
+mod file_change_projection;
 pub mod limits;
 pub mod preparation;
 pub mod retrieval_window;
@@ -41,6 +42,7 @@ pub use counter::{
     clear_token_count_cache, token_count_cache_stats, HeuristicTokenCounter,
     ProviderVisibleToolEstimate, TiktokenTokenCounter, TokenCountCacheStats, TokenCounter,
 };
+pub use file_change_projection::project_file_change_results;
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
 pub use preparation::{
     estimate_prompt_cache_savings, estimate_prompt_cache_savings_with_fixed_tokens,

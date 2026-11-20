@@ -1110,6 +1110,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
 
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
+    bamboo_compression::project_file_change_results(&mut real_transcript);
     let cache_scope = serde_json::json!({
         // Rebuild saved prompt prefixes that still contain unconditional memory guidance.
         "external_memory_projection_version": 2,

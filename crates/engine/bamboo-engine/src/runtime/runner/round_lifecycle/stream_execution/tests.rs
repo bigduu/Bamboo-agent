@@ -3169,6 +3169,109 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     );
 }
 
+#[tokio::test]
+async fn file_mutation_receipts_stay_intact_in_history_and_compact_on_the_wire() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("file-change-wire", "test-model");
+    session.add_message(Message::user("Update the fixture."));
+    let untouched = "unchanged middle source with repeated fields";
+    let middle = format!("{untouched}\n").repeat(160);
+    let before = format!("first\n{middle}last\n");
+    let after = format!("new first\n{middle}new last\n");
+    let mut originals = Vec::new();
+    for (name, call_id) in [("Write", "call_write"), ("Edit", "call_edit")] {
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: call_id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: serde_json::json!({"file_path": "/workspace/fixture.json"})
+                        .to_string(),
+                },
+            }]),
+        ));
+        let mut receipt = bamboo_tools::tools::file_change::build_file_change_payload_value(
+            name,
+            std::path::Path::new("/workspace/fixture.json"),
+            "Updated fixture".to_owned(),
+            serde_json::json!({"created": true, "path": "/checkpoint/fixture"}),
+            &before,
+            &after,
+        );
+        receipt["diagnostics"] = serde_json::json!({"format":"json","valid":false,"line":1});
+        let mut result = Message::tool_result(call_id, receipt.to_string());
+        if name == "Edit" {
+            // Legacy stored results can lack an explicit success bit.
+            result.tool_success = None;
+            result.content.push_str(
+                "\n\n<post_tool_use_feedback>\nvalidation hint\n</post_tool_use_feedback>",
+            );
+        }
+        assert!(result.content.matches(untouched).count() > 100);
+        originals.push((call_id, result.content.clone()));
+        session.add_message(result);
+    }
+
+    let config = test_config("BASE_IDENTITY");
+    let budget = TokenBudget::new(8_000, 128, Default::default());
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    let prepared = bamboo_compression::prepare_hybrid_context(&session, &budget, &counter).unwrap();
+    assert!(!prepared.truncation_occurred);
+    assert!(prepared.token_usage.window_tokens < 500);
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared,
+        &[],
+        &LlmStreamFrame {
+            provider_default_output: false,
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "file-change-wire",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            output_limit_recovery: None,
+            budget: &budget,
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("file change provider request");
+
+    let request = llm.requested_responses_body.lock().unwrap();
+    let input = request.as_ref().unwrap()["input"].as_array().unwrap();
+    for (call_id, original) in originals {
+        let result = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+            .expect("paired tool result on the wire");
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("fixture.json"));
+        assert!(output.contains("\"valid\":false"));
+        assert!(output.contains("\"old_line_count\":162"));
+        assert!(!output.contains("unified"));
+        assert!(!output.contains(untouched));
+        if call_id == "call_edit" {
+            assert!(output.contains("validation hint"));
+        }
+        let stored = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+            .unwrap();
+        assert_eq!(stored.content, original);
+    }
+}
+
 #[test]
 fn build_request_envelope_relocates_session_context_after_tool_guide() {
     // Session-variable context (here: loaded-skill context) must leave the static
