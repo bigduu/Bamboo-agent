@@ -8,10 +8,11 @@ use bamboo_agent_core::Session;
 use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
 use bamboo_memory::memory_store::{
     normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
-    MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
-    MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES,
-    MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS,
-    MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
+    DurableMemoryType, MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore,
+    DEFAULT_QUERY_LIMIT, MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS,
+    MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS,
+    MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT,
+    MAX_RETRIEVAL_TERM_CHARS,
 };
 use bamboo_projects::ProjectStore;
 use bamboo_tools::tools::session_memory::{
@@ -590,12 +591,19 @@ impl Tool for MemoryTool {
                 let memory_access = self
                     .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
+                let memory_type = Self::parse_type(&r#type)?;
+                if scope == MemoryScope::Global && memory_type == DurableMemoryType::Project {
+                    return Err(ToolError::InvalidArguments(
+                        "Project-typed memory requires Project or an assigned Section scope"
+                            .to_string(),
+                    ));
+                }
                 let doc = memory_access
                     .store
                     .write_memory_with_retrieval(
                         scope,
                         memory_access.project_key.as_deref(),
-                        Self::parse_type(&r#type)?,
+                        memory_type,
                         &title,
                         &content,
                         &tags,
