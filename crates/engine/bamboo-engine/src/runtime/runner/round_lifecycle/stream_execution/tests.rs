@@ -1502,6 +1502,198 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
 }
 
 #[tokio::test]
+async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
+    use bamboo_llm::providers::AnthropicProvider;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "text/event-stream",
+        ))
+        .expect(5)
+        .mount(&server)
+        .await;
+    let llm: Arc<dyn LLMProvider> = Arc::new(
+        AnthropicProvider::new("fixture-key").with_base_url(format!("{}/v1", server.uri())),
+    );
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let frame = LlmStreamFrame {
+        provider_default_output: false,
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "anthropic-cache-wire",
+        model: "test-model",
+        provider_name: Some("test-anthropic"),
+        provider_type: Some("anthropic"),
+        reasoning_effort: None,
+        output_limit_recovery: None,
+        budget: &TokenBudget::new(400_000, 128, Default::default()),
+        observation_progress_hint: None,
+        prompt_memory_exposure: None,
+    };
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("anthropic".into());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".into());
+    let tools = [ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "lookup".into(),
+            description: "look up a value".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    }];
+    let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let mut session = Session::new(frame.session_id, frame.model);
+    session.add_message(Message::user("original request"));
+    session.add_message(Message::assistant("prior answer", None));
+    session.add_message(Message::user("first history boundary"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Fixture task".into(),
+        items: vec![TaskItem {
+            id: "task-1".into(),
+            description: "task snapshot before tools".into(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+
+    for step in 0..5 {
+        if step == 1 {
+            // Resume from the serialized ledger without an in-process cache
+            // cursor. The prior boundary still has to survive the wide append.
+            session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+            // Exceed Anthropic's 20-block lookback even when parallel tool
+            // blocks are counted as a single position.
+            for index in 0..11 {
+                session.add_message(Message::assistant(format!("answer {index}"), None));
+                session.add_message(Message::user(format!("append {index}")));
+            }
+            session.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "cached-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            ));
+            session.add_message(Message::tool_result("cached-call", "retained tool output"));
+        } else if step == 3 {
+            session.add_message(Message::assistant("tool-based answer", None));
+            session.add_message(Message::user("new user turn"));
+        } else if step == 4 {
+            session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+            session.add_message(Message::user("first request in a new epoch"));
+        }
+        if step < 3 {
+            session
+                .metadata
+                .insert(memory_key.into(), format!("live memory revision {step}"));
+        } else {
+            session.metadata.remove(memory_key);
+        }
+        if step == 2 {
+            session.task_list.as_mut().unwrap().items[0].description =
+                "task snapshot after tools".into();
+        }
+        let prepared = PreparedContext {
+            messages: session.messages.clone(),
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        execute_llm_stream(&mut session, &config, &llm, &prepared, &tools, &frame)
+            .await
+            .expect("dispatch fixture through Anthropic rendering");
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let mut prior_prefix = Vec::new();
+    for (step, request) in requests.iter().enumerate() {
+        let body: serde_json::Value = request.body_json().unwrap();
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        let endpoint = match step {
+            0 => "first history boundary",
+            1 | 2 => "retained tool output",
+            3 => "new user turn",
+            _ => "first request in a new epoch",
+        };
+        let boundary = blocks
+            .iter()
+            .position(|block| block["text"] == endpoint || block["content"] == endpoint)
+            .expect("history endpoint on the wire");
+        assert_eq!(blocks[boundary]["cache_control"]["ttl"], "1h");
+        assert!(blocks[boundary + 1..]
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
+        let marked = [
+            body["tools"].as_array().unwrap(),
+            body["system"].as_array().unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(blocks.iter().copied())
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+        assert!(marked <= 4);
+
+        let prefix = blocks[..=boundary]
+            .iter()
+            .map(|block| {
+                let mut content = (*block).clone();
+                content.as_object_mut().unwrap().remove("cache_control");
+                content
+            })
+            .collect::<Vec<_>>();
+        if step == 4 {
+            assert!(blocks
+                .iter()
+                .any(|block| block["text"] == "new user turn"
+                    && block.get("cache_control").is_none()));
+        } else {
+            assert!(prefix.starts_with(&prior_prefix));
+            if !prior_prefix.is_empty() {
+                assert_eq!(blocks[prior_prefix.len() - 1]["cache_control"]["ttl"], "1h");
+            }
+        }
+        if step == 1 {
+            assert!(boundary + 1 - prior_prefix.len() > 20);
+        }
+        let memory = body["messages"].to_string();
+        for revision in 0..3 {
+            assert_eq!(
+                memory.contains(&format!("live memory revision {revision}")),
+                step == revision
+            );
+        }
+        if step < 3 {
+            assert!(blocks[boundary + 1..].iter().any(|block| block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("live memory revision {step}")))));
+        }
+        prior_prefix = prefix;
+    }
+}
+
+#[tokio::test]
 async fn explicit_activation_pending_suppresses_answer_tokens() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-explicit-guard", "test-model");

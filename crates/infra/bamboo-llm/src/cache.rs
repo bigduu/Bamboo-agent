@@ -3,16 +3,13 @@
 //! Prompt caching has two halves that differ per provider but share a single
 //! policy, so the policy lives here and each provider only renders it:
 //!
-//! 1. **Where the cacheable prefix ends.** Anthropic needs explicit
+//! 1. **Where the cacheable prefix ends.** Anthropic renders explicit
 //!    `cache_control` breakpoints (at most [`MAX_ANTHROPIC_CACHE_BREAKPOINTS`]).
-//!    GPT-5.6+ Responses requests can lower the same plan into explicit OpenAI
-//!    content breakpoints; older OpenAI models, Gemini, and Copilot retain their
-//!    automatic prefix caching. In every case a cache *hit* requires the bytes
-//!    before the selected prefix boundary to be identical to a previous request.
-//!    That means the engine must keep per-round volatile content (task list,
-//!    recalled memory, plan state) **out** of the cacheable prefix and order it
-//!    last — otherwise the boundary moves every round and the cache read size
-//!    swings or drops to zero.
+//!    GPT-5.6+ Responses requests can lower stable landmarks into explicit
+//!    OpenAI content breakpoints; older OpenAI models, Gemini, and Copilot
+//!    retain automatic prefix caching. Cache hits depend on reusing the same
+//!    content before the boundary. Durable context events can join that prefix
+//!    as it grows, while request-local context can change on every call.
 //!
 //! 2. **How cached-token usage is reported.** Anthropic reports
 //!    `cache_read_input_tokens`; OpenAI-compatible APIs report
@@ -55,8 +52,7 @@ impl CacheTtl {
     }
 }
 
-/// Provider-agnostic description of which logical regions of a request form a
-/// stable, cacheable prefix.
+/// Cache policy for the logical regions of a request.
 ///
 /// Breakpoints are identified by **message id** rather than position so the plan
 /// survives provider-side message reshaping — for example, Anthropic merges
@@ -73,8 +69,22 @@ pub struct PromptCachePlan {
     /// Ids of messages that end a stable prefix; each becomes a cache
     /// breakpoint. Order is not significant.
     pub breakpoint_message_ids: Vec<String>,
+    /// Rolling history boundaries used only by Anthropic Messages renderers.
+    /// Responses annotations remain fixed in the serialized input items.
+    pub anthropic_history: Option<AnthropicHistoryCache>,
     /// TTL hint for providers that support it.
     pub ttl: CacheTtl,
+}
+
+/// Boundaries in the durable transcript, expressed before wire coalescing.
+#[derive(Debug, Clone)]
+pub struct AnthropicHistoryCache {
+    /// Last durable message in the current request.
+    pub newest_message_id: String,
+    /// Prior request's boundary in the same prefix epoch, when distinct.
+    pub previous_message_id: Option<String>,
+    /// Request-local external memory to place after the reusable history.
+    pub external_memory_message_id: Option<String>,
 }
 
 impl PromptCachePlan {
@@ -85,7 +95,10 @@ impl PromptCachePlan {
 
     /// True when the plan asks for at least one cache breakpoint.
     pub fn is_enabled(&self) -> bool {
-        self.cache_tools || self.cache_system || !self.breakpoint_message_ids.is_empty()
+        self.cache_tools
+            || self.cache_system
+            || !self.breakpoint_message_ids.is_empty()
+            || self.anthropic_history.is_some()
     }
 
     /// Whether the given message id is marked as a cache breakpoint.
