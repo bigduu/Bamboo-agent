@@ -4,9 +4,10 @@ use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
-    message_summary_tool_work_pending, validate_message_summary_tool_protocol, CompressionEvent,
-    CompressionEventKind, CompressionTriggerType, ConversationSummary, Message,
-    MessageSummaryToolProtocolError, ModelContextResetReason, Session,
+    is_post_compaction_recovery, message_summary_archive_message_ids,
+    message_summary_tool_work_pending, CompressionEvent, CompressionEventKind,
+    CompressionTriggerType, ConversationSummary, Message, MessageSummaryToolProtocolError,
+    ModelContextResetReason, Session,
 };
 
 /// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
@@ -91,7 +92,7 @@ pub enum CompressionPlanError {
     CandidateSetChanged,
     /// Tool work is still pending or the final assistant batch awaits results.
     MessageSummaryPendingToolResults,
-    /// The active history contains malformed or protected tool protocol.
+    /// The active history cannot be projected as complete tool exchanges.
     MessageSummaryToolProtocol { reason: String },
     /// A message-only summary may be empty only when no prose is represented.
     EmptyMessageSummary,
@@ -583,11 +584,6 @@ fn message_summary_snapshot(session: &Session) -> Result<Vec<u8>, CompressionPla
     .map_err(|_| CompressionPlanError::CandidateSetChanged)
 }
 
-fn is_post_compaction_recovery(message: &Message) -> bool {
-    message.role == bamboo_domain::Role::Assistant
-        && message.content.starts_with("[post-compaction-recovery]\n")
-}
-
 fn message_content_source(message: &Message) -> Option<Message> {
     if message.content.trim().is_empty() || is_post_compaction_recovery(message) {
         return None;
@@ -620,9 +616,9 @@ fn summary_prompt_tokens(
 /// Archive all eligible active history, retaining the current user request and
 /// explicit prose anchors, while summarizing only user/assistant `content`.
 ///
-/// Completed tool chains and abandoned calls from superseded user turns are
-/// archived without entering the summary source. Unresolved current or
-/// protected tool protocol still blocks the pass.
+/// Unpinned completed batches and abandoned calls from superseded user turns
+/// are archived. Complete pinned batches remain active and count against the
+/// budget. Pending work and malformed tool protocol block the pass.
 /// A mixed existing summary is rebuilt from durable prose on the first pass.
 pub fn build_message_summary_candidate_plan_with_fixed_tokens(
     session: &Session,
@@ -664,25 +660,20 @@ pub fn build_message_summary_candidate_plan_with_input_costs(
     if active_messages.is_empty() {
         return Err(CompressionPlanError::NoActiveMessages);
     }
-    validate_message_summary_tool_protocol(session).map_err(|error| match error {
-        MessageSummaryToolProtocolError::PendingResults => {
-            CompressionPlanError::MessageSummaryPendingToolResults
-        }
-        MessageSummaryToolProtocolError::Invalid(reason) => {
-            CompressionPlanError::MessageSummaryToolProtocol {
-                reason: reason.to_owned(),
+    let archived_ids =
+        message_summary_archive_message_ids(session).map_err(|error| match error {
+            MessageSummaryToolProtocolError::PendingResults => {
+                CompressionPlanError::MessageSummaryPendingToolResults
             }
-        }
-    })?;
-    let latest_user_id = active_messages
-        .iter()
-        .rfind(|message| message.role == bamboo_domain::Role::User)
-        .map(|message| message.id.as_str());
+            MessageSummaryToolProtocolError::Invalid(reason) => {
+                CompressionPlanError::MessageSummaryToolProtocol {
+                    reason: reason.to_owned(),
+                }
+            }
+        })?;
     let archived = active_messages
         .iter()
-        .filter(|message| message.role != bamboo_domain::Role::System)
-        .filter(|message| Some(message.id.as_str()) != latest_user_id)
-        .filter(|message| !message.never_compress || is_post_compaction_recovery(message))
+        .filter(|message| archived_ids.contains(message.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if archived.is_empty() {
@@ -698,10 +689,6 @@ pub fn build_message_summary_candidate_plan_with_input_costs(
         .iter()
         .map(|message| message.id.clone())
         .collect::<Vec<_>>();
-    let archived_ids = compressed_message_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
     let latest_summary_index = session
         .compression_events
         .iter()
