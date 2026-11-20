@@ -845,20 +845,21 @@ fn build_retrieval_window_extraction_batches_with_ranges(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DreamSessionSelection {
+enum DreamSessionSelection<'a> {
     Any,
     Unbound,
+    Project(&'a str),
 }
 
 async fn collect_candidate_sessions(
     ctx: &AutoDreamContext,
     since: DateTime<Utc>,
-    selection: DreamSessionSelection,
+    selection: DreamSessionSelection<'_>,
 ) -> Vec<(SessionIndexEntry, Option<String>)> {
     let mut items = ctx.session_store.list_index_entries().await;
     items.retain(|entry| {
         session_is_candidate(entry, since)
-            && (selection == DreamSessionSelection::Any || entry.project_id.is_none())
+            && (selection != DreamSessionSelection::Unbound || entry.project_id.is_none())
     });
     items.sort_by_key(|e| Reverse(e.updated_at));
 
@@ -870,18 +871,31 @@ async fn collect_candidate_sessions(
         }
         let summary = match ctx.storage.load_session(&entry.id).await {
             Ok(Some(session)) => {
-                if selection == DreamSessionSelection::Unbound {
-                    // The index is only a hint. Use the same canonical read for
-                    // both the scope decision and every field given to Dream.
+                if selection != DreamSessionSelection::Any {
+                    use crate::project_context::SessionProjectIdentity;
+
+                    // The index supplies ordering hints. Scope and prompt
+                    // fields must come from the same canonical lifetime.
                     if session.id != entry.id
                         || session.created_at != entry.created_at
-                        || !matches!(
-                            ProjectContextResolver::session_project_identity(&session),
-                            crate::project_context::SessionProjectIdentity::Unassigned
-                        )
+                        || session.kind != SessionKind::Root
+                        || session.updated_at < since
                     {
                         continue;
                     }
+                    entry.project_id = match (
+                        selection,
+                        ProjectContextResolver::session_project_identity(&session),
+                    ) {
+                        (DreamSessionSelection::Unbound, SessionProjectIdentity::Unassigned) => {
+                            None
+                        }
+                        (
+                            DreamSessionSelection::Project(expected),
+                            SessionProjectIdentity::Assigned(actual),
+                        ) if actual.as_str() == expected => Some(actual.into_string()),
+                        _ => continue,
+                    };
                     entry.title.clone_from(&session.title);
                     entry.kind = session.kind;
                     entry.updated_at = session.updated_at;
@@ -894,7 +908,7 @@ async fn collect_candidate_sessions(
                     .map(|summary| summary.content.clone())
                     .or_else(|| derive_sanitized_session_outline(&session))
             }
-            _ if selection == DreamSessionSelection::Unbound => continue,
+            _ if selection != DreamSessionSelection::Any => continue,
             _ => None,
         };
         seen_roots.insert(entry.root_session_id.clone());
@@ -916,28 +930,6 @@ async fn resolve_session_project_id(
         .ok()
         .flatten()
         .and_then(|session| ProjectContextResolver::memory_read_identity_for_session(&session))
-}
-
-async fn collect_candidate_sessions_for_project(
-    ctx: &AutoDreamContext,
-    project_key: &str,
-    since: DateTime<Utc>,
-) -> Vec<(SessionIndexEntry, Option<String>)> {
-    let mut out = Vec::new();
-    for (entry, summary) in collect_candidate_sessions(ctx, since, DreamSessionSelection::Any).await
-    {
-        let Some(project_id) = resolve_session_project_id(ctx, &entry.id).await else {
-            continue;
-        };
-        if project_id.as_str() != project_key {
-            continue;
-        }
-        out.push((entry, summary));
-        if out.len() >= DREAM_MAX_SESSIONS {
-            break;
-        }
-    }
-    out
 }
 
 async fn collect_candidate_session_contexts_from_sessions(
@@ -3228,7 +3220,8 @@ async fn run_auto_dream_once_for_scope(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
-            collect_candidate_sessions_for_project(ctx, project_key, since).await
+            collect_candidate_sessions(ctx, since, DreamSessionSelection::Project(project_key))
+                .await
         }
         MemoryScope::Session | MemoryScope::Section => {
             return Err(format!(
@@ -4066,6 +4059,93 @@ mod tests {
             }
             Ok(session)
         }
+    }
+
+    #[tokio::test]
+    async fn project_dream_does_not_relabel_a_snapshot_after_reassignment() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let mut session = Session::new("scope-reassignment-fixture", "model");
+        session.set_project_id_meta("project-a".to_owned());
+        session.title = "Project A title".to_owned();
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "Project A fixture summary.",
+            4,
+            160,
+        ));
+        store.save_session(&session).await.unwrap();
+
+        let paused = Arc::new(PausedCandidateStorage {
+            inner: store.clone(),
+            loads: AtomicUsize::new(0),
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        let routes = RoutingContext::new(None);
+        let context = AutoDreamContext {
+            session_store: store.clone(),
+            storage: paused.clone(),
+            memory: MemoryStore::new(temp.path().join("jiandu")),
+            provider: routes.providers["chat-a"].clone(),
+            config: routes.config.clone(),
+            provider_registry: routes.registry.clone(),
+        };
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let reassign = async {
+            tokio::time::timeout(Duration::from_secs(5), paused.reached.wait())
+                .await
+                .unwrap();
+            session.metadata_version += 1;
+            session.title_version += 1;
+            session.set_project_id_meta("project-b".to_owned());
+            session.title = "Project B title".to_owned();
+            session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+                "Project B fixture summary.",
+                4,
+                160,
+            ));
+            store.save_session(&session).await.unwrap();
+            paused.release.wait().await;
+        };
+        let (racing, ()) = tokio::join!(
+            collect_candidate_sessions(
+                &context,
+                since,
+                DreamSessionSelection::Project("project-b")
+            ),
+            reassign,
+        );
+        assert!(
+            racing.is_empty(),
+            "the captured snapshot belonged to Project A"
+        );
+        assert_eq!(paused.loads.load(Ordering::SeqCst), 1);
+
+        let current = collect_candidate_sessions(
+            &context,
+            since,
+            DreamSessionSelection::Project("project-b"),
+        )
+        .await;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].0.title, "Project B title");
+        assert_eq!(current[0].1.as_deref(), Some("Project B fixture summary."));
+
+        for index in 0..DREAM_MAX_SESSIONS {
+            let mut unrelated = Session::new(format!("foreign-source-{index}"), "model");
+            unrelated.set_project_id_meta("project-c".to_owned());
+            store.save_session(&unrelated).await.unwrap();
+        }
+        let scoped = collect_candidate_sessions(
+            &context,
+            since,
+            DreamSessionSelection::Project("project-b"),
+        )
+        .await;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].0.id, session.id);
     }
 
     #[tokio::test]
