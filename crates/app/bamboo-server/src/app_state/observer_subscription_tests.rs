@@ -6,8 +6,8 @@ use actix_web::web;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
-    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session, SessionInboxPort,
-    SessionPermissionMode,
+    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session,
+    SessionInboxError, SessionInboxPort, SessionPermissionMode,
 };
 use bamboo_engine::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
@@ -1606,6 +1606,58 @@ async fn settle_material_notices(f: &Fixture) {
     .expect("unchanged sources must finish their finite proof I/O");
 }
 
+async fn replay_settled_material_notice<T>(
+    mut replay: impl AsyncFnMut() -> Result<T, SessionInboxError>,
+) -> Result<T, SessionInboxError> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match replay().await {
+                Err(SessionInboxError::Storage(reason))
+                    if reason == "Session proof I/O is busy" =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .expect("settled material notice proof must become available before the fixture deadline")
+}
+
+async fn assert_settled_replay_retries_only_proof_contention() {
+    let mut attempts = 0;
+    let result = replay_settled_material_notice(async || {
+        attempts += 1;
+        match attempts {
+            1 => Err(SessionInboxError::Storage(
+                "Session proof I/O is busy".into(),
+            )),
+            2 => Ok("settled receipt"),
+            _ => panic!("the replay should stop after the first success"),
+        }
+    })
+    .await;
+    assert_eq!(result.unwrap(), "settled receipt");
+    assert_eq!(attempts, 2);
+
+    let mut attempts = 0;
+    let error = replay_settled_material_notice(async || -> Result<(), SessionInboxError> {
+        attempts += 1;
+        assert_eq!(attempts, 1, "a different storage error must propagate");
+        Err(SessionInboxError::Storage(
+            "Session proof I/O is busy for an unrecognized reason".into(),
+        ))
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SessionInboxError::Storage(reason)
+            if reason == "Session proof I/O is busy for an unrecognized reason"
+    ));
+}
+
 pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     decision: Option<PermissionDecisionKind>,
     repeat: bool,
@@ -1613,6 +1665,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     use actix_web::{http::StatusCode, test, App};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
+    if repeat {
+        assert_settled_replay_retries_only_proof_contention().await;
+    }
     let f = Fixture::new_with_native_source(true).await;
     let workspace = f.home.path().join("subscribed-dispatch");
     std::fs::create_dir(&workspace).unwrap();
@@ -2001,14 +2056,15 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .unwrap()
             .unwrap();
         assert_eq!(permanent.id.as_str(), notice.id);
-        let replayed = f
-            .state
-            .observer_subscriptions
-            .inbox
-            .deliver_managed_root_notification(&selected, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+        let inbox = &f.state.observer_subscriptions.inbox;
+        let replayed = replay_settled_material_notice(async || {
+            inbox
+                .deliver_managed_root_notification(&selected, Utc::now())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(replayed.delivery, permanent);
         assert!(!replayed.pending);
         assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
@@ -2059,14 +2115,15 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .unwrap()
             .unwrap();
         assert_eq!(receipt.id.as_str(), notice.id);
-        let retry = f
-            .state
-            .observer_subscriptions
-            .inbox
-            .deliver_managed_root_notification(&selected, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+        let inbox = &f.state.observer_subscriptions.inbox;
+        let retry = replay_settled_material_notice(async || {
+            inbox
+                .deliver_managed_root_notification(&selected, Utc::now())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(retry.delivery.id.as_str(), notice.id);
         assert!(!retry.pending);
         assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
