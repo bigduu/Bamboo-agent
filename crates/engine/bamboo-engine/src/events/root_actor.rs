@@ -1,15 +1,22 @@
 //! One immutable Root execution's actual per-session/account publication.
 
-use super::AccountEventSink;
+use super::{account_sink::ReservedAccountEvent, AccountEventSink};
 use bamboo_agent_core::AgentEvent;
-use bamboo_domain::{RootActorRuntimeWrite, Storage};
+use bamboo_domain::{RootActorRuntimeWrite, SessionAuthorityConflict, Storage};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 #[derive(Clone)]
 pub struct RootActorEventPublication {
     storage: Arc<dyn Storage>,
     account_sink: Arc<AccountEventSink>,
     owner: RootActorRuntimeWrite,
+}
+
+pub struct PreparedRootActorEvent {
+    storage: Arc<dyn Storage>,
+    owner: RootActorRuntimeWrite,
+    account: Option<(ReservedAccountEvent, oneshot::Receiver<bool>)>,
 }
 
 impl RootActorEventPublication {
@@ -45,15 +52,49 @@ impl RootActorEventPublication {
         event: &AgentEvent,
         publish: Box<dyn FnOnce() -> bool + Send>,
     ) -> std::io::Result<()> {
-        let storage = self.storage.clone();
-        let sink = self.account_sink.clone();
-        let owner_for_queue = self.owner.clone();
-        let event = event.clone();
-        let session_id = session_id.to_owned();
-        let (queued, receipt) = tokio::sync::oneshot::channel();
-        self.storage
+        self.prepare(session_id, event)
+            .await?
+            .publish(publish)
+            .await
+    }
+
+    /// Reserve account capacity before taking any local or physical publication guard.
+    pub async fn prepare(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+    ) -> std::io::Result<PreparedRootActorEvent> {
+        let account = match self
+            .account_sink
+            .reserve_root_actor_event(self.storage.clone(), self.owner.clone(), session_id, event)
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                return Err(authority_conflict(self.storage.as_ref(), &self.owner)
+                    .await
+                    .unwrap_or(error));
+            }
+        };
+        Ok(PreparedRootActorEvent {
+            storage: self.storage.clone(),
+            owner: self.owner.clone(),
+            account,
+        })
+    }
+}
+
+impl PreparedRootActorEvent {
+    pub async fn publish(self, publish: Box<dyn FnOnce() -> bool + Send>) -> std::io::Result<()> {
+        let Self {
+            storage,
+            owner,
+            account,
+        } = self;
+        let (reservation, confirmation) = account.unzip();
+        storage
             .publish_root_actor_runtime_event(
-                &self.owner,
+                &owner,
                 Box::new(move |check_current| {
                     check_current()?;
                     if !publish() {
@@ -62,33 +103,15 @@ impl RootActorEventPublication {
                         ));
                     }
                     check_current()?;
-                    let confirmation = if event.is_durable_change() {
-                        Some(
-                            sink.record_root_actor(
-                                storage,
-                                owner_for_queue,
-                                Some(&session_id),
-                                &event,
-                            )
-                            .ok_or_else(|| {
-                                std::io::Error::other(
-                                    "Root account event queue rejected publication",
-                                )
-                            })?,
-                        )
-                    } else {
-                        None
-                    };
-                    let _ = queued.send(confirmation);
+                    if let Some(reservation) = reservation {
+                        reservation.enqueue();
+                    }
                     Ok(())
                 }),
             )
             .await?;
         // The account writer needs the same physical Root guards. Await only
         // after the per-session publication job has released those guards.
-        let confirmation = receipt
-            .await
-            .map_err(|_| std::io::Error::other("Root account admission receipt closed"))?;
         if let Some(confirmation) = confirmation {
             if !tokio::time::timeout(std::time::Duration::from_secs(30), confirmation)
                 .await
@@ -96,31 +119,31 @@ impl RootActorEventPublication {
                 .and_then(Result::ok)
                 .unwrap_or(false)
             {
-                // The account writer reports a boolean receipt, so an owner
-                // conflict there otherwise loses its typed cause. Revalidate
-                // without publishing or writing runtime state before returning the
-                // generic receipt failure; a lost owner must still interrupt
-                // its exact live transport through the event forwarder.
-                if let Err(error) = self
-                    .storage
-                    .publish_root_actor_runtime_event(
-                        &self.owner,
-                        Box::new(|check_current| check_current()),
-                    )
+                return Err(authority_conflict(storage.as_ref(), &owner)
                     .await
-                {
-                    if error
-                        .get_ref()
-                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
-                    {
-                        return Err(error);
-                    }
-                }
-                return Err(std::io::Error::other(
-                    "Root account final publication was not confirmed",
-                ));
+                    .unwrap_or_else(|| {
+                        std::io::Error::other("Root account final publication was not confirmed")
+                    }));
             }
         }
         Ok(())
     }
+}
+
+/// Queue and receipt failures can mask an ownership change. Revalidate
+/// without publishing or writing after the queue wait has ended so the
+/// forwarder can interrupt the stale execution's exact transport.
+async fn authority_conflict(
+    storage: &dyn Storage,
+    owner: &RootActorRuntimeWrite,
+) -> Option<std::io::Error> {
+    storage
+        .publish_root_actor_runtime_event(owner, Box::new(|check_current| check_current()))
+        .await
+        .err()
+        .filter(|error| {
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>())
+        })
 }

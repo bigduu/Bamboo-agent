@@ -27,9 +27,8 @@ use tokio::sync::{broadcast, mpsc};
 use super::change_feed::ChangeEvent;
 use super::journal::EventJournal;
 
-/// Bounded inbox to the writer task. Change events are low-volume, so this
-/// should never fill; a full inbox drops with a warning rather than blocking a
-/// forwarder.
+/// Bounded inbox to the writer task. Async session publications reserve
+/// capacity before taking their publication guards.
 const INBOX_CAPACITY: usize = 1024;
 
 /// Live-tail ring capacity. Larger than the per-session channel because the
@@ -56,6 +55,33 @@ enum QueuedEvent {
         pending: PendingEvent,
         receipt: oneshot::Sender<bool>,
     },
+}
+
+pub struct ReservedAccountEvent {
+    permit: mpsc::OwnedPermit<QueuedEvent>,
+    event: Box<QueuedEvent>,
+}
+
+impl ReservedAccountEvent {
+    pub fn enqueue(self) {
+        self.permit.send(*self.event);
+    }
+}
+
+pub(crate) async fn reserve_account_slot<T>(
+    sender: &mpsc::Sender<T>,
+) -> std::io::Result<mpsc::OwnedPermit<T>> {
+    match tokio::time::timeout(CONFIRMATION_TIMEOUT, sender.clone().reserve_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "account change-feed queue closed",
+        )),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "account change-feed queue capacity timed out",
+        )),
+    }
 }
 
 type ConfirmationWaiter = (u64, oneshot::Sender<bool>);
@@ -91,6 +117,13 @@ pub struct AccountEventSink {
 impl AccountEventSink {
     /// Open the journal (recovering the max seq) and spawn the writer task.
     pub fn new(events_dir: PathBuf) -> std::io::Result<Arc<Self>> {
+        Self::with_inbox_capacity(events_dir, INBOX_CAPACITY)
+    }
+
+    fn with_inbox_capacity(
+        events_dir: PathBuf,
+        inbox_capacity: usize,
+    ) -> std::io::Result<Arc<Self>> {
         // Build the boot snapshot under the same fixed claim used by appends.
         // Otherwise a rolling process could observe the new max sequence but
         // miss the corresponding confirmation id and later duplicate it.
@@ -110,8 +143,8 @@ impl AccountEventSink {
             .filter_map(|change| config_event_id(&change.event))
             .collect::<HashSet<_>>();
         let seq = Arc::new(AtomicU64::new(max_seq));
-        let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
-        let (legacy_inbox, mut legacy_rx) = mpsc::channel(INBOX_CAPACITY);
+        let (tx, rx) = mpsc::channel(inbox_capacity);
+        let (legacy_inbox, mut legacy_rx) = mpsc::channel(inbox_capacity);
         let legacy_writer = tx.clone();
         tokio::spawn(async move {
             while let Some(event) = legacy_rx.recv().await {
@@ -178,6 +211,51 @@ impl AccountEventSink {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("account change-feed inbox full or closed; event dropped");
         }
+    }
+
+    /// Reserve a durable frame before taking a local session publication lock.
+    /// The caller can drop the reservation if its session publication retires.
+    pub async fn reserve_session_event(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+    ) -> std::io::Result<Option<ReservedAccountEvent>> {
+        if !event.is_durable_change() {
+            return Ok(None);
+        }
+        Ok(Some(ReservedAccountEvent {
+            permit: reserve_account_slot(&self.tx).await?,
+            event: Box::new(QueuedEvent::Legacy((
+                Some(session_id.to_owned()),
+                event.clone(),
+            ))),
+        }))
+    }
+
+    pub(crate) async fn reserve_root_actor_event(
+        &self,
+        storage: Arc<dyn Storage>,
+        owner: RootActorRuntimeWrite,
+        session_id: &str,
+        event: &AgentEvent,
+    ) -> std::io::Result<Option<(ReservedAccountEvent, oneshot::Receiver<bool>)>> {
+        if !event.is_durable_change() {
+            return Ok(None);
+        }
+        let permit = reserve_account_slot(&self.tx).await?;
+        let (receipt, confirmation) = oneshot::channel();
+        Ok(Some((
+            ReservedAccountEvent {
+                permit,
+                event: Box::new(QueuedEvent::RootActor {
+                    storage,
+                    owner,
+                    pending: (Some(session_id.to_owned()), event.clone()),
+                    receipt,
+                }),
+            },
+            confirmation,
+        )))
     }
 
     /// Queue an immutable Host-created Root capability with the durable frame.
@@ -1219,6 +1297,21 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(confirmation_waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_reservation_reports_a_full_or_closed_queue() {
+        let (tx, receiver) = mpsc::channel(1);
+        tx.try_send(()).unwrap();
+        assert_eq!(
+            reserve_account_slot(&tx).await.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        drop(receiver);
+        assert_eq!(
+            reserve_account_slot(&tx).await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     #[tokio::test]
