@@ -3,8 +3,8 @@
 //! This is the single choke point the feed is built around. The three existing
 //! per-session event paths (the interactive execute forwarder, the synchronous
 //! `publish_replayable_session_event` helper, and the engine forwarder) each
-//! also hand their events to this sink via [`AccountEventSink::record`] (or
-//! [`AccountEventSink::inbox`] for the dependency-free engine path).
+//! also hand their events to this sink. Before committing a session mutation,
+//! reserve queue capacity so its account event cannot be lost to a full inbox.
 //!
 //! A **single writer task per sink** owns its live broadcast ordering. Durable
 //! sequence allocation and append are additionally serialized by one fixed
@@ -49,6 +49,7 @@ pub type PendingEvent = (Option<String>, AgentEvent);
 
 enum QueuedEvent {
     Legacy(PendingEvent),
+    DeletedSessions(Vec<String>),
     ChildTerminal {
         pending: PendingEvent,
         completion_id: String,
@@ -69,6 +70,28 @@ pub struct ReservedAccountEvent {
 impl ReservedAccountEvent {
     pub fn enqueue(self) {
         self.permit.send(*self.event);
+    }
+}
+
+/// Capacity reserved before storage commits. The mutation builds the event
+/// from the committed state and sends it without awaiting under a write guard.
+pub struct ReservedSessionMutation(mpsc::OwnedPermit<QueuedEvent>);
+
+impl ReservedSessionMutation {
+    pub fn enqueue(self, session_id: &str, event: AgentEvent) {
+        debug_assert!(event.is_durable_change());
+        debug_assert_eq!(event.session_id(), Some(session_id));
+        self.0
+            .send(QueuedEvent::Legacy((Some(session_id.to_owned()), event)));
+    }
+
+    /// The exact subtree is known only after deletion. One reserved queue
+    /// slot covers the operation even when it removes more than a queue's
+    /// worth of sessions.
+    pub fn enqueue_deletions(self, session_ids: Vec<String>) {
+        if !session_ids.is_empty() {
+            self.0.send(QueuedEvent::DeletedSessions(session_ids));
+        }
     }
 }
 
@@ -236,6 +259,14 @@ impl AccountEventSink {
                 event.clone(),
             ))),
         }))
+    }
+
+    /// Reserve capacity before a Session mutation takes physical write guards.
+    /// Dropping an unused reservation (including a failed mutation) sends no event.
+    pub async fn reserve_session_mutation(&self) -> std::io::Result<ReservedSessionMutation> {
+        Ok(ReservedSessionMutation(
+            reserve_account_slot(&self.tx).await?,
+        ))
     }
 
     pub(crate) async fn reserve_child_terminal_event(
@@ -783,9 +814,24 @@ async fn writer_loop(
     state: WriterDedupState,
 ) {
     let state = Arc::new(Mutex::new(state));
-    while let Some(queued) = rx.recv().await {
+    let mut deleted_sessions = Vec::<String>::new().into_iter();
+    loop {
+        let queued = if let Some(session_id) = deleted_sessions.next() {
+            QueuedEvent::Legacy((
+                Some(session_id.clone()),
+                AgentEvent::SessionDeleted { session_id },
+            ))
+        } else if let Some(queued) = rx.recv().await {
+            queued
+        } else {
+            break;
+        };
         let (pending, root, child_completion_id) = match queued {
             QueuedEvent::Legacy(pending) => (pending, None, None),
+            QueuedEvent::DeletedSessions(ids) => {
+                deleted_sessions = ids.into_iter();
+                continue;
+            }
             QueuedEvent::ChildTerminal {
                 pending,
                 completion_id,
