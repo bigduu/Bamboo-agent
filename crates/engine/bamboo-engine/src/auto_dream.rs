@@ -844,28 +844,60 @@ fn build_retrieval_window_extraction_batches_with_ranges(
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DreamSessionSelection {
+    Any,
+    Unbound,
+}
+
 async fn collect_candidate_sessions(
     ctx: &AutoDreamContext,
     since: DateTime<Utc>,
+    selection: DreamSessionSelection,
 ) -> Vec<(SessionIndexEntry, Option<String>)> {
     let mut items = ctx.session_store.list_index_entries().await;
-    items.retain(|entry| session_is_candidate(entry, since));
+    items.retain(|entry| {
+        session_is_candidate(entry, since)
+            && (selection == DreamSessionSelection::Any || entry.project_id.is_none())
+    });
     items.sort_by_key(|e| Reverse(e.updated_at));
 
     let mut seen_roots = HashSet::new();
     let mut out = Vec::new();
-    for entry in items.into_iter() {
-        if !seen_roots.insert(entry.root_session_id.clone()) {
+    for mut entry in items.into_iter() {
+        if seen_roots.contains(&entry.root_session_id) {
             continue;
         }
         let summary = match ctx.storage.load_session(&entry.id).await {
-            Ok(Some(session)) => session
-                .conversation_summary
-                .as_ref()
-                .map(|summary| summary.content.clone())
-                .or_else(|| derive_sanitized_session_outline(&session)),
+            Ok(Some(session)) => {
+                if selection == DreamSessionSelection::Unbound {
+                    // The index is only a hint. Use the same canonical read for
+                    // both the scope decision and every field given to Dream.
+                    if session.id != entry.id
+                        || session.created_at != entry.created_at
+                        || !matches!(
+                            ProjectContextResolver::session_project_identity(&session),
+                            crate::project_context::SessionProjectIdentity::Unassigned
+                        )
+                    {
+                        continue;
+                    }
+                    entry.title.clone_from(&session.title);
+                    entry.kind = session.kind;
+                    entry.updated_at = session.updated_at;
+                    entry.message_count = session.messages.len();
+                    entry.last_run_status = session.last_run_status();
+                }
+                session
+                    .conversation_summary
+                    .as_ref()
+                    .map(|summary| summary.content.clone())
+                    .or_else(|| derive_sanitized_session_outline(&session))
+            }
+            _ if selection == DreamSessionSelection::Unbound => continue,
             _ => None,
         };
+        seen_roots.insert(entry.root_session_id.clone());
         out.push((entry, summary));
         if out.len() >= DREAM_MAX_SESSIONS {
             break;
@@ -892,7 +924,8 @@ async fn collect_candidate_sessions_for_project(
     since: DateTime<Utc>,
 ) -> Vec<(SessionIndexEntry, Option<String>)> {
     let mut out = Vec::new();
-    for (entry, summary) in collect_candidate_sessions(ctx, since).await {
+    for (entry, summary) in collect_candidate_sessions(ctx, since, DreamSessionSelection::Any).await
+    {
         let Some(project_id) = resolve_session_project_id(ctx, &entry.id).await else {
             continue;
         };
@@ -1086,7 +1119,7 @@ async fn collect_candidate_session_contexts(
     collect_candidate_session_contexts_from_sessions(
         ctx,
         memory,
-        collect_candidate_sessions(ctx, since).await,
+        collect_candidate_sessions(ctx, since, DreamSessionSelection::Any).await,
         None,
     )
     .await
@@ -3187,7 +3220,9 @@ async fn run_auto_dream_once_for_scope(
     };
 
     let sessions = match scope {
-        MemoryScope::Global => collect_candidate_sessions(ctx, since).await,
+        MemoryScope::Global => {
+            collect_candidate_sessions(ctx, since, DreamSessionSelection::Any).await
+        }
         MemoryScope::Project => {
             let project_key = project_key
                 .map(str::trim)
@@ -3281,6 +3316,16 @@ async fn run_auto_dream_once_for_scope(
         .map_err(|error| format!("failed to capture Dream source generation: {error}"))?;
     let durable_memory_index =
         read_durable_memory_index_for_scope(memory, scope, project_key).await?;
+    // Extraction can route candidates from a Project into their own scope.
+    // Global synthesis only receives canonical sources verified as unbound.
+    let sessions = if scope == MemoryScope::Global {
+        collect_candidate_sessions(ctx, since, DreamSessionSelection::Unbound).await
+    } else {
+        sessions
+    };
+    if sessions.is_empty() && durable_memory_index.is_none() {
+        return Ok(None);
+    }
 
     // The notebook is a VIEW of durable memory (L3): rebuild it from the canonical
     // durable memory index whenever any durable memory exists — grounded in the
@@ -8428,6 +8473,73 @@ Model: gpt-5-mini
             1,
             "the durable extraction must not repeat when only Dream publication retries"
         );
+    }
+
+    #[tokio::test]
+    async fn global_dream_synthesis_uses_only_verified_unbound_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStoreV2::new(dir.path().into()).await.unwrap());
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let memory = MemoryStore::new(dir.path());
+        let no_candidates = serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string();
+        let provider = Arc::new(SequenceProvider::new(vec![
+            no_candidates.clone(),
+            no_candidates.clone(),
+            no_candidates,
+            "## Current durable context\n- Global fixture orientation".to_string(),
+        ]));
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(config_with_memory(
+                bamboo_config::MemoryConfig {
+                    background_model: Some("fast-model".into()),
+                    auto_dream_enabled: true,
+                    ..Default::default()
+                },
+            ))),
+            provider_registry: test_registry(),
+        };
+
+        let global_summary = "Unbound fixture summary.";
+        let project_summary = "Project fixture summary.";
+        let invalid_summary = "Invalid binding fixture summary.";
+        for (id, project, summary) in [
+            ("global-source", None, global_summary),
+            ("project-source", Some("project-fixture"), project_summary),
+            (
+                "invalid-source",
+                Some("../invalid-project"),
+                invalid_summary,
+            ),
+        ] {
+            let mut session = Session::new(id, "model");
+            if let Some(project) = project {
+                session.set_project_id_meta(project.to_string());
+            }
+            session.conversation_summary =
+                Some(bamboo_agent_core::ConversationSummary::new(summary, 4, 160));
+            session.add_message(Message::user("Source fixture message."));
+            storage.save_session(&session).await.expect("save source");
+        }
+
+        let result = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect("run Global Dream")
+            .expect("publish Global Dream");
+        let prompts = provider.recorded_prompts();
+        let synthesis = prompts.last().expect("synthesis received a prompt");
+        assert!(synthesis.contains(global_summary));
+        assert!(!synthesis.contains(project_summary));
+        assert!(!synthesis.contains(invalid_summary));
+        assert_eq!(result.session_count, 1);
     }
 
     #[tokio::test]
