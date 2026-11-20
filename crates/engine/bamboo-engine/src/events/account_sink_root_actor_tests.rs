@@ -156,6 +156,151 @@ async fn confirmed(receipt: oneshot::Receiver<bool>) -> bool {
         .expect("actual writer returns a result rather than dropping the receipt")
 }
 
+async fn full_account_queue_timeout(rotate_owner: bool) -> std::io::Error {
+    let fixture = Fixture::with_inbox_capacity(1).await;
+    let lease = if rotate_owner {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(90)
+    };
+    let owner = fixture.running_owner(&fixture.a, "a", lease).await;
+    let slot = fixture.sink.tx.clone().try_reserve_owned().unwrap();
+    assert_eq!(fixture.sink.tx.capacity(), 0);
+    let mut live = fixture.sink.subscribe();
+    let publisher =
+        RootActorEventPublication::new(fixture.a.clone(), fixture.sink.clone(), owner.clone());
+    let event = AgentEvent::SessionHistoryCommitted {
+        session_id: ROOT.into(),
+    };
+    let publish = publisher.publish(
+        ROOT,
+        &event,
+        Box::new(|| panic!("a reservation failure must not publish locally")),
+    );
+    tokio::pin!(publish);
+    assert!(futures::poll!(&mut publish).is_pending());
+
+    let current = if rotate_owner {
+        fixture.expire_a(&owner).await;
+        let replacement = fixture
+            .running_owner(&fixture.b, "b", Duration::from_secs(30))
+            .await;
+        assert!(replacement.fence.lease_epoch > owner.fence.lease_epoch);
+        replacement
+    } else {
+        owner
+    };
+    // The real Actor clock has already reached the desired state. Advance
+    // only the queue wait's monotonic deadline while its only slot stays held.
+    tokio::time::pause();
+    tokio::time::advance(super::CONFIRMATION_TIMEOUT).await;
+    let error = publish.await.unwrap_err();
+    tokio::time::resume();
+
+    assert_eq!(
+        fixture
+            .b
+            .inspect_actor(ROOT)
+            .await
+            .unwrap()
+            .activation
+            .unwrap()
+            .fence(),
+        current.fence
+    );
+    assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+    assert!(journal::read_since(fixture.sink.events_dir(), 0)
+        .unwrap()
+        .is_empty());
+    drop(slot);
+    assert_eq!(fixture.sink.tx.capacity(), 1);
+    error
+}
+
+#[tokio::test]
+async fn full_account_queue_timeout_preserves_current_owner_error() {
+    let error = full_account_queue_timeout(false).await;
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[tokio::test]
+async fn full_account_queue_timeout_reports_rotated_owner_conflict() {
+    let error = full_account_queue_timeout(true).await;
+    assert!(
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()),
+        "obsolete Root must return an authority conflict, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_account_queue_at_start_interrupts_obsolete_generic_transport() {
+    use crate::execution::{create_event_forwarder_with_root_actor, AgentRunner, AgentStatus};
+    use std::collections::HashMap;
+    use tokio::sync::{broadcast, RwLock};
+
+    let fixture = Fixture::with_inbox_capacity(1).await;
+    let owner = fixture
+        .running_owner(&fixture.a, "a", Duration::from_secs(30))
+        .await;
+    fixture
+        .a
+        .finish_activation(
+            &owner.fence,
+            Utc::now(),
+            bamboo_domain::ActorActivationFinish::Failed,
+        )
+        .await
+        .unwrap();
+    let slot = fixture.sink.tx.clone().try_reserve_owned().unwrap();
+    let (sender, mut events) = broadcast::channel(8);
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    runner.run_id = owner.fence.run_id.clone();
+    runner.event_sender = sender.clone();
+    let cancelled = runner.cancel_token.clone();
+    let publication = runner.event_publication.clone();
+    let visible = runner.visible_messages.clone();
+    let runners = Arc::new(RwLock::new(HashMap::from([(ROOT.to_owned(), runner)])));
+    tokio::time::pause();
+    let (_input, task, _history) = create_event_forwarder_with_root_actor(
+        ROOT.to_owned(),
+        owner.fence.run_id.clone(),
+        sender,
+        runners.clone(),
+        None,
+        Some(RootActorEventPublication::new(
+            fixture.a.clone(),
+            fixture.sink.clone(),
+            owner,
+        )),
+    );
+    tokio::time::timeout(super::CONFIRMATION_TIMEOUT * 2, task)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::resume();
+
+    assert!(
+        cancelled.is_cancelled(),
+        "the exact obsolete transport must be cancelled"
+    );
+    assert!(!publication.publish(|| panic!("obsolete transport accepted output")));
+    let (_, snapshot) = visible.subscribe_with_snapshot();
+    assert_eq!(snapshot.terminal.as_deref(), Some("error"));
+    assert!(
+        matches!(events.try_recv(), Ok(AgentEvent::Error { message })
+        if message.contains("actor_authority_conflict"))
+    );
+    assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    assert!(runners.read().await[ROOT]
+        .published_execution_started
+        .is_none());
+    assert_eq!(fixture.sink.latest_seq(), 0);
+    drop(slot);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_account_queue_revalidates_the_root_before_either_publication() {
     let fixture = Fixture::with_inbox_capacity(1).await;
