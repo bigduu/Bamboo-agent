@@ -723,6 +723,28 @@ pub async fn interrupt_root_on_authority_loss(
     .await;
 }
 
+/// Capture only the already installed run's live transport. The registry guard
+/// is released here, before waiting for account capacity.
+pub async fn capture_root_startup_transport(
+    runners: &RwLock<HashMap<String, AgentRunner>>,
+    session_id: &str,
+    run_id: &str,
+) -> Option<(
+    Arc<super::event_publication::EventPublication>,
+    Arc<super::visible_messages::VisibleMessageStream>,
+    CancellationToken,
+)> {
+    let guard = runners.read().await;
+    let runner = guard
+        .get(session_id)
+        .filter(|runner| runner.run_id == run_id)?;
+    Some((
+        runner.event_publication.clone(),
+        runner.visible_messages.clone(),
+        runner.cancel_token.clone(),
+    ))
+}
+
 /// The Root adapter passes its immutable capability before any Started frame.
 /// Legacy Child/Supervisor/standalone callers keep the existing queue behavior.
 pub fn create_event_forwarder_with_root_actor(
@@ -758,6 +780,11 @@ pub fn create_event_forwarder_with_root_actor(
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
         };
+        let startup_transport = if root_actor.is_some() {
+            capture_root_startup_transport(&runners, &session_id, &run_id).await
+        } else {
+            None
+        };
         let started_reservation = match prepare_forwarded_event(
             root_actor.as_ref(),
             legacy_feed.as_ref(),
@@ -768,7 +795,7 @@ pub fn create_event_forwarder_with_root_actor(
         {
             Ok(reservation) => reservation,
             Err(error) => {
-                record_publication_rejection(
+                let diagnostic_id = record_publication_rejection(
                     &error,
                     &session_id,
                     &run_id,
@@ -776,6 +803,23 @@ pub fn create_event_forwarder_with_root_actor(
                     root_actor.as_ref(),
                     "root_started_feed_reservation",
                 );
+                let stale_transport = startup_transport.filter(|_| {
+                    error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                });
+                if let Some((publication, visible, cancel_token)) = stale_transport {
+                    RootInterruption {
+                        session_id: &session_id,
+                        run_id: &run_id,
+                        runners: &runners,
+                        publication: &publication,
+                        visible: &visible,
+                        cancel_token: &cancel_token,
+                    }
+                    .close(&diagnostic_id)
+                    .await;
+                }
                 return;
             }
         };
