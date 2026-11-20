@@ -132,6 +132,13 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         max_requests: 3,
     });
     let state = web::Data::new(host(&path, provider.clone()).await);
+    state
+        .config
+        .write()
+        .await
+        .features
+        .work_execution
+        .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Xhigh);
     let owner_principal = Principal::User {
         user_id: "host-owner".into(),
     };
@@ -223,6 +230,10 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         .unwrap()
         .unwrap();
     assert_eq!(root.kind, SessionKind::Root);
+    assert_eq!(
+        root.reasoning_effort,
+        Some(bamboo_domain::ReasoningEffort::Xhigh)
+    );
     assert_eq!(root.created_at, admission.target_created_at);
     assert_eq!(root.project_id_meta().as_deref(), Some(project.id.as_str()));
     assert_eq!(root.parent_session_id, None);

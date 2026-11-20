@@ -1211,6 +1211,69 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
+    async fn provider_ultra_default_seeds_new_chat_without_overriding_existing_roots() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let saved: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/bamboo/config")
+                .set_json(serde_json::json!({"features": {"chat_ultra_by_default": true}}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(saved["features"]["chat_ultra_by_default"], true);
+        let providers: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/bamboo/settings/provider-instances")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(providers["features"]["chat_ultra_by_default"], true);
+        for (id, selection, expected) in [
+            ("default-ultra", None, "ultra"),
+            ("explicit-standard", Some("standard"), "standard"),
+            ("explicit-standard", None, "standard"),
+        ] {
+            let mut body = serde_json::json!({
+                "session_id": id, "message": "Review progress", "model": "test-model",
+                "reasoning_effort": "max"
+            });
+            if let Some(mode) = selection {
+                body["thinking_mode"] = mode.into();
+            }
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
+            assert!(
+                response.status().is_success(),
+                "{id}: {}",
+                response.status()
+            );
+            let session = state.storage.load_session(id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(session.root_thinking_mode()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                session.reasoning_effort,
+                Some(bamboo_domain::ReasoningEffort::Max)
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn root_tool_mode_chat_create_resume_conflict_disable_and_detail_are_durable() {
         let state = new_state().await;
         let app = test::init_service(

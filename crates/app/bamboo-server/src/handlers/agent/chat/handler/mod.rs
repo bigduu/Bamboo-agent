@@ -693,6 +693,10 @@ async fn handle_chat(
             }),
         );
     }
+    if authoritative_session.is_none() && config_snapshot.features.chat_ultra_by_default {
+        // Explicit first-turn choices take precedence over the saved default.
+        input.root_orchestration_only.get_or_insert(true);
+    }
     let root_input_messages = if let Some(session) = authoritative_session.as_ref() {
         match state.session_store.root_actor_input_required(session).await {
             Ok(true) => Some(session.messages.clone()),

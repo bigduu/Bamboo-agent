@@ -33,6 +33,16 @@ pub enum ClaimDecision {
     NoEligibleWork,
 }
 
+impl Snapshot {
+    /// Pending, running and unreconciled assignments occupy dispatch capacity.
+    pub fn occupied_dispatch_slots(&self) -> usize {
+        self.assignments
+            .values()
+            .filter(|assignment| holds_resources(assignment))
+            .count()
+    }
+}
+
 impl TicketService {
     /// Select oldest-updated Ready Work (ID breaks ties) from a bounded, already
     /// host-validated set. This method performs no write and does not start work.
@@ -88,11 +98,7 @@ impl TicketService {
         if snapshot.receipts.contains_key(operation_id) {
             return Err(Error::IdempotencyConflict);
         }
-        let occupied = snapshot
-            .assignments
-            .values()
-            .filter(|a| holds_resources(a))
-            .count();
+        let occupied = snapshot.occupied_dispatch_slots();
         if occupied >= capacity {
             return Ok(ClaimDecision::CapacityBlocked { occupied, capacity });
         }

@@ -215,7 +215,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Its wire ordering and preparation regressions stay in the existing Engine owner.
 // #2909 changes the stream runner and Anthropic renderer. Their cache cases
 // use the default Engine packages-3 and LLM packages-2 owners.
-const FEATURE_SOURCE_SHA256 = "130aed6de73210e04c23b349db160ef5020798edddb0f769d959ec26936d9e97";
+// #2916 retains the default Server library, native Work and Ready Work owners
+// for Chat and Work settings. The four additive contexts and 20 cases stay intact.
+const FEATURE_SOURCE_SHA256 = "9a60baa2386ac5a2a54b1432a699b49b333bc8e51a3c78545bd7d55e270a7f7e";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
