@@ -1625,8 +1625,7 @@ async fn replay_settled_material_notice<T>(
     .expect("settled material notice proof must become available before the fixture deadline")
 }
 
-#[tokio::test]
-async fn subscribed_creation_duplicate_replay_retries_only_exact_session_proof_contention() {
+async fn assert_settled_replay_retries_only_proof_contention() {
     let mut attempts = 0;
     let result = replay_settled_material_notice(async || {
         attempts += 1;
@@ -1666,6 +1665,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     use actix_web::{http::StatusCode, test, App};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
+    if repeat {
+        assert_settled_replay_retries_only_proof_contention().await;
+    }
     let f = Fixture::new_with_native_source(true).await;
     let workspace = f.home.path().join("subscribed-dispatch");
     std::fs::create_dir(&workspace).unwrap();
