@@ -2,7 +2,7 @@
 
 use super::{account_sink::ReservedAccountEvent, AccountEventSink};
 use bamboo_agent_core::AgentEvent;
-use bamboo_domain::{RootActorRuntimeWrite, Storage};
+use bamboo_domain::{RootActorRuntimeWrite, SessionAuthorityConflict, Storage};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -64,10 +64,18 @@ impl RootActorEventPublication {
         session_id: &str,
         event: &AgentEvent,
     ) -> std::io::Result<PreparedRootActorEvent> {
-        let account = self
+        let account = match self
             .account_sink
             .reserve_root_actor_event(self.storage.clone(), self.owner.clone(), session_id, event)
-            .await?;
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                return Err(authority_conflict(self.storage.as_ref(), &self.owner)
+                    .await
+                    .unwrap_or(error));
+            }
+        };
         Ok(PreparedRootActorEvent {
             storage: self.storage.clone(),
             owner: self.owner.clone(),
@@ -111,30 +119,31 @@ impl PreparedRootActorEvent {
                 .and_then(Result::ok)
                 .unwrap_or(false)
             {
-                // The account writer reports a boolean receipt, so an owner
-                // conflict there otherwise loses its typed cause. Revalidate
-                // without publishing or writing runtime state before returning the
-                // generic receipt failure; a lost owner must still interrupt
-                // its exact live transport through the event forwarder.
-                if let Err(error) = storage
-                    .publish_root_actor_runtime_event(
-                        &owner,
-                        Box::new(|check_current| check_current()),
-                    )
+                return Err(authority_conflict(storage.as_ref(), &owner)
                     .await
-                {
-                    if error
-                        .get_ref()
-                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
-                    {
-                        return Err(error);
-                    }
-                }
-                return Err(std::io::Error::other(
-                    "Root account final publication was not confirmed",
-                ));
+                    .unwrap_or_else(|| {
+                        std::io::Error::other("Root account final publication was not confirmed")
+                    }));
             }
         }
         Ok(())
     }
+}
+
+/// Queue and receipt failures can mask an ownership change. Revalidate
+/// without publishing or writing after the queue wait has ended so the
+/// forwarder can interrupt the stale execution's exact transport.
+async fn authority_conflict(
+    storage: &dyn Storage,
+    owner: &RootActorRuntimeWrite,
+) -> Option<std::io::Error> {
+    storage
+        .publish_root_actor_runtime_event(owner, Box::new(|check_current| check_current()))
+        .await
+        .err()
+        .filter(|error| {
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>())
+        })
 }
