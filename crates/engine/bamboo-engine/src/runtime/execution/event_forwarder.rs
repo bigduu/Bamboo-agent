@@ -5,7 +5,7 @@
 //! diagnostic state (budget events, tool execution, round progress).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::AgentEvent;
 
-use crate::events::account_sink::{reserve_account_slot, PendingEvent};
-use crate::events::{PreparedRootActorEvent, RootActorEventPublication};
+use crate::events::account_sink::{reserve_account_slot, PendingEvent, ReservedAccountEvent};
+use crate::events::{AccountEventSink, PreparedRootActorEvent, RootActorEventPublication};
 
 use super::runner_state::AgentRunner;
 
@@ -33,6 +33,71 @@ fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
 /// the engine stays free of any `bamboo-server` dependency.
 pub type AccountFeedInbox = mpsc::Sender<PendingEvent>;
 
+#[derive(Clone)]
+pub(crate) enum SessionAccountFeed {
+    Legacy(Option<AccountFeedInbox>),
+    // Related Child lifecycle and history frames share the keyed completion's
+    // writer queue so it cannot overtake the public inbox bridge.
+    Host(Arc<AccountEventSink>),
+}
+
+impl SessionAccountFeed {
+    pub(crate) fn for_host(
+        inbox: Option<AccountFeedInbox>,
+        sink: Option<&Arc<AccountEventSink>>,
+    ) -> Self {
+        match sink {
+            Some(sink)
+                if inbox
+                    .as_ref()
+                    .is_some_and(|inbox| inbox.same_channel(&sink.inbox())) =>
+            {
+                Self::Host(sink.clone())
+            }
+            _ => Self::Legacy(inbox),
+        }
+    }
+
+    pub(crate) async fn reserve(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+        completion_id: Option<String>,
+    ) -> std::io::Result<Option<ReservedSessionAccountEvent>> {
+        match self {
+            Self::Legacy(inbox) => reserve_account_inbox_event(inbox.as_ref(), session_id, event)
+                .await
+                .map(|permit| permit.map(ReservedSessionAccountEvent::Inbox)),
+            Self::Host(sink) => {
+                let route = event.session_id().unwrap_or(session_id);
+                if let Some(id) = completion_id {
+                    sink.reserve_child_terminal_event(route, event, id)
+                        .await
+                        .map(|permit| Some(ReservedSessionAccountEvent::Host(permit)))
+                } else {
+                    sink.reserve_session_event(route, event)
+                        .await
+                        .map(|permit| permit.map(ReservedSessionAccountEvent::Host))
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum ReservedSessionAccountEvent {
+    Inbox(ReservedInboxEvent),
+    Host(ReservedAccountEvent),
+}
+
+impl ReservedSessionAccountEvent {
+    pub(crate) fn enqueue(self, event: &AgentEvent) {
+        match self {
+            Self::Inbox(permit) => permit.enqueue(event),
+            Self::Host(permit) => permit.enqueue(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "root_actor_event_forwarder_tests.rs"]
 mod root_actor_tests;
@@ -44,28 +109,49 @@ mod root_actor_tests;
 #[derive(Clone, Debug)]
 pub struct HistoryCommitBarrier {
     revision: watch::Receiver<u64>,
+    child_source: ChildHistorySource,
 }
 
 /// Forwarder-owned half of [`HistoryCommitBarrier`].
 #[derive(Clone, Debug)]
 pub struct HistoryCommitAcknowledger {
     revision: watch::Sender<u64>,
+    child_source: ChildHistorySource,
 }
+
+type ChildHistorySource = Arc<Mutex<Option<(String, String)>>>;
 
 /// Create the acknowledgment pair shared by an event producer and forwarder.
 pub fn history_commit_barrier() -> (HistoryCommitAcknowledger, HistoryCommitBarrier) {
     let (revision_tx, revision_rx) = watch::channel(0);
+    let child_source = Arc::default();
     (
         HistoryCommitAcknowledger {
             revision: revision_tx,
+            child_source: Arc::clone(&child_source),
         },
         HistoryCommitBarrier {
             revision: revision_rx,
+            child_source,
         },
     )
 }
 
 impl HistoryCommitAcknowledger {
+    fn take_child_source(&self, session_id: &str) -> Option<String> {
+        let mut source = self
+            .child_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if source
+            .as_ref()
+            .is_some_and(|(child, _)| child == session_id)
+        {
+            return source.take().map(|(_, id)| id);
+        }
+        None
+    }
+
     /// Mark one history barrier as synchronously published to every configured
     /// sink. Call this only after the publication fence accepts the event.
     pub fn acknowledge(&self) {
@@ -82,14 +168,29 @@ impl HistoryCommitBarrier {
         event_tx: &mpsc::Sender<AgentEvent>,
         session_id: String,
     ) -> bool {
-        let observed = *self.revision.borrow_and_update();
-        if event_tx
-            .send(AgentEvent::SessionHistoryCommitted { session_id })
+        self.send_and_wait_with_child_source(event_tx, session_id, None)
             .await
-            .is_err()
-        {
+    }
+
+    pub(crate) async fn send_and_wait_with_child_source(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        session_id: String,
+        source_id: Option<String>,
+    ) -> bool {
+        let observed = *self.revision.borrow_and_update();
+        let Ok(permit) = event_tx.reserve().await else {
             return false;
+        };
+        if let Some(id) = source_id {
+            // Only the final SDK coordinator stages a committed Child source.
+            // The public marker stays unchanged on its dedicated run stream.
+            *self
+                .child_source
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((session_id.clone(), id));
         }
+        permit.send(AgentEvent::SessionHistoryCommitted { session_id });
 
         loop {
             if *self.revision.borrow() > observed {
@@ -113,7 +214,7 @@ impl ReservedInboxEvent {
     }
 }
 
-pub(crate) async fn reserve_account_inbox_event(
+async fn reserve_account_inbox_event(
     inbox: Option<&AccountFeedInbox>,
     session_id: &str,
     event: &AgentEvent,
@@ -574,17 +675,17 @@ pub fn create_event_forwarder_with_history_commit_barrier(
 
 enum PreparedForwardedEvent {
     Root(PreparedRootActorEvent),
-    Legacy(Option<ReservedInboxEvent>),
+    Session(Option<ReservedSessionAccountEvent>),
 }
 
 impl PreparedForwardedEvent {
     async fn publish(
         self,
-        publish: impl FnOnce(Option<ReservedInboxEvent>) -> bool + Send + 'static,
+        publish: impl FnOnce(Option<ReservedSessionAccountEvent>) -> bool + Send + 'static,
     ) -> std::io::Result<()> {
         match self {
             Self::Root(root) => root.publish(Box::new(move || publish(None))).await,
-            Self::Legacy(account) => publish(account)
+            Self::Session(account) => publish(account)
                 .then_some(())
                 .ok_or_else(|| std::io::Error::other("event publication was retired")),
         }
@@ -593,9 +694,10 @@ impl PreparedForwardedEvent {
 
 async fn prepare_forwarded_event(
     root_actor: Option<&RootActorEventPublication>,
-    legacy_feed: Option<&AccountFeedInbox>,
+    account_feed: &SessionAccountFeed,
     session_id: &str,
     event: &AgentEvent,
+    child_source_id: Option<String>,
 ) -> std::io::Result<PreparedForwardedEvent> {
     if let Some(owner) = root_actor {
         owner
@@ -603,12 +705,15 @@ async fn prepare_forwarded_event(
             .await
             .map(PreparedForwardedEvent::Root)
     } else {
-        match reserve_account_inbox_event(legacy_feed, session_id, event).await {
-            Ok(account) => Ok(PreparedForwardedEvent::Legacy(account)),
+        match account_feed
+            .reserve(session_id, event, child_source_id)
+            .await
+        {
+            Ok(account) => Ok(PreparedForwardedEvent::Session(account)),
             Err(error) if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) => Err(error),
             Err(error) => {
                 tracing::warn!(%error, "session event could not enter the account change feed");
-                Ok(PreparedForwardedEvent::Legacy(None))
+                Ok(PreparedForwardedEvent::Session(None))
             }
         }
     }
@@ -759,6 +864,28 @@ pub fn create_event_forwarder_with_root_actor(
     tokio::task::JoinHandle<()>,
     HistoryCommitBarrier,
 ) {
+    create_event_forwarder_for_account(
+        session_id,
+        run_id,
+        broadcast_tx,
+        runners,
+        SessionAccountFeed::Legacy(account_feed_inbox),
+        root_actor,
+    )
+}
+
+pub(crate) fn create_event_forwarder_for_account(
+    session_id: String,
+    run_id: String,
+    broadcast_tx: broadcast::Sender<AgentEvent>,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    account_feed: SessionAccountFeed,
+    root_actor: Option<RootActorEventPublication>,
+) -> (
+    mpsc::Sender<AgentEvent>,
+    tokio::task::JoinHandle<()>,
+    HistoryCommitBarrier,
+) {
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
     let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
     let forward = async move {
@@ -770,10 +897,10 @@ pub fn create_event_forwarder_with_root_actor(
             return;
         }
         // A bound Root never enters the legacy account queue.
-        let legacy_feed = if root_actor.is_some() {
-            None
+        let account_feed = if root_actor.is_some() {
+            SessionAccountFeed::Legacy(None)
         } else {
-            account_feed_inbox
+            account_feed
         };
         let started_event = AgentEvent::ExecutionStarted {
             run_id: run_id.clone(),
@@ -787,9 +914,10 @@ pub fn create_event_forwarder_with_root_actor(
         };
         let started_reservation = match prepare_forwarded_event(
             root_actor.as_ref(),
-            legacy_feed.as_ref(),
+            &account_feed,
             &session_id,
             &started_event,
+            None,
         )
         .await
         {
@@ -909,12 +1037,21 @@ pub fn create_event_forwarder_with_root_actor(
                         | AgentEvent::RunnerProgress { .. }
                 );
             let is_history_commit = matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+            let child_source_id = match &event {
+                AgentEvent::SessionHistoryCommitted { session_id: child }
+                    if child == &session_id =>
+                {
+                    history_commit_acknowledger.take_child_source(child)
+                }
+                _ => None,
+            };
             let terminal_reason = visible_terminal_reason(&event);
             let owner = root_actor.as_ref().filter(|_| {
                 needs_runner_update || event.is_durable_change() || terminal_reason.is_some()
             });
             let reservation =
-                prepare_forwarded_event(owner, legacy_feed.as_ref(), &session_id, &event).await;
+                prepare_forwarded_event(owner, &account_feed, &session_id, &event, child_source_id)
+                    .await;
             let frame = event.clone();
             let sid = session_id.clone();
             let tx = broadcast_tx.clone();
