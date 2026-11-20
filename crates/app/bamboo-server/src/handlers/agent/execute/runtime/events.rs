@@ -9,7 +9,9 @@ use bamboo_engine::config::GoldConfig;
 use bamboo_engine::events::{
     account_sink::ReservedAccountEvent, PreparedRootActorEvent, RootActorEventPublication,
 };
-use bamboo_engine::execution::event_forwarder::interrupt_root_on_authority_loss;
+use bamboo_engine::execution::event_forwarder::{
+    capture_root_startup_transport, interrupt_root_on_authority_loss,
+};
 use bamboo_engine::execution::{history_commit_barrier, HistoryCommitBarrier};
 use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAutoAnswerOutcome};
 
@@ -152,12 +154,25 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
+            let startup_transport = if root_actor.as_ref().is_some_and(|owner| {
+                owner.fence.actor_id == session_id && owner.fence.run_id == run_id
+            }) {
+                capture_root_startup_transport(&state.agent_runners, &session_id, &run_id).await
+            } else {
+                None
+            };
             let started = match prepare_session_event(
                 state.get_ref(), root_actor.as_ref(), &session_id, &started_event,
             ).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     tracing::warn!(%session_id, %run_id, %error, "Root start account reservation failed");
+                    if let Some((publication, visible, cancel_token)) = startup_transport {
+                        interrupt_root_on_authority_loss(
+                            &error, &session_id, &run_id, &state.agent_runners,
+                            &publication, &visible, &cancel_token,
+                        ).await;
+                    }
                     return;
                 }
             };

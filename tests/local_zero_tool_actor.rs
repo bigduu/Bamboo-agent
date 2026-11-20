@@ -110,14 +110,7 @@ async fn root_tool_result(
                 })
                 .collect();
             assert!(results.len() <= 1, "unique actual Root Tool result");
-            let rows: Value = client
-                .get(format!("{base}/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let rows: Value = poll_sessions(client, base).await.unwrap();
             let settled = rows["sessions"]
                 .as_array()
                 .unwrap()
@@ -950,7 +943,7 @@ fn fixture_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         // Provider/fault cuts can outlive the Host's idle keep-alive window.
-        // Poll the live service on a fresh connection, without transport retry.
+        // Open a fresh connection. Settlement polls own their bounded retry.
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(15))
         .build()
@@ -1047,6 +1040,184 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
     );
     assert_eq!(second.unwrap(), first);
     served.expect("live service accepted the second poll");
+}
+
+const SESSIONS_POLL_ATTEMPTS: usize = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum SessionsPollError {
+    #[error(transparent)]
+    Request(#[from] reqwest::Error),
+    #[error("GET /sessions returned {0}")]
+    Status(reqwest::StatusCode),
+}
+
+fn interrupted_sessions_poll(error: &SessionsPollError) -> bool {
+    let SessionsPollError::Request(error) = error else {
+        return matches!(
+            error,
+            SessionsPollError::Status(reqwest::StatusCode::REQUEST_TIMEOUT)
+        );
+    };
+    std::iter::successors(std::error::Error::source(error), |cause| cause.source()).any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            )
+        }) || cause
+            .downcast_ref::<serde_json::Error>()
+            .is_some_and(serde_json::Error::is_eof)
+    })
+}
+
+async fn poll_sessions(client: &reqwest::Client, base: &str) -> Result<Value, SessionsPollError> {
+    let url = format!("{base}/sessions");
+    let mut retries_left = SESSIONS_POLL_ATTEMPTS - 1;
+    loop {
+        let result = async {
+            let response = client.get(&url).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(SessionsPollError::Status(status));
+            }
+            Ok(response.json().await?)
+        }
+        .await;
+        let Err(error) = &result else {
+            return result;
+        };
+        if retries_left == 0 || !interrupted_sessions_poll(error) {
+            return result;
+        }
+        // The owning loop still enforces its original settlement deadline.
+        retries_left -= 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FixtureSessionsReply {
+    Reset,
+    Http(&'static str, &'static str),
+}
+
+async fn scripted_sessions_poll(
+    replies: &[FixtureSessionsReply],
+) -> Result<Value, SessionsPollError> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let serve = async move {
+        for reply in replies {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(peer.read_u8().await.unwrap());
+                assert!(request.len() < 8192, "bounded request head");
+            }
+            assert!(request.starts_with(b"GET /api/v1/sessions HTTP/1.1"));
+            match reply {
+                FixtureSessionsReply::Reset => {
+                    // Closing a socket with zero linger sends a TCP reset.
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    // SAFETY: the live peer fd and linger pointer are valid for setsockopt.
+                    let rc = unsafe {
+                        libc::setsockopt(
+                            peer.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            (&linger as *const libc::linger).cast(),
+                            std::mem::size_of_val(&linger) as libc::socklen_t,
+                        )
+                    };
+                    assert_eq!(rc, 0, "set TCP reset: {}", std::io::Error::last_os_error());
+                }
+                FixtureSessionsReply::Http(status, body) => {
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    peer.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        }
+    };
+    let client = fixture_http_client();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(poll_sessions(&client, &base), serve)
+    })
+    .await
+    .expect("scripted sessions polls must complete within their deadline");
+    result
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_retries_reset_and_truncated_json() {
+    use FixtureSessionsReply::{Http, Reset};
+
+    let rows = scripted_sessions_poll(&[
+        Reset,
+        Http("200 OK", r#"{"sessions":["#),
+        Http(
+            "200 OK",
+            r#"{"sessions":[{"id":"plain-root","is_running":false}]}"#,
+        ),
+    ])
+    .await
+    .expect("bounded retries should recover both interrupted reads");
+    assert_eq!(rows["sessions"][0]["is_running"], false);
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_preserves_nontransient_and_exhausted_errors() {
+    use FixtureSessionsReply::Http;
+
+    let invalid = scripted_sessions_poll(&[Http("200 OK", r#"{"sessions":!}"#)]).await;
+    assert!(matches!(invalid, Err(SessionsPollError::Request(error)) if error.is_decode()));
+    let rejected = scripted_sessions_poll(&[Http("503 Unavailable", r#"{"sessions":[]}"#)]).await;
+    assert!(matches!(
+        rejected,
+        Err(SessionsPollError::Status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ))
+    ));
+    let exhausted =
+        scripted_sessions_poll(&[Http("200 OK", r#"{"sessions":["#); SESSIONS_POLL_ATTEMPTS]).await;
+    assert!(matches!(exhausted, Err(SessionsPollError::Request(error)) if error.is_decode()));
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_retries_http_request_timeout() {
+    use FixtureSessionsReply::Http;
+
+    let rows = scripted_sessions_poll(&[
+        Http("408 Request Timeout", ""),
+        Http("200 OK", r#"{"sessions":[]}"#),
+    ])
+    .await
+    .expect("an isolated HTTP request timeout should recover");
+    assert_eq!(rows["sessions"], json!([]));
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_exhausts_http_request_timeout() {
+    use FixtureSessionsReply::Http;
+
+    let exhausted =
+        scripted_sessions_poll(&[Http("408 Request Timeout", ""); SESSIONS_POLL_ATTEMPTS]).await;
+    assert!(matches!(
+        exhausted,
+        Err(SessionsPollError::Status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ))
+    ));
 }
 
 fn start(data: &Path, port: u16) -> Host {
@@ -1364,14 +1535,7 @@ async fn fixture_with_followups(
         // ancestor bytes at the pre-ACK fault boundary.
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let rows: Value = client
-                    .get(format!("{base}/sessions"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
+                let rows: Value = poll_sessions(&client, &base).await.unwrap();
                 if rows["sessions"]
                     .as_array()
                     .unwrap()
@@ -1524,14 +1688,7 @@ async fn fixture_with_followups(
         // correction without racing the ancestor-byte publication barrier.
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let rows: Value = client
-                    .get(format!("{base}/sessions"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
+                let rows: Value = poll_sessions(&client, &base).await.unwrap();
                 if rows["sessions"]
                     .as_array()
                     .unwrap()
@@ -2103,14 +2260,7 @@ async fn finish_two_fixture(
     // Observe actual runner finalization, including any pending-successor attempt.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let rows: Value = client
-                .get(format!("{base}/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let rows: Value = poll_sessions(client, base).await.unwrap();
             let row = rows["sessions"]
                 .as_array()
                 .unwrap()
@@ -2469,14 +2619,7 @@ async fn root_catalog_turn(
                     "Root: {:?}",
                     root.last_run_error()
                 );
-                let rows: Value = client
-                    .get(format!("{base}/sessions"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
+                let rows: Value = poll_sessions(client, base).await.unwrap();
                 let settled = rows["sessions"]
                     .as_array()
                     .unwrap()
@@ -3364,14 +3507,7 @@ async fn message_only_fixture(
         loop {
             assert!(host.0.try_wait().unwrap().is_none(), "actual Host exited");
             let parent = store.load_session("plain-root").await.unwrap().unwrap();
-            let rows: Value = client
-                .get(format!("{base}/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let rows: Value = poll_sessions(&client, &base).await.unwrap();
             let settled = rows["sessions"]
                 .as_array()
                 .unwrap()
@@ -3573,14 +3709,7 @@ async fn message_only_fixture(
                 parent.last_run_error()
             );
             let actor = store.inspect_actor(&id).await.unwrap();
-            let rows: Value = client
-                .get(format!("{base}/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let rows: Value = poll_sessions(&client, &base).await.unwrap();
             let settled = [id.as_str(), "plain-root"].iter().all(|target| {
                 rows["sessions"]
                     .as_array()

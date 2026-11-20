@@ -210,6 +210,48 @@ async fn http_root_authority_loss_before_started_interrupts_only_live_transport(
         .is_none());
 }
 
+#[tokio::test]
+async fn http_full_account_queue_at_start_interrupts_obsolete_transport() {
+    let mut fixture = Fixture::new().await;
+    let filler = AgentEvent::SessionHistoryCommitted {
+        session_id: "synthetic-account-slot".into(),
+    };
+    let mut held = Vec::new();
+    // Hold every default account writer slot through the Started deadline.
+    for _ in 0..1024 {
+        held.push(
+            fixture
+                .state
+                .account_sink
+                .reserve_session_event("synthetic-account-slot", &filler)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    fixture.revoke().await;
+    let persisted = fixture.persisted();
+    let sequence = fixture.state.account_sink.latest_seq();
+    tokio::time::pause();
+    let (input, mut history) = fixture.start();
+    tokio::time::timeout(Duration::from_secs(60), input.closed())
+        .await
+        .unwrap();
+    tokio::time::resume();
+
+    assert!(
+        fixture.cancel.is_cancelled(),
+        "the exact obsolete transport must be cancelled"
+    );
+    fixture
+        .assert_interrupted(&input, &mut history, &persisted, sequence)
+        .await;
+    assert!(fixture.state.agent_runners.read().await[ROOT]
+        .published_execution_started
+        .is_none());
+    drop(held);
+}
+
 async fn rejected_event_interrupts_http_run(event: AgentEvent) {
     let mut fixture = Fixture::new().await;
     let mut account = fixture.state.account_sink.subscribe();
