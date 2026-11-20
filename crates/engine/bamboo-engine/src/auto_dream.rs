@@ -1,5 +1,4 @@
 use std::cmp::Reverse;
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +26,8 @@ use bamboo_memory::auto_dream::{
     ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, DurableExtractionCandidate,
     LedgerExtractionCandidate,
 };
-use bamboo_memory::ledger_store::store::new_record_id;
-use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
+use bamboo_memory::ledger_store::store::LedgerSuggestionIdentity;
+use bamboo_memory::ledger_store::{LedgerStore, MAX_RECORD_TITLE_LEN};
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore, MAX_MEMORY_TITLE_LEN,
 };
@@ -1142,6 +1141,7 @@ struct RetrievalSourceState {
 #[derive(Debug)]
 struct PreparedExtractionBatch {
     context_index: usize,
+    checkpoint_id: String,
     source_message_ids: Vec<String>,
     source_message_fingerprints: BTreeMap<String, String>,
     extracted: ExtractedCandidateBatch,
@@ -2058,6 +2058,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         ledger,
                         std::slice::from_ref(&replay_context),
                         checkpoint.extracted,
+                        &checkpoint.batch_id,
                         project_resolver,
                         current_store_is_project_scoped,
                     )
@@ -2277,6 +2278,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             };
         prepared_batches.push(PreparedExtractionBatch {
             context_index: pending.context_index,
+            checkpoint_id: pending.checkpoint_id,
             source_message_ids,
             source_message_fingerprints,
             extracted,
@@ -2293,6 +2295,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             ledger,
             std::slice::from_ref(&source_context),
             batch.extracted,
+            &batch.checkpoint_id,
             project_resolver,
             current_store_is_project_scoped,
         )
@@ -2573,6 +2576,7 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     ledger: &LedgerStore,
     sessions: &[CandidateSessionContext],
     extracted: ExtractedCandidateBatch,
+    checkpoint_id: &str,
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
 ) -> Result<ExtractionWrites, String> {
@@ -2816,8 +2820,13 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         current_store_is_project_scoped,
     )
     .await?;
-    let ledger_writes =
-        persist_ledger_candidates(ledger, ledger_candidates, &verified_ledger_sources).await?;
+    let ledger_writes = persist_ledger_candidates(
+        ledger,
+        ledger_candidates,
+        &verified_ledger_sources,
+        checkpoint_id,
+    )
+    .await?;
 
     Ok(ExtractionWrites {
         memory: writes,
@@ -2877,10 +2886,6 @@ async fn verify_ledger_source_scopes(
     Ok(verified)
 }
 
-fn normalized_ledger_title(title: &str) -> String {
-    title.trim().to_lowercase()
-}
-
 fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
     value
         .map(str::trim)
@@ -2895,9 +2900,11 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// - only `high`/`medium` confidence candidates are written; `low` (or
 ///   missing) confidence is skipped;
 /// - empty or over-long titles are skipped;
-/// - a candidate whose normalized (case-insensitive, trimmed) title matches an
-///   existing open record in that scope, or an earlier candidate there,
-///   is skipped (dedup guard);
+/// - a candidate is skipped if an existing nonterminal record or an earlier
+///   candidate in the same scope has the same trimmed, case-insensitive
+///   title, kind, deadline and start time;
+/// - an exact checkpoint retry preserves an already written record at any
+///   status, including if a user edited or closed it;
 /// - records are created `Open`, tagged `suggested`, attributed to
 ///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
 ///   reminders are created for suggested records (no schedule-bridge
@@ -2907,8 +2914,9 @@ async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
     verified_sources: &HashMap<String, Option<String>>,
+    checkpoint_id: &str,
 ) -> Result<usize, String> {
-    let mut seen_by_scope: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+    let mut seen = HashSet::new();
     let mut writes = 0usize;
     for candidate in candidates {
         let Some(session_id) = ledger_candidate_session_id(&candidate) else {
@@ -2935,27 +2943,25 @@ async fn persist_ledger_candidates(
         } else {
             LedgerScope::Global
         };
-        let seen_titles = match seen_by_scope.entry(project_key.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let existing = ledger
-                    .list_records(scope, project_key.as_deref(), &RecordFilter::default())
-                    .await
-                    .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
-                entry.insert(
-                    existing
-                        .iter()
-                        .map(|doc| normalized_ledger_title(&doc.record.title))
-                        .collect(),
-                )
-            }
-        };
-        if !seen_titles.insert(normalized_ledger_title(&title)) {
+        let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
+        let mut record = LedgerRecord::new(String::new(), kind, title);
+        record.time.due_at = parse_candidate_timestamp(candidate.due_at.as_deref());
+        record.time.starts_at = parse_candidate_timestamp(candidate.starts_at.as_deref());
+
+        let provenance = serde_json::to_vec(&(
+            checkpoint_id,
+            session_id,
+            project_key.as_deref(),
+            LedgerSuggestionIdentity::from(&record),
+        ))
+        .map_err(|error| format!("failed to identify Ledger suggestion: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"bamboo-auto-dream-ledger-suggestion-v1\0");
+        digest.update(provenance);
+        record.id = format!("rec_extract_{}", hex::encode(digest.finalize()));
+        if !seen.insert(record.id.clone()) {
             continue;
         }
-
-        let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
-        let mut record = LedgerRecord::new(new_record_id(), kind, title);
         record.scope = scope;
         record.project_key = project_key.clone();
         record.source.session_id = Some(session_id.to_string());
@@ -2967,14 +2973,14 @@ async fn persist_ledger_candidates(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
         record.tags = vec!["suggested".to_string()];
-        record.time.due_at = parse_candidate_timestamp(candidate.due_at.as_deref());
-        record.time.starts_at = parse_candidate_timestamp(candidate.starts_at.as_deref());
-
         let title_for_error = record.title.clone();
-        ledger.write_record(record, None).await.map_err(|error| {
-            format!("failed to persist ledger candidate '{title_for_error}': {error}")
-        })?;
-        writes += 1;
+        let inserted = ledger
+            .insert_extracted_suggestion(record)
+            .await
+            .map_err(|error| {
+                format!("failed to persist ledger candidate '{title_for_error}': {error}")
+            })?;
+        writes += usize::from(inserted);
     }
 
     Ok(writes)
@@ -3479,6 +3485,7 @@ mod tests {
     };
     use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
     use bamboo_llm::{LLMError, LLMStream};
+    use bamboo_memory::ledger_store::{store::new_record_id, RecordFilter};
 
     struct StaticProjectSource(crate::project_context::ProjectDescriptor);
 
@@ -7231,6 +7238,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_replay_does_not_reopen_a_terminal_ledger_suggestion() {
+        use bamboo_domain::ledger::RecordStatus;
+
+        let home = tempfile::tempdir().unwrap();
+        let session_store = Arc::new(
+            SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut session = Session::new("ledger-terminal-replay", "fixture-model");
+        session.add_message(Message::user("Please check the shared schedule."));
+        session_store.save_session(&session).await.unwrap();
+        let response = serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [{
+                "title": "Check the schedule",
+                "kind": "todo",
+                "session_id": "source-session-0001",
+                "confidence": "high"
+            }],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence = Arc::new(SequenceProvider::new(vec![response.clone(), response]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
+        let memory = MemoryStore::new(home.path());
+        let context = AutoDreamContext {
+            session_store: session_store.clone(),
+            storage: session_store.clone(),
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let sources = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(sources.len(), 1);
+
+        let ledger = LedgerStore::new(home.path());
+        let indexes = ledger.resolver().indexes_dir(LedgerScope::Global, None);
+        tokio::fs::create_dir_all(indexes.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&indexes, b"fixture blocking the index refresh")
+            .await
+            .unwrap();
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &sources,
+        )
+        .await
+        .expect_err("the Ledger record is durable before the derived index refresh fails");
+        tokio::fs::remove_file(indexes).await.unwrap();
+        let open = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        let terminal = ledger
+            .transition_record(
+                LedgerScope::Global,
+                None,
+                &open[0].record.id,
+                RecordStatus::Done,
+                Some("confirmed by the fixture"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            load_extraction_checkpoint_transactions(&context, &session.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &sources,
+        )
+        .await
+        .expect("replay the exact checkpoint");
+        assert_eq!(
+            writes.ledger, 0,
+            "the exact source must not recreate settled work"
+        );
+        assert_eq!(sequence.recorded_prompts().len(), 1);
+        let all = ledger
+            .list_records(
+                LedgerScope::Global,
+                None,
+                &RecordFilter {
+                    include_terminal: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].record, terminal.record);
+
+        let mut current = session_store
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        current.add_message(Message::user(
+            "Please check the new copy of the shared schedule.",
+        ));
+        session_store.save_session(&current).await.unwrap();
+        let new_sources = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(new_sources.len(), 1);
+        let recurrence = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &new_sources,
+        )
+        .await
+        .expect("extract the new occurrence from a later source");
+        assert_eq!(recurrence.ledger, 1);
+        let active = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].record.id, terminal.record.id);
+        assert_eq!(active[0].record.title, terminal.record.title);
+        assert_eq!(sequence.recorded_prompts().len(), 2);
+    }
+
+    #[tokio::test]
     async fn persist_ledger_candidates_writes_suggested_records_and_skips_unusable_ones() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let ledger = LedgerStore::new(temp_dir.path());
@@ -7275,8 +7434,14 @@ mod tests {
             candidate("   ", "todo", None, None, Some("high")),
             // Skipped: title longer than the record title cap.
             candidate(&long_title, "todo", None, None, Some("high")),
-            // Skipped: in-batch duplicate (case-insensitive, trimmed).
-            candidate("  RENEW PASSPORT  ", "todo", None, None, Some("high")),
+            // Skipped: same kind, normalized title, and UTC deadline.
+            candidate(
+                "  RENEW PASSPORT  ",
+                "todo",
+                Some("2026-08-01T02:00:00+02:00"),
+                None,
+                Some("high"),
+            ),
             // Written despite malformed timestamps (they parse to None).
             candidate(
                 "Call the bank",
@@ -7288,7 +7453,7 @@ mod tests {
         ];
 
         let sources = HashMap::from([("session-ledger".to_string(), None)]);
-        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources, "fixture-batch")
             .await
             .expect("persist should succeed");
         assert_eq!(writes, 3);
@@ -7350,11 +7515,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_ledger_candidates_preserves_distinct_deadlines_kinds_and_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = LedgerStore::new(dir.path());
+        let first_due = "2026-08-01T00:00:00Z";
+        let later_due = "2026-09-01T00:00:00Z";
+        let starts_at = "2026-07-31T22:00:00Z";
+        let mut existing = LedgerRecord::new("rec_confirmed", RecordKind::Todo, "Renew membership");
+        existing.time.due_at = parse_candidate_timestamp(Some(first_due));
+        existing.status = bamboo_domain::ledger::RecordStatus::InProgress;
+        ledger
+            .write_record(existing.clone(), Some("Confirmed details".into()))
+            .await
+            .unwrap();
+        let candidate = |scope_source: &str, kind: &str, due_at: &str, start: Option<&str>| {
+            LedgerExtractionCandidate {
+                title: "  RENEW membership  ".into(),
+                kind: kind.into(),
+                due_at: Some(due_at.into()),
+                starts_at: start.map(ToOwned::to_owned),
+                session_id: Some(scope_source.into()),
+                confidence: Some("high".into()),
+                ..Default::default()
+            }
+        };
+        let candidates = vec![
+            candidate("global-source", "todo", "2026-08-01T03:00:00+03:00", None),
+            candidate("global-source", "todo", later_due, None),
+            candidate("global-source", "todo", "2026-08-31T20:00:00-04:00", None),
+            candidate("global-source", "reminder", first_due, None),
+            candidate("global-source", "todo", first_due, Some(starts_at)),
+            candidate("project-source", "todo", first_due, None),
+        ];
+        let sources = HashMap::from([
+            ("global-source".into(), None),
+            ("project-source".into(), Some("project-fixture".into())),
+        ]);
+        assert_eq!(
+            persist_ledger_candidates(&ledger, candidates.clone(), &sources, "fixture-batch")
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            persist_ledger_candidates(&ledger, candidates, &sources, "fixture-batch")
+                .await
+                .unwrap(),
+            0
+        );
+        let global = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(global.len(), 4);
+        let confirmed = global
+            .iter()
+            .find(|doc| doc.record.id == existing.id)
+            .unwrap();
+        assert_eq!(confirmed.record.status, existing.status);
+        assert_eq!(confirmed.body, "Confirmed details");
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Todo
+                && doc.record.time.due_at == parse_candidate_timestamp(Some(later_due))
+        }));
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Reminder
+                && doc.record.time.due_at == existing.time.due_at
+        }));
+        assert!(global.iter().any(|doc| {
+            doc.record.kind == RecordKind::Todo
+                && doc.record.time.due_at == existing.time.due_at
+                && doc.record.time.starts_at == parse_candidate_timestamp(Some(starts_at))
+        }));
+        let project = ledger
+            .list_records(
+                LedgerScope::Project,
+                Some("project-fixture"),
+                &RecordFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].record.tags, vec!["suggested".to_string()]);
+    }
+
+    #[tokio::test]
     async fn persist_ledger_candidates_dedups_against_existing_open_records() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let ledger = LedgerStore::new(temp_dir.path());
 
-        // Pre-existing OPEN record with the same normalized title → skip.
+        // Pre-existing open record with the same untimed identity → skip.
         ledger
             .write_record(
                 LedgerRecord::new(new_record_id(), RecordKind::Todo, "Renew passport"),
@@ -7383,7 +7633,7 @@ mod tests {
         ];
 
         let sources = HashMap::from([("session-dup".to_string(), None)]);
-        let writes = persist_ledger_candidates(&ledger, candidates, &sources)
+        let writes = persist_ledger_candidates(&ledger, candidates, &sources, "fixture-batch")
             .await
             .expect("persist should succeed");
         assert_eq!(
