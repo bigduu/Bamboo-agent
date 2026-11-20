@@ -340,6 +340,7 @@ impl TicketApplication {
         let root = self.scope_root(incarnation_id);
         let service_slot = self.service.clone();
         let service_publisher = self.service_publisher.clone();
+        let work_config = self.config.clone();
         let created = Arc::new(AtomicBool::new(false));
         let created_job = created.clone();
         let operation = Box::new(move || {
@@ -374,7 +375,7 @@ impl TicketApplication {
                     "New scope requires recovery",
                 ));
             }
-            let service = Arc::new(service);
+            let service = Arc::new(Self::bind_work_start_check(service, work_config));
             service_slot.set(service.clone()).map_err(|_| {
                 io::Error::new(io::ErrorKind::WouldBlock, "concurrent initialization")
             })?;

@@ -352,6 +352,7 @@ impl TicketService {
                     &command.operations,
                     store.root(),
                     None,
+                    self.work_start_check.as_deref(),
                 )
             })
         };

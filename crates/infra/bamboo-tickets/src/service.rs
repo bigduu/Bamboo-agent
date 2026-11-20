@@ -11,6 +11,7 @@ use crate::{
 
 pub(crate) type ManagedRootSelection<'a> = dyn Fn(&DispatchSpec) -> Result<ManagedWorkRoot> + 'a;
 pub(crate) type ManagedInputValidation<'a> = dyn Fn(&crate::WorkContextPacket) -> Result<()> + 'a;
+pub(crate) type WorkStartCheck = dyn Fn(&Snapshot) -> Result<()> + Send + Sync;
 
 pub(crate) struct ManagedStart<'a> {
     pub select_root: &'a ManagedRootSelection<'a>,
@@ -119,6 +120,7 @@ impl Authority {
 #[derive(Clone)]
 pub struct TicketService {
     pub(crate) inner: Arc<Mutex<FileStore>>,
+    pub(crate) work_start_check: Option<Arc<WorkStartCheck>>,
 }
 
 impl TicketService {
@@ -215,7 +217,18 @@ impl TicketService {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(store)),
+            work_start_check: None,
         })
+    }
+
+    /// Install the trusted Host's admission policy before publishing this service.
+    /// It observes the projected scope under the existing transaction.
+    pub fn with_work_start_check(
+        mut self,
+        check: impl Fn(&Snapshot) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.work_start_check = Some(Arc::new(check));
+        self
     }
 
     pub fn health(&self) -> Health {
@@ -413,6 +426,7 @@ impl TicketService {
             &command.operations,
             store.root(),
             managed_start.as_ref().map(|start| start.select_root),
+            self.work_start_check.as_deref(),
         )?;
         validate_snapshot(&next)?;
         validate_new_assignment_contexts(
@@ -773,6 +787,7 @@ fn apply(
     operation: &Operation,
     ids: &mut BTreeMap<String, String>,
     select_root: Option<&ManagedRootSelection<'_>>,
+    work_start_check: Option<&WorkStartCheck>,
 ) -> Result<()> {
     use Operation::*;
     let seq = snapshot.seq;
@@ -949,6 +964,9 @@ fn apply(
                 return Err(invalid(
                     "start requires ready Work without an active Assignment",
                 ));
+            }
+            if let Some(check) = work_start_check {
+                check(snapshot)?;
             }
             validate_contract(&work.contract)?;
             if work
@@ -2377,6 +2395,7 @@ pub(crate) fn apply_operations(
     operations: &[Operation],
     root: &Path,
     select_root: Option<&ManagedRootSelection<'_>>,
+    work_start_check: Option<&WorkStartCheck>,
 ) -> Result<BTreeMap<String, String>> {
     let mut ids = BTreeMap::new();
     for operation in operations {
@@ -2394,7 +2413,14 @@ pub(crate) fn apply_operations(
                 }
             }
         }
-        apply(snapshot, authority, operation, &mut ids, select_root)?;
+        apply(
+            snapshot,
+            authority,
+            operation,
+            &mut ids,
+            select_root,
+            work_start_check,
+        )?;
     }
     Ok(ids)
 }

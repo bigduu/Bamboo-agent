@@ -225,15 +225,15 @@ impl Fixture {
     }
 
     async fn run(&mut self, expected_effort: Option<ReasoningEffort>) {
-        self.run_selected(ACCOUNT, MODEL, expected_effort).await;
+        self.run_selected(expected_effort, expected_effort).await;
     }
 
     async fn run_selected(
         &mut self,
-        account: &str,
-        model: &str,
+        role_effort: Option<ReasoningEffort>,
         expected_effort: Option<ReasoningEffort>,
     ) {
+        let (account, model) = (ACCOUNT, MODEL);
         let dispatched = self
             .state
             .tickets
@@ -287,7 +287,7 @@ impl Fixture {
         assert_eq!(child.model_ref.as_ref().unwrap().model, model);
         assert_eq!(
             child.model_ref.as_ref().unwrap().reasoning_effort,
-            expected_effort
+            role_effort
         );
         assert_eq!(child.reasoning_effort, expected_effort);
         // A replay must not re-resolve the role or create a second run after a config change.
@@ -353,6 +353,26 @@ impl Fixture {
         .await
         .expect("native result settles before fixture shutdown");
     }
+}
+
+#[actix_web::test]
+async fn native_work_uses_the_supervisor_work_effort_for_the_actual_request() {
+    let mut fixture = Fixture::new(
+        Some(ProviderModelRef::new(ACCOUNT, MODEL).with_reasoning_effort(ReasoningEffort::Low)),
+        Some(ReasoningEffort::High),
+    )
+    .await;
+    fixture
+        .state
+        .config
+        .write()
+        .await
+        .features
+        .work_execution
+        .reasoning_effort = Some(ReasoningEffort::Max);
+    fixture
+        .run_selected(Some(ReasoningEffort::Low), Some(ReasoningEffort::Max))
+        .await;
 }
 
 #[actix_web::test]

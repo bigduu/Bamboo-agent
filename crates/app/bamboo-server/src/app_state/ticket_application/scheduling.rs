@@ -69,6 +69,15 @@ impl ReadyWorkHost for TicketApplication {
         .await
     }
 
+    async fn work_dispatch_capacity(&self) -> Option<std::num::NonZeroU32> {
+        self.config
+            .read()
+            .await
+            .features
+            .work_execution
+            .max_parallel
+    }
+
     async fn check_budget(&self, max_rounds: u32) -> Result<()> {
         if self
             .adapter

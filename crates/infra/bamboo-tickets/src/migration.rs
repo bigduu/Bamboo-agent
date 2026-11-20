@@ -328,6 +328,7 @@ impl TicketService {
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(store)),
+            work_start_check: None,
         })
     }
 
