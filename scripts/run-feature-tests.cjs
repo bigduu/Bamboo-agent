@@ -208,9 +208,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // test helper through its dev-dependency. The additive catalog stays at 20.
 // #2871 keeps Workflow authoring pressure in server-settings and retains
 // the existing SkillStore ownership and additive test catalog.
+// File-change receipt projection edits the stream runner covered by its
+// token-usage-log cfg. Receipt and wait regressions use the default Engine
+// and Compression owners. The four additive contexts and 20 cases stay intact.
 // #2882 changes live external-memory projection and legacy context fitting.
 // Its wire and preparation regressions stay in the existing Engine owner.
-const FEATURE_SOURCE_SHA256 = "4bdc379f8d1e454c34745196d842ce67793f25326d4aad4421927362e45123d2";
+const FEATURE_SOURCE_SHA256 = "f48740bb8a5fa62fd70dd8fbcd99b37a810b53c1050c09b23e65913ea92f69a4";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

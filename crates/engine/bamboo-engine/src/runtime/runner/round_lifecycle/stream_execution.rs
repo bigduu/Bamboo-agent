@@ -1107,6 +1107,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
 
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
+    bamboo_compression::project_file_change_results(&mut real_transcript);
     let cache_scope = serde_json::json!({
         // Retire old generated epochs that preserved withdrawn memory snapshots.
         "external_memory_projection_version": 3,
