@@ -51,6 +51,40 @@ struct ManagedRootCreation {
     dispatch: TicketDispatchBinding,
 }
 
+fn managed_work_fingerprint(
+    fingerprint: &str,
+    dispatch: &TicketDispatchBinding,
+) -> Result<String, ToolError> {
+    payload_fingerprint(&(fingerprint, dispatch))
+        .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+}
+
+fn restore_historical_managed_work_input(
+    authority: &CreationAuthority,
+    request: &mut SupervisedRootCreateRequest,
+    contract: &bamboo_tickets::Contract,
+    dispatch: &TicketDispatchBinding,
+    stored_fingerprint: &str,
+) -> Result<bool, ToolError> {
+    let Some(message) = bamboo_orchestration::managed_work::legacy_task_only_instruction_for_replay(
+        &request.message,
+        contract,
+    ) else {
+        return Ok(false);
+    };
+    let historical = SupervisedRootCreateRequest {
+        message,
+        ..request.clone()
+    };
+    let (_, _, historical_fingerprint) = authority.operation_identity(&historical)?;
+    if managed_work_fingerprint(&historical_fingerprint, dispatch)? != stored_fingerprint {
+        return Ok(false);
+    }
+    // The first input might already have been staged with the historical bytes.
+    *request = historical;
+    Ok(true)
+}
+
 fn blocked(
     operation_id: uuid::Uuid,
     target: Option<&str>,
@@ -232,7 +266,7 @@ impl SupervisedRootCreator {
     async fn create_authorized_inner(
         &self,
         authority: &CreationAuthority,
-        request: SupervisedRootCreateRequest,
+        mut request: SupervisedRootCreateRequest,
         managed: Option<&ManagedRootCreation>,
     ) -> Result<ToolResult, ToolError> {
         if request.thinking_mode == Some(RootThinkingMode::Ultra)
@@ -252,8 +286,7 @@ impl SupervisedRootCreator {
         let operation_id = request.operation_id;
         let (digest, reserved_id, mut fingerprint) = authority.operation_identity(&request)?;
         if let Some(managed) = managed {
-            fingerprint = payload_fingerprint(&(&fingerprint, &managed.dispatch))
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            fingerprint = managed_work_fingerprint(&fingerprint, &managed.dispatch)?;
         }
         let state_revision = match authority.validate_request(self, &request).await {
             Ok(revision) => revision,
@@ -293,13 +326,25 @@ impl SupervisedRootCreator {
                 ));
             }
             if existing.payload_fingerprint != fingerprint {
-                return Ok(blocked(
-                    operation_id,
-                    Some(&existing.session_id),
-                    "reservation",
-                    "idempotency_conflict",
-                    "The operation UUID is already bound to a different request",
-                ));
+                let historical = match managed {
+                    Some(managed) => restore_historical_managed_work_input(
+                        authority,
+                        &mut request,
+                        &managed.spec.contract,
+                        &managed.dispatch,
+                        &existing.payload_fingerprint,
+                    )?,
+                    None => false,
+                };
+                if !historical {
+                    return Ok(blocked(
+                        operation_id,
+                        Some(&existing.session_id),
+                        "reservation",
+                        "idempotency_conflict",
+                        "The operation UUID is already bound to a different request",
+                    ));
+                }
             }
         }
         if request.notify_on_material_event
