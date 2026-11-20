@@ -1052,7 +1052,13 @@ enum SessionsPollError {
     Status(reqwest::StatusCode),
 }
 
-fn interrupted_sessions_poll(error: &reqwest::Error) -> bool {
+fn interrupted_sessions_poll(error: &SessionsPollError) -> bool {
+    let SessionsPollError::Request(error) = error else {
+        return matches!(
+            error,
+            SessionsPollError::Status(reqwest::StatusCode::REQUEST_TIMEOUT)
+        );
+    };
     std::iter::successors(std::error::Error::source(error), |cause| cause.source()).any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
             matches!(
@@ -1078,7 +1084,7 @@ async fn poll_sessions(client: &reqwest::Client, base: &str) -> Result<Value, Se
             Ok(response.json().await?)
         }
         .await;
-        let Err(SessionsPollError::Request(error)) = &result else {
+        let Err(error) = &result else {
             return result;
         };
         if retries_left == 0 || !interrupted_sessions_poll(error) {
@@ -1185,6 +1191,33 @@ async fn fixture_sessions_poll_preserves_nontransient_and_exhausted_errors() {
     let exhausted =
         scripted_sessions_poll(&[Http("200 OK", r#"{"sessions":["#); SESSIONS_POLL_ATTEMPTS]).await;
     assert!(matches!(exhausted, Err(SessionsPollError::Request(error)) if error.is_decode()));
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_retries_http_request_timeout() {
+    use FixtureSessionsReply::Http;
+
+    let rows = scripted_sessions_poll(&[
+        Http("408 Request Timeout", ""),
+        Http("200 OK", r#"{"sessions":[]}"#),
+    ])
+    .await
+    .expect("an isolated HTTP request timeout should recover");
+    assert_eq!(rows["sessions"], json!([]));
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_exhausts_http_request_timeout() {
+    use FixtureSessionsReply::Http;
+
+    let exhausted =
+        scripted_sessions_poll(&[Http("408 Request Timeout", ""); SESSIONS_POLL_ATTEMPTS]).await;
+    assert!(matches!(
+        exhausted,
+        Err(SessionsPollError::Status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ))
+    ));
 }
 
 fn start(data: &Path, port: u16) -> Host {
