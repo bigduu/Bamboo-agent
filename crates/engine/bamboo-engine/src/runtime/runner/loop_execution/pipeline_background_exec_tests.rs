@@ -222,11 +222,8 @@ async fn background_exec_handoff_releases_the_conversation_and_keeps_the_command
 }
 
 #[tokio::test(start_paused = true)]
-async fn quiet_exec_wait_ceiling_preserves_the_handle_without_rearming_the_wait() {
-    use bamboo_tools::tools::{
-        bash_runtime::get_shell,
-        exec_command::{reserve_background_job, reserve_quiet_exec_job},
-    };
+async fn quiet_exec_wait_ceiling_requires_a_fresh_empty_poll_to_wait_again() {
+    use bamboo_tools::tools::{bash_runtime::get_shell, exec_command::reserve_quiet_exec_job};
 
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
@@ -271,18 +268,49 @@ async fn quiet_exec_wait_ceiling_preserves_the_handle_without_rearming_the_wait(
     assert!(message.content.contains("Completion is not confirmed"));
     assert!(message.content.contains(handle));
     assert_eq!(get_shell(handle).unwrap().status(), "running");
-    poll.invoke(poll_args, context("poll-after-ceiling"))
+    assert!(reserve_quiet_exec_job(owner, handle).await.is_none());
+
+    let ToolOutcome::Completed(poll_after_ceiling) = poll
+        .invoke(poll_args.clone(), context("poll-after-ceiling"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected running result");
+    };
+    let result: Value = serde_json::from_str(&poll_after_ceiling.result).unwrap();
+    assert_eq!(result["status"], "running");
+    assert_eq!(result["session_id"], handle);
+    assert!(result.get("exit_code").is_none());
+    assert!(reserve_quiet_exec_job("another-owner", handle)
+        .await
+        .is_none());
+
+    let job = reserve_quiet_exec_job(owner, handle).await.unwrap();
+    poll.invoke(poll_args.clone(), context("poll-during-wait"))
         .await
         .unwrap();
     assert!(reserve_quiet_exec_job(owner, handle).await.is_none());
-
-    let job = reserve_background_job(owner, handle).unwrap();
     tokio::time::resume();
     tokio::fs::write(&gate, b"release").await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(5), job.completion())
+    let message = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_quiet_exec(job, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(message.content.contains(r#""exit_code":7"#));
+
+    let ToolOutcome::Completed(collected) = poll
+        .invoke(poll_args, context("collect-terminal-result"))
         .await
-        .unwrap();
-    assert_eq!(result.exit_code, Some(7));
+        .unwrap()
+    else {
+        panic!("expected terminal result");
+    };
+    let result: Value = serde_json::from_str(&collected.result).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["exit_code"], 7);
 }
 
 struct PollMonitoredExec {
