@@ -736,7 +736,15 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command and wait up to yield_time_ms. Keep builds and tests you need to verify attached to this call. A running command returns a session_id. Use empty write_stdin on that handle to wait for output and the exit code. Preserve the command's own exit status when piping test output. interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
+        "Run a shell command and wait up to yield_time_ms. \
+         Group related commands with a known order and a shared working directory in one exec_command call. \
+         Set the shared directory with workdir and use && in cmd when the next step requires the previous one to succeed. \
+         Send independent checks as separate tool calls in the same response. \
+         Inspect a result before choosing any command that depends on it. \
+         Keep builds and tests you need to verify attached to this call. \
+         A running command returns a session_id. Use empty write_stdin on that handle to wait for output and the exit code. \
+         Preserve the command's own exit status when piping test output. \
+         interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
