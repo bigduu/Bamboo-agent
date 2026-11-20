@@ -837,15 +837,12 @@ pub fn finalize_compression_candidate_plan(
     } else {
         post_compaction_recovery_tokens(&candidate.messages_to_summarize, session, &counter)
     };
-    let remaining_tokens = session
-        .messages
-        .iter()
-        .filter(|message| !message.compressed)
+    let remaining_messages = active_messages_for_budget(session)
+        .into_iter()
         .filter(|message| !candidate_ids.contains(message.id.as_str()))
-        .cloned()
         .collect::<Vec<_>>();
     let projected_tokens = counter
-        .count_messages(&remaining_tokens)
+        .count_messages(&remaining_messages)
         .saturating_add(candidate.additional_fixed_tokens)
         .saturating_add(candidate.retained_input_tokens)
         .saturating_add(summary_tokens)
@@ -1577,12 +1574,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
     // limit from the previous usage snapshot so their meanings stay distinct
     // across rounds.
     let counter = TiktokenTokenCounter::default();
-    let remaining_active: Vec<_> = session
-        .messages
-        .iter()
-        .filter(|m| !m.compressed)
-        .cloned()
-        .collect();
+    let remaining_active = active_messages_for_budget(session);
     let system_msgs: Vec<_> = remaining_active
         .iter()
         .filter(|m| matches!(m.role, bamboo_domain::Role::System))
@@ -1663,12 +1655,14 @@ pub fn compression_summary_message(summary_content: &str) -> Message {
 }
 
 pub fn active_messages_for_budget(session: &Session) -> Vec<Message> {
-    session
+    let mut messages: Vec<_> = session
         .messages
         .iter()
         .filter(|message| !message.compressed)
         .cloned()
-        .collect()
+        .collect();
+    crate::project_file_change_results(&mut messages);
+    messages
 }
 
 pub fn summary_source_messages(session: &Session) -> Vec<Message> {

@@ -191,11 +191,7 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
                 .as_ref()
                 .unwrap()
                 .effective_permission_mode(),
-            if is_supervisor {
-                bamboo_domain::SessionPermissionMode::Bypass
-            } else {
-                bamboo_domain::SessionPermissionMode::Default
-            }
+            bamboo_domain::SessionPermissionMode::Default
         );
         assert_eq!(
             target.project_id_meta().as_deref(),

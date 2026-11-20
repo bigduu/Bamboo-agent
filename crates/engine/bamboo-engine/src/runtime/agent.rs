@@ -606,6 +606,16 @@ impl Agent {
             }))
     }
 
+    /// Bind paced behavior to the reserved execution that owns the Inbox input.
+    pub(crate) fn with_paced_loop_turn(
+        &self,
+        turn: super::paced_loop_wakeup::PacedLoopTurn,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.paced_loop_turn = Some(turn);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]

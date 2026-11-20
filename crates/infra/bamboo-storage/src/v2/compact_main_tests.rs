@@ -973,7 +973,7 @@ async fn compact_actual_main_authority_readers_reject_contradiction_without_repa
         .unwrap();
     let guards = DefaultWriterGuards::shared(lifecycle, task, writer);
     assert!(store
-        .validate_root_context_for_full_save(&session, false)
+        .validate_root_context_for_full_save(&session)
         .await
         .is_err());
     drop(guards);

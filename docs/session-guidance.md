@@ -37,3 +37,42 @@ Goal commands use the existing chat command handler. `/goal` opens the settings
 for the current session; `/goal <objective>` sets and advances a goal, and control
 commands such as `/goal off` and `/goal clear` follow the server's response without
 starting an unwanted execution.
+
+## Run a prompt in the current chat
+
+In a Standard chat, send `/loop Check the build and report changes` for an
+adaptive loop. The first occurrence is due immediately. After each successful
+occurrence, Bamboo can use the model's suggested delay of one minute to one
+hour, measured from the end of the turn. Bamboo waits 20 minutes following a
+failed turn or a turn without a valid suggestion and keeps scheduling later
+occurrences. Bamboo saves a fallback before dispatch so an interrupted turn
+without a completion record still has a next wakeup.
+
+For a fixed interval, say “Check the build every five minutes and
+only tell me if it changes,” or “每隔五分钟检查构建状态，有变化再告诉我”.
+Give the task and its fixed interval in one message. Conversational intervals
+accept common Chinese and English wording. You can also enter
+`/loop 5m Check the build and report changes`. The first run is due after
+one interval. Fixed intervals range from one minute to one day.
+
+Each run uses the session's current model, workspace, and permissions. If
+the session is busy or waiting for input, one scheduled run becomes due when
+the session is free. Missed occurrences do not accumulate.
+
+Ask “When will the loop run next?”, “Stop this loop”, or “Resume this loop”
+to manage it conversationally. The commands below do the same directly.
+
+- `/loop status` shows the next due time and the most recent known run state.
+  The status API also includes an accepted adaptive delay and its reason.
+- `/loop stop` stops scheduling future runs. Use the chat's normal cancel
+  action to interrupt a run already in progress.
+- `/loop resume` resumes an unexpired loop after a Bamboo restart. Time spent
+  offline is skipped.
+
+The loop ends after seven days or when its conversation is reset or deleted.
+A session can have one active loop.
+
+Clients can read the same state with `GET /api/v1/sessions/{session_id}/loop`
+and send `start`, `start_adaptive`, `stop`, or `resume` with `POST` on that
+endpoint. Both start actions take `prompt`. Fixed `start` also takes
+`interval_seconds`.

@@ -1,6 +1,6 @@
 //! Pending user-work / resume-marker helpers.
 
-use bamboo_agent_core::Role;
+use bamboo_agent_core::{Message, Role};
 use bamboo_domain::Session;
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -41,8 +41,36 @@ pub fn has_pending_user_message(session: &Session) -> bool {
     session
         .messages
         .last()
-        .map(|message| matches!(message.role, Role::User))
+        .map(|message| {
+            matches!(message.role, Role::User) && !is_paced_loop_iteration_message(message)
+        })
         .unwrap_or(false)
+}
+
+/// A scheduled input can only start the exact run that reserved it. If that
+/// run stopped after checkpointing the input, an ordinary Execute cannot
+/// mistake its retained transcript tail for a fresh user turn.
+pub(crate) fn is_paced_loop_iteration_message(message: &Message) -> bool {
+    let Some(envelope) = message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("session_message"))
+    else {
+        return false;
+    };
+    let is = |path: &str, expected: &str| {
+        envelope.pointer(path).and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    is("/source/type", "runtime")
+        && is(
+            "/source/subsystem",
+            bamboo_domain::session::inbox::PACED_LOOP_SUBSYSTEM,
+        )
+        && is("/kind", "runtime_instruction")
+        && is(
+            "/body/instruction",
+            bamboo_domain::session::inbox::PACED_LOOP_INSTRUCTION,
+        )
 }
 
 pub fn consume_pending_clarification_resume(session: &mut Session) {
