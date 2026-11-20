@@ -5098,8 +5098,15 @@ mod tests {
         volatile_a.id = "tail-a".to_string();
         let mut volatile_b = Message::user("volatile B");
         volatile_b.id = "tail-b".to_string();
-        let plan = PromptCachePlan {
+        // Anthropic-only rolling boundaries must never become Responses item
+        // annotations, even when explicit Responses caching is enabled.
+        let mut plan = PromptCachePlan {
             breakpoint_message_ids: vec!["stable".to_string()],
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: volatile_a.id.clone(),
+                previous_message_id: None,
+                external_memory_message_id: None,
+            }),
             ..Default::default()
         };
 
@@ -5113,6 +5120,7 @@ mod tests {
             None,
             Some(&plan),
         );
+        plan.anthropic_history.as_mut().unwrap().newest_message_id = volatile_b.id.clone();
         let second = build_responses_body(
             "gpt-5.6",
             &[stable, volatile_b],
@@ -5130,6 +5138,8 @@ mod tests {
             "explicit"
         );
         assert_ne!(first["input"][1], second["input"][1]);
+        assert_eq!(count_responses_explicit_breakpoints(&first["input"]), 1);
+        assert_eq!(count_responses_explicit_breakpoints(&second["input"]), 1);
     }
 
     #[test]

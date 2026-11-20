@@ -31,7 +31,9 @@ use bamboo_domain::{
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
-use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
+use crate::cache::{
+    AnthropicHistoryCache, CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS,
+};
 use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
 use crate::provider::{
@@ -646,14 +648,14 @@ impl AnthropicProvider {
         // we can tell with certainty whether a screenshot reaches the wire vs being
         // dropped before send. image_blocks_on_wire=0 with a screenshot in the
         // conversation means the image never left bamboo.
-        let image_blocks_on_wire: usize = body
+        let (image_blocks_on_wire, cache_message_breakpoints) = body
             .get("messages")
             .and_then(|m| m.as_array())
             .map(|msgs| {
                 msgs.iter()
                     .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
                     .flatten()
-                    .map(|block| {
+                    .fold((0, 0), |(images, breakpoints), block| {
                         let mut n = usize::from(
                             block.get("type").and_then(|t| t.as_str()) == Some("image"),
                         );
@@ -663,15 +665,18 @@ impl AnthropicProvider {
                                 .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
                                 .count();
                         }
-                        n
+                        (
+                            images + n,
+                            breakpoints + usize::from(block.get("cache_control").is_some()),
+                        )
                     })
-                    .sum()
             })
-            .unwrap_or(0);
+            .unwrap_or_default();
         tracing::info!(
-            "[session_hash={}] Anthropic request image_blocks_on_wire={} model_hash={}",
+            "[session_hash={}] Anthropic request image_blocks_on_wire={} cache_message_breakpoints={} model_hash={}",
             log_identity(session_log_id),
             image_blocks_on_wire,
+            cache_message_breakpoints,
             log_identity(model)
         );
         let applied_reasoning_effort = reasoning_effort;
@@ -916,11 +921,14 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         system_blocks,
         thinking_enabled,
         thinking_replay_always,
+        plan.anthropic_history
+            .as_ref()
+            .and_then(|history| history.external_memory_message_id.as_deref()),
     );
 
     // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
-    // markers per request. Spend the budget on the most stable regions first
-    // (tools, then system), then on conversation breakpoints nearest the end.
+    // markers per request. Reserve the tools and system anchors, then
+    // prioritize history boundaries within the remaining message budget.
     let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
 
     let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
@@ -950,7 +958,7 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         }
     }
 
-    if budget > 0 && !plan.breakpoint_message_ids.is_empty() {
+    if budget > 0 && (!plan.breakpoint_message_ids.is_empty() || plan.anthropic_history.is_some()) {
         let mut breakpoint_targets: Vec<(usize, usize)> = source_spans
             .iter()
             .enumerate()
@@ -964,14 +972,21 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
                     .map(|span| (message_idx, span.end_block - 1))
             })
             .collect();
-        // Keep only the breakpoints closest to the end of the conversation.
-        if breakpoint_targets.len() > budget {
-            breakpoint_targets = breakpoint_targets.split_off(breakpoint_targets.len() - budget);
+        if let Some(history) = &plan.anthropic_history {
+            // The prior history write remains an explicit target, including
+            // when it falls outside the provider's 20-block lookback.
+            let history_targets = history_cache_targets(
+                &anthropic_messages,
+                &source_spans,
+                history,
+                native_groups,
+                capability_loading_mode,
+            );
+            breakpoint_targets.retain(|target| !history_targets.contains(target));
+            breakpoint_targets.extend(history_targets);
         }
-        for (message_idx, block_idx) in breakpoint_targets {
-            if let Some(message) = anthropic_messages.get_mut(message_idx) {
-                add_cache_control_to_block(message, block_idx, ttl);
-            }
+        for (message_idx, block_idx) in breakpoint_targets.into_iter().rev().take(budget) {
+            add_cache_control_to_block(&mut anthropic_messages[message_idx], block_idx, ttl);
         }
     }
 
@@ -1017,6 +1032,67 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     }
 
     body
+}
+
+/// Map history boundaries to cacheable blocks before any native replacements.
+/// A boundary on omitted, thinking-only, or provider-owned content falls back
+/// to the nearest preceding block. History targets can share a coalesced
+/// message with each other or with the stable tool guide.
+fn history_cache_targets(
+    messages: &[Value],
+    source_spans: &[Vec<SourceSpan>],
+    history: &AnthropicHistoryCache,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Vec<(usize, usize)> {
+    let native_anchors: HashSet<_> = native_groups
+        .iter()
+        .filter(|group| {
+            capability_loading_mode == CapabilityLoadingMode::Progressive
+                && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+        })
+        .map(ProviderTranscriptGroup::anchor_message_id)
+        .collect();
+    let mut targets = Vec::with_capacity(2);
+    let mut last_cacheable = None;
+    let mut stable_prefix = true;
+    for (message_idx, spans) in source_spans.iter().enumerate() {
+        let Some(blocks) = messages[message_idx]["content"].as_array() else {
+            continue;
+        };
+        for span in spans {
+            let id = span.id.as_str();
+            // The retained screenshots in the newest tool batch can be
+            // omitted as soon as a later tool batch produces images.
+            let retained_tool_image = span.is_tool_result
+                && blocks
+                    .get(span.start_block)
+                    .is_some_and(|block| block["content"].is_array());
+            stable_prefix &=
+                history.external_memory_message_id.as_deref() != Some(id) && !retained_tool_image;
+            if stable_prefix && !native_anchors.contains(id) {
+                let eligible = blocks[span.start_block..span.end_block]
+                    .iter()
+                    .rposition(|block| {
+                        matches!(
+                            block["type"].as_str(),
+                            Some("text" | "image" | "document" | "tool_use" | "tool_result")
+                        )
+                    });
+                if let Some(offset) = eligible {
+                    last_cacheable = Some((message_idx, span.start_block + offset));
+                }
+            }
+            if id == history.newest_message_id || history.previous_message_id.as_deref() == Some(id)
+            {
+                if let Some(target) = last_cacheable.filter(|target| targets.last() != Some(target))
+                {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+    targets
 }
 
 /// Replace only the normalized source contribution owned by each anchor. Cache
@@ -1247,6 +1323,7 @@ fn messages_to_anthropic_json(
     system_blocks: &[PromptBlock],
     thinking_enabled: bool,
     thinking_replay_always: bool,
+    external_memory_message_id: Option<&str>,
 ) -> (Option<Value>, Vec<Value>, Vec<Vec<SourceSpan>>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
@@ -1255,24 +1332,40 @@ fn messages_to_anthropic_json(
     // at the marked stable source, not at a later volatile coalesced tail.
     let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
 
+    let mut ordered_messages = messages.iter().collect::<Vec<_>>();
+    if let Some(id) = external_memory_message_id {
+        let source = messages.iter().position(|message| message.id == id);
+        let last_user_block = messages.iter().rposition(|message| {
+            matches!(message.role, Role::User | Role::Tool) && message.id != id
+        });
+        // Tool results are user blocks on this wire. Put memory after them
+        // and any other user blocks, preserving a trailing assistant prefill.
+        if let Some((source, last_user_block)) = source
+            .zip(last_user_block)
+            .filter(|(source, last)| source < last)
+        {
+            ordered_messages[source..=last_user_block].rotate_left(1);
+        }
+    }
+
     // Keep every image in the latest tool-result batch. Parallel ViewImage
     // calls must all reach their first subsequent request. Older batches retain
     // the existing explicit omission marker to bound accumulated screenshots.
     // User-attached images are untouched.
-    let last_image_tool_idx = messages
+    let last_image_tool_idx = ordered_messages
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
         .map(|(i, _)| i)
         .next_back();
     let latest_image_batch_start = last_image_tool_idx.map(|last| {
-        messages[..last]
+        ordered_messages[..last]
             .iter()
             .rposition(|m| !matches!(m.role, Role::Tool | Role::System))
             .map_or(0, |idx| idx + 1)
     });
 
-    for (idx, m) in messages.iter().enumerate() {
+    for (idx, m) in ordered_messages.into_iter().enumerate() {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
@@ -5148,7 +5241,7 @@ mod anthropic_request_building {
 
         let messages = [system, user, assistant];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // (a) The System message is routed into the top-level `system` field.
         let system_value =
@@ -5204,7 +5297,7 @@ mod anthropic_request_building {
             Message::assistant("Hi!", None),
         ];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // Both system messages are joined into the system field.
         let system_value =
@@ -5284,7 +5377,7 @@ mod anthropic_request_building {
             Message::tool_result("call_1", "found it"),
         ];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // The wedged System message is routed to the system field, not dropped.
         assert!(
@@ -5327,13 +5420,38 @@ mod anthropic_request_building {
             Message::tool_result_with_images("first", "first shot", true, vec![img("FIRST")]),
             Message::tool_result_with_images("second", "second shot", true, vec![img("SECOND")]),
         ];
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let plan = crate::cache::PromptCachePlan {
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: messages[4].id.clone(),
+                previous_message_id: None,
+                external_memory_message_id: None,
+            }),
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
         let dumped = out.to_string();
         assert!(dumped.contains("FIRST"));
         assert!(dumped.contains("SECOND"));
         assert!(!dumped.contains("OLDER"));
         assert!(dumped.contains("omitted"));
+        assert_eq!(
+            out["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(out["messages"][2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
     }
 
     #[test]
@@ -5637,6 +5755,40 @@ mod anthropic_request_building {
         assert!(blocks[0].get("cache_control").is_none());
         assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
         assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn history_keeps_both_boundaries_in_one_coalesced_message() {
+        let prior = Message::user("prior user text");
+        let newest = Message::user("next user text");
+        let memory = Message::user("request-local memory");
+        let plan = crate::cache::PromptCachePlan {
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: newest.id.clone(),
+                previous_message_id: Some(prior.id.clone()),
+                external_memory_message_id: Some(memory.id.clone()),
+            }),
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &[prior, memory, newest, Message::assistant("prefill", None)],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], "prior user text");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "next user text");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[2]["text"], "request-local memory");
+        assert!(blocks[2].get("cache_control").is_none());
+        assert_eq!(out["messages"][1]["role"], "assistant");
     }
 
     #[test]

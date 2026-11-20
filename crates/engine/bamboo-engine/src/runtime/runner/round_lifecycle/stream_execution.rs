@@ -34,6 +34,7 @@ use bamboo_domain::{
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
     ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
+use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
     CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
     REASONING_REPETITION_FINISH_REASON,
@@ -1078,21 +1079,12 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         stable_prefix_messages.push(message);
     }
 
-    // Keep Responses item annotations append-only too: a rolling breakpoint on
-    // the conversation tail would remove the marker from an item in the prior
-    // request. The stable tool-guide boundary is the only generated message
-    // breakpoint on the ledger path.
-    let mut breakpoint_message_ids = Vec::new();
-    // The relocated tool guide is large and session-stable, so it earns a
-    // dedicated breakpoint. For legacy/continuation paths this id simply isn't
-    // found in the message array, so the breakpoint is harmlessly ignored there.
-    if let Some(id) = tool_guide_breakpoint_id {
-        breakpoint_message_ids.push(id);
-    }
-    let cache_plan = PromptCachePlan {
+    let mut cache_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
-        breakpoint_message_ids,
+        // Responses replays item annotations byte-for-byte. Only the stable
+        // tool guide participates in its explicit message cache plan.
+        breakpoint_message_ids: tool_guide_breakpoint_id.into_iter().collect(),
         // Use the 1-hour extended cache TTL for the growing append-only prefix
         // (tools + system + tool guide + model transcript). The
         // default 5-minute TTL expires across any pause longer than 5 min
@@ -1103,6 +1095,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         // Gated behind the `extended-cache-ttl-2025-04-11` beta header, which
         // the Anthropic provider adds whenever the plan's TTL is Extended.
         ttl: CacheTtl::Extended,
+        ..PromptCachePlan::default()
     };
 
     let mut real_transcript = system_remainder_messages;
@@ -1134,7 +1127,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // Recall, Dream, and agenda are current read models. Keeping them outside
     // the generated ledger prevents old snapshots from reappearing after an
     // edit, archive, or project reassignment.
-    if let Some(block) = build_external_memory_context_block(session) {
+    let external_memory_message_id = build_external_memory_context_block(session).map(|block| {
         // Place the current snapshot before the user who owns this turn.
         // Tool continuations then end with the same call/results as before.
         let anchor = real_transcript
@@ -1156,8 +1149,24 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                     .rposition(|message| message.id == anchor.id)
             })
             .unwrap_or(0);
-        model_transcript.insert(index, block.render_runtime_context_message());
-    }
+        let message = block.render_runtime_context_message();
+        let id = message.id.clone();
+        model_transcript.insert(index, message);
+        id
+    });
+    cache_plan.anthropic_history = real_transcript.last().map(|newest| {
+        let previous_message_id = ledger
+            .prior_message_count
+            .checked_sub(1)
+            .and_then(|index| real_transcript.get(index))
+            .filter(|prior| prior.id != newest.id)
+            .map(|prior| prior.id.clone());
+        AnthropicHistoryCache {
+            newest_message_id: newest.id.clone(),
+            previous_message_id,
+            external_memory_message_id,
+        }
+    });
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
