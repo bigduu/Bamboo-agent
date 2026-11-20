@@ -121,6 +121,91 @@ async fn invoke_json(
 }
 
 #[tokio::test]
+async fn memory_write_rejects_global_project_memory_and_preserves_valid_writes() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let session_id = "memory-guard-source";
+    let project_id = bamboo_domain::ProjectId::parse("project-fixture").unwrap();
+    let mut session = Session::new(session_id, "model");
+    session.set_project_id_meta(project_id.to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let denied = tool
+        .invoke(
+            json!({
+                "action": "write",
+                "scope": "global",
+                "type": "project",
+                "title": "Project display setting",
+                "content": "The Project dashboard uses one column."
+            }),
+            test_context(session_id),
+        )
+        .await
+        .expect_err("a project-typed Global write must fail");
+    assert!(matches!(denied, ToolError::InvalidArguments(_)));
+
+    let memory = MemoryStore::new(dir.path());
+    assert!(memory
+        .list_memory_documents(MemoryScope::Global, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(memory
+        .for_project(&project_id)
+        .list_memory_documents(MemoryScope::Project, Some(project_id.as_str()))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let legacy = memory
+        .write_memory(
+            MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Legacy Project entry",
+            "A previously stored Project entry.",
+            &[],
+            Some(session_id),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let legacy_id = legacy.frontmatter.id;
+    let fetched = invoke_json(&tool, json!({"action": "get", "id": legacy_id}), session_id).await;
+    assert_eq!(fetched["memory"]["frontmatter"]["type"], "project");
+    let archived = invoke_json(
+        &tool,
+        json!({"action": "purge", "id": legacy_id, "mode": "archived"}),
+        session_id,
+    )
+    .await;
+    assert_eq!(archived["status"], "archived");
+
+    for (scope, memory_type, title) in [
+        ("project", "project", "Project display setting"),
+        ("global", "reference", "Cross-project display reference"),
+        ("global", "feedback", "Cross-project display preference"),
+    ] {
+        let written = invoke_json(
+            &tool,
+            json!({
+                "action": "write",
+                "scope": scope,
+                "type": memory_type,
+                "title": title,
+                "content": "Use compact display defaults."
+            }),
+            session_id,
+        )
+        .await;
+        assert_eq!(written["memory"]["scope"], scope);
+        assert_eq!(written["memory"]["type"], memory_type);
+    }
+}
+
+#[tokio::test]
 async fn memory_session_actions_share_read_shape_and_limits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tool = build_memory_tool(dir.path());
@@ -304,7 +389,7 @@ async fn query_action_filters_by_granularity() {
         json!({
             "action": "write",
             "scope": "global",
-            "type": "project",
+            "type": "reference",
             "title": "This week's sprint priorities",
             "content": "Ship the granularity filter end to end.",
             "granularity": "week"
@@ -317,7 +402,7 @@ async fn query_action_filters_by_granularity() {
         json!({
             "action": "write",
             "scope": "global",
-            "type": "project",
+            "type": "reference",
             "title": "Long-term architecture direction",
             "content": "Move to a modular workspace layout over the year.",
             "granularity": "year"
@@ -665,7 +750,7 @@ async fn lexical_query_defaults_to_compact_top_three_without_bodies() {
             json!({
                 "action": "write",
                 "scope": "global",
-                "type": "project",
+                "type": "reference",
                 "title": format!("Release freeze fact {index}"),
                 "content": format!("Confirmed release freeze detail number {index}."),
                 "keywords": ["release-freeze-alias"]

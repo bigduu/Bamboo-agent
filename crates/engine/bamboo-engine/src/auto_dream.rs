@@ -2688,6 +2688,9 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         let Some(scope) = durable_scope_for_source(&candidate, project_key.as_deref()) else {
             continue;
         };
+        if scope == MemoryScope::Global && memory_type == DurableMemoryType::Project {
+            continue;
+        }
         let mut write_memory = memory.clone();
         let mut write_project_key = project_key;
         if scope == MemoryScope::Project && !current_store_is_project_scoped {
@@ -6628,7 +6631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_and_persist_durable_candidates_writes_memory() {
+    async fn extract_and_persist_durable_candidates_rejects_global_project_memory() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
@@ -6646,6 +6649,21 @@ mod tests {
                     "scope": "global",
                     "content": "The user prefers terse responses and no recap.",
                     "tags": ["preference", "style"],
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                },
+                {
+                    "title": "Project link layout",
+                    "type": "project",
+                    "scope": "global",
+                    "content": "The Project dashboard groups links by label.",
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
+                },
+                {
+                    "title": "Project chart layout",
+                    "type": "project",
+                    "content": "The Project dashboard uses a single chart column.",
                     "session_id": "source-session-0001",
                     "confidence": "high"
                 },
