@@ -211,7 +211,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // File-change receipt projection edits the stream runner covered by its
 // token-usage-log cfg. Receipt and wait regressions use the default Engine
 // and Compression owners. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "f825e620af46d4a5f0ce6684742879c9646390736a99281df566d916490045ac";
+// #2882 changes live external-memory projection and legacy context fitting.
+// Its wire ordering and preparation regressions stay in the existing Engine owner.
+const FEATURE_SOURCE_SHA256 = "e88b5172345e3b8a8ec185ea4fc40681a55cd215d10ba697beeff8792b86a2a4";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

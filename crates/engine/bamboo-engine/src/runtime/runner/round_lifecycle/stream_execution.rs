@@ -847,7 +847,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
-    // Host-owned context (recalled memory, task list, plan state, summary) is
+    // Host-owned context (task list, plan state, summary) is
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
     // Session identity leads this run so a newly seeded ledger places it
@@ -905,9 +905,6 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         }
     }
     if let Some(block) = build_active_workflow_context_block(session) {
-        context_blocks.push(block);
-    }
-    if let Some(block) = build_external_memory_context_block(session) {
         context_blocks.push(block);
     }
     if let Some(block) = build_project_resources_context_block(session) {
@@ -1112,8 +1109,8 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     real_transcript.extend(conversation_messages);
     bamboo_compression::project_file_change_results(&mut real_transcript);
     let cache_scope = serde_json::json!({
-        // Rebuild saved prompt prefixes that still contain unconditional memory guidance.
-        "external_memory_projection_version": 2,
+        // Retire old generated epochs that preserved withdrawn memory snapshots.
+        "external_memory_projection_version": 3,
         "model": model,
         "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
@@ -1134,6 +1131,33 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
+    // Recall, Dream, and agenda are current read models. Keeping them outside
+    // the generated ledger prevents old snapshots from reappearing after an
+    // edit, archive, or project reassignment.
+    if let Some(block) = build_external_memory_context_block(session) {
+        // Place the current snapshot before the user who owns this turn.
+        // Tool continuations then end with the same call/results as before.
+        let anchor = real_transcript
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::User
+                    && !crate::session_app::execute::is_hidden_from_ui(message)
+                    && message
+                        .metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.get("runtime_kind").is_none())
+            })
+            .or_else(|| real_transcript.first());
+        let index = anchor
+            .and_then(|anchor| {
+                model_transcript
+                    .iter()
+                    .rposition(|message| message.id == anchor.id)
+            })
+            .unwrap_or(0);
+        model_transcript.insert(index, block.render_runtime_context_message());
+    }
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));

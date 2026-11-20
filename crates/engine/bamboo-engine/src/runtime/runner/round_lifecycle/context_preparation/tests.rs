@@ -1848,6 +1848,73 @@ async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_contex
 }
 
 #[tokio::test]
+async fn prepare_round_context_retires_withdrawn_external_memory_before_budgeting() {
+    use bamboo_domain::{ContextBlock, ContextBlockPriority, ContextBlockStability};
+
+    let id = "retired-memory-budget-fixture";
+    let mut session = Session::new(id, "test-model");
+    let system = "system instruction ".repeat(2_000);
+    let current_request = Message::user("Keep the current request in the provider context.");
+    session.add_message(Message::system(&system));
+    session.add_message(current_request.clone());
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".into()),
+        system_prompt: Some(system),
+        ..Default::default()
+    };
+    let budget = TokenBudget::with_safety_margin(8_000, 2_400, BudgetStrategy::default(), 0);
+    session.token_budget = Some(budget.clone());
+
+    let withdrawn_memory = ContextBlock::new(
+        ContextBlockType::ExternalMemory,
+        ContextBlockPriority::Medium,
+        ContextBlockStability::RoundDynamic,
+        "Old external memory",
+        "withdrawn memory text ".repeat(600),
+    );
+    super::super::context_ledger::reconcile_model_context(
+        &mut session,
+        vec![withdrawn_memory],
+        std::slice::from_ref(&current_request),
+        "a".repeat(64),
+        false,
+    );
+    let previous_epoch = session.model_context_state.as_ref().unwrap().prefix_epoch;
+    let counter = TiktokenTokenCounter::default();
+    let historical_reserve = super::model_context_ledger_usage(&session, &counter).tokens;
+    assert!(matches!(
+        super::prepare_hybrid_context_with_fixed_tokens(
+            &session,
+            &budget,
+            &counter,
+            historical_reserve
+        ),
+        Err(bamboo_compression::BudgetError::SystemPromptTooLarge { .. })
+    ));
+
+    let (llm, model_calls) = recording_llm();
+    let prepared = prepare_round_context(&mut session, &config, "test-model", id, &[], &llm, None)
+        .await
+        .expect("withdrawn memory must not make the current request too large");
+
+    assert!(!prepared.prepared_context.truncation_occurred);
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| message.id == current_request.id));
+    let ledger = session.model_context_state.as_ref().unwrap();
+    assert_eq!(ledger.prefix_epoch, previous_epoch + 1);
+    assert_eq!(
+        ledger.last_reset_reason,
+        Some(ModelContextResetReason::CacheScopeChanged)
+    );
+    assert!(ledger.events.is_empty());
+    assert!(session.compression_events.is_empty());
+    assert!(model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_context() {
     let mut session = Session::new("session-cp-1", "test-model");
     session.messages.push(Message::user_with_parts(
