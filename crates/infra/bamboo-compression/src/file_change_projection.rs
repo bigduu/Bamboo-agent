@@ -53,7 +53,7 @@ pub fn project_file_change_results(messages: &mut [Message]) {
 
 fn compact_file_change_receipt(content: &str, operation: &str) -> Option<String> {
     let mut values = serde_json::Deserializer::from_str(content).into_iter::<Value>();
-    let receipt = values.next()?.ok()?;
+    let mut receipt = values.next()?.ok()?;
     let suffix = &content[values.byte_offset()..];
     // Preserve the exact hook feedback that the runtime appends after JSON.
     if !suffix.trim().is_empty()
@@ -78,28 +78,15 @@ fn compact_file_change_receipt(content: &str, operation: &str) -> Option<String>
         return None;
     }
     diff.get("unified")?.as_str()?;
-    // Original and updated file lengths stay accurate when a diff hunk spans
-    // multiple edits with unchanged lines between them.
-    let mut summary = json!({
-        "operation": operation,
-        "file_path": path,
-        "message": message,
-        "checkpoint": checkpoint,
-        "old_line_count": diff.get("old_line_count")?.as_u64()?,
-        "new_line_count": diff.get("new_line_count")?.as_u64()?,
-    });
-    if let Some(diagnostics) = receipt.get("diagnostics").filter(|value| value.is_object()) {
-        summary["diagnostics"] = diagnostics.clone();
-    }
-    if operation == "Edit" {
-        if let Some(replacements) = receipt.get("replacements").and_then(Value::as_u64) {
-            summary["replacements"] = json!(replacements);
-        }
-        if let Some(mode) = receipt.get("edit_mode").and_then(Value::as_str) {
-            summary["edit_mode"] = json!(mode);
-        }
-    }
-    let mut projected = summary.to_string();
+    // Keep the original small metadata, including the file parent used by
+    // model-facing tools. File lengths stay accurate across distant edits.
+    let old_line_count = diff.get("old_line_count")?.as_u64()?;
+    let new_line_count = diff.get("new_line_count")?.as_u64()?;
+    let fields = receipt.as_object_mut()?;
+    fields.remove("diff");
+    fields.insert("old_line_count".into(), json!(old_line_count));
+    fields.insert("new_line_count".into(), json!(new_line_count));
+    let mut projected = receipt.to_string();
     projected.push_str(suffix);
     Some(projected)
 }
@@ -145,6 +132,7 @@ mod tests {
         project_file_change_results(&mut messages);
         let summary: Value = serde_json::from_str(&messages[1].content).unwrap();
         assert_eq!(summary["checkpoint"]["created"], false);
+        assert_eq!(summary["workspace"], ".");
         assert_eq!(summary["old_line_count"], 0);
         assert_eq!(summary["new_line_count"], 1);
         assert!(summary.get("diff").is_none());

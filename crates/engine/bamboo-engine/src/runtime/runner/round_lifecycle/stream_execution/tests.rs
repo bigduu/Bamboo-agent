@@ -3256,6 +3256,15 @@ async fn file_mutation_receipts_stay_intact_in_history_and_compact_on_the_wire()
             .expect("paired tool result on the wire");
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("fixture.json"));
+        let receipt = serde_json::Deserializer::from_str(output)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("compact receipt")
+            .expect("compact receipt JSON");
+        assert_eq!(
+            receipt["workspace"],
+            bamboo_config::paths::path_to_display_string(std::path::Path::new("/workspace"))
+        );
         assert!(output.contains("\"valid\":false"));
         assert!(output.contains("\"old_line_count\":162"));
         assert!(!output.contains("unified"));
