@@ -66,6 +66,7 @@ pub use inbox::*;
 pub use loop_control_request::{parse_loop_control_request, LoopControlRequest};
 pub use message_part::{ImageUrlRef, MessagePart};
 pub use message_summary::{
+    is_post_compaction_recovery, message_summary_archive_message_ids,
     validate_message_summary_tool_protocol, MessageSummaryToolProtocolError,
 };
 pub use model_context::*;

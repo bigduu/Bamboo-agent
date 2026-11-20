@@ -746,6 +746,74 @@ async fn message_summary_save_failure_does_not_publish_the_archive() {
 }
 
 #[tokio::test]
+async fn automatic_message_summary_keeps_a_paired_pinned_batch_in_the_next_request() {
+    let mut session = message_summary_session();
+    session.force_manual_compression = None;
+    session.messages[3].content = "old unpinned tool output ".repeat(12_000);
+    let mut discovery = Message::assistant(
+        "Pinned assistant prose",
+        Some(vec![ToolCall {
+            id: "pinned-discovery".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "discover_capabilities".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+    );
+    discovery.never_compress = true;
+    let result = Message::tool_result("pinned-discovery", "Pinned discovery output");
+    let pinned = [discovery, result];
+    session.messages.splice(4..4, pinned.clone());
+    let (provider, summary_requests) = prompt_capture_llm();
+    let config = message_summary_config(provider);
+
+    assert!(maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        None,
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert_eq!(session.compression_events.len(), 1);
+    assert!(session.messages[2..4]
+        .iter()
+        .all(|message| message.compressed));
+    let summary = serde_json::to_string(&*summary_requests.lock().unwrap()).unwrap();
+    assert!(summary.contains("OLDER_USER_PROSE"));
+    for message in &pinned {
+        assert!(!summary.contains(&message.content));
+    }
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        None,
+    )
+    .await
+    .unwrap();
+    let tool_rows = prepared
+        .prepared_context
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool || message.tool_calls.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(tool_rows).unwrap(),
+        serde_json::to_value(pinned).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn message_summary_runs_for_automatic_pressure_and_critical_overflow() {
     for critical_overflow in [false, true] {
         let mut session = message_summary_session();
