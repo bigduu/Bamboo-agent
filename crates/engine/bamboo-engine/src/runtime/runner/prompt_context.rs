@@ -8,10 +8,10 @@ mod plan_runtime;
 mod system_sections;
 mod task;
 
+pub(crate) use external_memory::EXTERNAL_MEMORY_RENDERED_KEY;
 pub(crate) use external_memory::{
     PromptMemoryExposureProvenance, PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
-pub(crate) use external_memory::EXTERNAL_MEMORY_RENDERED_KEY;
 
 pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
