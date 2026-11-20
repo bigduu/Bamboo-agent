@@ -23,8 +23,8 @@ results and the advisory, a sole follow-up empty poll of the same handle can
 hand off waiting to the runner. The tool result is paired first. The active run
 waits up to 180 seconds for the terminal capture and sends its bounded result
 before the next model request. On expiry, it reports the unconfirmed outcome
-and keeps the live command and handle available. An unchanged quiet period
-starts at most one automatic wait. Run cancellation interrupts the wait.
+and keeps the live command and handle available. A new empty poll is required
+before another bounded wait can start. Run cancellation interrupts the wait.
 
 A Human follow-up that repeatedly polls the same quiet handle yields back to
 the existing wait. It keeps the original monitor and waits for the actual

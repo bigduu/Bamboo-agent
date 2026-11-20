@@ -86,12 +86,7 @@ pub fn prepare_hybrid_context_with_fixed_tokens(
         .as_ref()
         .map(|message| counter.count_messages(std::slice::from_ref(message)))
         .unwrap_or(0);
-    let active_messages: Vec<_> = session
-        .messages
-        .iter()
-        .filter(|message| !message.compressed)
-        .cloned()
-        .collect();
+    let active_messages = crate::compression_tooling::active_messages_for_budget(session);
     let prompt_cache_result = maybe_compact_old_tool_outputs_for_prompt(
         session,
         active_messages,

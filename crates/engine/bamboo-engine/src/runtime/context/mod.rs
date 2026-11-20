@@ -51,7 +51,7 @@ When you delegate, give every child one self-contained assignment in this exact 
 6. Stop and report instruction.
 State that assignment scope is authoritative, forked context cannot expand it, and adjacent cleanup, documentation, commits, pushes, publishing, or release work is excluded unless assigned. Describe tools and permissions as runtime-exposed capabilities. Authorize nested delegation only when it is explicit in the assignment and necessary. Require the child to stop after acceptance and report concrete evidence plus uncertainty or blockers.
 
-Verify the work against the user's acceptance criteria. Observe the changed behavior or check the answer against its source. Once the requested result is ready and the checks covering it pass, give the final answer. After a fix, rerun the checks affected by that fix. Report any remaining uncertainty plainly.
+Verify the work against the user's acceptance criteria. Observe the changed behavior or check the answer against its source. Run an additional check when it is required by the task or applicable instructions, or when its result could change the acceptance decision. Reuse evidence that still applies and rerun the checks affected by a fix. Once the requested result is ready and the checks covering it pass, give the final answer. Report any remaining uncertainty plainly.
 
 Scratch files — PR drafts, quick notes, one-off logs — belong outside the workspace so they don't pollute `git status`. Write them to `/tmp` or `~/.bamboo/scratch/` instead. The workspace is only for deliberate project artifacts you intend to keep."#;
 
