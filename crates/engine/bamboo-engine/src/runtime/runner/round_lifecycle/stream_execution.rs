@@ -1135,7 +1135,28 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // the generated ledger prevents old snapshots from reappearing after an
     // edit, archive, or project reassignment.
     if let Some(block) = build_external_memory_context_block(session) {
-        model_transcript.push(block.render_runtime_context_message());
+        // Place the current snapshot before the user who owns this turn.
+        // Tool continuations then end with the same call/results as before.
+        let anchor = real_transcript
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::User
+                    && !crate::session_app::execute::is_hidden_from_ui(message)
+                    && message
+                        .metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.get("runtime_kind").is_none())
+            })
+            .or_else(|| real_transcript.first());
+        let index = anchor
+            .and_then(|anchor| {
+                model_transcript
+                    .iter()
+                    .rposition(|message| message.id == anchor.id)
+            })
+            .unwrap_or(0);
+        model_transcript.insert(index, block.render_runtime_context_message());
     }
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.

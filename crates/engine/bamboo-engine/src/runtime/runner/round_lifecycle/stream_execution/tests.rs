@@ -4697,7 +4697,7 @@ fn responses_continuation_enabled_requires_store_true_and_supported_provider() {
 }
 
 #[tokio::test]
-async fn execute_llm_stream_includes_external_memory_volatile_block() {
+async fn execute_llm_stream_preserves_tool_continuation_after_current_external_memory() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2a", "test-model");
     // A stale continuation id may still be present (pre-fix persistence); under
@@ -4715,11 +4715,24 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let config = test_config("system");
+    let mut resume = Message::user("Resume the current turn.");
+    resume.metadata = Some(serde_json::json!({"runtime_kind":"retry_resume"}));
     let prepared_context = PreparedContext {
         messages: vec![
             Message::system("system"),
             Message::user("run a tool"),
-            Message::assistant("calling tool", None),
+            resume,
+            Message::assistant(
+                "calling tool",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "test_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            ),
             Message::tool_result("call_1", "{\"ok\":true}"),
         ],
         token_usage: usage(0, 22),
@@ -4766,15 +4779,23 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 6);
+    assert_eq!(requested_messages.len(), 7);
     assert!(matches!(requested_messages[0].role, Role::System));
     assert_session_identity_message(&requested_messages[1], "session-stream-2a");
-    assert!(matches!(requested_messages[4].role, Role::Tool));
-    assert!(matches!(requested_messages[5].role, Role::User));
-    assert!(requested_messages[5]
+    assert!(requested_messages[2]
         .content
         .contains("context_type: external_memory"));
-    assert!(requested_messages[5].content.contains("Session note body"));
+    assert!(requested_messages[2].content.contains("Session note body"));
+    for (actual, original) in requested_messages[3..]
+        .iter()
+        .zip(&prepared_context.messages[1..])
+    {
+        assert_eq!(actual.id, original.id);
+    }
+    assert_eq!(
+        requested_messages.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
+    );
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -4782,6 +4803,22 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             .expect("previous_response_id lock")
             .as_deref(),
         None
+    );
+
+    let mut without_user = prepared_context;
+    without_user.messages.remove(1);
+    let envelope = super::build_request_envelope(&session, &without_user, &config, &[]);
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let first_real = transcript
+        .iter()
+        .position(|message| message.id == without_user.messages[1].id)
+        .expect("the first real row survives preparation");
+    assert!(transcript[first_real - 1]
+        .content
+        .contains("context_type: external_memory"));
+    assert_eq!(
+        transcript.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
     );
 }
 
@@ -6649,6 +6686,13 @@ async fn responses_input_contains_only_the_current_external_memory_projection() 
         let body = llm.requested_responses_body.lock().unwrap();
         let body = body.as_ref().expect("rendered body");
         let input = body["input"].to_string();
+        let items = body["input"].as_array().expect("Responses input array");
+        let user = items.last().expect("final user input");
+        assert_eq!(user["role"], "user");
+        assert!(user.to_string().contains("Continue."));
+        if let Some(current) = current {
+            assert!(items[items.len() - 2].to_string().contains(current));
+        }
         actual.push((
             input.contains(legacy),
             input.contains(old),
