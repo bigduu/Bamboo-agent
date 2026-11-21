@@ -125,6 +125,7 @@ pub(crate) fn legacy_effective_callable_set(
 
 pub(crate) struct RoundToolExecutionResult {
     pub quiet_exec_handle: Option<String>,
+    pub explicit_exec_waits: Vec<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,

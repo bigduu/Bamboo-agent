@@ -1648,16 +1648,14 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
-/// Yield an owned quiet command to background monitoring without spending
-/// another model recovery round. A new handoff commits its notice and wait
-/// together before the monitor starts.
-async fn maybe_background_quiet_exec(
+/// Commit the command wait before starting the Host monitor.
+async fn maybe_suspend_for_background_exec(
     session: &mut Session,
     config: &AgentLoopConfig,
     runtime: &mut AgentRuntimeState,
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
-) -> Result<bool, AgentError> {
+) -> std::io::Result<bool> {
     if !crate::runtime::runner::tool_execution::quiet_poll_guard_active(session, runtime, config) {
         return Ok(false);
     }
@@ -1718,14 +1716,7 @@ async fn maybe_background_quiet_exec(
     }
     notice.metadata = Some(notice_metadata);
     candidate.add_message(notice.clone());
-    persistence
-        .save_runtime_session(&mut candidate)
-        .await
-        .map_err(|error| {
-            AgentError::Tool(format!(
-                "Background command wait could not be saved: {error}"
-            ))
-        })?;
+    persistence.save_runtime_session(&mut candidate).await?;
     *session = candidate;
     *runtime = waiting_runtime;
     hook.arrange_exec_self_resume(job, session.created_at);
@@ -3077,9 +3068,10 @@ async fn handle_no_tool_calls(
 
 const QUIET_EXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
-async fn wait_for_quiet_exec(
+async fn wait_for_exec(
     job: bamboo_tools::tools::exec_command::BackgroundExecJob,
     cancel_token: &CancellationToken,
+    ceiling: Option<Duration>,
 ) -> Result<Message, AgentError> {
     use crate::session_app::child_completion_coordinator::{
         exec_completion_message, exec_wait_resume_message,
@@ -3088,12 +3080,71 @@ async fn wait_for_quiet_exec(
     let result = tokio::select! {
         biased;
         _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
-        result = tokio::time::timeout(QUIET_EXEC_WAIT_TIMEOUT, job.completion()) => result,
+        result = async {
+            match ceiling {
+                Some(ceiling) => tokio::time::timeout(ceiling, job.completion()).await.ok(),
+                None => Some(job.completion().await),
+            }
+        } => result,
     };
     Ok(match result {
-        Ok(info) => exec_completion_message(&info),
-        Err(_) => exec_wait_resume_message(&[job.id().to_owned()], true),
+        Some(info) => exec_completion_message(&info),
+        None => exec_wait_resume_message(&[job.id().to_owned()], true),
     })
+}
+
+async fn observe_explicit_exec_waits(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    handles: &[String],
+    cancel_token: &CancellationToken,
+) -> Result<bool, AgentError> {
+    use crate::session_app::child_completion_coordinator::exec_wait_resume_message;
+    use bamboo_tools::tools::exec_command::reserve_background_job;
+
+    if let [handle] = handles {
+        match maybe_suspend_for_background_exec(session, config, runtime, event_tx, handle).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()) =>
+            {
+                return Err(AgentError::Tool(format!(
+                    "Background command wait could not be saved: {error}"
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    exec_session_id = %handle,
+                    %error,
+                    "Could not checkpoint exec wait; observing completion in the current run"
+                );
+            }
+        }
+    }
+
+    // Reserve every requested capture before awaiting any of them. A shorter
+    // command can finish and age out of the pull registry while another runs.
+    let jobs: Vec<_> = handles
+        .iter()
+        .map(|handle| reserve_background_job(&session.id, handle))
+        .collect();
+    for (handle, job) in handles.iter().zip(jobs) {
+        let message = match job {
+            Some(job) => wait_for_exec(job, cancel_token, None).await?,
+            None => exec_wait_resume_message(std::slice::from_ref(handle), false),
+        };
+        session.add_message(message.clone());
+        let _ = event_tx
+            .send(AgentEvent::message_appended(&session.id, &message))
+            .await;
+    }
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3237,6 +3288,21 @@ async fn handle_tool_calls_path(
             .metadata
             .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
     if ticket_question_yield || awaiting_clarification || waiting_for_children {
+        if !tool_execution.explicit_exec_waits.is_empty() {
+            let handles = tool_execution.explicit_exec_waits.join(", ");
+            let mut notice = Message::user(format!(
+                "Runtime notification: waiting for commands [{handles}] was deferred by another wait in this batch. If a later step needs a command's result, request a wait again with its original session_id."
+            ));
+            notice.metadata = Some(serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "exec_wait_deferred",
+            }));
+            session.add_message(notice.clone());
+            let _ = frame
+                .event_tx
+                .send(AgentEvent::message_appended(&session.id, &notice))
+                .await;
+        }
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
             frame.metrics_collector,
             frame.round_id,
@@ -3291,16 +3357,30 @@ async fn handle_tool_calls_path(
         );
     }
 
+    let waiting_for_exec = observe_explicit_exec_waits(
+        session,
+        frame.config,
+        runtime_state,
+        frame.event_tx,
+        &tool_execution.explicit_exec_waits,
+        cancel_token,
+    )
+    .await?;
+
     // The poll has already returned and its tool result is paired. A sole
     // follow-up quiet read can now wait within this run, outside tool deadlines
     // and without spending another provider turn.
-    if !output_limit_recovery && round_status == MetricsRoundStatus::Success {
+    if tool_execution.explicit_exec_waits.is_empty()
+        && !output_limit_recovery
+        && round_status == MetricsRoundStatus::Success
+    {
         if let Some(handle) = tool_execution.quiet_exec_handle {
             if let Some(job) =
                 bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
                     .await
             {
-                let message = wait_for_quiet_exec(job, cancel_token).await?;
+                let message =
+                    wait_for_exec(job, cancel_token, Some(QUIET_EXEC_WAIT_TIMEOUT)).await?;
                 session.add_message(message.clone());
                 let _ = frame
                     .event_tx
@@ -3373,7 +3453,7 @@ async fn handle_tool_calls_path(
     );
 
     Ok(TurnOutcome {
-        should_break: false,
+        should_break: waiting_for_exec,
         sent_complete: false,
     })
 }
@@ -3846,15 +3926,19 @@ async fn run_pipeline_inner(
         );
         if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
-                if maybe_background_quiet_exec(
+                if maybe_suspend_for_background_exec(
                     session,
                     config,
                     &mut state.runtime_state,
                     event_tx,
                     handle,
                 )
-                .await?
-                {
+                .await
+                .map_err(|error| {
+                    AgentError::Tool(format!(
+                        "Background command wait could not be saved: {error}"
+                    ))
+                })? {
                     break;
                 }
             }

@@ -217,7 +217,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // use the default Engine packages-3 and LLM packages-2 owners.
 // #2916 retains the default Server library, native Work and Ready Work owners
 // for Chat and Work settings. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "9a60baa2386ac5a2a54b1432a699b49b333bc8e51a3c78545bd7d55e270a7f7e";
+// #2922 changes the existing feature-sensitive SubAgent adapter. Exec wait
+// cases use the default Agent, Engine and Server owners; nested creation stays
+// in default server-other. The additive contexts and case names are unchanged.
+const FEATURE_SOURCE_SHA256 = "65351a27163a4d89e63ac269424656b474f5e24ae03e1a2629592850da93212b";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
