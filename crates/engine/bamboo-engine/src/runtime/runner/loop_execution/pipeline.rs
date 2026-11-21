@@ -10786,6 +10786,226 @@ mod tests {
             .set_body_string(sse)
     }
 
+    #[tokio::test]
+    async fn retired_bash_recovers_on_next_model_request() {
+        use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer};
+
+        struct DelegateProbe;
+
+        #[async_trait::async_trait]
+        impl Tool for DelegateProbe {
+            fn name(&self) -> &str {
+                "SubAgent"
+            }
+
+            fn description(&self) -> &str {
+                "Delegate work to an authorized worker."
+            }
+
+            fn parameters_schema(&self) -> Value {
+                json!({"type":"object","properties":{"action":{"type":"string"}}})
+            }
+
+            async fn invoke(&self, _args: Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+                Ok(ToolOutcome::Completed(ToolResult::text(true, "delegated")))
+            }
+        }
+
+        let tool_response = |id: &str, name: &str, arguments: Value| {
+            mock_messages_completion(
+                json!({"type":"tool_use","id":id,"name":name,"input":{}}),
+                json!({"type":"input_json_delta","partial_json":arguments.to_string()}),
+                "tool_use",
+                Some(6),
+            )
+        };
+        let finished = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"Recovery complete."}),
+            "end_turn",
+            Some(3),
+        );
+        let retired = "Tool 'Bash' has been retired.";
+        for scenario in ["standard", "ultra", "disabled", "plan", "supervisor"] {
+            let direct = scenario == "standard";
+            let recovery_tool = match scenario {
+                "standard" => Some(("exec_command", json!({"cmd":"echo recovered-shell"}))),
+                "ultra" | "disabled" => Some(("SubAgent", json!({"action":"create"}))),
+                _ => None,
+            };
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(tool_response(
+                    "toolu_retired",
+                    "Bash",
+                    json!({"command":"echo retired-call-must-not-run"}),
+                ))
+                .with_priority(3)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let response = recovery_tool
+                .as_ref()
+                .map(|(name, args)| tool_response("toolu_recovery", name, args.clone()))
+                .unwrap_or_else(|| finished.clone());
+            Mock::given(method("POST"))
+                .and(body_string_contains(retired))
+                .and(body_string_contains(match scenario {
+                    "standard" => "call `exec_command` with the command in `cmd`",
+                    "plan" => "This session is in read-only Plan mode",
+                    _ => "Delegate it to an authorized execution session",
+                }))
+                .respond_with(response)
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            if let Some((name, _)) = &recovery_tool {
+                let output = if *name == "exec_command" {
+                    "recovered-shell"
+                } else {
+                    "delegated"
+                };
+                Mock::given(method("POST"))
+                    .and(body_string_contains(retired))
+                    .and(body_string_contains(output))
+                    .respond_with(finished.clone())
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let llm = bamboo_llm::AnthropicProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+            let tools = bamboo_tools::BuiltinToolExecutor::new();
+            tools.registry().register(DelegateProbe).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(directory.path().into());
+            config.run_budget.max_rounds = Some(3);
+            if scenario == "disabled" {
+                config.disabled_tools.insert("exec_command".into());
+            } else if scenario == "plan" {
+                config.permission_mode = Some(bamboo_config::PermissionMode::Plan);
+            }
+            let mut session = if scenario == "supervisor" {
+                let mut supervisor =
+                    Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                supervisor.authority_identity =
+                    bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                assert!(supervisor.supervisor_incarnation_id().is_some());
+                supervisor
+            } else {
+                Session::new(&format!("retired-shell-{scenario}"), "model")
+            };
+            if direct {
+                bamboo_agent_core::workspace_state::publish_resolved_workspace(
+                    &session.id,
+                    directory.path().to_path_buf(),
+                );
+            }
+            session
+                .set_root_orchestration_only(scenario == "ultra")
+                .unwrap();
+            session.add_message(Message::user("Follow the available recovery path."));
+            let mut state = e2e_loop_state(&session.id);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                Arc::new(tools),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+            assert!(complete, "{scenario}");
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                2 + usize::from(recovery_tool.is_some()),
+                "{scenario}"
+            );
+            let next: Value = requests[1].body_json().unwrap();
+            let tool_result = next["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|block| block["tool_use_id"] == "toolu_retired")
+                .expect("model receives the retired tool result");
+            assert_eq!(tool_result["type"], "tool_result");
+            assert!(tool_result["content"].to_string().contains(retired));
+            assert_eq!(
+                tool_result["content"].to_string().contains("exec_command"),
+                direct
+            );
+            let rejected = session
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("toolu_retired"))
+                .expect("rejection is recorded against the original call");
+            assert_eq!(rejected.tool_success, Some(false));
+            for request in requests {
+                let body: Value = request.body_json().unwrap();
+                let definitions = body["tools"].as_array().unwrap();
+                assert!(
+                    definitions.iter().all(|tool| tool["name"] != "Bash"),
+                    "{scenario}"
+                );
+            }
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(|event| {
+                matches!(event, AgentEvent::ToolError { tool_call_id, error }
+                    if tool_call_id == "toolu_retired" && error.contains(retired))
+            }));
+            let started = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolStart { tool_name, .. } => Some(tool_name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                started,
+                recovery_tool
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+                "{scenario}",
+            );
+            if recovery_tool.is_some() {
+                let result = session
+                    .messages
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some("toolu_recovery"))
+                    .expect("recovery tool completes");
+                assert_eq!(
+                    result.tool_success,
+                    Some(true),
+                    "{scenario}: {}",
+                    result.content
+                );
+                assert!(result.content.contains(if direct {
+                    "recovered-shell"
+                } else {
+                    "delegated"
+                }));
+            }
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct OutputLimitExecutor(AtomicUsize);
 

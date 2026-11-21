@@ -332,10 +332,12 @@ pub(super) async fn execute_model_requested_tool_call_only(
         effective_callable_set,
         &ctx.tool_call.function.name,
     ) else {
-        let message = format!(
-            "Tool '{}' is not callable at the current conversation position",
-            ctx.tool_call.function.name
-        );
+        let message = retired_shell_call_error(effective_callable_set, &ctx).unwrap_or_else(|| {
+            format!(
+                "Tool '{}' is not callable at the current conversation position",
+                ctx.tool_call.function.name
+            )
+        });
         tracing::warn!(
             "[{}][round:{}] Tool call rejected by capability loading before ToolStart: tool_call_id={}, tool_name={}",
             ctx.session_id,
@@ -347,6 +349,36 @@ pub(super) async fn execute_model_requested_tool_call_only(
     };
 
     execute_tool_call_only_with_execution_name(&execution_name, ctx).await
+}
+
+fn retired_shell_call_error(
+    callable: &EffectiveCallableSet,
+    ctx: &ToolExecutionOnlyContext<'_>,
+) -> Option<String> {
+    let reference = ctx.tool_call.function.name.trim();
+    let replacement = bamboo_domain::tool_names::retired_shell_tool_replacement(reference)?;
+    let can_use_replacement = !ctx.root_orchestration_only
+        && ctx.executing_supervisor.is_none()
+        && !ctx.session_flags.plan_read_only
+        && callable.contains_execution_name(replacement)
+        && ctx.tools.owns_exact_tool(replacement);
+    let recovery = match (replacement, can_use_replacement) {
+        ("exec_command", true) => {
+            "If the command is still needed, call `exec_command` with the command in `cmd`."
+        }
+        ("write_stdin", true) => {
+            "Use `write_stdin` only with a valid `session_id` returned by `exec_command`. Legacy shell IDs cannot be reused."
+        }
+        _ if ctx.session_flags.plan_read_only => {
+            "This session is in read-only Plan mode. Report that an authorized execution session is needed."
+        }
+        _ => {
+            "This session cannot perform that shell operation. Delegate it to an authorized execution session through an available delegation tool. If no authorized route is available, report the blocker."
+        }
+    };
+    Some(format!(
+        "Tool '{reference}' has been retired. Do not retry or search for it. {recovery}"
+    ))
 }
 
 #[cfg(test)]

@@ -175,14 +175,12 @@ impl ShellSession {
     /// exited shell's pipe is gone.
     pub async fn write_stdin(&self, data: &str, append_newline: bool) -> Result<(), String> {
         let mut guard = self.stdin.lock().await;
-        let stdin =
-            guard.as_mut().ok_or_else(|| {
-                format!(
-                "Shell '{}' has no interactive stdin pipe; spawn it via {} with interactive=true",
+        let stdin = guard.as_mut().ok_or_else(|| {
+            format!(
+                "Shell '{}' has no interactive stdin pipe. Use exec_command with interactive=true for commands that need input.",
                 self.id,
-                if self.is_model_polled() { "exec_command" } else { "Bash" }
             )
-            })?;
+        })?;
         let mut bytes = data.as_bytes().to_vec();
         if append_newline {
             bytes.push(b'\n');

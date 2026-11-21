@@ -304,14 +304,21 @@ async fn supervisor_native_direct_files_and_processes_never_enter_executor_in_bo
                     panic!("missing result: mode={ultra}, tool={}", call.function.name)
                 });
             assert_eq!(result.tool_success, Some(false), "{result:?}");
-            let legacy_alias =
-                call.function.name == "Bash" || call.function.name.starts_with("default::");
-            assert!(
+            let denied = if call.function.name == "Bash" {
+                result.content.contains("Tool 'Bash' has been retired")
+                    && result
+                        .content
+                        .contains("Delegate it to an authorized execution session")
+                    && !result.content.contains("exec_command")
+            } else {
                 result.content.contains("supervisor_delegation_required")
-                    || (legacy_alias
+                    || (call.function.name.starts_with("default::")
                         && result
                             .content
-                            .contains("not callable at the current conversation position")),
+                            .contains("not callable at the current conversation position"))
+            };
+            assert!(
+                denied,
                 "unexpected denial: mode={ultra}, tool={}, result={result:?}",
                 call.function.name
             );
