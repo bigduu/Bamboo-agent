@@ -2976,14 +2976,14 @@ impl ChildCompletionCoordinator {
 fn bash_completion_resume_message(bash_ids: &[String], timed_out: bool) -> Message {
     let body = if timed_out {
         format!(
-            "Runtime notification: the background-Bash wait ceiling was reached while one or more \
+            "Runtime notification: the background shell wait ceiling was reached while one or more \
              shell(s) ({}) may still be running. Verify the command's expected effects before \
              assuming completion or restarting it.",
             bash_ids.join(", ")
         )
     } else {
         format!(
-            "Runtime notification: all background Bash shell(s) ({}) have completed. \
+            "Runtime notification: all background shells ({}) have completed. \
              Review the recorded output and exit status before continuing the task.",
             bash_ids.join(", ")
         )

@@ -271,7 +271,7 @@ pub const GUARDIAN_REVIEW_RUBRIC: &str = r#"You are an adversarial code reviewer
 Verify, do not trust:
 - Inspect the implementer's exact changed-file/diff evidence. If it is absent or insufficient, reject with the exact evidence still needed.
 - Read the named changed files and the surrounding code with the dedicated read/search tools to judge correctness.
-- Inspect the implementer's exact test/build evidence. Do not invoke Bash, shells, builds, tests, package managers, repository programs, or executable helpers: ambient command resolution is not a hard read-only boundary. If required evidence is absent or insufficient, reject with the exact verification still needed.
+- Inspect the implementer's exact test/build evidence. Do not run shell commands, builds, tests, package managers, repository programs, or executable helpers: ambient command resolution is not a hard read-only boundary. If required evidence is absent or insufficient, reject with the exact verification still needed.
 - Check every completion criterion below against real evidence, not the agent's claims.
 
 Be skeptical. Flag real bugs, missed requirements, broken or skipped tests, and unmet criteria. You are READ-ONLY: do not modify files.
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn guardian_rubric_requests_only_non_executable_verification() {
         assert!(GUARDIAN_REVIEW_RUBRIC.contains("dedicated read/search tools"));
-        assert!(GUARDIAN_REVIEW_RUBRIC.contains("Do not invoke Bash"));
+        assert!(GUARDIAN_REVIEW_RUBRIC.contains("Do not run shell commands"));
         assert!(!GUARDIAN_REVIEW_RUBRIC.contains("`cargo test`"));
         assert!(!GUARDIAN_REVIEW_RUBRIC.contains("`git status`"));
     }

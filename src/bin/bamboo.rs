@@ -80,7 +80,7 @@ struct Cli {
     /// With -p: permission mode for the headless run, which has no interactive
     /// approver. One of: default | plan | accept-edits | dont-ask | bypass.
     /// Use `bypass` to let a tool-using agent run unattended (otherwise the run
-    /// stalls at the first permission-gated tool such as Bash).
+    /// stalls at the first permission-gated tool such as exec_command).
     #[arg(long = "permission-mode")]
     permission_mode: Option<String>,
 
@@ -947,7 +947,7 @@ enum ConfigAction {
     ///
     /// Any other key is a generic validated dot-path into config.json
     /// (e.g. `server.port 9563`, `features.provider_model_ref true`,
-    /// `tools.disabled '["Bash"]'`). The value is parsed as JSON when it
+    /// `tools.disabled '["exec_command"]'`). The value is parsed as JSON when it
     /// parses, else taken as a string; unknown keys and type mismatches are
     /// rejected before anything is written. `proxy_auth.*` and `*_encrypted`
     /// keys cannot be set here.
