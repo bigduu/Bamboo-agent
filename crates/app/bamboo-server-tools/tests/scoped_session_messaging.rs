@@ -192,6 +192,27 @@ fn result(outcome: ToolOutcome) -> Value {
 }
 
 #[tokio::test]
+async fn retired_bash_search_does_not_load_session_message() {
+    use bamboo_domain::ClassifiedToolSchema;
+    use bamboo_tools::tool_search::ToolSearchIndex;
+
+    let fixture = Fixture::new().await;
+    let peer_tool = SessionMessageTool::new(fixture.messenger.clone());
+    let scoped_tool = fixture.tool();
+    let loop_control = bamboo_tools::tools::loop_control::LoopControlTool::new();
+    let loop_schema = ClassifiedToolSchema::new(loop_control.to_schema()).unwrap();
+    for tool in [peer_tool, scoped_tool] {
+        let schema = ClassifiedToolSchema::new(tool.to_schema()).unwrap();
+        let index = ToolSearchIndex::from_resolved_catalog([&schema, &loop_schema]);
+        assert!(index.search("Bash", None).unwrap().is_empty());
+        assert_eq!(
+            index.search("session_message", None).unwrap(),
+            ["session_message"]
+        );
+    }
+}
+
+#[tokio::test]
 async fn observed_peer_entry_rejects_stale_original_before_canonical_admission() {
     let fixture = Fixture::new().await;
     let mut stale = SessionCallerReference::from(&fixture.sender);

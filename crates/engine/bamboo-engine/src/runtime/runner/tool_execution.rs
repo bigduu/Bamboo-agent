@@ -186,7 +186,11 @@ async fn execute_and_apply_single_tool_call(
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
-        if !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name) {
+        // An unavailable legacy shell call will be rejected by admission with
+        // recovery guidance that respects the same read-only flag.
+        let retired_shell = admitted_execution_name.is_none()
+            && bamboo_domain::tool_names::retired_shell_tool_replacement(tool_name).is_some();
+        if !retired_shell && !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name) {
             tracing::warn!(
                 "[{}][round:{}] Plan mode blocked mutating tool: tool_call_id={}, tool_name={}",
                 session_id,
