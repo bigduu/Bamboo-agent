@@ -331,6 +331,19 @@ pub struct BackgroundExecJob {
     shell: Arc<bash_runtime::ShellSession>,
 }
 
+pub const WAIT_FOR_EXEC_DISPLAY: &str = "runtime_control:waiting_for_exec";
+
+pub(super) fn owned_exec(owner: &str, handle: &str) -> Option<Arc<bash_runtime::ShellSession>> {
+    bash_runtime::get_shell(handle)
+        .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
+}
+
+/// None leaves non-exec targets to the caller's ordinary dispatch.
+pub async fn exec_wait_target(owner: &str, handle: &str) -> Option<bool> {
+    let shell = owned_exec(owner, handle)?;
+    Some(!shell.stdin_is_open().await)
+}
+
 impl BackgroundExecJob {
     pub fn id(&self) -> &str {
         &self.shell.id
@@ -385,10 +398,7 @@ impl Drop for BackgroundExecJob {
 /// Reserve only an exact handle from this owner's pull-session registry.
 /// Legacy Bash shells and another owner's handles cannot be handed off.
 pub fn reserve_background_job(owner: &str, handle: &str) -> Option<BackgroundExecJob> {
-    let shell = bash_runtime::get_shell(handle)?;
-    if shell.session_id.as_deref() != Some(owner) {
-        return None;
-    }
+    let shell = owned_exec(owner, handle)?;
     shell
         .polled
         .as_ref()?
@@ -745,7 +755,7 @@ impl Tool for ExecCommandTool {
          Send independent checks as separate tool calls in the same response. \
          Inspect a result before choosing any command that depends on it. \
          Keep builds and tests you need to verify attached to this call. \
-         A running command returns a session_id. Use empty write_stdin on that handle to wait for output and the exit code. \
+         A running command returns a session_id. An ordinary Root with SubAgent can wait for a non-interactive command using intent=wait and that exact session_id. Use write_stdin for interactive input or output and exit status when needed. \
          Preserve the command's own exit status when piping test output. \
          interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
     }

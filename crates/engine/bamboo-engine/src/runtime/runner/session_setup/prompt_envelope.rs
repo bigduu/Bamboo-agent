@@ -57,9 +57,9 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
 /// work. Keep this independent of the current SubAgent action schema: the
 /// runtime will continue to own the concrete delegation and inspection calls.
 const ROOT_ORCHESTRATION_INTRO: &str = "Root delegation mode (explicitly selected for this Session):\n\
-Own task boundaries, ordering, progress, integration, and the final response. Delegate independently verifiable work when useful; keep the root available to coordinate. Split multi-part work into non-overlapping independently verifiable slices and run them as parallel children; serialize dependent slices or shared-file writes.";
+Own task boundaries, ordering, progress, integration, and the final response. Give ready, independently verifiable directions or slices to parallel children within available capacity and budget. Sequence dependent work, overlapping writes, and jobs competing for the same constrained compute.";
 
-const ROOT_ORCHESTRATION_GUIDANCE: &str = "Give each child a narrow objective, in-scope files or systems, non-goals, expected evidence, and a time or budget bound. Shared background is context, not permission to widen scope.\n\
+const ROOT_ORCHESTRATION_GUIDANCE: &str = "Give each child scope, non-goals, required evidence, and a budget. Explicitly authorize scoped nested delegation when useful.\n\
 Inspect authoritative child progress and results when needed. Correct or revise the same child's assignment, then confirm the child received the change.\n\
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
@@ -67,7 +67,7 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
-Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work. Sequence jobs competing for the same constrained compute.\n\
 Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
 This mode is independent of each model call's reasoning effort.";
 

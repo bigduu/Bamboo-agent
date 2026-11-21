@@ -6,6 +6,7 @@ use super::RoundToolExecutionResult;
 pub(super) struct RoundExecutionState {
     pub single_tool_call: bool,
     pub quiet_exec_handle: Option<String>,
+    pub explicit_exec_waits: Vec<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,
@@ -17,6 +18,7 @@ impl Default for RoundExecutionState {
         Self {
             single_tool_call: false,
             quiet_exec_handle: None,
+            explicit_exec_waits: Vec::new(),
             awaiting_clarification: false,
             waiting_for_children: false,
             round_status: MetricsRoundStatus::Success,
@@ -52,6 +54,7 @@ impl RoundExecutionState {
     pub(super) fn into_result(self) -> RoundToolExecutionResult {
         RoundToolExecutionResult {
             quiet_exec_handle: self.quiet_exec_handle,
+            explicit_exec_waits: self.explicit_exec_waits,
             awaiting_clarification: self.awaiting_clarification,
             waiting_for_children: self.waiting_for_children,
             round_status: self.round_status,

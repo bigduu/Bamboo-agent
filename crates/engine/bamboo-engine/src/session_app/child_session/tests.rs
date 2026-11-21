@@ -65,6 +65,15 @@ fn child_contract_append_is_canonical_idempotent_and_preserves_custom_base() {
 
     assert!(once.starts_with(custom_base));
     assert_eq!(twice, once);
+    for instruction in [
+        "your assignment authorizes nested delegation",
+        "you may spawn your own Children",
+        "Use intent=chat with the scoped assignment in message and omit target",
+        "Launch ready independent slices in parallel within capacity and budget",
+        "Use intent=wait with a direct Child's exact ActorId",
+    ] {
+        assert!(once.contains(instruction), "missing {instruction}");
+    }
     assert_eq!(
         once.matches(SUBAGENT_DELEGATION_CONTRACT_VERSION).count(),
         1
