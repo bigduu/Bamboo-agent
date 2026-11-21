@@ -9,12 +9,30 @@ use serde_json::{json, Value};
 use super::*;
 
 const LAST_POLL: &str = "poll-4";
-const OUTPUT: &str = "quiet command completed";
+const EXPLICIT_WAIT: &str = "wait-for-command";
+const OUTPUT: &str = "command completed";
 const CLI_TIMEOUT_SECS: u64 = 8;
 
-struct QuietExecProvider {
+#[derive(Clone, Copy)]
+enum WaitMode {
+    QuietPolls,
+    Explicit,
+}
+
+impl WaitMode {
+    fn wait_call(self) -> (&'static str, &'static str, usize) {
+        match self {
+            Self::QuietPolls => (LAST_POLL, "session_id", 5),
+            Self::Explicit => (EXPLICIT_WAIT, "target", 2),
+        }
+    }
+}
+
+struct ExecWaitProvider {
     gate: PathBuf,
     calls: AtomicUsize,
+    mode: WaitMode,
+    exit_code: u8,
 }
 
 fn tool_result(messages: &[Message], id: &str) -> Value {
@@ -37,7 +55,7 @@ fn call(id: &str, name: &str, arguments: Value) -> LLMChunk {
 }
 
 #[async_trait::async_trait]
-impl LLMProvider for QuietExecProvider {
+impl LLMProvider for ExecWaitProvider {
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -50,19 +68,56 @@ impl LLMProvider for QuietExecProvider {
         }
         assert!(!tools.iter().any(|tool| tool.function.name == "bash"));
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (wait_call_id, _, terminal_round) = self.mode.wait_call();
         let chunk = match round {
             0 => {
                 let gate = self.gate.to_string_lossy().replace('\'', "'\\''");
                 let command = format!(
                     "n=0; while [ ! -f '{gate}' ] && [ \"$n\" -lt 800 ]; do \
                      sleep 0.05; n=$((n+1)); done; [ -f '{gate}' ] || exit 90; \
-                     printf '%s' '{OUTPUT}'; exit 7"
+                     printf '%s' '{OUTPUT}'; exit {}",
+                    self.exit_code
                 );
                 call(
                     "start",
                     "exec_command",
                     json!({"cmd": command, "yield_time_ms": 250}),
                 )
+            }
+            1 if matches!(self.mode, WaitMode::Explicit) => {
+                assert!(tools.iter().any(|tool| tool.function.name == "SubAgent"));
+                let start = tool_result(messages, "start");
+                assert_eq!(start["status"], "running");
+                call(
+                    EXPLICIT_WAIT,
+                    "SubAgent",
+                    json!({"intent": "wait", "target": start["session_id"]}),
+                )
+            }
+            round if round == terminal_round => {
+                let result = tool_result(messages, wait_call_id);
+                match self.mode {
+                    WaitMode::QuietPolls => assert_eq!(result["status"], "running"),
+                    WaitMode::Explicit => {
+                        assert_eq!(result["status"], "wait_requested");
+                        assert_eq!(
+                            result["session_id"],
+                            tool_result(messages, "start")["session_id"]
+                        );
+                    }
+                }
+                let notification = messages
+                    .iter()
+                    .find(|m| {
+                        m.content
+                            .starts_with("Runtime notification: background exec command")
+                    })
+                    .expect("runner must deliver terminal evidence before calling the model");
+                assert!(notification
+                    .content
+                    .contains(&format!(r#""exit_code":{}"#, self.exit_code)));
+                assert!(notification.content.contains(OUTPUT));
+                LLMChunk::Token("Received the terminal result.".into())
             }
             1..=4 => {
                 let start = tool_result(messages, "start");
@@ -79,20 +134,6 @@ impl LLMProvider for QuietExecProvider {
                     json!({"session_id": start["session_id"], "chars": "", "yield_time_ms": 250}),
                 )
             }
-            5 => {
-                let result = tool_result(messages, LAST_POLL);
-                assert_eq!(result["status"], "running");
-                let notification = messages
-                    .iter()
-                    .find(|m| {
-                        m.content
-                            .starts_with("Runtime notification: background exec command")
-                    })
-                    .expect("runner must deliver terminal evidence before calling the model");
-                assert!(notification.content.contains(r#""exit_code":7"#));
-                assert!(notification.content.contains(OUTPUT));
-                LLMChunk::Token("Received the terminal result.".into())
-            }
             _ => panic!("unexpected provider round {round}"),
         };
         Ok(Box::pin(futures::stream::iter([
@@ -102,12 +143,14 @@ impl LLMProvider for QuietExecProvider {
     }
 }
 
-async fn run_quiet_exec(should_time_out: bool) {
+async fn run_exec_wait(mode: WaitMode, should_time_out: bool, exit_code: u8) {
     let dir = tempfile::tempdir().unwrap();
-    let session_id = format!("headless-quiet-exec-{}", uuid::Uuid::new_v4());
-    let provider = Arc::new(QuietExecProvider {
+    let session_id = format!("headless-exec-wait-{}", uuid::Uuid::new_v4());
+    let provider = Arc::new(ExecWaitProvider {
         gate: dir.path().join("release"),
         calls: AtomicUsize::new(0),
+        mode,
+        exit_code,
     });
     let config = crate::model_entrypoint_routing_tests::config(true, "chat-a");
     let state = AppState::new_with_provider_and_memory_store(
@@ -138,7 +181,7 @@ async fn run_quiet_exec(should_time_out: bool) {
     let started = Instant::now();
     let run = run_with_state(
         HeadlessArgs {
-            prompt: "Run the synthetic quiet command.".into(),
+            prompt: "Run the command and check its exit status.".into(),
             session: Some(session_id.clone()),
             model: None,
             workspace: None,
@@ -154,6 +197,7 @@ async fn run_quiet_exec(should_time_out: bool) {
         state,
     );
     tokio::pin!(run);
+    let (wait_call_id, target_key, rounds_before_completion) = mode.wait_call();
     let fixture_timeout = Duration::from_secs(CLI_TIMEOUT_SECS + 20);
     let result = tokio::time::timeout(fixture_timeout, async {
         let mut handle = None;
@@ -167,10 +211,12 @@ async fn run_quiet_exec(should_time_out: bool) {
                     tool_call_id,
                     arguments,
                     ..
-                } if tool_call_id == LAST_POLL => {
-                    handle = arguments["session_id"].as_str().map(str::to_owned);
+                } if tool_call_id == wait_call_id => {
+                    handle = arguments[target_key].as_str().map(str::to_owned);
                 }
-                AgentEvent::ToolComplete { tool_call_id, .. } if tool_call_id == LAST_POLL => break,
+                AgentEvent::ToolComplete { tool_call_id, .. } if tool_call_id == wait_call_id => {
+                    break
+                }
                 _ => {}
             }
         }
@@ -178,7 +224,10 @@ async fn run_quiet_exec(should_time_out: bool) {
             result = &mut run => panic!("headless exited with a live command: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(750)) => {},
         }
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            rounds_before_completion
+        );
         if !should_time_out {
             tokio::fs::write(&provider.gate, b"release").await.unwrap();
         }
@@ -201,19 +250,37 @@ async fn run_quiet_exec(should_time_out: bool) {
     if should_time_out {
         assert!(result.unwrap_err().contains("cancelled"));
         assert!(started.elapsed() >= Duration::from_secs(CLI_TIMEOUT_SECS));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            rounds_before_completion
+        );
     } else {
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            rounds_before_completion + 1
+        );
     }
 }
 
 #[tokio::test]
 async fn headless_quiet_exec_waits_for_the_real_exit_after_the_poll_returns() {
-    run_quiet_exec(false).await;
+    run_exec_wait(WaitMode::QuietPolls, false, 7).await;
 }
 
 #[tokio::test]
 async fn headless_quiet_exec_wait_respects_cli_timeout() {
-    run_quiet_exec(true).await;
+    run_exec_wait(WaitMode::QuietPolls, true, 7).await;
+}
+
+#[tokio::test]
+async fn headless_explicit_wait_reports_success_and_failure_without_model_polling() {
+    for exit_code in [0, 7] {
+        run_exec_wait(WaitMode::Explicit, false, exit_code).await;
+    }
+}
+
+#[tokio::test]
+async fn headless_explicit_wait_obeys_the_run_deadline() {
+    run_exec_wait(WaitMode::Explicit, true, 7).await;
 }

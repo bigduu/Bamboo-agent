@@ -1468,6 +1468,30 @@ async fn apply_completed_tool_execution_outcome(
             )?;
         }
     }
+    // The tool has validated the exact target. Recover it from the call so a
+    // small tool-output budget cannot erase the runtime's wait request.
+    if ctx.admitted_execution_name == Some("SubAgent")
+        && outcome.result.as_ref().is_ok_and(|result| {
+            result.success
+                && result.display_preference.as_deref()
+                    == Some(bamboo_tools::tools::exec_command::WAIT_FOR_EXEC_DISPLAY)
+        })
+    {
+        let arguments =
+            serde_json::from_str::<serde_json::Value>(&ctx.tool_call.function.arguments);
+        let handle = arguments
+            .as_ref()
+            .ok()
+            .and_then(|value| value["target"].as_str());
+        if let Some(handle) = handle.filter(|handle| {
+            !ctx.state
+                .explicit_exec_waits
+                .iter()
+                .any(|id| id.as_str() == *handle)
+        }) {
+            ctx.state.explicit_exec_waits.push(handle.to_owned());
+        }
+    }
     // Read the shell envelope before post-hook feedback appends prose. Only
     // the admitted exact identity selects command-specific task accounting.
     let task_progress_result = task_progress_result_for_outcome(&outcome);

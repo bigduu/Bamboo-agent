@@ -1,14 +1,11 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, time::Duration};
 
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{
-    bash_runtime,
-    exec_command::{owner_session, poll_result, yield_duration, EmptyPoll},
-};
+use super::exec_command::{owned_exec, owner_session, poll_result, yield_duration, EmptyPoll};
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 
@@ -31,11 +28,6 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     eof: bool,
-}
-
-fn owned_exec(owner: &str, id: &str) -> Option<Arc<bash_runtime::ShellSession>> {
-    bash_runtime::get_shell(id)
-        .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
 }
 
 /// Honor a longer empty poll or continue a quiet one within the runner's

@@ -3086,7 +3086,7 @@ async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
         .max_spawn_depth = Some(1);
     for (index, args) in [
         json!({"action":"create","title":"Child","responsibility":"Inspect","prompt":"Inspect","workspace":h.workspace_path,"auto_run":false}),
-        json!({"message":"Inspect the assigned scope"}),
+        json!({"intent":"chat","message":"Inspect the assigned scope"}),
     ].into_iter().enumerate() {
         let error = invoke_completed(
             &h.tool,
@@ -3128,7 +3128,7 @@ async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
     // The same valid compact create rejected above now succeeds after reload.
     let second = invoke_completed(
         &h.tool,
-        json!({"message":"Inspect the assigned scope"}),
+        json!({"intent":"chat","message":"Inspect the assigned scope"}),
         ctx_for(&child.id, "depth-raised").to_tool_ctx(),
     )
     .await
@@ -3141,6 +3141,10 @@ async fn spawn_depth_reload_changes_later_creation_without_rewriting_lineage() {
         .unwrap()
         .unwrap();
     assert_eq!(grandchild.spawn_depth, 3);
+    assert_eq!(
+        grandchild.parent_session_id.as_deref(),
+        Some(child.id.as_str())
+    );
     assert_eq!(grandchild.root_session_id, h.parent_session_id);
 }
 

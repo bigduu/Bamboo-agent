@@ -732,6 +732,33 @@ impl Tool for SubAgentTool {
                 ));
             }
         }
+        if projection == Some(Projection::Wait) && !ctx.plan_read_only {
+            if let Some((caller, target)) = ctx
+                .session_id()
+                .and_then(|id| ctx.executing_caller_for(id))
+                .filter(|caller| caller.is_ordinary_root())
+                .zip(args["child_session_ids"][0].as_str())
+            {
+                use bamboo_tools::tools::exec_command::{exec_wait_target, WAIT_FOR_EXEC_DISPLAY};
+                match exec_wait_target(&caller.session_id, target).await {
+                    Some(true) => {
+                        let result = json!({"status": "wait_requested", "session_id": target});
+                        return Ok(ToolOutcome::Completed(ToolResult {
+                            success: true,
+                            result: result.to_string(),
+                            display_preference: Some(WAIT_FOR_EXEC_DISPLAY.into()),
+                            images: Vec::new(),
+                        }));
+                    }
+                    Some(false) => {
+                        return Err(ToolError::InvalidArguments(
+                            "This command has an open stdin pipe. Use write_stdin for interactive input, or close stdin before waiting for exit.".into(),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+        }
         if projection == Some(Projection::Tree) {
             let parent_id = ctx.session_id().ok_or_else(|| {
                 ToolError::Execution("SubAgent requires a current session".into())
