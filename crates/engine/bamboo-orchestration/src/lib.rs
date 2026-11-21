@@ -13,6 +13,7 @@ pub mod work_review;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     path::Path,
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -33,6 +34,18 @@ use ready_recovery::{ReadyRecovery, RetryContext, RetryGate, RetryPermit};
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSIENT_ATTEMPT_LIMIT: u8 = 3;
+
+/// Scope-wide Work admission applies to direct and scheduled Starts.
+pub fn check_work_dispatch_capacity(snapshot: &Snapshot, limit: Option<NonZeroU32>) -> Result<()> {
+    if let Some(limit) = limit {
+        if snapshot.occupied_dispatch_slots() >= limit.get() as usize {
+            return Err(Error::ResourceBlocked(format!(
+                "Parallel Work limit reached ({limit}). Retry when a slot is available."
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// One explicitly authorized initial attempt, never a client/model DTO.
 #[derive(Clone, Debug)]
@@ -193,6 +206,9 @@ impl ReadyAdmissionFence {
 pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
+    async fn work_dispatch_capacity(&self) -> Option<NonZeroU32> {
+        None
+    }
     /// Observe only the Works selected by this already installed Host policy.
     /// The Host may stage a bounded decision notice or a diagnostic under
     /// this live fence and the canonical Work budget. The pass grants no
@@ -754,12 +770,18 @@ impl ReadyWorkScheduler {
             authority_epoch: snapshot.authority_epoch,
         };
         let operation_id = format!("host-ready/{}/{}", snapshot.authority_epoch, snapshot.seq);
+        let capacity = host
+            .work_dispatch_capacity()
+            .await
+            .map_or(policy.capacity, |limit| {
+                policy.capacity.min(limit.get() as usize)
+            });
         match service.prepare_ready_claim(
             &authority,
             &observed,
             &operation_id,
             &candidates,
-            policy.capacity,
+            capacity,
         )? {
             ClaimDecision::CapacityBlocked { occupied, capacity } => {
                 Ok(pending_wait.unwrap_or(ReadyReconcile::CapacityBlocked { occupied, capacity }))

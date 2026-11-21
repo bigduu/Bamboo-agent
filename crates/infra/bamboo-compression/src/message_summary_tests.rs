@@ -442,21 +442,90 @@ fn an_older_unanswered_call_cannot_be_archived_during_legacy_tool_work() {
 }
 
 #[test]
-fn protected_tool_chain_blocks_message_summary() {
+fn protected_tool_batch_does_not_block_message_summary() {
     for protect_call in [true, false] {
         let mut session = Session::new("message-summary-protected-tool", "test-model");
-        let mut call = tool_call("protected", "calling", "load_skill");
-        let mut result = Message::tool_result("protected", "guidance");
+        session.add_message(Message::user("old request"));
+        // An earlier batch can reuse the provider's call ID without inheriting
+        // the later batch's pin.
+        session.add_message(tool_call("reused", "old assistant prose", "Read"));
+        session.add_message(Message::tool_result("reused", "old unpinned result"));
+        let mut call = tool_call(
+            "reused",
+            "protected assistant prose",
+            "discover_capabilities",
+        );
+        call.tool_calls
+            .as_mut()
+            .unwrap()
+            .extend(tool_call("sibling", "", "Read").tool_calls.unwrap());
+        let mut result = Message::tool_result("reused", "protected discovery result");
         call.never_compress = protect_call;
         result.never_compress = !protect_call;
+        let sibling = Message::tool_result("sibling", "unmarked sibling result");
+        let retained_ids = [call.id.clone(), sibling.id.clone(), result.id.clone()];
         session.add_message(call);
+        session.add_message(sibling);
         session.add_message(result);
+        session.add_message(Message::assistant("later prose", None));
         session.add_message(Message::user("current request"));
-        assert!(matches!(
-            candidate(&session),
-            Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
-        ));
+
+        let candidate = candidate(&session).expect("eligible history can be compacted");
+        assert_eq!(candidate.compressed_message_ids.len(), 4);
+        assert_eq!(
+            candidate
+                .messages_to_summarize
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["old request", "old assistant prose", "later prose"]
+        );
+        let plan =
+            finalize_compression_candidate_plan(&session, candidate, "summary".into()).unwrap();
+        assert_eq!(apply_compression_plan(&mut session, plan), 4);
+        let active_tool_ids = session
+            .messages
+            .iter()
+            .filter(|message| !message.compressed)
+            .filter(|message| message.role == Role::Tool || message.tool_calls.is_some())
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(active_tool_ids, retained_ids.each_ref().map(String::as_str));
+        bamboo_domain::validate_message_summary_tool_protocol(&session).unwrap();
     }
+}
+
+#[test]
+fn incomplete_pinned_tool_batch_remains_a_blocker_after_a_new_user_turn() {
+    let mut session = Session::new("message-summary-pinned-incomplete", "test-model");
+    session.add_message(Message::user("older request"));
+    let mut call = tool_call("pending", "", "discover_capabilities");
+    call.never_compress = true;
+    session.add_message(call);
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+
+    session.add_message(Message::user("new request"));
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
+    ));
+}
+
+#[test]
+fn message_summary_rejects_a_message_identifier_shared_across_retention() {
+    let mut session = Session::new("message-summary-shared-message-id", "test-model");
+    let retained = Message::user("current request");
+    let mut archived = Message::user("older request");
+    archived.id.clone_from(&retained.id);
+    session.add_message(archived);
+    session.add_message(retained);
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
+    ));
 }
 
 #[test]

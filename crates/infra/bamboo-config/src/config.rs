@@ -2662,6 +2662,12 @@ pub struct FeatureFlags {
     /// Actual fresh one-shot dispatch; independent of Ticket record writes.
     #[serde(default)]
     pub ticket_dispatch: bool,
+    /// Defaults and admission capacity for Supervisor Work execution.
+    #[serde(default)]
+    pub work_execution: WorkExecutionSettings,
+    /// Start new interactive chats in Root Ultra mode.
+    #[serde(default)]
+    pub chat_ultra_by_default: bool,
     /// Enable the ProviderModelRef system (multi-provider + unified model selection).
     #[serde(default)]
     pub provider_model_ref: bool,
@@ -2671,6 +2677,15 @@ pub struct FeatureFlags {
     /// Check a final answer once against this request's recorded tool evidence.
     #[serde(default)]
     pub final_evidence_check: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkExecutionSettings {
+    /// Session override for future Work executions. Auto inherits the model route.
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    /// Maximum occupied Work dispatch slots. None uses the existing scheduler limits.
+    pub max_parallel: Option<std::num::NonZeroU32>,
 }
 
 /// Default model assignments for specific capabilities.

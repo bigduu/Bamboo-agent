@@ -5,7 +5,7 @@ use super::*;
 impl SqliteMetricsStorage {
     pub(super) async fn apply_mutations(
         &self,
-        mutations: Vec<MetricsMutation>,
+        mutations: Vec<MetricsWrite>,
     ) -> MetricsResult<Vec<MetricsResult<()>>> {
         let mut results = Vec::with_capacity(mutations.len());
         let mut mutations = mutations.into_iter();
@@ -30,7 +30,7 @@ impl SqliteMetricsStorage {
     }
 }
 
-fn apply_segment(path: &Path, mutations: Vec<MetricsMutation>) -> Vec<MetricsResult<()>> {
+fn apply_segment(path: &Path, mutations: Vec<MetricsWrite>) -> Vec<MetricsResult<()>> {
     let mut results = Vec::with_capacity(mutations.len());
     let mut connection = None;
     for mutation in mutations {
@@ -39,7 +39,7 @@ fn apply_segment(path: &Path, mutations: Vec<MetricsMutation>) -> Vec<MetricsRes
                 connection = Some(open_connection(path)?);
             }
             let connection = connection.as_ref().expect("connection just opened");
-            writes::apply_mutation_on_connection(connection, mutation)?;
+            writes::apply_write_on_connection(connection, mutation)?;
             if !connection.is_autocommit() {
                 return Err(MetricsError::Task(
                     "metrics command left a transaction open".into(),

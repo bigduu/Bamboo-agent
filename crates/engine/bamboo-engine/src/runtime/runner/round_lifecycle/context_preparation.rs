@@ -29,9 +29,9 @@ use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
 };
 use bamboo_domain::{
-    AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason, ResponseOccurrence,
-    RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
-    MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    AgentHookPoint, AgentRuntimeState, ContextBlockType, HookPayload, ModelContextResetReason,
+    ResponseOccurrence, RetrievalWindowCheckpointOutcome, TokenUsageBreakdown,
+    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::LLMProvider;
 use base64::Engine as _;
@@ -413,10 +413,21 @@ fn enforce_model_context_ledger_retention(
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
 ) -> ModelContextLedgerUsage {
-    let usage = model_context_ledger_usage(session, counter);
     let Some(state) = session.model_context_state.as_ref() else {
-        return usage;
+        return ModelContextLedgerUsage::default();
     };
+    // Legacy epochs include memory snapshots that the current request will
+    // discard. Reset before reserving their tokens for compression or fitting.
+    if state
+        .events
+        .iter()
+        .any(|event| event.block_type == ContextBlockType::ExternalMemory)
+    {
+        session.reset_model_context_epoch(ModelContextResetReason::CacheScopeChanged);
+        return ModelContextLedgerUsage::default();
+    }
+
+    let usage = model_context_ledger_usage(session, counter);
     let token_limit = budget
         .max_request_input_tokens()
         .saturating_mul(MODEL_CONTEXT_RETENTION_PERCENT)
@@ -1768,6 +1779,11 @@ pub(crate) async fn stage_user_context_compaction(
             "Lossy compaction is unavailable for required one-shot context".into(),
         ));
     }
+    // Idle compaction has no round refresh to establish the current Project's
+    // memory. Do not use a saved rendering even for preflight accounting.
+    session
+        .metadata
+        .remove(super::super::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY);
     let id = session.id.clone();
     let budget =
         super::token_budget::resolve_token_budget(session, config, model, provider.as_ref()).await;
@@ -2476,7 +2492,12 @@ async fn maybe_apply_summary_context_compression_with_budget(
     .with_context_blocks(if message_summary {
         Vec::new()
     } else {
+        // Current external memory is counted for normal inference, while
+        // copying it into a durable summary would defeat later withdrawal.
         compression_context_blocks
+            .into_iter()
+            .filter(|block| block.block_type != bamboo_domain::ContextBlockType::ExternalMemory)
+            .collect()
     })
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {

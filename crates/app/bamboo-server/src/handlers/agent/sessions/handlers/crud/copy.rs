@@ -21,6 +21,10 @@ pub async fn copy_session(
     // writers so the source transcript and attachments form one snapshot.
     let _source_guard = state.persistence.acquire_lock(&source_id).await;
     let _target_guard = state.persistence.acquire_lock(&new_id).await;
+    let event_slot = match state.account_sink.reserve_session_mutation().await {
+        Ok(slot) => slot,
+        Err(error) => return Ok(crate::events::session_event_queue_unavailable(error)),
+    };
 
     let (copied, projection_guard) = match state
         .session_store
@@ -76,9 +80,9 @@ pub async fn copy_session(
 
     // Account-feed consumers use the ordinary creation event to insert the
     // copied root into their session list without polling.
-    state.account_sink.record(
-        Some(&new_id),
-        &bamboo_agent_core::AgentEvent::SessionCreated {
+    event_slot.enqueue(
+        &new_id,
+        bamboo_agent_core::AgentEvent::SessionCreated {
             session_id: new_id.clone(),
             project_id: copied.project_id_meta(),
             title: copied.title.clone(),
@@ -113,6 +117,178 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("tempdir").keep();
         bamboo_config::paths::init_bamboo_dir(data_dir.clone());
         web::Data::new(AppState::new(data_dir).await.expect("app state"))
+    }
+
+    #[actix_web::test]
+    async fn session_mutation_routes_wait_for_account_capacity_before_persisting() {
+        use std::time::Duration;
+
+        let state = new_state().await;
+        let mut root = Session::new("synthetic-feed-root", "test-model");
+        root.add_message(Message::user("synthetic retained history"));
+        let child = Session::new_child_of("synthetic-feed-child", &root, "test-model", "Task");
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.save_session(&child).await.unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let mut feed = state.account_sink.subscribe();
+        let filler = AgentEvent::SessionDeleted {
+            session_id: "synthetic-held-slot".into(),
+        };
+        let requests = [
+            (
+                "copy",
+                test::TestRequest::post().uri("/api/v1/sessions/synthetic-feed-root/copy"),
+                StatusCode::CREATED,
+            ),
+            (
+                "rename",
+                test::TestRequest::patch()
+                    .uri("/api/v1/sessions/synthetic-feed-root")
+                    .set_json(serde_json::json!({"title": "Renamed"})),
+                StatusCode::OK,
+            ),
+            (
+                "pin",
+                test::TestRequest::patch()
+                    .uri("/api/v1/sessions/synthetic-feed-root")
+                    .set_json(serde_json::json!({"pinned": true})),
+                StatusCode::OK,
+            ),
+            (
+                "clear",
+                test::TestRequest::post().uri("/api/v1/sessions/synthetic-feed-root/clear"),
+                StatusCode::OK,
+            ),
+            (
+                "delete",
+                test::TestRequest::delete().uri("/api/v1/sessions/synthetic-feed-root"),
+                StatusCode::OK,
+            ),
+        ];
+        let mut premature = Vec::new();
+        for (operation, req, expected_status) in requests {
+            let before = state
+                .session_store
+                .load_session(&root.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let index_count = state.session_store.list_index_entries().await.len();
+            let dropped_before = state.account_sink.dropped_count();
+            let mut held = Vec::new();
+            // The default sink has 1024 slots. Reserve every slot without
+            // running fake writers or blocking the real writer task.
+            for _ in 0..1024 {
+                held.push(
+                    state
+                        .account_sink
+                        .reserve_session_event("synthetic-held-slot", &filler)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            let request = test::call_service(&app, req.to_request());
+            tokio::pin!(request);
+            let early = tokio::time::timeout(Duration::from_millis(500), &mut request).await;
+            if let Ok(response) = &early {
+                premature.push((
+                    operation,
+                    response.status(),
+                    state.account_sink.dropped_count() - dropped_before,
+                ));
+            } else {
+                let current = state
+                    .session_store
+                    .load_session(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(current.metadata_version, before.metadata_version);
+                assert_eq!(current.title, before.title);
+                assert_eq!(current.pinned, before.pinned);
+                assert_eq!(current.messages.len(), before.messages.len());
+                assert_eq!(
+                    state.session_store.list_index_entries().await.len(),
+                    index_count
+                );
+            }
+            drop(held);
+            let response = match early {
+                Ok(response) => response,
+                Err(_) => request.await,
+            };
+            assert_eq!(response.status(), expected_status);
+            if premature.iter().any(|(name, _, _)| *name == operation) {
+                continue;
+            }
+            let copied_id = if operation == "copy" {
+                let body: Value = test::read_body_json(response).await;
+                Some(body["session"]["id"].as_str().unwrap().to_owned())
+            } else {
+                None
+            };
+            let event_count = if operation == "delete" { 2 } else { 1 };
+            let mut matched = std::collections::HashSet::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while matched.len() < event_count {
+                    let change = feed.recv().await.unwrap();
+                    let id = match (&change.event, operation) {
+                        (AgentEvent::SessionCreated { session_id, .. }, "copy")
+                            if copied_id.as_ref() == Some(session_id) =>
+                        {
+                            session_id
+                        }
+                        (
+                            AgentEvent::SessionTitleUpdated {
+                                session_id, title, ..
+                            },
+                            "rename",
+                        ) if session_id == &root.id && title == "Renamed" => session_id,
+                        (
+                            AgentEvent::SessionPinnedUpdated {
+                                session_id,
+                                pinned: true,
+                                ..
+                            },
+                            "pin",
+                        ) if session_id == &root.id => session_id,
+                        (AgentEvent::SessionCleared { session_id }, "clear")
+                            if session_id == &root.id =>
+                        {
+                            session_id
+                        }
+                        (AgentEvent::SessionDeleted { session_id }, "delete")
+                            if session_id == &root.id || session_id == &child.id =>
+                        {
+                            session_id
+                        }
+                        _ => continue,
+                    };
+                    assert_eq!(change.session_id.as_ref(), Some(id));
+                    assert!(bamboo_engine::events::journal::read_since(
+                        state.account_sink.events_dir(),
+                        change.seq - 1,
+                    )
+                    .unwrap()
+                    .iter()
+                    .any(|written| written.seq == change.seq));
+                    matched.insert(id.clone());
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("missing account notifications for {operation}"));
+        }
+        assert!(
+            premature.is_empty(),
+            "mutations succeeded while the queue was full (operation, HTTP status, dropped events): {premature:?}"
+        );
+        assert_eq!(state.account_sink.dropped_count(), 0);
     }
 
     #[actix_web::test]

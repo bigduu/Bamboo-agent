@@ -18,6 +18,7 @@ pub struct TicketDispatchPolicy {
     pub worker_role: String,
     pub workspace: String,
     pub max_rounds: Option<u32>,
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
     pub admission_fence: Option<bamboo_orchestration::ReadyAdmissionFence>,
 }
 
@@ -136,7 +137,7 @@ impl ChildSessionAdapter {
                         runtime_metadata: metadata,
                         read_only: false,
                         auto_run: false,
-                        reasoning_effort: None,
+                        reasoning_effort: policy.reasoning_effort,
                         lifecycle: None,
                         resident_name: None,
                         resident_context: None,

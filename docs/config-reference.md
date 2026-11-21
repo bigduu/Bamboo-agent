@@ -384,7 +384,7 @@ ratios of `0.80` and `0.25`. All three strategies calculate their effective toke
 boundaries from the current model window, output allowance and safety margin;
 changing the history representation does not change that maintenance range.
 The `message_summary` strategy summarizes historical user and
-assistant prose while discarding completed tool exchanges from the next model
+assistant prose while removing unpinned completed tool exchanges from the next model
 context. The `retrieval_window` strategy keeps exact raw
 messages in the Session store, removes eligible older complete turns only from
 the active provider window, and directs the model to
@@ -407,7 +407,7 @@ the active provider window, and directs the model to
 
 | Field | Default | What it does |
 |---|---|---|
-| `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `strategy` | `summary` | `summary` preserves the current summarizer path. `message_summary` summarizes historical user and assistant prose and removes unpinned completed tool exchanges from the active model view. `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
 | `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the smaller of the joint model window and any independent input ceiling. Output and safety headroom can move the effective trigger earlier. |
 | `target_usage_ratio` | `0.25` | Shared post-compression target on the same window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
@@ -457,14 +457,15 @@ messages as summary source. It excludes tool-call names, arguments, IDs, tool
 outputs, reasoning, and image/OCR fields. An assistant message that also made
 tool calls can still contribute its prose; its tool fields do not enter the
 summary. The latest user request remains verbatim in the next model context.
-All completed tool exchanges are removed from that active view, including
-recent or skill-related exchanges. Original messages remain in durable Session
-history; compression does not delete them.
+When a tool call or result is marked `never_compress`, the entire completed
+batch stays active and counts toward the post-compression target. Other completed
+tool exchanges leave the active view. All original messages remain in durable
+Session history.
 
 Automatic pressure checks and `compact_context` use the selected message-summary
 mode. Its `compact_context.instructions` argument is ignored so tool parameters
-cannot re-enter the summary through custom instructions. Incomplete tool chains
-defer compression until their results are complete.
+cannot re-enter the summary through custom instructions. Pending tool work
+defers compression until it completes.
 When switching a Session with an existing mixed-message summary, Bamboo rebuilds
 from the durable user/assistant prose rather than merging the old summary's tool
 details. The default stays `summary`; selecting `message_summary` requires an

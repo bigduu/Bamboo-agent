@@ -1502,6 +1502,198 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
 }
 
 #[tokio::test]
+async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
+    use bamboo_llm::providers::AnthropicProvider;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "text/event-stream",
+        ))
+        .expect(5)
+        .mount(&server)
+        .await;
+    let llm: Arc<dyn LLMProvider> = Arc::new(
+        AnthropicProvider::new("fixture-key").with_base_url(format!("{}/v1", server.uri())),
+    );
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let frame = LlmStreamFrame {
+        provider_default_output: false,
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "anthropic-cache-wire",
+        model: "test-model",
+        provider_name: Some("test-anthropic"),
+        provider_type: Some("anthropic"),
+        reasoning_effort: None,
+        output_limit_recovery: None,
+        budget: &TokenBudget::new(400_000, 128, Default::default()),
+        observation_progress_hint: None,
+        prompt_memory_exposure: None,
+    };
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("anthropic".into());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".into());
+    let tools = [ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "lookup".into(),
+            description: "look up a value".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    }];
+    let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let mut session = Session::new(frame.session_id, frame.model);
+    session.add_message(Message::user("original request"));
+    session.add_message(Message::assistant("prior answer", None));
+    session.add_message(Message::user("first history boundary"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Fixture task".into(),
+        items: vec![TaskItem {
+            id: "task-1".into(),
+            description: "task snapshot before tools".into(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+
+    for step in 0..5 {
+        if step == 1 {
+            // Resume from the serialized ledger without an in-process cache
+            // cursor. The prior boundary still has to survive the wide append.
+            session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+            // Exceed Anthropic's 20-block lookback even when parallel tool
+            // blocks are counted as a single position.
+            for index in 0..11 {
+                session.add_message(Message::assistant(format!("answer {index}"), None));
+                session.add_message(Message::user(format!("append {index}")));
+            }
+            session.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "cached-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            ));
+            session.add_message(Message::tool_result("cached-call", "retained tool output"));
+        } else if step == 3 {
+            session.add_message(Message::assistant("tool-based answer", None));
+            session.add_message(Message::user("new user turn"));
+        } else if step == 4 {
+            session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+            session.add_message(Message::user("first request in a new epoch"));
+        }
+        if step < 3 {
+            session
+                .metadata
+                .insert(memory_key.into(), format!("live memory revision {step}"));
+        } else {
+            session.metadata.remove(memory_key);
+        }
+        if step == 2 {
+            session.task_list.as_mut().unwrap().items[0].description =
+                "task snapshot after tools".into();
+        }
+        let prepared = PreparedContext {
+            messages: session.messages.clone(),
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        execute_llm_stream(&mut session, &config, &llm, &prepared, &tools, &frame)
+            .await
+            .expect("dispatch fixture through Anthropic rendering");
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let mut prior_prefix = Vec::new();
+    for (step, request) in requests.iter().enumerate() {
+        let body: serde_json::Value = request.body_json().unwrap();
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        let endpoint = match step {
+            0 => "first history boundary",
+            1 | 2 => "retained tool output",
+            3 => "new user turn",
+            _ => "first request in a new epoch",
+        };
+        let boundary = blocks
+            .iter()
+            .position(|block| block["text"] == endpoint || block["content"] == endpoint)
+            .expect("history endpoint on the wire");
+        assert_eq!(blocks[boundary]["cache_control"]["ttl"], "1h");
+        assert!(blocks[boundary + 1..]
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
+        let marked = [
+            body["tools"].as_array().unwrap(),
+            body["system"].as_array().unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(blocks.iter().copied())
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+        assert!(marked <= 4);
+
+        let prefix = blocks[..=boundary]
+            .iter()
+            .map(|block| {
+                let mut content = (*block).clone();
+                content.as_object_mut().unwrap().remove("cache_control");
+                content
+            })
+            .collect::<Vec<_>>();
+        if step == 4 {
+            assert!(blocks
+                .iter()
+                .any(|block| block["text"] == "new user turn"
+                    && block.get("cache_control").is_none()));
+        } else {
+            assert!(prefix.starts_with(&prior_prefix));
+            if !prior_prefix.is_empty() {
+                assert_eq!(blocks[prior_prefix.len() - 1]["cache_control"]["ttl"], "1h");
+            }
+        }
+        if step == 1 {
+            assert!(boundary + 1 - prior_prefix.len() > 20);
+        }
+        let memory = body["messages"].to_string();
+        for revision in 0..3 {
+            assert_eq!(
+                memory.contains(&format!("live memory revision {revision}")),
+                step == revision
+            );
+        }
+        if step < 3 {
+            assert!(blocks[boundary + 1..].iter().any(|block| block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("live memory revision {step}")))));
+        }
+        prior_prefix = prefix;
+    }
+}
+
+#[tokio::test]
 async fn explicit_activation_pending_suppresses_answer_tokens() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-explicit-guard", "test-model");
@@ -4697,7 +4889,7 @@ fn responses_continuation_enabled_requires_store_true_and_supported_provider() {
 }
 
 #[tokio::test]
-async fn execute_llm_stream_includes_external_memory_volatile_block() {
+async fn execute_llm_stream_preserves_tool_continuation_after_current_external_memory() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2a", "test-model");
     // A stale continuation id may still be present (pre-fix persistence); under
@@ -4715,11 +4907,24 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let config = test_config("system");
+    let mut resume = Message::user("Resume the current turn.");
+    resume.metadata = Some(serde_json::json!({"runtime_kind":"retry_resume"}));
     let prepared_context = PreparedContext {
         messages: vec![
             Message::system("system"),
             Message::user("run a tool"),
-            Message::assistant("calling tool", None),
+            resume,
+            Message::assistant(
+                "calling tool",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "test_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            ),
             Message::tool_result("call_1", "{\"ok\":true}"),
         ],
         token_usage: usage(0, 22),
@@ -4766,17 +4971,23 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         .lock()
         .expect("messages lock")
         .clone();
-    // First epoch: external memory is seeded before the real transcript. Later
-    // revisions append after the then-current transcript boundary.
-    assert_eq!(requested_messages.len(), 6);
+    assert_eq!(requested_messages.len(), 7);
     assert!(matches!(requested_messages[0].role, Role::System));
     assert_session_identity_message(&requested_messages[1], "session-stream-2a");
-    assert!(matches!(requested_messages[2].role, Role::User));
     assert!(requested_messages[2]
         .content
         .contains("context_type: external_memory"));
     assert!(requested_messages[2].content.contains("Session note body"));
-    assert!(matches!(requested_messages[5].role, Role::Tool));
+    for (actual, original) in requested_messages[3..]
+        .iter()
+        .zip(&prepared_context.messages[1..])
+    {
+        assert_eq!(actual.id, original.id);
+    }
+    assert_eq!(
+        requested_messages.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
+    );
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -4784,6 +4995,22 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             .expect("previous_response_id lock")
             .as_deref(),
         None
+    );
+
+    let mut without_user = prepared_context;
+    without_user.messages.remove(1);
+    let envelope = super::build_request_envelope(&session, &without_user, &config, &[]);
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let first_real = transcript
+        .iter()
+        .position(|message| message.id == without_user.messages[1].id)
+        .expect("the first real row survives preparation");
+    assert!(transcript[first_real - 1]
+        .content
+        .contains("context_type: external_memory"));
+    assert_eq!(
+        transcript.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
     );
 }
 
@@ -6532,5 +6759,173 @@ async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_
         persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "an over-budget prepared request must be rejected before any checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn responses_input_contains_only_the_current_external_memory_projection() {
+    use bamboo_domain::ContextBlockType;
+    use bamboo_llm::SegmentRole;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let legacy = "bamboo legacy generated memory fixture";
+    let old = "bamboo memory fixture being withdrawn";
+    let replacement = "bamboo current replacement fixture";
+    let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let transcript = vec![
+        Message::user("Prior user transcript fixture."),
+        Message::assistant("Prior assistant transcript fixture.", None),
+        Message::user("Continue."),
+    ];
+    let mut session = Session::new("memory-wire-fixture", "test-model");
+    session.set_project_id_meta("memory-wire-project-a");
+    session.messages = transcript.clone();
+    let config = test_config("system");
+    let prepared = PreparedContext {
+        messages: std::iter::once(Message::system("system"))
+            .chain(transcript.iter().cloned())
+            .collect(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Rebuild the old v2 cache identity and use the existing reconciliation
+    // function to persist the same typed full snapshot old Hosts produced.
+    let envelope = super::build_request_envelope(&session, &prepared, &config, &[]);
+    let v2_cache_scope = serde_json::json!({
+        "external_memory_projection_version": 2,
+        "model": "test-model",
+        "provider_boundary_sha256": null,
+        "system": envelope.ir.system_text,
+        "stable_prefix": envelope.ir.run(SegmentRole::StablePrefix)
+            .iter()
+            .map(|message| (&message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        "tools": [],
+    });
+    session.metadata.insert(memory_key.into(), legacy.into());
+    let legacy_block = super::build_external_memory_context_block(&session).unwrap();
+    super::super::context_ledger::reconcile_model_context(
+        &mut session,
+        vec![legacy_block],
+        &transcript,
+        bamboo_domain::sha256_hex(&serde_json::to_vec(&v2_cache_scope).unwrap()),
+        false,
+    );
+    session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    assert!(session
+        .model_context_state
+        .as_ref()
+        .unwrap()
+        .events
+        .iter()
+        .any(|event| event.block_type == ContextBlockType::ExternalMemory
+            && event.rendered_text.contains(legacy)));
+
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let provider: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(256);
+    let frame = LlmStreamFrame {
+        provider_default_output: false,
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "memory-wire-fixture",
+        model: "test-model",
+        provider_name: Some("openai"),
+        provider_type: Some("openai"),
+        reasoning_effort: None,
+        output_limit_recovery: None,
+        budget: &TokenBudget::new(400_000, 128, Default::default()),
+        observation_progress_hint: None,
+        prompt_memory_exposure: None,
+    };
+
+    let mut actual = Vec::new();
+    let mut first_request_and_state = None;
+    for (step, (project, current)) in [
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-a"), Some(replacement)),
+        (Some("memory-wire-project-a"), None),
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-b"), Some(replacement)),
+        (None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match project {
+            Some(project) => session.set_project_id_meta(project),
+            None => session.clear_project_id_meta(),
+        }
+        // This is the live field set by refresh after editing or archiving a
+        // record, regenerating Dream, or closing an agenda item.
+        match current {
+            Some(current) => {
+                session.metadata.insert(memory_key.into(), current.into());
+            }
+            None => {
+                session.metadata.remove(memory_key);
+            }
+        }
+        execute_llm_stream(&mut session, &config, &provider, &prepared, &[], &frame)
+            .await
+            .expect("dispatch fixture through Responses rendering");
+        let body = llm.requested_responses_body.lock().unwrap();
+        let body = body.as_ref().expect("rendered body");
+        let input = body["input"].to_string();
+        let items = body["input"].as_array().expect("Responses input array");
+        let user = items.last().expect("final user input");
+        assert_eq!(user["role"], "user");
+        assert!(user.to_string().contains("Continue."));
+        if let Some(current) = current {
+            assert!(items[items.len() - 2].to_string().contains(current));
+        }
+        actual.push((
+            input.contains(legacy),
+            input.contains(old),
+            input.contains(replacement),
+        ));
+        assert!(input.contains("Prior user transcript fixture."));
+        assert!(input.contains("Prior assistant transcript fixture."));
+        assert_eq!(
+            serde_json::to_value(&session.messages).unwrap(),
+            serde_json::to_value(&transcript).unwrap(),
+            "memory reconciliation must not rewrite the original transcript"
+        );
+
+        let state = session.model_context_state.as_ref().unwrap();
+        assert!(state
+            .events
+            .iter()
+            .all(|event| event.block_type != ContextBlockType::ExternalMemory));
+        let request_and_state = (
+            body["instructions"].clone(),
+            body["input"].clone(),
+            state.clone(),
+        );
+        if step == 0 {
+            first_request_and_state = Some(request_and_state);
+        } else if step == 1 {
+            assert_eq!(first_request_and_state.as_ref(), Some(&request_and_state));
+        }
+    }
+
+    assert_eq!(
+        actual,
+        [
+            (false, true, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ],
+        "each complete Responses input must contain only the live external memory projection"
     );
 }

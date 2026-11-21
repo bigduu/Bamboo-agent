@@ -434,8 +434,11 @@ impl ManagedWorkHost {
             })?;
         Ok(ProviderModelRef {
             model,
-            reasoning_effort: configured
-                .and_then(|model| model.reasoning_effort)
+            reasoning_effort: config
+                .features
+                .work_execution
+                .reasoning_effort
+                .or_else(|| configured.and_then(|model| model.reasoning_effort))
                 .or_else(|| get_reasoning_effort_for_provider(config, &provider)),
             provider,
         })

@@ -577,6 +577,91 @@ async fn assert_chat_reasoning_cutoff_recovers(
 }
 
 #[tokio::test]
+async fn chat_message_summary_keeps_retry_room_for_a_near_window_map() {
+    const MODEL: &str = "summary-secondary";
+    const CONTEXT_TOKENS: u32 = 32_000;
+    const OUTPUT_LIMIT: u64 = 64_000;
+    const SAFETY_MARGIN: u32 = 1_000;
+    const REASONING_TOKENS: u64 = 7_000;
+    const SUMMARY: &str = "The chosen design is recorded.";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": MODEL, "max_context_tokens": CONTEXT_TOKENS, "max_output_tokens": OUTPUT_LIMIT}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let output = body["max_tokens"].as_u64().unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            let prompt = [
+                Message::system(messages[0]["content"].as_str().unwrap()),
+                Message::user(messages[1]["content"].as_str().unwrap()),
+            ];
+            let input = TiktokenTokenCounter::default().count_messages(&prompt);
+            assert!(
+                u64::from(input + SAFETY_MARGIN) + output <= u64::from(CONTEXT_TOKENS * 80 / 100)
+            );
+            assert!(output <= OUTPUT_LIMIT);
+
+            if prompt[0].content.contains("map stage") && output <= REASONING_TOKENS {
+                let finish = r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#;
+                let usage = serde_json::json!({"choices": [], "usage": {
+                    "prompt_tokens": input,
+                    "completion_tokens": output,
+                    "completion_tokens_details": {"reasoning_tokens": output},
+                }});
+                return ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "data: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n"
+                    ));
+            }
+            chat_summary_stream(SUMMARY)
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let provider = bamboo_llm::OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+    let mut config = message_summary_config(Arc::new(provider));
+    config.app_data_dir = Some(directory.path().to_path_buf());
+    config.summarization_model_name = Some(MODEL.to_string());
+    let mut session = message_summary_session();
+    session.messages[1].content = format!(
+        "Long source begins.{} Long source ends.",
+        " evidence".repeat(19_900)
+    );
+
+    assert!(run_message_summary(&mut session, &config).await.unwrap());
+    assert_eq!(session.compression_events.len(), 1);
+    assert!(session.messages[1].compressed);
+    assert_eq!(session.conversation_summary.unwrap().content, SUMMARY);
+
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .map(|request| request.body_json::<serde_json::Value>().unwrap())
+        .collect::<Vec<_>>();
+    let first = bodies[0]["max_tokens"].as_u64().unwrap();
+    let retry = bodies[1]["max_tokens"].as_u64().unwrap();
+    assert!(first <= REASONING_TOKENS && retry > REASONING_TOKENS);
+    let mut expected_retry = bodies[0].clone();
+    expected_retry["max_tokens"] = retry.into();
+    assert_eq!(bodies[1], expected_retry);
+}
+
+#[tokio::test]
 async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
     for effort in [None, Some(bamboo_domain::ReasoningEffort::Low)] {
         assert_chat_empty_reduce_preserves_history(effort).await;
@@ -743,6 +828,74 @@ async fn message_summary_save_failure_does_not_publish_the_archive() {
     assert!(session
         .metadata
         .contains_key("responses.previous_response_id"));
+}
+
+#[tokio::test]
+async fn automatic_message_summary_keeps_a_paired_pinned_batch_in_the_next_request() {
+    let mut session = message_summary_session();
+    session.force_manual_compression = None;
+    session.messages[3].content = "old unpinned tool output ".repeat(12_000);
+    let mut discovery = Message::assistant(
+        "Pinned assistant prose",
+        Some(vec![ToolCall {
+            id: "pinned-discovery".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "discover_capabilities".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+    );
+    discovery.never_compress = true;
+    let result = Message::tool_result("pinned-discovery", "Pinned discovery output");
+    let pinned = [discovery, result];
+    session.messages.splice(4..4, pinned.clone());
+    let (provider, summary_requests) = prompt_capture_llm();
+    let config = message_summary_config(provider);
+
+    assert!(maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        None,
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert_eq!(session.compression_events.len(), 1);
+    assert!(session.messages[2..4]
+        .iter()
+        .all(|message| message.compressed));
+    let summary = serde_json::to_string(&*summary_requests.lock().unwrap()).unwrap();
+    assert!(summary.contains("OLDER_USER_PROSE"));
+    for message in &pinned {
+        assert!(!summary.contains(&message.content));
+    }
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        None,
+    )
+    .await
+    .unwrap();
+    let tool_rows = prepared
+        .prepared_context
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool || message.tool_calls.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(tool_rows).unwrap(),
+        serde_json::to_value(pinned).unwrap()
+    );
 }
 
 #[tokio::test]
