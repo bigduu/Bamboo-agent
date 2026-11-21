@@ -145,13 +145,19 @@ impl Fixture {
             inbox.clone(),
             activation.clone(),
         ));
+        let mut config = bamboo_llm::Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("fixture-root-model".into()),
+            ..Default::default()
+        });
         let creator = SupervisedRootCreator {
             store,
             operations: Arc::new(SessionCreateOperationStore::new(home)),
             projects,
             workspace,
             project_context,
-            config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
+            config: Arc::new(RwLock::new(config)),
             repo,
             messenger,
             account: bamboo_engine::events::AccountEventSink::new(home.join("events")).unwrap(),
@@ -191,6 +197,7 @@ impl Fixture {
                 &record,
                 &self.request,
                 std::path::Path::new(self.workspace()),
+                &CreationAuthority::legacy_supervisor(self.supervisor.clone()),
                 None,
             )
             .await
@@ -317,6 +324,52 @@ fn historical_managed_work_input_requires_the_entire_receipt_fingerprint() {
     )
     .unwrap());
     assert_eq!(current.message, old_message);
+}
+
+#[tokio::test]
+async fn supervisor_requires_a_model_before_publishing_a_new_root() {
+    let f = Fixture::new().await;
+    *f.creator.config.write().await = Default::default();
+    let unconfigured = f.create(f.request.clone()).await;
+    assert!(!unconfigured.success);
+    let unconfigured = value(unconfigured);
+    assert!(unconfigured["message"]
+        .as_str()
+        .unwrap()
+        .contains("defaults.chat"));
+    let id = unconfigured["target_session_id"].as_str().unwrap();
+    assert!(!f.creator.store.sessions_root_dir().join(id).exists());
+
+    let mut defaults: bamboo_config::DefaultsConfig = serde_json::from_value(json!({
+        "chat": {"provider": "worker-instance", "model": "unknown"},
+    }))
+    .unwrap();
+    f.creator.config.write().await.defaults = Some(defaults.clone());
+    let invalid = f.create(f.request.clone()).await;
+    assert!(!invalid.success);
+    assert_eq!(value(invalid)["target_session_id"], id);
+    assert!(!f.creator.store.sessions_root_dir().join(id).exists());
+    assert_eq!(f.count().await, 1);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+
+    defaults.chat.model = "configured-model".into();
+    defaults.chat.reasoning_effort = Some(bamboo_domain::ReasoningEffort::High);
+    f.creator.config.write().await.defaults = Some(defaults.clone());
+    let receipt = accepted(f.create(f.request.clone()).await);
+    assert_eq!(receipt["target_session_id"], id);
+    let root = f
+        .creator
+        .store
+        .load_root_authority(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.model_ref, Some(defaults.chat));
+    assert_eq!(
+        root.reasoning_effort,
+        Some(bamboo_domain::ReasoningEffort::High)
+    );
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -503,6 +556,7 @@ async fn recovered_root_before_link_and_link_before_input_use_the_reserved_lifet
             // before management publication. The reservation preceded it.
             f.creator.store.save_session(&candidate).await.unwrap();
         }
+        *f.creator.config.write().await = Default::default();
         let result = accepted(f.create(f.request.clone()).await);
         assert_eq!(result["target_session_id"], record.session_id);
         assert_eq!(
