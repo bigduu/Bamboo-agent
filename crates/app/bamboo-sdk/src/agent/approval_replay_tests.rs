@@ -822,8 +822,12 @@ async fn approved_shell_alias_requires_a_new_operation_after_durable_ultra_selec
     let agent = fixture.registered_agent(config.clone(), &["exec_command"]);
     let completed = events(agent.resume_stream(stale)).await;
     assert!(
-        completed.iter().any(|event| matches!(event, AgentEvent::Error { message }
-            if message.contains("pending operation binding does not match the original caller/operation"))),
+        !completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolLifecycle { .. }
+                | AgentEvent::ToolComplete { .. }
+                | AgentEvent::Error { .. }
+        )),
         "{completed:#?}"
     );
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
@@ -837,15 +841,43 @@ async fn approved_shell_alias_requires_a_new_operation_after_durable_ultra_selec
     ));
     let saved = fixture.reload(&request.session_id).await;
     assert!(saved.root_orchestration_only_enabled());
-    assert_eq!(saved.metadata[PERMISSION_REEXECUTE_METADATA_KEY], CALL);
-    assert_eq!(
-        saved.metadata[PERMISSION_REEXECUTE_GENERATION_METADATA_KEY],
-        request.request_generation
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    assert!(!saved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
+    let blocked = result_message(&saved, &pending_result_id);
+    assert_eq!(blocked["tool_success"], false);
+    assert!(blocked["content"]
+        .as_str()
+        .unwrap()
+        .contains("Root orchestration policy blocked"));
+    assert_eq!(blocked["metadata"], expected_pending_result["metadata"]);
+
+    *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+    let retried = events(agent.run_stream(saved, "Try the command under Ultra")).await;
+    assert!(
+        retried
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })),
+        "{retried:#?}"
     );
-    assert_eq!(
-        result_message(&saved, &pending_result_id),
-        expected_pending_result
+    let pending = fixture.reload(&request.session_id).await;
+    assert!(pending.root_orchestration_only_enabled());
+    let fresh = current_request(&pending);
+    assert_ne!(fresh.request_generation, request.request_generation);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    let approved = fixture.approve(&fresh).await;
+    let completed = events(agent.resume_stream(approved)).await;
+    assert!(
+        !completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { .. } | AgentEvent::NeedClarification { .. }
+        )),
+        "{completed:#?}"
     );
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

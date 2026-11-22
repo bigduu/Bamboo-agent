@@ -1058,9 +1058,9 @@ pub async fn refresh_approval_replay_posture(
     }
 }
 
-/// Refresh the live policy, then preserve the historical custom-owner mode
-/// boundary. The common spawn name is for the proven framework Root tool;
-/// joining that allowlist cannot promote a retained custom implementation.
+/// Refresh live policy before replaying a retained operation. Shell approvals
+/// expire when the Root changes tool authority. The common spawn name is for
+/// the proven framework Root tool and must not promote a retained custom owner.
 pub async fn refresh_retained_approval_replay_posture(
     storage: &dyn Storage,
     session: &mut Session,
@@ -1068,14 +1068,21 @@ pub async fn refresh_retained_approval_replay_posture(
     execution_name: Option<&str>,
     execution: Option<&RetainedToolExecution>,
 ) -> Result<ApprovalReplayDecision, AgentError> {
+    let original_revision = session.root_tool_authority_revision;
     let decision =
         refresh_approval_replay_posture(storage, session, configured_mode, execution_name).await?;
-    if matches!(decision, ApprovalReplayDecision::Execute(_))
-        && execution_name == Some("spawn_session")
+    if !matches!(decision, ApprovalReplayDecision::Execute(_)) {
+        return Ok(decision);
+    }
+    // The callers validated the original operation before this refresh. End an
+    // expired shell replay before restoring grants against the newer authority.
+    let expired_shell = matches!(execution_name, Some("exec_command" | "write_stdin"))
+        && session.root_tool_authority_revision > original_revision;
+    let retained_custom_spawn = execution_name == Some("spawn_session")
         && session.model_orchestration_only_enabled()
         && execution.and_then(RetainedToolExecution::execution_contract)
-            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
-    {
+            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
+    if expired_shell || retained_custom_spawn {
         return Ok(ApprovalReplayDecision::BlockedByRootToolAuthority);
     }
     Ok(decision)

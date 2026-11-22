@@ -23,7 +23,7 @@ use crate::runtime::runner::session_setup::prompt_setup::{
 };
 use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
@@ -32,8 +32,8 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
@@ -687,9 +687,13 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
+    configured_mode: PermissionMode,
 ) -> Option<ContextBlock> {
+    let flags =
+        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
     let schemas = effective_tool_schemas(session, tool_schemas);
-    if !session.allows_model_tool_execution("write_stdin")
+    if flags.plan_read_only
+        || !session.allows_model_tool_execution("write_stdin")
         || !schemas
             .iter()
             .any(|schema| schema.function.name == "write_stdin")
@@ -701,8 +705,6 @@ pub(super) fn build_exec_session_continuation_context_block(
         return None;
     }
     let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
-        && !bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session)
-            .plan_read_only
         && schemas
             .iter()
             .any(|schema| schema.function.name == "SubAgent")
@@ -1215,7 +1217,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             remaining.as_secs()
         )));
     }
-    if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
+    if let Some(block) = build_exec_session_continuation_context_block(
+        session,
+        tool_schemas,
+        config.permission_mode.unwrap_or_default(),
+    ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
         // stale ID from the next request as soon as its terminal poll consumes it.
