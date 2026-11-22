@@ -1,5 +1,7 @@
 //! Google Gemini provider implementation.
 
+#[cfg(feature = "litellm-wire-types")]
+mod litellm;
 mod stream;
 
 pub use stream::{parse_gemini_sse_event, GeminiStreamState};
@@ -23,6 +25,7 @@ use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::Message;
+use bamboo_domain::ProviderTranscriptGroup;
 use bamboo_domain::ReasoningEffort;
 
 pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
@@ -68,6 +71,8 @@ pub struct GeminiProvider {
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_wire_types: bool,
 }
 
 impl GeminiProvider {
@@ -81,7 +86,24 @@ impl GeminiProvider {
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_wire_types: false,
         }
+    }
+
+    /// Use the generated LiteLLM types for native Gemini requests.
+    /// Signed turns from this provider replay through the native transcript.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = true;
+        self
+    }
+
+    /// Select Bamboo's original Gemini wire adapter.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = false;
+        self
     }
 
     /// Configure keyword masking applied as a last-moment scan of every outbound
@@ -161,8 +183,62 @@ impl GeminiProvider {
     }
 }
 
+#[cfg(feature = "litellm-wire-types")]
+#[derive(Default)]
+pub(super) struct LiteLlmRequestOptions<'a> {
+    replay: Option<litellm::replay::NativeReplay<'a>>,
+    reasoning_overridden: bool,
+}
+
+pub(super) fn build_gemini_request_body(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    max_output_tokens: Option<u32>,
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    #[cfg(feature = "litellm-wire-types")] litellm_options: Option<LiteLlmRequestOptions<'_>>,
+) -> Result<Value> {
+    #[cfg(feature = "litellm-wire-types")]
+    if let Some(options) = litellm_options {
+        return litellm::build_request(
+            messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            options,
+        );
+    }
+    #[cfg(not(feature = "litellm-wire-types"))]
+    let _ = model;
+
+    let mut request: GeminiRequest = messages.to_vec().to_provider()?;
+    if !tools.is_empty() {
+        request.tools = Some(tools.to_vec().to_provider()?);
+    }
+    apply_generation_config(&mut request, max_output_tokens, reasoning_effort);
+    serde_json::to_value(&request).map_err(LLMError::Json)
+}
+
 #[async_trait]
 impl LLMProvider for GeminiProvider {
+    #[cfg(feature = "litellm-wire-types")]
+    fn native_transcript_protocol(&self, model: &str) -> Option<bamboo_domain::ProviderProtocol> {
+        // Raw native parts cannot be replayed exactly if operator patches or
+        // keyword masking are allowed to rewrite them.
+        (self.litellm_wire_types
+            && !self
+                .masking_config
+                .entries
+                .iter()
+                .any(|entry| entry.enabled)
+            && !request_overrides::gemini_contents_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            ))
+        .then_some(litellm::replay::PROTOCOL)
+    }
+
     async fn request_tool_selection(
         &self,
         model: &str,
@@ -224,6 +300,75 @@ impl LLMProvider for GeminiProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        self.stream_with_history(messages, tools, max_output_tokens, model, options, &[])
+            .await
+    }
+
+    #[cfg(feature = "litellm-wire-types")]
+    async fn chat_stream_ir(
+        &self,
+        ir: &crate::prompt_ir::PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        crate::image_budget::validate_tool_image_budget(ir.body_chat_iter())
+            .map_err(LLMError::Api)?;
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        self.stream_with_history(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            options,
+            &ir.provider_transcript_groups,
+        )
+        .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.list_models_url();
+        model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
+    }
+
+    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = self.list_models_url();
+        let models = self
+            .model_info_cache
+            .get(
+                &self.client,
+                &url,
+                headers,
+                "Gemini",
+                model_fetcher::ModelListFormat::Gemini,
+            )
+            .await?;
+        Ok(request_overrides::bind_catalog_limits(
+            models,
+            self.request_overrides.as_ref(),
+            |_| &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
+        ))
+    }
+}
+
+impl GeminiProvider {
+    async fn stream_with_history(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+        #[cfg_attr(not(feature = "litellm-wire-types"), allow(unused_variables))]
+        groups: &[ProviderTranscriptGroup],
+    ) -> Result<LLMStream> {
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         tracing::debug!("Gemini provider using model_hash={}", log_identity(model));
         let reasoning_effort = options
@@ -247,25 +392,31 @@ impl LLMProvider for GeminiProvider {
 
         // Auth is supplied via the x-goog-api-key header (see build_headers).
         let url = self.stream_url(model);
-
-        let build_request = |effort: Option<ReasoningEffort>| -> Result<GeminiRequest> {
-            // Convert messages using the new protocol system
-            let messages_vec: Vec<Message> = messages.to_vec();
-            let mut request: GeminiRequest = messages_vec.to_provider()?;
-
-            // Add tools if present
-            if !tools.is_empty() {
-                let tools_vec: Vec<ToolSchema> = tools.to_vec();
-                request.tools = Some(tools_vec.to_provider()?);
-            }
-
-            apply_generation_config(&mut request, max_output_tokens, effort);
-
-            Ok(request)
-        };
-
-        let request = build_request(reasoning_effort)?;
-        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            Some(model),
+        )?;
+        #[cfg(feature = "litellm-wire-types")]
+        let scope = self
+            .native_transcript_protocol(model)
+            .map(|_| litellm::replay::signing_scope(&url, &headers));
+        let mut request_json = build_gemini_request_body(
+            messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types.then(|| LiteLlmRequestOptions {
+                replay: scope
+                    .as_deref()
+                    .map(|scope| litellm::replay::NativeReplay { scope, groups }),
+                reasoning_overridden: request_overrides::gemini_reasoning_overridden(
+                    self.request_overrides.as_ref(),
+                    model,
+                ),
+            }),
+        )?;
         request_overrides::validate_budgeted_overrides(
             self.request_overrides.as_ref(),
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
@@ -306,10 +457,6 @@ impl LLMProvider for GeminiProvider {
             "Gemini request prepared"
         );
 
-        let headers = self.build_headers(
-            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
-            Some(model),
-        )?;
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
         let response =
@@ -348,6 +495,14 @@ impl LLMProvider for GeminiProvider {
         // chunks from the one event — rather than deferring — guarantees usage
         // is delivered even when the connection closes immediately afterwards.
         let mut state = GeminiStreamState::default();
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            state.enable_litellm_tool_ids();
+        }
+        #[cfg(feature = "litellm-wire-types")]
+        if let Some(scope) = scope {
+            state.capture_native_replay(scope);
+        }
         let model_for_log = model.to_string();
         let requested_reasoning_for_log = reasoning_effort;
         let mut logged_summary = false;
@@ -383,32 +538,6 @@ impl LLMProvider for GeminiProvider {
         );
 
         Ok(stream)
-    }
-
-    async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
-        let url = self.list_models_url();
-        model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
-    }
-
-    async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
-        let url = self.list_models_url();
-        let models = self
-            .model_info_cache
-            .get(
-                &self.client,
-                &url,
-                headers,
-                "Gemini",
-                model_fetcher::ModelListFormat::Gemini,
-            )
-            .await?;
-        Ok(request_overrides::bind_catalog_limits(
-            models,
-            self.request_overrides.as_ref(),
-            |_| &[request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT],
-        ))
     }
 }
 

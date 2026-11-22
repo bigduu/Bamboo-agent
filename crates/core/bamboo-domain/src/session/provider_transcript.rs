@@ -1,8 +1,8 @@
-//! Durable, provider-native transcript items used by progressive tool discovery.
+//! Durable, provider-native transcript items used by tool discovery and signed history.
 //!
 //! This lane is deliberately separate from [`Session::messages`]. The latter is
 //! the provider-neutral, user-visible transcript; this module preserves the
-//! small set of provider-owned items whose exact position carries tool-loading
+//! small set of provider-owned items whose exact position carries protocol
 //! state. Raw JSON is admitted only through the validators below, so persisted
 //! data cannot become an unrestricted request-injection channel.
 
@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::Session;
+
+mod gemini;
 
 pub const PROVIDER_TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
 const ITEM_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-item/v1\0";
@@ -31,6 +33,7 @@ pub enum ProviderFamily {
     OpenAi,
     Anthropic,
     Copilot,
+    Gemini,
 }
 
 impl ProviderFamily {
@@ -41,6 +44,7 @@ impl ProviderFamily {
             Some("openai") => Some(Self::OpenAi),
             Some("anthropic") => Some(Self::Anthropic),
             Some("copilot") => Some(Self::Copilot),
+            Some("gemini") => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -52,6 +56,7 @@ impl ProviderFamily {
 pub enum ProviderProtocol {
     OpenAiResponsesV1,
     AnthropicMessages2023_06_01,
+    GeminiGenerateContentV1Beta,
 }
 
 impl ProviderProtocol {
@@ -61,6 +66,7 @@ impl ProviderProtocol {
                 matches!(family, ProviderFamily::OpenAi | ProviderFamily::Copilot)
             }
             Self::AnthropicMessages2023_06_01 => family == ProviderFamily::Anthropic,
+            Self::GeminiGenerateContentV1Beta => family == ProviderFamily::Gemini,
         }
     }
 }
@@ -135,6 +141,7 @@ pub enum ProviderTranscriptItemKind {
     AnthropicToolSearchToolResult,
     AnthropicToolUse,
     AnthropicToolResult,
+    GeminiModelContent,
 }
 
 impl ProviderTranscriptItemKind {
@@ -1109,6 +1116,9 @@ fn infer_and_validate_item(
         }
         ProviderProtocol::AnthropicMessages2023_06_01 => {
             validate_anthropic_item(item_type, origin, author, payload)
+        }
+        ProviderProtocol::GeminiGenerateContentV1Beta => {
+            gemini::validate_model_content(item_type, origin, author, object)
         }
     }
 }
@@ -2209,7 +2219,9 @@ fn validated_group_identity(
     {
         return Err(ProviderTranscriptError::MixedProviderGroup);
     }
-    if !items.iter().any(|item| item.kind.is_discovery()) {
+    if protocol != ProviderProtocol::GeminiGenerateContentV1Beta
+        && !items.iter().any(|item| item.kind.is_discovery())
+    {
         return Err(ProviderTranscriptError::MissingDiscoveryItem);
     }
     validate_group_order(protocol, items)?;
@@ -2221,6 +2233,11 @@ fn validate_group_order(
     items: &[ProviderTranscriptItem],
 ) -> Result<(), ProviderTranscriptError> {
     match protocol {
+        ProviderProtocol::GeminiGenerateContentV1Beta => {
+            if items.len() != 1 {
+                return Err(ProviderTranscriptError::InvalidGroupOrder);
+            }
+        }
         ProviderProtocol::OpenAiResponsesV1 => {
             let mut seen_item_ids = HashSet::<&str>::new();
             let mut seen_search_call_ids = HashSet::<&str>::new();

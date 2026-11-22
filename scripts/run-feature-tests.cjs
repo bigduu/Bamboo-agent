@@ -231,7 +231,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2939 adds the vendored LiteLLM crate to the existing packages-1 shard.
 // #2940 enables the Messages comparison in the existing bamboo-llm default owner.
 // #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
-const FEATURE_SOURCE_SHA256 = "900d3b908550f6755e22b7da9c61cae9b2be169f62cfc53ee7d260a11d4d6474";
+// #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
+const FEATURE_SOURCE_SHA256 = "f8e5598f07b754c0582c913a611f606e2c64268a238942b39b6f71d87f2775ca";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

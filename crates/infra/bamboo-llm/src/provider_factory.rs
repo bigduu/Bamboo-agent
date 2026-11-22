@@ -38,7 +38,7 @@ pub fn effective_litellm_wire_types(instance: &ProviderInstanceConfig) -> Option
     } else {
         instance.provider_type.as_str()
     };
-    (cfg!(feature = "litellm-wire-types") && matches!(target, "anthropic" | "openai"))
+    (cfg!(feature = "litellm-wire-types") && matches!(target, "anthropic" | "openai" | "gemini"))
         .then(|| litellm_wire_types_override(instance).unwrap_or(false))
 }
 
@@ -240,6 +240,10 @@ pub async fn create_provider_from_instance(
 
             let mut provider =
                 GeminiProvider::new(&instance.api_key).with_client(http_client.clone());
+            #[cfg(feature = "litellm-wire-types")]
+            if use_litellm_wire_types {
+                provider = provider.with_litellm_wire_types();
+            }
 
             if let Some(base_url) = &instance.base_url {
                 if !base_url.is_empty() {
@@ -429,42 +433,47 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
-            .expect(6)
+            .expect(12)
             .mount(&server)
             .await;
         let options = LLMRequestOptions {
             reasoning_effort: Some(ReasoningEffort::Low),
             ..Default::default()
         };
-        for provider_type in ["anthropic", "bodhi"] {
-            for setting in [None, Some(false), Some(true)] {
-                let mut instance = json!({
-                    "provider_type": provider_type,
-                    "target_provider": "anthropic",
-                    "api_key": "fixture-key",
-                    "base_url": server.uri()
-                });
-                if let Some(enabled) = setting {
-                    instance[LITELLM_WIRE_TYPES_CONFIG_KEY] = json!(enabled);
-                }
-                let instance = serde_json::from_value(instance).unwrap();
-                let provider = create_provider_from_instance(
-                    &Config::default(),
-                    &instance,
-                    Default::default(),
-                )
-                .await
-                .unwrap();
-                assert!(provider
-                    .chat_stream_with_options(
-                        &[Message::user("hello")],
-                        &[],
-                        Some(4000),
-                        "claude-haiku-4-5",
-                        Some(&options)
+        for (family, model) in [
+            ("anthropic", "claude-haiku-4-5"),
+            ("gemini", "gemini-3.5-flash"),
+        ] {
+            for is_gateway in [false, true] {
+                for setting in [None, Some(false), Some(true)] {
+                    let mut instance = json!({
+                        "provider_type": if is_gateway { "bodhi" } else { family },
+                        "target_provider": family,
+                        "api_key": "fixture-key",
+                        "base_url": server.uri()
+                    });
+                    if let Some(enabled) = setting {
+                        instance[LITELLM_WIRE_TYPES_CONFIG_KEY] = json!(enabled);
+                    }
+                    let instance = serde_json::from_value(instance).unwrap();
+                    let provider = create_provider_from_instance(
+                        &Config::default(),
+                        &instance,
+                        Default::default(),
                     )
                     .await
-                    .is_err());
+                    .unwrap();
+                    assert!(provider
+                        .chat_stream_with_options(
+                            &[Message::user("hello")],
+                            &[],
+                            Some(4000),
+                            model,
+                            Some(&options)
+                        )
+                        .await
+                        .is_err());
+                }
             }
         }
         let requests = server.received_requests().await.unwrap();
@@ -472,11 +481,22 @@ mod tests {
             let baseline: Value = baseline.body_json().unwrap();
             let typed: Value = typed.body_json().unwrap();
             assert_eq!(baseline, explicitly_disabled.body_json::<Value>().unwrap());
-            assert_ne!(baseline["thinking"], typed["thinking"]);
-            assert_eq!(
-                typed["thinking"],
-                json!({"type":"enabled","budget_tokens":1024})
-            );
+            if typed.get("thinking").is_some() {
+                assert_ne!(baseline["thinking"], typed["thinking"]);
+                assert_eq!(
+                    typed["thinking"],
+                    json!({"type":"enabled","budget_tokens":1024})
+                );
+            } else {
+                assert_eq!(
+                    baseline["generationConfig"]["thinkingConfig"],
+                    json!({"thinkingLevel":"LOW"})
+                );
+                assert_eq!(
+                    typed["generationConfig"]["thinkingConfig"],
+                    json!({"thinkingLevel":"low","includeThoughts":true})
+                );
+            }
         }
     }
 

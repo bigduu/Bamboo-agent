@@ -37,8 +37,8 @@ use bamboo_domain::{
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
-    REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
+    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -738,6 +738,7 @@ pub(super) async fn project_request_usage(
     model: &str,
     llm: &Arc<dyn LLMProvider>,
 ) -> Result<ProjectedRequestUsage, AgentError> {
+    let llm = &request_provider(llm, model).await?;
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
@@ -769,6 +770,7 @@ pub(super) async fn project_request_usage(
         effective_tool_schemas.as_ref(),
         model,
         loading_mode,
+        native_transcript_protocol_for(llm, model),
         None,
     );
     let tool_footprint = llm
@@ -800,9 +802,22 @@ fn build_request_envelope_reconciled(
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     )
 }
 
+async fn request_provider(
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+) -> Result<Arc<dyn LLMProvider>, AgentError> {
+    provider
+        .native_transcript_dispatch_snapshot(model)
+        .await
+        .map(|selected| selected.unwrap_or_else(|| Arc::clone(provider)))
+        .map_err(|error| AgentError::LLM(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_request_envelope_reconciled_for_loading_mode<'a>(
     session: &mut Session,
     prepared_context: &PreparedContext,
@@ -810,16 +825,28 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
+    native_protocol: Option<ProviderProtocol>,
     request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
-    let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
+    let gemini_native = native_protocol == Some(ProviderProtocol::GeminiGenerateContentV1Beta);
+    let requested_family = if gemini_native {
+        Some(ProviderFamily::Gemini)
+    } else {
+        ProviderFamily::from_provider_type(config.provider_type.as_deref())
+            .filter(|family| *family != ProviderFamily::Gemini)
+    };
     let requested_protocol = requested_family.map(|family| match family {
         ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
         ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+        ProviderFamily::Gemini => ProviderProtocol::GeminiGenerateContentV1Beta,
     });
     let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
         config.provider_name.as_deref(),
-        config.provider_type.as_deref(),
+        if gemini_native {
+            Some("gemini")
+        } else {
+            config.provider_type.as_deref()
+        },
     );
     let had_prior_provider_route = session.provider_transcript.active_family().is_some()
         || session.provider_transcript.active_protocol().is_some()
@@ -1564,6 +1591,7 @@ pub(super) async fn execute_llm_stream(
     let mut budget = frame.budget.clone();
     let mut provider_default_output = frame.provider_default_output;
     let model = frame.model;
+    let llm = &request_provider(llm, model).await?;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
     let reasoning_effort = frame.reasoning_effort;
@@ -1624,6 +1652,7 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
+            native_transcript_protocol_for(llm, model),
             observation_progress_hint
                 .into_iter()
                 .chain(convergence_hint),

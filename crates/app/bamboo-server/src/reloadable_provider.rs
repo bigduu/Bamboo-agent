@@ -4,7 +4,10 @@ use tokio::sync::RwLock;
 
 use bamboo_agent_core::{tools::ToolSchema, Message};
 use bamboo_domain::CapabilityLoadingMode;
-use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, ProviderModelInfo, Result};
+use bamboo_llm::provider::{
+    guarded_snapshot_forwarded_provider, native_transcript_protocol_for,
+    snapshot_forwarded_provider, LLMProvider, LLMRequestOptions, ProviderModelInfo, Result,
+};
 use bamboo_llm::{LLMStream, PromptIR, ProviderVisibleToolFootprint};
 
 /// An `LLMProvider` wrapper that always delegates to the latest provider stored in a shared lock.
@@ -38,6 +41,33 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    async fn native_transcript_dispatch_snapshot(
+        &self,
+        model: &str,
+    ) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let provider = self.current().await;
+        if native_transcript_protocol_for(&provider, model).is_none() {
+            return Ok(None);
+        }
+
+        let inner = self.inner.clone();
+        let selected = provider.clone();
+        guarded_snapshot_forwarded_provider(provider, move || {
+            let current = inner.try_read().map_err(|_| {
+                bamboo_llm::LLMError::Api(
+                    "Provider is being reconfigured; retry the request".into(),
+                )
+            })?;
+            if !Arc::ptr_eq(&current, &selected) {
+                return Err(bamboo_llm::LLMError::Api(
+                    "Provider changed before dispatch; retry the request".into(),
+                ));
+            }
+            Ok(())
+        })
+        .map(Some)
+    }
+
     fn legacy_injected_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
         let Some(injected) = self.initial_injected_provider.as_ref() else {
             return Ok(None);
@@ -60,9 +90,7 @@ impl LLMProvider for ReloadableProvider {
                 )
             })?
             .clone();
-        Ok(Some(bamboo_llm::provider::snapshot_forwarded_provider(
-            current,
-        )?))
+        snapshot_forwarded_provider(current).map(Some)
     }
 
     fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
@@ -366,6 +394,75 @@ mod tests {
 
     fn wrapped(provider: Arc<dyn LLMProvider>) -> ReloadableProvider {
         ReloadableProvider::new(Arc::new(RwLock::new(provider)))
+    }
+
+    #[tokio::test]
+    async fn native_replay_snapshot_refuses_dispatch_after_reload() {
+        use bamboo_domain::ProviderProtocol;
+        use bamboo_llm::provider::scope_main_dispatch;
+        use bamboo_llm::{GeminiProvider, LLMError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n",
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = "gemini-3.5-flash";
+        let selected: Arc<dyn LLMProvider> = Arc::new(
+            GeminiProvider::new("fixture-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_litellm_wire_types(),
+        );
+        let wrapper = wrapped(selected.clone());
+        let snapshot = wrapper
+            .native_transcript_dispatch_snapshot(model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            native_transcript_protocol_for(&snapshot, model),
+            Some(ProviderProtocol::GeminiGenerateContentV1Beta)
+        );
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let ir = PromptIR::default();
+        let options = LLMRequestOptions {
+            request_purpose: Some("agent_loop".into()),
+            ..Default::default()
+        };
+        let dispatch = || {
+            let observed = observed.clone();
+            let selected = selected.clone();
+            scope_main_dispatch(
+                Arc::new(move |provider| {
+                    assert!(Arc::ptr_eq(&provider, &selected));
+                    observed.store(true, Ordering::SeqCst);
+                }),
+                snapshot.chat_stream_ir(&ir, &[], Some(64), model, Some(&options)),
+            )
+        };
+        assert!(dispatch().await.is_ok());
+        assert!(observed.swap(false, Ordering::SeqCst));
+
+        *wrapper.inner.write().await = Arc::new(GeminiProvider::new("new-fixture-key"));
+        assert!(wrapper
+            .native_transcript_dispatch_snapshot(model)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            dispatch().await,
+            Err(LLMError::Api(message)) if message == "Provider changed before dispatch; retry the request"
+        ));
+        assert!(!observed.load(Ordering::SeqCst));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

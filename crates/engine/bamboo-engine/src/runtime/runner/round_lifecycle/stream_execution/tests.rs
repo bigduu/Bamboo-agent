@@ -5753,6 +5753,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
+        None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
         "messages":before.ir.flatten(),"tools":before_tools.as_ref()
@@ -5779,6 +5780,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::Progressive,
         None,
+        None,
     );
     let duplicate_wire = serde_json::to_vec(&serde_json::json!({
         "messages":duplicate.ir.flatten(),"tools":loaded_tools.as_ref()
@@ -5791,6 +5793,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     let after_messages = after.ir.flatten();
@@ -5831,6 +5834,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     );
     assert_eq!(
         resumed_request
@@ -5851,6 +5855,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     );
     assert!(disabled
         .ir
@@ -5869,6 +5874,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        None,
         None,
     );
     assert!(sticky
@@ -5891,6 +5897,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     assert!(envelope
@@ -5941,6 +5948,7 @@ fn discovery_history_projection_omits_removed_tool_definitions() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     let transcript = envelope.ir.flatten();

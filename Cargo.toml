@@ -246,6 +246,7 @@ name = "bamboo"
 path = "src/bin/bamboo.rs"
 
 [features]
+litellm-wire-types = ["bamboo-engine/litellm-wire-types"]
 otel-otlp = ["bamboo-infrastructure/otel-otlp"]
 ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
 
