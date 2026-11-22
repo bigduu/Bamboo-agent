@@ -38,7 +38,7 @@ pub fn effective_litellm_wire_types(instance: &ProviderInstanceConfig) -> Option
     } else {
         instance.provider_type.as_str()
     };
-    (cfg!(feature = "litellm-wire-types") && target == "anthropic")
+    (cfg!(feature = "litellm-wire-types") && matches!(target, "anthropic" | "openai"))
         .then(|| litellm_wire_types_override(instance).unwrap_or(false))
 }
 
@@ -152,6 +152,12 @@ pub async fn create_provider_from_instance(
 
             let mut provider =
                 OpenAIProvider::new(&instance.api_key).with_client(http_client.clone());
+            #[cfg(feature = "litellm-wire-types")]
+            if use_litellm_wire_types {
+                provider = provider
+                    .with_litellm_chat_messages()
+                    .with_litellm_responses_events();
+            }
 
             if let Some(base_url) = &instance.base_url {
                 if !base_url.is_empty() {

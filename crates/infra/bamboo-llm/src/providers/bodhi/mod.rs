@@ -18,6 +18,8 @@ use crate::provider::{
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
 };
 use crate::providers::common::model_fetcher;
+#[cfg(feature = "litellm-wire-types")]
+use crate::providers::common::openai_compat::build_litellm_chat_body;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
@@ -353,7 +355,14 @@ impl BodhiProvider {
         required_tool: Option<&str>,
         allow_disable_correction: bool,
     ) -> Result<LLMStream> {
-        let mut body = build_openai_compat_body(
+        let build_body = build_openai_compat_body;
+        #[cfg(feature = "litellm-wire-types")]
+        let build_body = if self.litellm_wire_types {
+            build_litellm_chat_body
+        } else {
+            build_body
+        };
+        let mut body = build_body(
             model,
             messages,
             tools,
