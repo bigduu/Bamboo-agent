@@ -1083,12 +1083,20 @@ async fn supervisor_can_create_an_ordinary_ultra_worker_before_its_first_turn() 
             .await
             .expect("the worker's first turn reached the provider")
             .unwrap();
-        for name in ["Read", "Write", "Edit", "SubAgent"] {
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "SubAgent",
+            "exec_command",
+            "write_stdin",
+        ] {
             assert!(catalog.iter().any(|tool| tool == name), "{catalog:?}");
         }
-        for name in ["exec_command", "session_control"] {
-            assert!(!catalog.iter().any(|tool| tool == name), "{catalog:?}");
-        }
+        assert!(
+            !catalog.iter().any(|tool| tool == "session_control"),
+            "{catalog:?}"
+        );
         let root = f
             .state
             .storage

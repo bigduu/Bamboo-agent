@@ -1143,6 +1143,7 @@ mod tests {
             schema("Plan"),
             schema("Task"),
             schema("exec_command"),
+            schema("write_stdin"),
             schema("discover_capabilities"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -1166,17 +1167,17 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "SubAgent", "Task"]
+            vec!["Read", "SubAgent", "Task", "exec_command", "write_stdin"]
         );
         let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
             &session,
             &tools,
             CapabilityLoadingMode::StickyFallback,
         );
-        for name in ["Read", "SubAgent", "Task"] {
+        for name in ["Read", "SubAgent", "Task", "exec_command", "write_stdin"] {
             assert!(callable.contains_execution_name(name), "{name}");
         }
-        for name in ["Plan", "exec_command", "discover_capabilities"] {
+        for name in ["Plan", "discover_capabilities"] {
             assert!(!callable.contains_execution_name(name), "{name}");
         }
     }

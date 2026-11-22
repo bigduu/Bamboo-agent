@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_active_workflow_context_block, build_agent_hook_context_block,
+    build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
@@ -23,7 +23,7 @@ use crate::runtime::runner::session_setup::prompt_setup::{
 };
 use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
@@ -32,8 +32,8 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
@@ -687,9 +687,14 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
+    configured_mode: PermissionMode,
 ) -> Option<ContextBlock> {
-    if !session.allows_model_tool_execution("write_stdin")
-        || !effective_tool_schemas(session, tool_schemas)
+    let flags =
+        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let schemas = effective_tool_schemas(session, tool_schemas);
+    if flags.plan_read_only
+        || !session.allows_model_tool_execution("write_stdin")
+        || !schemas
             .iter()
             .any(|schema| schema.function.name == "write_stdin")
     {
@@ -699,13 +704,22 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
+    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && schemas
+            .iter()
+            .any(|schema| schema.function.name == "SubAgent")
+    {
+        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
+    } else {
+        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
+    };
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
         ContextBlockStability::RoundDynamic,
-        "Shell sessions awaiting a terminal result",
+        "Shell session handles",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
+            "{guidance}\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))
@@ -1183,6 +1197,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
+    if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
     if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
         model_transcript.push(block.render_runtime_context_message());
     }
@@ -1200,7 +1217,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             remaining.as_secs()
         )));
     }
-    if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
+    if let Some(block) = build_exec_session_continuation_context_block(
+        session,
+        tool_schemas,
+        config.permission_mode.unwrap_or_default(),
+    ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
         // stale ID from the next request as soon as its terminal poll consumes it.

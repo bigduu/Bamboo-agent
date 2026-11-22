@@ -3,15 +3,17 @@
 Ultra combines the primary model's highest reasoning effort with active
 parallel SubAgent delegation. The Root looks for useful independent work,
 dispatches as capacity permits, advances its own ready work, and verifies the
-results. An ordinary Ultra Root can also write and edit under its workspace
-and permission checks. Other reasoning selections use their chosen level
-and delegate when the task benefits.
+results. An ordinary Ultra Root can write, edit and use `exec_command` under
+its workspace and permission checks. Use `SubAgent` with `intent=wait` for
+non-interactive completion and `write_stdin` for input or unread output.
+Other reasoning selections use their chosen level and delegate when useful.
 
 At primary request dispatch Bamboo uses the highest supported native tier
-for known limits, such as `xhigh` on GPT-5.4 and `high` on Gemini. On routes
-without a known lower ceiling it requests `max`. Provider validation and
-explicit request overrides apply normally. The saved standard effort remains
-available when the user switches to Standard.
+for known limits, such as `xhigh` on GPT-5.4 and `high` on Gemini 3. Routes
+without a known lower ceiling use `max`. Native models such as Claude 4.5
+that reject the adapter's adaptive-effort request receive no Ultra effort
+override. Provider defaults and request overrides still apply. The saved
+standard effort is available when the user switches to Standard.
 
 ## Authority and wire contract
 
@@ -38,6 +40,8 @@ ordinary `reasoning_effort` separately.
 
 No second persisted field, proof version, journal or stage protocol is added.
 The existing birth token, terminal epoch/receipt and dispatch fences are kept.
+A command approval is bound to the Session's tool authority revision. After a
+mode change, send a new tool call so the current policy can authorize it.
 
 ## Delegated execution evidence and limits
 

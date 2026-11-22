@@ -2,7 +2,7 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
-use bamboo_domain::CapabilityLoadingMode;
+use bamboo_domain::{CapabilityLoadingMode, SessionKind};
 
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
@@ -55,6 +55,35 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
     )
 }
 
+/// The request-selected catalog already accounts for role, Host, and provider
+/// restrictions. The native shell entry point is Core and is never deferred.
+pub(crate) fn build_child_tool_guidance(
+    session: &Session,
+    tool_schemas: &[ToolSchema],
+) -> Option<ContextBlock> {
+    if session.kind != SessionKind::Child
+        || tool_schemas
+            .iter()
+            .any(|schema| schema.function.name == "exec_command")
+    {
+        return None;
+    }
+    let availability = if tool_schemas.is_empty() {
+        "This child request has no tools. Work from the supplied inputs."
+    } else {
+        "Bamboo's built-in shell command tool is unavailable on this request. Use the supplied inputs and exposed tools, including dedicated file or search tools where useful. Use tool discovery when offered to find an eligible alternative."
+    };
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Child Tool Availability",
+        format!(
+            "{availability} Complete and verify what you can. Mention a missing tool only when it blocks a required result. If it does, tell your parent the exact action and evidence needed from an authorized session, alongside your verified findings."
+        ),
+    ))
+}
+
 /// A session-selected prompt enhancement for a root that coordinates child
 /// work. Keep this independent of the current SubAgent action schema: the
 /// runtime will continue to own the concrete delegation and inspection calls.
@@ -69,7 +98,8 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
-Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work. Sequence jobs competing for the same constrained compute.\n\
+Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+Use exec_command for authorized shell commands. Prefer SubAgent intent=wait for non-interactive exit. Use write_stdin for input or unread output.\n\
 Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
 Use the highest reasoning tier available on the primary model.";
 
@@ -200,6 +230,9 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     assert!(guidance
         .content
         .contains("Use the highest reasoning tier available on the primary model"));
+    assert!(guidance
+        .content
+        .contains("Prefer SubAgent intent=wait for non-interactive exit"));
     for concept in [
         "Actively look for useful independent work",
         "Launch ready independent SubAgent assignments in parallel",
