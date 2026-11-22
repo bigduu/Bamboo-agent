@@ -19,33 +19,14 @@ pub const DISPATCH_CONFIRMATION: &str = concat!(
     "and execution status in the tools."
 );
 
-const CONTINUE_AFTER_DELIVERY: &str = concat!(
-    "For an ongoing assignment, take the next authorized action before reporting. ",
-    "If review found an unverified risk or missing tests, dispatch a bounded reproduction ",
-    "and the independent missing coverage before asking for a product decision. ",
-    "Reuse suitable Sessions, subscribe to their results, and separate overlapping writes. ",
-    "A Session waiting for approval is unavailable for new work. ",
-    "Start independent checks in available Sessions instead of queuing them behind that approval."
-);
-
 pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
-    "For managed Session work, make dispatch calls without a preamble. ",
-    "Give each new Session a short title that names the concrete task in the user's language, ",
-    "such as \"核对 Bodhi 开发启动流程\" or \"Fix duplicate progress events\". ",
-    "Honor any title explicitly supplied by the user. Keep operation IDs, timestamps and retry labels in the tools. ",
-    "Acknowledge a dispatch once in a short reply with the user-facing task names. ",
-    "Keep dispatch and monitoring mechanics in tools. On a committed handoff, use the Worker summary by default. ",
-    "For an ongoing goal, dispatch or resume the next unblocked step before reporting. ",
-    "A Session waiting for approval cannot run a new followup. Keep that work parked. ",
-    "Dispatch independent reproduction and missing validation in available Sessions, creating new ones as needed. ",
-    "Treat a queued or coalesced admission as pending until execution is observed. ",
-    "Report only the newly delivered task in one short update with its conclusion, key source locations and material risk. ",
-    "If multiple handoffs arrive together, give each new task one entry. Use the user's language. ",
-    "Let approval cards show the exact operation and collect the user's decision. Advance independent work while waiting. ",
-    "Leave tool narration, internal identifiers and repeated rollups out of the reply unless requested. ",
-    "Read the referenced final message only when a concrete gap or conflict blocks the user's decision, ",
-    "the user requests detail, or an explicit verification or acceptance step requires more evidence. ",
-    "Report delivery as the Worker's result and preserve its uncertainty. Keep formal verification and acceptance separate."
+    "Dispatch directly with a short task title in the user's language or the exact title they supplied. Subscribe to results when offered. ",
+    "Confirm dispatch once by task name. Use the Run receipt for progress. Park Sessions pending approval. Let the card collect the decision and advance independent work in available Sessions.\n",
+    "For each new handoff, give a brief update in the user's language with the Worker's conclusion, key sources and uncertainty. ",
+    "Inspect the referenced result for a specific evidence gap, requested detail or acceptance. ",
+    "For ongoing work, dispatch the next authorized step before reporting, including bounded reproduction or missing validation when needed.\n",
+    "Verify artifacts and evidence against assigned acceptance criteria. Identify a failed criterion, reject the exact current submission when applicable and send a bounded correction. Verify the corrected result. ",
+    "When user_acceptance_required is true, wait for explicit User acceptance of the exact current submission."
 );
 
 /// The canonical notice stays stable across retries. The provider presentation
@@ -86,7 +67,7 @@ pub fn project_managed_notice(
         ))
     };
     Some(SessionProviderMessage {
-        content: SessionMessageContent::text(format!("{body}\n\n{CONTINUE_AFTER_DELIVERY}")),
+        content: SessionMessageContent::text(body),
         metadata: Default::default(),
         never_compress: false,
     })
@@ -330,6 +311,47 @@ mod tests {
     }
 
     const SUMMARY: &str = "<!-- bamboo-handoff:v1 -->\n\n- **Task** 核查进度\n- **Conclusion** 已定位更新路径\n- **Evidence** `src/进度.ts:12-15`, `src/tests.ts:70`\n- **Risk** 重连未实测\n<!-- /bamboo-handoff:v1 -->";
+
+    #[test]
+    fn supervisor_delivery_projection_contains_the_result_without_repeating_role_guidance() {
+        let mut target = Session::new("worker", "test");
+        let message = Message::assistant(SUMMARY, None);
+        let reference = RootFinalMessageReference::capture(&message).unwrap();
+        target.add_message(message);
+        let fact = SupervisedRootOutcomeFact {
+            sequence: 2,
+            activation_id: "worker-activation".into(),
+            attempt: 1,
+            lease_epoch: 1,
+            lease_owner_sha256: "0".repeat(64),
+            run_id: "run".into(),
+            conversation_reset_sha256: None,
+            resumed_from: Some(1),
+            inputs: Vec::new(),
+            questions: Vec::new(),
+            result: Some(SupervisedRootOutcomeResult::Completed),
+            final_message: Some(reference.clone()),
+        };
+        let supervisor = SupervisorReference {
+            session_id: "supervisor".into(),
+            incarnation_id: "1b6b8356-52fd-4c4c-84d6-58faf97cb5fc".parse().unwrap(),
+        };
+        let (outcome, _) = completed();
+        let canonical = project_handoff_notice(
+            &outcome,
+            Some(&reference),
+            Some(SUMMARY),
+            ManagedRootHandoffFormat::WorkerSummary,
+        );
+        for canonical_handoff in [Some(canonical.as_str()), None] {
+            let notice = project_managed_notice(&supervisor, &target, &fact, canonical_handoff)
+                .expect("completed managed handoff");
+            assert_eq!(notice.content.text, canonical);
+        }
+        assert!(canonical.contains("Recorded outcome: completed"));
+        assert!(canonical.contains(&reference.message_id));
+        assert!(canonical.contains("重连未实测"));
+    }
 
     #[test]
     fn projects_the_complete_summary_even_when_it_follows_long_details() {

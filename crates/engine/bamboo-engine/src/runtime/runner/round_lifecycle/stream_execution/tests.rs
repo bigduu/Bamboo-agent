@@ -3706,6 +3706,96 @@ fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_on
 }
 
 #[test]
+fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
+    use bamboo_domain::{
+        ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+        ModelContextResetReason, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID,
+    };
+    use bamboo_llm::SegmentRole;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let config = test_config("BASE_IDENTITY");
+    let mut prepared = workspace_prepared_context();
+    prepared
+        .messages
+        .push(Message::assistant("Delivery pending.", None));
+    prepared.messages.push(Message::user("Check its progress."));
+    let mut saved = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+    saved.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    saved.messages = prepared.messages.clone();
+
+    let initial = super::build_request_envelope(&saved, &prepared, &config, &[]);
+    let old_scope = serde_json::json!({
+        "external_memory_projection_version": 3,
+        "model": "test-model",
+        "provider_boundary_sha256": null,
+        "system": initial.ir.system_text,
+        "stable_prefix": initial.ir.run(SegmentRole::StablePrefix)
+            .iter()
+            .map(|message| (&message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        "tools": [],
+    });
+    let legacy = ContextBlock::new(
+        ContextBlockType::RootOrchestration,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Supervisor Delegation Policy",
+        "LEGACY_SUPERVISOR_ROLE\n\nCurrent delegation route observation: {\"status\":\"routes_exposed\"}",
+    );
+    let prior = super::super::context_ledger::reconcile_model_context(
+        &mut saved,
+        vec![legacy],
+        &prepared.messages[1..],
+        bamboo_domain::sha256_hex(&serde_json::to_vec(&old_scope).unwrap()),
+        false,
+    );
+    let history = serde_json::to_value(&saved.messages).unwrap();
+    let mut restored: Session =
+        serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+    let refreshed = super::build_request_envelope_reconciled(
+        &mut restored,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(
+        refreshed.prefix_reset_reason,
+        Some(ModelContextResetReason::CacheScopeChanged)
+    );
+    assert_eq!(refreshed.prefix_epoch, prior.prefix_epoch + 1);
+    let wire = refreshed.ir.flatten();
+    assert!(wire
+        .iter()
+        .all(|message| !message.content.contains("LEGACY_SUPERVISOR_ROLE")));
+    assert!(wire
+        .iter()
+        .any(|message| message.content == "Check its progress."));
+    assert_eq!(
+        wire.iter()
+            .filter(|message| message
+                .content
+                .contains("Supervisor delegation-first policy"))
+            .count(),
+        1
+    );
+    let repeated = super::build_request_envelope_reconciled(
+        &mut restored,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(repeated.prefix_epoch, refreshed.prefix_epoch);
+    assert_eq!(repeated.prefix_reset_reason, None);
+    assert!(!repeated.ledger_changed);
+    assert_eq!(serde_json::to_value(&restored.messages).unwrap(), history);
+}
+
+#[test]
 fn session_identity_is_model_visible_after_invariant_prefix_without_cross_session_drift() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut config = test_config("BASE_IDENTITY");

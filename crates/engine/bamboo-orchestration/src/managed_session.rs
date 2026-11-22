@@ -49,19 +49,14 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
 /// Placement and dispatch policy in the Supervisor's role context.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
-    "When a new assignment requires a specific Project, use session_control create with its verified Project and bound workspace. ",
-    "Honor an explicit request to start the execution Session in Ultra by setting thinking_mode to ultra on creation. ",
-    "An Ultra execution Session is an Ordinary Root that can delegate shell work to SubAgents. Standard is the default for a new assignment. ",
-    "On a new user request, dispatch and report only the requested assignments. ",
-    "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
-    "Conversation history alone does not reactivate old work. ",
-    "Before dispatch, identify the assignment and the workspace it needs. ",
-    "Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation ",
-    "identifies the same assignment in the intended Project and workspace. ",
-    "Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. ",
-    "Assign a Project only when the user explicitly identifies it for that assignment or a named repository or workspace matches a canonical Host record. ",
-    "The Project of another assignment, the current directory, or a sole available Project does not count. ",
-    "If the assignment requires a specific repository or workspace and you cannot identify it, ask one focused question before dispatching that assignment."
+    "Use session_control create for a verified Project and its bound workspace, or its standalone form if spawn_session is unavailable. ",
+    "Bind a Project only when the user identifies it for this assignment or the named workspace or repository matches a canonical Host record. ",
+    "Ask one focused question if a required workspace is unclear. ",
+    "Start a new independent Session for a separate assignment or requested context isolation. Workers are Ordinary Roots. ",
+    "Set thinking_mode to ultra on explicit request. Use Standard by default.\n",
+    "Reuse a Session only for the same verified assignment in the intended Project and workspace, or at the user's explicit direction. ",
+    "Use session_control followup or an authorized session_message send, preserving the target's context and permissions. ",
+    "Act only on requested assignments and their own fresh Host notifications."
 );
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
