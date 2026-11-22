@@ -133,7 +133,7 @@ fn select_work<'a>(
 }
 
 impl TicketApplication {
-    fn handoff_cwd(
+    async fn handoff_cwd(
         &self,
         snapshot: &Snapshot,
         work: &Ticket,
@@ -154,14 +154,22 @@ impl TicketApplication {
             })?;
         self.validate_project_context(project, Some(context), false)?;
         let binding = Path::new(&context.workspace_binding.path);
-        let selected = attempt
-            .and_then(|attempt| attempt.workspace.as_ref())
+        let workspace = attempt.and_then(|attempt| attempt.workspace.as_ref());
+        let selected = workspace
             .map(|workspace| Path::new(&workspace.worktree))
             .unwrap_or(binding);
         let unavailable =
             || Error::ResourceBlocked("the Work workspace is unavailable on this host".into());
         if !selected.is_dir() || !binding.is_dir() {
             return Err(unavailable());
+        }
+        let checkout = selected.canonicalize().map_err(|_| unavailable())?;
+        snapshot.verify_handoff_checkout_released(attempt, &checkout)?;
+        if let Some(workspace) = workspace {
+            bamboo_engine::ticket_worker_plan::files::verify_continuation_workspace(
+                workspace.clone(),
+            )
+            .await?;
         }
         if selected != binding {
             let binding_git =
@@ -253,7 +261,9 @@ impl TicketApplication {
         }
         let (_, snapshot) = service.published()?;
         let (work, attempt) = select_work(&snapshot, &selector)?;
-        let cwd = self.handoff_cwd(&snapshot, work, attempt, &selector.project_id)?;
+        let cwd = self
+            .handoff_cwd(&snapshot, work, attempt, &selector.project_id)
+            .await?;
         self.codex_handoffs
             .create(selector, snapshot.binding.scope_id, cwd)
     }
@@ -275,7 +285,11 @@ impl TicketApplication {
             return Err(Error::RevisionConflict);
         }
         let (work, attempt) = select_work(&snapshot, &offer.selector)?;
-        if self.handoff_cwd(&snapshot, work, attempt, &offer.selector.project_id)? != offer.cwd {
+        if self
+            .handoff_cwd(&snapshot, work, attempt, &offer.selector.project_id)
+            .await?
+            != offer.cwd
+        {
             return Err(Error::RevisionConflict);
         }
         let session = if let Some(attempt) = attempt {
@@ -307,12 +321,158 @@ impl TicketApplication {
             session.as_ref(),
         );
         // Do not consume an offer after a concurrent ledger change or checkout change.
-        if service.published()?.0 != commit
-            || self.handoff_cwd(&snapshot, work, attempt, &offer.selector.project_id)? != offer.cwd
+        if self
+            .handoff_cwd(&snapshot, work, attempt, &offer.selector.project_id)
+            .await?
+            != offer.cwd
+            || service.published()?.0 != commit
         {
             return Err(Error::RevisionConflict);
         }
         self.codex_handoffs.consume(id)?;
         Ok(prompt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    use bamboo_tickets::{AssignmentState, Effect, EffectState, ExecutionWorkspace, ScopeBinding};
+    use serde_json::json;
+
+    use super::*;
+
+    fn git(directory: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Handoff fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn codex_handoff_requires_released_checkout_and_recorded_git_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory.path().join("repo");
+        let checkout = directory.path().join("worktree");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "fixture base",
+            ],
+        );
+        let branch = "bamboo/work/handoff-fixture";
+        git(
+            &repo,
+            &["worktree", "add", "-b", branch, checkout.to_str().unwrap()],
+        );
+        let canonical_checkout = checkout.canonicalize().unwrap();
+        let worktree = checkout.to_str().unwrap().to_owned();
+        let workspace = ExecutionWorkspace {
+            repo: repo.to_str().unwrap().to_owned(),
+            worktree: worktree.clone(),
+            base_commit: git(&repo, &["rev-parse", "HEAD"]),
+            branch: branch.to_owned(),
+            claims: BTreeSet::from([format!("worktree:{}", canonical_checkout.display())]),
+            write_roots: vec![worktree],
+        };
+        let mut assignment: Assignment = serde_json::from_value(json!({
+            "id":"original","work_id":"work-fixture","generation":1,"contract_revision":1,
+            "authority_epoch":1,"record_revision":1,"state":"running","dispatch_key":"fixture",
+            "plan":{"plan_revision":1,"steps":[]},"dependency_inputs":[],"allowed_tools":[],
+            "effects":{},"workspace":workspace,"updated_seq":1
+        }))
+        .unwrap();
+        let mut snapshot = Snapshot::empty(ScopeBinding {
+            scope_id: "fixture".to_owned(),
+            supervisor_session_id: "supervisor".to_owned(),
+            binding_revision: 1,
+        });
+        let verify = |snapshot: &Snapshot, attempt: &Assignment| {
+            snapshot.verify_handoff_checkout_released(Some(attempt), &canonical_checkout)
+        };
+        assert!(matches!(
+            verify(&snapshot, &assignment),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assignment.state = AssignmentState::Cancelling;
+        assert!(matches!(
+            verify(&snapshot, &assignment),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assignment.process_stopped = true;
+        assignment.effects.insert(
+            "effect".to_owned(),
+            Effect {
+                action_fingerprint: "fixture".to_owned(),
+                state: EffectState::OutcomeUnknown,
+                provider_receipt: None,
+                artifact: None,
+                file_intent: None,
+            },
+        );
+        assert!(matches!(
+            verify(&snapshot, &assignment),
+            Err(Error::ResourceBlocked(_))
+        ));
+        assignment.effects.clear();
+        let mut competing = assignment.clone();
+        competing.id = "other-assignment".to_owned();
+        competing.state = AssignmentState::Running;
+        competing.process_stopped = false;
+        snapshot.assignments.insert(competing.id.clone(), competing);
+        assert!(matches!(
+            verify(&snapshot, &assignment),
+            Err(Error::ResourceBlocked(_))
+        ));
+        snapshot.assignments.clear();
+        verify(&snapshot, &assignment).unwrap();
+
+        use bamboo_engine::ticket_worker_plan::files::{
+            verify_continuation_workspace, verify_workspace,
+        };
+        verify_continuation_workspace(workspace.clone())
+            .await
+            .unwrap();
+        git(
+            &checkout,
+            &[
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "committed Work progress",
+            ],
+        );
+        verify_continuation_workspace(workspace.clone())
+            .await
+            .unwrap();
+        assert!(verify_workspace(workspace.clone()).await.is_err());
+        git(&checkout, &["switch", "-c", "unrelated-branch"]);
+        assert!(matches!(
+            verify_continuation_workspace(workspace).await,
+            Err(Error::ScopeDenied(_))
+        ));
     }
 }
