@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 
@@ -266,6 +267,46 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<Option<String>> {
         self.store.read_memory_view(scope, project_key).await
+    }
+
+    /// Project orientation for model requests. Management views also list
+    /// superseded, contradicted, and archived records.
+    pub async fn read_project_prompt_index(&self, project_key: &str) -> io::Result<Option<String>> {
+        use DurableMemoryStatus::{Active, Stale};
+        let scope = MemoryScope::Project;
+        let key = Some(project_key);
+        let Some(index) = self.store.read_lexical_index(scope, key).await? else {
+            return Ok(None);
+        };
+        let mut items = index
+            .items
+            .into_iter()
+            .filter(|item| {
+                item.scope == scope
+                    && item.project_key.as_deref() == key
+                    && matches!(item.status, Active | Stale)
+            })
+            .peekable();
+        if items.peek().is_none() {
+            return Ok(None);
+        }
+        let mut content = format!("# Jiandu Memory Index (Project: {project_key})\n\n");
+        for item in items {
+            let _ = writeln!(
+                content,
+                "- `{}` {} [{} / {}] updated {}",
+                item.id,
+                item.title,
+                item.r#type.as_str(),
+                item.status.as_str(),
+                item.updated_at
+            );
+            if !item.summary.is_empty() {
+                let (summary, _) = truncate_chars(&item.summary, 160);
+                let _ = writeln!(content, "  - {summary}");
+            }
+        }
+        Ok(Some(content))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -809,6 +850,36 @@ pub async fn shortlist_relevant_memories(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn prompt_index_without_lexical_index_excludes_misplaced_topic() {
+        let directory = tempdir().unwrap();
+        let store = MemoryStore::new(directory.path());
+        let local = bamboo_domain::ProjectId::parse("local-prompt-index-fixture").unwrap();
+        let foreign = bamboo_domain::ProjectId::parse("foreign-prompt-index-fixture").unwrap();
+        let document = write_durable(
+            &store.for_project(&foreign),
+            MemoryScope::Project,
+            Some(foreign.as_str()),
+            "Foreign decision",
+            "FOREIGN_PROJECT_MUST_NOT_REACH_PROMPT",
+        )
+        .await;
+        let local = store.for_project(&local);
+        let key = Some("local-prompt-index-fixture");
+        let misplaced = local
+            .store
+            .resolver()
+            .topic_path(MemoryScope::Project, key, &document.frontmatter.id)
+            .unwrap();
+        std::fs::create_dir_all(misplaced.parent().unwrap()).unwrap();
+        std::fs::copy(document.path, misplaced).unwrap();
+        assert!(local
+            .read_project_prompt_index(key.unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     async fn write_durable(
         store: &MemoryStore,
