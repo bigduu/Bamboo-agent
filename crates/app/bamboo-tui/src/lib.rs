@@ -8,7 +8,7 @@
 //! existing tokio runtime; both binaries provide one via `#[tokio::main]`.
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,6 +23,7 @@ mod app;
 mod components;
 mod event;
 mod file_change;
+mod file_reference;
 mod history;
 mod keymap;
 mod search;
@@ -129,6 +130,7 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;

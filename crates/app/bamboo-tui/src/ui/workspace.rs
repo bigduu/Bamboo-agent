@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use crate::app::{ActiveQuestionKind, App, ConfigView, MessageRole, Tab};
 use crate::event::AppEvent;
+use crate::file_reference::file_name;
 use crate::keymap::{ActionContext, ActionId};
 use crate::text::clip_cells;
 use crate::theme::{self, ThemePalette};
@@ -84,13 +85,12 @@ impl WorkspaceState {
                 .iter()
                 .find(|message| matches!(message.role, MessageRole::User))
                 .and_then(|message| message.content.lines().next());
-            short_label(
-                session_title
-                    .or(prompt)
-                    .or(session)
-                    .unwrap_or("New session"),
-                title_width,
-            )
+            let label = session_title
+                .or(prompt)
+                .or(session)
+                .unwrap_or("New session");
+            let name = file_name(label);
+            short_label(name.as_deref().unwrap_or(label), title_width)
         } else if app.tab == Tab::Config && app.config.view == ConfigView::Permissions {
             "Permission policy".to_string()
         } else {
@@ -133,12 +133,7 @@ impl WorkspaceState {
             task_progress: (progress.total > 0)
                 .then(|| format!("{}/{} tasks", progress.completed, progress.total)),
             streaming: app.chat.streaming,
-            has_draft: app
-                .chat
-                .textarea
-                .lines()
-                .iter()
-                .any(|line| !line.trim().is_empty()),
+            has_draft: app.chat.has_composer_draft(),
             command_hint: app.primary_key_hint(ActionContext::Global, ActionId::OpenCommandPalette),
             session_hint: app.primary_key_hint(ActionContext::Global, ActionId::OpenSessionPicker),
             hints: app.workspace_hints,

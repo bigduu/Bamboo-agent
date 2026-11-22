@@ -28,6 +28,7 @@ pub enum AnswerSubmissionOutcome {
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),
     Mouse(MouseEvent),
     WorkspaceAction(crate::ui::workspace::WorkspaceAction),
     /// Terminal resized; the next loop iteration redraws at the new size (the

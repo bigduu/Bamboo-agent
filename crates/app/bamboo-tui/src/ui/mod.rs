@@ -47,7 +47,8 @@ fn render_with_palette(f: &mut Frame, app: &App) {
 pub(crate) fn render_workspace(f: &mut Frame, app: &App, body: Rect, status: Rect) {
     crate::theme::with_palette(app.theme, || {
         let (anchor, inline_approval) = if app.tab == crate::app::Tab::Chat {
-            let input_height = app.chat.textarea.lines().len().clamp(2, 5) as u16;
+            let input_height = app.chat.textarea.lines().len().clamp(2, 5) as u16
+                + u16::from(!app.chat.composer_files.is_empty());
             let approval_height =
                 layout::inline_approval_height(app, body.height.saturating_sub(input_height + 2));
             let [transcript, approval, input] = Layout::vertical([

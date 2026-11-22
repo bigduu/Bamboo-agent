@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
@@ -22,6 +25,7 @@ use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
+use crate::file_reference::{pasted_files, FileReference};
 use crate::history::map_history;
 use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
@@ -1167,6 +1171,7 @@ pub struct ChatState {
     pub project_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
+    pub(crate) composer_files: Vec<FileReference>,
     pending_loop_composer: Option<ComposerSnapshot>,
     loop_watch: Option<LoopWatch>,
     loop_discovery_token: Option<String>,
@@ -1294,6 +1299,15 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    pub(crate) fn has_composer_draft(&self) -> bool {
+        !self.composer_files.is_empty()
+            || self
+                .textarea
+                .lines()
+                .iter()
+                .any(|line| !line.trim().is_empty())
+    }
+
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text(chat_placeholder_for(&Keymap::default()));
@@ -1306,6 +1320,7 @@ impl ChatState {
             project_id: None,
             messages: Vec::new(),
             textarea,
+            composer_files: Vec::new(),
             pending_loop_composer: None,
             loop_watch: None,
             loop_discovery_token: None,
@@ -4162,18 +4177,22 @@ impl CommandPaletteEntry {
 pub struct ComposerSnapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
+    files: Vec<FileReference>,
 }
 
 impl ComposerSnapshot {
-    fn capture(textarea: &TextArea<'_>) -> Self {
+    fn capture(chat: &ChatState) -> Self {
         Self {
-            lines: textarea.lines().to_vec(),
-            cursor: textarea.cursor(),
+            lines: chat.textarea.lines().to_vec(),
+            cursor: chat.textarea.cursor(),
+            files: chat.composer_files.clone(),
         }
     }
 
-    fn still_matches(&self, textarea: &TextArea<'_>) -> bool {
-        self.lines == textarea.lines() && self.cursor == textarea.cursor()
+    fn still_matches(&self, chat: &ChatState) -> bool {
+        self.lines == chat.textarea.lines()
+            && self.cursor == chat.textarea.cursor()
+            && self.files == chat.composer_files
     }
 }
 
@@ -5708,6 +5727,11 @@ impl App {
                     Ok(Event::Mouse(mouse)) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
                         break;
                     }
+                    Ok(Event::Paste(text)) => {
+                        if tx.send(AppEvent::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(Event::Resize(width, height))
                         if tx.send(AppEvent::Resize(width, height)).is_err() =>
                     {
@@ -5730,6 +5754,7 @@ impl App {
         background_status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Main event loop.
+        let mut bracketed_paste = false;
         while self.running {
             let size = terminal.size()?;
             self.terminal_width = size.width;
@@ -5743,6 +5768,21 @@ impl App {
             self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            // Other editors continue receiving the terminal's ordinary text input.
+            let wants_paste = self.chat_composer_focused();
+            if wants_paste != bracketed_paste {
+                let result = if wants_paste {
+                    crossterm::execute!(terminal.backend_mut(), EnableBracketedPaste)
+                } else {
+                    crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste)
+                };
+                if let Err(error) = result {
+                    if error.kind() != std::io::ErrorKind::Unsupported {
+                        return Err(error.into());
+                    }
+                }
+                bracketed_paste = wants_paste;
+            }
             terminal.draw(|frame| workspace.render(frame, self))?;
             workspace.check_error()?;
 
@@ -6286,13 +6326,16 @@ impl App {
                     }
                     return Ok(());
                 }
-                AppEvent::Mouse(_) | AppEvent::WorkspaceAction(_) => return Ok(()),
+                AppEvent::Paste(_) | AppEvent::Mouse(_) | AppEvent::WorkspaceAction(_) => {
+                    return Ok(());
+                }
                 _ => {}
             }
         }
 
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
+            AppEvent::Paste(text) => self.handle_composer_paste(&text),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::WorkspaceAction(action) => self.handle_workspace_action(action),
             AppEvent::SessionsLoaded {
@@ -6952,7 +6995,7 @@ impl App {
                             reply.loop_command.filter(|command| !command.should_execute)
                         {
                             if session_id.as_deref() == Some(reply.response.session_id.as_str()) {
-                                if submitted.still_matches(&self.chat.textarea) {
+                                if submitted.still_matches(&self.chat) {
                                     self.clear_chat_composer();
                                 }
                                 self.update_loop_watch(acknowledgment.record.as_ref());
@@ -6967,7 +7010,7 @@ impl App {
                             self.notify(NoticeLevel::Error, "The server did not acknowledge /loop");
                         } else {
                             // Bamboo accepted spoken loop wording as a user turn.
-                            if submitted.still_matches(&self.chat.textarea) {
+                            if submitted.still_matches(&self.chat) {
                                 self.clear_chat_composer();
                             }
                             let turn_id = self.begin_chat_turn(message);
@@ -7692,7 +7735,7 @@ impl App {
                 palette.resolving_key = None;
                 match result {
                     Ok(detail) => {
-                        if !palette.original_composer.still_matches(&self.chat.textarea) {
+                        if !palette.original_composer.still_matches(&self.chat) {
                             palette.error = Some(
                                 "Composer changed while resolving; draft was not replaced"
                                     .to_string(),
@@ -9357,6 +9400,10 @@ impl App {
 
     pub(crate) fn workspace_controls_enabled(&self) -> bool {
         self.running && self.active_action_contexts()[0] == self.tab_context()
+    }
+
+    fn chat_composer_focused(&self) -> bool {
+        self.active_action_contexts()[0] == ActionContext::Chat
     }
 
     pub(crate) fn workspace_context_id(&self) -> u64 {
@@ -11204,6 +11251,26 @@ impl App {
         }
     }
 
+    fn handle_composer_paste(&mut self, text: &str) {
+        if !self.chat_composer_focused() || text.is_empty() {
+            return;
+        }
+        self.pending_key_sequence = None;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(files) = pasted_files(&text) {
+            self.chat.composer_files.extend(files);
+            self.status_message = "Backspace at the start removes the last file".to_string();
+        } else {
+            let text: String = text
+                .chars()
+                .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+                .collect();
+            if !text.is_empty() {
+                self.chat.textarea.insert_str(text);
+            }
+        }
+    }
+
     async fn handle_chat_key(&mut self, key: KeyEvent) -> Result<()> {
         self.normalize_conversation_focus();
         let contexts: &[ActionContext] = if self.chat.focused_block.is_some() {
@@ -11246,6 +11313,15 @@ impl App {
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
             Some(ActionId::SendMessage) => self.submit_chat_draft(),
+            None if key.code == KeyCode::Backspace
+                && key.modifiers.is_empty()
+                && self.chat.textarea.cursor() == (0, 0)
+                && self.chat.textarea.selection_range().is_none()
+                && !self.chat.composer_files.is_empty() =>
+            {
+                self.chat.composer_files.pop();
+                self.status_message = "File removed".to_string();
+            }
             None => {
                 if text_widget_input_allowed(key) {
                     self.chat.textarea.input(key);
@@ -11257,7 +11333,17 @@ impl App {
     }
 
     fn submit_chat_draft(&mut self) {
-        let draft = self.chat.textarea.lines().join("\n");
+        let text = self.chat.textarea.lines().join("\n");
+        let draft = std::iter::once(text.trim())
+            .filter(|text| !text.is_empty())
+            .chain(
+                self.chat
+                    .composer_files
+                    .iter()
+                    .map(|file| file.path.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
         let loop_command = Self::is_loop_chat_command(&draft);
         if self.chat.streaming && !loop_command {
             self.status_message = format!(
@@ -11281,14 +11367,13 @@ impl App {
             self.status_message = "Session is being deleted — message kept as draft".to_string();
             return;
         }
-        let input = draft.trim();
-        if input.is_empty() {
+        if draft.is_empty() {
             return;
         }
         if !loop_command {
             self.clear_chat_composer();
         }
-        self.send_message(input.to_string());
+        self.send_message(draft);
     }
 
     fn handle_conversation_block_action(&mut self, action: ActionId) {
@@ -11327,6 +11412,7 @@ impl App {
         textarea.set_placeholder_text(self.chat_placeholder());
         apply_textarea_palette(&mut textarea, self.theme);
         self.chat.textarea = textarea;
+        self.chat.composer_files.clear();
     }
 
     /// Send a chat message WITHOUT blocking the event loop: the user turn is
@@ -11366,7 +11452,7 @@ impl App {
                 self.status_message = "Loop command is still pending — draft preserved".to_string();
                 return;
             }
-            self.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&self.chat.textarea));
+            self.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&self.chat));
             let session_id = req.session_id.clone();
             tokio::spawn(async move {
                 let result = match tokio::time::timeout(
@@ -11799,12 +11885,14 @@ impl App {
         } else {
             let mut discarded = self.take_active_context();
             let textarea = std::mem::take(&mut discarded.chat.textarea);
+            let files = std::mem::take(&mut discarded.chat.composer_files);
             discarded.abort_background_work();
-            Some(textarea)
+            Some((textarea, files))
         };
         self.install_active_context(SessionUiContext::blank(context_id));
-        if let Some(textarea) = preserved_composer {
+        if let Some((textarea, files)) = preserved_composer {
             self.chat.textarea = textarea;
+            self.chat.composer_files = files;
             apply_textarea_palette(&mut self.chat.textarea, self.theme);
         }
         self.chat.model = model;
@@ -15837,7 +15925,7 @@ impl App {
             resolving: false,
             resolving_key: None,
             error: None,
-            original_composer: ComposerSnapshot::capture(&self.chat.textarea),
+            original_composer: ComposerSnapshot::capture(&self.chat),
             hitboxes: RefCell::new(Vec::new()),
             mouse_pressed_item: None,
         };
@@ -16090,7 +16178,7 @@ impl App {
             palette.trigger == CommandPaletteTrigger::Slash
                 && palette.search_query().eq_ignore_ascii_case("loop")
         }) {
-            if !palette.original_composer.still_matches(&self.chat.textarea) {
+            if !palette.original_composer.still_matches(&self.chat) {
                 palette.error = Some("Composer changed while selecting; draft preserved".into());
                 return;
             }
@@ -16196,7 +16284,7 @@ impl App {
         let Some(palette) = self.command_palette.as_ref() else {
             return;
         };
-        if !palette.original_composer.still_matches(&self.chat.textarea) {
+        if !palette.original_composer.still_matches(&self.chat) {
             if let Some(palette) = self.command_palette.as_mut() {
                 palette.error =
                     Some("Composer changed while selecting; draft was not replaced".to_string());
@@ -16582,7 +16670,7 @@ mod command_palette_tests {
             resolving: false,
             resolving_key: None,
             error: None,
-            original_composer: ComposerSnapshot::capture(&app.chat.textarea),
+            original_composer: ComposerSnapshot::capture(&app.chat),
             hitboxes: RefCell::new(Vec::new()),
             mouse_pressed_item: None,
         };
@@ -16595,7 +16683,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.textarea.insert_str("draft text");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 0));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
 
         app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
         assert_eq!(
@@ -16609,7 +16697,7 @@ mod command_palette_tests {
         app.handle_command_palette_key(key(KeyCode::Esc));
 
         assert!(app.command_palette.is_none());
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
 
         app.chat.textarea.move_cursor(CursorMove::End);
         app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
@@ -16727,7 +16815,7 @@ mod command_palette_tests {
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep this draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 4));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         install_test_palette(
             &mut app,
             CommandPaletteTrigger::Global,
@@ -16752,7 +16840,7 @@ mod command_palette_tests {
             .is_some_and(|error| error.contains("offline")));
         assert!(palette.error.as_deref().unwrap().contains("F10 retries"));
         assert!(!palette.error.as_deref().unwrap().contains("Ctrl+R"));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
 
         app.command_palette.as_mut().unwrap().epoch = epoch.wrapping_add(1);
         app.handle_event(AppEvent::CommandCatalogLoaded {
@@ -16772,7 +16860,7 @@ mod command_palette_tests {
             .entries
             .iter()
             .all(|entry| !matches!(entry, CommandPaletteEntry::Server(_))));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
     }
 
     #[tokio::test]
@@ -16929,7 +17017,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.textarea.insert_str("exact draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 5));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         install_test_palette(
             &mut app,
             CommandPaletteTrigger::Global,
@@ -16949,7 +17037,7 @@ mod command_palette_tests {
             .entries
             .iter()
             .all(|entry| matches!(entry, CommandPaletteEntry::Builtin(_))));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
     }
 
     #[tokio::test]
@@ -17001,7 +17089,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("untouched");
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         let prompt = command("review", "prompt", "workspace");
         let entry = CommandPaletteEntry::Server(prompt.clone());
         install_test_palette(
@@ -17031,7 +17119,7 @@ mod command_palette_tests {
         .await
         .unwrap();
 
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
         assert!(app.command_palette.is_some());
     }
 
@@ -17041,7 +17129,7 @@ mod command_palette_tests {
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep me");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 2));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         let prompt = command("review", "prompt", "workspace");
         let entry = CommandPaletteEntry::Server(prompt);
         install_test_palette(
@@ -17070,7 +17158,7 @@ mod command_palette_tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("server unavailable")));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
         app.handle_command_palette_key(key(KeyCode::Backspace));
         assert_eq!(app.command_palette.as_ref().unwrap().input, "review sr");
     }
@@ -24794,13 +24882,13 @@ mod question_tests {
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("current-turn".to_string());
         app.install_command_draft("  /loop 每五分钟检查 CI\n这行也要保留".to_string());
-        let original = ComposerSnapshot::capture(&app.chat.textarea);
+        let original = ComposerSnapshot::capture(&app.chat);
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
 
         app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
         app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
-        assert!(original.still_matches(&app.chat.textarea));
+        assert!(original.still_matches(&app.chat));
         assert_eq!(
             app.status_message,
             "Loop command is still pending — draft preserved"
@@ -24816,7 +24904,7 @@ mod question_tests {
         ));
         app.handle_event(result).await.unwrap();
 
-        assert!(original.still_matches(&app.chat.textarea));
+        assert!(original.still_matches(&app.chat));
         assert!(app.chat.pending_loop_composer.is_none());
         assert_eq!(app.chat.current_turn_id.as_deref(), Some("current-turn"));
         assert!(app.chat.streaming);
@@ -24834,7 +24922,7 @@ mod question_tests {
         app.event_tx = Some(tx);
         app.chat.session_id = Some("loop-session".to_string());
         app.install_command_draft("/loop check CI".to_string());
-        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
         let response = |state: &str| {
             serde_json::from_value(serde_json::json!({
                 "session_id": "loop-session",
@@ -25018,7 +25106,7 @@ mod question_tests {
         );
         assert_eq!(app.chat.textarea.lines(), ["A newer draft"]);
 
-        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
         app.handle_event(acknowledgment(&app, "stopped"))
             .await
             .unwrap();
@@ -25075,7 +25163,7 @@ mod question_tests {
         });
         for newer_draft in [None, Some("A newer draft")] {
             app.install_command_draft("/loop stop".to_string());
-            app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+            app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
             if let Some(draft) = newer_draft {
                 app.install_command_draft(draft.to_string());
             }
