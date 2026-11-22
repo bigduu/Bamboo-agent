@@ -4635,6 +4635,8 @@ pub struct App {
     pub terminal_height: u16,
     pub client: BambooClient,
     pub chat: ChatState,
+    /// The local launch directory used when the first message creates a session.
+    pub(crate) launch_workspace: Option<String>,
     /// Recently visited non-foreground chats, keyed by server session id (or a
     /// temporary local id until the first chat request creates the session).
     session_views: HashMap<String, SessionUiContext>,
@@ -4915,6 +4917,7 @@ impl App {
             terminal_height: u16::MAX,
             client,
             chat: ChatState::with_context_id(1),
+            launch_workspace: None,
             session_views: HashMap::new(),
             session_view_order: VecDeque::new(),
             next_context_id: 1,
@@ -11221,6 +11224,11 @@ impl App {
             message: message.clone(),
             session_id: self.chat.session_id.clone(),
             project_id: self.chat.project_id.clone(),
+            workspace_path: if self.chat.session_id.is_none() {
+                self.launch_workspace.clone()
+            } else {
+                None
+            },
             model: Some(model),
             provider: self.chat.provider.clone(),
             reasoning_effort: self.chat.reasoning_effort,
@@ -26682,6 +26690,67 @@ mod question_tests {
         assert_eq!(opened.total_message_count, 1);
         assert_eq!(opened.messages.len(), 1);
         assert_eq!(opened.messages[0].content, "visible answer");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_sends_launch_workspace_only_when_creating_a_session() {
+        const WORKSPACE: &str = "/terminal/launch directory";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for (session_id, workspace_path) in [
+                (None, Some(WORKSPACE)),
+                (Some("first-session"), None),
+                (Some("other-session"), None),
+                (None, Some(WORKSPACE)),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /api/v1/chat "));
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(
+                    payload.get("session_id"),
+                    session_id.map(serde_json::Value::from).as_ref()
+                );
+                assert_eq!(
+                    payload.get("workspace_path"),
+                    workspace_path.map(serde_json::Value::from).as_ref()
+                );
+                let reply = serde_json::json!({
+                    "session_id": session_id.unwrap_or("first-session"),
+                    "stream_url": "/events",
+                    "status": "accepted"
+                });
+                respond_test_http(&mut socket, "application/json", &reply.to_string()).await;
+            }
+        });
+
+        let mut app = App::new(client);
+        app.launch_workspace = Some(WORKSPACE.to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        for (index, session_id) in [None, Some("first-session"), Some("other-session"), None]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 3 {
+                app.new_session();
+            } else {
+                app.chat.session_id = session_id.map(str::to_string);
+            }
+            app.chat.textarea.insert_str("test workspace selection");
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                event,
+                Some(AppEvent::ChatStarted { result: Ok(_), .. })
+            ));
+            app.chat.streaming = false;
+        }
         server.await.unwrap();
     }
 

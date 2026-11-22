@@ -6,6 +6,10 @@ are used in tab headers, dialog footers, and the command palette.
 
 ## Chat workspace
 
+With a local Bamboo server, new sessions use the directory where you launched
+`bamboo tui`. Opening an existing session uses its saved workspace. Remote
+servers resolve new workspaces from their own configuration.
+
 Press `/` at the start of the draft or `Ctrl+K` to open Functions. The menu
 searches built-in actions and commands available to the active Bamboo session.
 `Ctrl+O` opens the model and reasoning picker. Use the Left and Right keys to

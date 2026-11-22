@@ -1317,6 +1317,7 @@ mod tests {
                     message: "/loop stop".into(),
                     session_id: Some("chat".into()),
                     project_id: None,
+                    workspace_path: None,
                     model: None,
                     provider: None,
                     reasoning_effort: None,
