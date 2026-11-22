@@ -19,6 +19,7 @@ use bamboo_domain::{
 use bamboo_llm::provider::{
     OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
 };
+use bamboo_llm::providers::gemini::{reasoning_control_for_model, GeminiReasoningControl};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -52,9 +53,10 @@ fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<Re
                 .is_some_and(|suffix| suffix.starts_with('-'))
     };
     // These routes have no named reasoning tier in their native request.
-    if ["gpt-4.1", "gpt-4o", "gpt-3.5-turbo", "gemini-2.5"]
+    if ["gpt-4.1", "gpt-4o", "gpt-3.5-turbo"]
         .iter()
         .any(|family| belongs_to(family))
+        || model == "gemini-2.5"
     {
         return None;
     }
@@ -65,8 +67,13 @@ fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<Re
         // Earlier Claude models use extended thinking and reject that mode.
         return None;
     }
-    if provider_type == Some("gemini") || belongs_to("gemini-3") {
-        return Some(ReasoningEffort::High);
+    match reasoning_control_for_model(model) {
+        GeminiReasoningControl::Level => return Some(ReasoningEffort::High),
+        GeminiReasoningControl::Budget | GeminiReasoningControl::Unsupported => return None,
+        GeminiReasoningControl::Unknown if provider_type == Some("gemini") => {
+            return Some(ReasoningEffort::High);
+        }
+        GeminiReasoningControl::Unknown => {}
     }
     if [
         "gpt-5.2",
@@ -126,6 +133,9 @@ fn ultra_effort_uses_the_selected_routes_named_ceiling() {
             Some(ReasoningEffort::High),
         ),
         ("gemini", "models/gemini-2.5-flash", None),
+        ("bodhi", "gemini-2.0-flash", None),
+        ("bodhi", "gemini-3.5-flash", Some(ReasoningEffort::High)),
+        ("bodhi", "gemini-flash-latest", Some(ReasoningEffort::High)),
         ("anthropic", "claude-3-7-sonnet-20250219", None),
         ("anthropic", "claude-sonnet-4-20250514", None),
         ("anthropic", "claude-opus-4-1-20250805", None),

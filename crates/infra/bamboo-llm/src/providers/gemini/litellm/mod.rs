@@ -2,6 +2,7 @@ pub(super) mod replay;
 mod wire;
 
 use super::super::common::tool_schema::canonicalize_json_value;
+use super::{reasoning_control_for_model, GeminiReasoningControl};
 use crate::protocol::gemini::{normalize_function_response, parse_data_url_base64};
 use crate::protocol::ProtocolError;
 use crate::provider::{optional_protocol_output_limit, LLMError, Result};
@@ -29,7 +30,8 @@ pub(super) fn build_request(
         .next()
         .unwrap_or(model)
         .to_ascii_lowercase();
-    let gemini3_or_newer = is_gemini_3_or_newer(&model_name);
+    let reasoning_control = reasoning_control_for_model(&model_name);
+    let gemini3_or_newer = reasoning_control == GeminiReasoningControl::Level;
     let mut system_texts = Vec::new();
     let mut contents = Vec::<ContentType>::new();
     let mut tool_calls = HashMap::new();
@@ -110,7 +112,7 @@ pub(super) fn build_request(
     }
 
     let thinking_config = match reasoning_effort
-        .map(|effort| thinking_config(&model_name, gemini3_or_newer, effort))
+        .map(|effort| thinking_config(&model_name, reasoning_control, effort))
         .transpose()
     {
         Err(_) if options.reasoning_overridden => None,
@@ -252,25 +254,11 @@ fn tool_result_parts(
     std::iter::once(primary).chain(images).collect()
 }
 
-fn is_gemini_3_or_newer(model: &str) -> bool {
-    let Some(version) = model.strip_prefix("gemini-") else {
-        return false;
-    };
-    matches!(
-        version,
-        "flash-latest" | "flash-lite-latest" | "pro-latest" | "robotics-er-2-preview"
-    ) || version
-        .split(['.', '-'])
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 3)
-}
-
 // LiteLLM's VertexGeminiConfig maps OpenAI-style effort to a thinking level or
 // the Gemini 2.5 budget defaults. These are the pinned Google AI Studio rules.
 fn thinking_config(
     model: &str,
-    gemini3_or_newer: bool,
+    control: GeminiReasoningControl,
     effort: ReasoningEffort,
 ) -> Result<GeminiThinkingConfig> {
     let unsupported = || {
@@ -283,40 +271,39 @@ fn thinking_config(
         include_thoughts: Some(effort != ReasoningEffort::Disabled),
         ..Default::default()
     };
-    if gemini3_or_newer {
-        let level = match effort {
-            ReasoningEffort::Disabled => {
-                if model.contains("flash") && !wire::MODELS_WITHOUT_MINIMAL.contains(&model) {
-                    "minimal"
-                } else {
-                    "low"
+    match control {
+        GeminiReasoningControl::Level => {
+            let level = match effort {
+                ReasoningEffort::Disabled => {
+                    if model.contains("flash") && !wire::MODELS_WITHOUT_MINIMAL.contains(&model) {
+                        "minimal"
+                    } else {
+                        "low"
+                    }
                 }
-            }
-            ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
-                effort.as_str()
-            }
-            ReasoningEffort::Xhigh if wire::MODELS_WITH_XHIGH.contains(&model) => "xhigh",
-            ReasoningEffort::Xhigh | ReasoningEffort::Max => return Err(unsupported()),
-        };
-        config.thinking_level = Some(level.into());
-    } else if model.starts_with("gemini-2.5-") {
-        config.thinking_budget = Some(match effort {
-            ReasoningEffort::Disabled if !model.starts_with("gemini-2.5-pro") => 0,
-            ReasoningEffort::Low => wire::LOW_THINKING_BUDGET,
-            ReasoningEffort::Medium => wire::MEDIUM_THINKING_BUDGET,
-            ReasoningEffort::High => wire::HIGH_THINKING_BUDGET,
-            _ => return Err(unsupported()),
-        });
-    } else if model.starts_with("gemini-2.0-")
-        || model.starts_with("gemini-1.")
-        || model == "gemini-pro"
-    {
-        return Err(unsupported());
-    } else {
-        // A gateway alias carries no known Gemini capabilities. Preserve
-        // the previous wire level and let the configured endpoint interpret it.
-        config.thinking_level = Some(effort.as_str().to_ascii_uppercase());
-        config.include_thoughts = None;
+                ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
+                    effort.as_str()
+                }
+                ReasoningEffort::Xhigh if wire::MODELS_WITH_XHIGH.contains(&model) => "xhigh",
+                ReasoningEffort::Xhigh | ReasoningEffort::Max => return Err(unsupported()),
+            };
+            config.thinking_level = Some(level.into());
+        }
+        GeminiReasoningControl::Budget => {
+            config.thinking_budget = Some(match effort {
+                ReasoningEffort::Disabled if !model.starts_with("gemini-2.5-pro") => 0,
+                ReasoningEffort::Low => wire::LOW_THINKING_BUDGET,
+                ReasoningEffort::Medium => wire::MEDIUM_THINKING_BUDGET,
+                ReasoningEffort::High => wire::HIGH_THINKING_BUDGET,
+                _ => return Err(unsupported()),
+            });
+        }
+        GeminiReasoningControl::Unsupported => return Err(unsupported()),
+        GeminiReasoningControl::Unknown => {
+            // A gateway alias carries no known Gemini capabilities.
+            config.thinking_level = Some(effort.as_str().to_ascii_uppercase());
+            config.include_thoughts = None;
+        }
     }
     Ok(config)
 }

@@ -804,17 +804,6 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
-    /// Freeze an optional native replay route for one request. Mutable wrappers
-    /// may return a snapshot that preserves their dispatch observation and uses
-    /// the same concrete provider for planning and sending.
-    #[doc(hidden)]
-    async fn native_transcript_dispatch_snapshot(
-        &self,
-        _model: &str,
-    ) -> Result<Option<Arc<dyn LLMProvider>>> {
-        Ok(None)
-    }
-
     /// Built-in effort for a compression request before any role override.
     /// A provider can leave the setting to the upstream when its transport
     /// cannot reserve a small output budget separately from reasoning.
@@ -1160,17 +1149,17 @@ pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc
     forwarded_provider_snapshot(selected, None)
 }
 
-/// Refuse a prepared request if the forwarding owner no longer selects its
-/// captured route. Validate again at dispatch, before recording its origin.
+/// Refuse a prepared IR request if the forwarding owner no longer selects its
+/// captured route. Validate the model at dispatch, before recording its origin.
 #[doc(hidden)]
 pub fn guarded_snapshot_forwarded_provider(
     selected: Arc<dyn LLMProvider>,
-    check_current: impl Fn() -> Result<()> + Send + Sync + 'static,
+    check_current: impl Fn(&str) -> Result<()> + Send + Sync + 'static,
 ) -> Result<Arc<dyn LLMProvider>> {
     forwarded_provider_snapshot(selected, Some(Box::new(check_current)))
 }
 
-type ForwardingGuard = Box<dyn Fn() -> Result<()> + Send + Sync>;
+type ForwardingGuard = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 fn forwarded_provider_snapshot(
     selected: Arc<dyn LLMProvider>,
@@ -1211,15 +1200,6 @@ struct QueuedBudgetProvider {
     fixed_inner: bool,
     main_dispatch_origin: Option<Arc<dyn LLMProvider>>,
     forwarding_guard: Option<ForwardingGuard>,
-}
-
-impl QueuedBudgetProvider {
-    fn check_forwarding_guard(&self) -> Result<()> {
-        if let Some(check_current) = &self.forwarding_guard {
-            check_current()?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -1301,7 +1281,6 @@ impl LLMProvider for QueuedBudgetProvider {
         max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<LLMStream> {
-        self.check_forwarding_guard()?;
         self.inner
             .chat_stream(messages, tools, max_output_tokens, model)
             .await
@@ -1314,7 +1293,6 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        self.check_forwarding_guard()?;
         self.inner
             .chat_stream_with_options(messages, tools, max_output_tokens, model, options)
             .await
@@ -1327,7 +1305,9 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        self.check_forwarding_guard()?;
+        if let Some(check_current) = &self.forwarding_guard {
+            check_current(model)?;
+        }
         if let Some(origin) = self.main_dispatch_origin.as_ref().filter(|_| {
             options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop")
         }) {

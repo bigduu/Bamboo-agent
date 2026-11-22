@@ -62,6 +62,48 @@ pub(crate) fn apply_generation_config(
 }
 use bamboo_domain::ToolSchema;
 
+/// Reasoning controls supported by a known Gemini model family.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GeminiReasoningControl {
+    Level,
+    Budget,
+    Unsupported,
+    Unknown,
+}
+
+/// Use the same model classification for automatic effort and request conversion.
+#[doc(hidden)]
+pub fn reasoning_control_for_model(model: &str) -> GeminiReasoningControl {
+    use GeminiReasoningControl::{Budget, Level, Unknown, Unsupported};
+
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let Some(version) = model.strip_prefix("gemini-") else {
+        return Unknown;
+    };
+    if matches!(
+        version,
+        "flash-latest" | "flash-lite-latest" | "pro-latest" | "robotics-er-2-preview"
+    ) || version
+        .split(['.', '-'])
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 3)
+    {
+        Level
+    } else if version.starts_with("2.5-") {
+        Budget
+    } else if version.starts_with("2.0-") || version.starts_with("1.") || version == "pro" {
+        Unsupported
+    } else {
+        Unknown
+    }
+}
+
 /// Google Gemini API provider.
 pub struct GeminiProvider {
     client: Client,

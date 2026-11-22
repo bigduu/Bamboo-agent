@@ -71,7 +71,7 @@ async fn run_round(
     catalog: &[ToolSchema],
     output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
-    run_round_for_model(session, provider, catalog, output_limit_policy, MODEL).await
+    run_round_for_model(session, provider, catalog, output_limit_policy, MODEL, None).await
 }
 
 async fn run_round_for_model(
@@ -80,9 +80,11 @@ async fn run_round_for_model(
     catalog: &[ToolSchema],
     output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
     model: &str,
+    provider_type: Option<&str>,
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
     let config = AgentLoopConfig {
         model_name: Some(model.into()),
+        provider_type: provider_type.map(str::to_owned),
         reasoning_effort: session.reasoning_effort,
         ..Default::default()
     };
@@ -102,6 +104,54 @@ async fn run_round_for_model(
         output_limit_policy,
     )
     .await
+}
+
+#[cfg(feature = "litellm-wire-types")]
+#[tokio::test]
+async fn ultra_bodhi_gemini_sends_supported_reasoning_for_dotted_models() {
+    use wiremock::matchers::path;
+
+    let server = MockServer::start().await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        BodhiProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_target_provider("gemini")
+            .with_litellm_wire_types(),
+    );
+
+    for model in ["gemini-3.1-pro", "gemini-3.5-flash"] {
+        let endpoint = format!("/proxy/gemini/v1beta/models/{model}:streamGenerateContent");
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Ready."}]},"finishReason":"STOP"}]}"#,
+                    "\n\n",
+                ),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut session = Session::new(format!("ultra-{model}"), model);
+        session.add_message(Message::user("Check the route."));
+        session.set_root_orchestration_only(true).unwrap();
+        let round = run_round_for_model(&mut session, &provider, &[], None, model, Some("bodhi"))
+            .await
+            .unwrap();
+        assert_eq!(round.stream_output.content, "Ready.");
+    }
+
+    let requests = capture(&server).await;
+    assert_eq!(requests.len(), 2);
+    for body in requests {
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel":"high","includeThoughts":true})
+        );
+    }
 }
 
 #[cfg(feature = "litellm-wire-types")]
@@ -148,9 +198,8 @@ async fn gemini_replays_signed_parallel_tool_turn_after_session_reload() {
 
     #[async_trait::async_trait]
     impl LLMProvider for SnapshottingProvider {
-        async fn native_transcript_dispatch_snapshot(
+        fn queued_provider_snapshot(
             &self,
-            _model: &str,
         ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
             bamboo_llm::provider::snapshot_forwarded_provider(Arc::clone(&self.0)).map(Some)
         }
@@ -183,6 +232,7 @@ async fn gemini_replays_signed_parallel_tool_turn_after_session_reload() {
         &catalog,
         None,
         GEMINI_MODEL,
+        None,
     )
     .await
     .unwrap()
@@ -223,11 +273,18 @@ async fn gemini_replays_signed_parallel_tool_turn_after_session_reload() {
     for key in ["original-key", "different-key"] {
         let mut restored = restarted.load_session(&session.id).await.unwrap().unwrap();
         assert_eq!(
-            run_round_for_model(&mut restored, &provider(key), &catalog, None, GEMINI_MODEL)
-                .await
-                .unwrap()
-                .stream_output
-                .content,
+            run_round_for_model(
+                &mut restored,
+                &provider(key),
+                &catalog,
+                None,
+                GEMINI_MODEL,
+                None
+            )
+            .await
+            .unwrap()
+            .stream_output
+            .content,
             "Both looked up."
         );
     }

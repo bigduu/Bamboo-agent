@@ -752,7 +752,6 @@ pub(super) async fn project_request_usage(
     model: &str,
     llm: &Arc<dyn LLMProvider>,
 ) -> Result<ProjectedRequestUsage, AgentError> {
-    let llm = &request_provider(llm, model).await?;
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
@@ -818,17 +817,6 @@ fn build_request_envelope_reconciled(
         None,
         None,
     )
-}
-
-async fn request_provider(
-    provider: &Arc<dyn LLMProvider>,
-    model: &str,
-) -> Result<Arc<dyn LLMProvider>, AgentError> {
-    provider
-        .native_transcript_dispatch_snapshot(model)
-        .await
-        .map(|selected| selected.unwrap_or_else(|| Arc::clone(provider)))
-        .map_err(|error| AgentError::LLM(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1612,7 +1600,6 @@ pub(super) async fn execute_llm_stream(
     let mut budget = frame.budget.clone();
     let mut provider_default_output = frame.provider_default_output;
     let model = frame.model;
-    let llm = &request_provider(llm, model).await?;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
     let reasoning_effort = frame.reasoning_effort;
