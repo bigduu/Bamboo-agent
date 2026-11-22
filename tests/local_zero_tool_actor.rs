@@ -2873,7 +2873,10 @@ async fn root_catalog_fixture() {
                 .iter()
                 .any(|tool| tool["function"]["name"] == shell_tool));
         }
-        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(
+            request["reasoning_effort"],
+            if ultra { "max" } else { "high" }
+        );
         assert_eq!(
             request["messages"]
                 .to_string()

@@ -10,6 +10,7 @@ pub mod counted_loop;
 pub mod execution;
 pub(crate) mod final_evidence;
 pub mod goal_recovery;
+pub mod goal_restart;
 pub mod goal_state;
 pub mod gold_evaluation;
 pub mod guardian_state;

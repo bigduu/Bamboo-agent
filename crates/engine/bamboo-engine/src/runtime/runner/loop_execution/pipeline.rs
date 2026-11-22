@@ -2630,6 +2630,7 @@ async fn handle_no_tool_calls_with_native(
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
     cancel_token: &CancellationToken,
+    goal_no_progress_limit: bool,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -2710,9 +2711,8 @@ async fn handle_no_tool_calls_with_native(
     // decide whether to keep working toward it INSTEAD of completing. The agent
     // self-reports completion via `update_goal`, and a side-channel Gold
     // double-check verifies the objective before the run actually stops. Running
-    // this inside the loop means the run emits a single terminal `Complete` only
-    // when the goal is truly done — keeping `is_running` accurate and the SSE
-    // stream open.
+    // this inside the loop keeps `is_running` accurate and the SSE stream open
+    // until the Goal has either been verified or reached a stopping condition.
     let decision = evaluate_gold_terminal(
         session,
         task_context,
@@ -2721,6 +2721,7 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
+        goal_no_progress_limit,
         if config.auxiliary_model_resolver.is_some() {
             main_llm.clone()
         } else {
@@ -2752,8 +2753,7 @@ async fn handle_no_tool_calls_with_native(
         });
     }
 
-    // Gold decided STOP: the goal is met, or no goal loop is configured. Only now
-    // review the genuinely-final state. Adversarial guardian review: before
+    // Gold has decided to stop. Adversarial guardian review: before
     // completing, spawn a read-only reviewer child to verify the work and suspend
     // until its verdict returns. `maybe_spawn_guardian_review` returns `Some` when
     // it engages a review (spawn + suspend); it is inert unless a guardian config
@@ -3060,6 +3060,7 @@ async fn handle_no_tool_calls(
         Vec::new(),
         llm,
         &CancellationToken::new(),
+        false,
     )
     .await
 }
@@ -3719,6 +3720,7 @@ async fn run_pipeline_inner(
     let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
+        crate::runtime::goal_restart::disarm_before_round(session, config).await?;
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
             && cancel_token.is_cancelled()
         {
@@ -4700,6 +4702,8 @@ async fn run_pipeline_inner(
                         .clone()
                         .unwrap_or_else(|| llm.clone()),
                     cancel_token,
+                    no_tool_call_continuation_streak
+                        >= MAX_NO_TOOL_CALL_CONTINUATIONS - 1,
                 )
                 .await
                 {
