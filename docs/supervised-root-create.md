@@ -23,7 +23,7 @@ Project binding or permission is automatically changed.
 The worker is a new Ordinary Root. Standard is the default. An observed
 Supervisor can select `thinking_mode: "ultra"` in either `spawn_session` or
 `session_control create`. The first turn uses the ordinary Ultra tool catalog,
-including direct reads and edits and delegation of shell work to SubAgents.
+including direct reads, edits, and shell execution subject to its permissions.
 Keep the selected mode in the exact request when retrying a creation.
 
 The worker uses the same global defaults and Project context as `POST /sessions`.
