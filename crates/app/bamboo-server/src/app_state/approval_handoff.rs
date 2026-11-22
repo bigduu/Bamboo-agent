@@ -37,6 +37,7 @@ impl AppState {
                 }
             });
         }
+        crate::handlers::agent::sessions::spawn_automatic_session_archive(&state);
         web::Data::from(state)
     }
 }
