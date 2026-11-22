@@ -1845,6 +1845,7 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
         "session_control",
         "session_history",
         "exec_command",
+        "write_stdin",
         "vendor::session_control",
         "default::session_control",
     ]);
@@ -1905,7 +1906,7 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        vec!["Read", "session_history"]
+        vec!["Read", "exec_command", "session_history", "write_stdin"]
     );
 }
 
@@ -2032,7 +2033,7 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
             .iter()
             .map(|schema| schema.function.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Read"]
+        vec!["Read", "exec_command", "write_stdin"]
     );
     let guide = super::prompt_setup::build_tool_guide_context(
         &config,
@@ -2225,16 +2226,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
 
     assert_eq!(
         effective.execution_names().collect::<Vec<_>>(),
-        vec!["Edit", "Read"]
+        vec!["Edit", "Read", "exec_command", "write_stdin"]
     );
-    for denied in [
-        "Bash",
-        "default::Bash",
-        "exec_command",
-        "default::exec_command",
-        "write_stdin",
-        "mcp__x__run",
-    ] {
+    for denied in ["Bash", "default::Bash", "mcp__x__run"] {
         assert_eq!(
             effective.resolve_callable_reference(denied),
             None,
@@ -2244,6 +2238,10 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
     assert_eq!(
         effective.resolve_callable_reference("Edit"),
         Some("Edit".into())
+    );
+    assert_eq!(
+        effective.resolve_callable_reference("default::exec_command"),
+        Some("exec_command".into())
     );
     assert!(!catalog
         .iter()

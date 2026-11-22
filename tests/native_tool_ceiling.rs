@@ -138,7 +138,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         match probe.root.fetch_add(1, Ordering::SeqCst) {
             0 => call(
                 "exec_command",
-                json!({"cmd":"printf 'forbidden root' > root-denied.txt","workdir":probe.workspace}),
+                json!({"cmd":"printf 'root shell' > root-shell.txt","workdir":probe.workspace}),
             ),
             1 => {
                 let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
@@ -565,7 +565,12 @@ async fn fixture(case: Case) {
             std::fs::read_to_string(data.join("host.log")).unwrap()
         )
     });
-    assert!(!workspace.join("root-denied.txt").exists());
+    let root_shell = workspace.join("root-shell.txt");
+    if case == Case::Narrow {
+        assert!(!root_shell.exists());
+    } else {
+        assert_eq!(std::fs::read_to_string(root_shell).unwrap(), "root shell");
+    }
     if case == Case::Archived {
         assert!(probe.root.load(Ordering::SeqCst) >= 3);
         assert_eq!(
@@ -640,12 +645,9 @@ async fn fixture(case: Case) {
                     "Root {tool} visibility for {case:?}"
                 );
             }
-            assert!(request["tools"].as_array().unwrap().iter().all(|t| {
-                !matches!(
-                    t["function"]["name"].as_str(),
-                    Some("exec_command" | "write_stdin")
-                )
-            }));
+            for name in ["exec_command", "write_stdin"] {
+                assert_eq!(declared_tools(request).contains(name), case != Case::Narrow);
+            }
         }
         if case.forced() {
             assert_eq!(probe.reviews.load(Ordering::SeqCst), 1);
