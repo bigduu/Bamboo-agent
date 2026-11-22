@@ -88,7 +88,8 @@ fn public_workflow_catalog_snapshot(
     skill_catalog
 }
 
-/// Metadata-only catalog shared by Lotus palette, explicit selection and model matching.
+/// Metadata-only catalog of Workflows, with the older combined view for clients
+/// which still use instruction selection and migration.
 pub async fn list_workflow_catalog(
     app_state: web::Data<AppState>,
     query: web::Query<WorkflowCatalogQuery>,
@@ -198,13 +199,12 @@ pub async fn list_workflow_catalog(
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
     };
 
-    // Instruction Skills and orchestration definitions are independent
-    // activation namespaces, but they form one product-level Workflow
-    // Library. Clone both metadata-only snapshots while the store holds one
-    // publication guard, then expose only the public Workflow side of the
-    // orchestration/legacy namespace.
-    let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
-    let snapshot = public_workflow_catalog_snapshot(skill_catalog, workflow_catalog);
+    let snapshot = if query.orchestration_only {
+        store.executable_workflow_catalog_snapshot().await
+    } else {
+        let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+        public_workflow_catalog_snapshot(skill_catalog, workflow_catalog)
+    };
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
         .json(snapshot))

@@ -544,7 +544,7 @@ async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candi
         .await
         .unwrap();
         assert_eq!(
-            before.contains("Discover a Workflow when one could help."),
+            before.contains("Discover a Skill when one could help."),
             shows_guidance
         );
         let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
@@ -3206,6 +3206,12 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     assert!(stable
         .stable_instructions
         .contains("record a plan before implementation and resume a matching plan"));
+    assert!(stable
+        .stable_instructions
+        .contains("build the session DAG from the objective and applicable Skill instructions"));
+    assert!(stable
+        .stable_instructions
+        .contains("Start a matching executable Workflow with `workflow_run`"));
     assert!(stable
         .stable_instructions
         .contains("Use an active Workflow's steps and checks for its scope."));

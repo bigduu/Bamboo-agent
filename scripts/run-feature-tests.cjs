@@ -227,7 +227,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // existing owners. The four additive contexts and 20 cases stay intact.
 // #2935 keeps Supervisor route, prompt refresh and handoff cases in the default
 // Engine and Orchestration owners. Additive feature selections stay the same.
-const FEATURE_SOURCE_SHA256 = "ce347b559dc2b8e267663327d28b9881c391301e461a6b04ba45a30da068ce05";
+// #2936 retains the existing Engine, Server, and Skill test owners.
+const FEATURE_SOURCE_SHA256 = "6ba7e843de6df35f3f609a9968fe2b8745b284f171992c38efab5c4f3f3e3141";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
