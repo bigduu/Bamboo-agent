@@ -106,7 +106,7 @@ pub(crate) fn spawn_automatic_session_archive(state: &Arc<AppState>) {
                     if shutdown.is_cancelled() {
                         return;
                     }
-                    match maintain(&state, id, cutoff, Operation::Archive).await {
+                    match maintain(&state, id, cutoff, Operation::AutomaticArchive).await {
                         Ok(Some(Outcome::Archived {
                             original_bytes,
                             archived_bytes,

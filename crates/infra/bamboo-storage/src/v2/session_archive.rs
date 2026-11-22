@@ -14,6 +14,7 @@ const MIN_MAIN_BYTES: usize = 1024 * 1024;
 pub enum SessionArchiveOperation {
     Preview,
     Archive,
+    AutomaticArchive,
     Restore,
 }
 
@@ -110,7 +111,7 @@ impl SessionStoreV2 {
         cutoff: DateTime<Utc>,
         operation: SessionArchiveOperation,
     ) -> io::Result<Option<SessionArchiveOutcome>> {
-        use SessionArchiveOperation::{Archive, Preview, Restore};
+        use SessionArchiveOperation::{Preview, Restore};
         validate_session_id(id)?;
         let guards = self.session_maintenance_guards(id).await?;
         self.ensure_no_session_version_migration_locked().await?;
@@ -156,7 +157,7 @@ impl SessionStoreV2 {
 
         let guards = self.session_maintenance_guards(id).await?;
         self.ensure_no_session_version_migration_locked().await?;
-        match self.inspect_archive_source(id, cutoff, Archive).await? {
+        match self.inspect_archive_source(id, cutoff, operation).await? {
             Some(Inspection::Ready(current)) if current.pair.sha256 == expected => {
                 self.write_default_bytes(&current.path, encoded, &guards)
                     .await?;
@@ -180,7 +181,6 @@ impl SessionStoreV2 {
         cutoff: DateTime<Utc>,
         operation: SessionArchiveOperation,
     ) -> io::Result<Option<Inspection>> {
-        let restoring = operation == SessionArchiveOperation::Restore;
         let relative = Self::root_rel_path(id);
         let directory = self.abs_path_from_rel(&relative);
         for path in [&self.sessions_dir, &directory] {
@@ -198,9 +198,14 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
         let archived = cold_main::file_is_archived(&mut fs::File::open(&path).await?).await?;
-        match (archived, restoring) {
-            (true, false) => return Ok(Some(Inspection::Finished(Outcome::AlreadyArchived))),
-            (false, true) => {
+        use SessionArchiveOperation::{Archive, AutomaticArchive, Preview, Restore};
+        match (archived, operation) {
+            // Scheduled scans and previews observe the encoding without
+            // reading every archived history. An explicit retry validates it.
+            (true, AutomaticArchive | Preview) => {
+                return Ok(Some(Inspection::Finished(Outcome::AlreadyArchived)));
+            }
+            (false, Restore) => {
                 return Ok(self
                     .load_authoritative_root_session(id)
                     .await?
@@ -208,7 +213,7 @@ impl SessionStoreV2 {
             }
             _ => {}
         }
-        if !restoring {
+        if !archived {
             if metadata.len() < MIN_MAIN_BYTES as u64 {
                 return Ok(Some(skipped("small_main")));
             }
@@ -222,14 +227,17 @@ impl SessionStoreV2 {
             }
         }
         let stored = bounded_read(&path).await?;
-        if !restoring && compact_main::validate_full_main(&stored)?.is_none() {
+        if !archived && compact_main::validate_full_main(&stored)?.is_none() {
             return Ok(Some(skipped("legacy_main")));
         }
         let main = cold_main::decode_async(stored).await?;
         let runtime = bounded_read(&directory.join(RUNTIME_SIDECAR_FILE)).await?;
         let pair = Pair::new(main, runtime)?;
         let session = self.validate_maintenance_pair(id, &relative, &pair).await?;
-        if !restoring {
+        if archived && operation == Archive {
+            return Ok(Some(Inspection::Finished(Outcome::AlreadyArchived)));
+        }
+        if !archived {
             if session.pinned
                 || session.updated_at.max(session.created_at) > cutoff
                 || !session.authority_identity.is_ordinary()
@@ -506,10 +514,14 @@ mod tests {
         compressed.truncate(compressed.len() - 7);
         fs::write(&main, &compressed).await.unwrap();
         assert!(peer.load_session(id).await.is_err());
-        assert!(peer
-            .maintain_session_archive(id, boundary, restore)
-            .await
-            .is_err());
+        for operation in [archive, restore] {
+            assert!(
+                peer.maintain_session_archive(id, boundary, operation)
+                    .await
+                    .is_err(),
+                "{operation:?} should detect corruption"
+            );
+        }
         assert!(peer
             .save_session(&Session::new(id, "replacement"))
             .await
