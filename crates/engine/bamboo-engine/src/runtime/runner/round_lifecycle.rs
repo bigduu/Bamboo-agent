@@ -58,6 +58,13 @@ fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<Re
     {
         return None;
     }
+    if matches!(provider_type.map(str::trim), Some("anthropic" | "bodhi"))
+        && legacy_claude_model(model)
+    {
+        // The Messages adapters pair a named effort with adaptive thinking.
+        // Earlier Claude models use extended thinking and reject that mode.
+        return None;
+    }
     if provider_type == Some("gemini") || belongs_to("gemini-3") {
         return Some(ReasoningEffort::High);
     }
@@ -82,6 +89,29 @@ fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<Re
     Some(ReasoningEffort::Max)
 }
 
+fn legacy_claude_model(model: &str) -> bool {
+    // Dated snapshots and moving aliases use the same wire configuration as
+    // their family. Match exact 4.x families so newer tiers stay enabled.
+    let model = model.strip_suffix("-latest").unwrap_or(model);
+    let family = model
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(model, |(family, _)| family);
+    matches!(
+        family,
+        "claude-opus-4"
+            | "claude-opus-4-1"
+            | "claude-opus-4-5"
+            | "claude-sonnet-4"
+            | "claude-sonnet-4-5"
+            | "claude-haiku-4-5"
+            | "claude-2"
+            | "claude-3"
+    ) || family.starts_with("claude-3-")
+        || family.starts_with("claude-2.")
+        || family.starts_with("claude-instant-")
+}
+
 #[cfg(test)]
 #[test]
 fn ultra_effort_uses_the_selected_routes_named_ceiling() {
@@ -96,7 +126,23 @@ fn ultra_effort_uses_the_selected_routes_named_ceiling() {
             Some(ReasoningEffort::High),
         ),
         ("gemini", "models/gemini-2.5-flash", None),
+        ("anthropic", "claude-3-7-sonnet-20250219", None),
+        ("anthropic", "claude-sonnet-4-20250514", None),
+        ("anthropic", "claude-opus-4-1-20250805", None),
+        ("anthropic", "claude-opus-4-5", None),
+        ("anthropic", "claude-sonnet-4-5-latest", None),
+        ("bodhi", "claude-haiku-4-5-20251001", None),
         ("anthropic", "claude-sonnet-4-6", Some(ReasoningEffort::Max)),
+        (
+            "anthropic",
+            "claude-opus-4-8-20260830",
+            Some(ReasoningEffort::Max),
+        ),
+        (
+            "openai",
+            "anthropic/claude-opus-4-5",
+            Some(ReasoningEffort::High),
+        ),
         ("openai", "local-alias", Some(ReasoningEffort::Max)),
     ] {
         assert_eq!(

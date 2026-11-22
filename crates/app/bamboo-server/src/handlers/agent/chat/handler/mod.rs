@@ -11,6 +11,7 @@ use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
 use bamboo_engine::session_app::metadata::SessionMetadataService;
 
 mod goal_resume;
+pub(crate) use goal_resume::resume_goal;
 mod images;
 mod legacy_selection;
 #[cfg(test)]

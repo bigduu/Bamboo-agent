@@ -43,3 +43,6 @@ ordinary recovery.
 Use `/goal resume` to explicitly continue a stopped or interrupted Goal
 with the same saved history and continuation count. Resolve outstanding waits
 and verify any tool call with an unknown result before resuming.
+Chat clients can submit the command through
+`POST /api/v1/sessions/{session_id}/goal/resume`. Bamboo starts that run under
+its Root owner as part of accepting the request.

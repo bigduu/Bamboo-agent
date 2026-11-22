@@ -109,19 +109,20 @@ async fn goal_restart_uses_one_expired_owned_checkpoint_and_skips_newer_input() 
             session.add_message(Message::user("Use the newer instruction first."));
         }
         store.save_session(&session).await.unwrap();
-        let now = Utc::now();
-        store
+        let now = Utc::now() - chrono::Duration::seconds(5);
+        let owner = store
             .claim_activation(&ActorActivationClaim {
                 actor_id: id.into(),
                 run_id: OLD_RUN.into(),
                 lease_owner: "predecessor-host".into(),
-                lease_expires_at: now + chrono::Duration::milliseconds(150),
+                lease_expires_at: now + chrono::Duration::seconds(1),
                 inbox_generation: 0,
                 placement_ref: None,
                 now,
             })
             .await
             .unwrap();
+        store.start_activation(&owner.fence(), now).await.unwrap();
         ids.push((id, session.created_at));
     }
     let cutoff = Utc::now();
