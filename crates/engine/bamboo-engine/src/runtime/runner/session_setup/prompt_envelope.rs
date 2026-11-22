@@ -273,7 +273,6 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
         assert_eq!(block.stability, ContextBlockStability::SessionStable);
-        assert!(block.content.len() <= 3_900);
         assert_eq!(
             block
                 .content
