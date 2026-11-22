@@ -1410,6 +1410,7 @@ impl AppState {
                 observer_subscriptions.clone(),
                 paced_loops.clone(),
                 sessions.clone(),
+                child_completion_coordinator.clone(),
             )
             .await;
             if wake_report.attempted > 0

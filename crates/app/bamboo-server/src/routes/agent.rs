@@ -232,6 +232,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .route("/chat", web::post().to(agent::chat::handler))
         .route(
+            "/sessions/{session_id}/goal/resume",
+            web::post().to(agent::chat::resume_goal),
+        )
+        .route(
             "/prompt-presets",
             web::get().to(agent::prompt_presets::list_prompt_presets),
         )

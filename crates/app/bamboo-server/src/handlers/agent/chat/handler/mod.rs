@@ -10,6 +10,8 @@ use bamboo_engine::model_config_helper::{
 use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
 use bamboo_engine::session_app::metadata::SessionMetadataService;
 
+mod goal_resume;
+pub(crate) use goal_resume::resume_goal;
 mod images;
 mod legacy_selection;
 #[cfg(test)]
@@ -1353,7 +1355,7 @@ async fn handle_chat(
 /// Additional response payload for `/goal` control commands.
 #[derive(Debug, serde::Serialize)]
 pub struct GoalCommandResponse {
-    /// The action taken: "status", "off", "clear", "on", "set_prompt", "on_no_prompt".
+    /// The action taken: "status", "off", "clear", "on", "set_prompt", "on_no_prompt", "resume".
     pub action: String,
     /// Whether the frontend should proceed with execute after this response.
     pub should_execute: bool,
@@ -1368,6 +1370,9 @@ async fn handle_goal_command(
     session_id: &str,
     cmd: &GoalCommand,
 ) -> HttpResponse {
+    if matches!(cmd, GoalCommand::Resume) {
+        return goal_resume::handle(state, session_id).await;
+    }
     let config_snapshot = state.config.read().await.clone();
 
     // Load current session to read the existing gold_config override.
@@ -1386,6 +1391,7 @@ async fn handle_goal_command(
     let current_effective = resolve_gold_config(&config_snapshot, current_json.as_deref());
 
     let (new_config, should_resume) = match cmd {
+        GoalCommand::Resume => unreachable!(),
         GoalCommand::Status => {
             let response_config = current_effective.clone();
             return HttpResponse::Ok().json(ChatResponse {
@@ -1528,7 +1534,7 @@ async fn handle_goal_command(
                 GoalCommand::Clear => "clear".to_string(),
                 GoalCommand::On => "on".to_string(),
                 GoalCommand::SetPrompt(_) => "set_prompt".to_string(),
-                GoalCommand::Status => unreachable!(),
+                GoalCommand::Status | GoalCommand::Resume => unreachable!(),
             },
             should_execute: should_resume,
             gold_config: response_config,

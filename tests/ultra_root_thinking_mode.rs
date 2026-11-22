@@ -297,7 +297,7 @@ async fn run_ultra_fixture() {
         .collect();
     assert!(root_requests.len() >= 7);
     for request in root_requests {
-        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(request["reasoning_effort"], "max");
         assert!(request.to_string().contains(REQUIRED));
         assert!(request
             .to_string()

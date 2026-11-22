@@ -98,10 +98,10 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
-Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work. Sequence jobs competing for the same constrained compute.\n\
+Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
 Use exec_command for authorized shell commands. Prefer SubAgent intent=wait for non-interactive exit. Use write_stdin for input or unread output.\n\
 Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
-This mode is independent of each model call's reasoning effort.";
+Use the highest reasoning tier available on the primary model.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
 Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized independent Sessions. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
@@ -115,7 +115,7 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
         let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
         if session.root_orchestration_only_enabled() {
-            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification when the assignments are independent.");
+            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification. Actively look for independent assignments.");
         }
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
@@ -229,9 +229,12 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance
         .content
+        .contains("Use the highest reasoning tier available on the primary model"));
+    assert!(guidance
+        .content
         .contains("Prefer SubAgent intent=wait for non-interactive exit"));
-    assert!(guidance.content.contains("independent of each model call"));
     for concept in [
+        "Actively look for useful independent work",
         "Launch ready independent SubAgent assignments in parallel",
         "within the available capacity and budget",
         "While children run, dispatch additional ready assignments and advance your own independent work",
