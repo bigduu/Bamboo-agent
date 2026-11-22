@@ -1315,6 +1315,7 @@ mod tests {
                     in_reply_to: None,
                     correlation_id: None,
                     message: "/loop stop".into(),
+                    images: Vec::new(),
                     session_id: Some("chat".into()),
                     project_id: None,
                     workspace_path: None,

@@ -179,6 +179,7 @@ pub(crate) enum ActionId {
     Reject,
     OpenSlashPalette,
     SendMessage,
+    PasteClipboard,
     InsertNewline,
     ScrollTranscriptUp,
     ScrollTranscriptDown,
@@ -975,6 +976,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [Chat],
         [(Chat, "Enter")]
     ),
+    ActionSpec {
+        id: ActionId::PasteClipboard,
+        label: "Paste clipboard",
+        description: "Paste a screenshot or text from the macOS clipboard",
+        palette: false,
+        availability: ActionAvailability::Chat,
+        contexts: &[ActionContext::Chat],
+        defaults: if cfg!(target_os = "macos") {
+            &[DefaultBinding {
+                context: ActionContext::Chat,
+                keys: "Ctrl+V; Super+V",
+            }]
+        } else {
+            &[]
+        },
+    },
     spec!(
         InsertNewline,
         "Insert newline",
@@ -1468,9 +1485,8 @@ struct KeyStroke {
 
 impl KeyStroke {
     fn from_event(event: KeyEvent) -> Self {
-        // Keep every modifier reported by crossterm.  SUPER/HYPER/META are not
-        // configurable today, but silently discarding them would turn e.g.
-        // Super+Y into plain `y` and could confirm a destructive dialog.
+        // Keep every modifier reported by crossterm. Discarding them would
+        // turn e.g. Super+Y into plain `y` and could confirm a dialog.
         let mut modifiers = event.modifiers;
         let code = match event.code {
             KeyCode::BackTab => {
@@ -1556,7 +1572,8 @@ impl KeyStroke {
     }
 
     fn is_protocol_dependent(&self) -> bool {
-        (self.code == KeyCode::Enter && self.modifiers == KeyModifiers::SHIFT)
+        self.modifiers.contains(KeyModifiers::SUPER)
+            || (self.code == KeyCode::Enter && self.modifiers == KeyModifiers::SHIFT)
             || (self.code == KeyCode::Char('?') && self.modifiers == KeyModifiers::CONTROL)
     }
 }
@@ -2228,9 +2245,10 @@ fn parse_stroke(value: &str) -> Result<KeyStroke, KeymapError> {
             "ctrl" | "control" => KeyModifiers::CONTROL,
             "alt" | "option" => KeyModifiers::ALT,
             "shift" => KeyModifiers::SHIFT,
+            "super" | "cmd" | "command" => KeyModifiers::SUPER,
             _ => {
                 return Err(KeymapError(format!(
-                    "unknown modifier '{modifier}' (use Ctrl, Alt, or Shift)"
+                    "unknown modifier '{modifier}' (use Ctrl, Alt, Shift, or Super)"
                 )))
             }
         };

@@ -16,7 +16,7 @@ use crate::app::{
 /// transcript the Chat tab renders.
 ///
 /// - `system` messages are dropped — the TUI never displays them.
-/// - `user` messages become a plain `ChatMessage`.
+/// - `user` messages retain their text and image attachment count.
 /// - `assistant` messages become a `ChatMessage` carrying their tool calls
 ///   (installed with `phase: "pending"`, no result yet — a paired `tool`
 ///   message fills that in below).
@@ -40,13 +40,27 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
         match msg.role.as_str() {
             "system" => continue,
             "user" => {
-                if msg.content.is_empty() {
+                let image_count = msg
+                    .content_parts
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |parts| {
+                        parts
+                            .iter()
+                            .filter(|part| {
+                                part.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("image_url")
+                            })
+                            .count()
+                    });
+                if msg.content.is_empty() && image_count == 0 {
                     continue;
                 }
                 out.push(ChatMessage {
                     id: message_id,
                     role: MessageRole::User,
                     content: msg.content,
+                    image_count,
                     tool_calls: Vec::new(),
                     reasoning: None,
                     sub_agents: Vec::new(),
@@ -92,6 +106,7 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                     id: message_id,
                     role: MessageRole::Assistant,
                     content: msg.content,
+                    image_count: 0,
                     tool_calls,
                     reasoning,
                     sub_agents,
@@ -412,6 +427,23 @@ mod tests {
             content: content.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resumed_image_only_message_keeps_its_attachment() {
+        let message: HistoryMessage = serde_json::from_value(serde_json::json!({
+            "id": "screenshot",
+            "role": "user",
+            "content_parts": [
+                {"type": "text", "text": ""},
+                {"type": "image_url", "image_url": {"url": "bamboo-attachment://test/image"}}
+            ]
+        }))
+        .unwrap();
+        let transcript = map_history(vec![message]);
+        assert_eq!(transcript.len(), 1);
+        assert!(transcript[0].content.is_empty());
+        assert_eq!(transcript[0].image_count, 1);
     }
 
     fn assistant(content: &str, tool_calls: Vec<(&str, &str, &str)>) -> HistoryMessage {
@@ -995,7 +1027,7 @@ mod tests {
                     ConversationBlockKind::AssistantMarkdown { .. } => "assistant",
                     ConversationBlockKind::Reasoning { .. } => "reasoning",
                     ConversationBlockKind::ToolCall { .. } => "tool",
-                    ConversationBlockKind::UserMessage(_) => "user",
+                    ConversationBlockKind::UserMessage { .. } => "user",
                     ConversationBlockKind::SubAgent { .. } => "subagent",
                     ConversationBlockKind::Question { .. } => "question",
                     ConversationBlockKind::TerminalStatus(_) => "terminal",

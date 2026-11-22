@@ -5,12 +5,12 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    App, ConversationBlockKind, ConversationBlockLineRange, ConversationBlockUiState,
-    ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
+    App, ComposerAttachment, ConversationBlockKind, ConversationBlockLineRange,
+    ConversationBlockUiState, ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
 };
 use crate::components::markdown;
 use crate::file_change::FileChangeState;
-use crate::file_reference::{file_name, FileReference};
+use crate::file_reference::file_name;
 use crate::keymap::{ActionContext, ActionId};
 use crate::text::{clip_tail_cells, display_width, hard_wrap};
 use crate::theme::{self, colors, ThemePalette};
@@ -264,7 +264,7 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
 
     // Editing remains available while a run is active. The action reducer
     // owns when Enter can send a draft.
-    let draft = render_composer_files(f, input, app);
+    let draft = render_composer_attachments(f, input, app);
     f.render_widget(&app.chat.textarea, draft);
 }
 
@@ -274,7 +274,7 @@ pub(super) fn render_workspace(f: &mut Frame, content: Rect, input: Rect, app: &
 
     let style = super::workspace::surface_style(app.theme);
     f.render_widget(Block::default().style(style), input);
-    let draft = render_composer_files(
+    let draft = render_composer_attachments(
         f,
         Rect::new(
             input.x + 3,
@@ -298,11 +298,12 @@ fn file_reference_style(theme: ThemePalette) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn render_composer_files(f: &mut Frame, area: Rect, app: &App) -> Rect {
-    if app.chat.composer_files.is_empty() || area.height < 2 {
+fn render_composer_attachments(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    app.chat.attachment_remove_buttons.borrow_mut().clear();
+    if app.chat.composer_attachments.is_empty() || area.height < 2 {
         return area;
     }
-    let row = composer_file_row(&app.chat.composer_files, area.width as usize, app.theme);
+    let row = composer_attachment_row(area, app);
     f.render_widget(
         Paragraph::new(row),
         Rect::new(area.x, area.y, area.width, 1),
@@ -310,36 +311,66 @@ fn render_composer_files(f: &mut Frame, area: Rect, app: &App) -> Rect {
     Rect::new(area.x, area.y + 1, area.width, area.height - 1)
 }
 
-fn composer_file_row(files: &[FileReference], width: usize, theme: ThemePalette) -> Line<'static> {
+fn composer_attachment_row(area: Rect, app: &App) -> Line<'static> {
+    let attachments = &app.chat.composer_attachments;
+    let theme = app.theme;
+    let width = area.width as usize;
     let mut spans = Vec::new();
     let mut remaining = width;
-    for (index, file) in files.iter().enumerate() {
-        let after = files.len() - index - 1;
+    let mut remove_buttons = app.chat.attachment_remove_buttons.borrow_mut();
+    // Keep the screenshot and its remove control visible beside long file names.
+    let images = attachments
+        .iter()
+        .filter(|item| matches!(item, ComposerAttachment::Image(_)));
+    let files = attachments
+        .iter()
+        .filter(|item| matches!(item, ComposerAttachment::File(_)));
+    for (index, attachment) in images.chain(files).enumerate() {
+        let (name, padding) = match attachment {
+            ComposerAttachment::File(file) => (&file.name, 2),
+            ComposerAttachment::Image(image) => (&image.label, 4),
+        };
+        let after = attachments.len() - index - 1;
         let reserve = if after == 0 {
             0
         } else {
             format!(" +{after}").len()
         };
-        let max_name = remaining.saturating_sub(reserve + 2);
-        if max_name == 0 || (index > 0 && display_width(&file.name) > max_name) {
+        let max_name = remaining.saturating_sub(reserve + padding);
+        if max_name == 0 || (index > 0 && display_width(name) > max_name) {
             spans.push(Span::styled(
-                format!("+{}", files.len() - index),
+                format!("+{}", attachments.len() - index),
                 Style::default().fg(theme.color(theme::ColorRole::Inactive)),
             ));
             break;
         }
-        let label = clip_tail_cells(&file.name, max_name);
-        remaining -= display_width(&label) + 2;
-        spans.push(Span::styled(
-            format!(" {label} "),
-            file_reference_style(theme),
-        ));
+        let label = clip_tail_cells(name, max_name);
+        let label_width = display_width(&label);
+        let style = file_reference_style(theme);
+        spans.push(Span::styled(format!(" {label} "), style));
+        if let ComposerAttachment::Image(image) = attachment {
+            let left = area.x + (width - remaining + label_width + 2) as u16;
+            remove_buttons.push((Rect::new(left, area.y, 1, 1), image.clone()));
+            spans.push(Span::styled(
+                "× ",
+                style.fg(theme.color(theme::ColorRole::Inactive)),
+            ));
+        }
+        remaining -= label_width + padding;
         if after > 0 {
             spans.push(Span::raw(" "));
             remaining -= 1;
         }
     }
     Line::from(spans)
+}
+
+fn image_attachment_label(count: usize) -> String {
+    if count == 1 {
+        "Image attachment".to_string()
+    } else {
+        format!("{count} image attachments")
+    }
 }
 
 fn render_transcript(f: &mut Frame, content: Rect, app: &App, workspace: bool) {
@@ -394,11 +425,14 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
             .cloned()
             .unwrap_or_default();
         match block.kind {
-            ConversationBlockKind::UserMessage(content) if workspace => {
+            ConversationBlockKind::UserMessage {
+                content,
+                image_count,
+            } if workspace => {
                 let width = width.saturating_sub(4).clamp(1, 76) as usize;
                 let style = super::workspace::surface_style(app.theme);
                 let mut marker = if focused { "▸" } else { "›" };
-                for line in content.split('\n') {
+                for line in content.split('\n').filter(|_| !content.is_empty()) {
                     let filename = file_name(line);
                     let value = filename.as_deref().unwrap_or(line);
                     let row_style = if filename.is_some() {
@@ -418,8 +452,23 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                         marker = " ";
                     }
                 }
+                if image_count > 0 {
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(format!(" {marker} "), style),
+                            Span::styled(
+                                format!("{} ", image_attachment_label(image_count)),
+                                file_reference_style(app.theme).bg(app.theme.surface()),
+                            ),
+                        ])
+                        .alignment(Alignment::Right),
+                    );
+                }
             }
-            ConversationBlockKind::UserMessage(content) => {
+            ConversationBlockKind::UserMessage {
+                content,
+                image_count,
+            } => {
                 lines.push(Line::from(Span::styled(
                     if focused { "▸ user" } else { ">" },
                     Style::default()
@@ -439,6 +488,12 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                         } else {
                             Style::default().fg(colors::user_prefix())
                         },
+                    )));
+                }
+                if image_count > 0 {
+                    lines.push(Line::from(Span::styled(
+                        image_attachment_label(image_count),
+                        file_reference_style(app.theme),
                     )));
                 }
             }
@@ -753,6 +808,7 @@ mod tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         let view = build_conversation_lines(&app, 60, true);
@@ -768,7 +824,7 @@ mod tests {
         assert!(filename.style.add_modifier.contains(Modifier::BOLD));
         assert!(matches!(
             app.conversation_blocks()[0].kind,
-            ConversationBlockKind::UserMessage(content) if content == path
+            ConversationBlockKind::UserMessage { content, .. } if content == path
         ));
     }
 
@@ -1094,6 +1150,7 @@ mod tests {
                 status: "completed".to_string(),
                 error: None,
             }],
+            image_count: 0,
             terminal_status: Some("completed".to_string()),
         });
         app.chat.block_ui.insert(
@@ -1152,6 +1209,7 @@ mod tests {
                 phase: "complete".to_string(),
             }],
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: Some("completed".to_string()),
         });
         for id in [
