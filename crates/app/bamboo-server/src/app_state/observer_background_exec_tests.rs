@@ -146,8 +146,20 @@ async fn worker_before_delivery() {
             .status(),
         "running"
     );
-    drive_material_notices(&f, 1).await;
+    let mut source = load(&f.state, ROOT_A).await;
+    source.add_message(Message::assistant("Later transcript entry.", None));
+    assert!(
+        bamboo_orchestration::managed_session::notification_candidates(&source)
+            .unwrap()
+            .is_empty(),
+        "a later append must not turn the same wait into a notification"
+    );
     settle_material_notices(&f).await;
+    assert_eq!(
+        f.probe.parent_calls.load(Ordering::SeqCst),
+        0,
+        "an owned command wait must keep the Supervisor idle"
+    );
 
     std::fs::write(&gate.0, b"release").unwrap();
     let source = settled(&f.state, ROOT_A).await;
@@ -193,7 +205,7 @@ async fn worker_before_delivery() {
         .unwrap());
     let final_message = terminal.verified_final_message(&source).unwrap();
     assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
 
     let marker = std::path::PathBuf::from(std::env::var_os(MARKER_ENV).unwrap());
     write_crash_marker(

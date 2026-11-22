@@ -60,6 +60,7 @@ pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
 );
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
+pub const SUPERVISOR_WAIT_YIELD: &str = "runtime_control:supervisor_wait_yield";
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
 const RECENT_NOTIFICATION_SOURCES: usize = 8;
@@ -104,6 +105,26 @@ fn short_handoff_notice(
     notice
 }
 
+fn has_owned_background_wait(
+    session: &Session,
+    fact: &bamboo_domain::SupervisedRootOutcomeFact,
+) -> bool {
+    // A later Main append can follow the wait notice before reconciliation.
+    // Bind the notice to its producing Run and preserve actionable questions.
+    fact.questions.is_empty()
+        && session.messages.iter().rev().any(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "background_exec_wait"
+                        && metadata["source"] == "runtime"
+                        && metadata["run_id"].as_str() == Some(fact.run_id.as_str())
+                        && metadata["exec_session_id"]
+                            .as_str()
+                            .is_some_and(|handle| !handle.is_empty())
+                })
+        })
+}
+
 /// Selectors only. The native Inbox writer proves each original source again.
 pub fn notification_candidates(
     session: &Session,
@@ -117,12 +138,17 @@ pub fn notification_candidates(
     outcomes.validate()?;
     let mut candidates = Vec::new();
     for fact in &outcomes.facts {
-        let has_material = fact.result.is_some()
-            || metadata
-                .managed_task_blocker
-                .as_ref()
-                .is_some_and(|blocker| blocker.run_id == fact.run_id);
-        if !has_material {
+        let blocker = metadata
+            .managed_task_blocker
+            .as_ref()
+            .filter(|blocker| blocker.run_id == fact.run_id);
+        if fact.result.is_none() && blocker.is_none() {
+            continue;
+        }
+        if fact.result == Some(bamboo_domain::SupervisedRootOutcomeResult::Suspended)
+            && blocker.is_none()
+            && has_owned_background_wait(session, fact)
+        {
             continue;
         }
         for input in outcomes.material_inputs(fact) {
@@ -147,17 +173,7 @@ pub fn notification_candidates(
                 run_id: fact.run_id.clone(),
                 after_sequence: fact.sequence - 1,
                 input_receipt_id: input.receipt_id.clone(),
-                blocker_cursor: fact
-                    .result
-                    .is_none()
-                    .then(|| {
-                        metadata
-                            .managed_task_blocker
-                            .as_ref()
-                            .filter(|blocker| blocker.run_id == fact.run_id)
-                            .map(|blocker| blocker.cursor)
-                    })
-                    .flatten(),
+                blocker_cursor: blocker.filter(|_| fact.result.is_none()).map(|b| b.cursor),
             });
         }
     }
