@@ -799,6 +799,11 @@ impl RequestToolSelection {
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Opt-in provider-native history used by the exact dispatch target.
+    fn native_transcript_protocol(&self, _model: &str) -> Option<bamboo_domain::ProviderProtocol> {
+        None
+    }
+
     /// Built-in effort for a compression request before any role override.
     /// A provider can leave the setting to the upstream when its transport
     /// cannot reserve a small output budget separately from reasoning.
@@ -1079,6 +1084,7 @@ pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLM
             original: provider,
             fixed_inner: false,
             main_dispatch_origin: None,
+            forwarding_guard: None,
         })),
         None => Ok(provider),
     }
@@ -1094,6 +1100,7 @@ pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProv
         require_current: true,
         fixed_inner: false,
         main_dispatch_origin: None,
+        forwarding_guard: None,
     })
 }
 
@@ -1112,6 +1119,7 @@ pub fn fixed_provider_with_identity(
         require_current: true,
         fixed_inner: true,
         main_dispatch_origin: None,
+        forwarding_guard: None,
     })
 }
 
@@ -1130,6 +1138,7 @@ pub fn fixed_injected_provider_with_identity(
         require_current: false,
         fixed_inner: true,
         main_dispatch_origin: None,
+        forwarding_guard: None,
     })
 }
 
@@ -1137,6 +1146,25 @@ pub fn fixed_injected_provider_with_identity(
 /// The dispatch observer still receives the selected Arc at that same boundary.
 #[doc(hidden)]
 pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    forwarded_provider_snapshot(selected, None)
+}
+
+/// Refuse a prepared IR request if the forwarding owner no longer selects its
+/// captured route. Validate the model at dispatch, before recording its origin.
+#[doc(hidden)]
+pub fn guarded_snapshot_forwarded_provider(
+    selected: Arc<dyn LLMProvider>,
+    check_current: impl Fn(&str) -> Result<()> + Send + Sync + 'static,
+) -> Result<Arc<dyn LLMProvider>> {
+    forwarded_provider_snapshot(selected, Some(Box::new(check_current)))
+}
+
+type ForwardingGuard = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+fn forwarded_provider_snapshot(
+    selected: Arc<dyn LLMProvider>,
+    forwarding_guard: Option<ForwardingGuard>,
+) -> Result<Arc<dyn LLMProvider>> {
     let inner = queued_snapshot_for(selected.clone())?;
     Ok(Arc::new(QueuedBudgetProvider {
         require_current: inner.queue_requires_current_route(),
@@ -1144,7 +1172,24 @@ pub fn snapshot_forwarded_provider(selected: Arc<dyn LLMProvider>) -> Result<Arc
         original: selected.clone(),
         fixed_inner: true,
         main_dispatch_origin: Some(selected),
+        forwarding_guard,
     }))
+}
+
+/// Identify native replay through immutable dispatch delegates only.
+#[doc(hidden)]
+pub fn native_transcript_protocol_for(
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+) -> Option<bamboo_domain::ProviderProtocol> {
+    let mut provider = Arc::clone(provider);
+    for _ in 0..32 {
+        if let Some(protocol) = provider.native_transcript_protocol(model) {
+            return Some(protocol);
+        }
+        provider = provider.fixed_gold_policy_delegate()?;
+    }
+    None
 }
 
 struct QueuedBudgetProvider {
@@ -1154,6 +1199,7 @@ struct QueuedBudgetProvider {
     // A receipt-bound delegate must not later resnapshot a mutable wrapper.
     fixed_inner: bool,
     main_dispatch_origin: Option<Arc<dyn LLMProvider>>,
+    forwarding_guard: Option<ForwardingGuard>,
 }
 
 #[async_trait]
@@ -1182,6 +1228,7 @@ impl LLMProvider for QueuedBudgetProvider {
             require_current: self.require_current,
             fixed_inner: false,
             main_dispatch_origin: None,
+            forwarding_guard: None,
         })))
     }
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
@@ -1258,6 +1305,9 @@ impl LLMProvider for QueuedBudgetProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        if let Some(check_current) = &self.forwarding_guard {
+            check_current(model)?;
+        }
         if let Some(origin) = self.main_dispatch_origin.as_ref().filter(|_| {
             options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop")
         }) {

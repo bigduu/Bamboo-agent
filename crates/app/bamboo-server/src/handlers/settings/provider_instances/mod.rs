@@ -811,14 +811,14 @@ mod tests {
         let other: Value =
             http_test::call_and_read_body_json(&app, create_request("openai", "other-fixture-key"))
                 .await;
-        let unsupported: Value = http_test::call_and_read_body_json(
+        let gemini: Value = http_test::call_and_read_body_json(
             &app,
             create_request("gemini", "gemini-fixture-key"),
         )
         .await;
         let id = created["id"].as_str().unwrap().to_owned();
         let other_id = other["id"].as_str().unwrap().to_owned();
-        let unsupported_id = unsupported["id"].as_str().unwrap();
+        let gemini_id = gemini["id"].as_str().unwrap().to_owned();
 
         let list_request = || {
             http_test::TestRequest::get()
@@ -827,11 +827,6 @@ mod tests {
         };
         let before: Value = http_test::call_and_read_body_json(&app, list_request()).await;
         let instances = before["instances"].as_array().unwrap();
-        let unsupported = instances
-            .iter()
-            .find(|entry| entry["id"] == unsupported_id)
-            .unwrap();
-        assert!(unsupported.get("experiments").is_none());
         let instance = instances.iter().find(|entry| entry["id"] == id).unwrap();
         assert_eq!(instance["experiments"]["litellm_wire_types"], false);
         assert!(instance["config"].get("litellm_wire_types").is_none());
@@ -848,7 +843,7 @@ mod tests {
 
         let after: Value = http_test::call_and_read_body_json(&app, list_request()).await;
         let instances = after["instances"].as_array().unwrap();
-        for (expected_id, enabled) in [(&id, true), (&other_id, false)] {
+        for (expected_id, enabled) in [(&id, true), (&other_id, false), (&gemini_id, false)] {
             let instance = instances
                 .iter()
                 .find(|entry| entry["id"].as_str() == Some(expected_id))

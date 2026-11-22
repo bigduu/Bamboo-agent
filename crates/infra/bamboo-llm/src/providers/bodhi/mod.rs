@@ -524,26 +524,22 @@ impl BodhiProvider {
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
     ) -> Result<LLMStream> {
-        use crate::protocol::gemini::GeminiRequest;
-        use crate::protocol::ToProvider;
         use crate::providers::gemini::{
-            apply_generation_config, apply_required_tool_choice, parse_gemini_sse_event,
+            apply_required_tool_choice, build_gemini_request_body, parse_gemini_sse_event,
             GeminiStreamState,
         };
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
-        let messages_vec: Vec<Message> = messages.to_vec();
-        let mut request: GeminiRequest = messages_vec.to_provider()?;
-
-        if !tools.is_empty() {
-            let tools_vec: Vec<ToolSchema> = tools.to_vec();
-            request.tools = Some(tools_vec.to_provider()?);
-        }
-
-        apply_generation_config(&mut request, max_output_tokens, reasoning_effort);
-
-        // Serialize then run the last-moment scan over the body Value before send.
-        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        let mut request_json = build_gemini_request_body(
+            messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types
+                .then(crate::providers::gemini::LiteLlmRequestOptions::default),
+        )?;
         apply_required_tool_choice(&mut request_json, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut request_json,
@@ -583,6 +579,10 @@ impl BodhiProvider {
         }
 
         let mut state = GeminiStreamState::default();
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            state.enable_litellm_tool_ids();
+        }
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).

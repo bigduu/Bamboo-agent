@@ -552,6 +552,41 @@ pub(crate) fn messages_reasoning_overridden(
     })
 }
 
+#[cfg(feature = "litellm-wire-types")]
+pub(crate) fn gemini_contents_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_STREAM_GENERATE_CONTENT, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                path.is_empty()
+                    || matches!(path.first(), Some(PathSegment::Key(key)) if key == "contents")
+            })
+    })
+}
+
+#[cfg(feature = "litellm-wire-types")]
+pub(crate) fn gemini_reasoning_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_STREAM_GENERATE_CONTENT, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                patches_reasoning_control(
+                    ENDPOINT_STREAM_GENERATE_CONTENT,
+                    &parse_path(&patch.path),
+                )
+            })
+    })
+}
+
 pub(crate) fn chat_completions_controls_overridden(
     overrides: Option<&RequestOverridesConfig>,
     model: &str,

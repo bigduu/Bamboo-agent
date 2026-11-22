@@ -236,7 +236,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // owners. Continuation formatting stays in the Orchestration packages-3 owner.
 // #2940 enables the Messages comparison in the existing bamboo-llm default owner.
 // #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
-const FEATURE_SOURCE_SHA256 = "2b9f37a010b7576332762afb153c3d05a22d554ceb102c4a96e645834980a64f";
+// #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
+const FEATURE_SOURCE_SHA256 = "4060f10347dec1187b57a693745f48afc5999ec3244a4f02b0424c5819353853";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

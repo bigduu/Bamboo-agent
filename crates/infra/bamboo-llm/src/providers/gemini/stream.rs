@@ -30,6 +30,10 @@ use serde_json::Value;
 pub struct GeminiStreamState {
     /// Counter for generating unique tool call IDs
     next_tool_id: usize,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_tool_ids: bool,
+    #[cfg(feature = "litellm-wire-types")]
+    native_replay: Option<super::litellm::replay::ReplayCapture>,
     /// Whether stream contained explicit thinking/thought signal.
     pub observed_thinking_signal: bool,
     /// Count of thought parts observed.
@@ -182,6 +186,16 @@ impl GeminiProviderUsage {
 }
 
 impl GeminiStreamState {
+    #[cfg(feature = "litellm-wire-types")]
+    pub(in crate::providers) fn enable_litellm_tool_ids(&mut self) {
+        self.litellm_tool_ids = true;
+    }
+
+    #[cfg(feature = "litellm-wire-types")]
+    pub(super) fn capture_native_replay(&mut self, scope: String) {
+        self.native_replay = Some(super::litellm::replay::ReplayCapture::new(scope));
+    }
+
     pub(crate) fn pending_provider_usage(&self) -> Option<ProviderUsageReplacement> {
         self.pending_replacement
     }
@@ -341,7 +355,27 @@ pub fn parse_gemini_sse_event(
     let value: Value = serde_json::from_str(data).map_err(|e| {
         LLMError::Stream(format!("Failed to parse Gemini SSE data: {}: {}", e, data))
     })?;
+    let chunks = parse_gemini_frame(state, &value, data)?;
+    #[cfg(feature = "litellm-wire-types")]
+    let chunks = {
+        let mut chunks = chunks;
+        if let Some(item) = state
+            .native_replay
+            .as_mut()
+            .and_then(|capture| capture.observe(&value, &chunks, data.len()))
+        {
+            chunks.push(item);
+        }
+        chunks
+    };
+    Ok(chunks)
+}
 
+fn parse_gemini_frame(
+    state: &mut GeminiStreamState,
+    value: &Value,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
     // Check for a REAL error in the response. Guard against a benign no-error
     // marker (`{"error": null}` / `""` / `{}`) that some Gemini gateways emit on an
     // otherwise-normal chunk — `get("error")` returns `Some(Null)` for an explicit
@@ -363,7 +397,7 @@ pub fn parse_gemini_sse_event(
         // treat that as a no-op instead of aborting the stream (#99). Route through
         // take_gemini_event_usage so any `usageMetadata` riding on the marker is
         // still emitted (empty when none is present).
-        None if error_field.is_some() => return Ok(take_gemini_event_usage(state, &value)),
+        None if error_field.is_some() => return Ok(take_gemini_event_usage(state, value)),
         None => {
             return Err(LLMError::Stream(format!(
                 "Missing candidates in Gemini response: {}",
@@ -373,7 +407,7 @@ pub fn parse_gemini_sse_event(
     };
 
     if candidates.is_empty() {
-        return Ok(take_gemini_event_usage(state, &value));
+        return Ok(take_gemini_event_usage(state, value));
     }
 
     // Get the first candidate (Gemini typically returns one)
@@ -393,17 +427,17 @@ pub fn parse_gemini_sse_event(
     // Extract content
     let content = match candidate.get("content") {
         Some(c) => c,
-        None => return Ok(take_gemini_event_usage(state, &value)),
+        None => return Ok(take_gemini_event_usage(state, value)),
     };
 
     // Extract parts array
     let parts = match content.get("parts").and_then(|p| p.as_array()) {
         Some(p) => p,
-        None => return Ok(take_gemini_event_usage(state, &value)),
+        None => return Ok(take_gemini_event_usage(state, value)),
     };
 
     if parts.is_empty() {
-        return Ok(take_gemini_event_usage(state, &value));
+        return Ok(take_gemini_event_usage(state, value));
     }
 
     // Process EVERY part. A single Gemini chunk can carry multiple parts —
@@ -468,8 +502,19 @@ pub fn parse_gemini_sse_event(
                 LLMError::Stream(format!("Failed to serialize function args: {}", e))
             })?;
 
+            let id = match function_call.get("id").and_then(Value::as_str) {
+                #[cfg(feature = "litellm-wire-types")]
+                native_id if state.litellm_tool_ids => {
+                    // Native IDs can match the legacy counters, even in a later SSE frame.
+                    native_id.filter(|id| !id.is_empty()).map_or_else(
+                        || format!("gemini_{}", uuid::Uuid::new_v4().simple()),
+                        str::to_owned,
+                    )
+                }
+                _ => state.generate_tool_id(),
+            };
             tool_calls.push(ToolCall {
-                id: state.generate_tool_id(),
+                id,
                 tool_type: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
@@ -492,11 +537,11 @@ pub fn parse_gemini_sse_event(
         // emit-once usage in the documented cache-before-summary order before
         // the stream closes. Intermediate cumulative totals are intentionally
         // ignored so they cannot suppress the final totals.
-        chunks.extend(take_gemini_event_usage(state, &value));
+        chunks.extend(take_gemini_event_usage(state, value));
     } else {
         // Observe only after successful content parsing, so a rejected frame
         // cannot corrupt later usage if a caller continues after an error.
-        observe_gemini_provider_usage(state, &value);
+        observe_gemini_provider_usage(state, value);
     }
 
     Ok(chunks)
