@@ -86,7 +86,7 @@ selecting Ultra on an Ordinary Root does not make it a Supervisor.
 | Executing Session | Model posture | Management authority |
 | --- | --- | --- |
 | Ordinary Root, Standard | Existing configured execution tools and permissions | Existing ordinary checks; no Supervisor exception |
-| Ordinary Root, Ultra | Parallel delegation, verification and authorized file edits | No Supervisor-only exception |
+| Ordinary Root, Ultra | Parallel delegation, verification, authorized file edits and shell execution | No Supervisor-only exception |
 | Trusted Supervisor, Standard or Ultra | Bounded Session and Work orchestration | Only current, explicitly authorized scope |
 | Child | Its own profile, tools and permissions | Does not inherit Supervisor identity or management scope |
 

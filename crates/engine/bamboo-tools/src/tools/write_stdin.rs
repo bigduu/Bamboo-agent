@@ -106,6 +106,15 @@ pub async fn continue_empty_poll(
     ToolOutcome::Completed(previous)
 }
 
+/// Send input to an owned exec session or read from its output cursor.
+///
+/// An ordinary Root waiting for a non-interactive command to exit should prefer
+/// `SubAgent` with `intent=wait` and `target` set to the `session_id` returned by
+/// `exec_command`. The wait reports the exit code and a bounded output snapshot,
+/// preserving the unread output cursor for this tool.
+///
+/// Use this tool for interactive input, EOF, interrupts, or unread output.
+/// Callers without the Host wait route can poll for exit status with empty `chars`.
 #[derive(Default)]
 pub struct WriteStdinTool;
 

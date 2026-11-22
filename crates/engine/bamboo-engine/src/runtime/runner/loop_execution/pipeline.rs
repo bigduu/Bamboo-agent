@@ -5460,6 +5460,7 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
         "Read",
         "SubAgent",
         "exec_command",
+        "write_stdin",
         "load_skill",
         "workflow_run",
         "vendor::Read",
@@ -5526,8 +5527,19 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        ["Read", "SubAgent"]
+        ["Read", "SubAgent", "exec_command", "write_stdin"]
     );
+    let request =
+        serde_json::from_value(serde_json::json!({"query":"exec_command","kinds":["tool"]}))
+            .unwrap();
+    assert!(discovery
+        .discover_complete_schemas(&request)
+        .unwrap()
+        .iter()
+        .all(|schema| !matches!(
+            schema.function.name.as_str(),
+            "exec_command" | "write_stdin"
+        )));
 }
 
 #[cfg(test)]
@@ -10940,10 +10952,12 @@ mod tests {
         );
         let retired = "Tool 'Bash' has been retired.";
         for scenario in ["standard", "ultra", "disabled", "plan", "supervisor"] {
-            let direct = scenario == "standard";
+            let direct = matches!(scenario, "standard" | "ultra");
             let recovery_tool = match scenario {
-                "standard" => Some(("exec_command", json!({"cmd":"echo recovered-shell"}))),
-                "ultra" | "disabled" => Some(("SubAgent", json!({"action":"create"}))),
+                "standard" | "ultra" => {
+                    Some(("exec_command", json!({"cmd":"echo recovered-shell"})))
+                }
+                "disabled" => Some(("SubAgent", json!({"action":"create"}))),
                 _ => None,
             };
             let server = MockServer::start().await;
@@ -10964,7 +10978,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(body_string_contains(retired))
                 .and(body_string_contains(match scenario {
-                    "standard" => "call `exec_command` with the command in `cmd`",
+                    "standard" | "ultra" => "call `exec_command` with the command in `cmd`",
                     "plan" => "This session is in read-only Plan mode",
                     _ => "Delegate it to an authorized execution session",
                 }))

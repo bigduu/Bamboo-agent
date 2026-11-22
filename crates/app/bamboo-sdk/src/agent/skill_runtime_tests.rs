@@ -1004,8 +1004,9 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
-    assert_eq!(canonical.len(), 13);
+    assert_eq!(canonical.len(), 15);
     assert!(canonical.contains("Write") && canonical.contains("Edit"));
+    assert!(canonical.contains("exec_command") && canonical.contains("write_stdin"));
     assert!(!canonical.contains("work_dispatch"));
     assert!(!canonical.contains("Plan"));
     assert!(canonical.contains("session_history"));

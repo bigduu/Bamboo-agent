@@ -18,6 +18,10 @@ workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
 
+The Linux `packages-1` shard owns the default LiteLLM wire-types suite. Its
+additive `schema` context runs the three schema-only cases with the same target
+directory and checks that the test names match the compiled catalog.
+
 Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
 frontend policy Node suites once. Manual Windows and macOS diagnostics run nine system cases:
 bounded file reading, canonical artifact paths, four process/listener binding
