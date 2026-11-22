@@ -131,17 +131,33 @@ struct WorktreeInventory {
     sessions: Vec<Value>,
 }
 
-pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response {
+#[derive(Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    sources_only: bool,
+}
+
+pub async fn list(
+    state: web::Data<AppState>,
+    id: web::Path<String>,
+    query: web::Query<ListQuery>,
+) -> Response {
     let project = project(&state, &id)?;
-    let sessions = state.session_store.list_index_entries().await;
-    let running: HashSet<_> = state
-        .agent_runners
-        .read()
-        .await
-        .iter()
-        .filter(|(_, runner)| runner.completed_at.is_none())
-        .map(|(id, _)| id.clone())
-        .collect();
+    let sources_only = query.sources_only;
+    let (sessions, running) = if sources_only {
+        (Vec::new(), HashSet::new())
+    } else {
+        let sessions = state.session_store.list_index_entries().await;
+        let running = state
+            .agent_runners
+            .read()
+            .await
+            .iter()
+            .filter(|(_, runner)| runner.completed_at.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        (sessions, running)
+    };
     let preferences = state.config.read().await.worktrees.clone();
     let project_id = project.id.to_string();
     let default_root = preferences
@@ -180,7 +196,23 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                     continue;
                 }
             };
+            if sources_only
+                && project.project_path.as_deref() != Some(source.as_str())
+                && !git::is_primary_checkout_until(&path, &common, scan_deadline)
+            {
+                // Worktrees from previous chats share a repository but can have
+                // a different HEAD. Only the configured Project checkout or
+                // an original Git checkout can supply the automatic base.
+                continue;
+            }
             if !seen.insert(common.clone()) { continue; }
+            if sources_only {
+                repositories.push(RepositoryInventory {
+                    path: source, common_dir: Some(git::path_label(&common)),
+                    worktrees: Vec::new(), error: None, warnings: Vec::new(),
+                });
+                continue;
+            }
             match git::list_until(&path, scan_deadline) {
                 Ok(entries) => {
                     for session in &sessions {
@@ -289,7 +321,7 @@ pub async fn create(
         .or_else(|| preferences.project_roots.get(id.as_str()).cloned())
         .or(preferences.default_root)
         .ok_or_else(|| AppError::BadRequest("Select a worktree root directory first".into()))?;
-    let path = blocking(move || {
+    let (path, project_owned_at_revision) = blocking(move || {
         let repo = PathBuf::from(&request.repository);
         let canonical = repo
             .canonicalize()
@@ -307,12 +339,20 @@ pub async fn create(
                     .into(),
             );
         }
-        git::create(&canonical, Path::new(&root), &request.name, &request.branch)
+        let path = git::create(&canonical, Path::new(&root), &request.name, &request.branch)?;
+        let project_owned_at_revision = project
+            .workspace_roots()
+            .any(|root| path.starts_with(Path::new(root)))
+            .then_some(project.revision);
+        Ok((path, project_owned_at_revision))
     })
     .await?;
     // Do not add another registry or implicitly mutate Project bindings. Native
     // Git discovery already includes the new checkout on the next list call.
-    Ok(HttpResponse::Created().json(json!({"path": path})))
+    Ok(HttpResponse::Created().json(json!({
+        "path": path,
+        "project_owned_at_revision": project_owned_at_revision
+    })))
 }
 
 /// Capabilities this build serves to an independently released frontend.

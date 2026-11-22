@@ -69,6 +69,9 @@ pub struct PatchProjectRequest {
     /// revision as name/description updates.
     #[serde(default)]
     pub project_path: Option<String>,
+    /// Default to a new Git worktree for user-started Project chats.
+    #[serde(default)]
+    pub new_chat_worktree: Option<bool>,
     /// Complete Project-owned sidebar snapshot. Explicit null is invalid;
     /// clearing the sidebar uses an empty snapshot, which remains durable.
     #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
@@ -542,7 +545,8 @@ pub async fn patch_project(
         && (request.name.is_some()
             || request.description.is_some()
             || request.section.is_some()
-            || request.project_path.is_some())
+            || request.project_path.is_some()
+            || request.new_chat_worktree.is_some())
     {
         return Ok(project_error(ProjectStoreError::Validation(
             "sidebar snapshots cannot be mixed with other Project metadata mutations".into(),
@@ -619,6 +623,9 @@ pub async fn patch_project(
         }
         if let Some(section) = request.section.as_ref() {
             project.section = section.as_ref().map(|value| value.trim().to_string());
+        }
+        if let Some(new_chat_worktree) = request.new_chat_worktree {
+            project.new_chat_worktree = new_chat_worktree;
         }
         apply_sidebar_snapshot(project, requested_sidebar, importing, &valid_roots)?;
         Ok(())
@@ -934,6 +941,7 @@ mod tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         assert_eq!(create.headers().get(header::ETAG).unwrap(), "\"1\"");
         let created: ProjectManifest = test::read_body_json(create).await;
+        assert!(!created.new_chat_worktree);
         assert_eq!(
             created.project_path.as_deref(),
             Some(
@@ -990,7 +998,8 @@ mod tests {
                 .insert_header((header::IF_MATCH, "\"1\""))
                 .set_json(serde_json::json!({
                     "name": "Renamed",
-                    "section": "Development"
+                    "section": "Development",
+                    "new_chat_worktree": true
                 }))
                 .to_request(),
         )
@@ -1001,6 +1010,7 @@ mod tests {
         assert_eq!(renamed.id, created.id);
         assert_eq!(renamed.name, "Renamed");
         assert_eq!(renamed.section.as_deref(), Some("Development"));
+        assert!(renamed.new_chat_worktree);
         assert_eq!(state.project_store.paths().project_home(&renamed.id), home);
         let updated_event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
             .await
@@ -1026,6 +1036,7 @@ mod tests {
         assert_eq!(moved.headers().get(header::ETAG).unwrap(), "\"3\"");
         let moved: ProjectManifest = test::read_body_json(moved).await;
         assert_eq!(moved.id, created.id);
+        assert!(moved.new_chat_worktree);
         assert_eq!(
             moved.project_path.as_deref(),
             Some(
@@ -1076,6 +1087,7 @@ mod tests {
         assert_eq!(listed["projects"][0]["id"], renamed.id.to_string());
         assert_eq!(listed["projects"][0]["project_path_status"], "configured");
         assert_eq!(listed["projects"][0]["section"], "Development");
+        assert_eq!(listed["projects"][0]["new_chat_worktree"], true);
 
         // Resource API returns only counts/revisions; file contents and secret
         // values never cross the contract.
