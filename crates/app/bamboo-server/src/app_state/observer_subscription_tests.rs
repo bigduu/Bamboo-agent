@@ -2692,6 +2692,88 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     state.shutdown().await;
 }
 
+pub(in crate::app_state) async fn exercise_subscribed_wait_yields_to_inbox() {
+    let f = Fixture::new_with_native_source(true).await;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "subscribed-wait-dispatch",
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":"subscribed-wait-dispatch", "message":"Run the subscribed task.",
+            "notify_on_material_event":true,
+        }),
+    )
+    .await;
+    assert_eq!(dispatch["notify_on_material_event"], true);
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the subscribed Root must start");
+    let observed = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "subscribed-wait-observe",
+        json!({"action":"observe_run", "target_session_id":ROOT_A, "target_ref":target}),
+    )
+    .await;
+    assert_eq!(observed["status"], "running");
+    let run = observed["run_id"].as_str().unwrap();
+    let wait_id = "supervisor-wait-for-subscribed-root";
+    *f.probe.parent_dispatch.lock().unwrap() = Some(vec![ToolCall {
+        id: wait_id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_control".into(),
+            arguments: json!({
+                "action":"wait_run", "target_session_id":ROOT_A, "target_ref":target,
+                "expected_run_id":run,
+            })
+            .to_string(),
+        },
+    }]);
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            &f.reference.session_id,
+            "Wait for the subscribed task.",
+        ))
+        .await
+        .unwrap();
+    drive_material_notices(&f, 1).await;
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let tool_result = parent
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(wait_id))
+        .expect("the wait result must survive turn completion");
+    assert_eq!(
+        tool_result.tool_success,
+        Some(true),
+        "{}",
+        tool_result.content
+    );
+    let result: Value = serde_json::from_str(&tool_result.content).unwrap();
+    assert_eq!(result["status"], "waiting_for_notification");
+    assert_eq!(result["run_id"], run);
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .as_deref(),
+        Some(run)
+    );
+
+    f.probe.source_release[0].notify_one();
+    settled(&f.state, ROOT_A).await;
+    drive_material_notices(&f, 2).await;
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    f.state.shutdown().await;
+}
+
 pub(in crate::app_state) async fn exercise_material_root_notifications() {
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 

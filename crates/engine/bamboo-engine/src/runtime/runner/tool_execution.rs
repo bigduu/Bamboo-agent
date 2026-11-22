@@ -128,6 +128,7 @@ pub(crate) struct RoundToolExecutionResult {
     pub explicit_exec_waits: Vec<String>,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
+    pub yield_supervisor_wait: bool,
     pub round_status: MetricsRoundStatus,
     pub round_error: Option<String>,
 }

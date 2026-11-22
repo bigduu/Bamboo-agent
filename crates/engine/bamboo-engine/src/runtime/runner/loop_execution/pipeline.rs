@@ -3287,7 +3287,11 @@ async fn handle_tool_calls_path(
         && session
             .metadata
             .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
-    if ticket_question_yield || awaiting_clarification || waiting_for_children {
+    if ticket_question_yield
+        || awaiting_clarification
+        || waiting_for_children
+        || tool_execution.yield_supervisor_wait
+    {
         if !tool_execution.explicit_exec_waits.is_empty() {
             let handles = tool_execution.explicit_exec_waits.join(", ");
             let mut notice = Message::user(format!(
