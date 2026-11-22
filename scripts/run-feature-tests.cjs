@@ -232,7 +232,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // SDK, Server, and CLI test owners. The additive contexts stay the same.
 // Shell wait guidance uses the existing Engine continuation and prompt tests.
 // #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
-const FEATURE_SOURCE_SHA256 = "94772484b5ca25df79cca7325813006683d168568c23782d9d2914963d37f687";
+// Codex Work handoff uses the default server-app-state and server-tests-0
+// owners. Continuation formatting stays in the Orchestration packages-3 owner.
+const FEATURE_SOURCE_SHA256 = "cde2745a1ada7c28d20bdce765e4990c69b0819096f7bee64e7b00b5d237f2ad";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

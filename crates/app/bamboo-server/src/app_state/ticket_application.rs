@@ -32,6 +32,7 @@ pub struct TicketApplication {
     patrol_sources: OnceLock<patrol_adapter::EvidenceSources>,
     patrol_calls: Arc<bamboo_orchestration::patrol::calls::Calls>,
     work_reviews: bamboo_orchestration::work_review::WorkReviews,
+    codex_handoffs: codex_handoff::Offers,
     // Registration and close share a short, synchronous gate. TaskTracker's
     // close alone does not prevent a new task from retaining the writer.
     cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
@@ -51,6 +52,7 @@ struct CancellationProbe {
 }
 
 mod admission;
+pub(crate) mod codex_handoff;
 mod initialization;
 mod managed_work;
 mod memory_sources;
@@ -110,6 +112,7 @@ impl TicketApplication {
             patrol_sources: OnceLock::new(),
             patrol_calls: Arc::default(),
             work_reviews: Default::default(),
+            codex_handoffs: Default::default(),
             cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
             #[cfg(test)]
             cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),
