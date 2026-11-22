@@ -98,6 +98,27 @@ impl LLMProvider for FinalProvider {
         _model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
+        if options.and_then(|options| options.request_purpose.as_deref()) == Some("gold_evaluation")
+        {
+            assert_eq!(tools[0].function.name, "report_gold_evaluation");
+            let report = ToolCall {
+                id: "goal-final-evidence-report".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "report_gold_evaluation".into(),
+                    arguments: json!({
+                        "decision": "continue",
+                        "confidence": "high",
+                        "reasoning": "The reported result still needs evidence.",
+                    })
+                    .to_string(),
+                },
+            };
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::ToolCalls(vec![report])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         if options.and_then(|options| options.request_purpose.as_deref())
             != Some("final_evidence_check")
         {
@@ -486,7 +507,7 @@ async fn routing_contract_gold_terminal_reloads_fast_during_the_main_stream() {
             crate::runtime::goal_state::read_goal_state(&session)
                 .unwrap()
                 .status,
-            crate::runtime::goal_state::GoalRuntimeStatus::NeedInput,
+            crate::runtime::goal_state::GoalRuntimeStatus::Blocked,
         );
     }
 }
