@@ -1398,7 +1398,33 @@ fn render_permission_inspector(
     );
 }
 
-fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
+pub(super) fn inline_approval_height(app: &App, available: u16) -> u16 {
+    let Some(q) = &app.pending_question else {
+        return 0;
+    };
+    let ActiveQuestionKind::Permission(permission) = &q.kind else {
+        return 0;
+    };
+    if q.inspecting || !matches!(permission.stage, PermissionStage::Decision) {
+        return 0;
+    }
+    let rows =
+        permission.request.allowed_decisions.len() + typed_question_footer(app, q, false).len();
+    // Reserve space for the operation and resource before exposing decisions.
+    let required = rows + 6;
+    if usize::from(available) < required {
+        return 0;
+    }
+    (required + 2).min(usize::from(available)) as u16
+}
+
+pub(super) fn render_inline_approval(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(question) = &app.pending_question {
+        render_permission_question(f, app, question, Some(area));
+    }
+}
+
+fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion, inline: Option<Rect>) {
     let ActiveQuestionKind::Permission(permission) = &q.kind else {
         return;
     };
@@ -1408,7 +1434,10 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
     }
     let request = &permission.request;
     let screen = f.area();
-    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let popup_width = inline.map_or_else(
+        || ((screen.width as u32 * 90 / 100) as u16).max(1),
+        |area| area.width,
+    );
     let text_width = popup_width.saturating_sub(4).max(1) as usize;
     let one_line = |label: &str, value: &str| {
         Line::raw(format!(
@@ -1421,7 +1450,7 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
         .as_ref()
         .map(|rule| rule.id.clone())
         .unwrap_or_else(|| "none".to_string());
-    let mut details = vec![
+    let identity = vec![
         one_line(
             "request/session",
             &format!("{} / {}", request.request_id, request.session_id),
@@ -1430,6 +1459,13 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
             "registered workspace",
             request.workspace_path.as_deref().unwrap_or("<unavailable>"),
         ),
+    ];
+    let mut details = if inline.is_some() {
+        Vec::new()
+    } else {
+        identity.clone()
+    };
+    details.extend([
         one_line(
             "tool/type",
             &format!(
@@ -1439,7 +1475,7 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
             ),
         ),
         one_line("operation", permission.display_operation_summary()),
-    ];
+    ]);
     details.extend(labelled_preview(
         permission.display_resource_label(),
         permission.display_resource(),
@@ -1451,6 +1487,17 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
             "file change",
             "PROPOSED server-supplied unified diff available in inspector",
         ));
+    }
+    if inline.is_some() {
+        details.push(one_line(
+            "risk / mode",
+            &format!(
+                "{} / {}",
+                request.risk_level.label(),
+                request.effective_mode.label()
+            ),
+        ));
+        details.extend(identity);
     }
     details.extend(labelled_preview(
         if permission.tool_arguments_truncated {
@@ -1492,7 +1539,11 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
     match permission.stage {
         PermissionStage::Decision => {
             interactive.push(Line::from(Span::styled(
-                " Allowed decisions (server-authoritative):",
+                if inline.is_some() {
+                    " Choose a decision"
+                } else {
+                    " Allowed decisions (server-authoritative):"
+                },
                 Style::default()
                     .fg(colors::brand())
                     .add_modifier(Modifier::BOLD),
@@ -1603,10 +1654,10 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
         details,
         interactive,
         footer,
-        screen.height.saturating_sub(2) as usize,
+        inline.unwrap_or(screen).height.saturating_sub(2) as usize,
     );
     let height = (lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(90, height, screen);
+    let area = inline.unwrap_or_else(|| centered_rect(90, height, screen));
     let option_bottom = area.y.saturating_add(area.height).saturating_sub(1);
     *q.option_hitboxes.borrow_mut() = option_rows
         .into_iter()
@@ -1624,6 +1675,14 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
             })
         })
         .collect();
+    if inline.is_some() {
+        let inner = super::workspace::panel(f, area, " Approval required ", app.theme);
+        f.render_widget(
+            Paragraph::new(lines).style(super::workspace::surface_style(app.theme)),
+            inner,
+        );
+        return;
+    }
     f.render_widget(Clear, area);
     let dangerous = request.bypass_requested
         || request.risk_level == crate::api::types::RiskLevel::High
@@ -1850,7 +1909,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
 
     match &q.kind {
         ActiveQuestionKind::Permission(_) => {
-            render_permission_question(f, app, q);
+            render_permission_question(f, app, q, None);
             return;
         }
         ActiveQuestionKind::PermissionUnavailable { .. } => {
@@ -2996,12 +3055,230 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+pub(super) fn render_model_popover(f: &mut Frame, app: &App, anchor: Rect) {
+    let Some(picker) = &app.model_picker else {
+        return;
+    };
+    let area = super::workspace::popover_area(anchor, 80, 17, true);
+    if area.height < 11 {
+        render_model_picker(f, app);
+        return;
+    }
+    let inner = super::workspace::panel(f, area, " Model and reasoning ", app.theme);
+    let mut hitboxes = picker.hitboxes.borrow_mut();
+    hitboxes.clear();
+    let mut lines = vec![Line::raw(format!(
+        " Search  {}▏",
+        clip_tail_cells(&picker.query, inner.width.saturating_sub(11) as usize),
+    ))];
+    if picker.loading || picker.visible.is_empty() {
+        lines.push(Line::raw(if picker.loading {
+            " Loading models…"
+        } else if picker.query.is_empty() {
+            " No models available"
+        } else {
+            " No models match this search"
+        }));
+    } else {
+        let count = usize::from(inner.height)
+            .saturating_sub(7 + usize::from(picker.error.is_some()))
+            .max(1);
+        let total = picker.visible.len();
+        let start = picker
+            .selected
+            .saturating_sub(count / 2)
+            .min(total.saturating_sub(count));
+        for (row, &model_index) in picker.visible.iter().enumerate().skip(start).take(count) {
+            let model = &picker.models[model_index];
+            let marker = if row == picker.selected { "›" } else { " " };
+            let group = app.model_group_label(model);
+            let label = format!(
+                " {marker} {}/{} · {group}",
+                model.reference.provider, model.reference.model
+            );
+            let style = if row == picker.selected {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            hitboxes.push(ModelPickerHitbox {
+                kind: ModelPickerHitboxKind::Model(model_index),
+                x: inner.x,
+                y: inner.y + lines.len() as u16,
+                width: inner.width,
+            });
+            lines.push(Line::styled(clip_cells(&label, inner.width.into()), style));
+        }
+        if let Some(model) = picker.selected_model() {
+            lines.push(Line::styled(
+                clip_cells(
+                    &format!(
+                        " {} of {total} · tools {} · vision {} · reasoning {}",
+                        picker.selected + 1,
+                        if model.capabilities.supports_tools {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        if model.capabilities.supports_vision {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        if model.capabilities.supports_reasoning {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                    ),
+                    inner.width.into(),
+                ),
+                Style::default().fg(colors::inactive()),
+            ));
+        }
+        lines.push(Line::raw(format!(
+            " Reasoning  {}",
+            picker.reasoning_label()
+        )));
+        let choices = [
+            ("default", None),
+            ("none", Some(ReasoningEffort::Disabled)),
+            ("low", Some(ReasoningEffort::Low)),
+            ("medium", Some(ReasoningEffort::Medium)),
+            ("high", Some(ReasoningEffort::High)),
+            ("xhigh", Some(ReasoningEffort::Xhigh)),
+            ("max", Some(ReasoningEffort::Max)),
+        ];
+        if picker.selected_supports_reasoning() {
+            let selected = choices
+                .iter()
+                .position(|(_, effort)| *effort == picker.reasoning_effort)
+                .unwrap_or_default();
+            let mut track = vec![Span::raw(" ")];
+            let mut x = inner.x + 1;
+            let y = inner.y + lines.len() as u16;
+            let fill = match (app.theme, picker.reasoning_effort) {
+                (
+                    theme::ThemePalette::TrueColor,
+                    Some(ReasoningEffort::Xhigh | ReasoningEffort::Max),
+                ) => ratatui::style::Color::Rgb(167, 139, 250),
+                (theme::ThemePalette::TrueColor, Some(_)) => {
+                    ratatui::style::Color::Rgb(120, 165, 251)
+                }
+                _ => colors::thinking(),
+            };
+            for (index, (label, effort)) in choices.iter().enumerate() {
+                let width = label.len() + 2;
+                let (draw, color) = if index < selected {
+                    ("━".repeat(width), fill)
+                } else if index == selected {
+                    let lead = width / 2;
+                    (
+                        format!("{}●{}", "━".repeat(lead), "─".repeat(width - lead - 1)),
+                        fill,
+                    )
+                } else {
+                    ("─".repeat(width), colors::inactive())
+                };
+                track.push(Span::styled(draw, Style::default().fg(color)));
+                hitboxes.push(ModelPickerHitbox {
+                    kind: ModelPickerHitboxKind::Reasoning(*effort),
+                    x,
+                    y,
+                    width: width as u16,
+                });
+                x += width as u16;
+            }
+            lines.push(Line::from(track));
+        } else {
+            lines.push(Line::styled(
+                " Model supports provider default only",
+                Style::default().fg(colors::inactive()),
+            ));
+        }
+        let y = inner.y + lines.len() as u16;
+        let mut spans = vec![Span::raw(" ")];
+        let mut x = inner.x + 1;
+        for (label, effort) in choices {
+            if effort.is_some() && !picker.selected_supports_reasoning() {
+                continue;
+            }
+            let label = if picker.reasoning_effort == effort {
+                format!("[{label}]")
+            } else {
+                format!(" {label} ")
+            };
+            let width = label.len() as u16;
+            hitboxes.push(ModelPickerHitbox {
+                kind: ModelPickerHitboxKind::Reasoning(effort),
+                x,
+                y,
+                width,
+            });
+            x += width;
+            spans.push(Span::styled(
+                label,
+                if picker.reasoning_effort == effort {
+                    Style::default()
+                        .fg(colors::thinking())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ));
+        }
+        lines.push(Line::from(spans));
+        if picker.applying {
+            lines.push(Line::raw(" Applying execution profile…"));
+        } else {
+            const APPLY: &str = " Apply ";
+            hitboxes.push(ModelPickerHitbox {
+                kind: ModelPickerHitboxKind::Apply,
+                x: inner.x + 1,
+                y: inner.y + lines.len() as u16,
+                width: APPLY.len() as u16,
+            });
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(APPLY, Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(format!(
+                    "  {} apply · {}/{} reasoning",
+                    app.primary_key_hint(ActionContext::ModelPicker, ActionId::Activate),
+                    app.primary_key_hint(
+                        ActionContext::ModelPicker,
+                        ActionId::PreviousReasoningEffort
+                    ),
+                    app.primary_key_hint(ActionContext::ModelPicker, ActionId::NextReasoningEffort),
+                )),
+            ]));
+        }
+    }
+    if let Some(error) = &picker.error {
+        lines.push(Line::styled(
+            clip_cells(error, inner.width.into()),
+            Style::default().fg(colors::error()),
+        ));
+    }
+    lines.push(Line::styled(
+        format!(
+            " {} refresh · {} close",
+            app.primary_key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+            app.primary_key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+        ),
+        Style::default().fg(colors::inactive()),
+    ));
+    f.render_widget(
+        Paragraph::new(lines).style(super::workspace::surface_style(app.theme)),
+        inner,
+    );
+}
+
 /// Combined built-in and session-aware command palette. Each result owns two
 /// fixed terminal rows, which makes both keyboard windowing and mouse hitboxes
 /// deterministic even when descriptions are long or the terminal is narrow.
 /// The list is clipped instead of wrapped so a row can never push the footer
 /// below the popup or move beneath the pointer between mouse-down/up events.
-pub fn render_command_palette(f: &mut Frame, app: &App) {
+pub(super) fn render_command_palette_at(f: &mut Frame, app: &App, anchor: Option<Rect>) {
     let Some(palette) = &app.command_palette else {
         return;
     };
@@ -3052,7 +3329,12 @@ pub fn render_command_palette(f: &mut Frame, app: &App) {
         binding_hints: &binding_hints,
         footer: Some(&footer),
     };
-    render_command_palette_view(f, view, Some(&palette.hitboxes));
+    render_command_palette_view_at(
+        f,
+        view,
+        Some(&palette.hitboxes),
+        anchor.map(|area| (area, app.theme)),
+    );
 }
 
 struct CommandPaletteView<'a> {
@@ -3077,17 +3359,34 @@ struct CommandPaletteRender {
     item_rows: Vec<(usize, u16, u16)>,
 }
 
+#[cfg(test)]
 fn render_command_palette_view(
     f: &mut Frame,
     view: CommandPaletteView<'_>,
     hitboxes: Option<&RefCell<Vec<CommandPaletteHitbox>>>,
 ) {
+    render_command_palette_view_at(f, view, hitboxes, None);
+}
+
+fn render_command_palette_view_at(
+    f: &mut Frame,
+    view: CommandPaletteView<'_>,
+    hitboxes: Option<&RefCell<Vec<CommandPaletteHitbox>>>,
+    placement: Option<(Rect, theme::ThemePalette)>,
+) {
     let screen = f.area();
-    let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
+    let popup_width = placement.map_or_else(
+        || ((screen.width as u32 * 94 / 100) as u16).max(1),
+        |(anchor, _)| anchor.width.min(80),
+    );
     let row_width = popup_width.saturating_sub(4) as usize;
-    let rendered = command_palette_lines(&view, screen.height, row_width);
-    let height = (rendered.lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(94, height, screen);
+    let available = placement.map_or(screen.height, |(anchor, _)| anchor.height);
+    let rendered = command_palette_lines(&view, available, row_width);
+    let height = (rendered.lines.len() as u16 + 2).min(available);
+    let area = placement.map_or_else(
+        || centered_rect(94, height, screen),
+        |(anchor, _)| super::workspace::popover_area(anchor, popup_width, height, false),
+    );
 
     if let Some(hitboxes) = hitboxes {
         if view.resolving {
@@ -3116,11 +3415,19 @@ fn render_command_palette_view(
         }
     }
 
-    f.render_widget(Clear, area);
     let title = match view.trigger {
         CommandPaletteTrigger::Slash => " Slash commands ",
         CommandPaletteTrigger::Global => " Command palette ",
     };
+    if let Some((_, palette)) = placement {
+        let inner = super::workspace::panel(f, area, "", palette);
+        f.render_widget(
+            Paragraph::new(rendered.lines).style(super::workspace::surface_style(palette)),
+            inner,
+        );
+        return;
+    }
+    f.render_widget(Clear, area);
     let border_color = if view.resolving {
         colors::warning()
     } else {
@@ -3596,10 +3903,12 @@ mod tests {
             assert!(text.contains("OFFLINE"));
             assert!(text.contains("2 ALERTS"));
             match palette {
-                crate::theme::ThemePalette::TrueColor => assert!(buffer
-                    .content()
-                    .iter()
-                    .any(|cell| matches!(cell.fg, Color::Rgb(_, _, _)))),
+                crate::theme::ThemePalette::TrueColor | crate::theme::ThemePalette::Light => {
+                    assert!(buffer
+                        .content()
+                        .iter()
+                        .any(|cell| matches!(cell.fg, Color::Rgb(_, _, _))))
+                }
                 crate::theme::ThemePalette::System => assert!(buffer
                     .content()
                     .iter()
@@ -3690,7 +3999,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [13_266_545_001_940_099_492, 4_099_890_368_697_133_414,],
+            [6_262_202_361_135_624_732, 4_918_634_831_399_365_758],
             "complete help-overlay buffer golden changed"
         );
     }

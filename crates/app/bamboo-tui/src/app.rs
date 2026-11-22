@@ -29,7 +29,7 @@ use crate::keymap::{
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
-use crate::ui;
+use crate::ui::workspace::{SettingsMenu, TerminalSetting, Workspace, WorkspaceAction};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -1160,6 +1160,8 @@ pub struct ChatState {
     pub block_line_ranges: RefCell<Vec<ConversationBlockLineRange>>,
     pub content_height: Cell<u16>,
     pub content_width: Cell<u16>,
+    pub(crate) transcript_area: Cell<ratatui::layout::Rect>,
+    pressed_block: Option<String>,
     /// Tool/reasoning payloads can be hundreds of KiB. Cache their wrapped
     /// rows so the fixed redraw tick only clones the bounded visible window
     /// instead of re-walking every byte on every frame.
@@ -1263,6 +1265,8 @@ impl ChatState {
             block_line_ranges: RefCell::new(Vec::new()),
             content_height: Cell::new(0),
             content_width: Cell::new(0),
+            transcript_area: Cell::new(ratatui::layout::Rect::default()),
+            pressed_block: None,
             inspector_cache: RefCell::new(HashMap::new()),
             file_change_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
@@ -4186,12 +4190,19 @@ fn slash_input_parts(input: &str) -> (&str, &str) {
 
 fn command_search_text(entry: &CommandPaletteEntry) -> String {
     match entry {
-        CommandPaletteEntry::Builtin(action) => format!(
-            "{} {} ui builtin {}",
-            action.label(),
-            action.description(),
-            action.key()
-        ),
+        CommandPaletteEntry::Builtin(action) => {
+            let alias = if *action == ActionId::OpenModelPicker {
+                " effort"
+            } else {
+                ""
+            };
+            format!(
+                "{} {} ui builtin {}{alias}",
+                action.label(),
+                action.description(),
+                action.key()
+            )
+        }
         CommandPaletteEntry::Server(command) => format!(
             "{} {} {} {} {} {} {} {} {}",
             command.name,
@@ -4615,6 +4626,8 @@ pub struct App {
     pub running: bool,
     pub tab: Tab,
     pub theme: crate::theme::ThemePalette,
+    pub(crate) terminal_settings: Option<SettingsMenu>,
+    pub(crate) workspace_hints: bool,
     pub(crate) keymap: Keymap,
     pending_key_sequence: Option<PendingSequence>,
     routed_action: Option<(ActionContext, ActionId)>,
@@ -4893,6 +4906,8 @@ impl App {
             running: true,
             tab: Tab::Chat,
             theme: crate::theme::ThemePalette::TrueColor,
+            terminal_settings: None,
+            workspace_hints: true,
             keymap: Keymap::default(),
             pending_key_sequence: None,
             routed_action: None,
@@ -5139,6 +5154,8 @@ impl App {
     }
 
     fn prepare_visible_session_switch(&mut self) {
+        self.terminal_settings = None;
+        self.chat.pressed_block = None;
         self.invalidate_permission_mode_context();
         if self.session_picker.is_some() {
             self.pending_delete = None;
@@ -5558,6 +5575,8 @@ impl App {
         // that check may call `spawn_local_server`, which needs this sender to
         // post its health-poll waiter's result back as `LocalServerReady`.
         self.event_tx = Some(event_tx.clone());
+        let workspace_wake = Arc::new(tokio::sync::Notify::new());
+        let mut workspace = Workspace::new(self, event_tx.clone(), workspace_wake.clone())?;
 
         self.connected = self.client.health().await.unwrap_or(false);
         if self.connected {
@@ -5641,14 +5660,19 @@ impl App {
             self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
-            terminal.draw(|f| ui::render(f, self))?;
+            terminal.draw(|frame| workspace.render(frame, self))?;
+            workspace.check_error()?;
 
             tokio::select! {
                 event = event_rx.recv() => {
-                    if let Some(event) = event {
-                        self.handle_event(event).await?;
+                    match event {
+                        Some(AppEvent::Mouse(mouse))
+                            if self.workspace_controls_enabled() && workspace.handle_mouse(mouse) => {}
+                        Some(event) => self.handle_event(event).await?,
+                        None => break,
                     }
                 }
+                _ = workspace_wake.notified() => {}
                 sse_event = async {
                     if let Some(rx) = &mut self.sse_rx {
                         rx.recv().await
@@ -6179,7 +6203,7 @@ impl App {
                     }
                     return Ok(());
                 }
-                AppEvent::Mouse(_) => return Ok(()),
+                AppEvent::Mouse(_) | AppEvent::WorkspaceAction(_) => return Ok(()),
                 _ => {}
             }
         }
@@ -6187,6 +6211,7 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::WorkspaceAction(action) => self.handle_workspace_action(action),
             AppEvent::SessionsLoaded {
                 observation_epoch,
                 result: r,
@@ -8381,6 +8406,13 @@ impl App {
             return;
         }
 
+        if let Some(settings) = self.terminal_settings.as_mut() {
+            if let Some(setting) = settings.handle_mouse(mouse) {
+                self.activate_terminal_setting(setting);
+            }
+            return;
+        }
+
         if self.model_picker.is_some() {
             let mut apply = None;
             {
@@ -8477,6 +8509,33 @@ impl App {
             return;
         }
 
+        if self.tab == Tab::Chat {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.chat.pressed_block = self.transcript_block_at(mouse.column, mouse.row);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(pressed) = self.chat.pressed_block.take() {
+                        if self.transcript_block_at(mouse.column, mouse.row).as_ref()
+                            == Some(&pressed)
+                        {
+                            let index = self
+                                .conversation_blocks()
+                                .iter()
+                                .position(|block| block.id == pressed && block.expandable());
+                            if let Some(index) = index {
+                                self.focus_conversation_block_at(index);
+                                self.toggle_conversation_details();
+                            }
+                        }
+                    }
+                    return;
+                }
+                MouseEventKind::Drag(_) => self.chat.pressed_block = None,
+                _ => {}
+            }
+        }
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -8520,6 +8579,27 @@ impl App {
                     scroll_selection(self.skills.selected, self.skills.skills.len(), delta);
             }
         }
+    }
+
+    fn transcript_block_at(&self, column: u16, row: u16) -> Option<String> {
+        use ratatui::layout::Position;
+
+        let area = self.chat.transcript_area.get();
+        if !area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let scroll = if self.chat.auto_scroll {
+            self.chat.max_scroll.get()
+        } else {
+            self.chat.scroll_offset.min(self.chat.max_scroll.get())
+        };
+        let line = scroll.saturating_add(row - area.y);
+        self.chat
+            .block_line_ranges
+            .borrow()
+            .iter()
+            .find(|range| (range.start..=range.end).contains(&line))
+            .map(|range| range.id.clone())
     }
 
     /// Scroll the chat transcript down by `delta` lines, clamped to
@@ -8675,6 +8755,10 @@ impl App {
             return;
         }
 
+        self.toggle_default_tool_details();
+    }
+
+    fn toggle_default_tool_details(&mut self) {
         // This default is captured only when future detail blocks are
         // inserted. Existing block state is intentionally untouched.
         self.chat.expand_tools = !self.chat.expand_tools;
@@ -8875,6 +8959,7 @@ impl App {
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
+            || self.terminal_settings.is_some()
     }
 
     fn pending_question_context(&self) -> ActionContext {
@@ -8947,6 +9032,8 @@ impl App {
             ActionContext::ConfigEditor
         } else if self.permission_editor.is_some() {
             ActionContext::PermissionEditor
+        } else if self.terminal_settings.is_some() {
+            ActionContext::TerminalSettings
         } else {
             self.tab_context()
         };
@@ -9121,6 +9208,13 @@ impl App {
             ActionId::OpenTaskPlan => self.open_task_plan(),
             ActionId::StopRun => self.stop_streaming(),
             ActionId::ToggleDetails => self.toggle_conversation_details(),
+            ActionId::OpenTerminalSettings => {
+                self.terminal_settings = Some(SettingsMenu::default());
+            }
+            ActionId::OpenChatTab => self.open_tab(Tab::Chat),
+            ActionId::OpenSessionsTab => self.open_tab(Tab::Sessions),
+            ActionId::OpenMcpTab => self.open_tab(Tab::Mcp),
+            ActionId::OpenSkillsTab => self.open_tab(Tab::Skills),
             ActionId::OpenConfigTab => {
                 self.tab = Tab::Config;
                 self.load_tab_data();
@@ -9140,6 +9234,76 @@ impl App {
                 self.load_tab_data();
             }
             _ => {}
+        }
+    }
+
+    fn open_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.load_tab_data();
+    }
+
+    pub(crate) fn workspace_controls_enabled(&self) -> bool {
+        self.running && self.active_action_contexts()[0] == self.tab_context()
+    }
+
+    pub(crate) fn workspace_context_id(&self) -> u64 {
+        self.chat.context_id
+    }
+
+    fn handle_workspace_action(&mut self, press: WorkspaceAction) {
+        if !self.workspace_controls_enabled()
+            || press.tab != self.tab
+            || press.context_id != self.workspace_context_id()
+        {
+            return;
+        }
+        if self.action_disabled_reason(press.action).is_none() {
+            self.pending_key_sequence = None;
+            if press.action == ActionId::SendMessage && self.tab == Tab::Chat {
+                self.submit_chat_draft();
+            } else {
+                self.handle_global_action(press.action);
+            }
+        }
+    }
+
+    fn handle_terminal_settings_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::TerminalSettings, key);
+        let Some(settings) = self.terminal_settings.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::NavigateUp) => settings.move_selection(-1),
+            Some(ActionId::NavigateDown) => settings.move_selection(1),
+            Some(ActionId::Activate) => {
+                let setting = settings.selected();
+                self.activate_terminal_setting(setting);
+            }
+            Some(ActionId::Cancel) => self.terminal_settings = None,
+            _ => {}
+        }
+    }
+
+    fn activate_terminal_setting(&mut self, setting: TerminalSetting) {
+        use crate::theme::ThemePalette;
+        match setting {
+            TerminalSetting::Appearance => self.set_theme(match self.theme {
+                ThemePalette::TrueColor => ThemePalette::Light,
+                ThemePalette::Light => ThemePalette::System,
+                ThemePalette::System => ThemePalette::NoColor,
+                ThemePalette::NoColor => ThemePalette::TrueColor,
+            }),
+            TerminalSetting::ToolDetails => self.toggle_default_tool_details(),
+            TerminalSetting::KeyHints => self.workspace_hints = !self.workspace_hints,
+            TerminalSetting::ServerConfig => {
+                self.terminal_settings = None;
+                self.config.view = ConfigView::Raw;
+                self.open_tab(Tab::Config);
+            }
+            TerminalSetting::Permissions => {
+                self.terminal_settings = None;
+                self.open_permission_policy();
+            }
         }
     }
 
@@ -9196,6 +9360,7 @@ impl App {
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
             ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
+            ActionContext::TerminalSettings => self.handle_terminal_settings_key(key),
             ActionContext::Chat | ActionContext::ConversationBlock => {
                 self.handle_chat_key(key).await?
             }
@@ -10949,48 +11114,7 @@ impl App {
             Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
-            Some(ActionId::SendMessage)
-                if self.chat.streaming
-                    && !Self::is_loop_chat_command(&self.chat.textarea.lines().join("\n")) =>
-            {
-                self.status_message = format!(
-                    "Run active — draft preserved; {}",
-                    self.action_key_phrase(
-                        ActionContext::Chat,
-                        ActionId::SendMessage,
-                        "sends after completion"
-                    )
-                );
-            }
-            Some(ActionId::SendMessage) => {
-                // Selecting a session starts an asynchronous history/summary
-                // fetch after the picker closes. Keep the existing draft
-                // editable while that fetch is in flight, but never submit it
-                // against the session still visible underneath: a concurrent
-                // `ChatStarted` and `SessionOpened` could otherwise route the
-                // turn (or its provider/model) to different sessions.
-                if self.opening_session_id.is_some() {
-                    self.status_message =
-                        "Session is still resuming — message kept as draft".to_string();
-                    return Ok(());
-                }
-                if self.chat.session_id.as_ref().is_some_and(|session_id| {
-                    self.deleting_session_id.as_deref() == Some(session_id.as_str())
-                }) {
-                    self.status_message =
-                        "Session is being deleted — message kept as draft".to_string();
-                    return Ok(());
-                }
-                let input = self.chat.textarea.lines().join("\n");
-                let input = input.trim().to_string();
-                if input.is_empty() {
-                    return Ok(());
-                }
-                if !Self::is_loop_chat_command(&input) {
-                    self.clear_chat_composer();
-                }
-                self.send_message(input);
-            }
+            Some(ActionId::SendMessage) => self.submit_chat_draft(),
             None => {
                 if text_widget_input_allowed(key) {
                     self.chat.textarea.input(key);
@@ -10999,6 +11123,41 @@ impl App {
             Some(_) => {}
         }
         Ok(())
+    }
+
+    fn submit_chat_draft(&mut self) {
+        let draft = self.chat.textarea.lines().join("\n");
+        let loop_command = Self::is_loop_chat_command(&draft);
+        if self.chat.streaming && !loop_command {
+            self.status_message = format!(
+                "Run active — draft preserved; {}",
+                self.action_key_phrase(
+                    ActionContext::Chat,
+                    ActionId::SendMessage,
+                    "sends after completion"
+                )
+            );
+            return;
+        }
+        // Never submit against the old session while a resume is in flight.
+        if self.opening_session_id.is_some() {
+            self.status_message = "Session is still resuming — message kept as draft".to_string();
+            return;
+        }
+        if self.chat.session_id.as_ref().is_some_and(|session_id| {
+            self.deleting_session_id.as_deref() == Some(session_id.as_str())
+        }) {
+            self.status_message = "Session is being deleted — message kept as draft".to_string();
+            return;
+        }
+        let input = draft.trim();
+        if input.is_empty() {
+            return;
+        }
+        if !loop_command {
+            self.clear_chat_composer();
+        }
+        self.send_message(input.to_string());
     }
 
     fn handle_conversation_block_action(&mut self, action: ActionId) {
@@ -21362,7 +21521,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                10_433_989_199_099_782_256,
+                1_641_006_049_907_515_232,
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
@@ -21371,7 +21530,7 @@ mod question_tests {
                 14_001_204_281_749_812_417,
                 3_082_197_214_727_898_618,
                 15_225_996_382_494_039_911,
-                7_702_362_162_043_901_237,
+                1_872_964_058_003_881_112,
                 10_297_461_319_307_885_699,
                 4_909_861_279_484_503_645,
                 7_080_015_168_463_480_579,

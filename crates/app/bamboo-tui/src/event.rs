@@ -29,6 +29,7 @@ pub enum AnswerSubmissionOutcome {
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    WorkspaceAction(crate::ui::workspace::WorkspaceAction),
     /// Terminal resized; the next loop iteration redraws at the new size (the
     /// dimensions themselves aren't needed — ratatui re-measures on draw).
     Resize(u16, u16),

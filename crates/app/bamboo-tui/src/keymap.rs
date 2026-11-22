@@ -46,10 +46,11 @@ pub(crate) enum ActionContext {
     SessionPickerPinning,
     ModelPicker,
     CommandPalette,
+    TerminalSettings,
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 32] = [
+    pub(crate) const ALL: [Self; 33] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -82,6 +83,7 @@ impl ActionContext {
         Self::SessionPickerPinning,
         Self::ModelPicker,
         Self::CommandPalette,
+        Self::TerminalSettings,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -118,6 +120,7 @@ impl ActionContext {
             Self::SessionPickerPinning => "Session pin",
             Self::ModelPicker => "Model picker",
             Self::CommandPalette => "Command palette",
+            Self::TerminalSettings => "Terminal settings",
         }
     }
 }
@@ -138,6 +141,11 @@ pub(crate) enum ActionId {
     StopRun,
     ToggleDetails,
     OpenConfigTab,
+    OpenTerminalSettings,
+    OpenChatTab,
+    OpenSessionsTab,
+    OpenMcpTab,
+    OpenSkillsTab,
     OpenSchedulesTab,
     NextTab,
     PreviousTab,
@@ -406,6 +414,46 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         []
     ),
     spec!(
+        OpenTerminalSettings,
+        "Terminal settings",
+        "Adjust appearance, tool output, and shortcut hints",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        OpenChatTab,
+        "Open chat",
+        "Return to the active conversation",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        OpenSessionsTab,
+        "Open session list",
+        "Browse and manage all sessions",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        OpenMcpTab,
+        "Open MCP",
+        "Manage MCP servers and inspect their tools",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        OpenSkillsTab,
+        "Open skills",
+        "Browse available skills",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
         OpenSchedulesTab,
         "Open schedules",
         "Switch to the schedules tab",
@@ -498,7 +546,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             TaskPlan,
             SessionPickerBrowse,
             ModelPicker,
-            CommandPalette
+            CommandPalette,
+            TerminalSettings
         ],
         [
             (Help, "Up; k"),
@@ -516,7 +565,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (TaskPlan, "Up; k"),
             (SessionPickerBrowse, "Up"),
             (ModelPicker, "Up"),
-            (CommandPalette, "Up")
+            (CommandPalette, "Up"),
+            (TerminalSettings, "Up; k")
         ]
     ),
     spec!(
@@ -540,7 +590,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             TaskPlan,
             SessionPickerBrowse,
             ModelPicker,
-            CommandPalette
+            CommandPalette,
+            TerminalSettings
         ],
         [
             (Help, "Down; j"),
@@ -558,7 +609,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (TaskPlan, "Down; j"),
             (SessionPickerBrowse, "Down"),
             (ModelPicker, "Down"),
-            (CommandPalette, "Down")
+            (CommandPalette, "Down"),
+            (TerminalSettings, "Down; j")
         ]
     ),
     spec!(
@@ -701,7 +753,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             SessionPickerBrowse,
             SessionPickerRename,
             ModelPicker,
-            CommandPalette
+            CommandPalette,
+            TerminalSettings
         ],
         [
             (QuestionOptions, "Enter"),
@@ -718,7 +771,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (SessionPickerBrowse, "Enter"),
             (SessionPickerRename, "Enter"),
             (ModelPicker, "Enter"),
-            (CommandPalette, "Enter")
+            (CommandPalette, "Enter"),
+            (TerminalSettings, "Enter")
         ]
     ),
     spec!(
@@ -743,7 +797,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             SessionPickerRename,
             SessionPickerPinning,
             ModelPicker,
-            CommandPalette
+            CommandPalette,
+            TerminalSettings
         ],
         [
             (Help, "Esc; q; F1"),
@@ -762,7 +817,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (SessionPickerRename, "Esc"),
             (SessionPickerPinning, "Esc"),
             (ModelPicker, "Esc"),
-            (CommandPalette, "Esc; Ctrl+K")
+            (CommandPalette, "Esc; Ctrl+K"),
+            (TerminalSettings, "Esc")
         ]
     ),
     spec!(

@@ -240,7 +240,7 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Colour palette: truecolor, system (terminal ANSI colours), or
+        /// Colour palette: truecolor (dark), light, system (ANSI), or
         /// no-color. `NO_COLOR` selects no-color when omitted.
         #[arg(long)]
         theme: Option<bamboo_tui::ThemePalette>,
