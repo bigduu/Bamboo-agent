@@ -710,6 +710,8 @@ pub enum GoalCommand {
     Clear,
     /// `/goal on` or `/goal enable` or `/goal enabled`.
     On,
+    /// `/goal resume` — continue the existing objective with the saved budget.
+    Resume,
     /// `/goal <prompt text>` — set the goal evaluation prompt and enable.
     SetPrompt(String),
 }
@@ -738,6 +740,7 @@ pub fn parse_goal_command(message: &str) -> Option<GoalCommand> {
         "off" | "disable" | "disabled" => Some(GoalCommand::Off),
         "clear" | "reset" => Some(GoalCommand::Clear),
         "on" | "enable" | "enabled" => Some(GoalCommand::On),
+        "resume" => Some(GoalCommand::Resume),
         _ => {
             // Everything else is treated as the goal prompt text.
             // Use the original (non-lowercased) arg to preserve casing.

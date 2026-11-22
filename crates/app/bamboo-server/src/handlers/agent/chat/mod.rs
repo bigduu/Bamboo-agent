@@ -8,6 +8,7 @@ mod types;
 #[cfg(test)]
 pub(crate) use handler::admit_for_execute;
 pub use handler::handler;
+pub(crate) use handler::resume_goal;
 pub use types::{ChatImage, ChatRequest, ChatResponse};
 
 #[cfg(test)]
