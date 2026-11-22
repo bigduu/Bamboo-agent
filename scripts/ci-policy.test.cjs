@@ -231,17 +231,20 @@ function serverMatrix(source) {
 }
 
 legacyTest("legacy release matrices retain their original crate and server coverage", (_, workflow, job, contributing) => {
-  const manifest = readFileSync("Cargo.toml", "utf8")
-  const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
-  assert.ok(members)
-  const packages = [...members[1].matchAll(/^\s*"([^"]+)"/gmu)].map((match) => {
-    const content = readFileSync(path.join(match[1], "Cargo.toml"), "utf8")
-    return content.match(/^\[package\]\nname = "([^"]+)"/mu)[1]
-  }).sort()
-  assert.ok(packages.length > 0)
+  // These fixtures capture the crate matrix before the grouped feature driver.
+  // The current workspace is checked independently by the feature-shard test.
+  const packages = [
+    "bamboo-a2a", "bamboo-agent", "bamboo-agent-core", "bamboo-broker",
+    "bamboo-client-core", "bamboo-compression", "bamboo-config", "bamboo-domain",
+    "bamboo-engine", "bamboo-hooks", "bamboo-infrastructure", "bamboo-llm",
+    "bamboo-mcp", "bamboo-memory", "bamboo-metrics", "bamboo-notification",
+    "bamboo-orchestration", "bamboo-permission", "bamboo-plugin", "bamboo-plugin-protocol",
+    "bamboo-projects", "bamboo-sdk", "bamboo-server-tools", "bamboo-skills",
+    "bamboo-storage", "bamboo-subagent", "bamboo-tickets", "bamboo-tools", "bamboo-tui",
+  ]
   for (const id of ["test-crates", "e2e-crates"]) {
     const source = job(id)
-    assert.deepEqual(crateMatrix(source).sort(), packages.filter((name) => name !== "bamboo-server"))
+    assert.deepEqual(crateMatrix(source).sort(), packages)
     assert.deepEqual(serverMatrix(source), serverBlocks.map((block) => ({ crate: "bamboo-server", block })))
     assert.ok(source.includes("${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }}"))
     assert.match(source, /fail-fast: false/u)
