@@ -15,6 +15,7 @@ use crate::runtime::config::AgentLoopConfig;
 
 const MODEL: &str = "fixture-model";
 const DENIED_SCHEMA_MARKER: &str = "PRIVATE_TOOL_DEFINITION_TEST_MARKER";
+const CHILD_GUIDANCE_TITLE: &str = "Child Tool Availability";
 
 fn schema(name: &str) -> ToolSchema {
     ToolSchema {
@@ -186,19 +187,82 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
         send(&mut session, provider, &catalog).await;
         record_discovery(&mut session, &[catalog[1].clone(), catalog[3].clone()]);
         send(&mut session, provider, &catalog).await;
+
+        let mut child = Session::new(&format!("wire-child-{index}"), MODEL);
+        child.kind = bamboo_domain::SessionKind::Child;
+        child.add_message(Message::user("Review the assigned change"));
+        send(&mut child, provider, &catalog[..2]).await;
     }
     let bodies = capture(&server).await;
-    assert_eq!(bodies.len(), providers.len() * 2);
-    for pair in bodies.chunks_exact(2) {
-        assert_eq!(tool_names(&pair[0]), ["Read", "discover_capabilities"]);
+    assert_eq!(bodies.len(), providers.len() * 3);
+    for rounds in bodies.chunks_exact(3) {
+        assert_eq!(tool_names(&rounds[0]), ["Read", "discover_capabilities"]);
         assert_eq!(
-            tool_names(&pair[1]),
+            tool_names(&rounds[1]),
             ["Read", "Glob", "discover_capabilities"]
         );
-        assert!(pair
+        assert_eq!(tool_names(&rounds[2]), ["Read", "discover_capabilities"]);
+        assert!(rounds[2].to_string().contains(CHILD_GUIDANCE_TITLE));
+        assert!(rounds
             .iter()
             .all(|body| !body.to_string().contains(DENIED_SCHEMA_MARKER)));
     }
+}
+
+#[tokio::test]
+async fn child_tool_guidance_matches_current_request_and_stays_out_of_history() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
+        .mount(&server)
+        .await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    let mut session = Session::new("child-tool-guidance", MODEL);
+    session.kind = bamboo_domain::SessionKind::Child;
+    session.add_message(Message::user("Review the assigned change"));
+    let read_only = ["Read", "Glob"].map(schema);
+    send(&mut session, &provider, &read_only).await;
+    record_discovery(&mut session, &read_only[1..]);
+    send(&mut session, &provider, &read_only).await;
+    let with_shell = ["Read", "exec_command", "write_stdin"].map(schema);
+    send(&mut session, &provider, &with_shell).await;
+    send(&mut session, &provider, &[]).await;
+    let mut root = Session::new("root-tool-guidance-control", MODEL);
+    root.add_message(Message::user("Inspect the change"));
+    send(&mut root, &provider, &read_only).await;
+
+    let requests = capture(&server).await;
+    let [restricted, discovered, restored, no_tools, root] = requests.as_slice() else {
+        panic!("expected five provider requests, got {}", requests.len());
+    };
+    assert_eq!(tool_names(restricted), ["Read", "discover_capabilities"]);
+    assert_eq!(
+        tool_names(discovered),
+        ["Read", "Glob", "discover_capabilities"]
+    );
+    for request in [restricted, discovered] {
+        let wire = request.to_string();
+        assert_eq!(wire.matches(CHILD_GUIDANCE_TITLE).count(), 1);
+        assert!(wire.contains("built-in shell command tool is unavailable on this request"));
+        assert!(wire.contains("tell your parent the exact action and evidence needed"));
+    }
+    assert_eq!(
+        tool_names(restored),
+        ["Read", "exec_command", "write_stdin"]
+    );
+    assert!(!restored.to_string().contains(CHILD_GUIDANCE_TITLE));
+    assert!(tool_names(no_tools).is_empty());
+    assert!(no_tools
+        .to_string()
+        .contains("This child request has no tools"));
+    assert!(!root.to_string().contains(CHILD_GUIDANCE_TITLE));
+    assert!(!serde_json::to_string(&session)
+        .unwrap()
+        .contains(CHILD_GUIDANCE_TITLE));
 }
 
 #[tokio::test]

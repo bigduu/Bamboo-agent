@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_active_workflow_context_block, build_agent_hook_context_block,
+    build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
@@ -1183,6 +1183,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
+    if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
     if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
         model_transcript.push(block.render_runtime_context_message());
     }

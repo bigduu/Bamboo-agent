@@ -1629,10 +1629,30 @@ async fn fixture_with_followups(
         .unwrap();
     }
     let requests = probe.requests.lock().unwrap().clone();
+    let role_description = requests
+        .iter()
+        .filter(|body| body["model"] == "plain-root")
+        .filter_map(|body| body["tools"].as_array())
+        .flatten()
+        .find(|tool| tool["function"]["name"] == "SubAgent")
+        .and_then(|tool| {
+            tool["function"]["parameters"]["properties"]["role"]["description"].as_str()
+        })
+        .expect("the actual parent receives the SubAgent role description");
+    assert!(role_description
+        .contains("For commands, tests, or edits, choose a role that can perform them"));
     let child_wire = requests
         .iter()
         .find(|body| body["model"] == "plain-child")
         .unwrap();
+    let child_prompt = child_wire["messages"].to_string();
+    assert_eq!(child_prompt.matches("Child Tool Availability").count(), 1);
+    if glob {
+        assert!(child_prompt.contains("built-in shell command tool is unavailable on this request"));
+        assert!(child_prompt.contains("Use tool discovery when offered"));
+    } else {
+        assert!(child_prompt.contains("This child request has no tools"));
+    }
     assert!(
         (glob
             && child_wire["tools"].as_array().is_some_and(|tools| {

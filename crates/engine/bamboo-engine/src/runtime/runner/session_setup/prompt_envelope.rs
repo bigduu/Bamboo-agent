@@ -2,7 +2,7 @@ use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
-use bamboo_domain::CapabilityLoadingMode;
+use bamboo_domain::{CapabilityLoadingMode, SessionKind};
 
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
@@ -53,6 +53,35 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
             "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
         ),
     )
+}
+
+/// The request-selected catalog already accounts for role, Host, and provider
+/// restrictions. The native shell entry point is Core and is never deferred.
+pub(crate) fn build_child_tool_guidance(
+    session: &Session,
+    tool_schemas: &[ToolSchema],
+) -> Option<ContextBlock> {
+    if session.kind != SessionKind::Child
+        || tool_schemas
+            .iter()
+            .any(|schema| schema.function.name == "exec_command")
+    {
+        return None;
+    }
+    let availability = if tool_schemas.is_empty() {
+        "This child request has no tools. Work from the supplied inputs."
+    } else {
+        "Bamboo's built-in shell command tool is unavailable on this request. Use the supplied inputs and exposed tools, including dedicated file or search tools where useful. Use tool discovery when offered to find an eligible alternative."
+    };
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Child Tool Availability",
+        format!(
+            "{availability} Complete and verify what you can. Mention a missing tool only when it blocks a required result. If it does, tell your parent the exact action and evidence needed from an authorized session, alongside your verified findings."
+        ),
+    ))
 }
 
 /// A session-selected prompt enhancement for a root that coordinates child
