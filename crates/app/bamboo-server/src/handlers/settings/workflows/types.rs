@@ -39,6 +39,8 @@ pub(super) struct CloneWorkflowResponse {
 pub struct WorkflowCatalogQuery {
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub orchestration_only: bool,
 }
 
 /// Request body for explicitly migrating a read-only legacy workflow into the

@@ -1257,7 +1257,7 @@ mod tests {
                 );
             }
             if ids.is_empty() {
-                assert!(prompt.contains("Discover a Workflow when one could help."));
+                assert!(prompt.contains("Discover a Skill when one could help."));
                 assert!(!prompt.contains("load_skill"));
             }
         }

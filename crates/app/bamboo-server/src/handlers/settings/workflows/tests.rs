@@ -111,6 +111,20 @@ async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
         .expect("orchestration entry");
     assert_eq!(deploy["status"], "valid");
 
+    let executable: bamboo_skills::WorkflowCatalogSnapshot =
+        actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/catalog?orchestration_only=true")
+                .to_request(),
+        )
+        .await;
+    assert!(executable.entries.iter().any(|entry| entry.id == "deploy"));
+    assert!(executable
+        .entries
+        .iter()
+        .all(|entry| entry.kind == bamboo_skills::WorkflowKind::Orchestration));
+
     const PRIVATE_INVALID_FIELD: &str = "private_invalid_catalog_field";
     const PRIVATE_INVALID_BODY: &str = "PRIVATE INVALID REPLACEMENT BODY";
     tokio::fs::write(

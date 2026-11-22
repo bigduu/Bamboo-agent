@@ -1046,7 +1046,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
             ContextBlockStability::RoundDynamic,
-            "Available Workflows",
+            "Available Skills",
             if workflow_is_active {
                 String::new()
             } else {
