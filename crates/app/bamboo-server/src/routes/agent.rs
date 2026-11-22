@@ -368,6 +368,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route(web::post().to(agent::sessions::migrate_session_version)),
         )
         .route(
+            "/session-storage/archive-preview",
+            web::get().to(agent::sessions::preview_session_archives),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive",
+            web::post().to(agent::sessions::archive_session),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive/restore",
+            web::post().to(agent::sessions::restore_session_archive),
+        )
+        .route(
             "/sessions/{session_id}/named-agent-profiles",
             web::get().to(agent::named_agent_catalog::handler),
         )

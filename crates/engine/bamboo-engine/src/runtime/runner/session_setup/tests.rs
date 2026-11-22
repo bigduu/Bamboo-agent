@@ -544,7 +544,7 @@ async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candi
         .await
         .unwrap();
         assert_eq!(
-            before.contains("Check Skill applicability."),
+            before.contains("Discover a Workflow when one could help."),
             shows_guidance
         );
         let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
@@ -2077,7 +2077,9 @@ fn default_delegation_prompts_use_the_compact_subagent_contract() {
         !base.contains("SubAgent"),
         "the schema supplies the SubAgent call contract"
     );
-    assert!(crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("delegate independent work"));
+    assert!(
+        crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("send ready assignments together")
+    );
     for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
         for stale in [
             "set `workspace`",
@@ -3203,11 +3205,11 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     assert!(stable.stable_instructions.contains("Base system"));
     assert!(stable
         .stable_instructions
-        .contains("infer the need for a plan from the work itself"));
+        .contains("record a plan before implementation and resume a matching plan"));
     assert!(stable
         .stable_instructions
-        .contains("Each Task update takes the full current list"));
-    assert!(stable.stable_instructions.contains("`criteriaMet`"));
+        .contains("Use an active Workflow's steps and checks for its scope."));
+    assert!(!stable.stable_instructions.contains("`criteriaMet`"));
     assert!(!stable.stable_instructions.contains("Workspace path:"));
     assert!(!stable
         .stable_instructions
@@ -3230,13 +3232,13 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     // base prompt.
     assert!(stable
         .stable_instructions
-        .contains("Investigate before you conclude"));
+        .contains("Trace the actual source and execution path"));
     assert!(stable
         .stable_instructions
         .contains("Verify the work against the user's acceptance criteria."));
     assert!(stable
         .stable_instructions
-        .contains("its result could change the acceptance decision"));
+        .contains("Spend additional effort only when it can change the deliverable or acceptance"));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 

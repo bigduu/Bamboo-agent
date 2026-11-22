@@ -412,7 +412,7 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "Create or update the shared task list for the current root session tree. Child sessions write to the same task list as their parent/root session."
+        "Create or replace the task list shared by the current Root and its Children. Send the full list, including completed and waiting items. Keep stable IDs. Use parentId for groups and dependsOn for acyclic prerequisites within the same list. Start steps with satisfied prerequisites and keep one locally executing item in_progress. For completed items, include each verified completionCriteria in criteriaMet and preserve that evidence in later updates."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

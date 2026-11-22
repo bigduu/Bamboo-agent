@@ -9,7 +9,7 @@
 //! Notes:
 //! - This is a greenfield format (no migration). Old on-disk layouts are ignored.
 //! - The global index is a rebuildable cache, not the source of truth. Each
-//!   `session.json` is authoritative; the index only speeds up lookups. A
+//!   `session.json` (plain or archived) is authoritative; the index speeds up lookups. A
 //!   *missing* `sessions.json` starts an empty index; a *corrupt/unparseable*
 //!   one is backed up to `sessions.json.bak` and the index is rebuilt by
 //!   scanning `sessions/<root>/[children/<child>/]session.json` (see
@@ -101,6 +101,7 @@ mod child_actor_runtime_tests;
 #[cfg(test)]
 mod child_deletion_tests;
 mod child_project;
+mod cold_main;
 mod compact_main;
 #[cfg(test)]
 mod compact_main_tests;
@@ -119,8 +120,12 @@ mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
+mod session_archive;
 #[cfg(test)]
 mod session_compatibility_tests;
+pub use session_archive::{
+    SessionArchiveOperation, SessionArchiveOutcome, DEFAULT_SESSION_ARCHIVE_IDLE_DAYS,
+};
 mod session_version_migration;
 pub use session_version_migration::{
     SessionVersionMigrationBlocker, SessionVersionMigrationDecision,
@@ -2474,7 +2479,7 @@ impl SessionStoreV2 {
     /// skipped with a warning; a sidecar read error degrades to "no sidecar"
     /// rather than failing recovery. `id` is used only for log context.
     async fn load_session_from_dir(&self, abs_dir: &Path, id: &str) -> Option<Session> {
-        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
+        let raw = match cold_main::read_text(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
             Err(error) => {
@@ -2557,7 +2562,7 @@ impl SessionStoreV2 {
         expected_root_id: &str,
         control_only: bool,
     ) -> io::Result<Option<Session>> {
-        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
+        let raw = match cold_main::read_text(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -3428,6 +3433,20 @@ impl SessionStoreV2 {
             // generation than a newer foreground save.
             let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
             let _session_write = self.acquire_session_maintenance_lock(&session_id).await?;
+            // The runtime sidecar holds the newest timestamp. Most archives
+            // are older than the search window and need no history decode on
+            // startup. Retain the full-load fallback for legacy/missing sides.
+            if self
+                .get_index_entry(&session_id)
+                .await
+                .is_some_and(|entry| !should_index_session(entry.updated_at))
+                && self
+                    .read_runtime_sidecar(&session_id)
+                    .await?
+                    .is_some_and(|side| !should_index_session(side.updated_at))
+            {
+                continue;
+            }
             if let Some(session) = self.load_session_unlocked(&session_id).await? {
                 if !should_index_session(session.updated_at) {
                     continue;
@@ -3691,7 +3710,7 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let abs_dir = self.sessions_dir.join(session_id);
-        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
+        let raw = match cold_main::read_text(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -4026,7 +4045,7 @@ impl SessionStoreV2 {
                 .await?;
             if crate::session_merge::has_uncommitted_response_marker(&side) {
                 if let Some(path) = self.session_json_path(session_id).await? {
-                    let raw = fs::read_to_string(path).await?;
+                    let raw = cold_main::read_text(path).await?;
                     compact_main::validate_full_main(raw.as_bytes())?;
                     let main = decode_main_control_plane(&raw, Some(&side))?;
                     supervisor::validate_overlay(&main, Some(&side))?;
@@ -4039,7 +4058,7 @@ impl SessionStoreV2 {
             self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         };
-        let raw = match fs::read_to_string(path).await {
+        let raw = match cold_main::read_text(path).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.ensure_no_unindexed_root(session_id).await?;
@@ -4134,7 +4153,7 @@ impl SessionStoreV2 {
         if !Self::runtime_task_recovery_real_file(&path).await? {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&path).await?;
+        let raw = cold_main::read_text(&path).await?;
         compact_main::validate_full_main(raw.as_bytes())?;
         let session: Session = serde_json::from_str(&raw).map_err(|error| {
             io::Error::new(
@@ -4892,7 +4911,7 @@ impl SessionStoreV2 {
                         return Err(other_io_error("copy rollback target pair is unavailable"));
                     }
                 }
-                let raw = fs::read(&main_path).await?;
+                let raw = cold_main::read(&main_path).await?;
                 compact_main::validate_full_main(&raw)?;
                 let main: Session = serde_json::from_slice(&raw).map_err(io::Error::other)?;
                 let side = Self::read_runtime_sidecar_at(&runtime_path, &journal.target_id)
@@ -5806,7 +5825,7 @@ impl SessionStoreV2 {
                 ))
             }
         }
-        let raw = match fs::read(&main).await {
+        let raw = match cold_main::read(&main).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -7484,7 +7503,7 @@ impl SessionStoreV2 {
             self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         }
-        let raw = fs::read_to_string(path).await?;
+        let raw = cold_main::read_text(path).await?;
         compact_main::validate_full_main(raw.as_bytes())?;
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
@@ -7935,7 +7954,7 @@ impl SessionStoreV2 {
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
         let mut previous_sidecar = None;
-        let previous_main = match fs::read_to_string(&current_main).await {
+        let previous_main = match cold_main::read_text(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)

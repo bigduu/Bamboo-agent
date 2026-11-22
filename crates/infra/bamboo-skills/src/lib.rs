@@ -167,9 +167,7 @@ fn fit_skills_to_context_budget(
     );
     let char_budget = char_budget.max(1);
     let token_budget = char_budget / ESTIMATED_CHARS_PER_TOKEN;
-    let static_chars = context::workflow_catalog_prefix().chars().count();
-    const DIAGNOSTIC_RESERVE_CHARS: usize = 512;
-    let overhead = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    let overhead = context::workflow_catalog_prefix().chars().count();
     let compressed_descriptions = skills
         .iter()
         .any(|skill| skill.description.chars().count() > MAX_CAPABILITY_SUMMARY_CHARS);
@@ -1259,7 +1257,7 @@ mod tests {
                 );
             }
             if ids.is_empty() {
-                assert!(prompt.contains("Check Skill applicability."));
+                assert!(prompt.contains("Discover a Workflow when one could help."));
                 assert!(!prompt.contains("load_skill"));
             }
         }

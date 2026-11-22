@@ -25,3 +25,4 @@ pub use root_mode::{recover_root_mode, select_root_mode};
 pub use running_snapshot::running_sessions_snapshot;
 pub use system_prompt::get_system_prompt_snapshot;
 pub use version_migration::{inspect_session_version_migration, migrate_session_version};
+pub(super) use version_migration::{owner_authorized, process_busy};

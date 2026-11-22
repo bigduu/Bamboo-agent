@@ -905,9 +905,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ));
         }
     }
-    if let Some(block) = build_active_workflow_context_block(session) {
-        context_blocks.push(block);
-    }
+    let active_workflow = build_active_workflow_context_block(session);
+    let workflow_is_active = active_workflow.is_some();
+    context_blocks.extend(active_workflow);
     if let Some(block) = build_project_resources_context_block(session) {
         context_blocks.push(block);
     }
@@ -1046,8 +1046,12 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
             ContextBlockStability::RoundDynamic,
-            "Loaded Skills",
-            section("skill"),
+            "Available Workflows",
+            if workflow_is_active {
+                String::new()
+            } else {
+                section("skill")
+            },
         ),
         (
             ContextBlockType::EnvSnapshot,
@@ -1170,6 +1174,20 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
+    if let Some(deadline) = config.run_deadline {
+        // Sample only the caller's explicit clock. A fresh reading belongs to
+        // this request, outside the durable ledger and the cacheable prefix.
+        let remaining = deadline.remaining();
+        let advice = if remaining <= deadline.delivery_reserve() {
+            " Save and verify the best available result now."
+        } else {
+            " Leave time to save and verify the deliverable."
+        };
+        model_transcript.push(Message::user(format!(
+            "Host execution deadline\nTime remaining: {}s.{advice}",
+            remaining.as_secs()
+        )));
+    }
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
