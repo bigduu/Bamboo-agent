@@ -91,6 +91,16 @@ Session create/list/detail and chat contracts expose `project_id`; explicit
 session reassignment also requires `If-Match` and is rejected while the session
 is running.
 
+Project list/detail responses expose `new_chat_worktree`, which defaults to
+`false` for new and existing Projects. The user can change it with the same
+revision-checked Project PATCH. Lotus applies it on the first send of a manually
+started Project chat. It uses the configured worktree destination and source
+checkout, and the composer allows a per-chat override. The
+`/api/v1/projects/{id}/worktrees?sources_only=true` view returns
+the configured Project checkout, discovered primary Git checkouts and the
+destination. Supervisor dispatches use the workspace explicitly supplied with
+the Project assignment.
+
 ### Project sidebar sections
 
 Project list/detail responses include `sidebar: null` until a snapshot is saved
