@@ -1183,14 +1183,10 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         } else {
             " Leave time to save and verify the deliverable."
         };
-        let block = ContextBlock::new(
-            ContextBlockType::RunDeadline,
-            ContextBlockPriority::High,
-            ContextBlockStability::RoundDynamic,
-            "Execution Deadline",
-            format!("Time remaining: {}s.{advice}", remaining.as_secs()),
-        );
-        model_transcript.push(block.render_runtime_context_message());
+        model_transcript.push(Message::user(format!(
+            "Host execution deadline\nTime remaining: {}s.{advice}",
+            remaining.as_secs()
+        )));
     }
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
         // This snapshot is current request context, never a second durable

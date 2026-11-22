@@ -661,7 +661,12 @@ async fn run_session(
     let run_deadline = args
         .timeout_secs
         .map(|secs| RunDeadline::new(Duration::from_secs(secs)));
-    let data = web::Data::new(state.with_headless_run_deadline(session_id.clone(), run_deadline));
+    let _deadline_binding = run_deadline.map(|deadline| {
+        state
+            .child_completion_coordinator
+            .bind_headless_run_deadline(session_id.clone(), deadline)
+    });
+    let data = web::Data::new(state);
     // -p / ExecuteRequest parity (#246 part A): every field `ExecuteRequest`
     // actually carries (model/provider/model_ref, skill_mode, reasoning_effort)
     // is threaded through from CLI flags above and below — none are hardcoded

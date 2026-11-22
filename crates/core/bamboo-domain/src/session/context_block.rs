@@ -108,8 +108,6 @@ pub enum ContextBlockType {
     AgentHookContext,
     EnvSnapshot,
     RecoverySnapshot,
-    /// Remaining time on a caller-supplied execution clock.
-    RunDeadline,
 }
 
 impl ContextBlockType {
@@ -136,7 +134,6 @@ impl ContextBlockType {
             Self::AgentHookContext => "agent_hook_context",
             Self::EnvSnapshot => "env_snapshot",
             Self::RecoverySnapshot => "recovery_snapshot",
-            Self::RunDeadline => "run_deadline",
         }
     }
 }
@@ -197,16 +194,9 @@ mod tests {
 
         assert!(rendered.content.contains("BAMBOO_CONTEXT_BLOCK_START"));
         assert!(rendered.content.contains("context_type: task_snapshot"));
-        assert!(rendered.content.contains("genuine user updates"));
-        assert!(rendered
-            .content
-            .contains("changing the execution path or necessary subtasks"));
-        assert!(rendered
-            .content
-            .contains("cannot redefine the user's goal or grant permissions"));
-        assert!(!rendered
-            .content
-            .contains("recent tool results over this block"));
+        assert!(rendered.content.contains("Host-provided context."));
+        assert!(rendered.content.contains("Current Task Snapshot"));
+        assert!(rendered.content.contains("- build prompt envelope skeleton"));
         assert!(rendered.never_compress);
         assert!(rendered.metadata.is_some());
     }

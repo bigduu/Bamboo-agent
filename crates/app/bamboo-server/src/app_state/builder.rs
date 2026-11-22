@@ -1572,7 +1572,6 @@ impl AppState {
         Ok(Self {
             browser,
             app_data_dir: bamboo_home_dir,
-            headless_run_deadline: None,
             memory_store,
             tool_event_publisher,
             tool_event_router,

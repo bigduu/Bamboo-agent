@@ -23,7 +23,9 @@ use crate::execution::{
     SessionCompletionHook, SessionExecutionArgs, SessionExecutionReservation,
     SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
-use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
+use crate::runtime::config::{
+    BashResumeHook, GuardianSpawner, RunDeadline, BASH_COMPLETION_RESUME_KIND,
+};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
@@ -899,6 +901,12 @@ pub type ReservedRootExecutionAdapter = Arc<
         + Sync,
 >;
 
+/// The CLI owns this binding while its original invocation is active.
+pub struct HeadlessRunDeadlineBinding {
+    session_id: String,
+    deadline: RunDeadline,
+}
+
 #[derive(Clone)]
 pub struct ChildCompletionCoordinator {
     storage: Arc<dyn Storage>,
@@ -923,6 +931,7 @@ pub struct ChildCompletionCoordinator {
     /// scheduler ownership cycle while still routing idle child activation
     /// through the canonical placement-aware spawn core.
     spawn_scheduler: Arc<RwLock<Weak<SpawnScheduler>>>,
+    headless_run_deadline: Arc<parking_lot::Mutex<Weak<HeadlessRunDeadlineBinding>>>,
 }
 
 impl ChildCompletionCoordinator {
@@ -962,7 +971,32 @@ impl ChildCompletionCoordinator {
             reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
+            headless_run_deadline: Arc::new(parking_lot::Mutex::new(Weak::new())),
         }
+    }
+
+    /// Share the headless invocation's clock with successor Root executions.
+    /// Keep the returned binding alive for the full invocation.
+    #[must_use]
+    pub fn bind_headless_run_deadline(
+        &self,
+        session_id: String,
+        deadline: RunDeadline,
+    ) -> Arc<HeadlessRunDeadlineBinding> {
+        let binding = Arc::new(HeadlessRunDeadlineBinding {
+            session_id,
+            deadline,
+        });
+        *self.headless_run_deadline.lock() = Arc::downgrade(&binding);
+        binding
+    }
+
+    pub fn headless_run_deadline_for(&self, session_id: &str) -> Option<RunDeadline> {
+        self.headless_run_deadline
+            .lock()
+            .upgrade()
+            .filter(|binding| binding.session_id == session_id)
+            .map(|binding| binding.deadline)
     }
 
     /// Register a host producer at the existing genuine reserved Root seam.
@@ -2556,6 +2590,7 @@ impl ChildCompletionCoordinator {
         let guardian_spawner = self.guardian_spawner.read().await.clone();
 
         consume_pending_clarification_resume(&mut session);
+        execution_reservation.set_run_deadline(self.headless_run_deadline_for(&session_id));
         spawn_session_execution(SessionExecutionArgs {
             agent,
             session_id,

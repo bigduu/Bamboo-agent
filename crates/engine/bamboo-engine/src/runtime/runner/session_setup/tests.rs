@@ -2077,7 +2077,9 @@ fn default_delegation_prompts_use_the_compact_subagent_contract() {
         !base.contains("SubAgent"),
         "the schema supplies the SubAgent call contract"
     );
-    assert!(crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("delegate independent work"));
+    assert!(
+        crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("send ready assignments together")
+    );
     for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
         for stale in [
             "set `workspace`",
@@ -3230,13 +3232,13 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     // base prompt.
     assert!(stable
         .stable_instructions
-        .contains("Investigate before you conclude"));
+        .contains("Trace the actual source and execution path"));
     assert!(stable
         .stable_instructions
         .contains("Verify the work against the user's acceptance criteria."));
     assert!(stable
         .stable_instructions
-        .contains("its result could change the acceptance decision"));
+        .contains("Spend additional effort only when it can change the deliverable or acceptance"));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 

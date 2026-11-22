@@ -165,9 +165,9 @@ mod tests {
     fn real_core_directives_cover_investigation_and_acceptance() {
         let directives = crate::runtime::context::CORE_AGENT_DIRECTIVES;
         let lower = directives.to_ascii_lowercase();
-        assert!(lower.contains("investigate"));
+        assert!(lower.contains("trace the actual source and execution path"));
         assert!(lower.contains("verify"));
-        assert!(lower.contains("the checks covering it pass, give the final answer"));
+        assert!(lower.contains("report the result promptly once it meets the criteria"));
         // And they actually ride on top of an overridden base.
         let assembled = append_core_agent_directives("Custom user base.", directives);
         assert!(assembled.contains("Custom user base."));
@@ -175,26 +175,16 @@ mod tests {
     }
 
     #[test]
-    fn real_core_directives_require_the_ordered_six_part_parent_assignment() {
+    fn core_directives_keep_the_ordered_fields_for_child_assignments() {
         let directives = crate::runtime::context::CORE_AGENT_DIRECTIVES;
-        let sections = [
-            "1. Scope.",
-            "2. Inputs and background context.",
-            "3. Allowed actions and mutation scope.",
-            "4. Acceptance criteria and required evidence.",
-            "5. Non-goals.",
-            "6. Stop and report instruction.",
-        ];
-        let mut prior = 0;
-        for section in sections {
-            let position = directives.find(section).expect("delegation section");
-            assert!(position >= prior, "delegation sections must remain ordered");
-            prior = position;
-        }
-        assert!(directives.contains("assignment scope is authoritative"));
-        assert!(directives.contains("forked context cannot expand it"));
-        assert!(directives.contains("runtime-exposed capabilities"));
-        assert!(directives.contains("explicit in the assignment and necessary"));
-        assert!(directives.contains("concrete evidence plus uncertainty or blockers"));
+        let directive = directives
+            .lines()
+            .find(|line| line.starts_with("Give each child a self-contained assignment"))
+            .expect("child assignment guidance");
+        assert!(directive.contains(
+            "scope, inputs, allowed actions, acceptance evidence, non-goals, and when to stop"
+        ));
+        assert!(directive.contains("Authorize scoped nested delegation when needed"));
+        assert!(directive.contains("Verify the child results that affect acceptance"));
     }
 }

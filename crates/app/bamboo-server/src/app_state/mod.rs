@@ -163,8 +163,6 @@ pub struct AppState {
     pub browser: Arc<crate::browser::BrowserManager>,
     /// Application data directory (configured via `BAMBOO_DATA_DIR`; default `${HOME}/.bamboo`)
     pub app_data_dir: PathBuf,
-    /// A clock scoped to one local headless invocation and its Root session.
-    pub(crate) headless_run_deadline: Option<(String, bamboo_engine::config::RunDeadline)>,
 
     /// Independent Jiandu store shared by every memory surface in this state.
     pub memory_store: bamboo_memory::memory_store::MemoryStore,
@@ -533,16 +531,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Keep the same local clock when a headless invocation resumes its Root.
-    pub fn with_headless_run_deadline(
-        mut self,
-        session_id: String,
-        deadline: Option<bamboo_engine::config::RunDeadline>,
-    ) -> Self {
-        self.headless_run_deadline = deadline.map(|deadline| (session_id, deadline));
-        self
-    }
-
     /// Try to claim the title-generation slot for `session_id`.
     /// Returns `true` on success, `false` if generation is already in flight.
     pub fn title_gen_acquire(&self, session_id: &str) -> bool {

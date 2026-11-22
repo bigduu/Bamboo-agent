@@ -70,7 +70,7 @@ impl LLMProvider for ExecWaitProvider {
         assert!(!tools.iter().any(|tool| tool.function.name == "bash"));
         let deadlines: Vec<_> = messages
             .iter()
-            .filter(|message| message.content.contains("context_type: run_deadline\n"))
+            .filter(|message| message.content.starts_with("Host execution deadline\n"))
             .collect();
         if self.expect_deadline {
             assert_eq!(deadlines.len(), 1);
