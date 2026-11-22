@@ -42,6 +42,18 @@ pub fn effective_litellm_wire_types(instance: &ProviderInstanceConfig) -> Option
         .then(|| litellm_wire_types_override(instance).unwrap_or(false))
 }
 
+fn validate_litellm_build_support(
+    instance: &ProviderInstanceConfig,
+    compiled: bool,
+) -> Result<(), LLMError> {
+    if !compiled && litellm_wire_types_override(instance) == Some(true) {
+        return Err(LLMError::Api(
+            "litellm_wire_types requires a build with the litellm-wire-types feature".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     crate::http_client::build_http_client(config)
 }
@@ -125,12 +137,7 @@ pub async fn create_provider_from_instance(
     let overrides = bamboo_config::model_vision_overrides(instance).map_err(LLMError::Api)?;
     let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
-    if !cfg!(feature = "litellm-wire-types") && litellm_wire_types_override(instance) == Some(true)
-    {
-        return Err(LLMError::Api(
-            "litellm_wire_types requires a build with the litellm-wire-types feature".into(),
-        ));
-    }
+    validate_litellm_build_support(instance, cfg!(feature = "litellm-wire-types"))?;
     #[cfg(feature = "litellm-wire-types")]
     let use_litellm_wire_types = effective_litellm_wire_types(instance) == Some(true);
 
@@ -467,21 +474,26 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "litellm-wire-types"))]
-    #[tokio::test]
-    async fn explicit_wire_types_opt_in_requires_the_build_feature() {
-        let instance = serde_json::from_value(serde_json::json!({
+    #[test]
+    fn explicit_wire_types_opt_in_requires_the_build_feature() {
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
             "provider_type": "anthropic",
             "api_key": "fixture-key",
             "litellm_wire_types": true
         }))
         .unwrap();
-        assert_eq!(effective_litellm_wire_types(&instance), None);
-        let result =
-            create_provider_from_instance(&Config::default(), &instance, Default::default()).await;
-        assert!(
-            matches!(result, Err(LLMError::Api(message)) if message.contains("litellm-wire-types"))
+        assert!(validate_litellm_build_support(&instance, true).is_ok());
+        assert!(matches!(
+            validate_litellm_build_support(&instance, false),
+            Err(LLMError::Api(message)) if message.contains("litellm-wire-types")
+        ));
+        instance.extra.insert(
+            LITELLM_WIRE_TYPES_CONFIG_KEY.into(),
+            serde_json::Value::Bool(false),
         );
+        assert!(validate_litellm_build_support(&instance, false).is_ok());
+        instance.extra.remove(LITELLM_WIRE_TYPES_CONFIG_KEY);
+        assert!(validate_litellm_build_support(&instance, false).is_ok());
     }
 
     #[tokio::test]
