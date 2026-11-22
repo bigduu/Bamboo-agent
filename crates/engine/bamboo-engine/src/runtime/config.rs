@@ -120,6 +120,10 @@ fn default_gold_min_confidence() -> GoldConfidence {
 pub struct GoldConfig {
     #[serde(default)]
     pub recovery: super::goal_recovery::GoalRecoveryPolicy,
+    /// Allow one startup wake from a committed continuation before another
+    /// provider round or tool effect was admitted.
+    #[serde(default)]
+    pub resume_after_restart: bool,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
     pub enabled: bool,
@@ -169,6 +173,7 @@ impl Default for GoldConfig {
     fn default() -> Self {
         Self {
             recovery: Default::default(),
+            resume_after_restart: false,
             enabled: false,
             auto_answer_enabled: false,
             auto_continue_enabled: false,

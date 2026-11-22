@@ -656,15 +656,12 @@ async fn load_project_memory_index_snippet(
         return None;
     }
 
-    let content = match memory
-        .read_memory_view(MemoryScope::Project, Some(project_key))
-        .await
-    {
+    let content = match memory.read_project_prompt_index(project_key).await {
         Ok(Some(content)) => content,
         Ok(None) => return None,
         Err(error) => {
             tracing::warn!(
-                "[{}] Failed to read project memory view for '{}': {}",
+                "[{}] Failed to read the project prompt index for '{}': {}",
                 session_id,
                 project_key,
                 error

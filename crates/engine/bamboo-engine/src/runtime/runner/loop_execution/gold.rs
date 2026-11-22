@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::goal_state::{
-    ensure_goal_state, write_goal_state, GoalDeclaredStatus, GoalEvalRecord, GoalRuntimeStatus,
-    GoalState,
+    ensure_goal_state, write_goal_state, GoalEvalRecord, GoalRuntimeStatus, GoalState,
+    GoalStopReason,
 };
 use crate::runtime::gold_evaluation::{
     apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold_with_dispatch,
@@ -73,14 +73,9 @@ enum GoalTerminalAction {
 /// goal instead of completing — persisting the goal state and the double-check
 /// verdict as a side effect.
 ///
-/// The autonomous loop is driven by the agent's own `update_goal` self-report
-/// (recorded into `goal_state.declared_status`). The Gold evaluator runs here
-/// only as a side-channel double-check at the moment the run would otherwise
-/// stop: it can veto a premature completion (agent declared complete but the
-/// objective is not actually met) or allow a confident stop. The default bias is
-/// to keep working. A confident `continue` can also veto a blocked declaration.
-/// A `need_input` verdict can stop the loop only if it names required user
-/// input, meets the confidence floor, and supplies no independent next step.
+/// The agent's self-report is input to Gold. A terminal evaluation can confirm
+/// achievement, identify a blocker or direct another work round. The final
+/// evaluation still runs after the continuation budget is spent.
 ///
 /// Running inside the runner loop keeps the single-terminal-`Complete` invariant
 /// intact, so `is_running` stays accurate and the SSE stream stays open across
@@ -94,6 +89,7 @@ pub(super) async fn evaluate_gold_terminal(
     reasoning_effort: Option<ReasoningEffort>,
     session_id: &str,
     iteration: u32,
+    no_progress_limit: bool,
     llm: Arc<dyn LLMProvider>,
     event_tx: &mpsc::Sender<AgentEvent>,
 ) -> GoldTerminalDecision {
@@ -110,29 +106,13 @@ pub(super) async fn evaluate_gold_terminal(
     };
 
     let mut goal_state = ensure_goal_state(session, objective);
-    let declared = goal_state.declared_status;
-
-    // Budget gate: stop once the continuation budget is spent. No further
-    // double-check will run here, so honor an explicit agent self-report rather
-    // than mislabeling it `budget_limited` (consistent with the eval-failure
-    // branch below, which also honors an explicit declaration when it cannot
-    // verify).
-    if goal_state.continuation_count >= gold_config.max_auto_continuations {
-        tracing::debug!(
-            "[{}] Goal terminal gate: continuation budget exhausted ({}/{})",
-            session_id,
-            goal_state.continuation_count,
-            gold_config.max_auto_continuations
-        );
-        goal_state.status = match declared {
-            Some(GoalDeclaredStatus::Complete) => GoalRuntimeStatus::Complete,
-            Some(GoalDeclaredStatus::Blocked) => GoalRuntimeStatus::Blocked,
-            None => GoalRuntimeStatus::BudgetLimited,
-        };
-        goal_state.clear_declaration();
-        persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
-        return GoldTerminalDecision::Stop;
-    }
+    let continuation_stop = if goal_state.continuation_count >= gold_config.max_auto_continuations {
+        Some(GoalStopReason::ContinuationBudget)
+    } else if no_progress_limit {
+        Some(GoalStopReason::NoProgress)
+    } else {
+        None
+    };
 
     // Take a new complete Fast pair at the terminal boundary. An explicitly
     // selected Gold model still uses the execution's original Gold guard.
@@ -193,23 +173,15 @@ pub(super) async fn evaluate_gold_terminal(
     {
         Ok(result) => result,
         Err(error) => {
-            // A broken evaluator must not strand the run in an infinite loop, but
-            // it also must not fabricate a *verified* completion. Honor an
-            // explicit agent self-report; otherwise stop as `need_input`
-            // (unverified — a human should check) rather than silently persisting
-            // a `complete` the double-check never confirmed.
             tracing::warn!(
                 "[{}] Goal terminal double-check failed; stopping without a verified completion: {}",
                 session_id,
                 error
             );
-            goal_state.status = match declared {
-                Some(GoalDeclaredStatus::Complete) => GoalRuntimeStatus::Complete,
-                Some(GoalDeclaredStatus::Blocked) => GoalRuntimeStatus::Blocked,
-                None => GoalRuntimeStatus::NeedInput,
-            };
+            goal_state.status = GoalRuntimeStatus::Blocked;
+            goal_state.stop_reason = Some(GoalStopReason::VerificationUnavailable);
             goal_state.clear_declaration();
-            persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
+            persist_goal_state_and_emit(session, goal_state, session_id, event_tx, None).await;
             return GoldTerminalDecision::Stop;
         }
     };
@@ -217,64 +189,63 @@ pub(super) async fn evaluate_gold_terminal(
     // Persist the verdict into the goal's durable evaluation trail.
     goal_state.push_eval(GoalEvalRecord::from_evaluation(&verdict));
 
-    match decide_goal_terminal_action(declared, &verdict, gold_config.min_auto_continue_confidence)
-    {
-        GoalTerminalAction::Stop(status) => {
+    let action = decide_goal_terminal_action(&verdict, gold_config.min_auto_continue_confidence);
+    match (action, continuation_stop) {
+        (GoalTerminalAction::Stop(status), _) => {
             goal_state.status = status;
-            goal_state.clear_declaration();
-            persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
-            GoldTerminalDecision::Stop
+            goal_state.stop_reason = None;
         }
-        GoalTerminalAction::Continue => {
+        (GoalTerminalAction::Continue, Some(reason)) => {
+            goal_state.status = GoalRuntimeStatus::BudgetLimited;
+            goal_state.stop_reason = Some(reason);
+        }
+        (GoalTerminalAction::Continue, None) => {
             let next_count = goal_state.continuation_count.saturating_add(1);
             goal_state.continuation_count = next_count;
             goal_state.status = GoalRuntimeStatus::Active;
+            goal_state.stop_reason = None;
             goal_state.clear_declaration();
-            persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
             session.add_message(goal_continue_runtime_message(
                 &verdict,
                 objective,
                 next_count,
                 gold_config.max_auto_continuations,
             ));
-            GoldTerminalDecision::Continue {
+            persist_goal_state_and_emit(session, goal_state, session_id, event_tx, Some(config))
+                .await;
+            return GoldTerminalDecision::Continue {
                 continuation_count: next_count,
-            }
+            };
         }
     }
+    goal_state.clear_declaration();
+    persist_goal_state_and_emit(session, goal_state, session_id, event_tx, None).await;
+    GoldTerminalDecision::Stop
 }
 
 /// Pure terminal-gate policy. See [`evaluate_gold_terminal`] for the bias.
 fn decide_goal_terminal_action(
-    declared: Option<GoalDeclaredStatus>,
     verdict: &GoldEvaluationResult,
     floor: GoldConfidence,
 ) -> GoalTerminalAction {
-    match declared {
-        Some(_)
-            if verdict.decision == GoldDecision::Continue && verdict.confidence.meets(floor) =>
+    match verdict.decision {
+        GoldDecision::Achieved
+            if verdict.confidence.meets(floor)
+                && verdict.missing_information.is_empty()
+                && verdict.next_action.is_none() =>
         {
-            GoalTerminalAction::Continue
+            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
         }
-        Some(GoalDeclaredStatus::Blocked) => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
-        Some(GoalDeclaredStatus::Complete) => GoalTerminalAction::Stop(GoalRuntimeStatus::Complete),
-        // The agent did not declare anything; default to KEEP WORKING unless the
-        // judge is confident the goal is achieved, or reports a hard stop.
-        None => match verdict.decision {
-            GoldDecision::Achieved if verdict.confidence.meets(floor) => {
-                GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
-            }
-            GoldDecision::Blocked => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
-            GoldDecision::NeedInput
-                if verdict.confidence.meets(floor)
-                    && !verdict.missing_information.is_empty()
-                    && verdict.next_action.is_none() =>
-            {
-                GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
-            }
-            GoldDecision::Exhausted => GoalTerminalAction::Stop(GoalRuntimeStatus::BudgetLimited),
-            _ => GoalTerminalAction::Continue,
-        },
+        GoldDecision::Blocked => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
+        GoldDecision::NeedInput
+            if verdict.confidence.meets(floor)
+                && !verdict.missing_information.is_empty()
+                && verdict.next_action.is_none() =>
+        {
+            GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
+        }
+        GoldDecision::Exhausted => GoalTerminalAction::Stop(GoalRuntimeStatus::BudgetLimited),
+        _ => GoalTerminalAction::Continue,
     }
 }
 
@@ -287,9 +258,13 @@ async fn persist_goal_state_and_emit(
     goal_state: GoalState,
     session_id: &str,
     event_tx: &mpsc::Sender<AgentEvent>,
+    continuation_config: Option<&AgentLoopConfig>,
 ) {
     let payload = serde_json::to_value(&goal_state).unwrap_or(serde_json::Value::Null);
     write_goal_state(session, goal_state);
+    if let Some(config) = continuation_config {
+        crate::runtime::goal_restart::arm(session, config).await;
+    }
     let _ = event_tx
         .send(AgentEvent::GoalStatusChanged {
             session_id: session_id.to_string(),
@@ -648,8 +623,7 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
-    /// Minimal provider; the terminal gate short-circuits before calling it in
-    /// the disabled / budget-exhausted paths exercised below.
+    /// Minimal provider with no terminal verdict.
     struct StubProvider;
 
     #[async_trait::async_trait]
@@ -682,10 +656,18 @@ mod tests {
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
-            let arguments = format!(
-                r#"{{"decision":"{}","confidence":"{}","reasoning":"gate test","next_action":"write the report","missing_information":["the report file"]}}"#,
-                self.decision, self.confidence
-            );
+            let mut arguments = serde_json::json!({
+                "decision": self.decision,
+                "confidence": self.confidence,
+                "reasoning": "gate test",
+            });
+            if self.decision != "achieved" {
+                arguments["missing_information"] = serde_json::json!(["the report file"]);
+            }
+            if self.decision == "continue" {
+                arguments["next_action"] = serde_json::json!("write the report");
+            }
+            let arguments = arguments.to_string();
             let call = ToolCall {
                 id: "gold-call-1".to_string(),
                 tool_type: "function".to_string(),
@@ -711,7 +693,10 @@ mod tests {
         provider: Arc<dyn LLMProvider>,
     ) -> GoldTerminalDecision {
         let (tx, _rx) = mpsc::channel(8);
-        evaluate_gold_terminal(session, &None, config, "model", None, "s", 1, provider, &tx).await
+        evaluate_gold_terminal(
+            session, &None, config, "model", None, "s", 1, false, provider, &tx,
+        )
+        .await
     }
 
     fn verdict(decision: GoldDecision, confidence: GoldConfidence) -> GoldEvaluationResult {
@@ -721,8 +706,8 @@ mod tests {
             decision,
             confidence,
             reasoning: "gate test".to_string(),
-            missing_information: vec!["the report file".to_string()],
-            next_action: Some("write the report".to_string()),
+            missing_information: Vec::new(),
+            next_action: None,
             prompt_tokens: 0,
             completion_tokens: 0,
         }
@@ -767,13 +752,18 @@ mod tests {
             None,
             "s",
             1,
+            false,
             provider,
             &tx,
         )
         .await;
         assert!(matches!(decision, GoldTerminalDecision::Stop));
         let state = read_goal_state(&session).unwrap();
-        assert_eq!(state.status, GoalRuntimeStatus::NeedInput);
+        assert_eq!(state.status, GoalRuntimeStatus::Blocked);
+        assert_eq!(
+            state.stop_reason,
+            Some(GoalStopReason::VerificationUnavailable)
+        );
         assert!(
             state.eval_history.is_empty(),
             "a refusal is not a Gold verdict"
@@ -942,128 +932,57 @@ mod tests {
         write_goal_state(session, state);
     }
 
-    // ---- Pure policy (decide_goal_terminal_action) ----
-
     #[test]
-    fn policy_declared_blocked_keeps_working_when_gold_finds_more_work() {
-        let action = decide_goal_terminal_action(
-            Some(GoalDeclaredStatus::Blocked),
-            &verdict(GoldDecision::Continue, GoldConfidence::High),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(action, GoalTerminalAction::Continue);
-    }
-
-    #[test]
-    fn policy_declared_blocked_stops_when_gold_agrees() {
-        let action = decide_goal_terminal_action(
-            Some(GoalDeclaredStatus::Blocked),
-            &verdict(GoldDecision::Blocked, GoldConfidence::High),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(action, GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked));
-    }
-
-    #[test]
-    fn policy_declared_complete_is_vetoed_by_confident_continue() {
-        let action = decide_goal_terminal_action(
-            Some(GoalDeclaredStatus::Complete),
-            &verdict(GoldDecision::Continue, GoldConfidence::High),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(action, GoalTerminalAction::Continue);
-    }
-
-    #[test]
-    fn policy_declared_complete_stops_when_veto_below_floor() {
-        // Judge wants to continue but only at low confidence (< medium floor):
-        // not enough to override the agent's explicit completion.
-        let action = decide_goal_terminal_action(
-            Some(GoalDeclaredStatus::Complete),
-            &verdict(GoldDecision::Continue, GoldConfidence::Low),
-            GoldConfidence::Medium,
-        );
+    fn policy_requires_confident_achievement_without_outstanding_work() {
+        let achieved = verdict(GoldDecision::Achieved, GoldConfidence::High);
         assert_eq!(
-            action,
+            decide_goal_terminal_action(&achieved, GoldConfidence::Medium),
             GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
         );
+        for incomplete in [
+            GoldEvaluationResult {
+                confidence: GoldConfidence::Low,
+                ..achieved.clone()
+            },
+            GoldEvaluationResult {
+                missing_information: vec!["the report file".into()],
+                ..achieved.clone()
+            },
+            GoldEvaluationResult {
+                next_action: Some("read the report".into()),
+                ..achieved
+            },
+            verdict(GoldDecision::Continue, GoldConfidence::Low),
+        ] {
+            assert_eq!(
+                decide_goal_terminal_action(&incomplete, GoldConfidence::Medium),
+                GoalTerminalAction::Continue
+            );
+        }
     }
 
     #[test]
-    fn policy_declared_complete_and_achieved_stops_complete() {
-        let action = decide_goal_terminal_action(
-            Some(GoalDeclaredStatus::Complete),
-            &verdict(GoldDecision::Achieved, GoldConfidence::High),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(
-            action,
-            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
-        );
-    }
-
-    #[test]
-    fn policy_undeclared_continue_keeps_working() {
-        // The Codex-style bias: the agent didn't declare done, so keep going even
-        // on a low-confidence continue.
-        let action = decide_goal_terminal_action(
-            None,
-            &verdict(GoldDecision::Continue, GoldConfidence::Low),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(action, GoalTerminalAction::Continue);
-    }
-
-    #[test]
-    fn policy_undeclared_confident_achieved_stops_complete() {
-        let action = decide_goal_terminal_action(
-            None,
-            &verdict(GoldDecision::Achieved, GoldConfidence::High),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(
-            action,
-            GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
-        );
-    }
-
-    #[test]
-    fn policy_undeclared_low_confidence_achieved_keeps_working() {
-        // Not confident enough to stop without an explicit declaration.
-        let action = decide_goal_terminal_action(
-            None,
-            &verdict(GoldDecision::Achieved, GoldConfidence::Low),
-            GoldConfidence::Medium,
-        );
-        assert_eq!(action, GoalTerminalAction::Continue);
-    }
-
-    #[test]
-    fn policy_undeclared_hard_stops_map_to_statuses() {
-        assert_eq!(
-            decide_goal_terminal_action(
-                None,
-                &verdict(GoldDecision::Blocked, GoldConfidence::Low),
-                GoldConfidence::Medium,
-            ),
-            GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked)
-        );
-        assert_eq!(
-            decide_goal_terminal_action(
-                None,
-                &verdict(GoldDecision::Exhausted, GoldConfidence::Low),
-                GoldConfidence::Medium,
-            ),
-            GoalTerminalAction::Stop(GoalRuntimeStatus::BudgetLimited)
-        );
+    fn policy_hard_stops_map_to_statuses() {
+        for (decision, status) in [
+            (GoldDecision::Blocked, GoalRuntimeStatus::Blocked),
+            (GoldDecision::Exhausted, GoalRuntimeStatus::BudgetLimited),
+        ] {
+            assert_eq!(
+                decide_goal_terminal_action(
+                    &verdict(decision, GoldConfidence::Low),
+                    GoldConfidence::Medium,
+                ),
+                GoalTerminalAction::Stop(status)
+            );
+        }
     }
 
     #[test]
     fn policy_need_input_requires_confidence_specific_input_and_no_next_action() {
         let mut result = verdict(GoldDecision::NeedInput, GoldConfidence::High);
-        result.next_action = None;
+        result.missing_information = vec!["the user-owned source file".into()];
         assert_eq!(
-            decide_goal_terminal_action(None, &result, GoldConfidence::Medium),
+            decide_goal_terminal_action(&result, GoldConfidence::Medium),
             GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
         );
         for result in [
@@ -1081,7 +1000,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                decide_goal_terminal_action(None, &result, GoldConfidence::Medium),
+                decide_goal_terminal_action(&result, GoldConfidence::Medium),
                 GoalTerminalAction::Continue
             );
         }
@@ -1131,22 +1050,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_gate_budget_exhausted_honors_declared_complete() {
-        // Budget at the cap AND the agent explicitly declared complete: no
-        // double-check runs at the budget gate, so honor the declaration
-        // (Complete) rather than mislabeling it BudgetLimited.
-        let mut session = Session::new("s", "model");
-        let config = gold_continue_config();
-        seed_goal_state(
-            &mut session,
-            "ship the feature",
-            Some(GoalDeclaredStatus::Complete),
-            3,
-        );
-        let decision = run_terminal_gate(&mut session, &config, Arc::new(StubProvider)).await;
-        assert!(matches!(decision, GoldTerminalDecision::Stop));
-        let state = read_goal_state(&session).expect("goal state persisted");
-        assert_eq!(state.status, GoalRuntimeStatus::Complete);
+    async fn terminal_gate_verifies_the_last_round_after_the_continuation_budget_is_spent() {
+        for (verdict, status, reason) in [
+            (
+                "continue",
+                GoalRuntimeStatus::BudgetLimited,
+                Some(GoalStopReason::ContinuationBudget),
+            ),
+            ("achieved", GoalRuntimeStatus::Complete, None),
+            ("need_input", GoalRuntimeStatus::NeedInput, None),
+        ] {
+            let mut session = Session::new("s", "model");
+            let config = gold_continue_config();
+            seed_goal_state(
+                &mut session,
+                "ship the feature",
+                Some(GoalDeclaredStatus::Complete),
+                3,
+            );
+            let decision = run_terminal_gate(
+                &mut session,
+                &config,
+                Arc::new(ScriptedGoldProvider {
+                    decision: verdict,
+                    confidence: "high",
+                }),
+            )
+            .await;
+            assert!(matches!(decision, GoldTerminalDecision::Stop));
+            let state = read_goal_state(&session).expect("goal state persisted");
+            assert_eq!(state.status, status);
+            assert_eq!(state.stop_reason, reason);
+            assert_eq!(state.declared_status, None);
+            assert_eq!(state.continuation_count, 3);
+            assert_eq!(state.eval_history.last().unwrap().decision, verdict);
+        }
     }
 
     #[tokio::test]
@@ -1296,6 +1234,7 @@ mod tests {
             None,
             "s",
             1,
+            false,
             Arc::new(ScriptedGoldProvider {
                 decision: "continue",
                 confidence: "high",
@@ -1345,35 +1284,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_gate_eval_failure_does_not_fabricate_complete() {
-        // Agent did NOT declare complete; the double-check errors. The gate must
-        // stop (no infinite loop) but must NOT persist a fabricated `complete` —
-        // it records `need_input` (unverified) instead.
-        let mut session = Session::new("s", "model");
-        let config = gold_continue_config();
-        let decision = run_terminal_gate(&mut session, &config, Arc::new(ErroringProvider)).await;
-        assert!(matches!(decision, GoldTerminalDecision::Stop));
-        let state = read_goal_state(&session).expect("goal state persisted");
-        assert_eq!(state.status, GoalRuntimeStatus::NeedInput);
-        assert_ne!(state.status, GoalRuntimeStatus::Complete);
+    async fn terminal_gate_eval_failure_records_the_blocker_for_any_self_report() {
+        for declared in [
+            None,
+            Some(GoalDeclaredStatus::Complete),
+            Some(GoalDeclaredStatus::Blocked),
+        ] {
+            let mut session = Session::new("s", "model");
+            let config = gold_continue_config();
+            seed_goal_state(&mut session, "ship the feature", declared, 0);
+            let decision =
+                run_terminal_gate(&mut session, &config, Arc::new(ErroringProvider)).await;
+            assert!(matches!(decision, GoldTerminalDecision::Stop));
+            let state = read_goal_state(&session).expect("goal state persisted");
+            assert_eq!(state.status, GoalRuntimeStatus::Blocked);
+            assert_eq!(
+                state.stop_reason,
+                Some(GoalStopReason::VerificationUnavailable)
+            );
+            assert_eq!(state.declared_status, None);
+            assert!(state.eval_history.is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn terminal_gate_eval_failure_honors_declared_complete() {
-        // When the agent explicitly declared complete and the double-check errors,
-        // honor the agent's declaration (no judge available to veto it).
+    async fn terminal_gate_does_not_enqueue_a_continuation_after_a_no_progress_stop() {
         let mut session = Session::new("s", "model");
         let config = gold_continue_config();
-        seed_goal_state(
+        seed_goal_state(&mut session, "ship the feature", None, 2);
+        let (tx, _rx) = mpsc::channel(8);
+        let decision = evaluate_gold_terminal(
             &mut session,
-            "ship the feature",
-            Some(GoalDeclaredStatus::Complete),
-            0,
-        );
-        let decision = run_terminal_gate(&mut session, &config, Arc::new(ErroringProvider)).await;
+            &None,
+            &config,
+            "model",
+            None,
+            "s",
+            3,
+            true,
+            Arc::new(ScriptedGoldProvider {
+                decision: "continue",
+                confidence: "high",
+            }),
+            &tx,
+        )
+        .await;
         assert!(matches!(decision, GoldTerminalDecision::Stop));
         let state = read_goal_state(&session).expect("goal state persisted");
-        assert_eq!(state.status, GoalRuntimeStatus::Complete);
+        assert_eq!(state.status, GoalRuntimeStatus::BudgetLimited);
+        assert_eq!(state.stop_reason, Some(GoalStopReason::NoProgress));
+        assert_eq!(state.continuation_count, 2);
+        assert!(session.messages.is_empty());
     }
 
     #[tokio::test]

@@ -203,6 +203,10 @@ pub struct ProjectManifest {
     /// primary path from `workspace_bindings` ordering or labels.
     #[serde(default)]
     pub project_path_status: ProjectPathStatus,
+    /// Default workspace choice for a user starting a new Project chat in the
+    /// UI. API callers and Supervisor dispatches choose their workspace explicitly.
+    #[serde(default)]
+    pub new_chat_worktree: bool,
     /// Additional registered workspaces/worktrees. `project_path` is itself an
     /// authoritative registered root and is not duplicated in this collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -235,6 +239,7 @@ impl ProjectManifest {
             status: ProjectStatus::Active,
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
+            new_chat_worktree: false,
             workspace_bindings: Vec::new(),
             revision: 1,
             resource_revision: 1,
