@@ -6693,33 +6693,45 @@ mod tests {
             let messages = ir.flatten();
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
             let marker = "Current delegation route observation: ";
-            let latest = messages
+            let mut observations = messages
                 .iter()
-                .rev()
-                .find_map(|message| {
-                    message
-                        .content
-                        .rfind(marker)
-                        .map(|index| &message.content[index + marker.len()..])
-                })
+                .filter_map(|message| message.content.split_once(marker).map(|(_, facts)| facts));
+            let observation = observations
+                .next()
                 .expect("Supervisor request must report current delegation state");
-            let observation = serde_json::Deserializer::from_str(latest)
+            assert!(
+                observations.next().is_none(),
+                "historical route observations must not replay"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message
+                        .content
+                        .contains("Supervisor delegation-first policy"))
+                    .count(),
+                1,
+                "the stable policy appears exactly once across discovery"
+            );
+            let observation = serde_json::Deserializer::from_str(observation)
                 .into_iter::<serde_json::Value>()
                 .next()
                 .unwrap()
                 .unwrap();
-            if count == 0 {
-                assert_eq!(
-                    observation["status"], "discovery_required",
-                    "deferred definitions are not callable yet"
-                );
-            } else {
-                assert_eq!(
-                    observation["status"], "routes_exposed",
-                    "validated discovery must be reflected in the next request"
-                );
-                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
-            }
+            assert_eq!(
+                observation["auxiliary"]["SubAgent"],
+                if count == 0 {
+                    "discoverable"
+                } else {
+                    "callable"
+                },
+                "validated discovery must be reflected in the next request"
+            );
+            assert!(observation["main_execution"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "unavailable"));
             if self.mode == CapabilityLoadingMode::StickyFallback {
                 assert!(tools.iter().any(|schema| schema.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
@@ -6784,7 +6796,7 @@ mod tests {
                         Ok(LLMChunk::ToolCalls(vec![activation_call(
                             "supervisor-delegate",
                             "SubAgent",
-                            r#"{"message":"Implement only the assigned change and return verification evidence."}"#,
+                            r#"{"message":"Review the proposed change and report verification evidence."}"#,
                         )])),
                         Ok(LLMChunk::Done),
                     ]
@@ -6891,7 +6903,7 @@ mod tests {
                     };
                     session.set_root_orchestration_only(ultra).unwrap();
                     session.add_message(Message::user(
-                        "Delegate the scoped implementation and report its admission or blocker.",
+                        "Delegate an auxiliary review and report its admission or blocker.",
                     ));
                     let provider = Arc::new(SupervisorLoadingProvider {
                         mode,
@@ -6940,11 +6952,25 @@ mod tests {
                         !removed.contains_execution_name("SubAgent"),
                         "a saved loading receipt cannot restore a removed tool"
                     );
-                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_supervisor_route_observation(
                         &restored, &[], mode,
                     ).unwrap();
-                    assert!(observation.content.contains("delegation_tools_unavailable"));
-                    assert!(!observation.content.contains("routes_exposed"));
+                    assert!(observation.content.contains("\"SubAgent\":\"unavailable\""));
+                    let ledger = restored.model_context_state.as_ref().unwrap();
+                    assert!(ledger.events.iter().all(|event| !event
+                        .rendered_text
+                        .contains("Current delegation route observation")));
+                    assert_eq!(
+                        ledger
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                event.block_type
+                                    == bamboo_domain::ContextBlockType::RootOrchestration
+                            })
+                            .count(),
+                        1
+                    );
                 }
             }
         }

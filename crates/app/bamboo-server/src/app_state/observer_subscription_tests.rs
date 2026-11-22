@@ -2003,7 +2003,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         panic!("exactly one durable handoff");
     };
     assert!(notice.content.contains(HANDOFF_HEAD), "{}", notice.content);
-    assert!(notice.content.contains("dispatch a bounded reproduction"));
+    assert!(!notice.content.contains("bounded reproduction"));
     assert!(notice.content.contains(HANDOFF_EVIDENCE));
     assert!(notice.content.contains(HANDOFF_RISK));
     assert!(!notice.content.contains('界'));
@@ -2014,9 +2014,21 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     assert!(notice.content.contains(&fact.run_id));
     assert!(notice.content.len() < 1_600);
     assert!(!notice.content.contains(HANDOFF_TAIL));
-    assert!(f.probe.parent_inputs.lock().unwrap()[expected_calls - 1]
-        .iter()
-        .any(|message| message.id == notice.id && message.content == notice.content));
+    {
+        let parent_inputs = f.probe.parent_inputs.lock().unwrap();
+        let delivered = &parent_inputs[expected_calls - 1];
+        assert!(delivered
+            .iter()
+            .any(|message| message.id == notice.id && message.content == notice.content));
+        assert!(delivered.iter().any(|message| {
+            message
+                .content
+                .contains("Supervisor delegation-first policy")
+                && message
+                    .content
+                    .contains("bounded reproduction or missing validation when needed")
+        }));
+    }
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
     if decision.is_some() {
         let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)

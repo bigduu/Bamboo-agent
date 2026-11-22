@@ -227,16 +227,9 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
 
     if session.supervisor_incarnation_id().is_some() {
         let has_project_create = session.allows_model_tool_execution("session_control")
-            && tool_schemas.iter().any(|schema| {
-                schema.function.name == "session_control"
-                    && schema.function.parameters["oneOf"]
-                        .as_array()
-                        .is_some_and(|actions| {
-                            actions
-                                .iter()
-                                .any(|action| action["properties"]["action"]["const"] == "create")
-                        })
-            })
+            && tool_schemas
+                .iter()
+                .any(|schema| offers_session_control_action(schema, "create"))
             && !disabled_tools.iter().any(|reference| {
                 resolve_disabled_tool_reference_name(reference, |name| name == "session_control")
                     .as_deref()
@@ -359,6 +352,17 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     });
 
     catalog
+}
+
+pub(super) fn offers_session_control_action(schema: &ToolSchema, name: &str) -> bool {
+    schema.function.name == "session_control"
+        && schema.function.parameters["oneOf"]
+            .as_array()
+            .is_some_and(|actions| {
+                actions
+                    .iter()
+                    .any(|action| action["properties"]["action"]["const"] == name)
+            })
 }
 
 /// Recognize the dedicated placement route in the filtered model catalog.
