@@ -1992,6 +1992,154 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
 }
 
 #[tokio::test]
+async fn provider_request_jiandu_recall_baseline() {
+    use bamboo_memory::memory_store::{
+        DurableMemoryStatus, DurableMemoryType, MemoryRetrievalInput, MemoryScope, MemoryStore,
+    };
+
+    let (_metrics_root, collector, _storage) = create_runner_metrics().await;
+    let memory_root = tempfile::tempdir().unwrap();
+    let store = MemoryStore::new(memory_root.path());
+    let local = bamboo_domain::ProjectId::parse("coding-recall-orchid").unwrap();
+    let other = bamboo_domain::ProjectId::parse("coding-recall-ember").unwrap();
+    let mut ids = Vec::new();
+    for (project, title, body, keywords) in [
+        (
+            &local,
+            "Bamboo sidecar readiness failure",
+            "BAMBOO_E_INIT means the sidecar did not reach the readiness probe.",
+            vec!["侧车探针", "启动失败"],
+        ),
+        (
+            &local,
+            "Orchid release window",
+            "Previous decision: Friday. ORCHID_FRIDAY_OLD.",
+            vec!["Orchid release window"],
+        ),
+        (
+            &local,
+            "Orchid release window",
+            "Current decision: Thursday morning.",
+            vec!["Orchid release window"],
+        ),
+        (
+            &other,
+            "Orchid release window",
+            "Separate Project's decision: Sunday. EMBER_SUNDAY_PRIVATE.",
+            vec!["Orchid release window"],
+        ),
+    ] {
+        let record = store
+            .for_project(project)
+            .write_memory_with_retrieval(
+                MemoryScope::Project,
+                Some(project.as_str()),
+                DurableMemoryType::Project,
+                title,
+                body,
+                &[],
+                &MemoryRetrievalInput {
+                    keywords: keywords.into_iter().map(str::to_owned).collect(),
+                    entities: vec![],
+                },
+                None,
+                "recall-fixture",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(record.frontmatter.id);
+    }
+    store
+        .for_project(&local)
+        .archive_memory(
+            &ids[1],
+            Some(local.as_str()),
+            DurableMemoryStatus::Superseded,
+            Some("Current decision adopted"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let cases = [
+        ("侧车探针启动失败", Some(ids[0].as_str())),
+        ("Orchid release window", Some(ids[2].as_str())),
+        ("EMBERSUNDAYPRIVATE", None),
+        ("TUNDRA934ZYX", None),
+    ];
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(
+            cases
+                .iter()
+                .map(|_| {
+                    vec![
+                        Ok(provider_usage(11, 2)),
+                        Ok(LLMChunk::Token("fixture reply".into())),
+                        Ok(LLMChunk::Done),
+                    ]
+                })
+                .collect(),
+        ),
+        requested_messages: Mutex::new(Vec::new()),
+    });
+    for (index, (query, _)) in cases.iter().enumerate() {
+        let mut session = Session::new(format!("coding-recall-{index}"), "test-model");
+        session.set_project_id_meta(local.to_string());
+        let mut config = runner_metrics_config(&collector);
+        config.memory_store = store.clone();
+        config.prompt_memory_flags.relevant_recall = true;
+        config.prompt_memory_flags.project_prompt_injection = true;
+        let (events, _receiver) = mpsc::channel(64);
+        super::run_agent_loop_with_config(
+            &mut session,
+            (*query).to_owned(),
+            events,
+            provider.clone(),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap();
+    }
+    let requests = provider.requested_messages.lock().await;
+    assert_eq!(requests.len(), cases.len());
+    for (messages, (query, expected)) in requests.iter().zip(cases) {
+        let text = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains(&ids[1]),
+            "{query}: superseded record entered the request"
+        );
+        assert!(
+            !text.contains(&ids[3]),
+            "{query}: another Project's record entered the request"
+        );
+        assert!(!text.contains("ORCHID_FRIDAY_OLD"));
+        assert!(!text.contains("EMBER_SUNDAY_PRIVATE"));
+        if let Some(expected) = expected {
+            let recall = text
+                .split_once("### Relevant Durable Memories")
+                .unwrap_or_else(|| panic!("no recall block for {query}"))
+                .1;
+            assert!(
+                recall.contains(&format!("action=get id={expected}")),
+                "{query}: expected evidence missing"
+            );
+        } else {
+            assert!(
+                !text.contains("### Relevant Durable Memories"),
+                "{query}: unmatched query received recall candidates"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn provider_bootstrap_persists_exact_project_ids_and_redacts_global_ids() {
     let session_id = "metrics-prompt-memory-exposure";
     let (_directory, collector, storage) = create_runner_metrics().await;
