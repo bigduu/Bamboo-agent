@@ -143,6 +143,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::codex_handoff::configure)
                 .configure(agent::tickets::patrol::configure)
                 .configure(agent::tickets::ready_policy::configure)
                 .configure(agent::tickets::sprints::configure)

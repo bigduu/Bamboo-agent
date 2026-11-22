@@ -52,6 +52,208 @@ impl LLMProvider for NoModelProvider {
 const FIRST: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
 const SECOND: &str = "section:28f595c0-21dc-4a86-8b83-5f8b258386fa";
 
+#[actix_web::test]
+async fn codex_work_handoff_requires_local_owner_and_one_explicit_claim() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = Arc::new(NoModelProvider::default());
+    let mut config: bamboo_llm::Config = serde_json::from_value(json!({
+        "provider":"openai", "features":{"ticket_mutation":true},
+        "providers":{"openai":{"api_key":"unused-local-fixture","model":"fixture-model"}}
+    }))
+    .unwrap();
+    config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
+    let state = web::Data::new(
+        AppState::new_with_provider_and_memory_store(
+            root.path().join("host"),
+            config,
+            provider.clone(),
+            MemoryStore::new(root.path().join("jiandu")),
+        )
+        .await
+        .unwrap(),
+    );
+    let (service, owner) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let project = state
+        .project_store
+        .create("Codex Work handoff", None)
+        .unwrap();
+    let other = state.project_store.create("Other", None).unwrap();
+    let workspace = root.path().join("work tree");
+    std::fs::create_dir(&workspace).unwrap();
+    let cwd = bamboo_projects::canonicalize_workspace_path(&workspace).unwrap();
+    let project = state
+        .project_store
+        .bind_workspace(
+            &project.id,
+            project.revision,
+            WorkspaceBinding {
+                path: cwd.clone(),
+                label: None,
+                git_common_dir: None,
+            },
+        )
+        .unwrap();
+    let contract = Contract {
+        title: "Continue fixture Work".into(),
+        objective: "Verify the revised release window.".into(),
+        constraints: vec!["Use the selected worktree".into()],
+        acceptance: vec!["Record a verified source".into()],
+        user_acceptance_required: true,
+        allowed_tools: BTreeSet::from(["Task".into()]),
+    };
+    let create = service
+        .prepare_command(
+            &owner,
+            "codex-fixture",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "work".into(),
+                    project_id: project.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    let work_id = state
+        .tickets
+        .update(owner.principal().clone(), &create)
+        .await
+        .unwrap()
+        .ids["work"]
+        .clone();
+    let context = ProjectContextSnapshot {
+        project_id: project.id.clone(),
+        project_revision: project.revision,
+        resource_revision: project.resource_revision,
+        workspace_binding: project.workspace_bindings[0].clone(),
+        contract_revision: service.published().unwrap().1.tickets[&work_id].contract_revision,
+        contract,
+        sources: BTreeMap::new(),
+    };
+    let binding = service
+        .prepare_command(
+            &owner,
+            "codex-context",
+            vec![Operation::SetProjectContext {
+                work_id: work_id.clone(),
+                context,
+            }],
+        )
+        .unwrap();
+    state
+        .tickets
+        .update(owner.principal().clone(), &binding)
+        .await
+        .unwrap();
+    let (commit, snapshot) = service.published().unwrap();
+    let work = &snapshot.tickets[&work_id];
+    let mut selector = json!({"project_id":project.id, "work_id":work_id, "record_revision":work.record_revision,
+        "authority_epoch":snapshot.authority_epoch, "generation":work.generation});
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let post = |path: &str, body: &Value, peer: &str, origin: &str| {
+        test::TestRequest::post()
+            .uri(path)
+            .peer_addr(peer.parse().unwrap())
+            .insert_header((header::HOST, "127.0.0.1:8542"))
+            .insert_header((header::ORIGIN, origin))
+            .set_json(body)
+            .to_request()
+    };
+    let prepare = "/api/v1/tickets/codex-handoff";
+    let claim = "/api/v1/tickets/codex-handoff/claim";
+    let peer = "127.0.0.1:5700";
+    let origin = "http://127.0.0.1:8542";
+    let response =
+        test::call_service(&app, post(prepare, &selector, "203.0.113.9:5700", origin)).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = test::call_service(
+        &app,
+        post(prepare, &selector, peer, "https://unrelated.example"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    selector["project_id"] = json!(other.id);
+    let response = test::call_service(&app, post(prepare, &selector, peer, origin)).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    selector["project_id"] = json!(project.id);
+    selector["record_revision"] = json!(work.record_revision + 1);
+    let response = test::call_service(&app, post(prepare, &selector, peer, origin)).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    selector["record_revision"] = json!(work.record_revision);
+    let response = test::call_service(&app, post(prepare, &selector, peer, origin)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let offered: Value = test::read_body_json(response).await;
+    assert_eq!(offered["cwd"], cwd);
+    assert_eq!(offered.as_object().unwrap().len(), 2);
+    let unrelated = json!({"offer_id":uuid::Uuid::new_v4()});
+    let response = test::call_service(&app, post(claim, &unrelated, peer, origin)).await;
+    assert_eq!(response.status(), StatusCode::LOCKED);
+    let claim_args = json!({"offer_id":offered["offer_id"]});
+    let response =
+        test::call_service(&app, post(claim, &claim_args, "203.0.113.9:5700", origin)).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}{claim}", listener.local_addr().unwrap());
+    let server = actix_web::HttpServer::new(move || {
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes)
+    })
+    .workers(1)
+    .listen(listener)
+    .unwrap()
+    .run();
+    let server_handle = server.handle();
+    let server_task = actix_web::rt::spawn(server);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let (first, second) = futures::join!(
+        client.post(&url).json(&claim_args).send(),
+        client.post(&url).json(&claim_args).send(),
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    let prompt = match (first.status().as_u16(), second.status().as_u16()) {
+        (200, 423) => first.text().await.unwrap(),
+        (423, 200) => second.text().await.unwrap(),
+        statuses => panic!("expected a single successful claim, got {statuses:?}"),
+    };
+    server_handle.stop(false).await;
+    server_task.await.unwrap().unwrap();
+    assert!(prompt.contains(&work_id));
+    assert!(prompt.contains("Verify the revised release window."));
+    assert!(prompt.contains("Record a verified source"));
+    assert!(prompt.contains("Next:"));
+    assert_eq!(service.published().unwrap().0, commit);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
 async fn section_memory_fixture() -> (tempfile::TempDir, web::Data<AppState>, Arc<NoModelProvider>)
 {
     let temp = tempfile::tempdir().unwrap();
