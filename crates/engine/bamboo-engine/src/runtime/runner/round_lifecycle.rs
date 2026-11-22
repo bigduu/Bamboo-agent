@@ -14,7 +14,7 @@ use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity, ProviderFamily,
     ProviderProtocol, ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
-    SessionKind,
+    ReasoningEffort, SessionKind,
 };
 use bamboo_llm::provider::{
     OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
@@ -40,6 +40,72 @@ pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
 #[cfg(test)]
 pub(in crate::runtime::runner) use stream_execution::effective_tool_schemas;
 pub(in crate::runtime::runner) use stream_execution::required_tool_for_session;
+
+/// Select the highest tier for a known provider/model. Alias routes retain the
+/// canonical Max request unless their adapter prescribes a lower wire ceiling.
+fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<ReasoningEffort> {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    let belongs_to = |family: &str| {
+        model == family
+            || model
+                .strip_prefix(family)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    // These routes have no named reasoning tier in their native request.
+    if ["gpt-4.1", "gpt-4o", "gpt-3.5-turbo", "gemini-2.5"]
+        .iter()
+        .any(|family| belongs_to(family))
+    {
+        return None;
+    }
+    if provider_type == Some("gemini") || belongs_to("gemini-3") {
+        return Some(ReasoningEffort::High);
+    }
+    if [
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.1-codex-max",
+    ]
+    .iter()
+    .any(|family| belongs_to(family))
+    {
+        return Some(ReasoningEffort::Xhigh);
+    }
+    if ["o1", "o3", "o4-mini", "gpt-5.1", "gpt-5", "claude-opus-4-5"]
+        .iter()
+        .any(|family| belongs_to(family))
+    {
+        return Some(ReasoningEffort::High);
+    }
+    Some(ReasoningEffort::Max)
+}
+
+#[cfg(test)]
+#[test]
+fn ultra_effort_uses_the_selected_routes_named_ceiling() {
+    for (provider, model, expected) in [
+        ("openai", "gpt-6.2-sol", Some(ReasoningEffort::Max)),
+        ("openai", "gpt-5.5-2026-04-23", Some(ReasoningEffort::Xhigh)),
+        ("openai", "o3", Some(ReasoningEffort::High)),
+        ("openai", "gpt-4.1-mini", None),
+        (
+            "gemini",
+            "models/gemini-3.1-pro",
+            Some(ReasoningEffort::High),
+        ),
+        ("gemini", "models/gemini-2.5-flash", None),
+        ("anthropic", "claude-sonnet-4-6", Some(ReasoningEffort::Max)),
+        ("openai", "local-alias", Some(ReasoningEffort::Max)),
+    ] {
+        assert_eq!(
+            ultra_reasoning_effort(Some(provider), model),
+            expected,
+            "{model}"
+        );
+    }
+}
 
 pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
     items: &[bamboo_domain::ProviderTranscriptItem],
@@ -403,7 +469,11 @@ pub(crate) async fn execute_llm_round(
         model,
         provider_name: config.provider_name.as_deref(),
         provider_type: config.provider_type.as_deref(),
-        reasoning_effort: config.reasoning_effort,
+        reasoning_effort: if session.root_orchestration_only_enabled() {
+            ultra_reasoning_effort(config.provider_type.as_deref(), model)
+        } else {
+            config.reasoning_effort
+        },
         output_limit_recovery,
         budget: &prepared.budget,
         provider_default_output: prepared.provider_default_output,

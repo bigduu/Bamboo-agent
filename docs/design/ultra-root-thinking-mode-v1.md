@@ -1,10 +1,17 @@
 # Ultra Root thinking mode
 
-Ultra is an independent Root product policy. It increases task-wide reasoning
-through parallel delegation of independent work, Root verification and
-synthesis. An ordinary Ultra Root can also write and edit files with its
-normal workspace and permission checks. Each model call retains its separately resolved ordinary reasoning
-effort. Ultra is not an alias for Max or a claimed provider-native budget.
+Ultra combines the primary model's highest reasoning effort with active
+parallel SubAgent delegation. The Root looks for useful independent work,
+dispatches as capacity permits, advances its own ready work, and verifies the
+results. An ordinary Ultra Root can also write and edit under its workspace
+and permission checks. Other reasoning selections use their chosen level
+and delegate when the task benefits.
+
+At primary request dispatch Bamboo uses the highest supported native tier
+for known limits, such as `xhigh` on GPT-5.4 and `high` on Gemini. On routes
+without a known lower ceiling it requests `max`. Provider validation and
+explicit request overrides apply normally. The saved standard effort remains
+available when the user switches to Standard.
 
 ## Authority and wire contract
 
@@ -41,10 +48,9 @@ It observes an actual worker provider request while the Root durably waits,
 then permits the child to finish and observes Root resume/synthesis. It also
 checks that an authorized Root can create and edit a file through real dispatch.
 
-Root ordinary High is explicit. The planner uses an independent model and its
-own ordinary provider default (no effort override); it receives neither Root
-High nor product Ultra. This does not prove explicit child effort overrides
-reach the worker: that pre-existing propagation gap is tracked in #1346.
+The fixture saves High as the ordinary Root setting and checks Max on
+the actual Ultra Root requests. The planner uses its own model and effort
+configuration.
 
 Ultra guidance reuses existing tools; it does not enforce a persistent N-agent,
 Plan or Review stage gate for every task. Required user goals, constraints and
