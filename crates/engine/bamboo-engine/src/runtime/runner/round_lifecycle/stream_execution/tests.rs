@@ -3782,6 +3782,29 @@ fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
             .count(),
         1
     );
+    let anthropic = bamboo_llm::providers::anthropic::build_anthropic_request_with_cache(
+        &wire,
+        &[],
+        "test-model",
+        128,
+        false,
+        None,
+        None,
+        Some(&refreshed.ir.cache),
+    );
+    let user = anthropic["messages"].as_array().unwrap().last().unwrap();
+    let blocks = user["content"].as_array().unwrap();
+    let last = blocks.last().unwrap();
+    assert!(last["text"]
+        .as_str()
+        .unwrap()
+        .contains("Current delegation route observation: "));
+    assert!(last.get("cache_control").is_none());
+    let newest = blocks
+        .iter()
+        .find(|block| block["text"] == "Check its progress.")
+        .unwrap();
+    assert_eq!(newest["cache_control"]["type"], "ephemeral");
     let repeated = super::build_request_envelope_reconciled(
         &mut restored,
         &prepared,
