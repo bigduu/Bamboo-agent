@@ -276,11 +276,7 @@ impl MemoryStore {
         let scope = MemoryScope::Project;
         let key = Some(project_key);
         let Some(index) = self.store.read_lexical_index(scope, key).await? else {
-            let mut documents = self.store.list_memory_documents(scope, key).await?;
-            documents.retain(|doc| matches!(doc.frontmatter.status, Active | Stale));
-            return Ok((!documents.is_empty()).then(|| {
-                jiandu_memory::memory_store::build_memory_markdown_view(scope, key, &documents)
-            }));
+            return Ok(None);
         };
         let mut items = index
             .items
@@ -854,6 +850,36 @@ pub async fn shortlist_relevant_memories(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn prompt_index_without_lexical_index_excludes_misplaced_topic() {
+        let directory = tempdir().unwrap();
+        let store = MemoryStore::new(directory.path());
+        let local = bamboo_domain::ProjectId::parse("local-prompt-index-fixture").unwrap();
+        let foreign = bamboo_domain::ProjectId::parse("foreign-prompt-index-fixture").unwrap();
+        let document = write_durable(
+            &store.for_project(&foreign),
+            MemoryScope::Project,
+            Some(foreign.as_str()),
+            "Foreign decision",
+            "FOREIGN_PROJECT_MUST_NOT_REACH_PROMPT",
+        )
+        .await;
+        let local = store.for_project(&local);
+        let key = Some("local-prompt-index-fixture");
+        let misplaced = local
+            .store
+            .resolver()
+            .topic_path(MemoryScope::Project, key, &document.frontmatter.id)
+            .unwrap();
+        std::fs::create_dir_all(misplaced.parent().unwrap()).unwrap();
+        std::fs::copy(document.path, misplaced).unwrap();
+        assert!(local
+            .read_project_prompt_index(key.unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     async fn write_durable(
         store: &MemoryStore,
