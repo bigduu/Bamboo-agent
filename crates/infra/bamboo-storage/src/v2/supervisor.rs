@@ -162,7 +162,7 @@ async fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     if !metadata.file_type().is_file() {
         return Err(invalid("canonical authority is not a regular file"));
     }
-    fs::read(path).await
+    cold_main::read_state_file(path).await
 }
 
 // The strict generic authority port retains the legacy main-pair check for

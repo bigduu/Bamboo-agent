@@ -563,7 +563,7 @@ impl SessionStoreV2 {
                 {
                     return Err(conflict("legacy Root canonical pair is incomplete"));
                 }
-                let main_bytes = fs::read(main_path).await?;
+                let main_bytes = cold_main::read(main_path).await?;
                 let side_bytes = fs::read(side_path).await?;
                 compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
@@ -837,7 +837,7 @@ impl SessionStoreV2 {
             // A full save already serializes the transcript and must not
             // replace damaged or stale canonical history from a caller's
             // snapshot. Only runtime-only paths skip this large read.
-            let bytes = fs::read(directory.join("session.json"))
+            let bytes = cold_main::read(directory.join("session.json"))
                 .await
                 .map_err(|error| conflict(format!("canonical main file: {error}")))?;
             compact_main::validate_full_main(&bytes)

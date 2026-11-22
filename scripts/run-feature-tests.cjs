@@ -220,10 +220,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2922 changes the existing feature-sensitive SubAgent adapter. Exec wait
 // cases use the default Agent, Engine and Server owners; nested creation stays
 // in default server-other. The additive contexts and case names are unchanged.
+// Session archive regressions use default Storage and server-handlers.
+// The capacity-bound HFS+ acceptance is explicitly selected on macOS.
 // #2929 changes the feature-sensitive prompt runner. The clock checks remain
 // in the default headless cases and the prompt and Skill tests retain their
 // existing owners. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "a5696d127f1a8fae9fc7d547f8a179b06658c60e9eb551cdef1e402c402e2348";
+const FEATURE_SOURCE_SHA256 = "9234e24cef91cc16e1027ceca92b93c7c624e30c5f900695f9a66ee3733b466a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

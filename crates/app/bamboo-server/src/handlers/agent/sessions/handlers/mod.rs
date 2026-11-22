@@ -1,8 +1,11 @@
+mod archive;
 mod attachments;
 mod compact;
 mod crud;
 mod maintenance;
 
+pub(crate) use archive::spawn_automatic_session_archive;
+pub use archive::{archive_session, preview_session_archives, restore_session_archive};
 pub use attachments::get_attachment;
 pub use compact::{compact_session, get_session_compaction};
 pub use crud::{
