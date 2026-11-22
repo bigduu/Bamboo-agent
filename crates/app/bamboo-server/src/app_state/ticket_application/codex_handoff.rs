@@ -344,6 +344,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn codex_handoff_cannot_consume_an_offer_that_expires_after_validation() {
+        let offers = Offers::default();
+        let selector = WorkSelector {
+            project_id: ProjectId::parse("project-fixture").unwrap(),
+            work_id: "work-fixture".to_owned(),
+            generation: 1,
+            record_revision: 1,
+            authority_epoch: 1,
+        };
+        let id = offers
+            .create(selector, "scope-fixture".to_owned(), "/work".to_owned())
+            .unwrap()
+            .offer_id;
+        assert!(offers.pending(id).is_ok());
+        offers.0.lock().get_mut(&id).unwrap().expires_at = Instant::now();
+        assert!(matches!(offers.consume(id), Err(Error::ResourceBlocked(_))));
+        assert!(matches!(offers.pending(id), Err(Error::ResourceBlocked(_))));
+    }
+
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
             .args([
