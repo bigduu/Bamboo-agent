@@ -312,8 +312,8 @@ pub struct HistoryToolCall {
 /// One entry in `GET /api/v1/history/{session_id}`'s `messages` array — a
 /// lenient subset of the server's `Message`
 /// (`bamboo-domain::session::types::Message`). Only the fields
-/// `history::map_history` needs are modeled; everything else (content_parts,
-/// image_ocr, phase, compression fields) is ignored on decode rather than
+/// `history::map_history` needs are modeled; everything else (image_ocr, phase,
+/// compression fields) is ignored on decode rather than
 /// breaking deserialization. Metadata is retained leniently because some
 /// servers persist structured child-session summaries there.
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -325,6 +325,8 @@ pub struct HistoryMessage {
     pub role: String,
     #[serde(default)]
     pub content: String,
+    #[serde(default)]
+    pub content_parts: Option<serde_json::Value>,
     #[serde(default)]
     pub reasoning: Option<String>,
     #[serde(default)]

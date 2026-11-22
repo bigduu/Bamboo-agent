@@ -19,6 +19,11 @@ change the reasoning level for supported models, then press Enter to apply the
 execution profile. Use **Switch session** in the header or `Ctrl+P` to search
 sessions. Click a row or press Enter to open the selection.
 
+On macOS, press `Ctrl+V` in the composer to paste a screenshot from the
+system clipboard. `Cmd+V` also works when your terminal forwards that key
+to Bamboo. Click `×` on the screenshot to remove it. Enter sends the draft
+with its image attachments, including an image-only draft.
+
 Markdown tables in assistant replies take shape as the header separator arrives.
 Column alignment follows the separator, and long cells wrap to fit the terminal.
 

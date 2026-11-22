@@ -29,6 +29,10 @@ pub enum AnswerSubmissionOutcome {
 pub enum AppEvent {
     Key(KeyEvent),
     Paste(String),
+    ClipboardRead {
+        context_id: u64,
+        result: Loaded<crate::clipboard::ClipboardContents>,
+    },
     Mouse(MouseEvent),
     WorkspaceAction(crate::ui::workspace::WorkspaceAction),
     /// Terminal resized; the next loop iteration redraws at the new size (the

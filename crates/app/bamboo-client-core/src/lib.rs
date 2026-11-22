@@ -55,6 +55,8 @@ impl ReasoningEffort {
 #[derive(Serialize, Clone, Debug)]
 pub struct ChatRequest {
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ChatImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +89,27 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+/// An image attachment accepted by the chat endpoint used by the web composer.
+#[derive(Serialize, Clone)]
+pub struct ChatImage {
+    pub base64: String,
+    pub name: String,
+    pub size: usize,
+    #[serde(rename = "type")]
+    pub mime_type: String,
+}
+
+impl std::fmt::Debug for ChatImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatImage")
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("mime_type", &self.mime_type)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct ChatResponse {
     #[serde(default)]
@@ -110,6 +133,7 @@ mod chat_request_tests {
             in_reply_to: None,
             correlation_id: None,
             message: "hello".to_string(),
+            images: Vec::new(),
             session_id: None,
             project_id: Some("project-client".to_string()),
             workspace_path: None,
@@ -122,6 +146,7 @@ mod chat_request_tests {
         assert_eq!(value["provider"], "openai");
         assert_eq!(value["reasoning_effort"], "high");
         assert!(value.get("session_id").is_none());
+        assert!(value.get("images").is_none());
     }
 }
 

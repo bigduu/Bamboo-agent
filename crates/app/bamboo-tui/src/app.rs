@@ -23,6 +23,7 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
+use crate::clipboard::{self, ClipboardContents, ClipboardImage};
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::file_reference::{pasted_files, FileReference};
@@ -978,6 +979,7 @@ pub struct ChatMessage {
     pub id: String,
     pub role: MessageRole,
     pub content: String,
+    pub image_count: usize,
     pub tool_calls: Vec<ToolCallDisplay>,
     pub reasoning: Option<String>,
     pub sub_agents: Vec<SubAgentDisplay>,
@@ -1022,7 +1024,10 @@ pub struct ConversationBlock<'a> {
 
 #[derive(Debug)]
 pub enum ConversationBlockKind<'a> {
-    UserMessage(&'a str),
+    UserMessage {
+        content: &'a str,
+        image_count: usize,
+    },
     AssistantMarkdown {
         content: &'a str,
         streaming: bool,
@@ -1059,7 +1064,7 @@ impl ConversationBlock<'_> {
 
     fn copy_text(&self) -> String {
         match &self.kind {
-            ConversationBlockKind::UserMessage(content)
+            ConversationBlockKind::UserMessage { content, .. }
             | ConversationBlockKind::TerminalStatus(content) => (*content).to_string(),
             ConversationBlockKind::AssistantMarkdown { content, .. }
             | ConversationBlockKind::Reasoning { content, .. } => (*content).to_string(),
@@ -1155,6 +1160,35 @@ struct FileChangeCacheEntry {
     view: Option<Arc<crate::file_change::FileChangeView>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ComposerAttachment {
+    File(FileReference),
+    Image(Arc<ClipboardImage>),
+}
+
+impl PartialEq for ComposerAttachment {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(left), Self::File(right)) => left == right,
+            // A fresh paste is a distinct draft attachment, even when its
+            // pixels match an image currently being submitted.
+            (Self::Image(left), Self::Image(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ComposerAttachment {}
+
+impl ComposerAttachment {
+    fn image(&self) -> Option<&Arc<ClipboardImage>> {
+        match self {
+            Self::Image(image) => Some(image),
+            Self::File(_) => None,
+        }
+    }
+}
+
 pub struct ChatState {
     /// Stable UI identity for this conversation view. A newly-authored chat
     /// does not have a server session id until the first `/chat` request
@@ -1171,7 +1205,12 @@ pub struct ChatState {
     pub project_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
-    pub(crate) composer_files: Vec<FileReference>,
+    pub(crate) composer_attachments: Vec<ComposerAttachment>,
+    reading_clipboard: bool,
+    pending_image_composer: Option<(String, ComposerSnapshot)>,
+    pub(crate) attachment_remove_buttons:
+        RefCell<Vec<(ratatui::layout::Rect, Arc<ClipboardImage>)>>,
+    pressed_attachment_remove: Option<Arc<ClipboardImage>>,
     pending_loop_composer: Option<ComposerSnapshot>,
     loop_watch: Option<LoopWatch>,
     loop_discovery_token: Option<String>,
@@ -1300,7 +1339,7 @@ pub struct ChatState {
 
 impl ChatState {
     pub(crate) fn has_composer_draft(&self) -> bool {
-        !self.composer_files.is_empty()
+        !self.composer_attachments.is_empty()
             || self
                 .textarea
                 .lines()
@@ -1320,7 +1359,11 @@ impl ChatState {
             project_id: None,
             messages: Vec::new(),
             textarea,
-            composer_files: Vec::new(),
+            composer_attachments: Vec::new(),
+            reading_clipboard: false,
+            pending_image_composer: None,
+            attachment_remove_buttons: RefCell::new(Vec::new()),
+            pressed_attachment_remove: None,
             pending_loop_composer: None,
             loop_watch: None,
             loop_discovery_token: None,
@@ -4177,7 +4220,7 @@ impl CommandPaletteEntry {
 pub struct ComposerSnapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
-    files: Vec<FileReference>,
+    attachments: Vec<ComposerAttachment>,
 }
 
 impl ComposerSnapshot {
@@ -4185,14 +4228,14 @@ impl ComposerSnapshot {
         Self {
             lines: chat.textarea.lines().to_vec(),
             cursor: chat.textarea.cursor(),
-            files: chat.composer_files.clone(),
+            attachments: chat.composer_attachments.clone(),
         }
     }
 
     fn still_matches(&self, chat: &ChatState) -> bool {
         self.lines == chat.textarea.lines()
             && self.cursor == chat.textarea.cursor()
-            && self.files == chat.composer_files
+            && self.attachments == chat.composer_attachments
     }
 }
 
@@ -4895,6 +4938,8 @@ pub struct App {
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
+    #[cfg(all(test, target_os = "macos"))]
+    next_clipboard_contents: Option<ClipboardContents>,
     sse_tx: Option<mpsc::Sender<SessionSseEvent>>,
     sse_rx: Option<mpsc::Receiver<SessionSseEvent>>,
     sse_task: Option<tokio::task::JoinHandle<()>>,
@@ -5081,6 +5126,8 @@ impl App {
             command_palette_task: None,
             recent_models: VecDeque::new(),
             event_tx: None,
+            #[cfg(all(test, target_os = "macos"))]
+            next_clipboard_contents: None,
             sse_tx: None,
             sse_rx: None,
             sse_task: None,
@@ -5254,6 +5301,7 @@ impl App {
     fn prepare_visible_session_switch(&mut self) {
         self.terminal_settings = None;
         self.chat.pressed_block = None;
+        self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
         if self.session_picker.is_some() {
             self.pending_delete = None;
@@ -6245,7 +6293,8 @@ impl App {
     fn event_context_target(&self, event: &AppEvent) -> Option<Option<u64>> {
         let session_target = |session_id: &str| self.context_id_for_session(session_id);
         match event {
-            AppEvent::ChatStarted { context_id, .. }
+            AppEvent::ClipboardRead { context_id, .. }
+            | AppEvent::ChatStarted { context_id, .. }
             | AppEvent::LoopChatFinished { context_id, .. }
             | AppEvent::SessionLoopDiscovered { context_id, .. }
             | AppEvent::SessionLoopObserved { context_id, .. } => Some(Some(*context_id)),
@@ -6282,7 +6331,9 @@ impl App {
                     .or_else(|| Some(format!("@local:{}", self.chat.context_id)));
                 let mark_unread = !matches!(
                     &event,
-                    AppEvent::SessionLoopDiscovered { .. } | AppEvent::SessionLoopObserved { .. }
+                    AppEvent::ClipboardRead { .. }
+                        | AppEvent::SessionLoopDiscovered { .. }
+                        | AppEvent::SessionLoopObserved { .. }
                 );
                 let result = self.handle_event_current(event).await;
                 if mark_unread {
@@ -6335,7 +6386,13 @@ impl App {
 
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
-            AppEvent::Paste(text) => self.handle_composer_paste(&text),
+            AppEvent::Paste(text) => {
+                if self.chat_composer_focused() {
+                    self.pending_key_sequence = None;
+                    self.insert_composer_text(&text);
+                }
+            }
+            AppEvent::ClipboardRead { result, .. } => self.finish_clipboard_paste(result),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::WorkspaceAction(action) => self.handle_workspace_action(action),
             AppEvent::SessionsLoaded {
@@ -6949,6 +7006,7 @@ impl App {
                 turn_id,
                 result: r,
             } => {
+                self.finish_image_submission(&turn_id, r.is_ok());
                 if !self.chat.streaming
                     || self.chat.current_turn_id.as_deref() != Some(turn_id.as_str())
                     || self.chat.stop_requested_turn_id.as_deref() == Some(turn_id.as_str())
@@ -7018,7 +7076,7 @@ impl App {
                             if submitted.still_matches(&self.chat) {
                                 self.clear_chat_composer();
                             }
-                            let turn_id = self.begin_chat_turn(message);
+                            let turn_id = self.begin_chat_turn(message, 0);
                             self.accept_chat_start(reply.response.session_id, turn_id);
                         }
                     }
@@ -8358,6 +8416,11 @@ impl App {
         if self.chat.pressed_block.is_some() && !self.workspace_controls_enabled() {
             self.chat.pressed_block = None;
         }
+        if self.chat.pressed_attachment_remove.is_some()
+            && (self.tab != Tab::Chat || !self.workspace_controls_enabled())
+        {
+            self.chat.pressed_attachment_remove = None;
+        }
         if self.notifications_visible {
             let max = self.notification_max_scroll.get();
             match mouse.kind {
@@ -8665,10 +8728,29 @@ impl App {
         if self.tab == Tab::Chat && self.workspace_controls_enabled() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    self.chat.pressed_block = self.transcript_block_at(mouse.column, mouse.row);
+                    self.chat.pressed_attachment_remove =
+                        self.attachment_remove_at(mouse.column, mouse.row);
+                    self.chat.pressed_block = if self.chat.pressed_attachment_remove.is_none() {
+                        self.transcript_block_at(mouse.column, mouse.row)
+                    } else {
+                        None
+                    };
                     return;
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(pressed) = self.chat.pressed_attachment_remove.take() {
+                        if self
+                            .attachment_remove_at(mouse.column, mouse.row)
+                            .is_some_and(|image| Arc::ptr_eq(&image, &pressed))
+                        {
+                            self.chat.composer_attachments.retain(|attachment| {
+                                attachment
+                                    .image()
+                                    .is_none_or(|image| !Arc::ptr_eq(image, &pressed))
+                            });
+                        }
+                        return;
+                    }
                     if let Some(pressed) = self.chat.pressed_block.take() {
                         if self.transcript_block_at(mouse.column, mouse.row).as_ref()
                             == Some(&pressed)
@@ -8678,7 +8760,10 @@ impl App {
                     }
                     return;
                 }
-                MouseEventKind::Drag(_) => self.chat.pressed_block = None,
+                MouseEventKind::Drag(_) => {
+                    self.chat.pressed_block = None;
+                    self.chat.pressed_attachment_remove = None;
+                }
                 _ => {}
             }
         }
@@ -8725,6 +8810,16 @@ impl App {
                     scroll_selection(self.skills.selected, self.skills.skills.len(), delta);
             }
         }
+    }
+
+    fn attachment_remove_at(&self, column: u16, row: u16) -> Option<Arc<ClipboardImage>> {
+        let position = ratatui::layout::Position::new(column, row);
+        self.chat
+            .attachment_remove_buttons
+            .borrow()
+            .iter()
+            .find(|(area, _)| area.contains(position))
+            .map(|(_, image)| Arc::clone(image))
     }
 
     fn transcript_block_at(&self, column: u16, row: u16) -> Option<String> {
@@ -11256,14 +11351,76 @@ impl App {
         }
     }
 
-    fn handle_composer_paste(&mut self, text: &str) {
-        if !self.chat_composer_focused() || text.is_empty() {
+    fn start_clipboard_paste(&mut self) {
+        if !self.chat_composer_focused() || self.chat.reading_clipboard {
             return;
         }
-        self.pending_key_sequence = None;
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let context_id = self.chat.context_id;
+        self.chat.reading_clipboard = true;
+        self.status_message = "Reading clipboard…".to_string();
+        #[cfg(all(test, target_os = "macos"))]
+        if let Some(contents) = self.next_clipboard_contents.take() {
+            let _ = tx.send(AppEvent::ClipboardRead {
+                context_id,
+                result: Ok(contents),
+            });
+            return;
+        }
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(clipboard::read)
+                .await
+                .map_err(|error| format!("Clipboard read ended unexpectedly: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = tx.send(AppEvent::ClipboardRead { context_id, result });
+        });
+    }
+
+    fn finish_clipboard_paste(&mut self, result: Result<ClipboardContents, String>) {
+        self.chat.reading_clipboard = false;
+        match result {
+            Ok(ClipboardContents {
+                image: Some(image), ..
+            }) => {
+                let total_bytes = self
+                    .chat
+                    .composer_attachments
+                    .iter()
+                    .filter_map(ComposerAttachment::image)
+                    .map(|image| image.size())
+                    .sum::<usize>();
+                if total_bytes + image.size() > clipboard::MAX_IMAGE_BYTES {
+                    self.status_message =
+                        "Draft screenshots exceed the 18 MiB image limit".to_string();
+                } else {
+                    self.chat
+                        .composer_attachments
+                        .push(ComposerAttachment::Image(image));
+                    self.status_message = "Screenshot attached".to_string();
+                }
+            }
+            Ok(ClipboardContents {
+                text: Some(text), ..
+            }) => {
+                self.status_message.clear();
+                self.insert_composer_text(&text);
+            }
+            Ok(_) => self.status_message = "The clipboard has no screenshot or text".to_string(),
+            Err(error) => self.status_message = error,
+        }
+    }
+
+    fn insert_composer_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if let Some(files) = pasted_files(&text) {
-            self.chat.composer_files.extend(files);
+            self.chat
+                .composer_attachments
+                .extend(files.into_iter().map(ComposerAttachment::File));
             self.status_message = "Backspace at the start removes the last file".to_string();
         } else {
             let text: String = text
@@ -11317,15 +11474,20 @@ impl App {
             Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
+            Some(ActionId::PasteClipboard) => self.start_clipboard_paste(),
             Some(ActionId::SendMessage) => self.submit_chat_draft(),
             None if key.code == KeyCode::Backspace
                 && key.modifiers.is_empty()
                 && self.chat.textarea.cursor() == (0, 0)
                 && self.chat.textarea.selection_range().is_none()
-                && !self.chat.composer_files.is_empty() =>
+                && !self.chat.composer_attachments.is_empty() =>
             {
-                self.chat.composer_files.pop();
-                self.status_message = "File removed".to_string();
+                let attachment = self.chat.composer_attachments.pop().unwrap();
+                self.status_message = match attachment {
+                    ComposerAttachment::File(_) => "File removed",
+                    ComposerAttachment::Image(_) => "Screenshot removed",
+                }
+                .to_string();
             }
             None => {
                 if text_widget_input_allowed(key) {
@@ -11338,15 +11500,20 @@ impl App {
     }
 
     fn submit_chat_draft(&mut self) {
+        if self.chat.reading_clipboard {
+            self.status_message =
+                "Reading the clipboard — send when the attachment appears".to_string();
+            return;
+        }
         let text = self.chat.textarea.lines().join("\n");
         let draft = std::iter::once(text.trim())
             .filter(|text| !text.is_empty())
-            .chain(
-                self.chat
-                    .composer_files
-                    .iter()
-                    .map(|file| file.path.as_str()),
-            )
+            .chain(self.chat.composer_attachments.iter().filter_map(
+                |attachment| match attachment {
+                    ComposerAttachment::File(file) => Some(file.path.as_str()),
+                    ComposerAttachment::Image(_) => None,
+                },
+            ))
             .collect::<Vec<_>>()
             .join("\n");
         let loop_command = Self::is_loop_chat_command(&draft);
@@ -11372,13 +11539,21 @@ impl App {
             self.status_message = "Session is being deleted — message kept as draft".to_string();
             return;
         }
-        if draft.is_empty() {
+        let images = self
+            .chat
+            .composer_attachments
+            .iter()
+            .filter_map(ComposerAttachment::image)
+            .cloned()
+            .collect::<Vec<_>>();
+        if draft.is_empty() && images.is_empty() {
             return;
         }
-        if !loop_command {
-            self.clear_chat_composer();
+        if loop_command && !images.is_empty() {
+            self.status_message = "Remove screenshots before sending a /loop command".to_string();
+            return;
         }
-        self.send_message(draft);
+        self.send_message(draft, images);
     }
 
     fn handle_conversation_block_action(&mut self, action: ActionId) {
@@ -11417,14 +11592,44 @@ impl App {
         textarea.set_placeholder_text(self.chat_placeholder());
         apply_textarea_palette(&mut textarea, self.theme);
         self.chat.textarea = textarea;
-        self.chat.composer_files.clear();
+        self.chat.composer_attachments.clear();
+    }
+
+    fn finish_image_submission(&mut self, turn_id: &str, accepted: bool) {
+        if self
+            .chat
+            .pending_image_composer
+            .as_ref()
+            .is_none_or(|(id, _)| id != turn_id)
+        {
+            return;
+        }
+        let (_, submitted) = self.chat.pending_image_composer.take().unwrap();
+        if !accepted {
+            return;
+        }
+        if submitted.lines == self.chat.textarea.lines()
+            && submitted.attachments == self.chat.composer_attachments
+        {
+            self.clear_chat_composer();
+        } else {
+            self.chat.composer_attachments.retain(|attachment| {
+                attachment.image().is_none_or(|image| {
+                    !submitted
+                        .attachments
+                        .iter()
+                        .filter_map(ComposerAttachment::image)
+                        .any(|sent| Arc::ptr_eq(sent, image))
+                })
+            });
+        }
     }
 
     /// Send a chat message WITHOUT blocking the event loop: the user turn is
     /// shown immediately (optimistic), and the `chat` POST runs on a task that
     /// posts `ChatStarted` back — the handler then opens the SSE stream and
     /// spawns `execute` once the session id is known.
-    fn send_message(&mut self, message: String) {
+    fn send_message(&mut self, message: String, images: Vec<Arc<ClipboardImage>>) {
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -11435,12 +11640,13 @@ impl App {
         };
         let client = self.client.clone();
         let context_id = self.chat.context_id;
-        let req = ChatRequest {
+        let mut req = ChatRequest {
             message_id: None,
             thread_id: None,
             in_reply_to: None,
             correlation_id: None,
             message: message.clone(),
+            images: Vec::new(),
             session_id: self.chat.session_id.clone(),
             project_id: self.chat.project_id.clone(),
             workspace_path: if self.chat.session_id.is_none() && self.chat.project_id.is_none() {
@@ -11481,9 +11687,29 @@ impl App {
             });
             return;
         }
-        let turn_id = self.begin_chat_turn(message);
+        let turn_id = self.begin_chat_turn(message, images.len());
+        self.chat.pending_image_composer = if images.is_empty() {
+            self.clear_chat_composer();
+            None
+        } else {
+            Some((turn_id.clone(), ComposerSnapshot::capture(&self.chat)))
+        };
         tokio::spawn(async move {
-            let result = client.chat(req).await.map_err(|error| error.to_string());
+            let encoded = if images.is_empty() {
+                Ok(Vec::new())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    images.iter().map(|image| image.to_chat_image()).collect()
+                })
+                .await
+            };
+            let result = match encoded {
+                Ok(images) => {
+                    req.images = images;
+                    client.chat(req).await.map_err(|error| error.to_string())
+                }
+                Err(error) => Err(format!("Screenshot encoding ended unexpectedly: {error}")),
+            };
             let _ = tx.send(AppEvent::ChatStarted {
                 context_id,
                 turn_id,
@@ -11499,7 +11725,7 @@ impl App {
             .is_some_and(|name| name.eq_ignore_ascii_case("/loop"))
     }
 
-    fn begin_chat_turn(&mut self, message: String) -> String {
+    fn begin_chat_turn(&mut self, message: String, image_count: usize) -> String {
         // A completed parent may leave its transport attached solely to watch
         // background child lifecycle. Supersede that generation before the
         // next optimistic turn so a replayed old Complete can never finalize
@@ -11530,6 +11756,7 @@ impl App {
             id: user_message_id,
             role: MessageRole::User,
             content: message,
+            image_count,
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
@@ -11886,14 +12113,14 @@ impl App {
         } else {
             let mut discarded = self.take_active_context();
             let textarea = std::mem::take(&mut discarded.chat.textarea);
-            let files = std::mem::take(&mut discarded.chat.composer_files);
+            let attachments = std::mem::take(&mut discarded.chat.composer_attachments);
             discarded.abort_background_work();
-            Some((textarea, files))
+            Some((textarea, attachments))
         };
         self.install_active_context(SessionUiContext::blank(context_id));
-        if let Some((textarea, files)) = preserved_composer {
+        if let Some((textarea, attachments)) = preserved_composer {
             self.chat.textarea = textarea;
-            self.chat.composer_files = files;
+            self.chat.composer_attachments = attachments;
             apply_textarea_palette(&mut self.chat.textarea, self.theme);
         }
         self.chat.model = model;
@@ -12088,10 +12315,13 @@ impl App {
             };
             match message.role {
                 MessageRole::User => {
-                    if !message.content.is_empty() {
+                    if !message.content.is_empty() || message.image_count > 0 {
                         blocks.push(ConversationBlock {
                             id: format!("{message_id}:user"),
-                            kind: ConversationBlockKind::UserMessage(&message.content),
+                            kind: ConversationBlockKind::UserMessage {
+                                content: &message.content,
+                                image_count: message.image_count,
+                            },
                         });
                     }
                 }
@@ -14035,6 +14265,7 @@ impl App {
                     Some(std::mem::take(&mut self.chat.current_reasoning))
                 },
                 sub_agents: std::mem::take(&mut self.chat.sub_agents),
+                image_count: 0,
                 terminal_status: self.chat.current_terminal_status.take(),
             });
         }
@@ -21808,7 +22039,11 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                1_603_011_432_197_960_348,
+                if cfg!(target_os = "macos") {
+                    12_360_418_717_810_675_712
+                } else {
+                    1_603_011_432_197_960_348
+                },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
@@ -22804,6 +23039,7 @@ mod question_tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         app.chat.current_response = "partial".to_string();
@@ -22845,6 +23081,7 @@ mod question_tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         app.opening_session_id = Some("delete-me".to_string());
@@ -23600,6 +23837,7 @@ mod question_tests {
                     status: "running_in_background".to_string(),
                     error: None,
                 }],
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -23609,6 +23847,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -23888,6 +24127,7 @@ mod question_tests {
                     status: "queued".to_string(),
                     error: None,
                 }],
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -23897,6 +24137,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -23918,6 +24159,7 @@ mod question_tests {
                 }],
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -23980,6 +24222,7 @@ mod question_tests {
                     status: "completed".to_string(),
                     error: None,
                 }],
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -23989,6 +24232,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -24012,6 +24256,7 @@ mod question_tests {
                 }],
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -24098,6 +24343,7 @@ mod question_tests {
                         error: None,
                     },
                 ],
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -24107,6 +24353,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -24152,6 +24399,7 @@ mod question_tests {
                 ],
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -24222,6 +24470,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -24236,6 +24485,7 @@ mod question_tests {
                     status: "running_in_background".to_string(),
                     error: None,
                 }],
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -24322,6 +24572,7 @@ mod question_tests {
             }],
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         app.chat.prepare_replay_reconciliation();
@@ -24789,6 +25040,7 @@ mod question_tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         app.chat.focused_block = Some("user-1:user".to_string());
@@ -25515,6 +25767,7 @@ mod question_tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         }
     }
@@ -25542,6 +25795,7 @@ mod question_tests {
                 status: "running".to_string(),
                 error: None,
             }],
+            image_count: 0,
             terminal_status: None,
         });
         app.chat.prepare_replay_reconciliation();
@@ -25609,6 +25863,7 @@ mod question_tests {
                 tool_calls: vec![pending_tool("provider-reused-id")],
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -25618,6 +25873,7 @@ mod question_tests {
                 tool_calls: Vec::new(),
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
             ChatMessage {
@@ -25627,6 +25883,7 @@ mod question_tests {
                 tool_calls: vec![pending_tool("active-id")],
                 reasoning: None,
                 sub_agents: Vec::new(),
+                image_count: 0,
                 terminal_status: None,
             },
         ];
@@ -27109,6 +27366,150 @@ mod question_tests {
         assert_eq!(app.chat.project_id.as_deref(), Some("registered-project"));
         assert_eq!(app.chat.messages.len(), 1);
         server.await.unwrap();
+    }
+
+    fn screenshot_contents() -> ClipboardContents {
+        let png = BASE64_STANDARD.decode(clipboard::TEST_PNG).unwrap();
+        ClipboardContents {
+            image: Some(Arc::new(ClipboardImage::new(png, 2, 3))),
+            text: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ctrl_v_and_forwarded_cmd_v_attach_in_the_composer() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            app.next_clipboard_contents = Some(screenshot_contents());
+            app.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Char('v'), modifier)))
+                .await
+                .unwrap();
+            assert!(app.chat.reading_clipboard);
+            let event = rx
+                .try_recv()
+                .expect("clipboard completion from the routed key");
+            app.handle_event(event).await.unwrap();
+            assert!(!app.chat.reading_clipboard);
+        }
+        assert_eq!(app.chat.composer_attachments.len(), 2);
+        assert!(app.chat.messages.is_empty());
+        app.help_visible = true;
+        app.next_clipboard_contents = Some(screenshot_contents());
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER,
+        )))
+        .await
+        .unwrap();
+        assert!(app.next_clipboard_contents.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn image_only_chat_sends_pixels_and_rejection_keeps_the_draft() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for accept in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /api/v1/chat "));
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(payload["message"], "");
+                assert_eq!(
+                    payload["images"],
+                    serde_json::json!([{
+                        "base64": format!("data:image/png;base64,{}", clipboard::TEST_PNG),
+                        "name": "screenshot.png",
+                        "type": "image/png",
+                        "size": BASE64_STANDARD.decode(clipboard::TEST_PNG).unwrap().len()
+                    }])
+                );
+                if accept {
+                    respond_test_http(&mut socket, "application/json",
+                        r#"{"session_id":"image-session","stream_url":"/events","status":"accepted"}"#,
+                    ).await;
+                } else {
+                    socket.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            }
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.finish_clipboard_paste(Ok(screenshot_contents()));
+        assert!(app.chat.has_composer_draft());
+        for accepted in [false, true] {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .expect("chat completion");
+            assert!(
+                matches!(&result, AppEvent::ChatStarted { result, .. } if result.is_ok() == accepted)
+            );
+            assert!(app.chat.has_composer_draft());
+            app.handle_event(result).await.unwrap();
+            assert_eq!(app.chat.has_composer_draft(), !accepted);
+        }
+        assert_eq!(
+            app.chat
+                .messages
+                .iter()
+                .filter(|msg| msg.image_count == 1)
+                .count(),
+            2
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn screenshot_remove_button_removes_only_its_attachment() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, layout::Rect};
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.insert_composer_text("/tmp/test/report.txt");
+        app.finish_clipboard_paste(Ok(screenshot_contents()));
+        app.chat.textarea.insert_str("Review");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::render_workspace(
+                    frame,
+                    &app,
+                    Rect::new(0, 2, 60, 16),
+                    Rect::new(0, 19, 60, 1),
+                );
+            })
+            .unwrap();
+        let button = app.chat.attachment_remove_buttons.borrow()[0].0;
+        assert_eq!(
+            terminal.backend().buffer()[(button.x, button.y)].symbol(),
+            "×"
+        );
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::empty(),
+            });
+        }
+        assert_eq!(app.chat.textarea.lines(), ["Review"]);
+        assert!(
+            matches!(&app.chat.composer_attachments[..], [ComposerAttachment::File(file)] if file.name == "report.txt")
+        );
     }
 
     /// `Ctrl+N` clears every session-scoped field but keeps the model and
@@ -30759,6 +31160,7 @@ mod auto_serve_tests {
             tool_calls: Vec::new(),
             reasoning: None,
             sub_agents: Vec::new(),
+            image_count: 0,
             terminal_status: None,
         });
         let (tx, _rx) = mpsc::unbounded_channel();

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 mod api;
 mod app;
+mod clipboard;
 mod components;
 mod event;
 mod file_change;
