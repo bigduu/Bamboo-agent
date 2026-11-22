@@ -3,17 +3,20 @@ use ratatui::text::{Line, Span};
 
 use crate::theme::colors;
 
+mod table;
+
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: fenced code blocks (```), inline `code`, **bold**, _italic_,
 /// [links](url), `#`..`######` headings, `-`/`*` and ordered (`1.`) lists with
-/// nesting, and `>` blockquotes.
+/// nesting, `>` blockquotes, and pipe tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut in_code_block = false;
     let mut code_lines: Vec<String> = Vec::new();
 
-    for raw_line in text.lines() {
+    let mut input = text.lines().peekable();
+    while let Some(raw_line) = input.next() {
         if raw_line.trim_start().starts_with("```") {
             if in_code_block {
                 render_code_block(&mut lines, &code_lines, width);
@@ -27,6 +30,11 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
 
         if in_code_block {
             code_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        if let Some(rows) = table::render_if_table(raw_line, &mut input, width) {
+            lines.extend(rows);
             continue;
         }
 
@@ -362,6 +370,78 @@ mod tests {
     fn italic_and_bold_distinct() {
         let out = render("_em_ and **strong** and `code`");
         assert_eq!(out[0], "em and strong and code");
+    }
+
+    #[test]
+    fn table_aligns_columns_and_preserves_inline_styles() {
+        let rows = render_markdown(
+            "Check | Runs | Score\n:---- | :--: | ----:\n**Unit** | x | `2`\nFormatting | full | 100",
+            80,
+        );
+        assert_eq!(text_of(&rows[0]), "Check        Runs   Score");
+        assert_eq!(text_of(&rows[1]), "──────────   ────   ─────");
+        assert_eq!(text_of(&rows[2]), "Unit          x         2");
+        assert!(rows[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(rows[2].spans.iter().any(|span| {
+            span.content == "Unit" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(rows[2].spans.iter().any(|span| {
+            span.content == "2" && span.style.add_modifier.contains(Modifier::REVERSED)
+        }));
+    }
+
+    #[test]
+    fn table_keeps_escaped_pipes_and_handles_short_and_long_rows() {
+        let rows = render(
+            "| Option | Value |\n| --- | --- |\n| `a\\|b` | enabled |\nsolo\n| more | yes | ignored |\n> outside",
+        );
+        assert!(rows[2].contains("a|b"));
+        assert_eq!(rows[3].trim(), "solo");
+        assert_eq!(
+            rows[4].split_whitespace().collect::<Vec<_>>(),
+            ["more", "yes"]
+        );
+        assert_eq!(rows[5], "│ outside");
+    }
+
+    #[test]
+    fn table_appears_once_the_stream_has_a_matching_delimiter() {
+        let header = "| Check | Result |";
+        assert_eq!(render(header), [header]);
+        assert_eq!(render("| Check | Result |\n| --- |"), [header, "| --- |"]);
+        assert!(render("| Check | Result |\n| --- | --- |")[1].contains('─'));
+        assert!(
+            render("| Check | Result |\n| --- | --- |\n| Format | Pass")[2]
+                .contains("Format   Pass")
+        );
+        let fenced = render("```md\n| Check | Result |\n| --- | --- |\n```");
+        assert!(fenced[2].contains("| --- | --- |"));
+    }
+
+    #[test]
+    fn table_wraps_wide_cells_with_styles_intact() {
+        let rows = render_markdown(
+            "| 項目 | Value |\n| --- | --- |\n| **四海八方** | abcdefgh |",
+            14,
+        );
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row.width() <= 14));
+        assert!(rows[2].spans.iter().any(|span| {
+            span.content == "四海八" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(rows[3].spans.iter().any(|span| {
+            span.content == "方" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(text_of(&rows[3]).contains("fgh"));
+    }
+
+    #[test]
+    fn table_stacks_labeled_cells_when_the_columns_cannot_fit() {
+        let rows = render_markdown("A | B | C\n--- | --- | ---\none | two | three", 8);
+        assert_eq!(
+            rows.iter().map(text_of).collect::<Vec<_>>(),
+            ["A: one", "B: two", "C: three"]
+        );
     }
 
     #[test]

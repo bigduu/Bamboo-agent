@@ -17,6 +17,9 @@ change the reasoning level for supported models, then press Enter to apply the
 execution profile. Use **Switch session** in the header or `Ctrl+P` to search
 sessions. Click a row or press Enter to open the selection.
 
+Markdown tables in assistant replies take shape as the header separator arrives.
+Column alignment follows the separator, and long cells wrap to fit the terminal.
+
 In chat, click **Open chat** on a sub-agent row to read its conversation. The
 **Sub-agents** button opens the session tree, where you can also click a row to
 open it. A child session shows **← Parent** in the header. Click it or press
