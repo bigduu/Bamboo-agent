@@ -26,6 +26,9 @@ use crate::execution::{
 use crate::runtime::config::{
     BashResumeHook, GuardianSpawner, RunDeadline, BASH_COMPLETION_RESUME_KIND,
 };
+use crate::runtime::goal_state::{
+    read_goal_state, write_goal_state, GoalRuntimeStatus, GOAL_STATE_METADATA_KEY,
+};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
@@ -1234,12 +1237,12 @@ impl ChildCompletionCoordinator {
         };
         let guard = self.persistence.acquire_lock(id).await;
         let current = self.storage.load_session(id).await?.ok_or_else(conflict)?;
-        let goal_state = crate::runtime::goal_state::GOAL_STATE_METADATA_KEY;
         if current.created_at != observed.created_at
             || current.metadata_version != observed.metadata_version
             || current.metadata.get(GOLD_CONFIG_METADATA_KEY)
                 != observed.metadata.get(GOLD_CONFIG_METADATA_KEY)
-            || current.metadata.get(goal_state) != observed.metadata.get(goal_state)
+            || current.metadata.get(GOAL_STATE_METADATA_KEY)
+                != observed.metadata.get(GOAL_STATE_METADATA_KEY)
             || current.messages.last().map(|message| &message.id)
                 != observed.messages.last().map(|message| &message.id)
             || current.has_runtime_wait()
@@ -1247,6 +1250,16 @@ impl ChildCompletionCoordinator {
         {
             return Err(conflict());
         }
+        let mut goal = read_goal_state(&current)
+            .filter(|goal| {
+                matches!(
+                    goal.status,
+                    GoalRuntimeStatus::Active
+                        | GoalRuntimeStatus::Blocked
+                        | GoalRuntimeStatus::BudgetLimited
+                )
+            })
+            .ok_or_else(conflict)?;
         let inbox = self
             .agent
             .session_inbox()
@@ -1263,6 +1276,11 @@ impl ChildCompletionCoordinator {
         self.prepare_paced_loop_turn(&mut reservation, &current)
             .await?;
         let mut resumed = current.clone();
+        if !goal.status.is_active() {
+            goal.status = GoalRuntimeStatus::Active;
+            goal.stop_reason = None;
+            write_goal_state(&mut resumed, goal);
+        }
         resumed.add_message(instruction);
         resumed.set_last_run_status("running");
         resumed.clear_last_run_error();

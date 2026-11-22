@@ -164,10 +164,14 @@ fn unavailable() -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::{FunctionCall, ToolCall};
+    use bamboo_agent_core::{
+        AgentError, FunctionCall, StreamTimeoutError, StreamTimeoutPhase, ToolCall,
+    };
     use bamboo_domain::ActorActivationClaim;
+    use bamboo_engine::runtime::goal_recovery::{pending_delay, reserve_retry, GoalRecoveryPolicy};
+    use bamboo_engine::runtime::goal_state::{write_goal_state, GoalStopReason};
     use bamboo_llm::{Config, LLMError, LLMProvider, LLMStream, ProviderRegistry};
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     struct LocalProvider;
 
@@ -185,7 +189,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn interrupted_goal_resumes_the_same_checkpoint_once_and_retains_its_budget() {
+    async fn requested_resume_reactivates_a_stopped_goal_and_retains_its_budget() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().to_path_buf();
         let provider: Arc<dyn LLMProvider> = Arc::new(LocalProvider);
@@ -209,11 +213,23 @@ mod tests {
         session
             .metadata
             .insert("provider".into(), provider_name.into());
-        let config = json!({"enabled": true, "auto_continue_enabled": true, "goal": "Ship the verified result", "max_auto_continuations": 3});
+        let recovery = GoalRecoveryPolicy {
+            max_attempts: 2,
+            max_elapsed_seconds: 120,
+        };
+        let config = json!({"enabled": true, "auto_continue_enabled": true, "goal": "Ship the verified result", "max_auto_continuations": 3, "recovery": recovery});
         let goal = json!({
             "objective": "Ship the verified result",
             "status": "active",
-            "continuation_count": 2,
+            "continuation_count": 3,
+            "eval_history": [{
+                "checkpoint": "terminal",
+                "iteration": 3,
+                "decision": "continue",
+                "confidence": "high",
+                "reasoning": "The result still needs verification",
+                "recorded_at": "2026-11-22T00:05:00Z",
+            }],
             "created_at": "2026-11-22T00:00:00Z",
             "updated_at": "2026-11-22T00:05:00Z",
         });
@@ -223,6 +239,24 @@ mod tests {
         session
             .metadata
             .insert("goal.state".into(), goal.to_string());
+        let timeout = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::FirstSemantic,
+            Duration::from_secs(30),
+            None,
+            None,
+            Duration::ZERO,
+            None,
+            true,
+        ));
+        assert_eq!(
+            reserve_retry(&mut session, &recovery, &timeout, 0),
+            Some(5_000)
+        );
+        let mut stopped = read_goal_state(&session).unwrap();
+        stopped.status = GoalRuntimeStatus::BudgetLimited;
+        stopped.stop_reason = Some(GoalStopReason::ContinuationBudget);
+        write_goal_state(&mut session, stopped);
+        assert_eq!(pending_delay(&session, 1_000), None);
         session.set_last_run_status("running");
         session.add_message(Message::user("Ship the verified result"));
         session.add_message(Message::assistant(
@@ -282,13 +316,30 @@ mod tests {
         let body: serde_json::Value = actix_web::test::read_body_json(response).await;
         assert_eq!(body["goal_command"]["action"], "resume");
         assert_eq!(body["goal_command"]["should_execute"], false);
-        let saved = state
+        let mut saved = state
             .storage
             .load_session(&session.id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved.metadata["goal.state"], goal.to_string());
+        let resumed = read_goal_state(&saved).unwrap();
+        assert_eq!(resumed.status, GoalRuntimeStatus::Active);
+        assert_eq!(resumed.stop_reason, None);
+        let resumed = serde_json::to_value(resumed).unwrap();
+        for key in [
+            "objective",
+            "created_at",
+            "continuation_count",
+            "eval_history",
+        ] {
+            assert_eq!(resumed[key], goal[key], "resume preserves {key}");
+        }
+        assert_eq!(pending_delay(&saved, 1_000), Some(4_000));
+        assert_eq!(
+            reserve_retry(&mut saved, &recovery, &timeout, 5_000),
+            Some(10_000)
+        );
+        assert_eq!(reserve_retry(&mut saved, &recovery, &timeout, 15_000), None);
         assert_eq!(saved.metadata[GOLD_CONFIG_METADATA_KEY], config.to_string());
         assert!(saved.messages.iter().any(|message| {
             message
