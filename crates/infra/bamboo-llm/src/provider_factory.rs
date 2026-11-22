@@ -12,9 +12,34 @@ use std::sync::Arc;
 /// Provider types offered when creating a new instance.
 pub const AVAILABLE_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini"];
 
+/// Provider-instance setting for the experimental LiteLLM wire adapters.
+pub const LITELLM_WIRE_TYPES_CONFIG_KEY: &str = "litellm_wire_types";
+
 /// Supported configured types, including the existing Bodhi gateway adapter.
 pub fn is_configured_provider_type(provider_type: &str) -> bool {
     AVAILABLE_PROVIDERS.contains(&provider_type) || provider_type == "bodhi"
+}
+
+fn litellm_wire_types_override(instance: &ProviderInstanceConfig) -> Option<bool> {
+    instance
+        .extra
+        .get(LITELLM_WIRE_TYPES_CONFIG_KEY)
+        .and_then(serde_json::Value::as_bool)
+}
+
+/// Effective adapter setting, or `None` if this build or provider does not support it.
+pub fn effective_litellm_wire_types(instance: &ProviderInstanceConfig) -> Option<bool> {
+    let target = if instance.provider_type == "bodhi" {
+        instance
+            .extra
+            .get("target_provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("openai")
+    } else {
+        instance.provider_type.as_str()
+    };
+    (cfg!(feature = "litellm-wire-types") && target == "anthropic")
+        .then(|| litellm_wire_types_override(instance).unwrap_or(false))
 }
 
 fn build_http_client(config: &Config) -> Result<Client, LLMError> {
@@ -100,6 +125,14 @@ pub async fn create_provider_from_instance(
     let overrides = bamboo_config::model_vision_overrides(instance).map_err(LLMError::Api)?;
     let masking_config = config.keyword_masking.clone();
     let http_client = build_http_client(config)?;
+    if !cfg!(feature = "litellm-wire-types") && litellm_wire_types_override(instance) == Some(true)
+    {
+        return Err(LLMError::Api(
+            "litellm_wire_types requires a build with the litellm-wire-types feature".into(),
+        ));
+    }
+    #[cfg(feature = "litellm-wire-types")]
+    let use_litellm_wire_types = effective_litellm_wire_types(instance) == Some(true);
 
     let provider: std::result::Result<Arc<dyn LLMProvider>, LLMError> = match instance
         .provider_type
@@ -154,6 +187,10 @@ pub async fn create_provider_from_instance(
 
             let mut provider =
                 AnthropicProvider::new(&instance.api_key).with_client(http_client.clone());
+            #[cfg(feature = "litellm-wire-types")]
+            if use_litellm_wire_types {
+                provider = provider.with_litellm_messages();
+            }
 
             if let Some(base_url) = &instance.base_url {
                 if !base_url.is_empty() {
@@ -216,6 +253,10 @@ pub async fn create_provider_from_instance(
 
             let mut provider =
                 BodhiProvider::new(&instance.api_key).with_client(http_client.clone());
+            #[cfg(feature = "litellm-wire-types")]
+            if use_litellm_wire_types {
+                provider = provider.with_litellm_wire_types();
+            }
 
             if let Some(base_url) = &instance.base_url {
                 if !base_url.is_empty() {
@@ -362,6 +403,85 @@ mod tests {
         config.provider = provider.to_string();
         *config.providers_mut() = providers;
         config
+    }
+
+    #[cfg(feature = "litellm-wire-types")]
+    #[tokio::test]
+    async fn provider_instances_use_wire_types_only_when_enabled() {
+        use crate::provider::LLMRequestOptions;
+        use bamboo_domain::{Message, ReasoningEffort};
+        use serde_json::{json, Value};
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
+            .expect(6)
+            .mount(&server)
+            .await;
+        let options = LLMRequestOptions {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        for provider_type in ["anthropic", "bodhi"] {
+            for setting in [None, Some(false), Some(true)] {
+                let mut instance = json!({
+                    "provider_type": provider_type,
+                    "target_provider": "anthropic",
+                    "api_key": "fixture-key",
+                    "base_url": server.uri()
+                });
+                if let Some(enabled) = setting {
+                    instance[LITELLM_WIRE_TYPES_CONFIG_KEY] = json!(enabled);
+                }
+                let instance = serde_json::from_value(instance).unwrap();
+                let provider = create_provider_from_instance(
+                    &Config::default(),
+                    &instance,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+                assert!(provider
+                    .chat_stream_with_options(
+                        &[Message::user("hello")],
+                        &[],
+                        Some(4000),
+                        "claude-haiku-4-5",
+                        Some(&options)
+                    )
+                    .await
+                    .is_err());
+            }
+        }
+        let requests = server.received_requests().await.unwrap();
+        for [baseline, explicitly_disabled, typed] in requests.as_chunks::<3>().0 {
+            let baseline: Value = baseline.body_json().unwrap();
+            let typed: Value = typed.body_json().unwrap();
+            assert_eq!(baseline, explicitly_disabled.body_json::<Value>().unwrap());
+            assert_ne!(baseline["thinking"], typed["thinking"]);
+            assert_eq!(
+                typed["thinking"],
+                json!({"type":"enabled","budget_tokens":1024})
+            );
+        }
+    }
+
+    #[cfg(not(feature = "litellm-wire-types"))]
+    #[tokio::test]
+    async fn explicit_wire_types_opt_in_requires_the_build_feature() {
+        let instance = serde_json::from_value(serde_json::json!({
+            "provider_type": "anthropic",
+            "api_key": "fixture-key",
+            "litellm_wire_types": true
+        }))
+        .unwrap();
+        assert_eq!(effective_litellm_wire_types(&instance), None);
+        let result =
+            create_provider_from_instance(&Config::default(), &instance, Default::default()).await;
+        assert!(
+            matches!(result, Err(LLMError::Api(message)) if message.contains("litellm-wire-types"))
+        );
     }
 
     #[tokio::test]

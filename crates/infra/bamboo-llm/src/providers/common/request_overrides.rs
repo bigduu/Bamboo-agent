@@ -534,6 +534,24 @@ pub(crate) fn messages_controls_overridden(
     })
 }
 
+#[cfg(feature = "litellm-wire-types")]
+pub(crate) fn messages_reasoning_overridden(
+    overrides: Option<&RequestOverridesConfig>,
+    model: &str,
+) -> bool {
+    overrides.is_some_and(|config| {
+        resolve_scope(config, ENDPOINT_MESSAGES, Some(model))
+            .body_patch
+            .iter()
+            .any(|patch| {
+                let path = parse_path(&patch.path);
+                patches_reasoning_control(ENDPOINT_MESSAGES, &path)
+                    || matches!(path.first(), Some(PathSegment::Key(key))
+                        if matches!(key.as_str(), "model" | "thinking" | "thinking_budget"))
+            })
+    })
+}
+
 pub(crate) fn chat_completions_controls_overridden(
     overrides: Option<&RequestOverridesConfig>,
     model: &str,

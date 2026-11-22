@@ -7,6 +7,7 @@ description = "LLM provider layer (providers, protocol adapters, streaming, rout
 license = "MIT"
 
 [features]
+default = ["litellm-wire-types"]
 litellm-wire-types = ["dep:bamboo-litellm-llms-types"]
 
 [dependencies]

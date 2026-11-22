@@ -1,5 +1,19 @@
 # Third-party source notices
 
+## LiteLLM Claude Messages
+
+`claude_reasoning.rs` and `claude_tool_ids.rs` under
+`crates/infra/bamboo-llm/src/providers/anthropic/litellm/` adapt effort rules,
+selected model capabilities, and client tool ID normalization from LiteLLM
+at revision `c3cafa3782642685ef10777e4c5931400c0a7176`, copyright 2023 Berri AI.
+
+- `litellm-rust/crates/llms/src/anthropic/messages/thinking.rs`
+- `litellm-rust/crates/llms/src/anthropic/common_utils.rs`
+- `litellm-rust/crates/llms/src/base_llm/messages/context.rs`
+- `model_prices_and_context_window.json`
+
+These portions retain the [MIT license and copyright notice](crates/infra/bamboo-llm/third_party/litellm/LICENSE).
+
 ## OpenAI Codex tool search
 
 `crates/engine/bamboo-tools/src/tool_search.rs` adapts metadata text construction
