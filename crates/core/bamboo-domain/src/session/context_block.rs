@@ -196,7 +196,9 @@ mod tests {
         assert!(rendered.content.contains("context_type: task_snapshot"));
         assert!(rendered.content.contains("Host-provided context."));
         assert!(rendered.content.contains("Current Task Snapshot"));
-        assert!(rendered.content.contains("- build prompt envelope skeleton"));
+        assert!(rendered
+            .content
+            .contains("- build prompt envelope skeleton"));
         assert!(rendered.never_compress);
         assert!(rendered.metadata.is_some());
     }

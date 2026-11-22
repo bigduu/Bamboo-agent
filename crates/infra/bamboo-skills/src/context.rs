@@ -91,8 +91,8 @@ pub fn build_workflow_catalog_context(
 pub(crate) fn workflow_catalog_prefix() -> String {
     "\n\n## Skill System\n\n\
 Choose the most specific advertised Workflow when it clearly applies. Proceed directly otherwise.\n\
-Use `load_skill` before responding for instruction Workflows. For orchestration, use `workflow_run` with the advertised revision and follow its invocation policy.\n\
-Follow the loaded instructions. Read auxiliary files only when needed, continuing from `next_offset` if more is required.\n\n\
+Read instruction Workflows with `skills_list` and `skills_read` when available, or with `load_skill` on the legacy catalog. For orchestration, use `workflow_run` with the advertised revision and follow its invocation policy.\n\
+Follow the loaded instructions. Read auxiliary files only when needed. Continue with the returned `next_cursor` or `next_offset` for more.\n\n\
 ### Available Workflows\n"
         .to_string()
 }
@@ -149,7 +149,8 @@ mod tests {
 
         assert!(context.contains("## Skill System"));
         assert!(context.contains("when it clearly applies"));
-        assert!(context.contains("load_skill"));
+        assert!(context.contains("with `skills_list` and `skills_read` when available"));
+        assert!(context.contains("with `load_skill` on the legacy catalog"));
         assert!(context.contains("workflow_run"));
         assert!(!context.contains("skill_check_completed"));
         assert!(!context.contains("Catalog budget:"));
