@@ -663,6 +663,9 @@ async fn background_exec_checkpoint_failure_or_wrong_owner_cannot_publish_a_hand
     let message = session.messages.last().unwrap();
     assert!(message.content.contains(r#""exit_code":7"#));
     assert!(message.content.contains("exec-finished"));
+    assert!(message
+        .content
+        .contains("If you need more unread output, use write_stdin"));
     let ToolOutcome::Completed(pulled) = executor
         .registry()
         .get("write_stdin")

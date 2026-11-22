@@ -2,10 +2,11 @@
 
 Ultra is an independent Root product policy. It increases task-wide reasoning
 through parallel delegation of independent work, Root verification and
-synthesis. An ordinary Ultra Root can write and edit files, run commands with
-`exec_command`, and collect results with `write_stdin` under its workspace
-and permission policy. Each model call retains its separately resolved
-ordinary reasoning effort.
+synthesis. An ordinary Ultra Root can write and edit files and run
+`exec_command` under its workspace and permission policy. Use
+`SubAgent` with `intent=wait` for non-interactive completion and
+`write_stdin` for input or unread output. Each model call retains its
+separately resolved ordinary reasoning effort.
 
 ## Authority and wire contract
 

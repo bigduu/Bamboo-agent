@@ -688,8 +688,9 @@ pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
 ) -> Option<ContextBlock> {
+    let schemas = effective_tool_schemas(session, tool_schemas);
     if !session.allows_model_tool_execution("write_stdin")
-        || !effective_tool_schemas(session, tool_schemas)
+        || !schemas
             .iter()
             .any(|schema| schema.function.name == "write_stdin")
     {
@@ -699,13 +700,24 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
+    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && !bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session)
+            .plan_read_only
+        && schemas
+            .iter()
+            .any(|schema| schema.function.name == "SubAgent")
+    {
+        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
+    } else {
+        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
+    };
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
         ContextBlockStability::RoundDynamic,
-        "Shell sessions awaiting a terminal result",
+        "Shell session handles",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
+            "{guidance}\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))

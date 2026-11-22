@@ -128,8 +128,7 @@ impl LLMProvider for PullFromContextProvider {
             .iter()
             .find(|message| {
                 message.metadata.as_ref().is_some_and(|metadata| {
-                    metadata["bamboo_context_block"]["title"]
-                        == "Shell sessions awaiting a terminal result"
+                    metadata["bamboo_context_block"]["title"] == "Shell session handles"
                 })
             })
             .expect("provider receives the live continuation snapshot after archival/trimming");
@@ -508,12 +507,32 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
     bash_runtime::remove_shell(&unowned.id);
     let mut session = Session::new(owner, "test-model");
     let schemas = shell_schemas();
+    let snapshot = build_exec_session_continuation_context_block(&session, &schemas).unwrap();
+    assert!(snapshot.content.contains(&handle));
+    assert!(snapshot.content.contains("Use write_stdin"));
+    assert!(!snapshot.content.contains("SubAgent"));
+    let mut with_wait = schemas.to_vec();
+    let mut subagent = schemas[0].clone();
+    subagent.function.name = "SubAgent".into();
+    with_wait.push(subagent);
+    for ultra in [false, true] {
+        session.set_root_orchestration_only(ultra).unwrap();
+        let snapshot = build_exec_session_continuation_context_block(&session, &with_wait).unwrap();
+        assert!(snapshot.content.contains("If you still need"));
+        assert!(snapshot
+            .content
+            .contains("SubAgent with intent=wait and target"));
+        assert!(snapshot.content.contains(&handle));
+    }
+    let parent = Session::new("shell-parent", "test-model");
+    let child = Session::new_child_of(owner, &parent, "test-model", "worker");
     assert!(
-        build_exec_session_continuation_context_block(&session, &schemas)
+        !build_exec_session_continuation_context_block(&child, &with_wait)
             .unwrap()
             .content
-            .contains(&handle)
+            .contains("SubAgent")
     );
+    session.set_root_orchestration_only(false).unwrap();
     for name in [
         "vendor::write_stdin",
         "default::write_stdin",
