@@ -30,6 +30,7 @@ impl ScopedTransportCensus {
         let Some(main_bytes) = regular_optional(&directory.join("session.json"))? else {
             return Ok(None);
         };
+        let main_bytes = cold_main::decode(main_bytes)?;
         compact_main::validate_full_main(&main_bytes)?;
         let mut main: Session = serde_json::from_slice(&main_bytes)?;
         if main.kind != SessionKind::Root || !main.authority_identity.is_ordinary() {

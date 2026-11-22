@@ -363,10 +363,12 @@ fn context_conflict() -> io::Error {
 
 async fn observe_file(path: &Path) -> ObservedFile {
     match fs::symlink_metadata(path).await {
-        Ok(meta) if meta.file_type().is_file() => match fs::read(path).await {
-            Ok(bytes) => ObservedFile::Bytes(bytes),
-            Err(_) => ObservedFile::Invalid,
-        },
+        Ok(meta) if meta.file_type().is_file() => {
+            match super::cold_main::read_state_file(path).await {
+                Ok(bytes) => ObservedFile::Bytes(bytes),
+                Err(_) => ObservedFile::Invalid,
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => ObservedFile::Absent,
         _ => ObservedFile::Invalid,
     }

@@ -313,7 +313,7 @@ impl SessionStoreV2 {
         let Some(side) = side else {
             // Ordinary compatibility: legacy Child Main remains authoritative
             // when its optional sidecar is missing or corrupt.
-            let bytes = match fs::read(directory.join("session.json")).await {
+            let bytes = match cold_main::read(directory.join("session.json")).await {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
@@ -349,7 +349,7 @@ impl SessionStoreV2 {
         if !full {
             return Ok(Some(side));
         }
-        let bytes = match fs::read(directory.join("session.json")).await {
+        let bytes = match cold_main::read(directory.join("session.json")).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),

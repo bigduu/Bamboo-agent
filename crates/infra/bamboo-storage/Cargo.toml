@@ -23,6 +23,7 @@ fs2 = "0.4"
 sha2 = { workspace = true }
 rusqlite = { version = "0.41", features = ["bundled", "chrono", "functions"] }
 tracing = "0.1"
+zstd = { version = "0.14", default-features = false }
 
 [features]
 # Deterministic persistence pause hooks used by higher-layer integration tests.

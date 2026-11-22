@@ -98,14 +98,14 @@ struct Journal {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Pair {
-    main: String,
+pub(super) struct Pair {
+    pub(super) main: String,
     runtime: String,
-    sha256: String,
+    pub(super) sha256: String,
 }
 
 impl Pair {
-    fn new(main: Vec<u8>, runtime: Vec<u8>) -> io::Result<Self> {
+    pub(super) fn new(main: Vec<u8>, runtime: Vec<u8>) -> io::Result<Self> {
         if main.len() > MAX_STATE_BYTES || runtime.len() > MAX_STATE_BYTES {
             return Err(invalid("migration pair exceeds state byte bound"));
         }
@@ -247,7 +247,7 @@ async fn regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     if !metadata.file_type().is_file() || metadata.len() > limit as u64 {
         return Err(invalid("state is not a bounded regular file"));
     }
-    let bytes = fs::read(path).await?;
+    let bytes = cold_main::read_state_file(path).await?;
     if bytes.len() > limit {
         return Err(invalid("state grew beyond its byte bound"));
     }
@@ -351,7 +351,10 @@ impl SessionStoreV2 {
         }
     }
 
-    async fn migration_guards(&self, id: &str) -> io::Result<Arc<DefaultWriterGuards>> {
+    pub(super) async fn session_maintenance_guards(
+        &self,
+        id: &str,
+    ) -> io::Result<Arc<DefaultWriterGuards>> {
         validate_session_id(id)?;
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let task = self.lock_runtime_task_transaction_exclusive().await?;
@@ -389,11 +392,11 @@ impl SessionStoreV2 {
             return Ok(None);
         };
         let pair = self.migration_pair(&relative).await?;
-        let session = self.validate_migration_pair(id, &relative, &pair).await?;
+        let session = self.validate_maintenance_pair(id, &relative, &pair).await?;
         Ok(Some((relative, session, pair)))
     }
 
-    async fn validate_migration_pair(
+    pub(super) async fn validate_maintenance_pair(
         &self,
         id: &str,
         relative: &str,
@@ -433,18 +436,28 @@ impl SessionStoreV2 {
         session: &Session,
         relative: &str,
     ) -> io::Result<Vec<SessionVersionMigrationBlocker>> {
-        let mut reasons = Vec::new();
+        let mut blockers = Vec::new();
         if !session.execution_compatibility().execution_allowed {
-            reasons.push(blocker(
+            blockers.push(blocker(
                 "session_execution_incompatible",
                 "Resolve the concrete Session/schema conflict before migration.",
             ));
         } else if !matches!(session.session_version, None | Some(1)) {
-            reasons.push(blocker(
+            blockers.push(blocker(
                 "already_current",
                 "This Session already uses the current behavior version.",
             ));
         }
+        blockers.extend(self.session_idle_blockers(session, relative).await?);
+        Ok(blockers)
+    }
+
+    pub(super) async fn session_idle_blockers(
+        &self,
+        session: &Session,
+        relative: &str,
+    ) -> io::Result<Vec<SessionVersionMigrationBlocker>> {
+        let mut reasons = Vec::new();
         if pending_response(session) {
             reasons.push(blocker(
                 "pending_response",
@@ -660,7 +673,7 @@ impl SessionStoreV2 {
             ));
         }
         let source = self
-            .validate_migration_pair(
+            .validate_maintenance_pair(
                 &journal.session_id,
                 &journal.relative_directory,
                 &journal.before,
@@ -687,12 +700,12 @@ impl SessionStoreV2 {
         &self,
         id: &str,
     ) -> io::Result<Option<SessionVersionMigrationObservation>> {
-        let _guards = self.migration_guards(id).await?;
+        let _guards = self.session_maintenance_guards(id).await?;
         for path in self.session_version_migration_journals().await? {
             let journal = self.read_migration_journal(&path).await?;
             if journal.session_id == id {
                 let source = self
-                    .validate_migration_pair(id, &journal.relative_directory, &journal.before)
+                    .validate_maintenance_pair(id, &journal.relative_directory, &journal.before)
                     .await?;
                 let mut view = Self::migration_observation(
                     &source,
@@ -827,7 +840,7 @@ impl SessionStoreV2 {
                 "invalid Session migration intent",
             ));
         }
-        let guards = self.migration_guards(id).await?;
+        let guards = self.session_maintenance_guards(id).await?;
         let journals = self.session_version_migration_journals().await?;
         let path = self
             .version_migration_directory()
