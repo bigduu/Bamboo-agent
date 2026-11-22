@@ -19,7 +19,7 @@ use bamboo_llm::LLMProvider;
 
 use crate::runtime::config::{
     AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, DisabledFilterResolver, GoldConfig,
-    GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+    GuardianConfig, GuardianSpawner, ImageFallbackConfig, RunDeadline,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
@@ -70,6 +70,7 @@ pub struct SessionExecutionReservation {
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     persistence_bound: bool,
     selected_input: bool,
+    run_deadline: Option<RunDeadline>,
     armed: bool,
 }
 
@@ -84,6 +85,11 @@ impl SessionExecutionReservation {
 
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Attach the clock supplied by this execution's local caller.
+    pub fn set_run_deadline(&mut self, deadline: Option<RunDeadline>) {
+        self.run_deadline = deadline;
     }
 
     /// Attach the canonical birth to this existing owner before accepting an
@@ -413,6 +419,7 @@ impl SessionExecutionReservation {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         }
     }
@@ -443,6 +450,7 @@ impl SessionExecutionReservation {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         }
     }
@@ -833,6 +841,7 @@ async fn reserve_logical_session(
         child_startup: None,
         child_closure: None,
         selected_input: false,
+        run_deadline: None,
         armed: true,
     };
     let registration = register_reserved_activation(
@@ -1055,6 +1064,7 @@ async fn reserve_session_execution_inner(
         child_startup: None,
         child_closure: None,
         selected_input,
+        run_deadline: None,
         armed: true,
     };
     SessionExecutionReserveOutcome::Reserved(execution_reservation)
@@ -1661,6 +1671,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                         execute_request,
                         inputs,
                         upstream_retry,
+                        execution_reservation.run_deadline,
                     );
                     match &work {
                         Some(work) => work.resources.scope(execution).await,
@@ -2561,6 +2572,7 @@ mod reservation_tests {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         };
 
@@ -2598,6 +2610,7 @@ mod reservation_tests {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         };
 

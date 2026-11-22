@@ -41,6 +41,19 @@ struct Request {
 }
 
 impl Request {
+    fn assert_deadline(&self, expected: bool) {
+        let count = self
+            .messages
+            .iter()
+            .filter(|message| message.content.starts_with("Host execution deadline\n"))
+            .count();
+        assert_eq!(
+            count,
+            usize::from(expected),
+            "caller clock must stay on the Root"
+        );
+    }
+
     fn is_child(&self) -> bool {
         self.messages
             .iter()
@@ -263,6 +276,12 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     let workspace = std::fs::canonicalize(workspace).unwrap();
     let parent_id = format!("local-conversation-root-{}", uuid::Uuid::new_v4());
     let child_id = format!("{parent_id}-child");
+    let deadline_binding = state
+        .child_completion_coordinator
+        .bind_headless_run_deadline(
+            parent_id.clone(),
+            bamboo_engine::config::RunDeadline::new(Duration::from_secs(120)),
+        );
     let mut parent = Session::new(&parent_id, MODEL);
     parent.model_ref = Some(ProviderModelRef::new(PROVIDER, MODEL));
     parent.set_provider_name(PROVIDER);
@@ -307,6 +326,7 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     let ask = next_request(&mut requests, &state, &parent_id, &child_id).await;
     assert_eq!(ask.process_id, std::process::id());
     assert!(ask.is_child());
+    ask.assert_deadline(false);
     ask.subagent(ASK_CALL, json!({"intent":"ask_parent", "message":QUESTION}));
 
     // No forged request, answer, completion source or stop marker is inserted.
@@ -323,6 +343,7 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
             .filter(|message| message.role == Role::Tool)
             .collect::<Vec<_>>()
     );
+    root_reply.assert_deadline(true);
     let question = question_from_messages(&root_reply.messages);
     assert_eq!(question.question, QUESTION);
     assert_eq!(question.tool_call_id, ASK_CALL);
@@ -376,6 +397,7 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     for _ in 0..2 {
         let request = next_request(&mut requests, &state, &parent_id, &child_id).await;
         assert_eq!(request.process_id, std::process::id());
+        request.assert_deadline(!request.is_child());
         if request.is_child() {
             assert!(
                 !child_resumed,
@@ -426,6 +448,11 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
     }
     assert!(child_resumed && root_finished);
     wait_until_finished(&state, &parent_id, &child_id, &mut requests).await;
+    drop(deadline_binding);
+    assert!(state
+        .child_completion_coordinator
+        .headless_run_deadline_for(&parent_id)
+        .is_none());
 
     let saved_parent = state
         .storage
@@ -439,6 +466,10 @@ async fn native_child_real_subagent_question_parent_reply_and_inbox_resume_witho
         .await
         .unwrap()
         .unwrap();
+    assert!(saved_parent
+        .messages
+        .iter()
+        .all(|message| !message.content.starts_with("Host execution deadline\n")));
     let resolution =
         ParentQuestionResolution::from_child(&saved_parent, &saved_child, &question.id)
             .expect("real reply must leave a canonical direct-parent resolution");

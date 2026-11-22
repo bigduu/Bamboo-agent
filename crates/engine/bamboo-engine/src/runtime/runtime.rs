@@ -25,7 +25,7 @@ use bamboo_skills::SkillManager;
 use crate::runtime::config::{
     AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook,
     DisabledFilterResolver, GoldConfig, GuardianConfig, GuardianSpawner, ImageFallbackConfig,
-    PromptMemoryFlags,
+    PromptMemoryFlags, RunDeadline,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::model_roster::{ModelRoster, RoleModel};
@@ -915,7 +915,7 @@ impl AgentRuntime {
         req: ExecuteRequest,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
-        self.execute_with_inputs_and_upstream_retry(session, req, None, upstream_retry)
+        self.execute_with_inputs_and_upstream_retry(session, req, None, upstream_retry, None)
             .await
     }
 
@@ -930,6 +930,7 @@ impl AgentRuntime {
             req,
             inputs,
             bamboo_llm::retry::UpstreamRetry::Bounded,
+            None,
         )
         .await
     }
@@ -940,6 +941,7 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
+        run_deadline: Option<RunDeadline>,
     ) -> crate::runtime::runner::Result<()> {
         struct WorkspaceFinish(Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>);
         impl Drop for WorkspaceFinish {
@@ -999,10 +1001,10 @@ impl AgentRuntime {
             }
             runtime.inherited_child_wait_captured = true;
             return runtime
-                .execute_bound(session, req, inputs, upstream_retry)
+                .execute_bound(session, req, inputs, upstream_retry, run_deadline)
                 .await;
         }
-        self.execute_bound(session, req, inputs, upstream_retry)
+        self.execute_bound(session, req, inputs, upstream_retry, run_deadline)
             .await
     }
 
@@ -1012,6 +1014,7 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
+        run_deadline: Option<RunDeadline>,
     ) -> crate::runtime::runner::Result<()> {
         if self.persistence.root_actor_execution_required(session) {
             return Err(bamboo_agent_core::AgentError::Tool(
@@ -1324,6 +1327,7 @@ impl AgentRuntime {
             // the HTTP layer) means every caller — HTTP, schedules, connect,
             // the in-proc SDK — gets the same clamped fallback for free.
             run_budget: effective_run_budget,
+            run_deadline,
             counted_loop,
             loop_control,
             stream_timeout: config.stream_timeout,

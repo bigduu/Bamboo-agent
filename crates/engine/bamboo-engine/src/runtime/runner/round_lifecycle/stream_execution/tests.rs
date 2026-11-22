@@ -365,13 +365,13 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 1
             );
             for clause in [
-                "active objective, constraints, and acceptance criteria",
-                "a status question does not cancel unfinished work",
-                "Work autonomously toward the authorized end-to-end result",
-                "necessary exploration and prerequisite subtasks",
-                "repair recoverable failures",
-                "without automatically taking them on",
-                "pushing code, or waiting for another actor does not by itself complete the task",
+                "Carry the user's objective, constraints, and acceptance criteria",
+                "Explicit user updates steer unfinished work",
+                "A status question leaves it active",
+                "Deliver the smallest complete result",
+                "Repair recoverable failures within scope",
+                "Verify the work against the user's acceptance criteria",
+                "what is complete, what remains, and the concrete blocker",
             ] {
                 assert!(
                     instructions.contains(clause),

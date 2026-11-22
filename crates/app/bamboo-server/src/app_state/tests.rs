@@ -51,10 +51,9 @@ fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options(
 }
 #[test]
 fn default_base_prompt_prefers_using_injected_context_before_reasking() {
-    assert!(DEFAULT_BASE_PROMPT.contains("treat it as available working context"));
+    assert!(DEFAULT_BASE_PROMPT.contains("Use injected workspace and environment context"));
     assert!(DEFAULT_BASE_PROMPT.contains("Prefer a minimal verifiable attempt first"));
-    assert!(DEFAULT_BASE_PROMPT
-        .contains("only ask follow-up questions for information that is still genuinely missing"));
+    assert!(DEFAULT_BASE_PROMPT.contains("before asking for missing information"));
 }
 
 #[tokio::test]
