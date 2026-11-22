@@ -166,6 +166,27 @@ impl LLMProvider for Probe {
         model: &str,
         options: Option<&bamboo_llm::provider::LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
+        if options.is_some_and(|options| {
+            options.request_purpose.as_deref() == Some("gold_evaluation")
+                && options.session_id.as_deref() == Some(ROOT_B)
+        }) {
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                    id: "managed-wait-goal-verdict".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "report_gold_evaluation".into(),
+                        arguments: json!({
+                            "decision": "continue",
+                            "confidence": "high",
+                            "reasoning": "The managed assignment still needs verification.",
+                        })
+                        .to_string(),
+                    },
+                }])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         if model == PARENT {
             let home = self.diagnostic_home.lock().unwrap().clone();
             let boundary = home.as_deref().map(provider_boundary_snapshot);
@@ -1093,6 +1114,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     };
     use bamboo_domain::{Role, SessionInboxReceipt, SessionMessageId, SupervisorCurrentUserTarget};
     use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+    use bamboo_engine::runtime::goal_state::{read_goal_state, GoalRuntimeStatus, GoalStopReason};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
     use sha2::{Digest, Sha256};
 
@@ -1137,7 +1159,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     second.workspace = Some(workspace.to_string_lossy().into());
     second.set_workspace_path_meta(workspace.to_string_lossy());
     // With an active Goal, the terminal answer is committed before Stop runs.
-    // A zero continuation budget keeps this fixture on its single provider turn.
+    // Zero continuations admit a terminal Gold verdict after a single Root turn.
     second.metadata.insert(
         GOLD_CONFIG_METADATA_KEY.into(),
         json!({
@@ -1286,6 +1308,12 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         second_input["receipt_id"]
     );
     let second_main = load(&f.state, ROOT_B).await;
+    let goal = read_goal_state(&second_main).expect("the terminal Goal verdict is durable");
+    assert_eq!(goal.status, GoalRuntimeStatus::BudgetLimited);
+    assert_eq!(goal.stop_reason, Some(GoalStopReason::ContinuationBudget));
+    assert_eq!(goal.continuation_count, 0);
+    assert_eq!(goal.eval_history.len(), 1);
+    assert_eq!(goal.eval_history[0].decision, "continue");
     let hook_context = second_main.messages.last().unwrap();
     assert_eq!(hook_context.role, Role::System);
     assert!(hook_context.content.contains("Retained Stop hook context."));
