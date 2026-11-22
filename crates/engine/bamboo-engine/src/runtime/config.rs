@@ -122,7 +122,7 @@ pub struct GoldConfig {
     pub recovery: super::goal_recovery::GoalRecoveryPolicy,
     /// Allow one startup wake from a committed continuation before another
     /// provider round or tool effect was admitted.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub resume_after_restart: bool,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
