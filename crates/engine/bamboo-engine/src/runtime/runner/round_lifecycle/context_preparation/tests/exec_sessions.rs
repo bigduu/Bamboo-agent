@@ -541,8 +541,12 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
     );
     assert!(build_exec_session_continuation_context_block(&required, &schemas).is_none());
     session.set_root_orchestration_only(true).unwrap();
-    assert!(build_exec_session_continuation_context_block(&session, &schemas).is_none());
-    session.set_root_orchestration_only(false).unwrap();
+    assert!(
+        build_exec_session_continuation_context_block(&session, &schemas)
+            .unwrap()
+            .content
+            .contains(&handle)
+    );
     let terminal = tool_payload(
         WriteStdinTool::new()
             .invoke(

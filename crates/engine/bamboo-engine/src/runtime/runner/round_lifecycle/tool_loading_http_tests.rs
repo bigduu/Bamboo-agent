@@ -73,6 +73,7 @@ async fn run_round(
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
     let config = AgentLoopConfig {
         model_name: Some(MODEL.into()),
+        reasoning_effort: session.reasoning_effort,
         ..Default::default()
     };
     let (events, _receiver) = tokio::sync::mpsc::channel(128);
@@ -179,7 +180,15 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
                 .with_target_provider("gemini"),
         ),
     ];
-    let catalog = ["Read", "Glob", "GetFileInfo", "load_skill"].map(schema);
+    let catalog = [
+        "Read",
+        "Glob",
+        "GetFileInfo",
+        "load_skill",
+        "exec_command",
+        "write_stdin",
+    ]
+    .map(schema);
     for (index, provider) in providers.iter().enumerate() {
         let mut session = Session::new(&format!("wire-role-{index}"), MODEL);
         session.add_message(Message::user("Find a file"));
@@ -196,11 +205,30 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
     let bodies = capture(&server).await;
     assert_eq!(bodies.len(), providers.len() * 3);
     for rounds in bodies.chunks_exact(3) {
-        assert_eq!(tool_names(&rounds[0]), ["Read", "discover_capabilities"]);
+        assert_eq!(
+            tool_names(&rounds[0]),
+            [
+                "Read",
+                "exec_command",
+                "write_stdin",
+                "discover_capabilities"
+            ]
+        );
         assert_eq!(
             tool_names(&rounds[1]),
-            ["Read", "Glob", "discover_capabilities"]
+            [
+                "Read",
+                "Glob",
+                "exec_command",
+                "write_stdin",
+                "discover_capabilities"
+            ]
         );
+        for round in &rounds[..2] {
+            assert!(round
+                .to_string()
+                .contains("Use exec_command for authorized shell commands"));
+        }
         assert_eq!(tool_names(&rounds[2]), ["Read", "discover_capabilities"]);
         assert!(rounds[2].to_string().contains(CHILD_GUIDANCE_TITLE));
         assert!(rounds
@@ -223,6 +251,7 @@ async fn child_tool_guidance_matches_current_request_and_stays_out_of_history() 
     );
     let mut session = Session::new("child-tool-guidance", MODEL);
     session.kind = bamboo_domain::SessionKind::Child;
+    session.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Max);
     session.add_message(Message::user("Review the assigned change"));
     let read_only = ["Read", "Glob"].map(schema);
     send(&mut session, &provider, &read_only).await;
@@ -254,6 +283,9 @@ async fn child_tool_guidance_matches_current_request_and_stays_out_of_history() 
         tool_names(restored),
         ["Read", "exec_command", "write_stdin"]
     );
+    for request in [restricted, discovered, restored, no_tools] {
+        assert_eq!(request["reasoning_effort"], "max");
+    }
     assert!(!restored.to_string().contains(CHILD_GUIDANCE_TITLE));
     assert!(tool_names(no_tools).is_empty());
     assert!(no_tools

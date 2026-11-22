@@ -1559,14 +1559,14 @@ mod tests {
                 &storage,
                 &mut owned,
                 PermissionMode::Default,
-                Some("exec_command"),
+                Some("vendor::exec_command"),
             )
             .await
             .unwrap(),
             ApprovalReplayDecision::BlockedByRootToolAuthority
         );
         assert!(owned.root_orchestration_only_enabled());
-        for name in ["Read", "Write", "Edit"] {
+        for name in ["Read", "Write", "Edit", "exec_command", "write_stdin"] {
             assert!(matches!(
                 refresh_approval_replay_posture(
                     &storage,

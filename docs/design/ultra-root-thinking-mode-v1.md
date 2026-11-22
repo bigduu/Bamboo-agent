@@ -2,9 +2,10 @@
 
 Ultra is an independent Root product policy. It increases task-wide reasoning
 through parallel delegation of independent work, Root verification and
-synthesis. An ordinary Ultra Root can also write and edit files with its
-normal workspace and permission checks. Each model call retains its separately resolved ordinary reasoning
-effort. Ultra is not an alias for Max or a claimed provider-native budget.
+synthesis. An ordinary Ultra Root can write and edit files, run commands with
+`exec_command`, and collect results with `write_stdin` under its workspace
+and permission policy. Each model call retains its separately resolved
+ordinary reasoning effort.
 
 ## Authority and wire contract
 
@@ -31,6 +32,8 @@ ordinary `reasoning_effort` separately.
 
 No second persisted field, proof version, journal or stage protocol is added.
 The existing birth token, terminal epoch/receipt and dispatch fences are kept.
+A command approval is bound to the Session's tool authority revision. After a
+mode change, send a new tool call so the current policy can authorize it.
 
 ## Delegated execution evidence and limits
 

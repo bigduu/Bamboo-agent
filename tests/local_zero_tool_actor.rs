@@ -2794,6 +2794,7 @@ async fn root_catalog_fixture() {
             "model": "catalog-root",
             "provider": "openai",
             "model_ref": {"provider": "openai", "model": "catalog-root"},
+            "reasoning_effort": "high",
             "thinking_mode": "standard",
             "permission_mode": "bypass",
             "workspace_path": workspace,
@@ -2816,6 +2817,7 @@ async fn root_catalog_fixture() {
             "model": "catalog-root",
             "provider": "openai",
             "model_ref": {"provider": "openai", "model": "catalog-root"},
+            "reasoning_effort": "high",
             "thinking_mode": "ultra",
             "permission_mode": "bypass",
             "workspace_path": workspace,
@@ -2863,6 +2865,22 @@ async fn root_catalog_fixture() {
     assert!(requests
         .iter()
         .all(|request| request["model"] == "catalog-root"));
+    for (index, request) in requests.iter().enumerate() {
+        let ultra = index > 0;
+        let tools = request["tools"].as_array().unwrap();
+        for shell_tool in ["exec_command", "write_stdin"] {
+            assert!(tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == shell_tool));
+        }
+        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(
+            request["messages"]
+                .to_string()
+                .contains("Use exec_command for authorized shell commands"),
+            ultra
+        );
+    }
     let observed_counts: Vec<_> = requests
         .iter()
         .map(|request| {

@@ -99,6 +99,7 @@ const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubA
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
 Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work. Sequence jobs competing for the same constrained compute.\n\
+Use exec_command for authorized shell commands and write_stdin for returned shell sessions when those tools are exposed.\n\
 Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
 This mode is independent of each model call's reasoning effort.";
 

@@ -337,6 +337,15 @@ impl Fixture {
     }
 
     fn registered_agent(&self, config: Arc<PermissionConfig>, names: &[&str]) -> Agent {
+        let executor = self.registered_executor(config.clone(), names);
+        self.agent_with_executor(Some(config), executor, None)
+    }
+
+    fn registered_executor(
+        &self,
+        config: Arc<PermissionConfig>,
+        names: &[&str],
+    ) -> Arc<dyn ToolExecutor> {
         let registry = bamboo_tools::ToolRegistry::new();
         for name in names {
             registry
@@ -347,11 +356,12 @@ impl Fixture {
                 })
                 .unwrap();
         }
-        let executor = bamboo_tools::executor::BuiltinToolExecutor::with_registry_and_permissions(
-            registry,
-            Arc::new(ConfigPermissionChecker::new(config.clone())),
-        );
-        self.agent_with_executor(Some(config), Arc::new(executor), None)
+        Arc::new(
+            bamboo_tools::executor::BuiltinToolExecutor::with_registry_and_permissions(
+                registry,
+                Arc::new(ConfigPermissionChecker::new(config)),
+            ),
+        )
     }
 
     async fn reload(&self, id: &str) -> Session {
@@ -444,17 +454,22 @@ fn waiting_result(request: &PermissionRequest) -> ToolResult {
 }
 
 fn parked(id: &str, typed: bool) -> (Session, PermissionRequest) {
+    parked_for_tool(id, typed, "exec_command")
+}
+
+fn parked_for_tool(id: &str, typed: bool, tool: &str) -> (Session, PermissionRequest) {
     let mut session = Session::new(id, "test-model");
     session.agent_runtime_state = Some(AgentRuntimeState::new(id));
     session.add_message(Message::system("caller System"));
     session.add_message(Message::user("perform the operation"));
-    let current = request(
+    let mut current = request(
         id,
         CURRENT,
         "current-command",
         PermissionType::ExecuteCommand,
     );
-    for (name, request) in [
+    current.tool_name = tool.into();
+    for (name, mut request) in [
         (
             "old",
             request(
@@ -466,13 +481,14 @@ fn parked(id: &str, typed: bool) -> (Session, PermissionRequest) {
         ),
         ("current", current.clone()),
     ] {
+        request.tool_name = tool.into();
         session.add_message(Message::assistant(
             "",
             Some(vec![ToolCall {
                 id: CALL.into(),
                 tool_type: "function".into(),
                 function: FunctionCall {
-                    name: "exec_command".into(),
+                    name: tool.into(),
                     arguments: json!({"cmd": request.resource}).to_string(),
                 },
             }]),
@@ -490,7 +506,7 @@ fn parked(id: &str, typed: bool) -> (Session, PermissionRequest) {
     }
     session.set_pending_question_with_source(
         CALL.into(),
-        "exec_command".into(),
+        tool.into(),
         "Permission required".into(),
         vec!["Approve".into(), "Deny".into()],
         false,
@@ -619,15 +635,26 @@ fn alias_config() -> Arc<PermissionConfig> {
 }
 
 async fn alias_pending_fixture() -> (Fixture, Session, PermissionRequest) {
+    alias_pending_in_mode(false).await
+}
+
+async fn alias_pending_in_mode(ultra: bool) -> (Fixture, Session, PermissionRequest) {
     let fixture = Fixture::new().await;
     let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
     *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
-    let initial_events =
-        events(agent.run_stream(Session::new("alias-pending", "test-model"), "operate")).await;
+    let id = if ultra {
+        "alias-pending-ultra"
+    } else {
+        "alias-pending"
+    };
+    let mut session = Session::new(id, "test-model");
+    session.set_root_orchestration_only(ultra).unwrap();
+    let initial_events = events(agent.run_stream(session, "operate")).await;
     assert!(initial_events
         .iter()
         .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
-    let pending = agent.load_session("alias-pending").await.unwrap().unwrap();
+    let pending = agent.load_session(id).await.unwrap().unwrap();
+    assert_eq!(pending.root_orchestration_only_enabled(), ultra);
     assert_eq!(
         pending.pending_question.as_ref().unwrap().tool_name,
         "default::exec_command"
@@ -661,7 +688,13 @@ async fn typed_alias_pending_retains_the_real_original_question_identity() {
 
 #[tokio::test]
 async fn typed_alias_approved_replay_reaches_the_registered_exec_owner() {
-    let (mut fixture, _, request) = Box::pin(alias_pending_fixture()).await;
+    for ultra in [false, true] {
+        check_typed_alias_approved_replay(ultra).await;
+    }
+}
+
+async fn check_typed_alias_approved_replay(ultra: bool) {
+    let (mut fixture, _, request) = Box::pin(alias_pending_in_mode(ultra)).await;
     fixture.approve(&request).await;
     fixture.reopen_store().await;
     let agent = fixture.registered_agent(alias_config(), &["exec_command"]);
@@ -672,10 +705,13 @@ async fn typed_alias_approved_replay_reaches_the_registered_exec_owner() {
         .unwrap();
     let calls_before = fixture.probe.provider_calls.load(Ordering::SeqCst);
     let completed = events(agent.resume_stream(session)).await;
-    assert!(!completed.iter().any(|event| matches!(
-        event,
-        AgentEvent::Error { .. } | AgentEvent::NeedClarification { .. }
-    )));
+    assert!(
+        !completed.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { .. } | AgentEvent::NeedClarification { .. }
+        )),
+        "ultra={ultra}: {completed:#?}"
+    );
     let calls = fixture.probe.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "exec_command");
@@ -766,22 +802,30 @@ async fn sdk_approval_replay_does_not_retain_a_completed_original_output_cap_sco
 }
 
 #[tokio::test]
-async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
+async fn approved_shell_alias_requires_a_new_operation_after_durable_ultra_selection() {
     let (fixture, _, request) = Box::pin(alias_pending_fixture()).await;
     let stale = fixture.approve(&request).await;
     let mut latest = stale.clone();
     latest.set_root_orchestration_only(true).unwrap();
+    let pending_result_id = latest
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+        .unwrap()
+        .id
+        .clone();
+    let expected_pending_result = result_message(&latest, &pending_result_id);
     fixture.store.save_session(&latest).await.unwrap();
 
     let config = alias_config();
     let agent = fixture.registered_agent(config.clone(), &["exec_command"]);
     let completed = events(agent.resume_stream(stale)).await;
-    assert!(!completed.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolLifecycle { .. }
-            | AgentEvent::ToolComplete { .. }
-            | AgentEvent::Error { .. }
-    )));
+    assert!(
+        completed.iter().any(|event| matches!(event, AgentEvent::Error { message }
+            if message.contains("pending operation binding does not match the original caller/operation"))),
+        "{completed:#?}"
+    );
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
     assert!(!config.consume_once_for_generation(
@@ -792,20 +836,16 @@ async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
         "current-command",
     ));
     let saved = fixture.reload(&request.session_id).await;
-    assert!(!saved
-        .metadata
-        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
-    assert!(!saved
-        .metadata
-        .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
-    let result = saved
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
-        .unwrap();
-    assert_eq!(result.tool_success, Some(false));
-    assert!(result.content.contains("Root orchestration policy blocked"));
+    assert!(saved.root_orchestration_only_enabled());
+    assert_eq!(saved.metadata[PERMISSION_REEXECUTE_METADATA_KEY], CALL);
+    assert_eq!(
+        saved.metadata[PERMISSION_REEXECUTE_GENERATION_METADATA_KEY],
+        request.request_generation
+    );
+    assert_eq!(
+        result_message(&saved, &pending_result_id),
+        expected_pending_result
+    );
 }
 
 #[tokio::test]
@@ -1470,7 +1510,8 @@ impl RuntimeSessionPersistence for FailAfterBlockedCommit {
 #[tokio::test]
 async fn sdk_post_commit_blocked_save_error_reloads_consumed_approval_in_caller_snapshot() {
     let fixture = Fixture::new().await;
-    let (mut pending, request) = parked("post-commit-blocked", true);
+    let tool = "default::exec_command";
+    let (mut pending, request) = parked_for_tool("post-commit-blocked", true, tool);
     fixture.repo.save(&mut pending).await.unwrap();
     let mut approved = fixture.approve(&request).await;
     let mut latest = approved.clone();
@@ -1481,12 +1522,9 @@ async fn sdk_post_commit_blocked_save_error_reloads_consumed_approval_in_caller_
         inner: fixture.persistence.clone(),
         attempts: AtomicUsize::new(0),
     });
-    let agent = fixture.agent(
-        Some(Arc::new(PermissionConfig::new())),
-        true,
-        false,
-        Some(persistence.clone()),
-    );
+    let config = Arc::new(PermissionConfig::new());
+    let executor = fixture.registered_executor(config.clone(), &[tool]);
+    let agent = fixture.agent_with_executor(Some(config), executor, Some(persistence.clone()));
     let error = Box::pin(agent.resume(&mut approved)).await.unwrap_err();
     assert!(error
         .to_string()
