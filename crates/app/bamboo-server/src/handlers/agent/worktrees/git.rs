@@ -336,6 +336,12 @@ pub fn repository_until(repo: &Path, deadline_at: Instant) -> Result<PathBuf, St
     repository_by(repo, deadline_at)
 }
 
+pub(super) fn is_primary_checkout_until(repo: &Path, common: &Path, deadline_at: Instant) -> bool {
+    git_path_by(repo, &["rev-parse", "--absolute-git-dir"], deadline_at)
+        .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
+        .is_ok_and(|path| path == common)
+}
+
 fn repository_by(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     let value = git_path_by(
         repo,

@@ -1469,6 +1469,16 @@ async fn apply_completed_tool_execution_outcome(
             )?;
         }
     }
+    if ctx.admitted_execution_name == Some("session_control")
+        && ctx.session.supervisor_incarnation_id().is_some()
+        && outcome.result.as_ref().is_ok_and(|result| {
+            result.success
+                && result.display_preference.as_deref()
+                    == Some(bamboo_orchestration::managed_session::SUPERVISOR_WAIT_YIELD)
+        })
+    {
+        ctx.state.yield_supervisor_wait = true;
+    }
     // The tool has validated the exact target. Recover it from the call so a
     // small tool-output budget cannot erase the runtime's wait request.
     if ctx.admitted_execution_name == Some("SubAgent")

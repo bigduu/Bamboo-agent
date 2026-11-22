@@ -26,6 +26,9 @@ use crate::execution::{
 use crate::runtime::config::{
     BashResumeHook, GuardianSpawner, RunDeadline, BASH_COMPLETION_RESUME_KIND,
 };
+use crate::runtime::goal_state::{
+    read_goal_state, write_goal_state, GoalRuntimeStatus, GOAL_STATE_METADATA_KEY,
+};
 use crate::runtime::guardian_state::{
     parse_guardian_verdict, read_guardian_config, read_guardian_state, write_guardian_state,
     GuardianVerdict,
@@ -1164,6 +1167,156 @@ impl ChildCompletionCoordinator {
             coordinator.spawn_resume_with_origin(request, origin).await;
         });
         Ok(())
+    }
+
+    /// Resume the exact Goal startup checkpoint under a newly fenced Root.
+    pub async fn resume_goal_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint: crate::runtime::goal_restart::GoalRestartCheckpoint,
+        startup: chrono::DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        let Some(mut reservation) = self.reserve_paced_loop_turn(session_id).await else {
+            return Ok(());
+        };
+        let guard = self.persistence.acquire_lock(session_id).await;
+        let Some(mut session) = self.storage.load_session(session_id).await? else {
+            return Ok(());
+        };
+        if crate::runtime::goal_restart::eligible_checkpoint(&session, startup).as_ref()
+            != Some(&checkpoint)
+        {
+            return Ok(());
+        }
+        let inbox = self
+            .agent
+            .session_inbox()
+            .ok_or_else(|| std::io::Error::other("Goal restart requires the Session Inbox"))?;
+        if inbox
+            .inspect(session_id)
+            .await
+            .map_err(std::io::Error::other)?
+            .oldest_generation
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.prepare_paced_loop_turn(&mut reservation, &session)
+            .await?;
+        let writer = reservation.root_actor_writer().ok_or_else(|| {
+            std::io::Error::other("Goal restart requires the current Root writer")
+        })?;
+        if checkpoint.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(());
+        }
+        let expected = session.clone();
+        crate::runtime::goal_restart::consume(&mut session, &checkpoint);
+        drop(guard);
+        self.start_bound_goal_turn(session, &expected, reservation)
+            .await
+    }
+
+    /// Admit the explicitly requested resume during this Root activation.
+    /// A later change to the Goal cannot reactivate a queued command.
+    pub async fn resume_requested_goal(
+        &self,
+        observed: &Session,
+        instruction: bamboo_agent_core::Message,
+    ) -> std::io::Result<()> {
+        let conflict = || {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "The saved Goal or its pending input changed. Check the session and retry.",
+            )
+        };
+        let id = &observed.id;
+        let Some(mut reservation) = self.reserve_paced_loop_turn(id).await else {
+            return Err(conflict());
+        };
+        let guard = self.persistence.acquire_lock(id).await;
+        let current = self.storage.load_session(id).await?.ok_or_else(conflict)?;
+        if current.created_at != observed.created_at
+            || current.metadata_version != observed.metadata_version
+            || current.metadata.get(GOLD_CONFIG_METADATA_KEY)
+                != observed.metadata.get(GOLD_CONFIG_METADATA_KEY)
+            || current.metadata.get(GOAL_STATE_METADATA_KEY)
+                != observed.metadata.get(GOAL_STATE_METADATA_KEY)
+            || current.messages.last().map(|message| &message.id)
+                != observed.messages.last().map(|message| &message.id)
+            || current.has_runtime_wait()
+            || current.last_run_status().as_deref() == Some("pending")
+        {
+            return Err(conflict());
+        }
+        let mut goal = read_goal_state(&current)
+            .filter(|goal| {
+                matches!(
+                    goal.status,
+                    GoalRuntimeStatus::Active
+                        | GoalRuntimeStatus::Blocked
+                        | GoalRuntimeStatus::BudgetLimited
+                )
+            })
+            .ok_or_else(conflict)?;
+        let inbox = self
+            .agent
+            .session_inbox()
+            .ok_or_else(|| std::io::Error::other("Goal resume requires the Session Inbox"))?;
+        if inbox
+            .inspect(id)
+            .await
+            .map_err(std::io::Error::other)?
+            .oldest_generation
+            .is_some()
+        {
+            return Err(conflict());
+        }
+        self.prepare_paced_loop_turn(&mut reservation, &current)
+            .await?;
+        let mut resumed = current.clone();
+        if !goal.status.is_active() {
+            goal.status = GoalRuntimeStatus::Active;
+            goal.stop_reason = None;
+            write_goal_state(&mut resumed, goal);
+        }
+        resumed.add_message(instruction);
+        resumed.set_last_run_status("running");
+        resumed.clear_last_run_error();
+        drop(guard);
+        self.start_bound_goal_turn(resumed, &current, reservation)
+            .await
+    }
+
+    async fn start_bound_goal_turn(
+        &self,
+        mut session: Session,
+        expected: &Session,
+        reservation: SessionExecutionReservation,
+    ) -> std::io::Result<()> {
+        let persistence = reservation
+            .execution_persistence()
+            .ok_or_else(|| std::io::Error::other("Goal restart requires fenced persistence"))?;
+        if let Err(error) = persistence
+            .save_bound_startup_session(&mut session, expected)
+            .await
+        {
+            reservation.abandon().await;
+            return Err(error);
+        }
+
+        let config_snapshot = self.config.read().await.clone();
+        let config = self.build_resume_config(&session, &config_snapshot);
+        let request = ResumeSpawnRequest {
+            session_id: session.id.clone(),
+            event_sender: ResumeExecutionPort::get_or_create_event_sender(self, &session.id).await,
+            session,
+            execution_reservation: reservation,
+            config,
+        };
+        ResumeExecutionPort::dispatch_configured_resume_execution(self, request)
+            .map_err(|_| std::io::Error::other("Goal restart owner did not accept the checkpoint"))
     }
 
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers

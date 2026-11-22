@@ -1,11 +1,12 @@
 //! Authenticated single-owner HTTP projections over the same Ticket service.
+pub mod codex_handoff;
 pub mod patrol;
 pub mod ready_policy;
 pub mod sprints;
 pub mod token_budget;
 use actix_web::{http::StatusCode, web, HttpMessage, HttpRequest, HttpResponse, ResponseError};
 use bamboo_engine::ticket_worker_plan::tickets::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -141,7 +142,17 @@ pub async fn project_board(
         .project_store
         .get(&body.project_id)
         .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(service.project_board(&authority, &body)?))
+    #[derive(Serialize)]
+    struct BoardResponse {
+        #[serde(flatten)]
+        page: ReadEnvelope<ProjectBoard>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        codex_handoff_available: bool,
+    }
+    Ok(HttpResponse::Ok().json(BoardResponse {
+        page: service.project_board(&authority, &body)?,
+        codex_handoff_available: codex_handoff::require_local(&req).is_ok(),
+    }))
 }
 
 #[derive(Deserialize)]

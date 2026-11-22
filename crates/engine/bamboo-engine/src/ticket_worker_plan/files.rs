@@ -19,6 +19,22 @@ pub const TICKET_FILE_ACTION: &str = "_ticket_workspace_file_v1";
 /// Read-only preflight for an explicitly prepared Git worktree. This never
 /// creates branches or workspaces, and runs outside the Ticket transaction lock.
 pub async fn verify_workspace(workspace: bamboo_tickets::ExecutionWorkspace) -> Result<()> {
+    verify_git_workspace(workspace, false).await
+}
+
+/// An explicitly stopped Work may have committed progress on its own branch.
+/// The selected worktree must still belong to the recorded repository and
+/// branch, and HEAD must descend from the prepared base.
+pub async fn verify_continuation_workspace(
+    workspace: bamboo_tickets::ExecutionWorkspace,
+) -> Result<()> {
+    verify_git_workspace(workspace, true).await
+}
+
+async fn verify_git_workspace(
+    workspace: bamboo_tickets::ExecutionWorkspace,
+    allow_committed_progress: bool,
+) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         use std::{path::Path, process::Command};
         fn git(path: &str, args: &[&str]) -> Result<String> {
@@ -46,7 +62,6 @@ pub async fn verify_workspace(workspace: bamboo_tickets::ExecutionWorkspace) -> 
             )?)
             .canonicalize()?
                 != root
-            || git(&workspace.worktree, &["rev-parse", "HEAD"])? != workspace.base_commit
             || git(&workspace.worktree, &["symbolic-ref", "--short", "HEAD"])? != workspace.branch
             || Path::new(&git(
                 &workspace.worktree,
@@ -59,6 +74,23 @@ pub async fn verify_workspace(workspace: bamboo_tickets::ExecutionWorkspace) -> 
                 )?)
                 .canonicalize()?
         {
+            return Err(Error::ScopeDenied(
+                "Assignment must use its exact isolated repo/base/branch/worktree".into(),
+            ));
+        }
+        let base = workspace.base_commit.as_str();
+        let base_matches = if allow_committed_progress {
+            matches!(base.len(), 40 | 64)
+                && base.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && git(
+                    &workspace.worktree,
+                    &["merge-base", "--is-ancestor", base, "HEAD"],
+                )
+                .is_ok()
+        } else {
+            git(&workspace.worktree, &["rev-parse", "HEAD"])? == base
+        };
+        if !base_matches {
             return Err(Error::ScopeDenied(
                 "Assignment must use its exact isolated repo/base/branch/worktree".into(),
             ));

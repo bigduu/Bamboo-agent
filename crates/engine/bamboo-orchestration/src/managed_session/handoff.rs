@@ -15,13 +15,14 @@ const DISPLAYED_SOURCES: usize = 3;
 
 pub const DISPATCH_CONFIRMATION: &str = concat!(
     "The first input and delivery subscription are recorded. ",
-    "Confirm dispatch in one sentence using the task names. Keep routing IDs, receipt details ",
-    "and execution status in the tools."
+    "Confirm ready dispatches once by task name and end the turn. Keep IDs, receipt details and execution status in the tools. ",
+    "The Inbox wakes this Supervisor for delivery or an actionable blocker."
 );
 
 pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
-    "Dispatch directly with a short task title in the user's language or the exact title they supplied. Subscribe to results when offered. ",
-    "Confirm dispatch once by task name. Use the Run receipt for progress. Park Sessions pending approval. Let the card collect the decision and advance independent work in available Sessions.\n",
+    "Dispatch directly with a short task title in the user's language or the exact title they supplied. Subscribe on supported dispatches and followups. ",
+    "Confirm ready dispatches once by task name and end the turn. Resume on Inbox delivery, actionable blockers, or a new request. ",
+    "Read bounded progress on request or for an evidence gap. Park Sessions pending approval and advance independent work while cards collect decisions.\n",
     "For each new handoff, give a brief update in the user's language with the Worker's conclusion, key sources and uncertainty. ",
     "Inspect the referenced result for a specific evidence gap, requested detail or acceptance. ",
     "For ongoing work, dispatch the next authorized step before reporting, including bounded reproduction or missing validation when needed.\n",

@@ -232,10 +232,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // SDK, Server, and CLI test owners. The additive contexts stay the same.
 // Shell wait guidance uses the existing Engine continuation and prompt tests.
 // #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
+// Codex Work handoff uses the default server-app-state and server-tests-0
+// owners. Continuation formatting stays in the Orchestration packages-3 owner.
 // #2940 enables the Messages comparison in the existing bamboo-llm default owner.
 // #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
 // #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
-const FEATURE_SOURCE_SHA256 = "b2311285ee473245cf9c8f3a80733d207903e6aedd7c794765133ac2cfb5b012";
+const FEATURE_SOURCE_SHA256 = "6789b05788e094047746798cba671d6ca40266d7c5dd0306d919abb3bf4c6822";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
