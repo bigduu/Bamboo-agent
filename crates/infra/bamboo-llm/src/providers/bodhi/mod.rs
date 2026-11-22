@@ -31,6 +31,8 @@ use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 pub struct BodhiProvider {
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_wire_types: bool,
     client: Client,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
@@ -44,6 +46,8 @@ pub struct BodhiProvider {
 impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_wire_types: false,
             client: crate::http_client::default_http_client(),
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
@@ -84,6 +88,20 @@ impl BodhiProvider {
 
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
+        self
+    }
+
+    /// Use the same pinned wire types as the direct provider adapters.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = true;
+        self
+    }
+
+    /// Select Bamboo's original wire adapters for this gateway.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = false;
         self
     }
 
@@ -409,16 +427,38 @@ impl BodhiProvider {
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let mut body = build_anthropic_request_with_cache(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            true,
-            reasoning_effort,
-            None,
-            cache_plan,
-        );
+        #[cfg(feature = "litellm-wire-types")]
+        let body = self
+            .litellm_wire_types
+            .then(|| {
+                crate::providers::anthropic::build_litellm_anthropic_proxy_request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    reasoning_effort,
+                    cache_plan,
+                )
+            })
+            .transpose()?;
+        #[cfg(not(feature = "litellm-wire-types"))]
+        let body: Option<Value> = None;
+        let mut body = body.unwrap_or_else(|| {
+            build_anthropic_request_with_cache(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                true,
+                reasoning_effort,
+                None,
+                cache_plan,
+            )
+        });
+        #[cfg(feature = "litellm-wire-types")]
+        let prepared_budget = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64);
         apply_required_tool_choice(&mut body, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut body,
@@ -427,6 +467,14 @@ impl BodhiProvider {
             request_overrides::ENDPOINT_MESSAGES,
             model,
         )?;
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            crate::providers::anthropic::finalize_litellm_anthropic_proxy_request(
+                &mut body,
+                model,
+                prepared_budget,
+            )?;
+        }
 
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
         apply_cache_ttl_header(&mut headers, cache_plan);

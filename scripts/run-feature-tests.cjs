@@ -234,7 +234,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
 // Codex Work handoff uses the default server-app-state and server-tests-0
 // owners. Continuation formatting stays in the Orchestration packages-3 owner.
-const FEATURE_SOURCE_SHA256 = "cde2745a1ada7c28d20bdce765e4990c69b0819096f7bee64e7b00b5d237f2ad";
+// #2940 enables the Messages comparison in the existing bamboo-llm default owner.
+const FEATURE_SOURCE_SHA256 = "328c245feaaf0f304a8fec07ad3ec3677f6854cff59492f4392d4c49b1162ab0";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
