@@ -293,6 +293,8 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             "blocker",
             "same child",
             "nested delegation",
+            "end the turn",
+            "Resume on Inbox delivery",
             "assigned acceptance criteria",
             "reject the exact current submission",
             "Verify the corrected result",
