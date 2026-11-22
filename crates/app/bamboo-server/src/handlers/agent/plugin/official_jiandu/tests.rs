@@ -19,7 +19,9 @@ pub(super) async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> w
     web::Data::new(state)
 }
 
-async fn fixture() -> (
+async fn fixture(
+    version: &str,
+) -> (
     tempfile::TempDir,
     web::Data<AppState>,
     Catalog,
@@ -32,9 +34,14 @@ async fn fixture() -> (
     tokio::fs::create_dir_all(plugin_dir.join("bin/macos"))
         .await
         .unwrap();
-    let manifest = b"{\"id\":\"jiandu\",\"version\":\"0.3.2\",\"provides\":{}}\n";
+    let manifest = serde_json::json!({
+        "id": "jiandu",
+        "version": version,
+        "provides": {},
+    })
+    .to_string();
     let binary = b"fixture executable bytes; never launched";
-    tokio::fs::write(plugin_dir.join("plugin.json"), manifest)
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest)
         .await
         .unwrap();
     tokio::fs::write(plugin_dir.join("bin/macos/jiandu"), binary)
@@ -51,12 +58,12 @@ async fn fixture() -> (
         .unwrap();
     }
     let release = Release {
-        version: "0.3.2".into(),
-        manifest_url:
-            "https://github.com/bigduu/Jiandu/releases/download/v0.3.2/jiandu-plugin-v0.3.2.tar.gz"
-                .into(),
+        version: version.into(),
+        manifest_url: format!(
+            "https://github.com/bigduu/Jiandu/releases/download/v{version}/jiandu-plugin-v{version}.tar.gz"
+        ),
         sha256: "a".repeat(64),
-        manifest_sha256: digest(manifest),
+        manifest_sha256: digest(manifest.as_bytes()),
         executable_sha256: BTreeMap::from([("macos".into(), digest(binary))]),
     };
     let entry = InstalledPlugin {
@@ -79,7 +86,7 @@ async fn fixture() -> (
     save(&state, entry.clone()).await;
     let catalog = Catalog {
         release: Some(release),
-        legacy_release: None,
+        legacy_releases: Vec::new(),
     };
     (dir, state, catalog, entry)
 }
@@ -142,7 +149,7 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
     assert_eq!(report["host"]["os"], std::env::consts::OS);
     assert_eq!(report["host"]["arch"], std::env::consts::ARCH);
     assert_eq!(report["installed"]["state"], "missing");
-    assert_eq!(report["release"]["version"], "0.4.0");
+    assert_eq!(report["release"]["version"], "0.5.0");
     assert!(report["external_client"].is_null());
     assert!(!state.app_data_dir.join("plugins/installed.json").exists());
     for body in [
@@ -183,7 +190,7 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
 
 #[actix_web::test]
 async fn ready_configuration_shares_actual_custom_root_without_registering_mcp() {
-    let (_dir, state, catalog, _entry) = fixture().await;
+    let (_dir, state, catalog, _entry) = fixture("0.3.2").await;
     let before = serde_json::to_value(&state.config.read().await.mcp).unwrap();
     let report = setup(&state, mac(), &catalog).await.unwrap();
     assert_eq!(report.installed.state, "ready");
@@ -206,38 +213,41 @@ async fn ready_configuration_shares_actual_custom_root_without_registering_mcp()
 
 #[actix_web::test]
 async fn verified_legacy_connector_keeps_its_configuration_until_explicit_update() {
-    let (_dir, state, previous, entry) = fixture().await;
-    let mut catalog = accepted_catalog();
-    assert_eq!(
-        catalog.legacy_release.as_ref().unwrap().version,
-        entry.version
-    );
-    catalog.legacy_release = previous.release;
-    let report = setup(&state, mac(), &catalog).await.unwrap();
-    assert_eq!(report.release.unwrap().version, "0.3.2");
-    assert_eq!(report.installed.state, "ready");
-    assert_eq!(report.installed.version.as_deref(), Some("0.3.2"));
-    assert_eq!(report.install.reason, Some("already_installed"));
-    let client = report.external_client.unwrap();
-    assert_eq!(
-        client.args,
-        [
-            "--data-dir",
-            state.memory_store.data_dir().to_str().unwrap()
-        ]
-    );
+    for version in ["0.3.2", "0.4.0"] {
+        let (_dir, state, previous, entry) = fixture(version).await;
+        let mut catalog = accepted_catalog();
+        let release = catalog
+            .legacy_releases
+            .iter_mut()
+            .find(|release| release.version == version)
+            .expect("a signed legacy version remains in the catalog");
+        *release = previous.release.unwrap();
+        let report = setup(&state, mac(), &catalog).await.unwrap();
+        assert_eq!(report.release.unwrap().version, version);
+        assert_eq!(report.installed.state, "ready");
+        assert_eq!(report.installed.version.as_deref(), Some(version));
+        assert_eq!(report.install.reason, Some("already_installed"));
+        let client = report.external_client.unwrap();
+        assert_eq!(
+            client.args,
+            [
+                "--data-dir",
+                state.memory_store.data_dir().to_str().unwrap()
+            ]
+        );
 
-    tokio::fs::write(entry.plugin_dir.join("bin/macos/jiandu"), b"changed")
-        .await
-        .unwrap();
-    let report = setup(&state, mac(), &catalog).await.unwrap();
-    assert_eq!(report.installed.state, "unverified");
-    assert!(report.external_client.is_none());
+        tokio::fs::write(entry.plugin_dir.join("bin/macos/jiandu"), b"changed")
+            .await
+            .unwrap();
+        let report = setup(&state, mac(), &catalog).await.unwrap();
+        assert_eq!(report.installed.state, "unverified");
+        assert!(report.external_client.is_none());
+    }
 }
 
 #[actix_web::test]
 async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_command() {
-    let (_dir, state, catalog, original) = fixture().await;
+    let (_dir, state, catalog, original) = fixture("0.3.2").await;
     let mut cases = vec![];
     let mut entry = original.clone();
     entry.status = PluginInstallStatus::Installing;
@@ -304,7 +314,7 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
 
 #[actix_web::test]
 async fn tampered_manifest_binary_and_duplicate_registry_are_refused() {
-    let (_dir, state, catalog, entry) = fixture().await;
+    let (_dir, state, catalog, entry) = fixture("0.3.2").await;
     let manifest = entry.plugin_dir.join("plugin.json");
     let original = tokio::fs::read(&manifest).await.unwrap();
     tokio::fs::write(&manifest, b"tampered").await.unwrap();
@@ -334,7 +344,7 @@ async fn tampered_manifest_binary_and_duplicate_registry_are_refused() {
 #[cfg(unix)]
 #[actix_web::test]
 async fn symlinked_directory_and_executable_are_refused_even_with_matching_bytes() {
-    let (dir, state, catalog, entry) = fixture().await;
+    let (dir, state, catalog, entry) = fixture("0.3.2").await;
     let executable = entry.plugin_dir.join("bin/macos/jiandu");
     let outside = dir.path().join("outside");
     tokio::fs::rename(&executable, &outside).await.unwrap();
@@ -428,7 +438,7 @@ async fn equal_or_nested_memory_root_blocks_setup_and_official_install_without_m
 
 #[actix_web::test]
 async fn completed_connector_never_exports_an_overlapping_active_store() {
-    let (_dir, state, catalog, entry) = fixture().await;
+    let (_dir, state, catalog, entry) = fixture("0.3.2").await;
     let state = isolated_state(
         state.app_data_dir.clone(),
         entry.plugin_dir.join("canonical-store"),
