@@ -166,12 +166,49 @@ mod tests {
     use super::*;
     use bamboo_agent_core::{FunctionCall, ToolCall};
     use bamboo_domain::ActorActivationClaim;
+    use bamboo_llm::{Config, LLMError, LLMProvider, LLMStream, ProviderRegistry};
+    use std::{collections::HashMap, sync::Arc};
+
+    struct LocalProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for LocalProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Auth("The fixture stops after startup".into()))
+        }
+    }
 
     #[actix_web::test]
     async fn interrupted_goal_resumes_the_same_checkpoint_once_and_retains_its_budget() {
         let directory = tempfile::tempdir().unwrap();
-        let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let home = directory.path().to_path_buf();
+        let provider: Arc<dyn LLMProvider> = Arc::new(LocalProvider);
+        let provider_name = "manual-goal-test";
+        let mut host_config = Config::from_data_dir(Some(home.clone()));
+        host_config.provider = provider_name.into();
+        let state = web::Data::new(
+            AppState::new_with_provider_for_legacy_ingress_test(
+                home,
+                host_config,
+                provider.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        state.provider_registry.replace_with(ProviderRegistry::new(
+            HashMap::from([(provider_name.into(), provider)]),
+            provider_name.into(),
+        ));
         let mut session = Session::new("interrupted-goal", "model");
+        session
+            .metadata
+            .insert("provider".into(), provider_name.into());
         let config = json!({"enabled": true, "auto_continue_enabled": true, "goal": "Ship the verified result", "max_auto_continuations": 3});
         let goal = json!({
             "objective": "Ship the verified result",
