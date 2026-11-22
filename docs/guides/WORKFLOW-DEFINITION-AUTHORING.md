@@ -4,6 +4,22 @@ The explicit authoring API creates and updates schema-1 orchestration definition
 in the existing Skill catalog. It does not execute a plan or approve execution.
 Markdown instruction-workflow settings and `workflow_run` remain separate.
 
+## Scope reusable guidance to a workflow
+
+An instruction Workflow can hold the method, constraints and acceptance checks
+for a repeated kind of work. Select it for the session that needs the method.
+The runtime loads its instructions from the selected revision, so ordinary
+sessions only need the general execution guidance. The
+[verified delivery example](../examples/workflows/verified-delivery/SKILL.md)
+keeps input files read-only and checks the saved artifact against the current
+request. Install the bundle in a user or Project Skill catalog and select it
+explicitly.
+
+Use a schema-1 orchestration definition when the order, inputs and outputs are
+known in advance. Put required dependencies, retry limits and resource budgets
+in its typed plan. A plan can run those steps and record each outcome. Keep
+permissions and cancellation with the host.
+
 ## Endpoints
 
 All paths below are relative to the authenticated `/api/v1` scope.

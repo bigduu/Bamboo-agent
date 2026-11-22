@@ -14,6 +14,7 @@ use actix_web::{body, web};
 
 use bamboo_agent_core::storage::Storage as _;
 use bamboo_agent_core::{Message, Role, Session, SessionKind, TokenUsage};
+use bamboo_engine::config::RunDeadline;
 use bamboo_server::app_state::AppState;
 use bamboo_server::handlers::agent::execute::{handle_execute, ExecuteRequest, ExecuteResponse};
 use bamboo_server::handlers::agent::respond::{submit_response, RespondRequest};
@@ -216,9 +217,8 @@ pub struct HeadlessArgs {
     pub provider: Option<String>,
     /// Cancel the run if it hasn't finished within this many seconds (wall
     /// clock; counts any permission-gate round trips). `None` never times out.
-    /// This is CLIENT-side only — `ExecuteRequest` has no per-run deadline
-    /// field to delegate to, so this reuses the same cancellation path as
-    /// Ctrl-C rather than inventing server-side behavior.
+    /// The local caller shares its clock with the runner prompt and uses the
+    /// same cancellation path as Ctrl-C.
     pub timeout_secs: Option<u64>,
 }
 
@@ -656,6 +656,16 @@ async fn run_session(
         OutputMode::Text => eprintln!("▶ session {session_id}"),
         OutputMode::Json => {}
     }
+    // Start the clock once, before execution admission. Resume uses the same
+    // deadline and the HTTP request schema remains unchanged.
+    let run_deadline = args
+        .timeout_secs
+        .map(|secs| RunDeadline::new(Duration::from_secs(secs)));
+    let _deadline_binding = run_deadline.map(|deadline| {
+        state
+            .child_completion_coordinator
+            .bind_headless_run_deadline(session_id.clone(), deadline)
+    });
     let data = web::Data::new(state);
     // -p / ExecuteRequest parity (#246 part A): every field `ExecuteRequest`
     // actually carries (model/provider/model_ref, skill_mode, reasoning_effort)
@@ -664,9 +674,7 @@ async fn run_session(
     // per-execute `--allowed-tools`/`--disallowed-tools`, and `--max-turns` are
     // intentionally NOT exposed as CLI flags: `ExecuteRequest` has no fields
     // for them today, and adding flags with no server-side effect would be
-    // inventing behavior the API doesn't back. `--timeout` IS added, but as a
-    // client-side wall-clock cutoff (reuses the Ctrl-C cancellation path
-    // below) rather than a request field, for the same reason.
+    // inventing behavior the API doesn't back.
     let response = handle_execute(
         data.clone(),
         session_id.clone(),
@@ -730,10 +738,6 @@ async fn run_session(
     let mut exit: Result<(), String> = Ok(());
     let mut streamed_tokens = false;
     let mut reasoning_progress = ReasoningProgress::default();
-    // `--timeout`: measured from before the FIRST execute, so it covers the
-    // whole run wall-clock including any permission-gate round trips across
-    // resumed segments below (not reset per segment).
-    let overall_start = Instant::now();
     let mut timed_out = false;
 
     'run: loop {
@@ -786,15 +790,13 @@ async fn run_session(
                     // then fall through to the same terminal-event + quiescence draining
                     // below so the "cancelled" event is observed and the tree actually
                     // winds down before we exit.
-                    if !timed_out {
-                        if let Some(secs) = args.timeout_secs {
-                            if overall_start.elapsed() >= Duration::from_secs(secs) {
-                                timed_out = true;
-                                eprintln!("\n⏰ --timeout {secs}s reached — cancelling…");
-                                if let Some(runner) = data.agent_runners.read().await.get(&session_id) {
-                                    runner.cancel_token.cancel();
-                                }
-                            }
+                    if let Some(secs) = args.timeout_secs.filter(|_| {
+                        !timed_out && run_deadline.is_some_and(|deadline| deadline.remaining().is_zero())
+                    }) {
+                        timed_out = true;
+                        eprintln!("\n⏰ --timeout {secs}s reached — cancelling…");
+                        if let Some(runner) = data.agent_runners.read().await.get(&session_id) {
+                            runner.cancel_token.cancel();
                         }
                     }
                     // Startup grace: give the spawn a moment to register the runner.

@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(rendered.role, Role::User);
         assert!(rendered.content.contains("BAMBOO_CONTEXT_BLOCK_START"));
         assert!(rendered.content.contains("context_type: task_snapshot"));
-        assert!(rendered.content.contains("It is not a new user request."));
+        assert!(rendered.content.contains("Host-provided context."));
         assert!(rendered.never_compress);
         assert!(rendered.metadata.is_some());
     }

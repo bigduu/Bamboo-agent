@@ -6,9 +6,11 @@ are used in tab headers, dialog footers, and the command palette.
 
 ## Chat workspace
 
-With a local Bamboo server, new sessions use the directory where you launched
-`bamboo tui`. Opening an existing session uses its saved workspace. Remote
-servers resolve new workspaces from their own configuration.
+With a local Bamboo server, a fresh chat uses the directory where you launched
+`bamboo tui` and its registered Project, if it has one. A new chat created
+with an inherited Project uses that Project's default workspace. Existing chats
+use their saved workspace. Remote servers resolve new workspaces from their own
+configuration.
 
 Press `/` at the start of the draft or `Ctrl+K` to open Functions. The menu
 searches built-in actions and commands available to the active Bamboo session.

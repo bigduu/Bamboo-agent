@@ -1398,7 +1398,7 @@ fn render_permission_inspector(
     );
 }
 
-pub(super) fn inline_approval_height(app: &App, available: u16) -> u16 {
+pub(super) fn inline_approval_height(app: &App, width: u16, available: u16) -> u16 {
     let Some(q) = &app.pending_question else {
         return 0;
     };
@@ -1410,8 +1410,16 @@ pub(super) fn inline_approval_height(app: &App, available: u16) -> u16 {
     }
     let rows =
         permission.request.allowed_decisions.len() + typed_question_footer(app, q, false).len();
-    // Reserve space for the operation and resource before exposing decisions.
-    let required = rows + 6;
+    let resource_rows = labelled_preview(
+        permission.display_resource_label(),
+        permission.display_resource(),
+        width.saturating_sub(4).max(1) as usize,
+        2,
+    )
+    .len();
+    // Panel margins, decision heading, identity, tool/type, operation and risk.
+    // The resource can use one or two rows as the available width changes.
+    let required = rows + 8 + resource_rows;
     if usize::from(available) < required {
         return 0;
     }
@@ -1450,7 +1458,7 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion, inli
         .as_ref()
         .map(|rule| rule.id.clone())
         .unwrap_or_else(|| "none".to_string());
-    let identity = vec![
+    let mut details = vec![
         one_line(
             "request/session",
             &format!("{} / {}", request.request_id, request.session_id),
@@ -1460,11 +1468,6 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion, inli
             request.workspace_path.as_deref().unwrap_or("<unavailable>"),
         ),
     ];
-    let mut details = if inline.is_some() {
-        Vec::new()
-    } else {
-        identity.clone()
-    };
     details.extend([
         one_line(
             "tool/type",
@@ -1482,12 +1485,6 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion, inli
         text_width,
         2,
     ));
-    if permission.proposed_file_change().is_some() {
-        details.push(one_line(
-            "file change",
-            "PROPOSED server-supplied unified diff available in inspector",
-        ));
-    }
     if inline.is_some() {
         details.push(one_line(
             "risk / mode",
@@ -1497,7 +1494,12 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion, inli
                 request.effective_mode.label()
             ),
         ));
-        details.extend(identity);
+    }
+    if permission.proposed_file_change().is_some() {
+        details.push(one_line(
+            "file change",
+            "PROPOSED server-supplied unified diff available in inspector",
+        ));
     }
     details.extend(labelled_preview(
         if permission.tool_arguments_truncated {

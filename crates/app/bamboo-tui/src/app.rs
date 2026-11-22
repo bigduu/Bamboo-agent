@@ -7014,7 +7014,12 @@ impl App {
                     return Ok(());
                 }
                 match r {
-                    Ok(session_id) => self.accept_chat_start(session_id, turn_id),
+                    Ok(started) => {
+                        if self.chat.session_id.is_none() {
+                            self.chat.project_id = started.project_id;
+                        }
+                        self.accept_chat_start(started.session_id, turn_id);
+                    }
                     Err(e) => {
                         // The optimistic user turn already reserved a matching
                         // assistant turn id. Preserve that turn with an explicit
@@ -11644,7 +11649,7 @@ impl App {
             images: Vec::new(),
             session_id: self.chat.session_id.clone(),
             project_id: self.chat.project_id.clone(),
-            workspace_path: if self.chat.session_id.is_none() {
+            workspace_path: if self.chat.session_id.is_none() && self.chat.project_id.is_none() {
                 self.launch_workspace.clone()
             } else {
                 None
@@ -11701,11 +11706,7 @@ impl App {
             let result = match encoded {
                 Ok(images) => {
                     req.images = images;
-                    client
-                        .chat(req)
-                        .await
-                        .map(|response| response.session_id)
-                        .map_err(|error| error.to_string())
+                    client.chat(req).await.map_err(|error| error.to_string())
                 }
                 Err(error) => Err(format!("Screenshot encoding ended unexpectedly: {error}")),
             };
@@ -17729,6 +17730,61 @@ mod question_tests {
             "must-not-be-used".to_string(),
         ));
         app
+    }
+
+    #[test]
+    fn approvals_keep_project_workspace_identity_with_a_wrapped_resource() {
+        use ratatui::{backend::TestBackend, layout::Rect};
+
+        let mut app = app_with_permission(vec![
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ]);
+        let Some(ActiveQuestionKind::Permission(permission)) = app
+            .pending_question
+            .as_mut()
+            .map(|question| &mut question.kind)
+        else {
+            panic!("expected typed permission");
+        };
+        permission.request.resource = format!("cargo test {}", "workspace-target ".repeat(12));
+
+        for (width, height, heading) in [
+            (60, 20, "Typed permission decision"),
+            (100, 28, "Approval required"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::ui::render_workspace(
+                        frame,
+                        &app,
+                        Rect::new(0, 2, width, height - 5),
+                        Rect::new(0, height - 1, width, 1),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let display = (0..height)
+                .map(|row| {
+                    (0..width)
+                        .map(|col| buffer[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in [
+                heading,
+                "registered workspace: /workspace/repo",
+                "request/session: permission-request",
+                "Allow once",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "{width}×{height} missing {expected}:\n{display}"
+                );
+            }
+        }
     }
 
     fn child_record(
@@ -25477,7 +25533,10 @@ mod question_tests {
         app.handle_event(AppEvent::ChatStarted {
             context_id,
             turn_id: "old-turn".to_string(),
-            result: Ok("stale-session".to_string()),
+            result: Ok(crate::api::ChatStart {
+                session_id: "stale-session".to_string(),
+                project_id: None,
+            }),
         })
         .await
         .unwrap();
@@ -25515,7 +25574,10 @@ mod question_tests {
         app.handle_event(AppEvent::ChatStarted {
             context_id,
             turn_id: "turn-being-stopped".to_string(),
-            result: Ok("existing-session".to_string()),
+            result: Ok(crate::api::ChatStart {
+                session_id: "existing-session".to_string(),
+                project_id: None,
+            }),
         })
         .await
         .unwrap();
@@ -27186,11 +27248,12 @@ mod question_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
         let server = tokio::spawn(async move {
-            for (session_id, workspace_path) in [
-                (None, Some(WORKSPACE)),
-                (Some("first-session"), None),
-                (Some("other-session"), None),
-                (None, Some(WORKSPACE)),
+            for (session_id, workspace_path, project_id) in [
+                (None, Some(WORKSPACE), None),
+                (Some("first-session"), None, None),
+                (Some("other-session"), None, None),
+                (None, Some(WORKSPACE), None),
+                (None, None, Some("other-project")),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_test_http_request(&mut socket).await;
@@ -27205,6 +27268,10 @@ mod question_tests {
                     payload.get("workspace_path"),
                     workspace_path.map(serde_json::Value::from).as_ref()
                 );
+                assert_eq!(
+                    payload.get("project_id"),
+                    project_id.map(serde_json::Value::from).as_ref()
+                );
                 let reply = serde_json::json!({
                     "session_id": session_id.unwrap_or("first-session"),
                     "stream_url": "/events",
@@ -27218,11 +27285,20 @@ mod question_tests {
         app.launch_workspace = Some(WORKSPACE.to_string());
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
-        for (index, session_id) in [None, Some("first-session"), Some("other-session"), None]
-            .into_iter()
-            .enumerate()
+        for (index, session_id) in [
+            None,
+            Some("first-session"),
+            Some("other-session"),
+            None,
+            None,
+        ]
+        .into_iter()
+        .enumerate()
         {
-            if index == 3 {
+            if index >= 3 {
+                if index == 4 {
+                    app.chat.project_id = Some("other-project".to_string());
+                }
                 app.new_session();
             } else {
                 app.chat.session_id = session_id.map(str::to_string);
@@ -27238,6 +27314,57 @@ mod question_tests {
             ));
             app.chat.streaming = false;
         }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_workspace_membership_uses_the_server_reported_owner() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for project_id in [None, Some("registered-project")] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /api/v1/chat "));
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                let chat: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(chat["message"], "hello from the worktree");
+                assert_eq!(chat["workspace_path"], "/worktrees/registered/subdirectory");
+                assert_eq!(chat["project_id"].as_str(), project_id);
+                if project_id.is_none() {
+                    let body = r#"{"error":{"code":"project_workspace_conflict"},"owner_project_id":"registered-project","session_project_id":"unassigned"}"#;
+                    let response = format!(
+                        "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(
+                        &mut socket,
+                        "application/json",
+                        r#"{"session_id":"registered-session","stream_url":"/events","status":"accepted"}"#,
+                    ).await;
+                }
+            }
+        });
+
+        let mut app = App::new(client);
+        app.launch_workspace = Some("/worktrees/registered/subdirectory".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.chat.textarea.insert_str("hello from the worktree");
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .expect("chat start event");
+        app.handle_event(started).await.unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("registered-session"));
+        assert_eq!(app.chat.project_id.as_deref(), Some("registered-project"));
+        assert_eq!(app.chat.messages.len(), 1);
         server.await.unwrap();
     }
 

@@ -973,9 +973,16 @@ impl Agent {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
+        run_deadline: Option<crate::runtime::config::RunDeadline>,
     ) -> crate::runtime::runner::Result<()> {
         self.runtime
-            .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            .execute_with_inputs_and_upstream_retry(
+                session,
+                req,
+                inputs,
+                upstream_retry,
+                run_deadline,
+            )
             .await
     }
 
@@ -1206,7 +1213,7 @@ impl Agent {
         }
         let Some(router) = lease.router.take() else {
             return self
-                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry, None)
                 .await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
@@ -1247,13 +1254,19 @@ impl Agent {
                 // Bind before the runtime is first polled, so cancellation of
                 // this observer still leaves Drop the same sticky host proof.
                 registration.bind_tool_suspension_observation(token);
-                self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
-                    .await
+                self.execute_with_inputs_and_upstream_retry(
+                    session,
+                    req,
+                    inputs,
+                    upstream_retry,
+                    None,
+                )
+                .await
             })
             .await
             .0
         } else {
-            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry, None)
                 .await
         };
         if registration.observed_forbidden_running() {
