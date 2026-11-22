@@ -1882,7 +1882,7 @@ mod tests {
         ));
         let calls = [
             named_call("read-first", "Read"),
-            named_call("exec-stale", "exec_command"),
+            named_call("stale-prepare", "prepare"),
         ];
 
         let (result, running, _, events) =
@@ -1892,12 +1892,12 @@ mod tests {
         assert!(running.root_orchestration_only_enabled());
         assert_eq!(running.root_tool_authority_revision, 1);
         assert!(executor.entered("Read"));
-        assert!(!executor.entered("exec_command"));
+        assert!(!executor.entered("prepare"));
         assert!(events.iter().all(|event| {
-            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "exec-stale")
+            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "stale-prepare")
         }));
         assert!(running.messages.iter().any(|message| {
-            message.tool_call_id.as_deref() == Some("exec-stale")
+            message.tool_call_id.as_deref() == Some("stale-prepare")
                 && message
                     .content
                     .contains("outside orchestration-only Root authority")

@@ -174,7 +174,7 @@ pub(super) fn request_schema() -> Value {
             "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private caller history is copied."},
             "title":{"type":["string","null"], "minLength":1, "maxLength":256},
             "notify_on_material_event":{"type":"boolean", "default":false, "description":"Set true for new Supervisor work when scope.create_material_notifications is true. Subscribe on the initial instruction to durable blocker and Worker summary notices from its exact Run. Keep this flag on exact retries."},
-            "thinking_mode":{"type":"string", "enum":["standard","ultra"], "description":"Omit to start a Standard Root. The canonical Supervisor may choose Ultra for a Root that coordinates its own SubAgents. Ultra uses the ordinary Root tool catalog for that mode and delegates shell execution. Keep this selection on exact retries."}
+            "thinking_mode":{"type":"string", "enum":["standard","ultra"], "description":"Omit to start a Standard Root. The canonical Supervisor may choose Ultra for a Root that coordinates its own SubAgents. The new Root can execute shell commands under its own tool policy and permissions. Keep this selection on exact retries."}
         },
         "required":["operation_id","expected_state_revision","message"]
     })

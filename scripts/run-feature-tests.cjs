@@ -228,8 +228,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2935 keeps Supervisor route, prompt refresh and handoff cases in the default
 // Engine and Orchestration owners. Additive feature selections stay the same.
 // #2936 retains the existing Engine, Server, and Skill test owners.
-// #2939 adds the vendored LiteLLM crate to the existing packages-1 shard.
-const FEATURE_SOURCE_SHA256 = "3453922836728a874f411d66ead60d43e698373596ff51ea431c8413a9d565bf";
+// Ordinary Ultra shell admission and Child guidance use the existing Engine,
+// SDK, Server, and CLI test owners. The additive contexts stay the same.
+// Shell wait guidance uses the existing Engine continuation and prompt tests.
+// #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
+const FEATURE_SOURCE_SHA256 = "94772484b5ca25df79cca7325813006683d168568c23782d9d2914963d37f687";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

@@ -357,8 +357,9 @@ fn retired_shell_call_error(
 ) -> Option<String> {
     let reference = ctx.tool_call.function.name.trim();
     let replacement = bamboo_domain::tool_names::retired_shell_tool_replacement(reference)?;
-    let can_use_replacement = !ctx.root_orchestration_only
-        && ctx.executing_supervisor.is_none()
+    let can_use_replacement = ctx.executing_supervisor.is_none()
+        && (!ctx.root_orchestration_only
+            || bamboo_domain::orchestration_only_allows_execution_name(replacement))
         && !ctx.session_flags.plan_read_only
         && callable.contains_execution_name(replacement)
         && ctx.tools.owns_exact_tool(replacement);
@@ -3472,6 +3473,9 @@ mod hook_tests {
                         "session_control" => {
                             observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID
                         }
+                        "exec_command" => {
+                            observation.is_none() || caller != DEFAULT_SUPERVISOR_SESSION_ID
+                        }
                         _ => false,
                     };
                     assert_eq!(
@@ -3486,6 +3490,9 @@ mod hook_tests {
                 }
                 if framework_proof {
                     expected.push("session_history");
+                }
+                if observation.is_none() || caller != DEFAULT_SUPERVISOR_SESSION_ID {
+                    expected.push("exec_command");
                 }
                 assert_eq!(concrete.entered(), expected);
                 assert_eq!(
@@ -3504,6 +3511,7 @@ mod hook_tests {
             "Read",
             "exec_command",
             "write_stdin",
+            "vendor::exec_command",
             "Edit",
             "apply_patch",
             "default::Read",
@@ -3516,6 +3524,7 @@ mod hook_tests {
                 "Read",
                 "exec_command",
                 "write_stdin",
+                "vendor::exec_command",
                 "Edit",
                 "apply_patch",
                 "default::Read",
@@ -3524,13 +3533,7 @@ mod hook_tests {
             &[],
         );
         let (event_tx, mut event_rx) = mpsc::channel(32);
-        for name in [
-            "exec_command",
-            "default::exec_command",
-            "write_stdin",
-            "apply_patch",
-            "default::Read",
-        ] {
+        for name in ["vendor::exec_command", "apply_patch", "default::Read"] {
             let outcome = execute_without_hooks_with_root_authority(
                 &stale,
                 &tools,
@@ -3545,7 +3548,7 @@ mod hook_tests {
             ));
             assert!(!outcome.post_tool_hook_eligible);
         }
-        for name in ["read_file", "Edit"] {
+        for name in ["read_file", "Edit", "default::exec_command", "write_stdin"] {
             let allowed = execute_without_hooks_with_root_authority(
                 &stale,
                 &tools,
@@ -3556,11 +3559,14 @@ mod hook_tests {
             .await;
             assert!(allowed.result.is_ok());
         }
-        assert_eq!(concrete_tools.entered(), ["Read", "Edit"]);
+        assert_eq!(
+            concrete_tools.entered(),
+            ["Read", "Edit", "exec_command", "write_stdin"]
+        );
         let starts = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
             .count();
-        assert_eq!(starts, 2);
+        assert_eq!(starts, 4);
     }
 
     #[tokio::test]
