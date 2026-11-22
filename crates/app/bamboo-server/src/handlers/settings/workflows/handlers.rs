@@ -11,7 +11,7 @@ use bamboo_skills::store::builtin::{
 };
 use bamboo_skills::{
     LegacyWorkflowMigrationStatus, ShadowedWorkflowCandidate, SkillStore, WorkflowCatalogEntry,
-    WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource, WorkflowStatus,
+    WorkflowCatalogSnapshot, WorkflowSource, WorkflowStatus,
 };
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -200,11 +200,7 @@ pub async fn list_workflow_catalog(
     };
 
     let snapshot = if query.orchestration_only {
-        let mut snapshot = store.workflow_catalog_snapshot().await;
-        snapshot
-            .entries
-            .retain(|entry| entry.kind == WorkflowKind::Orchestration);
-        snapshot
+        store.executable_workflow_catalog_snapshot().await
     } else {
         let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
         public_workflow_catalog_snapshot(skill_catalog, workflow_catalog)

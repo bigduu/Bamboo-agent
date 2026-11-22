@@ -68,6 +68,32 @@ async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
     )
     .await
     .expect("workflow metadata");
+    let typed = data.path().join("skills/inspect-files");
+    tokio::fs::create_dir_all(&typed).await.unwrap();
+    tokio::fs::write(
+        typed.join("SKILL.md"),
+        "---\nname: inspect-files\ndescription: Inspect project files\n---\nRead selected files.\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        typed.join("workflow.yaml"),
+        r#"workflow_schema: 1
+id: inspect-files
+revision: 7
+steps:
+  - id: inspect
+    type: tool
+    tool: Read
+    args: {}
+    capabilities: [read]
+plan:
+  type: step
+  step: inspect
+"#,
+    )
+    .await
+    .unwrap();
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
             .await
@@ -119,11 +145,40 @@ async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
                 .to_request(),
         )
         .await;
-    assert!(executable.entries.iter().any(|entry| entry.id == "deploy"));
-    assert!(executable
-        .entries
-        .iter()
-        .all(|entry| entry.kind == bamboo_skills::WorkflowKind::Orchestration));
+    assert_eq!(
+        executable
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.revision))
+            .collect::<Vec<_>>(),
+        vec![("inspect-files", 7)],
+    );
+    use bamboo_domain::{CapabilityInvocationTarget, CapabilityKind, DiscoverCapabilitiesRequest};
+    use bamboo_skills::capability_discovery::{
+        CapabilityDiscoveryEligibility, CapabilityDiscoveryIndex,
+    };
+
+    let index = CapabilityDiscoveryIndex::from_resolved_classified_store(
+        &[],
+        state.skill_manager.store(),
+        &CapabilityDiscoveryEligibility::default(),
+    )
+    .await;
+    let discover_workflows = |query: &str| {
+        index
+            .discover(&DiscoverCapabilitiesRequest {
+                query: query.into(),
+                kinds: Some(vec![CapabilityKind::Workflow]),
+                limit: None,
+            })
+            .unwrap()
+            .matches
+    };
+    assert!(discover_workflows("deploy").is_empty());
+    assert!(matches!(
+        discover_workflows("inspect-files").as_slice(),
+        [entry] if matches!(&entry.invocation_target, CapabilityInvocationTarget::Workflow { workflow_id, revision: 7, .. } if workflow_id == "inspect-files"),
+    ));
 
     const PRIVATE_INVALID_FIELD: &str = "private_invalid_catalog_field";
     const PRIVATE_INVALID_BODY: &str = "PRIVATE INVALID REPLACEMENT BODY";
