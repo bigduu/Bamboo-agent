@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 
@@ -266,6 +267,50 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<Option<String>> {
         self.store.read_memory_view(scope, project_key).await
+    }
+
+    /// Project orientation for model requests. Management views also list
+    /// superseded, contradicted, and archived records.
+    pub async fn read_project_prompt_index(&self, project_key: &str) -> io::Result<Option<String>> {
+        use DurableMemoryStatus::{Active, Stale};
+        let scope = MemoryScope::Project;
+        let key = Some(project_key);
+        let Some(index) = self.store.read_lexical_index(scope, key).await? else {
+            let mut documents = self.store.list_memory_documents(scope, key).await?;
+            documents.retain(|doc| matches!(doc.frontmatter.status, Active | Stale));
+            return Ok((!documents.is_empty()).then(|| {
+                jiandu_memory::memory_store::build_memory_markdown_view(scope, key, &documents)
+            }));
+        };
+        let mut items = index
+            .items
+            .into_iter()
+            .filter(|item| {
+                item.scope == scope
+                    && item.project_key.as_deref() == key
+                    && matches!(item.status, Active | Stale)
+            })
+            .peekable();
+        if items.peek().is_none() {
+            return Ok(None);
+        }
+        let mut content = format!("# Jiandu Memory Index (Project: {project_key})\n\n");
+        for item in items {
+            let _ = writeln!(
+                content,
+                "- `{}` {} [{} / {}] updated {}",
+                item.id,
+                item.title,
+                item.r#type.as_str(),
+                item.status.as_str(),
+                item.updated_at
+            );
+            if !item.summary.is_empty() {
+                let (summary, _) = truncate_chars(&item.summary, 160);
+                let _ = writeln!(content, "  - {summary}");
+            }
+        }
+        Ok(Some(content))
     }
 
     #[allow(clippy::too_many_arguments)]
