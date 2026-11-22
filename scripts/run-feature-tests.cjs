@@ -231,7 +231,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Ordinary Ultra shell admission and Child guidance use the existing Engine,
 // SDK, Server, and CLI test owners. The additive contexts stay the same.
 // Shell wait guidance uses the existing Engine continuation and prompt tests.
-const FEATURE_SOURCE_SHA256 = "209ee054543ad4fbd111de35dda97bb9023c0707e560d640d188fc748c79050c";
+// #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
+const FEATURE_SOURCE_SHA256 = "94772484b5ca25df79cca7325813006683d168568c23782d9d2914963d37f687";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
@@ -268,6 +269,11 @@ const FEATURE_CONTEXTS = [
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
     { name: "ticket_runtime_files", kind: "test", added: [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
+  { package: "bamboo-litellm-llms-types", features: ["schema"], targets: [
+    { name: "bamboo_litellm_llms_types", kind: "lib", added: [
+      "formats::messages::request::tests::content_block_type_schema_remains_a_string",
+      "formats::responses::streaming::tests::event_type_schema_accepts_unknown_strings",
+      "tests::wire_type_supports_schema_generation"] }] },
 ];
 
 const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",

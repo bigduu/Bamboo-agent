@@ -22,6 +22,10 @@ test("feature shards partition package targets and additive owners exactly once"
   }
   assert.equal(packageShard("bamboo-agent"), "agent");
   assert.equal(packageShard("bamboo-server"), "server");
+  const liteLlm = selectShard(packages, FEATURE_CONTEXTS, "packages-1");
+  assert.ok(liteLlm.packages.some(owner => owner.name === "bamboo-litellm-llms-types"));
+  assert.deepEqual(liteLlm.featureContexts.find(context => context.package === "bamboo-litellm-llms-types")
+    ?.targets.map(({ name, kind, added }) => [name, kind, added.length]), [["bamboo_litellm_llms_types", "lib", 3]]);
   for (const [name, count] of [["bamboo-agent", 4], ["bamboo-server", 2]]) {
     const owner = packages.find(item => item.name === name), prefix = name === "bamboo-agent" ? "agent" : "server";
     const targets = Array.from({ length: count }, (_, index) => integrationTargets(owner, `${prefix}-tests-${index}`)).flat();
@@ -132,7 +136,7 @@ test("ordinary owners preserve isolated defaults and feature owners select only 
       assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap((name) => ["--skip", name]));
     } else assert.ok(!args.includes("--"));
   }
-  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 20);
+  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 23);
   assert.ok(FEATURE_CONTEXTS.find((context) => context.package === "bamboo-infrastructure")
     .targets.find((target) => target.name === "bamboo_infrastructure").added
     .includes("telemetry::config::tests::zero_export_sampling_keeps_local_spans_without_sending_them"));
