@@ -136,6 +136,7 @@ pub(crate) enum ActionId {
     ReopenPendingQuestion,
     OpenModelPicker,
     OpenSessionPicker,
+    OpenParentSession,
     OpenSubagentTree,
     OpenTaskPlan,
     StopRun,
@@ -365,6 +366,15 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         Chat,
         [Global],
         [(Global, "Ctrl+P; Leader p")]
+    ),
+    spec!(
+        OpenParentSession,
+        "Back to parent session",
+        "Return to the parent of the active child session",
+        false,
+        Chat,
+        [Global],
+        [(Global, "F4")]
     ),
     spec!(
         OpenSubagentTree,

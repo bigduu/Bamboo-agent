@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 
 use crate::api::types::{AgentEvent, SessionTreeKind, SessionTreeSummary};
+use crate::components::session_rows::SessionRows;
 
 pub(crate) const MAX_SUBAGENT_TREE_SESSIONS: usize = 1_000;
 
@@ -186,6 +187,7 @@ pub(crate) struct SubagentTreeState {
     pub(crate) nodes: HashMap<String, SubagentTreeNode>,
     pub(crate) visible: Vec<SubagentTreeRow>,
     pub(crate) selected: usize,
+    pub(crate) session_rows: SessionRows,
     expanded: HashSet<String>,
     explicitly_collapsed: HashSet<String>,
     pub(crate) loading_root: bool,
@@ -207,6 +209,7 @@ impl SubagentTreeState {
             nodes: HashMap::new(),
             visible: Vec::new(),
             selected: 0,
+            session_rows: SessionRows::default(),
             expanded: HashSet::new(),
             explicitly_collapsed: HashSet::new(),
             loading_root: true,

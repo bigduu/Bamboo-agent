@@ -499,7 +499,7 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                 )));
                 push_tool_detail(&mut lines, app, &block.id, tool, &state, focused, width);
             }
-            ConversationBlockKind::SubAgent { child, streaming } => {
+            ConversationBlockKind::SubAgent { child } => {
                 let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
                 let (icon, style) = match child.status.as_str() {
                     "running" | "running_in_background" | "queued" | "starting" | "in_progress" => {
@@ -513,15 +513,31 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                     _ => ("·", Style::default().fg(colors::inactive())),
                 };
                 let label = child.title.as_deref().unwrap_or("sub-agent");
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        " {} {icon} {label} ({}) · {}",
-                        if focused { "▸" } else { " " },
-                        child.status,
-                        child.child_session_id
-                    ),
-                    style,
-                )));
+                let marker = if focused { "▸" } else { " " };
+                if workspace {
+                    const OPEN_CHAT: &str = "  Open chat ›";
+                    let short_id = crate::subagents::short_session_id(&child.child_session_id);
+                    let label = child.title.as_deref().unwrap_or(&short_id);
+                    let summary = format!(" {marker} {icon} {label} · {}", child.status);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            crate::text::clip_cells(
+                                &summary,
+                                usize::from(width).saturating_sub(OPEN_CHAT.chars().count()),
+                            ),
+                            style,
+                        ),
+                        Span::styled(OPEN_CHAT, Style::default().fg(colors::thinking())),
+                    ]));
+                } else {
+                    lines.push(Line::styled(
+                        format!(
+                            " {marker} {icon} {label} ({}) · {}",
+                            child.status, child.child_session_id
+                        ),
+                        style,
+                    ));
+                }
                 if state.expanded {
                     if let Some(error) = &child.error {
                         lines.push(Line::from(Span::styled(
@@ -532,23 +548,12 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                 }
                 if focused {
                     lines.push(Line::from(Span::styled(
-                        if streaming {
-                            format!(
-                                "   {} expand/collapse · child opens after parent run · {} copy",
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
-                            )
-                        } else {
-                            format!(
-                                "   {} open child · {} expand/collapse · {} copy",
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
-                                app.key_hint(
-                                    ActionContext::ConversationBlock,
-                                    ActionId::ToggleDetails
-                                ),
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
-                            )
-                        },
+                        format!(
+                            "   {} open child · {} expand/collapse · {} copy",
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::ToggleDetails),
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                        ),
                         Style::default().fg(colors::subtle()),
                     )));
                 }

@@ -20,6 +20,7 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
+use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::history::map_history;
 use crate::keymap::{
@@ -150,6 +151,77 @@ mod subagent_tree_navigation_tests {
                 diff_wrap: true,
             }
         );
+    }
+
+    #[test]
+    fn clicking_a_live_child_opens_its_chat_and_parent_return_preserves_the_draft() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".into());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.textarea = TextArea::from(["draft for the parent".to_string()]);
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 6));
+        app.chat.sub_agents.push(SubAgentDisplay {
+            child_session_id: "child".into(),
+            title: Some("Review tests".into()),
+            status: "running".into(),
+            error: None,
+        });
+
+        let mut child = SessionUiContext::blank(app.allocate_context_id());
+        child.chat.history_loaded = true;
+        child.chat.session_id = Some("child".into());
+        child.chat.parent_session_id = Some("root".into());
+        app.cache_context(child);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::render_workspace(
+                    frame,
+                    &app,
+                    Rect::new(0, 2, 60, 16),
+                    Rect::new(0, 19, 60, 1),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (column, row) = (0..buffer.area.height)
+            .find_map(|row| {
+                let line: String = (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                let index = line.find("Open chat")?;
+                Some((line[..index].chars().count() as u16, row))
+            })
+            .expect("the child row has an open-chat link");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(app.chat.session_id.as_deref(), Some("child"));
+        assert_eq!(app.parent_session_id(), Some("root"));
+
+        app.handle_workspace_action(WorkspaceAction {
+            action: ActionId::OpenParentSession,
+            tab: Tab::Chat,
+            context_id: app.workspace_context_id(),
+        });
+        assert_eq!(app.chat.session_id.as_deref(), Some("root"));
+        assert!(app.chat.streaming);
+        assert_eq!(app.chat.textarea.lines(), ["draft for the parent"]);
+        assert_eq!(app.chat.textarea.cursor(), (0, 6));
     }
 
     #[test]
@@ -961,7 +1033,6 @@ pub enum ConversationBlockKind<'a> {
     },
     SubAgent {
         child: &'a SubAgentDisplay,
-        streaming: bool,
     },
     Question {
         question: &'a str,
@@ -1090,6 +1161,7 @@ pub struct ChatState {
     /// still perform its initial fetch instead of taking the cache fast path.
     history_loaded: bool,
     pub session_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
     /// Project inherited from the opened/selected session and propagated when
     /// Ctrl+N creates a new root session.
     pub project_id: Option<String>,
@@ -1230,6 +1302,7 @@ impl ChatState {
             context_id: 0,
             history_loaded: false,
             session_id: None,
+            parent_session_id: None,
             project_id: None,
             messages: Vec::new(),
             textarea,
@@ -1593,6 +1666,7 @@ fn apply_textarea_palette(textarea: &mut TextArea<'_>, palette: crate::theme::Th
 /// long-lived UI state.
 pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
+    pub parent_session_id: Option<String>,
     pub model: String,
     pub provider: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -1645,6 +1719,7 @@ pub(crate) enum LoopObservation {
 
 fn same_history_snapshot(before: &SessionSummary, after: &SessionSummary) -> bool {
     before.id == after.id
+        && before.parent_session_id == after.parent_session_id
         && before.is_running == after.is_running
         && before.has_pending_question == after.has_pending_question
         && before.running_child_count == after.running_child_count
@@ -3993,6 +4068,7 @@ pub struct SessionPicker {
     pub page_limit: usize,
     pub next_offset: Option<usize>,
     pub mode: SessionPickerMode,
+    pub(crate) session_rows: SessionRows,
 }
 
 impl SessionPicker {
@@ -5323,6 +5399,10 @@ impl App {
             .map(|model_ref| model_ref.provider.clone())
             .or_else(|| summary.provider.clone());
         context.chat.reasoning_effort = summary.reasoning_effort;
+        context
+            .chat
+            .parent_session_id
+            .clone_from(&summary.parent_session_id);
         context.chat.project_id.clone_from(&summary.project_id);
         context.chat.permission_mode = summary.permission_mode;
         context.chat.bypass_permissions = summary.bypass_permissions;
@@ -7064,6 +7144,7 @@ impl App {
                         self.clear_child_approval_context();
                         self.detach_stream();
                         self.chat.session_id = Some(session_id.clone());
+                        self.chat.parent_session_id = opened.parent_session_id;
                         self.chat.history_loaded = true;
                         self.chat.observed_activity = None;
                         self.chat.latest_summary_observation_epoch = epoch;
@@ -8226,6 +8307,9 @@ impl App {
     /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.chat.pressed_block.is_some() && !self.workspace_controls_enabled() {
+            self.chat.pressed_block = None;
+        }
         if self.notifications_visible {
             let max = self.notification_max_scroll.get();
             match mouse.kind {
@@ -8396,8 +8480,26 @@ impl App {
             return;
         }
 
+        if let Some(tree) = self.subagent_tree.as_mut() {
+            if let Some(session_id) = tree.session_rows.handle_mouse(mouse) {
+                self.open_subagent_session(session_id);
+            } else {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => tree.move_selection(-3),
+                    MouseEventKind::ScrollDown => tree.move_selection(3),
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if let Some(picker) = self.session_picker.as_mut() {
             if matches!(picker.mode, SessionPickerMode::Browse) {
+                if let Some(session_id) = picker.session_rows.handle_mouse(mouse) {
+                    self.close_session_picker();
+                    self.resume_session(session_id);
+                    return;
+                }
                 let delta = match mouse.kind {
                     MouseEventKind::ScrollUp => -3,
                     MouseEventKind::ScrollDown => 3,
@@ -8512,7 +8614,7 @@ impl App {
             return;
         }
 
-        if self.tab == Tab::Chat {
+        if self.tab == Tab::Chat && self.workspace_controls_enabled() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.chat.pressed_block = self.transcript_block_at(mouse.column, mouse.row);
@@ -8523,14 +8625,7 @@ impl App {
                         if self.transcript_block_at(mouse.column, mouse.row).as_ref()
                             == Some(&pressed)
                         {
-                            let index = self
-                                .conversation_blocks()
-                                .iter()
-                                .position(|block| block.id == pressed && block.expandable());
-                            if let Some(index) = index {
-                                self.focus_conversation_block_at(index);
-                                self.toggle_conversation_details();
-                            }
+                            self.activate_clicked_conversation_block(&pressed);
                         }
                     }
                     return;
@@ -8603,6 +8698,20 @@ impl App {
             .iter()
             .find(|range| (range.start..=range.end).contains(&line))
             .map(|range| range.id.clone())
+    }
+
+    fn activate_clicked_conversation_block(&mut self, id: &str) {
+        let blocks = self.conversation_blocks();
+        let Some((index, block)) = blocks.iter().enumerate().find(|(_, block)| block.id == id)
+        else {
+            return;
+        };
+        if let ConversationBlockKind::SubAgent { child } = block.kind {
+            self.resume_session(child.child_session_id.clone());
+        } else if block.expandable() {
+            self.focus_conversation_block_at(index);
+            self.toggle_conversation_details();
+        }
     }
 
     /// Scroll the chat transcript down by `delta` lines, clamped to
@@ -8880,19 +8989,10 @@ impl App {
                 _ => None,
             });
         if let Some(child_id) = child_id {
-            if self.chat.streaming {
-                self.toggle_conversation_details();
-                self.status_message = format!(
-                    "{}; child opens after the parent run completes",
-                    self.status_message
-                );
-            } else {
-                self.chat.focused_block = None;
-                self.resume_session(child_id);
-            }
-            return;
+            self.resume_session(child_id);
+        } else {
+            self.toggle_conversation_details();
         }
-        self.toggle_conversation_details();
     }
 
     fn copy_focused_conversation_block(&mut self) {
@@ -9100,6 +9200,11 @@ impl App {
             ActionAvailability::Chat if self.tab != Tab::Chat => {
                 Some("Switch to Chat before using this action")
             }
+            ActionAvailability::Chat
+                if action == ActionId::OpenParentSession && self.parent_session_id().is_none() =>
+            {
+                Some("The active session has no parent")
+            }
             ActionAvailability::ActiveRun if !self.chat.streaming => Some("No active run to stop"),
             _ => None,
         }
@@ -9207,6 +9312,11 @@ impl App {
             ActionId::ReopenPendingQuestion => self.reopen_pending_question(),
             ActionId::OpenModelPicker => self.open_model_picker(),
             ActionId::OpenSessionPicker => self.open_session_picker(),
+            ActionId::OpenParentSession => {
+                if let Some(parent) = self.parent_session_id().map(str::to_string) {
+                    self.resume_session(parent);
+                }
+            }
             ActionId::OpenSubagentTree => self.open_subagent_tree(),
             ActionId::OpenTaskPlan => self.open_task_plan(),
             ActionId::StopRun => self.stop_streaming(),
@@ -9251,6 +9361,24 @@ impl App {
 
     pub(crate) fn workspace_context_id(&self) -> u64 {
         self.chat.context_id
+    }
+
+    pub(crate) fn parent_session_id(&self) -> Option<&str> {
+        let session_id = self.chat.session_id.as_deref()?;
+        self.chat
+            .parent_session_id
+            .as_deref()
+            .filter(|parent| !parent.trim().is_empty() && *parent != session_id)
+    }
+
+    pub(crate) fn has_visible_subagents(&self) -> bool {
+        self.chat.parent_terminal_pending
+            || !self.chat.sub_agents.is_empty()
+            || self
+                .chat
+                .messages
+                .iter()
+                .any(|message| !message.sub_agents.is_empty())
     }
 
     fn handle_workspace_action(&mut self, press: WorkspaceAction) {
@@ -11620,6 +11748,7 @@ impl App {
                 .or_else(|| summary.provider.clone());
             let opened = OpenedSession {
                 messages: map_history(history.messages),
+                parent_session_id: summary.parent_session_id,
                 model: summary.model,
                 provider,
                 reasoning_effort: summary.reasoning_effort,
@@ -11910,10 +12039,7 @@ impl App {
                     for child in &message.sub_agents {
                         blocks.push(ConversationBlock {
                             id: subagent_block_id(&message_id, &child.child_session_id),
-                            kind: ConversationBlockKind::SubAgent {
-                                child,
-                                streaming: false,
-                            },
+                            kind: ConversationBlockKind::SubAgent { child },
                         });
                     }
                     if let Some(status) = message.terminal_status.as_deref() {
@@ -11962,10 +12088,7 @@ impl App {
         for child in &self.chat.sub_agents {
             blocks.push(ConversationBlock {
                 id: subagent_block_id(live_id, &child.child_session_id),
-                kind: ConversationBlockKind::SubAgent {
-                    child,
-                    streaming: self.chat.streaming,
-                },
+                kind: ConversationBlockKind::SubAgent { child },
             });
         }
         let waiting_for_answer = self
@@ -15136,6 +15259,10 @@ impl App {
         let Some(session_id) = selected else {
             return;
         };
+        self.open_subagent_session(session_id);
+    }
+
+    fn open_subagent_session(&mut self, session_id: String) {
         let already_active = self.chat.session_id.as_deref() == Some(session_id.as_str());
         self.close_subagent_tree();
         if already_active {
@@ -15260,6 +15387,7 @@ impl App {
             page_limit: 0,
             next_offset: None,
             mode: SessionPickerMode::Browse,
+            session_rows: SessionRows::default(),
         });
         self.load_session_picker_page(epoch, 0);
     }
@@ -19075,6 +19203,7 @@ mod question_tests {
                     session_id: session_id.to_string(),
                     epoch: 0,
                     result: Ok(OpenedSession {
+                        parent_session_id: None,
                         is_running: true,
                         ..opened(vec![old, user, pending])
                     }),
@@ -21118,6 +21247,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21140,6 +21270,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21201,6 +21332,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21224,6 +21356,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21270,6 +21403,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21293,6 +21427,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21529,7 +21664,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                1_641_006_049_907_515_232,
+                1_603_011_432_197_960_348,
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
@@ -21537,10 +21672,10 @@ mod question_tests {
                 14_839_815_545_818_862_244,
                 14_001_204_281_749_812_417,
                 3_082_197_214_727_898_618,
-                15_225_996_382_494_039_911,
+                14_040_885_768_871_576_942,
                 1_872_964_058_003_881_112,
                 10_297_461_319_307_885_699,
-                4_909_861_279_484_503_645,
+                11_688_443_165_488_407_791,
                 7_080_015_168_463_480_579,
             ],
             "minimum-size modal golden changed"
@@ -22331,6 +22466,7 @@ mod question_tests {
     fn bare_session(id: &str) -> SessionSummary {
         SessionSummary {
             id: id.into(),
+            parent_session_id: None,
             project_id: None,
             title: String::new(),
             title_generated: true,
@@ -25154,6 +25290,7 @@ mod question_tests {
 
     fn opened(messages: Vec<ChatMessage>) -> OpenedSession {
         OpenedSession {
+            parent_session_id: None,
             messages,
             model: "claude-sonnet-5".to_string(),
             provider: None,
@@ -25201,6 +25338,7 @@ mod question_tests {
                 session_id: session_id.to_string(),
                 epoch: 0,
                 result: Ok(OpenedSession {
+                    parent_session_id: None,
                     pending: Some(pending),
                     ..opened(Vec::new())
                 }),
@@ -26304,6 +26442,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 is_running: true,
                 ..opened(vec![])
             }),
@@ -26326,6 +26465,7 @@ mod question_tests {
             session_id: "parent".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 running_child_count: 1,
                 last_run_status: Some("completed".to_string()),
                 ..opened(vec![])
@@ -26360,6 +26500,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 truncated: true,
                 total_message_count: 5000,
                 ..opened(vec![asst_msg("a"), asst_msg("b")])
@@ -26383,6 +26524,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
                     question: "Proceed?".to_string(),
@@ -27106,6 +27248,7 @@ mod question_tests {
             page_limit: 2,
             next_offset: None,
             mode: SessionPickerMode::Browse,
+            session_rows: SessionRows::default(),
         }
     }
 
@@ -28101,6 +28244,7 @@ mod question_tests {
             session_id: "session-b".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 model: "model-b".to_string(),
                 provider: Some("provider-b".to_string()),
                 reasoning_effort: Some(ReasoningEffort::Xhigh),

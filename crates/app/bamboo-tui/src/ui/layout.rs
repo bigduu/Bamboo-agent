@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -2376,6 +2376,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
     let screen = f.area();
     let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
     let row_width = popup_width.saturating_sub(4);
+    let mut session_rows = Vec::new();
     let mut lines = vec![Line::from(Span::styled(
         " Sessions",
         Style::default()
@@ -2449,6 +2450,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                         .get(visible_index)
                         .and_then(|index| picker.sessions.get(*index))
                     {
+                        session_rows.push((lines.len(), session.id.clone()));
                         lines.push(session_row_line_with_activity(
                             session,
                             visible_index == picker.selected,
@@ -2486,7 +2488,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                 Style::default().fg(colors::subtle()),
             )));
             lines.push(Line::raw(format!(
-                "  {}/{} · {} open · {} rename · {} pin",
+                "  {}/{} · {}/click open · {} rename · {} pin",
                 app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::NavigateUp),
                 app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::NavigateDown),
                 app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::Activate),
@@ -2599,6 +2601,9 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
 
     let height = (lines.len() as u16 + 2).min(screen.height);
     let area = centered_rect(94, height, screen);
+    picker
+        .session_rows
+        .render(area.inner(Margin::new(1, 1)), session_rows);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3999,7 +4004,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [6_262_202_361_135_624_732, 4_918_634_831_399_365_758],
+            [5_943_157_576_016_431_056, 4_628_304_044_703_891_390],
             "complete help-overlay buffer golden changed"
         );
     }

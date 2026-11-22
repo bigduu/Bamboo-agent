@@ -45,6 +45,8 @@ struct WorkspaceState {
     theme: ThemePalette,
     width: u16,
     title: String,
+    has_subagents: bool,
+    has_parent: bool,
     model: String,
     effort: String,
     task_progress: Option<String>,
@@ -58,6 +60,14 @@ struct WorkspaceState {
 
 impl WorkspaceState {
     fn read(app: &App, width: u16) -> Self {
+        let has_parent = app.parent_session_id().is_some();
+        let has_subagents = app.has_visible_subagents();
+        let title_width = match (width, has_parent && has_subagents) {
+            (..80, true) => 9,
+            (..80, false) => 18,
+            (..96, true) => 22,
+            _ => 30,
+        };
         let title = if app.tab == Tab::Chat {
             let session = app.chat.session_id.as_deref();
             let session_title = session.and_then(|id| {
@@ -79,7 +89,7 @@ impl WorkspaceState {
                     .or(prompt)
                     .or(session)
                     .unwrap_or("New session"),
-                30,
+                title_width,
             )
         } else if app.tab == Tab::Config && app.config.view == ConfigView::Permissions {
             "Permission policy".to_string()
@@ -105,6 +115,8 @@ impl WorkspaceState {
             theme: app.theme,
             width,
             title,
+            has_subagents,
+            has_parent,
             model: short_label(
                 if app.chat.model.is_empty() {
                     "Model"
@@ -235,11 +247,30 @@ fn render_shell(state: WorkspaceState, events: &mpsc::UnboundedSender<AppEvent>)
     let chat = state.tab == Tab::Chat;
     let roomy = state.width >= 80;
     let wide = state.width >= 100;
-    let sessions = if state.hints && roomy {
-        format!("{}  {}", state.title, state.session_hint)
+    let sessions = if state.hints && state.width >= 96 {
+        format!("Switch session ▾ {}", short_label(&state.session_hint, 10))
+    } else if roomy {
+        "Switch session ▾".into()
     } else {
-        state.title.clone()
+        "Switch session".into()
     };
+    let mut navigation = view()
+        .flex_shrink_0()
+        .flex_row()
+        .items_center()
+        .gap(px(CELL_WIDTH));
+    if state.has_parent {
+        navigation = navigation.child(
+            action("← Parent".into(), ActionId::OpenParentSession)
+                .flex_shrink_0()
+                .label("Back to parent session"),
+        );
+    }
+    if state.has_subagents {
+        navigation = navigation
+            .child(action("Sub-agents ›".into(), ActionId::OpenSubagentTree).flex_shrink_0());
+    }
+    navigation = navigation.child(action(sessions, ActionId::OpenSessionPicker).flex_shrink_0());
     let header = view()
         .w_full()
         .max_w(px(READING_WIDTH))
@@ -249,9 +280,20 @@ fn render_shell(state: WorkspaceState, events: &mpsc::UnboundedSender<AppEvent>)
         .flex_row()
         .items_center()
         .justify_between()
-        .child(text("Bamboo").font_weight(FontWeight::BOLD))
         .child(if chat {
-            action(sessions, ActionId::OpenSessionPicker).into_element()
+            view()
+                .flex_row()
+                .min_w(px(0.0))
+                .items_center()
+                .gap(px(CELL_WIDTH))
+                .child(text("Bamboo").font_weight(FontWeight::BOLD))
+                .child(text(state.title.clone()).number_of_lines(1))
+                .into_element()
+        } else {
+            text("Bamboo").font_weight(FontWeight::BOLD).into_element()
+        })
+        .child(if chat {
+            navigation.into_element()
         } else {
             text(state.title.clone()).into_element()
         });
@@ -715,6 +757,7 @@ pub(super) fn popover_area(anchor: Rect, width: u16, height: u16, right: bool) -
 mod tests {
     use super::*;
     use crate::api::BambooClient;
+    use crate::app::SubAgentDisplay;
     use ratatui::{backend::TestBackend, Terminal};
     use std::time::Duration;
 
@@ -759,33 +802,53 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             draw_until(&mut workspace, &mut terminal, &app, &wake, "/ Functions").await;
             assert!(position(terminal.backend().buffer(), "New session").is_some());
+            assert!(position(terminal.backend().buffer(), "Switch session").is_some());
+            assert!(position(terminal.backend().buffer(), "← Parent").is_none());
+            assert!(position(terminal.backend().buffer(), "Sub-agents").is_none());
             assert!(workspace.areas.body.get().height >= 14);
 
             app.chat.model = "fresh-model".into();
             draw_until(&mut workspace, &mut terminal, &app, &wake, "fresh-model").await;
-            let (column, row) = position(terminal.backend().buffer(), "Settings").unwrap();
-            for kind in [
-                MouseEventKind::Down(TerminalButton::Left),
-                MouseEventKind::Up(TerminalButton::Left),
+            app.chat.session_id = Some("current-child-session".into());
+            app.chat.parent_session_id = Some("parent-session".into());
+            app.chat.sub_agents.push(SubAgentDisplay {
+                child_session_id: "nested-child".into(),
+                title: None,
+                status: "running".into(),
+                error: None,
+            });
+            draw_until(&mut workspace, &mut terminal, &app, &wake, "← Parent").await;
+            for (label, expected) in [
+                ("Settings", ActionId::OpenTerminalSettings),
+                ("Switch session", ActionId::OpenSessionPicker),
+                ("Sub-agents", ActionId::OpenSubagentTree),
+                ("← Parent", ActionId::OpenParentSession),
             ] {
-                workspace.handle_mouse(MouseEvent {
-                    kind,
-                    column,
-                    row,
-                    modifiers: KeyModifiers::NONE,
-                });
+                let (column, row) = position(terminal.backend().buffer(), label)
+                    .unwrap_or_else(|| panic!("{label} was clipped at {width}×{height}"));
+                for kind in [
+                    MouseEventKind::Down(TerminalButton::Left),
+                    MouseEventKind::Up(TerminalButton::Left),
+                ] {
+                    workspace.handle_mouse(MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                }
+                let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                    .await
+                    .expect("workspace control did not emit a press");
+                assert!(matches!(
+                    event,
+                    Some(AppEvent::WorkspaceAction(WorkspaceAction {
+                        action,
+                        tab: Tab::Chat,
+                        ..
+                    })) if action == expected
+                ));
             }
-            let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
-                .await
-                .expect("workspace control did not emit a press");
-            assert!(matches!(
-                event,
-                Some(AppEvent::WorkspaceAction(WorkspaceAction {
-                    action: ActionId::OpenTerminalSettings,
-                    tab: Tab::Chat,
-                    ..
-                }))
-            ));
         }
     }
 }

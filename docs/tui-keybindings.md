@@ -14,7 +14,13 @@ Press `/` at the start of the draft or `Ctrl+K` to open Functions. The menu
 searches built-in actions and commands available to the active Bamboo session.
 `Ctrl+O` opens the model and reasoning picker. Use the Left and Right keys to
 change the reasoning level for supported models, then press Enter to apply the
-execution profile. `Ctrl+P` opens recent sessions.
+execution profile. Use **Switch session** in the header or `Ctrl+P` to search
+sessions. Click a row or press Enter to open the selection.
+
+In chat, click **Open chat** on a sub-agent row to read its conversation. The
+**Sub-agents** button opens the session tree, where you can also click a row to
+open it. A child session shows **← Parent** in the header. Click it or press
+`F4` to return to the immediate parent.
 
 Search for **Terminal settings** in Functions to adjust appearance, expansion of
 new tool blocks, and toolbar hints for the current terminal process. The server
@@ -82,7 +88,7 @@ Action and context IDs are stable kebab-case strings:
 
 - `global`: `quit-or-stop`, `show-help`, `show-notifications`,
   `open-command-palette`, `new-session`, `reopen-pending-question`,
-  `open-model-picker`, `open-session-picker`, `stop-run`, `open-config-tab`,
+  `open-model-picker`, `open-session-picker`, `open-parent-session`, `stop-run`, `open-config-tab`,
   `open-terminal-settings`, `open-chat-tab`, `open-sessions-tab`, `open-mcp-tab`,
   `open-skills-tab`, `open-schedules-tab`, `next-tab`, `previous-tab`
 - `navigation`: `show-help`, `switch-tab-1` through `switch-tab-6`
