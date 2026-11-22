@@ -1,6 +1,8 @@
+use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
+use bamboo_domain::CapabilityLoadingMode;
 
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
@@ -71,12 +73,11 @@ Launch ready independent SubAgent assignments in parallel within the available c
 Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
 This mode is independent of each model call's reasoning effort.";
 
-const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
-Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to authorized workers. Use only bounded Session/Work/plan views here. Delegate every direct workspace/file read, search, image read, write, shell or process operation to another Session; read-only file tools are not an exception. A Skill, Workflow, browser or external tool is not a shortcut. Split multi-part execution into independently verifiable slices with non-overlapping file ownership and dispatch them in parallel to separate workers instead of funneling everything through one worker; serialize only dependent slices or shared-file writes.\n\
-Session discovery: use canonical Host views for the current application user's Projects and Sessions. Use session_history list and bounded inspect when you need to verify a candidate. The trusted Supervisor role has default management within this user-data domain; do not ask for per-Project UI authorization. It has no authority over other users, data domains or external accounts. To continue a verified assignment, use the canonical session_control followup or separately authorized session_message route; preserve the target's history, model, Project, workspace, run and permissions. A pending target approval still requires its real decision. For a new independent Root, use the Host's advertised creation tool. Reuse the complete request and operation UUID after an uncertain response; creation/admission is not completion. This creates neither a Child nor a formal Work/Ticket or isolated worktree. Never inherit Supervisor management into a worker or Observer. Track parallel workstreams through session_control directory observation instead of memory: entries report origin (supervisor-created or user-opened), live-link state, persisted progress, and the last canonical Human engagement mark. An entry whose engagement postdates your dispatch means the user has taken over that session: do not keep followup-interrupting it unless the user asks. Directory observation grants no control and is never completion evidence. Use authoritative Run evidence for delivery status and compare acceptance evidence when verification is requested.\n\
-When technical verification or acceptance is part of the workflow, compare the returned artifact and its evidence against the assigned acceptance criteria. Missing, stale or mismatching evidence is not a pass: identify the failed criterion, reject the exact current submission when applicable, and send a bounded correction through the existing assignment or Work rework path. Reinspect the corrected result before reporting technical verification. Technical verification does not replace final User acceptance: preserve user_acceptance_required and, when it is true, wait for explicit User acceptance of the exact current submission.\n\
-Use SubAgent only for auxiliary planning, review or verification. Select its read-only explorer role for planning and keep main execution with an independent managed Session. Continue or correct the same child by its returned ActorId. Use work_dispatch only within an existing explicit Work authority; do not introduce Work as a fallback for missing Session scope. Do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
-No suitable Session and no available canonical creation route is an actionable blocker. If the Host still exposes an older per-Project restriction, report the missing current-user management capability as a Host migration blocker instead of requesting one grant per Project. If a worker or tool is unavailable, a target requires a human decision, or an assignment fails, report the actual recoverable blocker; never self-execute or substitute a main-execution Child. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying and reuse it where possible. Do not create overlapping assignments, retry unchanged failures indefinitely, change target permissions or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
+const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
+Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized independent Sessions. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
+Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. Track parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
+Use SubAgent only for auxiliary planning, review or verification. Select the read-only explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Use work_dispatch only for existing explicit Work. Keep the coordinating role with the Supervisor.\n\
+Use discovery for a discoverable route. Tool exposure describes the catalog. Use Host admission to verify target scope and worker readiness. When no authorized route or worker fits, report the specific blocker. Inspect the existing assignment or receipt before retrying. Reuse the complete request and operation UUID on an uncertain response.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
     if session.supervisor_incarnation_id().is_some() {
@@ -112,55 +113,53 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
     )
 }
 
-/// Catalog observation only: exposed routes do not prove worker readiness or
-/// target authorization. Real delegation errors remain authoritative.
-pub(crate) fn build_root_orchestration_context_block_for_tools(
+/// Render current tool exposure after ledger reconciliation. The caller adds
+/// this read model to the request tail so it cannot replay as historical state.
+pub(crate) fn build_supervisor_route_observation(
     session: &Session,
-    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-    loading_mode: bamboo_domain::CapabilityLoadingMode,
+    tool_schemas: &[ToolSchema],
+    loading_mode: CapabilityLoadingMode,
 ) -> Option<ContextBlock> {
-    let mut block = build_root_orchestration_context_block(session)?;
-    if session.supervisor_incarnation_id().is_some() {
-        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
-            session,
-            tool_schemas,
-            loading_mode,
-        );
-        let approved_routes = ["SubAgent", "work_dispatch", "session_control"]
-            .into_iter()
-            .filter(|name| {
-                session.allows_model_tool_execution(name)
-                    && tool_schemas
-                        .iter()
-                        .any(|schema| schema.function.name == *name)
-            })
-            .collect::<Vec<_>>();
-        let routes = approved_routes
-            .iter()
-            .copied()
-            .filter(|name| callable.contains_execution_name(name))
-            .collect::<Vec<_>>();
-        let deferred_routes = approved_routes
-            .iter()
-            .copied()
-            .filter(|name| !callable.contains_execution_name(name))
-            .collect::<Vec<_>>();
-        let observation = if routes.is_empty() && !deferred_routes.is_empty() {
-            serde_json::json!({"status":"discovery_required", "deferred_routes":deferred_routes,
-                "recovery":"Use the existing read-only discovery protocol to load an already-approved orchestration tool. If no match or worker is available, report the recoverable blocker; never self-execute."})
-        } else if routes.is_empty() {
-            serde_json::json!({"status":"blocked","reason":"delegation_tools_unavailable",
-                "recovery":"Ask the owner to provide an authorized delegation route; do not perform the execution here."})
-        } else {
-            serde_json::json!({"status":"routes_exposed","routes":routes,"deferred_routes":deferred_routes,
-                "caution":"Current callable exposure is not worker readiness or target authorization. Report the actual admission error as a recoverable blocker."})
+    session.supervisor_incarnation_id()?;
+    let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+        session,
+        tool_schemas,
+        loading_mode,
+    );
+    let route = |name| {
+        tool_schemas.iter().find(|schema| {
+            schema.function.name == name && session.allows_model_tool_execution(name)
+        })
+    };
+    let exposure = |schema: Option<&ToolSchema>| match schema {
+        Some(schema) if callable.contains_execution_name(&schema.function.name) => "callable",
+        Some(_) => "discoverable",
+        None => "unavailable",
+    };
+    let session_control = route("session_control");
+    let control_action =
+        |action| {
+            exposure(session_control.filter(|schema| {
+                super::tool_schemas::offers_session_control_action(schema, action)
+            }))
         };
-        block.content.push_str(&format!(
-            "\n\nCurrent delegation route observation: {observation}"
-        ));
-        block.stability = ContextBlockStability::RoundDynamic;
-    }
-    Some(block)
+    let observation = serde_json::json!({
+        "main_execution": {
+            "spawn_session": exposure(route("spawn_session")),
+            "session_control.create": control_action("create"),
+            "session_control.followup": control_action("followup"),
+            "session_message.send": exposure(route("session_message")),
+            "work_dispatch": exposure(route("work_dispatch")),
+        },
+        "auxiliary": { "SubAgent": exposure(route("SubAgent")) },
+    });
+    Some(ContextBlock::new(
+        ContextBlockType::RootOrchestration,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Supervisor Delegation Routes",
+        format!("Current delegation route observation: {observation}"),
+    ))
 }
 
 #[cfg(test)]
@@ -240,6 +239,8 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
+        assert_eq!(block.stability, ContextBlockStability::SessionStable);
+        assert!(block.content.len() <= 3_900);
         assert_eq!(
             block
                 .content
@@ -261,13 +262,13 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             "nested delegation",
             "assigned acceptance criteria",
             "reject the exact current submission",
-            "Reinspect the corrected result",
-            "Technical verification does not replace final User acceptance",
-            "dispatch them in parallel to separate workers",
+            "Verify the corrected result",
+            "wait for explicit User acceptance of the exact current submission",
+            "Dispatch independent slices in parallel with disjoint writes",
             "parallel workstreams",
-            "session_control directory observation instead of memory",
-            "taken over that session",
-            "Directory observation grants no control",
+            "session_control directory",
+            "Follow up a user-engaged Session again only when the user asks",
+            "Use authoritative Run evidence for completion",
         ] {
             assert!(block.content.contains(concept), "missing {concept}");
         }
@@ -283,7 +284,7 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
 
 #[cfg(test)]
 #[test]
-fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worker_readiness() {
+fn supervisor_delegation_first_reports_each_main_and_auxiliary_route() {
     use bamboo_domain::{
         CapabilityLoadingMode, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID,
     };
@@ -291,55 +292,99 @@ fn supervisor_delegation_first_reports_unavailable_routes_without_claiming_worke
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
         incarnation_id: uuid::Uuid::new_v4(),
     };
-    let schema = |name: &str| bamboo_agent_core::tools::ToolSchema {
-        schema_type: "function".into(),
-        function: bamboo_agent_core::tools::FunctionSchema {
-            name: name.into(),
-            description: name.into(),
-            parameters: serde_json::json!({"type":"object"}),
-        },
+    let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+        "Read",
+        "spawn_session",
+        "session_control",
+        "SubAgent",
+        "vendor::SubAgent",
+        "work_dispatch",
+    ]);
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["session_control".into()].into(),
+        ..Default::default()
     };
     for ultra in [false, true] {
         supervisor.set_root_orchestration_only(ultra).unwrap();
+        let catalog = super::tool_schemas::resolve_available_tool_schemas_for_session(
+            &config,
+            tools.as_ref(),
+            &supervisor,
+        );
+        let project_catalog = super::tool_schemas::resolve_available_tool_schemas_for_session(
+            &Default::default(),
+            tools.as_ref(),
+            &supervisor,
+        );
+        let observe = |schemas: &[ToolSchema], mode| {
+            let block = build_supervisor_route_observation(&supervisor, schemas, mode).unwrap();
+            assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+            let json = block.content.split_once(": ").unwrap().1;
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        };
         for mode in [
             CapabilityLoadingMode::LegacyFullCatalog,
             CapabilityLoadingMode::Progressive,
             CapabilityLoadingMode::StickyFallback,
         ] {
-            let blocked = build_root_orchestration_context_block_for_tools(
-                &supervisor,
-                &[schema("Read"), schema("vendor::SubAgent")],
-                mode,
-            )
-            .unwrap();
-            assert_eq!(blocked.stability, ContextBlockStability::RoundDynamic);
-            assert!(blocked.content.contains("delegation_tools_unavailable"));
-            assert!(blocked.content.contains("Ask the owner"));
-            assert!(!supervisor.allows_model_tool_execution("exec_command"));
-            let initial = build_root_orchestration_context_block_for_tools(
-                &supervisor,
-                &[schema("Read"), schema("SubAgent")],
-                mode,
-            )
-            .unwrap();
-            if mode == CapabilityLoadingMode::LegacyFullCatalog {
-                assert!(initial.content.contains("routes_exposed"));
-                assert!(initial
-                    .content
-                    .contains("not worker readiness or target authorization"));
+            let deferred_tool = if mode == CapabilityLoadingMode::LegacyFullCatalog {
+                "callable"
             } else {
-                assert!(initial.content.contains("discovery_required"));
-                assert!(!initial.content.contains("routes_exposed"));
-            }
+                "discoverable"
+            };
+            let full = observe(catalog.as_slice(), mode);
+            assert_eq!(full["main_execution"]["work_dispatch"], "callable");
+            assert_eq!(
+                full["main_execution"]["session_control.create"],
+                "unavailable"
+            );
+            assert_eq!(full["main_execution"]["spawn_session"], deferred_tool);
+            assert_eq!(full["auxiliary"]["SubAgent"], deferred_tool);
+
+            let standalone = catalog
+                .iter()
+                .find(|schema| schema.function.name == "spawn_session")
+                .unwrap();
+            let standalone = observe(std::slice::from_ref(standalone), mode);
+            assert_eq!(standalone["main_execution"]["spawn_session"], deferred_tool);
+            assert_eq!(standalone["auxiliary"]["SubAgent"], "unavailable");
+
+            let child = catalog
+                .iter()
+                .find(|schema| schema.function.name == "SubAgent")
+                .unwrap();
+            let auxiliary = observe(std::slice::from_ref(child), mode);
+            assert_eq!(auxiliary["auxiliary"]["SubAgent"], deferred_tool);
+            assert!(auxiliary["main_execution"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "unavailable"));
+
+            let blocked = observe(&[], mode);
+            assert!(blocked["main_execution"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "unavailable"));
+            assert_eq!(blocked["auxiliary"]["SubAgent"], "unavailable");
+
+            let project = observe(&project_catalog, mode);
+            assert_eq!(
+                project["main_execution"]["session_control.create"],
+                deferred_tool
+            );
+            assert_eq!(
+                project["main_execution"]["session_control.followup"],
+                "unavailable"
+            );
         }
     }
     let ordinary = Session::new("ordinary", "model");
-    assert!(build_root_orchestration_context_block_for_tools(
-        &ordinary,
-        &[],
-        CapabilityLoadingMode::Progressive
-    )
-    .is_none());
+    assert!(
+        build_supervisor_route_observation(&ordinary, &[], CapabilityLoadingMode::Progressive)
+            .is_none()
+    );
 }
 
 /// Build the single provider-visible Workspace block from authoritative
@@ -956,23 +1001,22 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             .unwrap()
             .content;
         for concept in [
-            "dispatch and report only the requested assignments",
-            "its own fresh Host notification",
-            "same assignment",
+            "Act only on requested assignments",
+            "their own fresh Host notifications",
+            "same verified assignment",
             "new independent Session for a separate assignment or requested context isolation",
             "intended Project and workspace",
             "Project is optional",
             "omit both project_id and workspace_path",
-            "a sole available Project does not count",
-            "ask one focused question before dispatching that assignment",
+            "the user identifies it for this assignment",
+            "Ask one focused question if a required workspace is unclear",
             "session_history list",
             "bounded inspect",
-            "main execution",
+            "to authorized independent Sessions",
             "auxiliary planning",
-            "continue a verified assignment",
+            "Use session_control followup",
             "current application user",
-            "No suitable Session",
-            "never self-execute",
+            "When no authorized route or worker fits, report the specific blocker",
         ] {
             assert!(guidance.contains(concept), "missing {concept}");
         }

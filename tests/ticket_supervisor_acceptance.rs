@@ -80,7 +80,7 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
         "Delegate execution",
         "assigned acceptance criteria",
         "reject the exact current submission",
-        "Technical verification does not replace final User acceptance",
+        "wait for explicit User acceptance of the exact current submission",
     ] {
         assert!(
             prompt.contains(required),
@@ -93,6 +93,25 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
     );
     assert!(!prompt.contains("Ultra Root thinking mode"));
     assert!(!prompt.contains("Make authorized file edits directly"));
+    assert_eq!(
+        prompt
+            .matches("Current delegation route observation: ")
+            .count(),
+        1
+    );
+    let (current_context, conversation) = messages.as_array().unwrap().split_last().unwrap();
+    let facts = current_context["content"]
+        .as_str()
+        .unwrap()
+        .split_once("Current delegation route observation: ")
+        .expect("Supervisor route facts follow the complete conversation")
+        .1;
+    let observation = serde_json::Deserializer::from_str(facts)
+        .into_iter::<Value>()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation["main_execution"]["work_dispatch"], "callable");
     assert!(tools.iter().all(|t| !matches!(
         t["function"]["name"].as_str(),
         Some(
@@ -107,7 +126,7 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
     )));
     let prefix = format!("acceptance-{round}-");
     let id = |name: &str| format!("{prefix}{name}");
-    let last_id = messages.as_array().unwrap().last().unwrap()["tool_call_id"]
+    let last_id = conversation.last().unwrap()["tool_call_id"]
         .as_str()
         .unwrap_or("");
     let stage = last_id.strip_prefix(&prefix).unwrap_or("start");

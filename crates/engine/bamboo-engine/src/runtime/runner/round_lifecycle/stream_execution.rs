@@ -14,8 +14,9 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block_for_tools, build_session_identity_context_block,
-    build_task_list_context_block, build_workspace_context_block,
+    build_root_orchestration_context_block, build_session_identity_context_block,
+    build_supervisor_route_observation, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -856,8 +857,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    let mut orchestration =
-        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode);
+    let mut orchestration = build_root_orchestration_context_block(session);
+    let supervisor_policy_digest = orchestration
+        .as_ref()
+        .filter(|_| session.supervisor_incarnation_id().is_some())
+        .map(bamboo_domain::model_context_block_sha256);
     if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
         session,
         config.guidance_active_run_id.as_deref(),
@@ -1105,7 +1109,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
     bamboo_compression::project_file_change_results(&mut real_transcript);
-    let cache_scope = serde_json::json!({
+    let mut cache_scope = serde_json::json!({
         // Retire old generated epochs that preserved withdrawn memory snapshots.
         "external_memory_projection_version": 3,
         "model": model,
@@ -1117,6 +1121,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             .collect::<Vec<_>>(),
         "tools": tool_schemas,
     });
+    if let Some(digest) = supervisor_policy_digest {
+        // Refresh the generated prefix when the role policy changes. Current
+        // route facts stay outside the scope and the durable transcript.
+        cache_scope["supervisor_policy_sha256"] = digest.into();
+    }
     let cache_scope_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&cache_scope).expect("cache scope is serializable"),
     ));
@@ -1174,6 +1183,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
+    if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
     if let Some(deadline) = config.run_deadline {
         // Sample only the caller's explicit clock. A fresh reading belongs to
         // this request, outside the durable ledger and the cacheable prefix.
