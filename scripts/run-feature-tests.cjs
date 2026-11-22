@@ -266,6 +266,11 @@ const FEATURE_CONTEXTS = [
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
     { name: "ticket_runtime_files", kind: "test", added: [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
+  { package: "bamboo-litellm-llms-types", features: ["schema"], targets: [
+    { name: "bamboo_litellm_llms_types", kind: "lib", added: [
+      "formats::messages::request::tests::content_block_type_schema_remains_a_string",
+      "formats::responses::streaming::tests::event_type_schema_accepts_unknown_strings",
+      "tests::wire_type_supports_schema_generation"] }] },
 ];
 
 const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",

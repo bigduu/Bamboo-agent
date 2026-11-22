@@ -285,10 +285,11 @@ test("feature shards preserve default configurations and complete explicit addit
   }
   assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
     'New feature-sensitive source requires a reviewed ownership update')
-  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 20)
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 23)
   assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
     ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
-    ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
+    ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']],
+    ['bamboo-litellm-llms-types', ['schema']]])
   for (const context of FEATURE_CONTEXTS) {
     assert.ok(packages.some(owner => owner.name === context.package))
     assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
