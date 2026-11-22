@@ -18,6 +18,8 @@ use crate::provider::{
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
 };
 use crate::providers::common::model_fetcher;
+#[cfg(feature = "litellm-wire-types")]
+use crate::providers::common::openai_compat::build_litellm_chat_body;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
@@ -31,6 +33,8 @@ use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 pub struct BodhiProvider {
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_wire_types: bool,
     client: Client,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
@@ -44,6 +48,8 @@ pub struct BodhiProvider {
 impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_wire_types: false,
             client: crate::http_client::default_http_client(),
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
@@ -84,6 +90,20 @@ impl BodhiProvider {
 
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
+        self
+    }
+
+    /// Use the same pinned wire types as the direct provider adapters.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = true;
+        self
+    }
+
+    /// Select Bamboo's original wire adapters for this gateway.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = false;
         self
     }
 
@@ -335,7 +355,14 @@ impl BodhiProvider {
         required_tool: Option<&str>,
         allow_disable_correction: bool,
     ) -> Result<LLMStream> {
-        let mut body = build_openai_compat_body(
+        let build_body = build_openai_compat_body;
+        #[cfg(feature = "litellm-wire-types")]
+        let build_body = if self.litellm_wire_types {
+            build_litellm_chat_body
+        } else {
+            build_body
+        };
+        let mut body = build_body(
             model,
             messages,
             tools,
@@ -409,16 +436,38 @@ impl BodhiProvider {
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let mut body = build_anthropic_request_with_cache(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            true,
-            reasoning_effort,
-            None,
-            cache_plan,
-        );
+        #[cfg(feature = "litellm-wire-types")]
+        let body = self
+            .litellm_wire_types
+            .then(|| {
+                crate::providers::anthropic::build_litellm_anthropic_proxy_request(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    reasoning_effort,
+                    cache_plan,
+                )
+            })
+            .transpose()?;
+        #[cfg(not(feature = "litellm-wire-types"))]
+        let body: Option<Value> = None;
+        let mut body = body.unwrap_or_else(|| {
+            build_anthropic_request_with_cache(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                true,
+                reasoning_effort,
+                None,
+                cache_plan,
+            )
+        });
+        #[cfg(feature = "litellm-wire-types")]
+        let prepared_budget = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64);
         apply_required_tool_choice(&mut body, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut body,
@@ -427,6 +476,14 @@ impl BodhiProvider {
             request_overrides::ENDPOINT_MESSAGES,
             model,
         )?;
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            crate::providers::anthropic::finalize_litellm_anthropic_proxy_request(
+                &mut body,
+                model,
+                prepared_budget,
+            )?;
+        }
 
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
         apply_cache_ttl_header(&mut headers, cache_plan);
@@ -467,26 +524,22 @@ impl BodhiProvider {
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
     ) -> Result<LLMStream> {
-        use crate::protocol::gemini::GeminiRequest;
-        use crate::protocol::ToProvider;
         use crate::providers::gemini::{
-            apply_generation_config, apply_required_tool_choice, parse_gemini_sse_event,
+            apply_required_tool_choice, build_gemini_request_body, parse_gemini_sse_event,
             GeminiStreamState,
         };
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
-        let messages_vec: Vec<Message> = messages.to_vec();
-        let mut request: GeminiRequest = messages_vec.to_provider()?;
-
-        if !tools.is_empty() {
-            let tools_vec: Vec<ToolSchema> = tools.to_vec();
-            request.tools = Some(tools_vec.to_provider()?);
-        }
-
-        apply_generation_config(&mut request, max_output_tokens, reasoning_effort);
-
-        // Serialize then run the last-moment scan over the body Value before send.
-        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        let mut request_json = build_gemini_request_body(
+            messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types
+                .then(crate::providers::gemini::LiteLlmRequestOptions::default),
+        )?;
         apply_required_tool_choice(&mut request_json, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut request_json,
@@ -526,6 +579,10 @@ impl BodhiProvider {
         }
 
         let mut state = GeminiStreamState::default();
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            state.enable_litellm_tool_ids();
+        }
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).

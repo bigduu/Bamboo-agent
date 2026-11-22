@@ -33,6 +33,7 @@ struct ExecWaitProvider {
     calls: AtomicUsize,
     mode: WaitMode,
     exit_code: u8,
+    expect_deadline: bool,
 }
 
 fn tool_result(messages: &[Message], id: &str) -> Value {
@@ -67,6 +68,22 @@ impl LLMProvider for ExecWaitProvider {
             assert!(tools.iter().any(|tool| tool.function.name == name));
         }
         assert!(!tools.iter().any(|tool| tool.function.name == "bash"));
+        let deadlines: Vec<_> = messages
+            .iter()
+            .filter(|message| message.content.starts_with("Host execution deadline\n"))
+            .collect();
+        if self.expect_deadline {
+            assert_eq!(deadlines.len(), 1);
+            let seconds = deadlines[0]
+                .content
+                .split_once("Time remaining: ")
+                .and_then(|(_, time)| time.split_once('s'))
+                .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
+                .expect("the CLI clock supplies the remaining time");
+            assert!(seconds <= CLI_TIMEOUT_SECS);
+        } else {
+            assert!(deadlines.is_empty());
+        }
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
         let (wait_call_id, _, terminal_round) = self.mode.wait_call();
         let chunk = match round {
@@ -151,6 +168,7 @@ async fn run_exec_wait(mode: WaitMode, should_time_out: bool, exit_code: u8) {
         calls: AtomicUsize::new(0),
         mode,
         exit_code,
+        expect_deadline: should_time_out,
     });
     let config = crate::model_entrypoint_routing_tests::config(true, "chat-a");
     let state = AppState::new_with_provider_and_memory_store(

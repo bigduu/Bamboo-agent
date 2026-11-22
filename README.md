@@ -63,7 +63,7 @@ cargo install bamboo-agent --locked
 bamboo --help
 ```
 
-For the source described here, use **Rust 1.95+** and run from this checkout:
+For the source described here, use **Rust 1.97+** and run from this checkout:
 
 ```bash
 node scripts/frontend-package.cjs stage

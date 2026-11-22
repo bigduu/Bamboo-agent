@@ -49,22 +49,18 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
 /// Placement and dispatch policy in the Supervisor's role context.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
-    "When a new assignment requires a specific Project, use session_control create with its verified Project and bound workspace. ",
-    "Honor an explicit request to start the execution Session in Ultra by setting thinking_mode to ultra on creation. ",
-    "An Ultra execution Session is an Ordinary Root that can delegate shell work to SubAgents. Standard is the default for a new assignment. ",
-    "On a new user request, dispatch and report only the requested assignments. ",
-    "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
-    "Conversation history alone does not reactivate old work. ",
-    "Before dispatch, identify the assignment and the workspace it needs. ",
-    "Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation ",
-    "identifies the same assignment in the intended Project and workspace. ",
-    "Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. ",
-    "Assign a Project only when the user explicitly identifies it for that assignment or a named repository or workspace matches a canonical Host record. ",
-    "The Project of another assignment, the current directory, or a sole available Project does not count. ",
-    "If the assignment requires a specific repository or workspace and you cannot identify it, ask one focused question before dispatching that assignment."
+    "Use session_control create for a verified Project and its bound workspace, or its standalone form if spawn_session is unavailable. ",
+    "Bind a Project only when the user identifies it for this assignment or the named workspace or repository matches a canonical Host record. ",
+    "Ask one focused question if a required workspace is unclear. ",
+    "Start a new independent Session for a separate assignment or requested context isolation. Workers are Ordinary Roots. ",
+    "Set thinking_mode to ultra on explicit request. Use Standard by default.\n",
+    "Reuse a Session only for the same verified assignment in the intended Project and workspace, or at the user's explicit direction. ",
+    "Use session_control followup or an authorized session_message send, preserving the target's context and permissions. ",
+    "Act only on requested assignments and their own fresh Host notifications."
 );
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
+pub const SUPERVISOR_WAIT_YIELD: &str = "runtime_control:supervisor_wait_yield";
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
 const RECENT_NOTIFICATION_SOURCES: usize = 8;
@@ -109,6 +105,26 @@ fn short_handoff_notice(
     notice
 }
 
+fn has_owned_background_wait(
+    session: &Session,
+    fact: &bamboo_domain::SupervisedRootOutcomeFact,
+) -> bool {
+    // A later Main append can follow the wait notice before reconciliation.
+    // Bind the notice to its producing Run and preserve actionable questions.
+    fact.questions.is_empty()
+        && session.messages.iter().rev().any(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "background_exec_wait"
+                        && metadata["source"] == "runtime"
+                        && metadata["run_id"].as_str() == Some(fact.run_id.as_str())
+                        && metadata["exec_session_id"]
+                            .as_str()
+                            .is_some_and(|handle| !handle.is_empty())
+                })
+        })
+}
+
 /// Selectors only. The native Inbox writer proves each original source again.
 pub fn notification_candidates(
     session: &Session,
@@ -122,12 +138,17 @@ pub fn notification_candidates(
     outcomes.validate()?;
     let mut candidates = Vec::new();
     for fact in &outcomes.facts {
-        let has_material = fact.result.is_some()
-            || metadata
-                .managed_task_blocker
-                .as_ref()
-                .is_some_and(|blocker| blocker.run_id == fact.run_id);
-        if !has_material {
+        let blocker = metadata
+            .managed_task_blocker
+            .as_ref()
+            .filter(|blocker| blocker.run_id == fact.run_id);
+        if fact.result.is_none() && blocker.is_none() {
+            continue;
+        }
+        if fact.result == Some(bamboo_domain::SupervisedRootOutcomeResult::Suspended)
+            && blocker.is_none()
+            && has_owned_background_wait(session, fact)
+        {
             continue;
         }
         for input in outcomes.material_inputs(fact) {
@@ -152,17 +173,7 @@ pub fn notification_candidates(
                 run_id: fact.run_id.clone(),
                 after_sequence: fact.sequence - 1,
                 input_receipt_id: input.receipt_id.clone(),
-                blocker_cursor: fact
-                    .result
-                    .is_none()
-                    .then(|| {
-                        metadata
-                            .managed_task_blocker
-                            .as_ref()
-                            .filter(|blocker| blocker.run_id == fact.run_id)
-                            .map(|blocker| blocker.cursor)
-                    })
-                    .flatten(),
+                blocker_cursor: blocker.filter(|_| fact.result.is_none()).map(|b| b.cursor),
             });
         }
     }

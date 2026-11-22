@@ -298,7 +298,7 @@ impl SessionStoreV2 {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let pair = async {
-                    let main_bytes = fs::read(directory.join("session.json")).await?;
+                    let main_bytes = cold_main::read(directory.join("session.json")).await?;
                     let side_bytes = fs::read(directory.join(RUNTIME_SIDECAR_FILE)).await?;
                     compact_main::validate_full_main(&main_bytes)?;
                     let main: Session = serde_json::from_slice(&main_bytes)?;

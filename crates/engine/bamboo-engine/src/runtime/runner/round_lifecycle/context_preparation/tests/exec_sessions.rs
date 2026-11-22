@@ -8,6 +8,7 @@ use super::super::maybe_apply_summary_context_compression_with_budget;
 use super::*;
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
 use bamboo_agent_core::{BashCompletionInfo, BashCompletionSink};
+use bamboo_domain::PermissionMode;
 use bamboo_tools::tools::{bash_runtime, ExecCommandTool, WriteStdinTool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -128,8 +129,7 @@ impl LLMProvider for PullFromContextProvider {
             .iter()
             .find(|message| {
                 message.metadata.as_ref().is_some_and(|metadata| {
-                    metadata["bamboo_context_block"]["title"]
-                        == "Shell sessions awaiting a terminal result"
+                    metadata["bamboo_context_block"]["title"] == "Shell session handles"
                 })
             })
             .expect("provider receives the live continuation snapshot after archival/trimming");
@@ -195,7 +195,7 @@ async fn dispatch_and_pull_from_context(
     .unwrap();
     let (tx, _rx) = mpsc::channel(128);
     let block_tokens = TiktokenTokenCounter::default().count_message(
-        &build_exec_session_continuation_context_block(session, schemas)
+        &build_exec_session_continuation_context_block(session, schemas, PermissionMode::Default)
             .unwrap()
             .render_runtime_context_message(),
     );
@@ -276,7 +276,12 @@ async fn dispatch_and_pull_from_context(
         .unwrap()
         .contains("terminal-output"));
     assert!(bash_runtime::uncollected_polled_shells_for_session(&owner).is_empty());
-    assert!(build_exec_session_continuation_context_block(session, schemas).is_none());
+    assert!(build_exec_session_continuation_context_block(
+        session,
+        schemas,
+        PermissionMode::Default
+    )
+    .is_none());
     assert!(
         session
             .model_context_state
@@ -364,9 +369,13 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
             }
             let schemas = shell_schemas();
             let block_tokens = TiktokenTokenCounter::default().count_message(
-                &build_exec_session_continuation_context_block(&session, &schemas)
-                    .unwrap()
-                    .render_runtime_context_message(),
+                &build_exec_session_continuation_context_block(
+                    &session,
+                    &schemas,
+                    PermissionMode::Default,
+                )
+                .unwrap()
+                .render_runtime_context_message(),
             );
             let (summary_llm, summary_requests) = prompt_capture_llm();
             let mut config = bounded_compression_config(summary_llm);
@@ -508,12 +517,47 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
     bash_runtime::remove_shell(&unowned.id);
     let mut session = Session::new(owner, "test-model");
     let schemas = shell_schemas();
-    assert!(
-        build_exec_session_continuation_context_block(&session, &schemas)
-            .unwrap()
+    let snapshot =
+        build_exec_session_continuation_context_block(&session, &schemas, PermissionMode::Default)
+            .unwrap();
+    assert!(snapshot.content.contains(&handle));
+    assert!(snapshot.content.contains("Use write_stdin"));
+    assert!(!snapshot.content.contains("SubAgent"));
+    let mut with_wait = schemas.to_vec();
+    let mut subagent = schemas[0].clone();
+    subagent.function.name = "SubAgent".into();
+    with_wait.push(subagent);
+    for ultra in [false, true] {
+        session.set_root_orchestration_only(ultra).unwrap();
+        let snapshot = build_exec_session_continuation_context_block(
+            &session,
+            &with_wait,
+            PermissionMode::Default,
+        )
+        .unwrap();
+        assert!(snapshot.content.contains("If you still need"));
+        assert!(snapshot
             .content
-            .contains(&handle)
-    );
+            .contains("SubAgent with intent=wait and target"));
+        assert!(snapshot.content.contains(&handle));
+    }
+    assert!(build_exec_session_continuation_context_block(
+        &session,
+        &with_wait,
+        PermissionMode::Plan,
+    )
+    .is_none());
+    let parent = Session::new("shell-parent", "test-model");
+    let child = Session::new_child_of(owner, &parent, "test-model", "worker");
+    assert!(!build_exec_session_continuation_context_block(
+        &child,
+        &with_wait,
+        PermissionMode::Default
+    )
+    .unwrap()
+    .content
+    .contains("SubAgent"));
+    session.set_root_orchestration_only(false).unwrap();
     for name in [
         "vendor::write_stdin",
         "default::write_stdin",
@@ -523,11 +567,19 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
         let mut foreign = schemas[1].clone();
         foreign.function.name = name.into();
         assert!(
-            build_exec_session_continuation_context_block(&session, &[foreign]).is_none(),
+            build_exec_session_continuation_context_block(
+                &session,
+                &[foreign],
+                PermissionMode::Default
+            )
+            .is_none(),
             "{name}"
         );
     }
-    assert!(build_exec_session_continuation_context_block(&session, &[]).is_none());
+    assert!(
+        build_exec_session_continuation_context_block(&session, &[], PermissionMode::Default)
+            .is_none()
+    );
     // An explicit load_skill-only request must not inherit continuation guidance
     // from a broader pre-projection schema list.
     let mut required = session.clone();
@@ -539,10 +591,21 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
         bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
         "[\"review\"]".into(),
     );
-    assert!(build_exec_session_continuation_context_block(&required, &schemas).is_none());
+    assert!(build_exec_session_continuation_context_block(
+        &required,
+        &schemas,
+        PermissionMode::Default
+    )
+    .is_none());
     session.set_root_orchestration_only(true).unwrap();
-    assert!(build_exec_session_continuation_context_block(&session, &schemas).is_none());
-    session.set_root_orchestration_only(false).unwrap();
+    assert!(build_exec_session_continuation_context_block(
+        &session,
+        &schemas,
+        PermissionMode::Default
+    )
+    .unwrap()
+    .content
+    .contains(&handle));
     let terminal = tool_payload(
         WriteStdinTool::new()
             .invoke(
@@ -553,6 +616,11 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
             .unwrap(),
     );
     assert_eq!(terminal["exit_code"], 7);
-    assert!(build_exec_session_continuation_context_block(&session, &schemas).is_none());
+    assert!(build_exec_session_continuation_context_block(
+        &session,
+        &schemas,
+        PermissionMode::Default
+    )
+    .is_none());
     assert_eq!(completion.0.load(Ordering::SeqCst), 0);
 }

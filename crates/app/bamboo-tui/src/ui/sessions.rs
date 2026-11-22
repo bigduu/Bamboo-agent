@@ -349,6 +349,7 @@ mod tests {
     fn session(id: &str) -> SessionSummary {
         SessionSummary {
             id: id.into(),
+            parent_session_id: None,
             project_id: None,
             title: String::new(),
             title_generated: true,

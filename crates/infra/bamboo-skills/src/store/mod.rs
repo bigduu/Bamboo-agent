@@ -724,6 +724,48 @@ struct SkillCatalogPublication {
     _instruction_revisions: Vec<Arc<u64>>,
 }
 
+#[derive(Debug, Default)]
+struct WorkflowCatalogPublication {
+    snapshot: WorkflowCatalogSnapshot,
+    executable_ids: HashSet<SkillId>,
+}
+
+impl WorkflowCatalogPublication {
+    fn executable_snapshot(&self) -> WorkflowCatalogSnapshot {
+        WorkflowCatalogSnapshot {
+            revision: self.snapshot.revision,
+            entries: self
+                .snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.winner && self.executable_ids.contains(&entry.id))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+fn read_published_run_definition(
+    entry: &WorkflowCatalogEntry,
+    bytes: &[u8],
+) -> SkillResult<Option<bamboo_domain::WorkflowRunDefinition>> {
+    let value: serde_yaml::Value = serde_yaml::from_slice(bytes)
+        .map_err(|_| SkillError::Validation("invalid pinned workflow yaml".into()))?;
+    if value.get("workflow_schema").is_none() {
+        return Ok(None);
+    }
+    let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_slice(bytes)
+        .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
+    bamboo_domain::CompiledWorkflow::compile(definition.clone())
+        .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
+    if definition.id != entry.id || definition.revision != entry.revision {
+        return Err(SkillError::Validation(
+            "workflow identity does not match its catalog entry".into(),
+        ));
+    }
+    Ok(Some(definition))
+}
+
 struct PreviousCatalog<'a> {
     roots: &'a HashMap<SkillId, PathBuf>,
     definitions: &'a HashMap<SkillId, SkillDefinition>,
@@ -1360,7 +1402,7 @@ pub struct SkillStore {
     workflow_roots: RwLock<HashMap<SkillId, PathBuf>>,
     workflow_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
     /// Public Workflow catalog (legacy adapters and orchestration bundles).
-    catalog: RwLock<WorkflowCatalogSnapshot>,
+    catalog: RwLock<WorkflowCatalogPublication>,
     /// Session/activation-scoped immutable workflow generations. The cache is bounded,
     /// and normal runtime finalization explicitly removes completed activations.
     pinned_activations: Arc<RwLock<PinnedSkillActivations>>,
@@ -1636,7 +1678,7 @@ impl SkillStore {
             workflow_definitions: RwLock::new(HashMap::new()),
             workflow_roots: RwLock::new(HashMap::new()),
             workflow_resources: RwLock::new(HashMap::new()),
-            catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
+            catalog: RwLock::new(WorkflowCatalogPublication::default()),
             pinned_activations: Arc::default(),
             watcher_started: AtomicBool::new(false),
             watcher_counters: Arc::new(SkillWatcherCounters::default()),
@@ -1807,7 +1849,7 @@ impl SkillStore {
                 self.workflow_definitions.read().await.clone(),
                 self.workflow_roots.read().await.clone(),
                 self.workflow_resources.read().await.clone(),
-                self.catalog.read().await.clone(),
+                self.catalog.read().await.snapshot.clone(),
             )
         };
         let mut skill_loaded = Vec::new();
@@ -2034,6 +2076,25 @@ impl SkillStore {
         {
             return Ok(count);
         }
+        // The catalog and the exact YAML bytes are published together. Derive
+        // eligibility once per publication for both UI and model discovery.
+        let executable_ids = next_catalog
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.winner
+                    && entry.status == WorkflowStatus::Valid
+                    && entry.kind == WorkflowKind::Orchestration
+                    && entry.id != crate::SKILL_CURATOR_ID
+                    && resolved_workflow_resources
+                        .get(&entry.id)
+                        .and_then(|resources| resources.get("workflow.yaml"))
+                        .is_some_and(|bytes| {
+                            matches!(read_published_run_definition(entry, bytes), Ok(Some(_)))
+                        })
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
         let publication_definition_bytes = resolved_skills
             .values()
             .chain(resolved_workflows.values())
@@ -2103,7 +2164,10 @@ impl SkillStore {
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
         *workflow_resources_guard = resolved_workflow_resources;
-        *catalog_guard = next_catalog.clone();
+        *catalog_guard = WorkflowCatalogPublication {
+            snapshot: next_catalog.clone(),
+            executable_ids,
+        };
         drop(catalog_guard);
         drop(workflow_resources_guard);
         drop(workflow_roots_guard);
@@ -2682,7 +2746,13 @@ impl SkillStore {
     /// Return the current immutable metadata-only catalog snapshot.
     pub async fn workflow_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
-        self.catalog.read().await.clone()
+        self.catalog.read().await.snapshot.clone()
+    }
+
+    /// Return the current catalog entries with a pinned execution definition.
+    pub async fn executable_workflow_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        self.catalog.read().await.executable_snapshot()
     }
 
     /// Return Skill activation metadata from the same publication machinery as
@@ -2735,7 +2805,17 @@ impl SkillStore {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         (
             self.skill_catalog.read().await.snapshot.clone(),
-            self.catalog.read().await.clone(),
+            self.catalog.read().await.snapshot.clone(),
+        )
+    }
+
+    pub(crate) async fn discovery_catalog_snapshots(
+        &self,
+    ) -> (WorkflowCatalogSnapshot, WorkflowCatalogSnapshot) {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        (
+            self.skill_catalog.read().await.snapshot.clone(),
+            self.catalog.read().await.executable_snapshot(),
         )
     }
 
@@ -2753,7 +2833,8 @@ impl SkillStore {
             );
         }
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
-        let catalog = self.catalog.read().await;
+        let publication = self.catalog.read().await;
+        let catalog = &publication.snapshot;
         let resources = self.workflow_resources.read().await;
         let mut definitions = BTreeMap::new();
         for entry in catalog
@@ -2767,22 +2848,9 @@ impl SkillStore {
             else {
                 continue;
             };
-            let value: serde_yaml::Value = serde_yaml::from_slice(bytes)
-                .map_err(|_| SkillError::Validation("invalid pinned workflow yaml".to_string()))?;
-            if value.get("workflow_schema").is_none() {
-                // Legacy definitions stay catalog-visible but are not executable
-                // by the versioned #578 runtime.
+            let Some(definition) = read_published_run_definition(entry, bytes)? else {
                 continue;
-            }
-            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_slice(bytes)
-                .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
-            bamboo_domain::CompiledWorkflow::compile(definition.clone())
-                .map_err(|_| SkillError::Validation("invalid pinned workflow definition".into()))?;
-            if definition.id != entry.id || definition.revision != entry.revision {
-                return Err(SkillError::Validation(
-                    "workflow identity does not match its catalog entry".to_string(),
-                ));
-            }
+            };
             definitions.insert(
                 bamboo_domain::WorkflowDefinitionBundle::key(&definition.id, definition.revision),
                 definition,
@@ -4497,7 +4565,7 @@ impl SkillStore {
     pub async fn get_legacy_workflow_source(&self, id: &str) -> SkillResult<PathBuf> {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let catalog = self.catalog.read().await;
-        let selectable = catalog.entries.iter().any(|entry| {
+        let selectable = catalog.snapshot.entries.iter().any(|entry| {
             entry.id == id
                 && entry.winner
                 && entry.kind == WorkflowKind::Instruction

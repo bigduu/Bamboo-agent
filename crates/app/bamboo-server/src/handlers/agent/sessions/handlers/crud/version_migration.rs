@@ -9,7 +9,7 @@ fn error(status: StatusCode, code: &str, message: &str) -> HttpResponse {
         .json(serde_json::json!({"error":{"type":"api_error","code":code,"message":message}}))
 }
 
-async fn process_busy(state: &AppState, id: &str) -> bool {
+pub(in crate::handlers::agent::sessions) async fn process_busy(state: &AppState, id: &str) -> bool {
     if crate::handlers::agent::events::execute_startup_is_in_flight(state, id) {
         return true;
     }
@@ -27,7 +27,10 @@ async fn process_busy(state: &AppState, id: &str) -> bool {
     }
 }
 
-async fn owner_authorized(state: &web::Data<AppState>, request: &HttpRequest) -> bool {
+pub(in crate::handlers::agent::sessions) async fn owner_authorized(
+    state: &web::Data<AppState>,
+    request: &HttpRequest,
+) -> bool {
     // Worker middleware may remove the original header after verifying it.
     // Its retained run context must never become Host-owner access on loopback.
     if request

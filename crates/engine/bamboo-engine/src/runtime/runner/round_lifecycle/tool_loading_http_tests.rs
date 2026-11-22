@@ -15,6 +15,7 @@ use crate::runtime::config::AgentLoopConfig;
 
 const MODEL: &str = "fixture-model";
 const DENIED_SCHEMA_MARKER: &str = "PRIVATE_TOOL_DEFINITION_TEST_MARKER";
+const CHILD_GUIDANCE_TITLE: &str = "Child Tool Availability";
 
 fn schema(name: &str) -> ToolSchema {
     ToolSchema {
@@ -70,8 +71,21 @@ async fn run_round(
     catalog: &[ToolSchema],
     output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
+    run_round_for_model(session, provider, catalog, output_limit_policy, MODEL, None).await
+}
+
+async fn run_round_for_model(
+    session: &mut Session,
+    provider: &Arc<dyn LLMProvider>,
+    catalog: &[ToolSchema],
+    output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
+    model: &str,
+    provider_type: Option<&str>,
+) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
     let config = AgentLoopConfig {
-        model_name: Some(MODEL.into()),
+        model_name: Some(model.into()),
+        provider_type: provider_type.map(str::to_owned),
+        reasoning_effort: session.reasoning_effort,
         ..Default::default()
     };
     let (events, _receiver) = tokio::sync::mpsc::channel(128);
@@ -83,13 +97,215 @@ async fn run_round(
         &events,
         &CancellationToken::new(),
         &session_id,
-        MODEL,
+        model,
         catalog,
         None,
         None,
         output_limit_policy,
     )
     .await
+}
+
+#[tokio::test]
+async fn ultra_bodhi_gemini_sends_supported_reasoning_for_dotted_models() {
+    use wiremock::matchers::path;
+
+    let server = MockServer::start().await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        BodhiProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_target_provider("gemini")
+            .with_litellm_wire_types(),
+    );
+
+    for model in ["gemini-3.1-pro", "gemini-3.5-flash"] {
+        let endpoint = format!("/proxy/gemini/v1beta/models/{model}:streamGenerateContent");
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Ready."}]},"finishReason":"STOP"}]}"#,
+                    "\n\n",
+                ),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut session = Session::new(format!("ultra-{model}"), model);
+        session.add_message(Message::user("Check the route."));
+        session.set_root_orchestration_only(true).unwrap();
+        let round = run_round_for_model(&mut session, &provider, &[], None, model, Some("bodhi"))
+            .await
+            .unwrap();
+        assert_eq!(round.stream_output.content, "Ready.");
+    }
+
+    let requests = capture(&server).await;
+    assert_eq!(requests.len(), 2);
+    for body in requests {
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel":"high","includeThoughts":true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_replays_signed_parallel_tool_turn_after_session_reload() {
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::{ProviderFamily, ProviderProtocol};
+    use bamboo_storage::SessionStoreV2;
+
+    const GEMINI_MODEL: &str = "gemini-3.5-flash";
+    let native_parts = json!([
+        {"thought": true, "text": "I need both results."},
+        {"functionCall":{"id":"gemini_1","name":"lookup","args":{}},
+            "thoughtSignature":"bW9kZWwtb3duZWQtc2lnbmF0dXJl"},
+        {"functionCall":{"name":"lookup","args":{}}}
+    ]);
+    let frames = [
+        json!({"candidates":[{"content":{"role":"model","parts":[native_parts[0]]}}]}),
+        json!({"candidates":[{"content":{"role":"model","parts":[native_parts[1],native_parts[2]]}}]}),
+        json!({"candidates":[{"finishReason":"STOP"}]}),
+    ];
+    let tool_stream: String = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let replay = body["contents"].as_array().unwrap().iter().any(|content| {
+                content["parts"].as_array().unwrap().iter().any(|part| part.get("functionResponse").is_some())
+            });
+            let stream = if replay {
+                "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Both looked up.\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+            } else {
+                &tool_stream
+            };
+            ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream")
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    struct SnapshottingProvider(Arc<dyn LLMProvider>);
+
+    #[async_trait::async_trait]
+    impl LLMProvider for SnapshottingProvider {
+        fn queued_provider_snapshot(
+            &self,
+        ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+            bamboo_llm::provider::snapshot_forwarded_provider(Arc::clone(&self.0)).map(Some)
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<bamboo_llm::LLMStream> {
+            panic!("signed Gemini replay must dispatch via the selected provider snapshot")
+        }
+    }
+
+    let provider = |key: &str| -> Arc<dyn LLMProvider> {
+        Arc::new(SnapshottingProvider(Arc::new(
+            GeminiProvider::new(key)
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_litellm_wire_types(),
+        )))
+    };
+    let mut session = Session::new("gemini-replay", GEMINI_MODEL);
+    session.add_message(Message::user("Look up both records."));
+    let catalog = [schema("lookup")];
+    let first = run_round_for_model(
+        &mut session,
+        &provider("original-key"),
+        &catalog,
+        None,
+        GEMINI_MODEL,
+        None,
+    )
+    .await
+    .unwrap()
+    .stream_output;
+    assert_eq!(first.tool_calls.len(), 2);
+    assert_eq!(first.tool_calls[0].id, "gemini_1");
+    assert_ne!(first.tool_calls[0].id, first.tool_calls[1].id);
+    let assistant = Message::assistant_with_reasoning(
+        first.content,
+        Some(first.tool_calls.clone()),
+        Some(first.reasoning_content),
+    );
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    session
+        .append_provider_transcript_group(&anchor, None, first.provider_transcript_items)
+        .unwrap();
+    assert_eq!(
+        session.provider_transcript.active_family(),
+        Some(ProviderFamily::Gemini)
+    );
+    assert_eq!(
+        session.provider_transcript.active_protocol(),
+        Some(ProviderProtocol::GeminiGenerateContentV1Beta)
+    );
+    for call in first.tool_calls.iter().rev() {
+        session.add_message(Message::tool_result(&call.id, "looked up"));
+    }
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(data_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    store.save_session(&session).await.unwrap();
+    drop(store);
+    let restarted = SessionStoreV2::new(data_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    for key in ["original-key", "different-key"] {
+        let mut restored = restarted.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            run_round_for_model(
+                &mut restored,
+                &provider(key),
+                &catalog,
+                None,
+                GEMINI_MODEL,
+                None
+            )
+            .await
+            .unwrap()
+            .stream_output
+            .content,
+            "Both looked up."
+        );
+    }
+    let requests = capture(&server).await;
+    let parts = |body_index: usize, key: &str| {
+        requests[body_index]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|content| {
+                let parts = content["parts"].as_array().unwrap();
+                parts
+                    .iter()
+                    .any(|part| part.get(key).is_some())
+                    .then_some(&content["parts"])
+            })
+            .unwrap()
+    };
+    assert_eq!(parts(1, "functionCall"), &native_parts);
+    let results = parts(1, "functionResponse").as_array().unwrap();
+    assert_eq!(results[0]["functionResponse"]["id"], "gemini_1");
+    assert!(results[1]["functionResponse"].get("id").is_none());
+    assert_ne!(parts(2, "functionCall"), &native_parts);
 }
 
 async fn capture(server: &MockServer) -> Vec<Value> {
@@ -178,7 +394,15 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
                 .with_target_provider("gemini"),
         ),
     ];
-    let catalog = ["Read", "Glob", "GetFileInfo", "load_skill"].map(schema);
+    let catalog = [
+        "Read",
+        "Glob",
+        "GetFileInfo",
+        "load_skill",
+        "exec_command",
+        "write_stdin",
+    ]
+    .map(schema);
     for (index, provider) in providers.iter().enumerate() {
         let mut session = Session::new(&format!("wire-role-{index}"), MODEL);
         session.add_message(Message::user("Find a file"));
@@ -186,19 +410,105 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
         send(&mut session, provider, &catalog).await;
         record_discovery(&mut session, &[catalog[1].clone(), catalog[3].clone()]);
         send(&mut session, provider, &catalog).await;
+
+        let mut child = Session::new(&format!("wire-child-{index}"), MODEL);
+        child.kind = bamboo_domain::SessionKind::Child;
+        child.add_message(Message::user("Review the assigned change"));
+        send(&mut child, provider, &catalog[..2]).await;
     }
     let bodies = capture(&server).await;
-    assert_eq!(bodies.len(), providers.len() * 2);
-    for pair in bodies.chunks_exact(2) {
-        assert_eq!(tool_names(&pair[0]), ["Read", "discover_capabilities"]);
+    assert_eq!(bodies.len(), providers.len() * 3);
+    for rounds in bodies.chunks_exact(3) {
         assert_eq!(
-            tool_names(&pair[1]),
-            ["Read", "Glob", "discover_capabilities"]
+            tool_names(&rounds[0]),
+            [
+                "Read",
+                "exec_command",
+                "write_stdin",
+                "discover_capabilities"
+            ]
         );
-        assert!(pair
+        assert_eq!(
+            tool_names(&rounds[1]),
+            [
+                "Read",
+                "Glob",
+                "exec_command",
+                "write_stdin",
+                "discover_capabilities"
+            ]
+        );
+        for round in &rounds[..2] {
+            assert!(round
+                .to_string()
+                .contains("Use exec_command for authorized shell commands"));
+        }
+        assert_eq!(tool_names(&rounds[2]), ["Read", "discover_capabilities"]);
+        assert!(rounds[2].to_string().contains(CHILD_GUIDANCE_TITLE));
+        assert!(rounds
             .iter()
             .all(|body| !body.to_string().contains(DENIED_SCHEMA_MARKER)));
     }
+}
+
+#[tokio::test]
+async fn child_tool_guidance_matches_current_request_and_stays_out_of_history() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
+        .mount(&server)
+        .await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    let mut session = Session::new("child-tool-guidance", MODEL);
+    session.kind = bamboo_domain::SessionKind::Child;
+    session.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Max);
+    session.add_message(Message::user("Review the assigned change"));
+    let read_only = ["Read", "Glob"].map(schema);
+    send(&mut session, &provider, &read_only).await;
+    record_discovery(&mut session, &read_only[1..]);
+    send(&mut session, &provider, &read_only).await;
+    let with_shell = ["Read", "exec_command", "write_stdin"].map(schema);
+    send(&mut session, &provider, &with_shell).await;
+    send(&mut session, &provider, &[]).await;
+    let mut root = Session::new("root-tool-guidance-control", MODEL);
+    root.add_message(Message::user("Inspect the change"));
+    send(&mut root, &provider, &read_only).await;
+
+    let requests = capture(&server).await;
+    let [restricted, discovered, restored, no_tools, root] = requests.as_slice() else {
+        panic!("expected five provider requests, got {}", requests.len());
+    };
+    assert_eq!(tool_names(restricted), ["Read", "discover_capabilities"]);
+    assert_eq!(
+        tool_names(discovered),
+        ["Read", "Glob", "discover_capabilities"]
+    );
+    for request in [restricted, discovered] {
+        let wire = request.to_string();
+        assert_eq!(wire.matches(CHILD_GUIDANCE_TITLE).count(), 1);
+        assert!(wire.contains("built-in shell command tool is unavailable on this request"));
+        assert!(wire.contains("tell your parent the exact action and evidence needed"));
+    }
+    assert_eq!(
+        tool_names(restored),
+        ["Read", "exec_command", "write_stdin"]
+    );
+    for request in [restricted, discovered, restored, no_tools] {
+        assert_eq!(request["reasoning_effort"], "max");
+    }
+    assert!(!restored.to_string().contains(CHILD_GUIDANCE_TITLE));
+    assert!(tool_names(no_tools).is_empty());
+    assert!(no_tools
+        .to_string()
+        .contains("This child request has no tools"));
+    assert!(!root.to_string().contains(CHILD_GUIDANCE_TITLE));
+    assert!(!serde_json::to_string(&session)
+        .unwrap()
+        .contains(CHILD_GUIDANCE_TITLE));
 }
 
 #[tokio::test]

@@ -567,6 +567,12 @@ async fn native_http_automatic_skill_prompt_is_task_bounded_and_metadata_only() 
             .iter()
             .find(|message| message.content.contains("Check Skill applicability."))
             .expect("applicability reaches the provider even without a candidate");
+        if !expected.is_empty() {
+            assert!(prompt
+                .content
+                .contains("Open the selected package with `skills_read`"));
+            assert!(prompt.content.contains("use `skills_list`"));
+        }
         for skill in ["pdf", "docx", "manual-only"] {
             assert_eq!(
                 prompt.content.contains(&format!("- {skill}:")),

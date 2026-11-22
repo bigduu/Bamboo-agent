@@ -1,10 +1,19 @@
 # Ultra Root thinking mode
 
-Ultra is an independent Root product policy. It increases task-wide reasoning
-through parallel delegation of independent work, Root verification and
-synthesis. An ordinary Ultra Root can also write and edit files with its
-normal workspace and permission checks. Each model call retains its separately resolved ordinary reasoning
-effort. Ultra is not an alias for Max or a claimed provider-native budget.
+Ultra combines the primary model's highest reasoning effort with active
+parallel SubAgent delegation. The Root looks for useful independent work,
+dispatches as capacity permits, advances its own ready work, and verifies the
+results. An ordinary Ultra Root can write, edit and use `exec_command` under
+its workspace and permission checks. Use `SubAgent` with `intent=wait` for
+non-interactive completion and `write_stdin` for input or unread output.
+Other reasoning selections use their chosen level and delegate when useful.
+
+At primary request dispatch Bamboo uses the highest supported native tier
+for known limits, such as `xhigh` on GPT-5.4 and `high` on Gemini 3. Routes
+without a known lower ceiling use `max`. Native models such as Claude 4.5
+that reject the adapter's adaptive-effort request receive no Ultra effort
+override. Provider defaults and request overrides still apply. The saved
+standard effort is available when the user switches to Standard.
 
 ## Authority and wire contract
 
@@ -31,6 +40,8 @@ ordinary `reasoning_effort` separately.
 
 No second persisted field, proof version, journal or stage protocol is added.
 The existing birth token, terminal epoch/receipt and dispatch fences are kept.
+A command approval is bound to the Session's tool authority revision. After a
+mode change, send a new tool call so the current policy can authorize it.
 
 ## Delegated execution evidence and limits
 
@@ -41,10 +52,9 @@ It observes an actual worker provider request while the Root durably waits,
 then permits the child to finish and observes Root resume/synthesis. It also
 checks that an authorized Root can create and edit a file through real dispatch.
 
-Root ordinary High is explicit. The planner uses an independent model and its
-own ordinary provider default (no effort override); it receives neither Root
-High nor product Ultra. This does not prove explicit child effort overrides
-reach the worker: that pre-existing propagation gap is tracked in #1346.
+The fixture saves High as the ordinary Root setting and checks Max on
+the actual Ultra Root requests. The planner uses its own model and effort
+configuration.
 
 Ultra guidance reuses existing tools; it does not enforce a persistent N-agent,
 Plan or Review stage gate for every task. Required user goals, constraints and

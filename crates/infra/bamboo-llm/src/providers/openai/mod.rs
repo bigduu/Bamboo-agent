@@ -22,6 +22,8 @@ use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 
 use super::common::model_fetcher;
+#[cfg(feature = "litellm-wire-types")]
+use super::common::openai_compat::build_litellm_chat_body;
 use super::common::openai_compat::{
     build_openai_compat_body, looks_like_responses_only_error, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
@@ -40,6 +42,10 @@ use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_chat_messages: bool,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_responses_events: bool,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
@@ -70,6 +76,10 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_chat_messages: false,
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_responses_events: false,
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
@@ -100,6 +110,43 @@ impl OpenAIProvider {
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = client;
         self
+    }
+
+    /// Use the pinned LiteLLM message types for Chat Completions requests.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_chat_messages(mut self) -> Self {
+        self.litellm_chat_messages = true;
+        self
+    }
+
+    /// Decode Responses SSE envelopes and function calls with the pinned types.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_responses_events(mut self) -> Self {
+        self.litellm_responses_events = true;
+        self
+    }
+
+    /// Select Bamboo's original Chat and Responses wire adapters.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_chat_messages = false;
+        self.litellm_responses_events = false;
+        self
+    }
+
+    fn responses_sse_parser(
+        &self,
+        model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
+        retain_protocol_events: bool,
+    ) -> ResponsesSseParser {
+        let parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_responses_events {
+            return parser.with_litellm_wire_types();
+        }
+        parser
     }
 
     /// Configure models that must use Responses API upstream.
@@ -157,6 +204,38 @@ impl OpenAIProvider {
             model,
         );
         Ok(headers)
+    }
+
+    fn build_chat_completions_body(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        reasoning_effort: Option<ReasoningEffort>,
+        parallel_tool_calls: Option<bool>,
+    ) -> Value {
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_chat_messages {
+            return build_litellm_chat_body(
+                model,
+                messages,
+                tools,
+                None,
+                max_output_tokens,
+                reasoning_effort,
+                parallel_tool_calls,
+            );
+        }
+        build_openai_compat_body(
+            model,
+            messages,
+            tools,
+            None,
+            max_output_tokens,
+            reasoning_effort,
+            parallel_tool_calls,
+        )
     }
 
     fn matches_model_pattern(pattern: &str, model: &str) -> bool {
@@ -449,8 +528,7 @@ impl OpenAIProvider {
                 }
 
                 let mut parser =
-                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
-                        .with_protocol_events(retain_protocol_events);
+                    self.responses_sse_parser(model, reasoning_effort, retain_protocol_events);
                 let model_for_debug = model.to_string();
                 let completion_diagnostics = completion_diagnostics.clone();
                 let stream = llm_stream_from_sse_multi_requiring_done(
@@ -477,8 +555,7 @@ impl OpenAIProvider {
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
-            .with_protocol_events(retain_protocol_events);
+        let mut parser = self.responses_sse_parser(model, reasoning_effort, retain_protocol_events);
         let model_for_debug = model.to_string();
         let stream = llm_stream_from_sse_multi_requiring_done(
             response,
@@ -732,11 +809,10 @@ impl LLMProvider for OpenAIProvider {
                 .await;
         }
 
-        let mut body = build_openai_compat_body(
+        let mut body = self.build_chat_completions_body(
             model,
             messages,
             tools,
-            None,
             max_output_tokens,
             reasoning_effort,
             parallel_tool_calls,
@@ -965,6 +1041,9 @@ impl LLMProvider for OpenAIProvider {
         ))
     }
 }
+
+#[cfg(all(test, feature = "litellm-wire-types"))]
+mod litellm_tests;
 
 #[cfg(test)]
 mod tests {

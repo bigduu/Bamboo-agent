@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::storage::Storage;
@@ -18,6 +19,31 @@ use bamboo_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 
 use super::hooks::HookRunner;
+
+/// The host's clock for an explicitly bounded run. Callers retain responsibility
+/// for cancellation. This value is local to the execution and never persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct RunDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl RunDeadline {
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+        }
+    }
+
+    pub fn remaining(self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
+    }
+
+    pub(crate) fn delivery_reserve(self) -> Duration {
+        self.budget / 10
+    }
+}
 
 /// Default process-wide concurrency ceiling for low-priority auxiliary
 /// evaluations sharing one provider/model allocation.
@@ -94,6 +120,10 @@ fn default_gold_min_confidence() -> GoldConfidence {
 pub struct GoldConfig {
     #[serde(default)]
     pub recovery: super::goal_recovery::GoalRecoveryPolicy,
+    /// Allow one startup wake from a committed continuation before another
+    /// provider round or tool effect was admitted.
+    #[serde(default)]
+    pub resume_after_restart: bool,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
     pub enabled: bool,
@@ -143,6 +173,7 @@ impl Default for GoldConfig {
     fn default() -> Self {
         Self {
             recovery: Default::default(),
+            resume_after_restart: false,
             enabled: false,
             auto_answer_enabled: false,
             auto_continue_enabled: false,
@@ -1159,6 +1190,7 @@ pub struct AgentLoopConfig {
     /// a configured cap keeps the issue #29 exhaustion contract (metadata
     /// stamp, visible notification, exactly one final summary turn).
     pub(crate) run_budget: bamboo_config::RunBudgetConfig,
+    pub(crate) run_deadline: Option<RunDeadline>,
     pub(crate) counted_loop: Option<super::counted_loop::CountedLoopConfig>,
     pub(crate) loop_control: Option<super::loop_control::LoopControlConfig>,
 }
@@ -1256,6 +1288,7 @@ impl Default for AgentLoopConfig {
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
+            run_deadline: None,
             counted_loop: None,
             loop_control: None,
         }

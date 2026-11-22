@@ -2630,6 +2630,7 @@ async fn handle_no_tool_calls_with_native(
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
     cancel_token: &CancellationToken,
+    goal_no_progress_limit: bool,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -2710,9 +2711,8 @@ async fn handle_no_tool_calls_with_native(
     // decide whether to keep working toward it INSTEAD of completing. The agent
     // self-reports completion via `update_goal`, and a side-channel Gold
     // double-check verifies the objective before the run actually stops. Running
-    // this inside the loop means the run emits a single terminal `Complete` only
-    // when the goal is truly done — keeping `is_running` accurate and the SSE
-    // stream open.
+    // this inside the loop keeps `is_running` accurate and the SSE stream open
+    // until the Goal has either been verified or reached a stopping condition.
     let decision = evaluate_gold_terminal(
         session,
         task_context,
@@ -2721,6 +2721,7 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
+        goal_no_progress_limit,
         if config.auxiliary_model_resolver.is_some() {
             main_llm.clone()
         } else {
@@ -2752,8 +2753,7 @@ async fn handle_no_tool_calls_with_native(
         });
     }
 
-    // Gold decided STOP: the goal is met, or no goal loop is configured. Only now
-    // review the genuinely-final state. Adversarial guardian review: before
+    // Gold has decided to stop. Adversarial guardian review: before
     // completing, spawn a read-only reviewer child to verify the work and suspend
     // until its verdict returns. `maybe_spawn_guardian_review` returns `Some` when
     // it engages a review (spawn + suspend); it is inert unless a guardian config
@@ -3060,6 +3060,7 @@ async fn handle_no_tool_calls(
         Vec::new(),
         llm,
         &CancellationToken::new(),
+        false,
     )
     .await
 }
@@ -3287,7 +3288,11 @@ async fn handle_tool_calls_path(
         && session
             .metadata
             .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
-    if ticket_question_yield || awaiting_clarification || waiting_for_children {
+    if ticket_question_yield
+        || awaiting_clarification
+        || waiting_for_children
+        || tool_execution.yield_supervisor_wait
+    {
         if !tool_execution.explicit_exec_waits.is_empty() {
             let handles = tool_execution.explicit_exec_waits.join(", ");
             let mut notice = Message::user(format!(
@@ -3719,6 +3724,7 @@ async fn run_pipeline_inner(
     let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
+        crate::runtime::goal_restart::disarm_before_round(session, config).await?;
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
             && cancel_token.is_cancelled()
         {
@@ -4700,6 +4706,8 @@ async fn run_pipeline_inner(
                         .clone()
                         .unwrap_or_else(|| llm.clone()),
                     cancel_token,
+                    no_tool_call_continuation_streak
+                        >= MAX_NO_TOOL_CALL_CONTINUATIONS - 1,
                 )
                 .await
                 {
@@ -5460,6 +5468,7 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
         "Read",
         "SubAgent",
         "exec_command",
+        "write_stdin",
         "load_skill",
         "workflow_run",
         "vendor::Read",
@@ -5526,8 +5535,19 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        ["Read", "SubAgent"]
+        ["Read", "SubAgent", "exec_command", "write_stdin"]
     );
+    let request =
+        serde_json::from_value(serde_json::json!({"query":"exec_command","kinds":["tool"]}))
+            .unwrap();
+    assert!(discovery
+        .discover_complete_schemas(&request)
+        .unwrap()
+        .iter()
+        .all(|schema| !matches!(
+            schema.function.name.as_str(),
+            "exec_command" | "write_stdin"
+        )));
 }
 
 #[cfg(test)]
@@ -6693,33 +6713,45 @@ mod tests {
             let messages = ir.flatten();
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
             let marker = "Current delegation route observation: ";
-            let latest = messages
+            let mut observations = messages
                 .iter()
-                .rev()
-                .find_map(|message| {
-                    message
-                        .content
-                        .rfind(marker)
-                        .map(|index| &message.content[index + marker.len()..])
-                })
+                .filter_map(|message| message.content.split_once(marker).map(|(_, facts)| facts));
+            let observation = observations
+                .next()
                 .expect("Supervisor request must report current delegation state");
-            let observation = serde_json::Deserializer::from_str(latest)
+            assert!(
+                observations.next().is_none(),
+                "historical route observations must not replay"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message
+                        .content
+                        .contains("Supervisor delegation-first policy"))
+                    .count(),
+                1,
+                "the stable policy appears exactly once across discovery"
+            );
+            let observation = serde_json::Deserializer::from_str(observation)
                 .into_iter::<serde_json::Value>()
                 .next()
                 .unwrap()
                 .unwrap();
-            if count == 0 {
-                assert_eq!(
-                    observation["status"], "discovery_required",
-                    "deferred definitions are not callable yet"
-                );
-            } else {
-                assert_eq!(
-                    observation["status"], "routes_exposed",
-                    "validated discovery must be reflected in the next request"
-                );
-                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
-            }
+            assert_eq!(
+                observation["auxiliary"]["SubAgent"],
+                if count == 0 {
+                    "discoverable"
+                } else {
+                    "callable"
+                },
+                "validated discovery must be reflected in the next request"
+            );
+            assert!(observation["main_execution"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "unavailable"));
             if self.mode == CapabilityLoadingMode::StickyFallback {
                 assert!(tools.iter().any(|schema| schema.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
@@ -6784,7 +6816,7 @@ mod tests {
                         Ok(LLMChunk::ToolCalls(vec![activation_call(
                             "supervisor-delegate",
                             "SubAgent",
-                            r#"{"message":"Implement only the assigned change and return verification evidence."}"#,
+                            r#"{"message":"Review the proposed change and report verification evidence."}"#,
                         )])),
                         Ok(LLMChunk::Done),
                     ]
@@ -6891,7 +6923,7 @@ mod tests {
                     };
                     session.set_root_orchestration_only(ultra).unwrap();
                     session.add_message(Message::user(
-                        "Delegate the scoped implementation and report its admission or blocker.",
+                        "Delegate an auxiliary review and report its admission or blocker.",
                     ));
                     let provider = Arc::new(SupervisorLoadingProvider {
                         mode,
@@ -6940,11 +6972,25 @@ mod tests {
                         !removed.contains_execution_name("SubAgent"),
                         "a saved loading receipt cannot restore a removed tool"
                     );
-                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_supervisor_route_observation(
                         &restored, &[], mode,
                     ).unwrap();
-                    assert!(observation.content.contains("delegation_tools_unavailable"));
-                    assert!(!observation.content.contains("routes_exposed"));
+                    assert!(observation.content.contains("\"SubAgent\":\"unavailable\""));
+                    let ledger = restored.model_context_state.as_ref().unwrap();
+                    assert!(ledger.events.iter().all(|event| !event
+                        .rendered_text
+                        .contains("Current delegation route observation")));
+                    assert_eq!(
+                        ledger
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                event.block_type
+                                    == bamboo_domain::ContextBlockType::RootOrchestration
+                            })
+                            .count(),
+                        1
+                    );
                 }
             }
         }
@@ -10914,10 +10960,12 @@ mod tests {
         );
         let retired = "Tool 'Bash' has been retired.";
         for scenario in ["standard", "ultra", "disabled", "plan", "supervisor"] {
-            let direct = scenario == "standard";
+            let direct = matches!(scenario, "standard" | "ultra");
             let recovery_tool = match scenario {
-                "standard" => Some(("exec_command", json!({"cmd":"echo recovered-shell"}))),
-                "ultra" | "disabled" => Some(("SubAgent", json!({"action":"create"}))),
+                "standard" | "ultra" => {
+                    Some(("exec_command", json!({"cmd":"echo recovered-shell"})))
+                }
+                "disabled" => Some(("SubAgent", json!({"action":"create"}))),
                 _ => None,
             };
             let server = MockServer::start().await;
@@ -10938,7 +10986,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(body_string_contains(retired))
                 .and(body_string_contains(match scenario {
-                    "standard" => "call `exec_command` with the command in `cmd`",
+                    "standard" | "ultra" => "call `exec_command` with the command in `cmd`",
                     "plan" => "This session is in read-only Plan mode",
                     _ => "Delegate it to an authorized execution session",
                 }))

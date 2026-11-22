@@ -189,7 +189,9 @@ impl SessionStoreV2 {
         if !Self::regular_actor_file(&path).await? {
             return Err(ActorDirectoryError::Corrupt);
         }
-        let bytes = fs::read(&path).await.map_err(storage)?;
+        let bytes = super::super::cold_main::read(&path)
+            .await
+            .map_err(storage)?;
         super::super::compact_main::validate_full_main(&bytes).map_err(storage)?;
         let main: Session =
             serde_json::from_slice(&bytes).map_err(|_| ActorDirectoryError::Corrupt)?;

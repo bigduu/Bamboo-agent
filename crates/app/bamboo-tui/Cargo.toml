@@ -21,6 +21,8 @@ futures = "0.3"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-textarea-2 = "0.13"
+nsh-core = { version = "=0.6.1", default-features = false }
+nsh-platform-tui = { version = "=0.6.1", default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -38,3 +40,8 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
 unicode-width = "0.2"
 unicode-segmentation = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSBitmapImageRep", "NSImageRep", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary"] }

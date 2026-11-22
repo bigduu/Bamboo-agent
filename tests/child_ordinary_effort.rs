@@ -241,7 +241,7 @@ async fn run_effort_fixture() {
         .collect();
     assert!(root_requests.len() >= 3);
     for request in root_requests {
-        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(request["reasoning_effort"], "max");
         assert!(request.to_string().contains(REQUIRED));
     }
     let child_request = requests
@@ -250,7 +250,7 @@ async fn run_effort_fixture() {
         .unwrap();
     assert_eq!(
         child_request["reasoning_effort"], "low",
-        "own planner preference must reach the wire instead of Root High"
+        "own planner preference must reach the wire when Root runs at Max"
     );
     assert!(child_request.to_string().contains(REQUIRED));
     assert!(!child_request

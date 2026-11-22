@@ -220,7 +220,24 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2922 changes the existing feature-sensitive SubAgent adapter. Exec wait
 // cases use the default Agent, Engine and Server owners; nested creation stays
 // in default server-other. The additive contexts and case names are unchanged.
-const FEATURE_SOURCE_SHA256 = "65351a27163a4d89e63ac269424656b474f5e24ae03e1a2629592850da93212b";
+// Session archive regressions use default Storage and server-handlers.
+// The capacity-bound HFS+ acceptance is explicitly selected on macOS.
+// #2929 changes the feature-sensitive prompt runner. The clock checks remain
+// in the default headless cases and the prompt and Skill tests retain their
+// existing owners. The four additive contexts and 20 cases stay intact.
+// #2935 keeps Supervisor route, prompt refresh and handoff cases in the default
+// Engine and Orchestration owners. Additive feature selections stay the same.
+// #2936 retains the existing Engine, Server, and Skill test owners.
+// Ordinary Ultra shell admission and Child guidance use the existing Engine,
+// SDK, Server, and CLI test owners. The additive contexts stay the same.
+// Shell wait guidance uses the existing Engine continuation and prompt tests.
+// #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
+// Codex Work handoff uses the default server-app-state and server-tests-0
+// owners. Continuation formatting stays in the Orchestration packages-3 owner.
+// #2940 enables the Messages comparison in the existing bamboo-llm default owner.
+// #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
+// #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
+const FEATURE_SOURCE_SHA256 = "4060f10347dec1187b57a693745f48afc5999ec3244a4f02b0424c5819353853";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
@@ -257,6 +274,11 @@ const FEATURE_CONTEXTS = [
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
     { name: "ticket_runtime_files", kind: "test", added: [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
+  { package: "bamboo-litellm-llms-types", features: ["schema"], targets: [
+    { name: "bamboo_litellm_llms_types", kind: "lib", added: [
+      "formats::messages::request::tests::content_block_type_schema_remains_a_string",
+      "formats::responses::streaming::tests::event_type_schema_accepts_unknown_strings",
+      "tests::wire_type_supports_schema_generation"] }] },
 ];
 
 const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",

@@ -8,7 +8,7 @@
 # - BambooConfig - Legacy config format, replaced by core::Config
 
 # Keep version-aware lints aligned with the workspace's declared MSRV.
-msrv = "1.95"
+msrv = "1.97"
 
 # Allow doc over-indentation (pre-existing style)
 doc-valid-idents = []

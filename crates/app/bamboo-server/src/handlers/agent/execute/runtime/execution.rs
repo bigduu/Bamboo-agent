@@ -268,6 +268,12 @@ fn spawn_agent_execution_with_inputs(
     #[cfg(test)]
     crate::handlers::agent::execute::tests::observe_inputs(&args.session_id, inputs.as_ref());
 
+    let run_deadline = args
+        .state
+        .child_completion_coordinator
+        .headless_run_deadline_for(&args.session_id);
+    args.execution_reservation.set_run_deadline(run_deadline);
+
     bamboo_engine::execution::agent_spawn::spawn_session_execution_with_upstream_retry(
         SessionExecutionArgs {
             agent,

@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use bamboo_config::{FeatureFlags, ProviderInstanceConfig};
-use bamboo_llm::AVAILABLE_PROVIDERS;
+use bamboo_llm::{provider_factory::effective_litellm_wire_types, AVAILABLE_PROVIDERS};
 
 use crate::app_state::{AppState, ConfigUpdateEffects};
 use crate::config_manager;
@@ -43,6 +43,14 @@ pub struct ProviderInstanceResponse {
     pub label: String,
     pub enabled: bool,
     pub config: Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experiments: Option<ProviderInstanceExperiments>,
+}
+
+/// Effective settings for experiments supported by this instance and server build.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProviderInstanceExperiments {
+    pub litellm_wire_types: bool,
 }
 
 /// Request body for `POST /provider-instances` (create).
@@ -166,6 +174,8 @@ fn instance_to_api(
             .unwrap_or_else(|| default_label_for_provider_type(&instance.provider_type)),
         enabled: instance.enabled,
         config: instance_config_to_api(instance, credential_configured),
+        experiments: effective_litellm_wire_types(instance)
+            .map(|litellm_wire_types| ProviderInstanceExperiments { litellm_wire_types }),
     }
 }
 
@@ -774,6 +784,79 @@ mod tests {
 
     fn provider_and_credential_bytes(home: &std::path::Path) -> [Vec<u8>; 2] {
         ["providers.json", "credentials.json"].map(|name| std::fs::read(home.join(name)).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn litellm_experiment_reports_default_off_and_persists_per_instance_opt_in() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state)
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let create_request = |kind: &str, key: &str| {
+            http_test::TestRequest::post()
+                .uri(INSTANCES_URL)
+                .set_json(serde_json::json!({
+                    "type": kind,
+                    "config": { "api_key": key, "base_url": "http://127.0.0.1:1/v1" }
+                }))
+                .to_request()
+        };
+        let created: Value =
+            http_test::call_and_read_body_json(&app, create_request("anthropic", "fixture-key"))
+                .await;
+        let other: Value =
+            http_test::call_and_read_body_json(&app, create_request("openai", "other-fixture-key"))
+                .await;
+        let gemini: Value = http_test::call_and_read_body_json(
+            &app,
+            create_request("gemini", "gemini-fixture-key"),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        let other_id = other["id"].as_str().unwrap().to_owned();
+        let gemini_id = gemini["id"].as_str().unwrap().to_owned();
+
+        let list_request = || {
+            http_test::TestRequest::get()
+                .uri(INSTANCES_URL)
+                .to_request()
+        };
+        let before: Value = http_test::call_and_read_body_json(&app, list_request()).await;
+        let instances = before["instances"].as_array().unwrap();
+        let instance = instances.iter().find(|entry| entry["id"] == id).unwrap();
+        assert_eq!(instance["experiments"]["litellm_wire_types"], false);
+        assert!(instance["config"].get("litellm_wire_types").is_none());
+
+        let updated: Value = http_test::call_and_read_body_json(
+            &app,
+            http_test::TestRequest::put()
+                .uri(&format!("{INSTANCES_URL}/{id}"))
+                .set_json(serde_json::json!({ "config": { "litellm_wire_types": true } }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(updated["experiments"]["litellm_wire_types"], true);
+
+        let after: Value = http_test::call_and_read_body_json(&app, list_request()).await;
+        let instances = after["instances"].as_array().unwrap();
+        for (expected_id, enabled) in [(&id, true), (&other_id, false), (&gemini_id, false)] {
+            let instance = instances
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some(expected_id))
+                .unwrap();
+            assert_eq!(instance["experiments"]["litellm_wire_types"], enabled);
+        }
+
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(home.path().join("providers.json")).unwrap())
+                .unwrap();
+        let instances = &stored["data"]["provider_instances"];
+        assert_eq!(instances[&id]["litellm_wire_types"], true);
+        assert!(instances[&other_id].get("litellm_wire_types").is_none());
     }
 
     #[actix_web::test]

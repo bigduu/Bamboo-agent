@@ -498,6 +498,29 @@ target.
 The raw Session transcript remains authoritative. Memory is selective context,
 not a substitute for exact history.
 
+
+## Session storage archives
+
+Bamboo can losslessly compress the history of idle ordinary Root sessions. The
+default threshold is 30 days. The first version considers Roots with an empty
+Child tree and 1 to 64 MiB of Main data. It archives a file when compression
+saves at least 20 percent. The idle clock uses the persisted update time and
+the last replacement of Main, including an explicit restore.
+
+- `GET /api/v1/session-storage/archive-preview` reports eligible sessions and
+  measured savings. Use `next_offset` to read further pages.
+- `POST /api/v1/sessions/{id}/storage-archive` archives an eligible session.
+- `POST /api/v1/sessions/{id}/storage-archive/restore` restores the original JSON.
+  History reads decode on demand. Continuing the conversation writes the normal
+  session file on the first full checkpoint.
+
+These endpoints require Host owner access. Set
+`BAMBOO_SESSION_ARCHIVE_ENABLED=true` to enable the daily background sweep.
+`BAMBOO_SESSION_ARCHIVE_IDLE_DAYS` overrides the 30-day threshold. Enable archive
+writes after all Bamboo Server and SDK processes sharing the data directory can
+read the archive format. Restore archived sessions before downgrading those
+processes.
+
 ## Memory / auto-dream / gardener
 
 Key `memory` (`Option<MemoryConfig>` — absent means every default below

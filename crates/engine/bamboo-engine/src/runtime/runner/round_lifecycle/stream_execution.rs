@@ -9,20 +9,21 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_active_workflow_context_block, build_agent_hook_context_block,
+    build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block_for_tools, build_session_identity_context_block,
-    build_task_list_context_block, build_workspace_context_block,
+    build_root_orchestration_context_block, build_session_identity_context_block,
+    build_supervisor_route_observation, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
 use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
@@ -31,13 +32,13 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
-    REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
+    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -686,9 +687,14 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
+    configured_mode: PermissionMode,
 ) -> Option<ContextBlock> {
-    if !session.allows_model_tool_execution("write_stdin")
-        || !effective_tool_schemas(session, tool_schemas)
+    let flags =
+        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let schemas = effective_tool_schemas(session, tool_schemas);
+    if flags.plan_read_only
+        || !session.allows_model_tool_execution("write_stdin")
+        || !schemas
             .iter()
             .any(|schema| schema.function.name == "write_stdin")
     {
@@ -698,13 +704,22 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
+    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && schemas
+            .iter()
+            .any(|schema| schema.function.name == "SubAgent")
+    {
+        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
+    } else {
+        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
+    };
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
         ContextBlockStability::RoundDynamic,
-        "Shell sessions awaiting a terminal result",
+        "Shell session handles",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
+            "{guidance}\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))
@@ -768,6 +783,7 @@ pub(super) async fn project_request_usage(
         effective_tool_schemas.as_ref(),
         model,
         loading_mode,
+        native_transcript_protocol_for(llm, model),
         None,
     );
     let tool_footprint = llm
@@ -799,9 +815,11 @@ fn build_request_envelope_reconciled(
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_request_envelope_reconciled_for_loading_mode<'a>(
     session: &mut Session,
     prepared_context: &PreparedContext,
@@ -809,16 +827,28 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
+    native_protocol: Option<ProviderProtocol>,
     request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
-    let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
+    let gemini_native = native_protocol == Some(ProviderProtocol::GeminiGenerateContentV1Beta);
+    let requested_family = if gemini_native {
+        Some(ProviderFamily::Gemini)
+    } else {
+        ProviderFamily::from_provider_type(config.provider_type.as_deref())
+            .filter(|family| *family != ProviderFamily::Gemini)
+    };
     let requested_protocol = requested_family.map(|family| match family {
         ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
         ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+        ProviderFamily::Gemini => ProviderProtocol::GeminiGenerateContentV1Beta,
     });
     let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
         config.provider_name.as_deref(),
-        config.provider_type.as_deref(),
+        if gemini_native {
+            Some("gemini")
+        } else {
+            config.provider_type.as_deref()
+        },
     );
     let had_prior_provider_route = session.provider_transcript.active_family().is_some()
         || session.provider_transcript.active_protocol().is_some()
@@ -856,8 +886,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    let mut orchestration =
-        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode);
+    let mut orchestration = build_root_orchestration_context_block(session);
+    let supervisor_policy_digest = orchestration
+        .as_ref()
+        .filter(|_| session.supervisor_incarnation_id().is_some())
+        .map(bamboo_domain::model_context_block_sha256);
     if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
         session,
         config.guidance_active_run_id.as_deref(),
@@ -905,9 +938,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ));
         }
     }
-    if let Some(block) = build_active_workflow_context_block(session) {
-        context_blocks.push(block);
-    }
+    let active_workflow = build_active_workflow_context_block(session);
+    let workflow_is_active = active_workflow.is_some();
+    context_blocks.extend(active_workflow);
     if let Some(block) = build_project_resources_context_block(session) {
         context_blocks.push(block);
     }
@@ -1046,8 +1079,12 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
             ContextBlockStability::RoundDynamic,
-            "Loaded Skills",
-            section("skill"),
+            "Available Skills",
+            if workflow_is_active {
+                String::new()
+            } else {
+                section("skill")
+            },
         ),
         (
             ContextBlockType::EnvSnapshot,
@@ -1101,7 +1138,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
     bamboo_compression::project_file_change_results(&mut real_transcript);
-    let cache_scope = serde_json::json!({
+    let mut cache_scope = serde_json::json!({
         // Retire old generated epochs that preserved withdrawn memory snapshots.
         "external_memory_projection_version": 3,
         "model": model,
@@ -1113,6 +1150,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             .collect::<Vec<_>>(),
         "tools": tool_schemas,
     });
+    if let Some(digest) = supervisor_policy_digest {
+        // Refresh the generated prefix when the role policy changes. Current
+        // route facts stay outside the scope and the durable transcript.
+        cache_scope["supervisor_policy_sha256"] = digest.into();
+    }
     let cache_scope_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&cache_scope).expect("cache scope is serializable"),
     ));
@@ -1170,7 +1212,31 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
-    if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
+    if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
+    if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
+    if let Some(deadline) = config.run_deadline {
+        // Sample only the caller's explicit clock. A fresh reading belongs to
+        // this request, outside the durable ledger and the cacheable prefix.
+        let remaining = deadline.remaining();
+        let advice = if remaining <= deadline.delivery_reserve() {
+            " Save and verify the best available result now."
+        } else {
+            " Leave time to save and verify the deliverable."
+        };
+        model_transcript.push(Message::user(format!(
+            "Host execution deadline\nTime remaining: {}s.{advice}",
+            remaining.as_secs()
+        )));
+    }
+    if let Some(block) = build_exec_session_continuation_context_block(
+        session,
+        tool_schemas,
+        config.permission_mode.unwrap_or_default(),
+    ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
         // stale ID from the next request as soon as its terminal poll consumes it.
@@ -1594,6 +1660,7 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
+            native_transcript_protocol_for(llm, model),
             observation_progress_hint
                 .into_iter()
                 .chain(convergence_hint),

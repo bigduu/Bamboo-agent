@@ -96,8 +96,7 @@ struct Cli {
 
     /// With -p: cancel the run if it hasn't finished within this many seconds
     /// (wall clock; counts any permission-gate round trips). Cancels the same
-    /// way Ctrl-C does, then exits non-zero. Client-side only — there is no
-    /// server-side per-run deadline in `ExecuteRequest` (yet) to delegate to.
+    /// way Ctrl-C does, then exits non-zero. The runner sees the remaining time.
     #[arg(long = "timeout", value_name = "SECONDS")]
     timeout: Option<u64>,
 
@@ -240,7 +239,7 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Colour palette: truecolor, system (terminal ANSI colours), or
+        /// Colour palette: truecolor (dark), light, system (ANSI), or
         /// no-color. `NO_COLOR` selects no-color when omitted.
         #[arg(long)]
         theme: Option<bamboo_tui::ThemePalette>,

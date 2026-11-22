@@ -17,7 +17,7 @@ use bamboo_domain::{
     SupervisorCurrentUserTarget, SupervisorReference,
 };
 use bamboo_orchestration::managed_session::{
-    read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals,
+    read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals, SUPERVISOR_WAIT_YIELD,
 };
 use bamboo_server_tools::session_control::root_run::{ManagedOutcomeTarget, SupervisedRootRunPort};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
@@ -59,6 +59,12 @@ fn finalized(target: &SupervisorCurrentUserTarget, runner: &AgentRunner) -> Valu
     json!({"status":"already_finished", "accepted":false, "target_session_id":target.session_id,
         "run_id":runner.run_id, "completion_verified":false,
         "note":"The exact execution finalizer ran; durable outcome and physical resource cleanup require their own evidence."})
+}
+
+fn yield_wait(response: Value) -> ToolResult {
+    let mut result = ToolResult::text(true, response.to_string());
+    result.display_preference = Some(SUPERVISOR_WAIT_YIELD.into());
+    result
 }
 
 fn run_control(
@@ -267,6 +273,55 @@ impl<F: Future<Output = ()> + Unpin + Send> ManagedRunSignals for RootRunSignals
 }
 
 impl SupervisedRootRunController {
+    async fn has_material_subscription(
+        &self,
+        caller: &SessionCallerReference,
+        target: &SupervisorCurrentUserTarget,
+        run_id: &str,
+    ) -> bool {
+        use bamboo_domain::Storage;
+
+        let Ok(Some(root)) = self.store.load_session(&target.session_id).await else {
+            return false;
+        };
+        let Some(outcomes) = root
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        else {
+            return false;
+        };
+        let Some(fact) = outcomes.facts.last().filter(|fact| fact.run_id == run_id) else {
+            return false;
+        };
+        let Some(input) = outcomes.material_inputs(fact).find(|input| {
+            input.supervisor_origin.as_ref().is_some_and(|origin| {
+                origin.original_caller() == Some(caller)
+                    && origin.current_user_target() == Some(target)
+                    && origin.permits_scope_replay(false)
+            })
+        }) else {
+            return false;
+        };
+        let Ok(supervisor) = original_supervisor(caller) else {
+            return false;
+        };
+        // Reuse the canonical target and ACK proof before relying on the
+        // subscription. A queued input alone cannot promise a wake for this Run.
+        self.inbox
+            .read_managed_root_admission(
+                caller,
+                &supervisor,
+                target,
+                &SessionInboxReceipt {
+                    id: input.receipt_id.clone(),
+                    generation: input.generation,
+                },
+            )
+            .await
+            .is_ok_and(|admitted| admitted.is_some())
+    }
+
     async fn read_event(
         &self,
         caller: &SessionCallerReference,
@@ -419,6 +474,17 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         if !initial.success || initial_status["status"] == "already_finished" {
             return Ok(initial);
         }
+        if self
+            .has_material_subscription(caller, target, expected_run_id)
+            .await
+        {
+            return Ok(yield_wait(json!({
+                "status": "waiting_for_notification",
+                "target_session_id": target.session_id,
+                "run_id": expected_run_id,
+                "completion_verified": false
+            })));
+        }
 
         let signal = self
             .runners
@@ -440,16 +506,12 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             return Ok(final_observation);
         }
 
-        Ok(ToolResult::text(
-            true,
-            json!({
-                "status": "wait_timeout",
-                "target_session_id": target.session_id,
-                "run_id": expected_run_id,
-                "completion_verified": false
-            })
-            .to_string(),
-        ))
+        Ok(yield_wait(json!({
+            "status": "wait_timeout",
+            "target_session_id": target.session_id,
+            "run_id": expected_run_id,
+            "completion_verified": false
+        })))
     }
 
     async fn wait_outcomes(
@@ -493,7 +555,7 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             Some(ManagedRootEvent::Blocker(blocker)) => {
                 json!({"status":"recorded_blocker", "blocker":blocker})
             }
-            None => json!({"status":"outcome_unknown"}),
+            None => return Ok(yield_wait(json!({"status":"outcome_unknown"}))),
         };
         Ok(ToolResult::text(true, response.to_string()))
     }
@@ -549,6 +611,12 @@ mod tests {
             true,
         )
         .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_wait_finishes_the_supervisor_turn_and_delivers_after_completion() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_wait_yields_to_inbox()
+            .await;
     }
 
     #[actix_web::test]

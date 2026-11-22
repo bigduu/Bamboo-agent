@@ -81,7 +81,7 @@ async fn regular_file_exists(path: &Path) -> io::Result<bool> {
 
 async fn read_regular(path: &Path) -> io::Result<Option<Vec<u8>>> {
     if regular_file_exists(path).await? {
-        fs::read(path).await.map(Some)
+        cold_main::read_state_file(path).await.map(Some)
     } else {
         Ok(None)
     }

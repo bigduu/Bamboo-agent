@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ratatui::layout::Rect;
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -20,7 +20,7 @@ pub fn render(f: &mut Frame, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let footer = [
         format!(
-            "{} / {} move · {} / {} branch · {} open",
+            "{}/{} move · {}/{} branch · {}/click open",
             app.primary_key_hint(ActionContext::SubagentTree, ActionId::NavigateUp),
             app.primary_key_hint(ActionContext::SubagentTree, ActionId::NavigateDown),
             app.primary_key_hint(ActionContext::SubagentTree, ActionId::CollapseTreeNode),
@@ -34,13 +34,15 @@ pub fn render(f: &mut Frame, app: &App) {
             app.primary_key_hint(ActionContext::SubagentTree, ActionId::Cancel),
         ),
     ];
-    let lines = tree_lines(
+    let (lines, session_rows) = tree_lines(
         tree,
         inner_width,
         area.height.saturating_sub(2) as usize,
         Utc::now(),
         &footer,
     );
+    tree.session_rows
+        .render(area.inner(Margin::new(1, 1)), session_rows);
 
     f.render_widget(Clear, area);
     f.render_widget(
@@ -60,7 +62,7 @@ fn tree_lines<'a>(
     height: usize,
     now: DateTime<Utc>,
     footer: &'a [String; 2],
-) -> Vec<Line<'a>> {
+) -> (Vec<Line<'a>>, Vec<(usize, String)>) {
     let compact = width < 76;
     let selected_path = tree
         .selected_id()
@@ -134,6 +136,7 @@ fn tree_lines<'a>(
             Style::default().fg(colors::subtle()),
         )));
     }
+    let mut session_rows = Vec::new();
     for (index, row) in tree
         .visible
         .iter()
@@ -144,6 +147,7 @@ fn tree_lines<'a>(
         let Some(node) = tree.nodes.get(&row.session_id) else {
             continue;
         };
+        session_rows.push((lines.len(), row.session_id.clone()));
         lines.push(tree_row(
             node,
             row.depth,
@@ -182,7 +186,7 @@ fn tree_lines<'a>(
             Style::default().fg(colors::subtle()),
         )));
     }
-    lines
+    (lines, session_rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,7 +222,8 @@ fn tree_row<'a>(
     } else {
         format!("{} {:<22}", status.glyph(), status.label())
     };
-    let prefix = format!(" {active}{indent}{branch} {status_text} ");
+    let prefix =
+        crate::text::clip_cells(&format!(" {active}{indent}{branch} {status_text} "), width);
     let id = short_session_id(&node.summary.id);
     let suffix = format!("{} [{id}]", node.title());
     let style = if selected {
@@ -227,12 +232,10 @@ fn tree_row<'a>(
         Style::default()
     };
     let status_style = style.fg(status_color(status));
+    let title_width = width.saturating_sub(display_width(&prefix));
     Line::from(vec![
-        Span::styled(truncate(&prefix, width), status_style),
-        Span::styled(
-            truncate(&suffix, width.saturating_sub(display_width(&prefix))),
-            style,
-        ),
+        Span::styled(prefix, status_style),
+        Span::styled(truncate(&suffix, title_width), style),
     ])
 }
 
@@ -460,7 +463,7 @@ mod tests {
                 .collect::<String>();
             assert!(text.contains("Active path"), "{width}: {text}");
             assert!(text.contains("waiting for input"), "{width}: {text}");
-            assert!(text.contains("Research child"), "{width}: {text}");
+            assert!(text.contains("Research child [child]"), "{width}: {text}");
         }
     }
 
@@ -481,7 +484,7 @@ mod tests {
         ];
         let height = 18;
 
-        let lines = tree_lines(&tree, 58, height, Utc::now(), &footer);
+        let (lines, _) = tree_lines(&tree, 58, height, Utc::now(), &footer);
 
         assert!(
             lines.len() <= height,

@@ -6,10 +6,14 @@
 
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, Role};
+#[cfg(feature = "litellm-wire-types")]
+use bamboo_litellm_llms_types::formats::chat_completions::ReasoningEffort as LiteLLMEffort;
+#[cfg(feature = "litellm-wire-types")]
+use bamboo_litellm_llms_types::formats::chat_completions::{ChatMessage, ChatMessageContent};
 use futures::{stream, StreamExt};
 use reqwest::{RequestBuilder, Response, StatusCode};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -23,7 +27,37 @@ use bamboo_domain::ReasoningEffort;
 /// Convert internal [`Message`] values to an OpenAI-compatible JSON array.
 ///
 /// This intentionally omits internal fields like `id` and `created_at`.
-///
+pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
+    render_chat_messages(messages, |role, content, extra| {
+        let mut fields = Map::from_iter([
+            ("role".into(), json!(role)),
+            ("content".into(), json!(content)),
+        ]);
+        fields.extend(extra);
+        Value::Object(fields)
+    })
+}
+
+#[cfg(feature = "litellm-wire-types")]
+pub(crate) fn messages_to_litellm_chat_messages(messages: &[Message]) -> Vec<ChatMessage> {
+    render_chat_messages(messages, |role, content, extra| ChatMessage {
+        role: role.into(),
+        content: Some(match content {
+            ChatContent::Text(text) => ChatMessageContent::Text(text.into()),
+            ChatContent::Parts(parts) => ChatMessageContent::Parts(parts),
+        }),
+        name: None,
+        extra,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ChatContent<'a> {
+    Text(&'a str),
+    Parts(Vec<Value>),
+}
+
 /// A `role:tool` message can only carry string content on the Chat Completions
 /// API — there is no place for an image (e.g. an MCP screenshot) the way the
 /// Responses / Anthropic paths have. Rather than silently drop it (#412, sibling
@@ -32,8 +66,11 @@ use bamboo_domain::ReasoningEffort;
 /// CONSECUTIVE before any other role, so the images are buffered and flushed as a
 /// single user message once the tool block ends (before the next non-tool
 /// message, or at the end) — never interleaved between two tool messages.
-pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
-    fn flush_relayed_images(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
+fn render_chat_messages<T>(
+    messages: &[Message],
+    render: impl Fn(&str, ChatContent<'_>, Map<String, Value>) -> T,
+) -> Vec<T> {
+    let flush_relayed_images = |out: &mut Vec<T>, pending: &mut Vec<Value>| {
         if pending.is_empty() {
             return;
         }
@@ -42,10 +79,10 @@ pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
             "text": "Image output from the preceding tool result(s).",
         })];
         content.append(pending);
-        out.push(json!({ "role": "user", "content": Value::Array(content) }));
-    }
+        out.push(render("user", ChatContent::Parts(content), Map::new()));
+    };
 
-    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut out = Vec::with_capacity(messages.len());
     let mut pending_tool_images: Vec<Value> = Vec::new();
 
     for m in messages {
@@ -65,28 +102,22 @@ pub fn messages_to_openai_compat_json(messages: &[Message]) -> Vec<Value> {
         // OpenAI-compatible APIs accept either a string content, or an array of
         // typed parts for multimodal messages. A `role:tool` message stays a
         // string (its images are relayed separately, below).
-        let content_value = if matches!(m.role, Role::Tool) {
-            json!(m.content)
-        } else if let Some(parts) = m.content_parts.as_ref() {
-            json!(parts)
-        } else {
-            json!(m.content)
+        let content = match (&m.role, m.content_parts.as_deref()) {
+            (Role::Tool, _) | (_, None) => ChatContent::Text(&m.content),
+            (_, Some(parts)) => ChatContent::Parts(parts.iter().map(|part| json!(part)).collect()),
         };
 
-        let mut msg = json!({
-            "role": role,
-            "content": content_value,
-        });
-
+        // LiteLLM's ChatMessage retains these fields in its flattened map.
+        let mut extra = Map::new();
         if let Some(tool_call_id) = &m.tool_call_id {
-            msg["tool_call_id"] = json!(tool_call_id);
+            extra.insert("tool_call_id".into(), json!(tool_call_id));
         }
 
         if let Some(tool_calls) = &m.tool_calls {
-            msg["tool_calls"] = json!(tool_calls);
+            extra.insert("tool_calls".into(), json!(tool_calls));
         }
 
-        out.push(msg);
+        out.push(render(role, content, extra));
 
         // Buffer this tool message's images (if any) to relay after the block.
         if matches!(m.role, Role::Tool) {
@@ -155,9 +186,58 @@ pub fn build_openai_compat_body(
     reasoning_effort: Option<ReasoningEffort>,
     parallel_tool_calls: Option<bool>,
 ) -> Value {
+    build_openai_compat_body_with_messages(
+        model,
+        messages_to_openai_compat_json(messages),
+        tools,
+        tool_choice,
+        max_output_tokens,
+        reasoning_effort.map(ReasoningEffort::as_str),
+        parallel_tool_calls,
+    )
+}
+
+#[cfg(feature = "litellm-wire-types")]
+pub(crate) fn build_litellm_chat_body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    tool_choice: Option<Value>,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+) -> Value {
+    let reasoning_effort = reasoning_effort.map(|effort| match effort {
+        ReasoningEffort::Disabled => LiteLLMEffort::None,
+        ReasoningEffort::Low => LiteLLMEffort::Low,
+        ReasoningEffort::Medium => LiteLLMEffort::Medium,
+        ReasoningEffort::High => LiteLLMEffort::High,
+        ReasoningEffort::Xhigh => LiteLLMEffort::Xhigh,
+        ReasoningEffort::Max => LiteLLMEffort::Max,
+    });
+    build_openai_compat_body_with_messages(
+        model,
+        messages_to_litellm_chat_messages(messages),
+        tools,
+        tool_choice,
+        max_output_tokens,
+        reasoning_effort,
+        parallel_tool_calls,
+    )
+}
+
+fn build_openai_compat_body_with_messages(
+    model: &str,
+    messages: impl Serialize,
+    tools: &[ToolSchema],
+    tool_choice: Option<Value>,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<impl Serialize>,
+    parallel_tool_calls: Option<bool>,
+) -> Value {
     let mut body = json!({
         "model": model,
-        "messages": messages_to_openai_compat_json(messages),
+        "messages": messages,
         "stream": true,
         // Ask for a final usage chunk so we can report prompt-cache hits
         // (`prompt_tokens_details.cached_tokens`). Standard OpenAI-compatible APIs
@@ -177,7 +257,7 @@ pub fn build_openai_compat_body(
     );
 
     if let Some(effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(effort.as_str());
+        body["reasoning_effort"] = json!(effort);
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {

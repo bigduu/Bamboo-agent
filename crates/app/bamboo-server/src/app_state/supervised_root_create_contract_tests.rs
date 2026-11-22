@@ -1215,6 +1215,20 @@ async fn generic_spawn_forwards_only_original_root_child_callers_to_an_explicit_
 async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_first_task_on_reopen() {
     use bamboo_server_tools::session_control::versioned::SpawnSessionTool;
     let f = Fixture::new().await;
+    let project = f.creator.projects.get(f.project_id()).unwrap();
+    f.creator
+        .projects
+        .update(&project.id, project.revision, |manifest| {
+            manifest.new_chat_worktree = true;
+            Ok(())
+        })
+        .unwrap();
+    let mut missing_workspace = f.request.clone();
+    missing_workspace.workspace_path = None;
+    let rejected = f.creator.create(&f.supervisor, missing_workspace).await;
+    assert!(matches!(rejected, Err(ToolError::InvalidArguments(error))
+        if error.contains("provide both project_id and workspace_path")));
+    assert_eq!(f.count().await, 1);
     let main = f.home.path().join("workspaces").join("source-checkout");
     std::fs::create_dir_all(&main).unwrap();
     native_git(&main, &["init", "--initial-branch=fixture"]);

@@ -143,6 +143,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::codex_handoff::configure)
                 .configure(agent::tickets::patrol::configure)
                 .configure(agent::tickets::ready_policy::configure)
                 .configure(agent::tickets::sprints::configure)
@@ -231,6 +232,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::browser::screenshot),
         )
         .route("/chat", web::post().to(agent::chat::handler))
+        .route(
+            "/sessions/{session_id}/goal/resume",
+            web::post().to(agent::chat::resume_goal),
+        )
         .route(
             "/prompt-presets",
             web::get().to(agent::prompt_presets::list_prompt_presets),
@@ -366,6 +371,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::resource("/sessions/{session_id}/version-migration")
                 .route(web::get().to(agent::sessions::inspect_session_version_migration))
                 .route(web::post().to(agent::sessions::migrate_session_version)),
+        )
+        .route(
+            "/session-storage/archive-preview",
+            web::get().to(agent::sessions::preview_session_archives),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive",
+            web::post().to(agent::sessions::archive_session),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive/restore",
+            web::post().to(agent::sessions::restore_session_archive),
         )
         .route(
             "/sessions/{session_id}/named-agent-profiles",

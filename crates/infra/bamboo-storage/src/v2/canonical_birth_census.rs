@@ -285,6 +285,13 @@ impl Collector {
         let (Some(main_bytes), Some(runtime)) = (main, runtime) else {
             return Err(CensusError::Incomplete);
         };
+        let stored_len = main_bytes.len();
+        let remaining = self.limits.total.saturating_sub(self.counts.bytes);
+        let main_bytes = supported(cold_main::decode_bounded(
+            main_bytes,
+            self.limits.main.min(stored_len.saturating_add(remaining)),
+        ))?;
+        self.counts.bytes += main_bytes.len().saturating_sub(stored_len);
         supported(compact_main::validate_full_main(&main_bytes))?;
         let mut main: Session =
             serde_json::from_slice(&main_bytes).map_err(|_| CensusError::Unsupported)?;

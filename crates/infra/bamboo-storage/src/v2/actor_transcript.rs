@@ -92,7 +92,11 @@ pub(super) fn regular_bytes(path: &Path) -> Result<Vec<u8>> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(ActorTranscriptAppendError::InvalidSource);
     }
-    Ok(std::fs::read(path)?)
+    let bytes = std::fs::read(path)?;
+    if path.file_name().is_some_and(|name| name == "session.json") {
+        return Ok(super::cold_main::decode(bytes)?);
+    }
+    Ok(bytes)
 }
 
 #[derive(Deserialize)]
