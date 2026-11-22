@@ -3201,6 +3201,13 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
+    assert!(stable
+        .stable_instructions
+        .contains("infer the need for a plan from the work itself"));
+    assert!(stable
+        .stable_instructions
+        .contains("Each Task update takes the full current list"));
+    assert!(stable.stable_instructions.contains("`criteriaMet`"));
     assert!(!stable.stable_instructions.contains("Workspace path:"));
     assert!(!stable
         .stable_instructions
