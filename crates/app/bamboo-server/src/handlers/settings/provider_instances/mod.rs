@@ -790,28 +790,35 @@ mod tests {
     async fn litellm_experiment_reports_default_off_and_persists_per_instance_opt_in() {
         let home = tempfile::tempdir().unwrap();
         let state = provider_delete_state(home.path()).await;
-        let unsupported_id = create_delete_fixture(&state, "openai-fixture-key").await;
         let app = http_test::init_service(
             App::new()
                 .app_data(state)
                 .configure(crate::routes::configure_routes),
         )
         .await;
-        let create_request = |key: &str| {
+        let create_request = |kind: &str, key: &str| {
             http_test::TestRequest::post()
                 .uri(INSTANCES_URL)
                 .set_json(serde_json::json!({
-                    "type": "anthropic",
+                    "type": kind,
                     "config": { "api_key": key, "base_url": "http://127.0.0.1:1/v1" }
                 }))
                 .to_request()
         };
         let created: Value =
-            http_test::call_and_read_body_json(&app, create_request("fixture-key")).await;
+            http_test::call_and_read_body_json(&app, create_request("anthropic", "fixture-key"))
+                .await;
         let other: Value =
-            http_test::call_and_read_body_json(&app, create_request("other-fixture-key")).await;
+            http_test::call_and_read_body_json(&app, create_request("openai", "other-fixture-key"))
+                .await;
+        let unsupported: Value = http_test::call_and_read_body_json(
+            &app,
+            create_request("gemini", "gemini-fixture-key"),
+        )
+        .await;
         let id = created["id"].as_str().unwrap().to_owned();
         let other_id = other["id"].as_str().unwrap().to_owned();
+        let unsupported_id = unsupported["id"].as_str().unwrap();
 
         let list_request = || {
             http_test::TestRequest::get()
