@@ -6,9 +6,13 @@ rust-version.workspace = true
 description = "LLM provider layer (providers, protocol adapters, streaming, routing, model catalog) for the Bamboo agent framework"
 license = "MIT"
 
+[features]
+litellm-wire-types = ["dep:bamboo-litellm-llms-types"]
+
 [dependencies]
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-litellm-llms-types = { path = "../bamboo-litellm-llms-types", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
