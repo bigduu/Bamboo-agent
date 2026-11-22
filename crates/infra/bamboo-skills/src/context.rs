@@ -57,7 +57,7 @@ pub fn build_workflow_catalog_context(
 ) -> String {
     if skills.is_empty() {
         if diagnostic.automatic_outcome.is_some() {
-            let guidance = "\n\n## Skill System\nCheck Skill applicability. If a Skill could help, look for it using available discovery tools. Otherwise continue normally.\n";
+            let guidance = "\n\n## Skill System\nDiscover a Workflow when one could help.\n";
             if guidance.chars().count() <= diagnostic.char_budget {
                 return guidance.to_owned();
             }
@@ -82,7 +82,6 @@ pub fn build_workflow_catalog_context(
         };
         context.push_str(&render_workflow_catalog_entry(skill, entry));
     }
-    context.push_str(&workflow_catalog_suffix(diagnostic));
 
     tracing::info!("Skill metadata context built: {} chars", context.len());
 
@@ -90,48 +89,12 @@ pub fn build_workflow_catalog_context(
 }
 
 pub(crate) fn workflow_catalog_prefix() -> String {
-    let mut context = String::from("\n\n## Skill System\n");
-    context.push_str(
-        "Before producing any user-facing response, you MUST perform a skill applicability check.\n\n",
-    );
-
-    context.push_str("### Mandatory Skill Check\n");
-    context.push_str(
-        "1. Evaluate the user's request against the bounded advertised workflow matches below. Load a candidate only when it clearly applies.\n",
-    );
-    context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
-    context.push_str("3. Do NOT skip this check.\n\n");
-
-    context.push_str("### If A Workflow Applies\n");
-    context.push_str("1. Select EXACTLY ONE workflow (prefer the most specific match).\n");
-    context.push_str(
-        "2. For `kind: instruction`, call `load_skill` with `skill_id` before responding.\n",
-    );
-    context.push_str("3. For `kind: orchestration`, never call `load_skill`; use `workflow_run` with the advertised fixed revision. The server will deny automatic starts unless policy allows them and the session explicitly opted in.\n");
-    context.push_str("4. Follow loaded instruction workflows precisely; inspect orchestration status through workflow_run get/list/events.\n\n");
-
-    context.push_str("### If No Skill Applies\n");
-    context.push_str("1. Proceed normally without loading any skill.\n");
-    context.push_str(
-        "2. Do NOT call `load_skill` or `read_skill_resource` when no skill applies.\n\n",
-    );
-
-    context.push_str("### Resource Loading Rules\n");
-    context.push_str("1. Do NOT preload all skills.\n");
-    context.push_str("2. Call `load_skill` only after selecting one skill.\n");
-    context.push_str("3. Use `read_skill_resource` only for auxiliary files after `load_skill`.\n");
-    context.push_str(
-        "4. When a resource response has `has_more=true`, continue with `next_offset` until you have enough context.\n\n",
-    );
-
-    context.push_str("### Execution Behavior With Injected Context\n");
-    context.push_str("1. Treat Bamboo-injected workspace and environment context as already available working context.\n");
-    context.push_str("2. If injected env variables appear sufficient for a skill workflow, prefer a minimal execution or verification attempt before asking the user for more information.\n");
-    context.push_str("3. When execution fails, diagnose the concrete failure first and only ask follow-up questions for information that remains genuinely missing after using the injected context and available tools.\n");
-    context.push_str("4. Do NOT ask the user to re-send env var values that Bamboo has already injected by name unless the value is clearly missing, malformed, or the user must change it.\n\n");
-
-    context.push_str("### Available Workflows\n");
-    context
+    "\n\n## Skill System\n\n\
+Choose the most specific advertised Workflow when it clearly applies. Proceed directly otherwise.\n\
+Use `load_skill` before responding for instruction Workflows. For orchestration, use `workflow_run` with the advertised revision and follow its invocation policy.\n\
+Follow the loaded instructions. Read auxiliary files only when needed, continuing from `next_offset` if more is required.\n\n\
+### Available Workflows\n"
+        .to_string()
 }
 
 pub(crate) fn render_workflow_catalog_entry(
@@ -155,24 +118,6 @@ pub(crate) fn render_workflow_catalog_entry(
     let automatic = entry.invocation_policy["automatic"].as_bool() == Some(true);
     context.push_str(&format!(
         "- Invocation policy: explicit={explicit}, automatic={automatic}\n"
-    ));
-
-    context
-}
-
-pub(crate) fn workflow_catalog_suffix(diagnostic: &WorkflowCatalogDiagnostic) -> String {
-    let mut context = String::new();
-    context.push_str("\n### Internal Verification\n");
-    context.push_str(
-        "Internally confirm `skill_check_completed=true` before each user-facing response.\n",
-    );
-    context.push_str(&format!(
-        "\nCatalog budget: advertised {}/{} candidates; char_budget={}; compressed={}; shortlisted={}.\n",
-        diagnostic.advertised_candidates,
-        diagnostic.total_candidates,
-        diagnostic.char_budget,
-        diagnostic.compressed_descriptions,
-        diagnostic.shortlisted,
     ));
 
     context
@@ -202,18 +147,12 @@ mod tests {
 
         let context = build_skill_context(&[skill]);
 
-        // Should contain instructions for AI
         assert!(context.contains("## Skill System"));
-        assert!(context.contains("Mandatory Skill Check"));
-        assert!(context.contains("Select EXACTLY ONE workflow"));
+        assert!(context.contains("when it clearly applies"));
         assert!(context.contains("load_skill"));
-        assert!(context.contains("read_skill_resource"));
-        assert!(context.contains("skill_check_completed=true"));
-        assert!(context.contains("Execution Behavior With Injected Context"));
-        assert!(context.contains("prefer a minimal execution or verification attempt"));
-        assert!(context.contains("Do NOT ask the user to re-send env var values"));
-        assert!(context.contains("bounded advertised workflow matches"));
-        assert!(!context.contains("ALL available skill descriptions"));
+        assert!(context.contains("workflow_run"));
+        assert!(!context.contains("skill_check_completed"));
+        assert!(!context.contains("Catalog budget:"));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));

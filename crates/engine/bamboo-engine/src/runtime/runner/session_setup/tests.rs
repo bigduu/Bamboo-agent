@@ -544,7 +544,7 @@ async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candi
         .await
         .unwrap();
         assert_eq!(
-            before.contains("Check Skill applicability."),
+            before.contains("Discover a Workflow when one could help."),
             shows_guidance
         );
         let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
@@ -3203,11 +3203,11 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     assert!(stable.stable_instructions.contains("Base system"));
     assert!(stable
         .stable_instructions
-        .contains("infer the need for a plan from the work itself"));
+        .contains("record a plan before implementation and resume a matching plan"));
     assert!(stable
         .stable_instructions
-        .contains("Each Task update takes the full current list"));
-    assert!(stable.stable_instructions.contains("`criteriaMet`"));
+        .contains("Use an active Workflow's steps and checks for its scope."));
+    assert!(!stable.stable_instructions.contains("`criteriaMet`"));
     assert!(!stable.stable_instructions.contains("Workspace path:"));
     assert!(!stable
         .stable_instructions

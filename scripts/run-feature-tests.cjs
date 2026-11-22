@@ -220,7 +220,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2922 changes the existing feature-sensitive SubAgent adapter. Exec wait
 // cases use the default Agent, Engine and Server owners; nested creation stays
 // in default server-other. The additive contexts and case names are unchanged.
-const FEATURE_SOURCE_SHA256 = "65351a27163a4d89e63ac269424656b474f5e24ae03e1a2629592850da93212b";
+// #2929 changes the feature-sensitive prompt runner. The clock checks remain
+// in the default headless cases and the prompt and Skill tests retain their
+// existing owners. The four additive contexts and 20 cases stay intact.
+const FEATURE_SOURCE_SHA256 = "ae36510095aaf31551d0cc6b41ed130b3b08aacafe9f591ce6cedf5ccf0a8b06";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
