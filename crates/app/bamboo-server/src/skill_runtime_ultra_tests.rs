@@ -157,7 +157,7 @@ async fn native_http_ultra_uses_finite_host_and_exact_registered_root_inventory(
         .collect::<BTreeSet<_>>();
     assert_eq!(actual, expected);
     assert_eq!(provider.requests.lock().unwrap()[0].1, expected);
-    for name in ["Write", "Edit"] {
+    for name in ["Write", "Edit", "exec_command", "write_stdin"] {
         assert!(actual.contains(name));
         assert!(executor.owns_exact_tool(name));
     }
@@ -166,7 +166,6 @@ async fn native_http_ultra_uses_finite_host_and_exact_registered_root_inventory(
         "skills_read",
         "load_skill",
         "read_skill_resource",
-        "exec_command",
     ] {
         assert!(!executor.owns_exact_tool(name));
         assert!(executor.exact_tool_owner(name).is_none());

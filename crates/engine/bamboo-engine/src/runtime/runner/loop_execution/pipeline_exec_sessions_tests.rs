@@ -711,6 +711,15 @@ impl LLMProvider for PullResultsProvider {
 
 #[tokio::test]
 async fn model_pulls_exec_completion_as_tool_result_without_a_runtime_user_notification() {
+    pull_exec_completion("model-pulls-exec-result", false).await;
+}
+
+#[tokio::test]
+async fn ultra_root_executes_and_polls_its_own_shell_session() {
+    pull_exec_completion("ultra-pulls-exec-result", true).await;
+}
+
+async fn pull_exec_completion(session_id: &str, ultra: bool) {
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
     let _release = ReleaseGate(gate.clone());
@@ -720,7 +729,8 @@ async fn model_pulls_exec_completion_as_tool_result_without_a_runtime_user_notif
         calls: AtomicUsize::new(0),
         handle: Mutex::new(None),
     });
-    let (mut session, mut config, mut state) = fixture("model-pulls-exec-result");
+    let (mut session, mut config, mut state) = fixture(session_id);
+    session.set_root_orchestration_only(ultra).unwrap();
     let resume = Arc::new(ResumeRecorder::default());
     let completion = Arc::new(CompletionRecorder::default());
     config.bash_resume_hook = Some(resume.clone());

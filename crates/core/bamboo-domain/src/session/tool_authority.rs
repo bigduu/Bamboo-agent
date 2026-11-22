@@ -3,7 +3,7 @@
 use super::{model_context::ModelContextResetReason, Session, SessionKind};
 
 /// Root product policy, independent of a model call's `ReasoningEffort`.
-/// Ultra delegates planning/execution and keeps verification at the Root.
+/// Ultra coordinates parallel work and keeps verification at the Root.
 /// It is projected from existing durable Root authority, never persisted twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,7 +54,7 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an ordinary Ultra Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 13] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
     "SubAgent",
     "spawn_session",
     "Task",
@@ -68,6 +68,8 @@ pub const ROOT_ORCHESTRATION_TOOLS: [&str; 13] = [
     "ViewImage",
     "Edit",
     "Write",
+    "exec_command",
+    "write_stdin",
 ];
 
 pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
@@ -531,9 +533,9 @@ mod tests {
             assert!(root.allows_model_tool_execution(tool), "{tool}");
         }
         for tool in [
-            "exec_command",
-            "write_stdin",
             "Bash",
+            "vendor::exec_command",
+            "vendor::write_stdin",
             "WebFetch",
             "work_overview",
             "work_dispatch",

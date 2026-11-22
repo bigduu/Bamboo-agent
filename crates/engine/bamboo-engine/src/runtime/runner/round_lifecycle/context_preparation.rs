@@ -2132,6 +2132,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             super::stream_execution::build_exec_session_continuation_context_block(
                 session,
                 tool_schemas,
+                config.permission_mode.unwrap_or_default(),
             )
             .map(|block| counter.count_message(&block.render_runtime_context_message()))
             .unwrap_or(0),
