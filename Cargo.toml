@@ -7,6 +7,7 @@ members = [
     # Infra — independent services
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-litellm-llms-types",
     "crates/infra/bamboo-storage",
     "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
@@ -54,6 +55,7 @@ default-members = [
     # Infra — independent services
     "crates/infra/bamboo-config",
     "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-litellm-llms-types",
     "crates/infra/bamboo-storage",
     "crates/infra/bamboo-tickets",
     "crates/infra/bamboo-a2a",
