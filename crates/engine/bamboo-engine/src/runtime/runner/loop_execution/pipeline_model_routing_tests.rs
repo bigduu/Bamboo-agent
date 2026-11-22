@@ -433,6 +433,7 @@ async fn routing_contract_gold_terminal_reads_live_fast_and_preserves_unverified
             None,
             &session_id,
             1,
+            false,
             context.providers["chat-a"].clone(),
             &tx,
         )
@@ -452,6 +453,7 @@ async fn routing_contract_gold_terminal_reads_live_fast_and_preserves_unverified
             None,
             &session_id,
             1,
+            false,
             context.providers["chat-a"].clone(),
             &tx,
         )
@@ -465,7 +467,7 @@ async fn routing_contract_gold_terminal_reads_live_fast_and_preserves_unverified
         crate::runtime::goal_state::read_goal_state(&session)
             .unwrap()
             .status,
-        crate::runtime::goal_state::GoalRuntimeStatus::NeedInput
+        crate::runtime::goal_state::GoalRuntimeStatus::Blocked
     );
 }
 

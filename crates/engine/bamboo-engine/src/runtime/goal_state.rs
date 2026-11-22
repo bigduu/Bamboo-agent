@@ -2,14 +2,10 @@
 //!
 //! Bamboo's goal feature is a hybrid of two ideas:
 //!
-//! 1. The **main agent self-reports** completion via the `update_goal` tool
-//!    (mirroring OpenAI Codex's `update_goal`), and the runtime relentlessly
-//!    re-injects a rigorous completion-audit continuation prompt until the agent
-//!    declares the goal complete (or blocked, or the continuation budget runs
-//!    out).
-//! 2. The existing **Gold evaluator** is kept as a *side-channel double-check*:
-//!    at the terminal point — when the run is actually about to stop — it
-//!    re-verifies achievement and can veto a premature completion.
+//! The main agent can report its assessment via `update_goal`. The Gold
+//! evaluator checks the objective at a terminal point. Only a sufficiently
+//! confident achievement verdict can mark a goal complete. Otherwise the
+//! runtime continues within its bounds or records why it stopped.
 //!
 //! This module owns the durable record that ties the two together. It lives in
 //! `session.metadata` under [`GOAL_STATE_METADATA_KEY`] as a single JSON value
@@ -40,15 +36,13 @@ const MAX_EVAL_HISTORY: usize = 50;
 pub enum GoalRuntimeStatus {
     /// The agent is actively pursuing the goal; the loop will keep continuing.
     Active,
-    /// The goal has been achieved (agent declared + double-check confirmed, or
-    /// the evaluator was confidently achieved).
+    /// The evaluator confirmed that the goal was achieved.
     Complete,
-    /// The agent explicitly gave up after the blocked discipline, or the
-    /// evaluator reported a concrete blocker.
+    /// A concrete blocker prevents progress or verification.
     Blocked,
     /// The evaluator reported that user input is the true next blocker.
     NeedInput,
-    /// The continuation budget was exhausted before completion.
+    /// A continuation or progress bound stopped the run before completion.
     BudgetLimited,
 }
 
@@ -67,6 +61,15 @@ impl GoalRuntimeStatus {
     pub fn is_active(self) -> bool {
         matches!(self, Self::Active)
     }
+}
+
+/// Machine-readable explanation for a runtime-imposed Goal stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStopReason {
+    ContinuationBudget,
+    NoProgress,
+    VerificationUnavailable,
 }
 
 /// What the agent last declared via the `update_goal` tool.
@@ -123,6 +126,8 @@ pub struct GoalState {
     /// The user's objective text (copied from the active goal config).
     pub objective: String,
     pub status: GoalRuntimeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<GoalStopReason>,
     /// The agent's most recent self-report, if any. Cleared once acted upon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_status: Option<GoalDeclaredStatus>,
@@ -144,6 +149,7 @@ impl GoalState {
         Self {
             objective: objective.into(),
             status: GoalRuntimeStatus::Active,
+            stop_reason: None,
             declared_status: None,
             declared_at_round: None,
             continuation_count: 0,
@@ -216,6 +222,7 @@ pub fn ensure_goal_state(session: &Session, objective: &str) -> GoalState {
                 // belonged to the previous objective.
                 state.objective = objective.to_string();
                 state.status = GoalRuntimeStatus::Active;
+                state.stop_reason = None;
                 state.continuation_count = 0;
                 state.eval_history.clear();
                 state.clear_declaration();
