@@ -106,7 +106,6 @@ async fn run_round_for_model(
     .await
 }
 
-#[cfg(feature = "litellm-wire-types")]
 #[tokio::test]
 async fn ultra_bodhi_gemini_sends_supported_reasoning_for_dotted_models() {
     use wiremock::matchers::path;
@@ -154,7 +153,6 @@ async fn ultra_bodhi_gemini_sends_supported_reasoning_for_dotted_models() {
     }
 }
 
-#[cfg(feature = "litellm-wire-types")]
 #[tokio::test]
 async fn gemini_replays_signed_parallel_tool_turn_after_session_reload() {
     use bamboo_agent_core::storage::Storage;

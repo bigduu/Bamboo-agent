@@ -75,9 +75,7 @@ tokio-test = "0.4"
 http = "1"
 
 [features]
-default = ["litellm-wire-types"]
 test-utils = []
-litellm-wire-types = ["bamboo-llm/litellm-wire-types"]
 # Write the per-call token-usage JSONL sidecar (for the bamboo-analytics dev
 # tool). The emit is also active automatically in any debug build, so dev
 # `cargo run`/tests get it for free; this feature is the explicit escape hatch
