@@ -8,7 +8,7 @@ use crate::api::types::{
     TaskListResponse, ToolInfo,
 };
 use crate::api::{
-    ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
+    ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
     SessionMutationFailure, VersionedSession,
 };
 use crate::app::{LoopObservation, OpenedSession, QuestionIdentity, SessionPickerIntent};
@@ -28,7 +28,9 @@ pub enum AnswerSubmissionOutcome {
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),
     Mouse(MouseEvent),
+    WorkspaceAction(crate::ui::workspace::WorkspaceAction),
     /// Terminal resized; the next loop iteration redraws at the new size (the
     /// dimensions themselves aren't needed — ratatui re-measures on draw).
     Resize(u16, u16),
@@ -104,7 +106,7 @@ pub enum AppEvent {
     ChatStarted {
         context_id: u64,
         turn_id: String,
-        result: Loaded<String>,
+        result: Loaded<ChatStart>,
     },
     LoopChatFinished {
         context_id: u64,

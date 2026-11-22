@@ -1,7 +1,7 @@
-use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::layout::{Alignment, Margin, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
@@ -10,8 +10,10 @@ use crate::app::{
 };
 use crate::components::markdown;
 use crate::file_change::FileChangeState;
+use crate::file_reference::{file_name, FileReference};
 use crate::keymap::{ActionContext, ActionId};
-use crate::theme::{self, colors};
+use crate::text::{clip_tail_cells, display_width, hard_wrap};
+use crate::theme::{self, colors, ThemePalette};
 
 const COLLAPSED_DETAIL_LINES: usize = 3;
 const COLLAPSED_DIFF_LINES: usize = 4;
@@ -258,7 +260,90 @@ fn push_tool_detail(
 }
 
 pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
-    let rendered = build_conversation_lines(app, content.width);
+    render_transcript(f, content, app, false);
+
+    // Editing remains available while a run is active. The action reducer
+    // owns when Enter can send a draft.
+    let draft = render_composer_files(f, input, app);
+    f.render_widget(&app.chat.textarea, draft);
+}
+
+pub(super) fn render_workspace(f: &mut Frame, content: Rect, input: Rect, app: &App) {
+    let content = content.inner(Margin::new(1, 0));
+    render_transcript(f, content, app, true);
+
+    let style = super::workspace::surface_style(app.theme);
+    f.render_widget(Block::default().style(style), input);
+    let draft = render_composer_files(
+        f,
+        Rect::new(
+            input.x + 3,
+            input.y,
+            input.width.saturating_sub(4),
+            input.height,
+        ),
+        app,
+    );
+    f.render_widget(
+        Paragraph::new(" › ").style(style),
+        Rect::new(input.x, draft.y, 3, draft.height),
+    );
+    f.render_widget(&app.chat.textarea, draft);
+}
+
+fn file_reference_style(theme: ThemePalette) -> Style {
+    Style::default()
+        .fg(theme.color(theme::ColorRole::UserPrefix))
+        .bg(theme.canvas())
+        .add_modifier(Modifier::BOLD)
+}
+
+fn render_composer_files(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    if app.chat.composer_files.is_empty() || area.height < 2 {
+        return area;
+    }
+    let row = composer_file_row(&app.chat.composer_files, area.width as usize, app.theme);
+    f.render_widget(
+        Paragraph::new(row),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+}
+
+fn composer_file_row(files: &[FileReference], width: usize, theme: ThemePalette) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut remaining = width;
+    for (index, file) in files.iter().enumerate() {
+        let after = files.len() - index - 1;
+        let reserve = if after == 0 {
+            0
+        } else {
+            format!(" +{after}").len()
+        };
+        let max_name = remaining.saturating_sub(reserve + 2);
+        if max_name == 0 || (index > 0 && display_width(&file.name) > max_name) {
+            spans.push(Span::styled(
+                format!("+{}", files.len() - index),
+                Style::default().fg(theme.color(theme::ColorRole::Inactive)),
+            ));
+            break;
+        }
+        let label = clip_tail_cells(&file.name, max_name);
+        remaining -= display_width(&label) + 2;
+        spans.push(Span::styled(
+            format!(" {label} "),
+            file_reference_style(theme),
+        ));
+        if after > 0 {
+            spans.push(Span::raw(" "));
+            remaining -= 1;
+        }
+    }
+    Line::from(spans)
+}
+
+fn render_transcript(f: &mut Frame, content: Rect, app: &App, workspace: bool) {
+    let rendered = build_conversation_lines(app, content.width, workspace);
     let total_lines = rendered.visual_line_count;
 
     let visible_height = content.height;
@@ -269,6 +354,7 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
     app.chat.max_scroll.set(max_scroll);
     app.chat.content_height.set(visible_height);
     app.chat.content_width.set(content.width);
+    app.chat.transcript_area.set(content);
     *app.chat.block_line_ranges.borrow_mut() = rendered.ranges;
     let scroll_offset = if app.chat.auto_scroll {
         max_scroll
@@ -276,16 +362,14 @@ pub fn render(f: &mut Frame, content: Rect, input: Rect, app: &App) {
         app.chat.scroll_offset.min(max_scroll)
     };
 
-    let messages = Paragraph::new(rendered.lines)
+    let mut messages = Paragraph::new(rendered.lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset, 0));
+    if workspace {
+        messages = messages.style(super::workspace::canvas_style(app.theme));
+    }
 
     f.render_widget(messages, content);
-
-    // The composer remains the stable editing surface while a run is active.
-    // Enter is gated in `handle_chat_key`; editing here never implies mid-run
-    // steering or a new server-side queue.
-    f.render_widget(&app.chat.textarea, input);
 }
 
 struct RenderedConversation {
@@ -294,7 +378,7 @@ struct RenderedConversation {
     visual_line_count: u16,
 }
 
-fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
+fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedConversation {
     let mut lines: Vec<Line> = Vec::new();
     let mut ranges = Vec::new();
     let mut visual_line_count = 0usize;
@@ -310,6 +394,31 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
             .cloned()
             .unwrap_or_default();
         match block.kind {
+            ConversationBlockKind::UserMessage(content) if workspace => {
+                let width = width.saturating_sub(4).clamp(1, 76) as usize;
+                let style = super::workspace::surface_style(app.theme);
+                let mut marker = if focused { "▸" } else { "›" };
+                for line in content.split('\n') {
+                    let filename = file_name(line);
+                    let value = filename.as_deref().unwrap_or(line);
+                    let row_style = if filename.is_some() {
+                        file_reference_style(app.theme).bg(app.theme.surface())
+                    } else {
+                        style
+                    };
+                    for row in hard_wrap(value, width) {
+                        lines.push(
+                            Line::from(vec![
+                                Span::styled(format!(" {marker} "), style),
+                                Span::styled(row, row_style),
+                                Span::styled(" ", style),
+                            ])
+                            .alignment(Alignment::Right),
+                        );
+                        marker = " ";
+                    }
+                }
+            }
             ConversationBlockKind::UserMessage(content) => {
                 lines.push(Line::from(Span::styled(
                     if focused { "▸ user" } else { ">" },
@@ -322,14 +431,28 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                         }),
                 )));
                 for line in content.lines() {
+                    let name = file_name(line);
                     lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(colors::user_prefix()),
+                        name.as_deref().unwrap_or(line).to_string(),
+                        if name.is_some() {
+                            file_reference_style(app.theme)
+                        } else {
+                            Style::default().fg(colors::user_prefix())
+                        },
                     )));
                 }
             }
             ConversationBlockKind::AssistantMarkdown { content, streaming } => {
-                if focused {
+                if workspace {
+                    lines.push(Line::styled(
+                        if streaming {
+                            "◆ Bamboo · streaming"
+                        } else {
+                            "◆ Bamboo"
+                        },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                } else if focused {
                     lines.push(Line::from(Span::styled(
                         if streaming {
                             "▸ assistant · streaming"
@@ -449,7 +572,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 )));
                 push_tool_detail(&mut lines, app, &block.id, tool, &state, focused, width);
             }
-            ConversationBlockKind::SubAgent { child, streaming } => {
+            ConversationBlockKind::SubAgent { child } => {
                 let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
                 let (icon, style) = match child.status.as_str() {
                     "running" | "running_in_background" | "queued" | "starting" | "in_progress" => {
@@ -463,15 +586,31 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     _ => ("·", Style::default().fg(colors::inactive())),
                 };
                 let label = child.title.as_deref().unwrap_or("sub-agent");
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        " {} {icon} {label} ({}) · {}",
-                        if focused { "▸" } else { " " },
-                        child.status,
-                        child.child_session_id
-                    ),
-                    style,
-                )));
+                let marker = if focused { "▸" } else { " " };
+                if workspace {
+                    const OPEN_CHAT: &str = "  Open chat ›";
+                    let short_id = crate::subagents::short_session_id(&child.child_session_id);
+                    let label = child.title.as_deref().unwrap_or(&short_id);
+                    let summary = format!(" {marker} {icon} {label} · {}", child.status);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            crate::text::clip_cells(
+                                &summary,
+                                usize::from(width).saturating_sub(OPEN_CHAT.chars().count()),
+                            ),
+                            style,
+                        ),
+                        Span::styled(OPEN_CHAT, Style::default().fg(colors::thinking())),
+                    ]));
+                } else {
+                    lines.push(Line::styled(
+                        format!(
+                            " {marker} {icon} {label} ({}) · {}",
+                            child.status, child.child_session_id
+                        ),
+                        style,
+                    ));
+                }
                 if state.expanded {
                     if let Some(error) = &child.error {
                         lines.push(Line::from(Span::styled(
@@ -482,23 +621,12 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 }
                 if focused {
                     lines.push(Line::from(Span::styled(
-                        if streaming {
-                            format!(
-                                "   {} expand/collapse · child opens after parent run · {} copy",
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
-                            )
-                        } else {
-                            format!(
-                                "   {} open child · {} expand/collapse · {} copy",
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
-                                app.key_hint(
-                                    ActionContext::ConversationBlock,
-                                    ActionId::ToggleDetails
-                                ),
-                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
-                            )
-                        },
+                        format!(
+                            "   {} open child · {} expand/collapse · {} copy",
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::ToggleDetails),
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                        ),
                         Style::default().fg(colors::subtle()),
                     )));
                 }
@@ -560,17 +688,26 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
         visual_line_count = visual_line_count.saturating_add(1);
     }
 
-    // Empty state
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No messages yet. Type a message below to start.",
-            Style::default().fg(colors::inactive()),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Tip: Use --model <name> to set the model.",
-            Style::default().fg(colors::subtle()),
-        )));
+        if workspace {
+            let sessions = app.primary_key_hint(ActionContext::Global, ActionId::OpenSessionPicker);
+            lines.push(Line::styled(
+                format!(" Type a message, or use {sessions} to open recent sessions."),
+                Style::default().fg(colors::inactive()),
+            ));
+        } else {
+            lines.extend([
+                Line::styled(
+                    "  No messages yet. Type a message below to start.",
+                    Style::default().fg(colors::inactive()),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "  Tip: Use --model <name> to set the model.",
+                    Style::default().fg(colors::subtle()),
+                ),
+            ]);
+        }
         visual_line_count = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width.max(1));
@@ -603,6 +740,36 @@ mod tests {
             error: None,
             phase: "complete".into(),
         }
+    }
+
+    #[test]
+    fn rendered_file_reference_is_bold_and_retains_the_original_message() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let path = "/work/media/Bamboo draft.png";
+        app.chat.messages.push(ChatMessage {
+            id: "user-file".into(),
+            role: MessageRole::User,
+            content: path.into(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
+        });
+        let view = build_conversation_lines(&app, 60, true);
+        assert!(view.lines[0]
+            .spans
+            .iter()
+            .all(|span| !span.content.contains("/work")));
+        let filename = view.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "Bamboo draft.png")
+            .unwrap();
+        assert!(filename.style.add_modifier.contains(Modifier::BOLD));
+        assert!(matches!(
+            app.conversation_blocks()[0].kind,
+            ConversationBlockKind::UserMessage(content) if content == path
+        ));
     }
 
     #[test]
@@ -674,7 +841,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let rendered = rendered_text(&build_conversation_lines(&app, 100));
+        let rendered = rendered_text(&build_conversation_lines(&app, 100, false));
         assert!(rendered.contains("Browser input awaiting permission approval"));
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("private input"));
@@ -943,7 +1110,7 @@ mod tests {
         );
         app.chat.focused_block = Some("message-1:tool:call-1".to_string());
 
-        let rendered = build_conversation_lines(&app, 100);
+        let rendered = build_conversation_lines(&app, 100, false);
         let text = rendered_text(&rendered);
         assert!(text.contains("25 reasoning lines hidden"));
         assert!(!text.contains("reason-0"));
@@ -1002,7 +1169,7 @@ mod tests {
         }
 
         let width = 20;
-        let rendered = build_conversation_lines(&app, width);
+        let rendered = build_conversation_lines(&app, width, false);
         let exact_visual_count = Paragraph::new(rendered.lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width);

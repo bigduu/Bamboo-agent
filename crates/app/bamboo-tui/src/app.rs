@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
@@ -20,7 +23,9 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
+use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
+use crate::file_reference::{pasted_files, FileReference};
 use crate::history::map_history;
 use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
@@ -29,7 +34,7 @@ use crate::keymap::{
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
-use crate::ui;
+use crate::ui::workspace::{SettingsMenu, TerminalSetting, Workspace, WorkspaceAction};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -150,6 +155,77 @@ mod subagent_tree_navigation_tests {
                 diff_wrap: true,
             }
         );
+    }
+
+    #[test]
+    fn clicking_a_live_child_opens_its_chat_and_parent_return_preserves_the_draft() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".into());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.textarea = TextArea::from(["draft for the parent".to_string()]);
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 6));
+        app.chat.sub_agents.push(SubAgentDisplay {
+            child_session_id: "child".into(),
+            title: Some("Review tests".into()),
+            status: "running".into(),
+            error: None,
+        });
+
+        let mut child = SessionUiContext::blank(app.allocate_context_id());
+        child.chat.history_loaded = true;
+        child.chat.session_id = Some("child".into());
+        child.chat.parent_session_id = Some("root".into());
+        app.cache_context(child);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::render_workspace(
+                    frame,
+                    &app,
+                    Rect::new(0, 2, 60, 16),
+                    Rect::new(0, 19, 60, 1),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (column, row) = (0..buffer.area.height)
+            .find_map(|row| {
+                let line: String = (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                let index = line.find("Open chat")?;
+                Some((line[..index].chars().count() as u16, row))
+            })
+            .expect("the child row has an open-chat link");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(app.chat.session_id.as_deref(), Some("child"));
+        assert_eq!(app.parent_session_id(), Some("root"));
+
+        app.handle_workspace_action(WorkspaceAction {
+            action: ActionId::OpenParentSession,
+            tab: Tab::Chat,
+            context_id: app.workspace_context_id(),
+        });
+        assert_eq!(app.chat.session_id.as_deref(), Some("root"));
+        assert!(app.chat.streaming);
+        assert_eq!(app.chat.textarea.lines(), ["draft for the parent"]);
+        assert_eq!(app.chat.textarea.cursor(), (0, 6));
     }
 
     #[test]
@@ -961,7 +1037,6 @@ pub enum ConversationBlockKind<'a> {
     },
     SubAgent {
         child: &'a SubAgentDisplay,
-        streaming: bool,
     },
     Question {
         question: &'a str,
@@ -1090,11 +1165,13 @@ pub struct ChatState {
     /// still perform its initial fetch instead of taking the cache fast path.
     history_loaded: bool,
     pub session_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
     /// Project inherited from the opened/selected session and propagated when
     /// Ctrl+N creates a new root session.
     pub project_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
+    pub(crate) composer_files: Vec<FileReference>,
     pending_loop_composer: Option<ComposerSnapshot>,
     loop_watch: Option<LoopWatch>,
     loop_discovery_token: Option<String>,
@@ -1160,6 +1237,8 @@ pub struct ChatState {
     pub block_line_ranges: RefCell<Vec<ConversationBlockLineRange>>,
     pub content_height: Cell<u16>,
     pub content_width: Cell<u16>,
+    pub(crate) transcript_area: Cell<ratatui::layout::Rect>,
+    pressed_block: Option<String>,
     /// Tool/reasoning payloads can be hundreds of KiB. Cache their wrapped
     /// rows so the fixed redraw tick only clones the bounded visible window
     /// instead of re-walking every byte on every frame.
@@ -1220,6 +1299,15 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    pub(crate) fn has_composer_draft(&self) -> bool {
+        !self.composer_files.is_empty()
+            || self
+                .textarea
+                .lines()
+                .iter()
+                .any(|line| !line.trim().is_empty())
+    }
+
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text(chat_placeholder_for(&Keymap::default()));
@@ -1228,9 +1316,11 @@ impl ChatState {
             context_id: 0,
             history_loaded: false,
             session_id: None,
+            parent_session_id: None,
             project_id: None,
             messages: Vec::new(),
             textarea,
+            composer_files: Vec::new(),
             pending_loop_composer: None,
             loop_watch: None,
             loop_discovery_token: None,
@@ -1263,6 +1353,8 @@ impl ChatState {
             block_line_ranges: RefCell::new(Vec::new()),
             content_height: Cell::new(0),
             content_width: Cell::new(0),
+            transcript_area: Cell::new(ratatui::layout::Rect::default()),
+            pressed_block: None,
             inspector_cache: RefCell::new(HashMap::new()),
             file_change_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
@@ -1589,6 +1681,7 @@ fn apply_textarea_palette(textarea: &mut TextArea<'_>, palette: crate::theme::Th
 /// long-lived UI state.
 pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
+    pub parent_session_id: Option<String>,
     pub model: String,
     pub provider: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -1641,6 +1734,7 @@ pub(crate) enum LoopObservation {
 
 fn same_history_snapshot(before: &SessionSummary, after: &SessionSummary) -> bool {
     before.id == after.id
+        && before.parent_session_id == after.parent_session_id
         && before.is_running == after.is_running
         && before.has_pending_question == after.has_pending_question
         && before.running_child_count == after.running_child_count
@@ -3989,6 +4083,7 @@ pub struct SessionPicker {
     pub page_limit: usize,
     pub next_offset: Option<usize>,
     pub mode: SessionPickerMode,
+    pub(crate) session_rows: SessionRows,
 }
 
 impl SessionPicker {
@@ -4082,18 +4177,22 @@ impl CommandPaletteEntry {
 pub struct ComposerSnapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
+    files: Vec<FileReference>,
 }
 
 impl ComposerSnapshot {
-    fn capture(textarea: &TextArea<'_>) -> Self {
+    fn capture(chat: &ChatState) -> Self {
         Self {
-            lines: textarea.lines().to_vec(),
-            cursor: textarea.cursor(),
+            lines: chat.textarea.lines().to_vec(),
+            cursor: chat.textarea.cursor(),
+            files: chat.composer_files.clone(),
         }
     }
 
-    fn still_matches(&self, textarea: &TextArea<'_>) -> bool {
-        self.lines == textarea.lines() && self.cursor == textarea.cursor()
+    fn still_matches(&self, chat: &ChatState) -> bool {
+        self.lines == chat.textarea.lines()
+            && self.cursor == chat.textarea.cursor()
+            && self.files == chat.composer_files
     }
 }
 
@@ -4186,12 +4285,19 @@ fn slash_input_parts(input: &str) -> (&str, &str) {
 
 fn command_search_text(entry: &CommandPaletteEntry) -> String {
     match entry {
-        CommandPaletteEntry::Builtin(action) => format!(
-            "{} {} ui builtin {}",
-            action.label(),
-            action.description(),
-            action.key()
-        ),
+        CommandPaletteEntry::Builtin(action) => {
+            let alias = if *action == ActionId::OpenModelPicker {
+                " effort"
+            } else {
+                ""
+            };
+            format!(
+                "{} {} ui builtin {}{alias}",
+                action.label(),
+                action.description(),
+                action.key()
+            )
+        }
         CommandPaletteEntry::Server(command) => format!(
             "{} {} {} {} {} {} {} {} {}",
             command.name,
@@ -4615,6 +4721,8 @@ pub struct App {
     pub running: bool,
     pub tab: Tab,
     pub theme: crate::theme::ThemePalette,
+    pub(crate) terminal_settings: Option<SettingsMenu>,
+    pub(crate) workspace_hints: bool,
     pub(crate) keymap: Keymap,
     pending_key_sequence: Option<PendingSequence>,
     routed_action: Option<(ActionContext, ActionId)>,
@@ -4622,6 +4730,8 @@ pub struct App {
     pub terminal_height: u16,
     pub client: BambooClient,
     pub chat: ChatState,
+    /// The local launch directory used when the first message creates a session.
+    pub(crate) launch_workspace: Option<String>,
     /// Recently visited non-foreground chats, keyed by server session id (or a
     /// temporary local id until the first chat request creates the session).
     session_views: HashMap<String, SessionUiContext>,
@@ -4893,6 +5003,8 @@ impl App {
             running: true,
             tab: Tab::Chat,
             theme: crate::theme::ThemePalette::TrueColor,
+            terminal_settings: None,
+            workspace_hints: true,
             keymap: Keymap::default(),
             pending_key_sequence: None,
             routed_action: None,
@@ -4900,6 +5012,7 @@ impl App {
             terminal_height: u16::MAX,
             client,
             chat: ChatState::with_context_id(1),
+            launch_workspace: None,
             session_views: HashMap::new(),
             session_view_order: VecDeque::new(),
             next_context_id: 1,
@@ -5139,6 +5252,8 @@ impl App {
     }
 
     fn prepare_visible_session_switch(&mut self) {
+        self.terminal_settings = None;
+        self.chat.pressed_block = None;
         self.invalidate_permission_mode_context();
         if self.session_picker.is_some() {
             self.pending_delete = None;
@@ -5303,6 +5418,10 @@ impl App {
             .map(|model_ref| model_ref.provider.clone())
             .or_else(|| summary.provider.clone());
         context.chat.reasoning_effort = summary.reasoning_effort;
+        context
+            .chat
+            .parent_session_id
+            .clone_from(&summary.parent_session_id);
         context.chat.project_id.clone_from(&summary.project_id);
         context.chat.permission_mode = summary.permission_mode;
         context.chat.bypass_permissions = summary.bypass_permissions;
@@ -5558,6 +5677,8 @@ impl App {
         // that check may call `spawn_local_server`, which needs this sender to
         // post its health-poll waiter's result back as `LocalServerReady`.
         self.event_tx = Some(event_tx.clone());
+        let workspace_wake = Arc::new(tokio::sync::Notify::new());
+        let mut workspace = Workspace::new(self, event_tx.clone(), workspace_wake.clone())?;
 
         self.connected = self.client.health().await.unwrap_or(false);
         if self.connected {
@@ -5606,6 +5727,11 @@ impl App {
                     Ok(Event::Mouse(mouse)) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
                         break;
                     }
+                    Ok(Event::Paste(text)) => {
+                        if tx.send(AppEvent::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(Event::Resize(width, height))
                         if tx.send(AppEvent::Resize(width, height)).is_err() =>
                     {
@@ -5628,6 +5754,7 @@ impl App {
         background_status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Main event loop.
+        let mut bracketed_paste = false;
         while self.running {
             let size = terminal.size()?;
             self.terminal_width = size.width;
@@ -5641,14 +5768,34 @@ impl App {
             self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
-            terminal.draw(|f| ui::render(f, self))?;
+            // Other editors continue receiving the terminal's ordinary text input.
+            let wants_paste = self.chat_composer_focused();
+            if wants_paste != bracketed_paste {
+                let result = if wants_paste {
+                    crossterm::execute!(terminal.backend_mut(), EnableBracketedPaste)
+                } else {
+                    crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste)
+                };
+                if let Err(error) = result {
+                    if error.kind() != std::io::ErrorKind::Unsupported {
+                        return Err(error.into());
+                    }
+                }
+                bracketed_paste = wants_paste;
+            }
+            terminal.draw(|frame| workspace.render(frame, self))?;
+            workspace.check_error()?;
 
             tokio::select! {
                 event = event_rx.recv() => {
-                    if let Some(event) = event {
-                        self.handle_event(event).await?;
+                    match event {
+                        Some(AppEvent::Mouse(mouse))
+                            if self.workspace_controls_enabled() && workspace.handle_mouse(mouse) => {}
+                        Some(event) => self.handle_event(event).await?,
+                        None => break,
                     }
                 }
+                _ = workspace_wake.notified() => {}
                 sse_event = async {
                     if let Some(rx) = &mut self.sse_rx {
                         rx.recv().await
@@ -6179,14 +6326,18 @@ impl App {
                     }
                     return Ok(());
                 }
-                AppEvent::Mouse(_) => return Ok(()),
+                AppEvent::Paste(_) | AppEvent::Mouse(_) | AppEvent::WorkspaceAction(_) => {
+                    return Ok(());
+                }
                 _ => {}
             }
         }
 
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
+            AppEvent::Paste(text) => self.handle_composer_paste(&text),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::WorkspaceAction(action) => self.handle_workspace_action(action),
             AppEvent::SessionsLoaded {
                 observation_epoch,
                 result: r,
@@ -6805,7 +6956,12 @@ impl App {
                     return Ok(());
                 }
                 match r {
-                    Ok(session_id) => self.accept_chat_start(session_id, turn_id),
+                    Ok(started) => {
+                        if self.chat.session_id.is_none() {
+                            self.chat.project_id = started.project_id;
+                        }
+                        self.accept_chat_start(started.session_id, turn_id);
+                    }
                     Err(e) => {
                         // The optimistic user turn already reserved a matching
                         // assistant turn id. Preserve that turn with an explicit
@@ -6844,7 +7000,7 @@ impl App {
                             reply.loop_command.filter(|command| !command.should_execute)
                         {
                             if session_id.as_deref() == Some(reply.response.session_id.as_str()) {
-                                if submitted.still_matches(&self.chat.textarea) {
+                                if submitted.still_matches(&self.chat) {
                                     self.clear_chat_composer();
                                 }
                                 self.update_loop_watch(acknowledgment.record.as_ref());
@@ -6859,7 +7015,7 @@ impl App {
                             self.notify(NoticeLevel::Error, "The server did not acknowledge /loop");
                         } else {
                             // Bamboo accepted spoken loop wording as a user turn.
-                            if submitted.still_matches(&self.chat.textarea) {
+                            if submitted.still_matches(&self.chat) {
                                 self.clear_chat_composer();
                             }
                             let turn_id = self.begin_chat_turn(message);
@@ -7036,6 +7192,7 @@ impl App {
                         self.clear_child_approval_context();
                         self.detach_stream();
                         self.chat.session_id = Some(session_id.clone());
+                        self.chat.parent_session_id = opened.parent_session_id;
                         self.chat.history_loaded = true;
                         self.chat.observed_activity = None;
                         self.chat.latest_summary_observation_epoch = epoch;
@@ -7583,7 +7740,7 @@ impl App {
                 palette.resolving_key = None;
                 match result {
                     Ok(detail) => {
-                        if !palette.original_composer.still_matches(&self.chat.textarea) {
+                        if !palette.original_composer.still_matches(&self.chat) {
                             palette.error = Some(
                                 "Composer changed while resolving; draft was not replaced"
                                     .to_string(),
@@ -8198,6 +8355,9 @@ impl App {
     /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.chat.pressed_block.is_some() && !self.workspace_controls_enabled() {
+            self.chat.pressed_block = None;
+        }
         if self.notifications_visible {
             let max = self.notification_max_scroll.get();
             match mouse.kind {
@@ -8368,8 +8528,26 @@ impl App {
             return;
         }
 
+        if let Some(tree) = self.subagent_tree.as_mut() {
+            if let Some(session_id) = tree.session_rows.handle_mouse(mouse) {
+                self.open_subagent_session(session_id);
+            } else {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => tree.move_selection(-3),
+                    MouseEventKind::ScrollDown => tree.move_selection(3),
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if let Some(picker) = self.session_picker.as_mut() {
             if matches!(picker.mode, SessionPickerMode::Browse) {
+                if let Some(session_id) = picker.session_rows.handle_mouse(mouse) {
+                    self.close_session_picker();
+                    self.resume_session(session_id);
+                    return;
+                }
                 let delta = match mouse.kind {
                     MouseEventKind::ScrollUp => -3,
                     MouseEventKind::ScrollDown => 3,
@@ -8377,6 +8555,13 @@ impl App {
                 };
                 picker.selected = scroll_selection(picker.selected, picker.visible.len(), delta);
                 picker.selection_touched = true;
+            }
+            return;
+        }
+
+        if let Some(settings) = self.terminal_settings.as_mut() {
+            if let Some(setting) = settings.handle_mouse(mouse) {
+                self.activate_terminal_setting(setting);
             }
             return;
         }
@@ -8477,6 +8662,26 @@ impl App {
             return;
         }
 
+        if self.tab == Tab::Chat && self.workspace_controls_enabled() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.chat.pressed_block = self.transcript_block_at(mouse.column, mouse.row);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(pressed) = self.chat.pressed_block.take() {
+                        if self.transcript_block_at(mouse.column, mouse.row).as_ref()
+                            == Some(&pressed)
+                        {
+                            self.activate_clicked_conversation_block(&pressed);
+                        }
+                    }
+                    return;
+                }
+                MouseEventKind::Drag(_) => self.chat.pressed_block = None,
+                _ => {}
+            }
+        }
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -8519,6 +8724,41 @@ impl App {
                 self.skills.selected =
                     scroll_selection(self.skills.selected, self.skills.skills.len(), delta);
             }
+        }
+    }
+
+    fn transcript_block_at(&self, column: u16, row: u16) -> Option<String> {
+        use ratatui::layout::Position;
+
+        let area = self.chat.transcript_area.get();
+        if !area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let scroll = if self.chat.auto_scroll {
+            self.chat.max_scroll.get()
+        } else {
+            self.chat.scroll_offset.min(self.chat.max_scroll.get())
+        };
+        let line = scroll.saturating_add(row - area.y);
+        self.chat
+            .block_line_ranges
+            .borrow()
+            .iter()
+            .find(|range| (range.start..=range.end).contains(&line))
+            .map(|range| range.id.clone())
+    }
+
+    fn activate_clicked_conversation_block(&mut self, id: &str) {
+        let blocks = self.conversation_blocks();
+        let Some((index, block)) = blocks.iter().enumerate().find(|(_, block)| block.id == id)
+        else {
+            return;
+        };
+        if let ConversationBlockKind::SubAgent { child } = block.kind {
+            self.resume_session(child.child_session_id.clone());
+        } else if block.expandable() {
+            self.focus_conversation_block_at(index);
+            self.toggle_conversation_details();
         }
     }
 
@@ -8675,6 +8915,10 @@ impl App {
             return;
         }
 
+        self.toggle_default_tool_details();
+    }
+
+    fn toggle_default_tool_details(&mut self) {
         // This default is captured only when future detail blocks are
         // inserted. Existing block state is intentionally untouched.
         self.chat.expand_tools = !self.chat.expand_tools;
@@ -8793,19 +9037,10 @@ impl App {
                 _ => None,
             });
         if let Some(child_id) = child_id {
-            if self.chat.streaming {
-                self.toggle_conversation_details();
-                self.status_message = format!(
-                    "{}; child opens after the parent run completes",
-                    self.status_message
-                );
-            } else {
-                self.chat.focused_block = None;
-                self.resume_session(child_id);
-            }
-            return;
+            self.resume_session(child_id);
+        } else {
+            self.toggle_conversation_details();
         }
-        self.toggle_conversation_details();
     }
 
     fn copy_focused_conversation_block(&mut self) {
@@ -8875,6 +9110,7 @@ impl App {
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
+            || self.terminal_settings.is_some()
     }
 
     fn pending_question_context(&self) -> ActionContext {
@@ -8947,6 +9183,8 @@ impl App {
             ActionContext::ConfigEditor
         } else if self.permission_editor.is_some() {
             ActionContext::PermissionEditor
+        } else if self.terminal_settings.is_some() {
+            ActionContext::TerminalSettings
         } else {
             self.tab_context()
         };
@@ -9009,6 +9247,11 @@ impl App {
             ActionAvailability::Always => None,
             ActionAvailability::Chat if self.tab != Tab::Chat => {
                 Some("Switch to Chat before using this action")
+            }
+            ActionAvailability::Chat
+                if action == ActionId::OpenParentSession && self.parent_session_id().is_none() =>
+            {
+                Some("The active session has no parent")
             }
             ActionAvailability::ActiveRun if !self.chat.streaming => Some("No active run to stop"),
             _ => None,
@@ -9117,10 +9360,22 @@ impl App {
             ActionId::ReopenPendingQuestion => self.reopen_pending_question(),
             ActionId::OpenModelPicker => self.open_model_picker(),
             ActionId::OpenSessionPicker => self.open_session_picker(),
+            ActionId::OpenParentSession => {
+                if let Some(parent) = self.parent_session_id().map(str::to_string) {
+                    self.resume_session(parent);
+                }
+            }
             ActionId::OpenSubagentTree => self.open_subagent_tree(),
             ActionId::OpenTaskPlan => self.open_task_plan(),
             ActionId::StopRun => self.stop_streaming(),
             ActionId::ToggleDetails => self.toggle_conversation_details(),
+            ActionId::OpenTerminalSettings => {
+                self.terminal_settings = Some(SettingsMenu::default());
+            }
+            ActionId::OpenChatTab => self.open_tab(Tab::Chat),
+            ActionId::OpenSessionsTab => self.open_tab(Tab::Sessions),
+            ActionId::OpenMcpTab => self.open_tab(Tab::Mcp),
+            ActionId::OpenSkillsTab => self.open_tab(Tab::Skills),
             ActionId::OpenConfigTab => {
                 self.tab = Tab::Config;
                 self.load_tab_data();
@@ -9140,6 +9395,98 @@ impl App {
                 self.load_tab_data();
             }
             _ => {}
+        }
+    }
+
+    fn open_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.load_tab_data();
+    }
+
+    pub(crate) fn workspace_controls_enabled(&self) -> bool {
+        self.running && self.active_action_contexts()[0] == self.tab_context()
+    }
+
+    fn chat_composer_focused(&self) -> bool {
+        self.active_action_contexts()[0] == ActionContext::Chat
+    }
+
+    pub(crate) fn workspace_context_id(&self) -> u64 {
+        self.chat.context_id
+    }
+
+    pub(crate) fn parent_session_id(&self) -> Option<&str> {
+        let session_id = self.chat.session_id.as_deref()?;
+        self.chat
+            .parent_session_id
+            .as_deref()
+            .filter(|parent| !parent.trim().is_empty() && *parent != session_id)
+    }
+
+    pub(crate) fn has_visible_subagents(&self) -> bool {
+        self.chat.parent_terminal_pending
+            || !self.chat.sub_agents.is_empty()
+            || self
+                .chat
+                .messages
+                .iter()
+                .any(|message| !message.sub_agents.is_empty())
+    }
+
+    fn handle_workspace_action(&mut self, press: WorkspaceAction) {
+        if !self.workspace_controls_enabled()
+            || press.tab != self.tab
+            || press.context_id != self.workspace_context_id()
+        {
+            return;
+        }
+        if self.action_disabled_reason(press.action).is_none() {
+            self.pending_key_sequence = None;
+            if press.action == ActionId::SendMessage && self.tab == Tab::Chat {
+                self.submit_chat_draft();
+            } else {
+                self.handle_global_action(press.action);
+            }
+        }
+    }
+
+    fn handle_terminal_settings_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::TerminalSettings, key);
+        let Some(settings) = self.terminal_settings.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::NavigateUp) => settings.move_selection(-1),
+            Some(ActionId::NavigateDown) => settings.move_selection(1),
+            Some(ActionId::Activate) => {
+                let setting = settings.selected();
+                self.activate_terminal_setting(setting);
+            }
+            Some(ActionId::Cancel) => self.terminal_settings = None,
+            _ => {}
+        }
+    }
+
+    fn activate_terminal_setting(&mut self, setting: TerminalSetting) {
+        use crate::theme::ThemePalette;
+        match setting {
+            TerminalSetting::Appearance => self.set_theme(match self.theme {
+                ThemePalette::TrueColor => ThemePalette::Light,
+                ThemePalette::Light => ThemePalette::System,
+                ThemePalette::System => ThemePalette::NoColor,
+                ThemePalette::NoColor => ThemePalette::TrueColor,
+            }),
+            TerminalSetting::ToolDetails => self.toggle_default_tool_details(),
+            TerminalSetting::KeyHints => self.workspace_hints = !self.workspace_hints,
+            TerminalSetting::ServerConfig => {
+                self.terminal_settings = None;
+                self.config.view = ConfigView::Raw;
+                self.open_tab(Tab::Config);
+            }
+            TerminalSetting::Permissions => {
+                self.terminal_settings = None;
+                self.open_permission_policy();
+            }
         }
     }
 
@@ -9196,6 +9543,7 @@ impl App {
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
             ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
+            ActionContext::TerminalSettings => self.handle_terminal_settings_key(key),
             ActionContext::Chat | ActionContext::ConversationBlock => {
                 self.handle_chat_key(key).await?
             }
@@ -10908,6 +11256,26 @@ impl App {
         }
     }
 
+    fn handle_composer_paste(&mut self, text: &str) {
+        if !self.chat_composer_focused() || text.is_empty() {
+            return;
+        }
+        self.pending_key_sequence = None;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if let Some(files) = pasted_files(&text) {
+            self.chat.composer_files.extend(files);
+            self.status_message = "Backspace at the start removes the last file".to_string();
+        } else {
+            let text: String = text
+                .chars()
+                .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+                .collect();
+            if !text.is_empty() {
+                self.chat.textarea.insert_str(text);
+            }
+        }
+    }
+
     async fn handle_chat_key(&mut self, key: KeyEvent) -> Result<()> {
         self.normalize_conversation_focus();
         let contexts: &[ActionContext] = if self.chat.focused_block.is_some() {
@@ -10949,47 +11317,15 @@ impl App {
             Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
-            Some(ActionId::SendMessage)
-                if self.chat.streaming
-                    && !Self::is_loop_chat_command(&self.chat.textarea.lines().join("\n")) =>
+            Some(ActionId::SendMessage) => self.submit_chat_draft(),
+            None if key.code == KeyCode::Backspace
+                && key.modifiers.is_empty()
+                && self.chat.textarea.cursor() == (0, 0)
+                && self.chat.textarea.selection_range().is_none()
+                && !self.chat.composer_files.is_empty() =>
             {
-                self.status_message = format!(
-                    "Run active — draft preserved; {}",
-                    self.action_key_phrase(
-                        ActionContext::Chat,
-                        ActionId::SendMessage,
-                        "sends after completion"
-                    )
-                );
-            }
-            Some(ActionId::SendMessage) => {
-                // Selecting a session starts an asynchronous history/summary
-                // fetch after the picker closes. Keep the existing draft
-                // editable while that fetch is in flight, but never submit it
-                // against the session still visible underneath: a concurrent
-                // `ChatStarted` and `SessionOpened` could otherwise route the
-                // turn (or its provider/model) to different sessions.
-                if self.opening_session_id.is_some() {
-                    self.status_message =
-                        "Session is still resuming — message kept as draft".to_string();
-                    return Ok(());
-                }
-                if self.chat.session_id.as_ref().is_some_and(|session_id| {
-                    self.deleting_session_id.as_deref() == Some(session_id.as_str())
-                }) {
-                    self.status_message =
-                        "Session is being deleted — message kept as draft".to_string();
-                    return Ok(());
-                }
-                let input = self.chat.textarea.lines().join("\n");
-                let input = input.trim().to_string();
-                if input.is_empty() {
-                    return Ok(());
-                }
-                if !Self::is_loop_chat_command(&input) {
-                    self.clear_chat_composer();
-                }
-                self.send_message(input);
+                self.chat.composer_files.pop();
+                self.status_message = "File removed".to_string();
             }
             None => {
                 if text_widget_input_allowed(key) {
@@ -10999,6 +11335,50 @@ impl App {
             Some(_) => {}
         }
         Ok(())
+    }
+
+    fn submit_chat_draft(&mut self) {
+        let text = self.chat.textarea.lines().join("\n");
+        let draft = std::iter::once(text.trim())
+            .filter(|text| !text.is_empty())
+            .chain(
+                self.chat
+                    .composer_files
+                    .iter()
+                    .map(|file| file.path.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loop_command = Self::is_loop_chat_command(&draft);
+        if self.chat.streaming && !loop_command {
+            self.status_message = format!(
+                "Run active — draft preserved; {}",
+                self.action_key_phrase(
+                    ActionContext::Chat,
+                    ActionId::SendMessage,
+                    "sends after completion"
+                )
+            );
+            return;
+        }
+        // Never submit against the old session while a resume is in flight.
+        if self.opening_session_id.is_some() {
+            self.status_message = "Session is still resuming — message kept as draft".to_string();
+            return;
+        }
+        if self.chat.session_id.as_ref().is_some_and(|session_id| {
+            self.deleting_session_id.as_deref() == Some(session_id.as_str())
+        }) {
+            self.status_message = "Session is being deleted — message kept as draft".to_string();
+            return;
+        }
+        if draft.is_empty() {
+            return;
+        }
+        if !loop_command {
+            self.clear_chat_composer();
+        }
+        self.send_message(draft);
     }
 
     fn handle_conversation_block_action(&mut self, action: ActionId) {
@@ -11037,6 +11417,7 @@ impl App {
         textarea.set_placeholder_text(self.chat_placeholder());
         apply_textarea_palette(&mut textarea, self.theme);
         self.chat.textarea = textarea;
+        self.chat.composer_files.clear();
     }
 
     /// Send a chat message WITHOUT blocking the event loop: the user turn is
@@ -11062,6 +11443,11 @@ impl App {
             message: message.clone(),
             session_id: self.chat.session_id.clone(),
             project_id: self.chat.project_id.clone(),
+            workspace_path: if self.chat.session_id.is_none() && self.chat.project_id.is_none() {
+                self.launch_workspace.clone()
+            } else {
+                None
+            },
             model: Some(model),
             provider: self.chat.provider.clone(),
             reasoning_effort: self.chat.reasoning_effort,
@@ -11071,7 +11457,7 @@ impl App {
                 self.status_message = "Loop command is still pending — draft preserved".to_string();
                 return;
             }
-            self.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&self.chat.textarea));
+            self.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&self.chat));
             let session_id = req.session_id.clone();
             tokio::spawn(async move {
                 let result = match tokio::time::timeout(
@@ -11097,11 +11483,7 @@ impl App {
         }
         let turn_id = self.begin_chat_turn(message);
         tokio::spawn(async move {
-            let result = client
-                .chat(req)
-                .await
-                .map(|response| response.session_id)
-                .map_err(|error| error.to_string());
+            let result = client.chat(req).await.map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::ChatStarted {
                 context_id,
                 turn_id,
@@ -11453,6 +11835,7 @@ impl App {
                 .or_else(|| summary.provider.clone());
             let opened = OpenedSession {
                 messages: map_history(history.messages),
+                parent_session_id: summary.parent_session_id,
                 model: summary.model,
                 provider,
                 reasoning_effort: summary.reasoning_effort,
@@ -11503,12 +11886,14 @@ impl App {
         } else {
             let mut discarded = self.take_active_context();
             let textarea = std::mem::take(&mut discarded.chat.textarea);
+            let files = std::mem::take(&mut discarded.chat.composer_files);
             discarded.abort_background_work();
-            Some(textarea)
+            Some((textarea, files))
         };
         self.install_active_context(SessionUiContext::blank(context_id));
-        if let Some(textarea) = preserved_composer {
+        if let Some((textarea, files)) = preserved_composer {
             self.chat.textarea = textarea;
+            self.chat.composer_files = files;
             apply_textarea_palette(&mut self.chat.textarea, self.theme);
         }
         self.chat.model = model;
@@ -11743,10 +12128,7 @@ impl App {
                     for child in &message.sub_agents {
                         blocks.push(ConversationBlock {
                             id: subagent_block_id(&message_id, &child.child_session_id),
-                            kind: ConversationBlockKind::SubAgent {
-                                child,
-                                streaming: false,
-                            },
+                            kind: ConversationBlockKind::SubAgent { child },
                         });
                     }
                     if let Some(status) = message.terminal_status.as_deref() {
@@ -11795,10 +12177,7 @@ impl App {
         for child in &self.chat.sub_agents {
             blocks.push(ConversationBlock {
                 id: subagent_block_id(live_id, &child.child_session_id),
-                kind: ConversationBlockKind::SubAgent {
-                    child,
-                    streaming: self.chat.streaming,
-                },
+                kind: ConversationBlockKind::SubAgent { child },
             });
         }
         let waiting_for_answer = self
@@ -14969,6 +15348,10 @@ impl App {
         let Some(session_id) = selected else {
             return;
         };
+        self.open_subagent_session(session_id);
+    }
+
+    fn open_subagent_session(&mut self, session_id: String) {
         let already_active = self.chat.session_id.as_deref() == Some(session_id.as_str());
         self.close_subagent_tree();
         if already_active {
@@ -15093,6 +15476,7 @@ impl App {
             page_limit: 0,
             next_offset: None,
             mode: SessionPickerMode::Browse,
+            session_rows: SessionRows::default(),
         });
         self.load_session_picker_page(epoch, 0);
     }
@@ -15542,7 +15926,7 @@ impl App {
             resolving: false,
             resolving_key: None,
             error: None,
-            original_composer: ComposerSnapshot::capture(&self.chat.textarea),
+            original_composer: ComposerSnapshot::capture(&self.chat),
             hitboxes: RefCell::new(Vec::new()),
             mouse_pressed_item: None,
         };
@@ -15795,7 +16179,7 @@ impl App {
             palette.trigger == CommandPaletteTrigger::Slash
                 && palette.search_query().eq_ignore_ascii_case("loop")
         }) {
-            if !palette.original_composer.still_matches(&self.chat.textarea) {
+            if !palette.original_composer.still_matches(&self.chat) {
                 palette.error = Some("Composer changed while selecting; draft preserved".into());
                 return;
             }
@@ -15901,7 +16285,7 @@ impl App {
         let Some(palette) = self.command_palette.as_ref() else {
             return;
         };
-        if !palette.original_composer.still_matches(&self.chat.textarea) {
+        if !palette.original_composer.still_matches(&self.chat) {
             if let Some(palette) = self.command_palette.as_mut() {
                 palette.error =
                     Some("Composer changed while selecting; draft was not replaced".to_string());
@@ -16287,7 +16671,7 @@ mod command_palette_tests {
             resolving: false,
             resolving_key: None,
             error: None,
-            original_composer: ComposerSnapshot::capture(&app.chat.textarea),
+            original_composer: ComposerSnapshot::capture(&app.chat),
             hitboxes: RefCell::new(Vec::new()),
             mouse_pressed_item: None,
         };
@@ -16300,7 +16684,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.textarea.insert_str("draft text");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 0));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
 
         app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
         assert_eq!(
@@ -16314,7 +16698,7 @@ mod command_palette_tests {
         app.handle_command_palette_key(key(KeyCode::Esc));
 
         assert!(app.command_palette.is_none());
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
 
         app.chat.textarea.move_cursor(CursorMove::End);
         app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
@@ -16432,7 +16816,7 @@ mod command_palette_tests {
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep this draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 4));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         install_test_palette(
             &mut app,
             CommandPaletteTrigger::Global,
@@ -16457,7 +16841,7 @@ mod command_palette_tests {
             .is_some_and(|error| error.contains("offline")));
         assert!(palette.error.as_deref().unwrap().contains("F10 retries"));
         assert!(!palette.error.as_deref().unwrap().contains("Ctrl+R"));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
 
         app.command_palette.as_mut().unwrap().epoch = epoch.wrapping_add(1);
         app.handle_event(AppEvent::CommandCatalogLoaded {
@@ -16477,7 +16861,7 @@ mod command_palette_tests {
             .entries
             .iter()
             .all(|entry| !matches!(entry, CommandPaletteEntry::Server(_))));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
     }
 
     #[tokio::test]
@@ -16634,7 +17018,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.textarea.insert_str("exact draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 5));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         install_test_palette(
             &mut app,
             CommandPaletteTrigger::Global,
@@ -16654,7 +17038,7 @@ mod command_palette_tests {
             .entries
             .iter()
             .all(|entry| matches!(entry, CommandPaletteEntry::Builtin(_))));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
     }
 
     #[tokio::test]
@@ -16706,7 +17090,7 @@ mod command_palette_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("untouched");
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         let prompt = command("review", "prompt", "workspace");
         let entry = CommandPaletteEntry::Server(prompt.clone());
         install_test_palette(
@@ -16736,7 +17120,7 @@ mod command_palette_tests {
         .await
         .unwrap();
 
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
         assert!(app.command_palette.is_some());
     }
 
@@ -16746,7 +17130,7 @@ mod command_palette_tests {
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep me");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 2));
-        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let before = ComposerSnapshot::capture(&app.chat);
         let prompt = command("review", "prompt", "workspace");
         let entry = CommandPaletteEntry::Server(prompt);
         install_test_palette(
@@ -16775,7 +17159,7 @@ mod command_palette_tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("server unavailable")));
-        assert!(before.still_matches(&app.chat.textarea));
+        assert!(before.still_matches(&app.chat));
         app.handle_command_palette_key(key(KeyCode::Backspace));
         assert_eq!(app.command_palette.as_ref().unwrap().input, "review sr");
     }
@@ -17115,6 +17499,61 @@ mod question_tests {
             "must-not-be-used".to_string(),
         ));
         app
+    }
+
+    #[test]
+    fn approvals_keep_project_workspace_identity_with_a_wrapped_resource() {
+        use ratatui::{backend::TestBackend, layout::Rect};
+
+        let mut app = app_with_permission(vec![
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ]);
+        let Some(ActiveQuestionKind::Permission(permission)) = app
+            .pending_question
+            .as_mut()
+            .map(|question| &mut question.kind)
+        else {
+            panic!("expected typed permission");
+        };
+        permission.request.resource = format!("cargo test {}", "workspace-target ".repeat(12));
+
+        for (width, height, heading) in [
+            (60, 20, "Typed permission decision"),
+            (100, 28, "Approval required"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::ui::render_workspace(
+                        frame,
+                        &app,
+                        Rect::new(0, 2, width, height - 5),
+                        Rect::new(0, height - 1, width, 1),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let display = (0..height)
+                .map(|row| {
+                    (0..width)
+                        .map(|col| buffer[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in [
+                heading,
+                "registered workspace: /workspace/repo",
+                "request/session: permission-request",
+                "Allow once",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "{width}×{height} missing {expected}:\n{display}"
+                );
+            }
+        }
     }
 
     fn child_record(
@@ -18908,6 +19347,7 @@ mod question_tests {
                     session_id: session_id.to_string(),
                     epoch: 0,
                     result: Ok(OpenedSession {
+                        parent_session_id: None,
                         is_running: true,
                         ..opened(vec![old, user, pending])
                     }),
@@ -20951,6 +21391,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -20973,6 +21414,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21034,6 +21476,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21057,6 +21500,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21103,6 +21547,7 @@ mod question_tests {
             session_id: "sess-2".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21126,6 +21571,7 @@ mod question_tests {
             session_id: "sess-1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
@@ -21362,7 +21808,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                10_433_989_199_099_782_256,
+                1_603_011_432_197_960_348,
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
@@ -21370,10 +21816,10 @@ mod question_tests {
                 14_839_815_545_818_862_244,
                 14_001_204_281_749_812_417,
                 3_082_197_214_727_898_618,
-                15_225_996_382_494_039_911,
-                7_702_362_162_043_901_237,
+                14_040_885_768_871_576_942,
+                1_872_964_058_003_881_112,
                 10_297_461_319_307_885_699,
-                4_909_861_279_484_503_645,
+                11_688_443_165_488_407_791,
                 7_080_015_168_463_480_579,
             ],
             "minimum-size modal golden changed"
@@ -22164,6 +22610,7 @@ mod question_tests {
     fn bare_session(id: &str) -> SessionSummary {
         SessionSummary {
             id: id.into(),
+            parent_session_id: None,
             project_id: None,
             title: String::new(),
             title_generated: true,
@@ -24491,13 +24938,13 @@ mod question_tests {
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("current-turn".to_string());
         app.install_command_draft("  /loop 每五分钟检查 CI\n这行也要保留".to_string());
-        let original = ComposerSnapshot::capture(&app.chat.textarea);
+        let original = ComposerSnapshot::capture(&app.chat);
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
 
         app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
         app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
-        assert!(original.still_matches(&app.chat.textarea));
+        assert!(original.still_matches(&app.chat));
         assert_eq!(
             app.status_message,
             "Loop command is still pending — draft preserved"
@@ -24513,7 +24960,7 @@ mod question_tests {
         ));
         app.handle_event(result).await.unwrap();
 
-        assert!(original.still_matches(&app.chat.textarea));
+        assert!(original.still_matches(&app.chat));
         assert!(app.chat.pending_loop_composer.is_none());
         assert_eq!(app.chat.current_turn_id.as_deref(), Some("current-turn"));
         assert!(app.chat.streaming);
@@ -24531,7 +24978,7 @@ mod question_tests {
         app.event_tx = Some(tx);
         app.chat.session_id = Some("loop-session".to_string());
         app.install_command_draft("/loop check CI".to_string());
-        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
         let response = |state: &str| {
             serde_json::from_value(serde_json::json!({
                 "session_id": "loop-session",
@@ -24715,7 +25162,7 @@ mod question_tests {
         );
         assert_eq!(app.chat.textarea.lines(), ["A newer draft"]);
 
-        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+        app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
         app.handle_event(acknowledgment(&app, "stopped"))
             .await
             .unwrap();
@@ -24772,7 +25219,7 @@ mod question_tests {
         });
         for newer_draft in [None, Some("A newer draft")] {
             app.install_command_draft("/loop stop".to_string());
-            app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat.textarea));
+            app.chat.pending_loop_composer = Some(ComposerSnapshot::capture(&app.chat));
             if let Some(draft) = newer_draft {
                 app.install_command_draft(draft.to_string());
             }
@@ -24834,7 +25281,10 @@ mod question_tests {
         app.handle_event(AppEvent::ChatStarted {
             context_id,
             turn_id: "old-turn".to_string(),
-            result: Ok("stale-session".to_string()),
+            result: Ok(crate::api::ChatStart {
+                session_id: "stale-session".to_string(),
+                project_id: None,
+            }),
         })
         .await
         .unwrap();
@@ -24872,7 +25322,10 @@ mod question_tests {
         app.handle_event(AppEvent::ChatStarted {
             context_id,
             turn_id: "turn-being-stopped".to_string(),
-            result: Ok("existing-session".to_string()),
+            result: Ok(crate::api::ChatStart {
+                session_id: "existing-session".to_string(),
+                project_id: None,
+            }),
         })
         .await
         .unwrap();
@@ -24987,6 +25440,7 @@ mod question_tests {
 
     fn opened(messages: Vec<ChatMessage>) -> OpenedSession {
         OpenedSession {
+            parent_session_id: None,
             messages,
             model: "claude-sonnet-5".to_string(),
             provider: None,
@@ -25034,6 +25488,7 @@ mod question_tests {
                 session_id: session_id.to_string(),
                 epoch: 0,
                 result: Ok(OpenedSession {
+                    parent_session_id: None,
                     pending: Some(pending),
                     ..opened(Vec::new())
                 }),
@@ -26137,6 +26592,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 is_running: true,
                 ..opened(vec![])
             }),
@@ -26159,6 +26615,7 @@ mod question_tests {
             session_id: "parent".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 running_child_count: 1,
                 last_run_status: Some("completed".to_string()),
                 ..opened(vec![])
@@ -26193,6 +26650,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 truncated: true,
                 total_message_count: 5000,
                 ..opened(vec![asst_msg("a"), asst_msg("b")])
@@ -26216,6 +26674,7 @@ mod question_tests {
             session_id: "s1".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
                     question: "Proceed?".to_string(),
@@ -26523,6 +26982,132 @@ mod question_tests {
         assert_eq!(opened.total_message_count, 1);
         assert_eq!(opened.messages.len(), 1);
         assert_eq!(opened.messages[0].content, "visible answer");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_sends_launch_workspace_only_when_creating_a_session() {
+        const WORKSPACE: &str = "/terminal/launch directory";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for (session_id, workspace_path, project_id) in [
+                (None, Some(WORKSPACE), None),
+                (Some("first-session"), None, None),
+                (Some("other-session"), None, None),
+                (None, Some(WORKSPACE), None),
+                (None, None, Some("other-project")),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /api/v1/chat "));
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(
+                    payload.get("session_id"),
+                    session_id.map(serde_json::Value::from).as_ref()
+                );
+                assert_eq!(
+                    payload.get("workspace_path"),
+                    workspace_path.map(serde_json::Value::from).as_ref()
+                );
+                assert_eq!(
+                    payload.get("project_id"),
+                    project_id.map(serde_json::Value::from).as_ref()
+                );
+                let reply = serde_json::json!({
+                    "session_id": session_id.unwrap_or("first-session"),
+                    "stream_url": "/events",
+                    "status": "accepted"
+                });
+                respond_test_http(&mut socket, "application/json", &reply.to_string()).await;
+            }
+        });
+
+        let mut app = App::new(client);
+        app.launch_workspace = Some(WORKSPACE.to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        for (index, session_id) in [
+            None,
+            Some("first-session"),
+            Some("other-session"),
+            None,
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index >= 3 {
+                if index == 4 {
+                    app.chat.project_id = Some("other-project".to_string());
+                }
+                app.new_session();
+            } else {
+                app.chat.session_id = session_id.map(str::to_string);
+            }
+            app.chat.textarea.insert_str("test workspace selection");
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                event,
+                Some(AppEvent::ChatStarted { result: Ok(_), .. })
+            ));
+            app.chat.streaming = false;
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_workspace_membership_uses_the_server_reported_owner() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for project_id in [None, Some("registered-project")] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert!(request.starts_with("POST /api/v1/chat "));
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                let chat: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(chat["message"], "hello from the worktree");
+                assert_eq!(chat["workspace_path"], "/worktrees/registered/subdirectory");
+                assert_eq!(chat["project_id"].as_str(), project_id);
+                if project_id.is_none() {
+                    let body = r#"{"error":{"code":"project_workspace_conflict"},"owner_project_id":"registered-project","session_project_id":"unassigned"}"#;
+                    let response = format!(
+                        "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(
+                        &mut socket,
+                        "application/json",
+                        r#"{"session_id":"registered-session","stream_url":"/events","status":"accepted"}"#,
+                    ).await;
+                }
+            }
+        });
+
+        let mut app = App::new(client);
+        app.launch_workspace = Some("/worktrees/registered/subdirectory".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.chat.textarea.insert_str("hello from the worktree");
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .expect("chat start event");
+        app.handle_event(started).await.unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("registered-session"));
+        assert_eq!(app.chat.project_id.as_deref(), Some("registered-project"));
+        assert_eq!(app.chat.messages.len(), 1);
         server.await.unwrap();
     }
 
@@ -26878,6 +27463,7 @@ mod question_tests {
             page_limit: 2,
             next_offset: None,
             mode: SessionPickerMode::Browse,
+            session_rows: SessionRows::default(),
         }
     }
 
@@ -27873,6 +28459,7 @@ mod question_tests {
             session_id: "session-b".to_string(),
             epoch: 0,
             result: Ok(OpenedSession {
+                parent_session_id: None,
                 model: "model-b".to_string(),
                 provider: Some("provider-b".to_string()),
                 reasoning_effort: Some(ReasoningEffort::Xhigh),

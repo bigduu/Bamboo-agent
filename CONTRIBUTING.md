@@ -43,7 +43,7 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
 
 ### Prerequisites
 
-- Rust 1.95 or later
+- Rust 1.97 or later
 - Cargo
 - Git
 
@@ -81,7 +81,7 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
 
 ```bash
 # Verify the complete workspace on the minimum supported Rust version
-cargo +1.95.0 check --locked --workspace --all-targets --all-features
+cargo +1.97.0 check --locked --workspace --all-targets --all-features
 
 # Run all tests
 cargo test

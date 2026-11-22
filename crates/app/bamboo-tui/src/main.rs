@@ -27,7 +27,7 @@ struct Cli {
     #[arg(short, long)]
     model: Option<String>,
 
-    /// Colour palette: truecolor, system (terminal ANSI colours), or no-color.
+    /// Colour palette: truecolor (dark), light, system (ANSI), or no-color.
     /// `NO_COLOR` selects no-color when this flag is omitted.
     #[arg(long)]
     theme: Option<ThemePalette>,

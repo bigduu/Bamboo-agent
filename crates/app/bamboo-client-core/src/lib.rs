@@ -69,6 +69,10 @@ pub struct ChatRequest {
     /// repeat the same id but cannot use chat to reassign membership.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// An initial workspace chosen by the client. Omit this field to use the
+    /// server default for a new session or the saved workspace for an existing one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// Optional model override. Omitted from the request body when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -108,6 +112,7 @@ mod chat_request_tests {
             message: "hello".to_string(),
             session_id: None,
             project_id: Some("project-client".to_string()),
+            workspace_path: None,
             model: Some("gpt-5".to_string()),
             provider: Some("openai".to_string()),
             reasoning_effort: Some(super::ReasoningEffort::High),

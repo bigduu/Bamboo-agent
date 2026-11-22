@@ -81,6 +81,8 @@ pub struct CommandDetail {
 #[derive(Deserialize, Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
     /// Stable Project membership used when authoring a schedule from the
     /// currently selected session.
     #[serde(default)]

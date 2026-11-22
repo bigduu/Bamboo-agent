@@ -8,7 +8,7 @@
 //! existing tokio runtime; both binaries provide one via `#[tokio::main]`.
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,6 +23,7 @@ mod app;
 mod components;
 mod event;
 mod file_change;
+mod file_reference;
 mod history;
 mod keymap;
 mod search;
@@ -91,6 +92,14 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
         .keymap
         .or_else(|| std::env::var_os("BAMBOO_TUI_KEYMAP").map(PathBuf::from));
     let (keymap, keymap_warning) = keymap::Keymap::load(keymap_path.as_deref());
+    // A non-loopback server interprets workspace paths on its own filesystem.
+    let launch_workspace = if app::is_loopback_url(&opts.server_url) {
+        std::env::current_dir()
+            .ok()
+            .and_then(|path| path.into_os_string().into_string().ok())
+    } else {
+        None
+    };
 
     // Setup terminal.
     enable_raw_mode()?;
@@ -102,6 +111,7 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
     // Create client and app.
     let client = api::BambooClient::new(&opts.server_url);
     let mut app = app::App::new(client);
+    app.launch_workspace = launch_workspace;
     app.set_theme(palette);
     app.set_keymap(keymap, keymap_warning);
 
@@ -120,6 +130,7 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;

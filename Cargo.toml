@@ -89,7 +89,7 @@ resolver = "2"
 # version at publish time; all members inherit via `version.workspace = true`.
 # Do NOT hardcode a real version here.
 version = "0.0.0"
-rust-version = "1.95"
+rust-version = "1.97"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -104,7 +104,7 @@ hex = "0.4"
 name = "bamboo-agent"
 version.workspace = true
 edition = "2021"
-rust-version = "1.95"
+rust-version.workspace = true
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
 description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"
@@ -204,7 +204,6 @@ async-stream = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
 eventsource-stream = "0.2"
-# Keep the Rust 1.95 contract; eventsource-client 0.18.1 requires Rust 1.97.
 eventsource-client = "=0.18.0"
 bytes = "1"
 

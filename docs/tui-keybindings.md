@@ -4,6 +4,35 @@ The Bamboo TUI resolves every key through one action registry. Press `F1` to
 see the bindings that are active after configuration; the same resolved labels
 are used in tab headers, dialog footers, and the command palette.
 
+## Chat workspace
+
+With a local Bamboo server, a fresh chat uses the directory where you launched
+`bamboo tui` and its registered Project, if it has one. A new chat created
+with an inherited Project uses that Project's default workspace. Existing chats
+use their saved workspace. Remote servers resolve new workspaces from their own
+configuration.
+
+Press `/` at the start of the draft or `Ctrl+K` to open Functions. The menu
+searches built-in actions and commands available to the active Bamboo session.
+`Ctrl+O` opens the model and reasoning picker. Use the Left and Right keys to
+change the reasoning level for supported models, then press Enter to apply the
+execution profile. Use **Switch session** in the header or `Ctrl+P` to search
+sessions. Click a row or press Enter to open the selection.
+
+Markdown tables in assistant replies take shape as the header separator arrives.
+Column alignment follows the separator, and long cells wrap to fit the terminal.
+
+In chat, click **Open chat** on a sub-agent row to read its conversation. The
+**Sub-agents** button opens the session tree, where you can also click a row to
+open it. A child session shows **← Parent** in the header. Click it or press
+`F4` to return to the immediate parent.
+
+Search for **Terminal settings** in Functions to adjust appearance, expansion of
+new tool blocks, and toolbar hints for the current terminal process. The server
+configuration and permission policy entries open the corresponding Bamboo views.
+Press `Esc` to park an approval in chat and `Ctrl+Q` to reopen it. The current
+draft remains in the composer.
+
 ## Load a keymap
 
 Pass a JSON file to either CLI surface:
@@ -64,8 +93,9 @@ Action and context IDs are stable kebab-case strings:
 
 - `global`: `quit-or-stop`, `show-help`, `show-notifications`,
   `open-command-palette`, `new-session`, `reopen-pending-question`,
-  `open-model-picker`, `open-session-picker`, `stop-run`, `open-config-tab`,
-  `open-schedules-tab`, `next-tab`, `previous-tab`
+  `open-model-picker`, `open-session-picker`, `open-parent-session`, `stop-run`, `open-config-tab`,
+  `open-terminal-settings`, `open-chat-tab`, `open-sessions-tab`, `open-mcp-tab`,
+  `open-skills-tab`, `open-schedules-tab`, `next-tab`, `previous-tab`
 - `navigation`: `show-help`, `switch-tab-1` through `switch-tab-6`
 - `chat`: `stop-run`, `toggle-details`, `open-slash-palette`, `send-message`,
   `insert-newline`, transcript scrolling, and `focus-conversation-blocks`
@@ -80,7 +110,7 @@ Action and context IDs are stable kebab-case strings:
 - `sessions`, `mcp`, `schedules`, `schedule-form`, `skills`, `config`,
   `config-editor`: the actions shown in the corresponding F1 group
 - `session-picker-browse`, `session-picker-rename`,
-  `session-picker-pinning`, `model-picker`, `command-palette`: the actions
+  `session-picker-pinning`, `model-picker`, `command-palette`, `terminal-settings`: the actions
   shown in each picker group
 
 Use the F1 reference to confirm the exact resolved action labels before
@@ -91,8 +121,8 @@ distributing a keymap.
 The Chat footer is a typed, per-session HUD. It keeps permission posture,
 run phase and id, connection state, plan mode, the current tool, compression,
 sub-agent counts, and budget failures separate from the short-lived status
-message. The active/background session strip carries the same session-scoped
-state when work continues outside the foreground. Text labels accompany every
+message. The session picker carries session-scoped activity when work continues
+outside the foreground. Text labels accompany every
 color and symbol. Press `Ctrl+L` to open the Activity center, where durable
 entries are grouped by session and run; `Enter` opens the newest linked
 session. The center retains at most 200 entries.

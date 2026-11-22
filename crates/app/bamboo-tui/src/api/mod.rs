@@ -14,6 +14,44 @@ pub(crate) struct ChatSubmission {
     pub(crate) loop_command: Option<LoopChatAcknowledgment>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ChatStart {
+    pub(crate) session_id: String,
+    pub(crate) project_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChatRejected {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl ChatRejected {
+    fn unassigned_workspace_owner(&self) -> Option<String> {
+        if self.status != reqwest::StatusCode::CONFLICT {
+            return None;
+        }
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        if body["error"]["code"].as_str() != Some("project_workspace_conflict")
+            || body["session_project_id"].as_str() != Some("unassigned")
+        {
+            return None;
+        }
+        body["owner_project_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+    }
+}
+
+impl fmt::Display for ChatRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "chat failed ({}): {}", self.status, self.body.trim())
+    }
+}
+
+impl std::error::Error for ChatRejected {}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct LoopChatAcknowledgment {
     pub(crate) should_execute: bool,
@@ -340,8 +378,28 @@ impl BambooClient {
 
     // ── Chat ──
 
-    pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
-        Ok(self.submit_chat(req).await?.response)
+    pub(crate) async fn chat(&self, mut req: ChatRequest) -> Result<ChatStart> {
+        let from_launch_directory =
+            req.session_id.is_none() && req.project_id.is_none() && req.workspace_path.is_some();
+        let submission = match self.submit_chat(&req).await {
+            Err(error) if from_launch_directory => {
+                // This conflict rejects the turn before admission. Use the
+                // server's canonical workspace owner and retry only once.
+                let Some(project_id) = error
+                    .downcast_ref::<ChatRejected>()
+                    .and_then(ChatRejected::unassigned_workspace_owner)
+                else {
+                    return Err(error);
+                };
+                req.project_id = Some(project_id);
+                self.submit_chat(&req).await?
+            }
+            result => result?,
+        };
+        Ok(ChatStart {
+            session_id: submission.response.session_id,
+            project_id: req.project_id,
+        })
     }
 
     /// A backend without /loop support could accept a control as normal chat.
@@ -353,7 +411,7 @@ impl BambooClient {
             .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Open a Session before using /loop"))?;
         self.session_loop_status(session_id).await?;
-        self.submit_chat(req).await
+        self.submit_chat(&req).await
     }
 
     pub(crate) async fn session_loop_status(
@@ -388,17 +446,17 @@ impl BambooClient {
         Ok(status.record)
     }
 
-    async fn submit_chat(&self, req: ChatRequest) -> Result<ChatSubmission> {
+    async fn submit_chat(&self, req: &ChatRequest) -> Result<ChatSubmission> {
         let resp = self
             .client
             .post(self.url("/api/v1/chat"))
-            .json(&req)
+            .json(req)
             .send()
             .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("chat failed ({status}): {}", body.trim());
+            return Err(ChatRejected { status, body }.into());
         }
         Ok(resp.json().await?)
     }
@@ -1317,6 +1375,7 @@ mod tests {
                     message: "/loop stop".into(),
                     session_id: Some("chat".into()),
                     project_id: None,
+                    workspace_path: None,
                     model: None,
                     provider: None,
                     reasoning_effort: None,
