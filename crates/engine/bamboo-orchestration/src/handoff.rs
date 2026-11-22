@@ -1,5 +1,7 @@
 //! A bounded review projection of one exact submission and its recorded run.
 //! Task progress and recorded source hashes are evidence for the reviewer.
+pub mod continuation;
+
 use std::{
     collections::HashSet,
     path::{Component, Path, PathBuf},
