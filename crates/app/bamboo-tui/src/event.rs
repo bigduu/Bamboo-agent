@@ -8,7 +8,7 @@ use crate::api::types::{
     TaskListResponse, ToolInfo,
 };
 use crate::api::{
-    ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
+    ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
     SessionMutationFailure, VersionedSession,
 };
 use crate::app::{LoopObservation, OpenedSession, QuestionIdentity, SessionPickerIntent};
@@ -106,7 +106,7 @@ pub enum AppEvent {
     ChatStarted {
         context_id: u64,
         turn_id: String,
-        result: Loaded<String>,
+        result: Loaded<ChatStart>,
     },
     LoopChatFinished {
         context_id: u64,
