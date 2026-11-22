@@ -214,23 +214,9 @@ pub fn write_goal_state(session: &mut Session, mut state: GoalState) {
 /// goal), the objective is refreshed and the declaration cleared so a stale
 /// "complete" cannot leak across objectives.
 pub fn ensure_goal_state(session: &Session, objective: &str) -> GoalState {
-    match read_goal_state(session) {
-        Some(mut state) => {
-            if state.objective != objective {
-                // A new objective is a fresh goal: reset the whole runtime, not
-                // just the status — the continuation budget and eval trail
-                // belonged to the previous objective.
-                state.objective = objective.to_string();
-                state.status = GoalRuntimeStatus::Active;
-                state.stop_reason = None;
-                state.continuation_count = 0;
-                state.eval_history.clear();
-                state.clear_declaration();
-            }
-            state
-        }
-        None => GoalState::new(objective),
-    }
+    read_goal_state(session)
+        .filter(|state| state.objective == objective)
+        .unwrap_or_else(|| GoalState::new(objective))
 }
 
 #[cfg(test)]

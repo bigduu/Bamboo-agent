@@ -3720,6 +3720,7 @@ async fn run_pipeline_inner(
     let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
+        crate::runtime::goal_restart::disarm_before_round(session, config).await?;
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
             && cancel_token.is_cancelled()
         {

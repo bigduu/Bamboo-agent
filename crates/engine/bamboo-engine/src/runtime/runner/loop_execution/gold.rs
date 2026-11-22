@@ -181,7 +181,7 @@ pub(super) async fn evaluate_gold_terminal(
             goal_state.status = GoalRuntimeStatus::Blocked;
             goal_state.stop_reason = Some(GoalStopReason::VerificationUnavailable);
             goal_state.clear_declaration();
-            persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
+            persist_goal_state_and_emit(session, goal_state, session_id, event_tx, None).await;
             return GoldTerminalDecision::Stop;
         }
     };
@@ -205,20 +205,21 @@ pub(super) async fn evaluate_gold_terminal(
             goal_state.status = GoalRuntimeStatus::Active;
             goal_state.stop_reason = None;
             goal_state.clear_declaration();
-            persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
             session.add_message(goal_continue_runtime_message(
                 &verdict,
                 objective,
                 next_count,
                 gold_config.max_auto_continuations,
             ));
+            persist_goal_state_and_emit(session, goal_state, session_id, event_tx, Some(config))
+                .await;
             return GoldTerminalDecision::Continue {
                 continuation_count: next_count,
             };
         }
     }
     goal_state.clear_declaration();
-    persist_goal_state_and_emit(session, goal_state, session_id, event_tx).await;
+    persist_goal_state_and_emit(session, goal_state, session_id, event_tx, None).await;
     GoldTerminalDecision::Stop
 }
 
@@ -257,9 +258,13 @@ async fn persist_goal_state_and_emit(
     goal_state: GoalState,
     session_id: &str,
     event_tx: &mpsc::Sender<AgentEvent>,
+    continuation_config: Option<&AgentLoopConfig>,
 ) {
     let payload = serde_json::to_value(&goal_state).unwrap_or(serde_json::Value::Null);
     write_goal_state(session, goal_state);
+    if let Some(config) = continuation_config {
+        crate::runtime::goal_restart::arm(session, config).await;
+    }
     let _ = event_tx
         .send(AgentEvent::GoalStatusChanged {
             session_id: session_id.to_string(),

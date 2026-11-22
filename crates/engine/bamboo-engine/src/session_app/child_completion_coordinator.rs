@@ -1166,6 +1166,74 @@ impl ChildCompletionCoordinator {
         Ok(())
     }
 
+    /// Resume the exact Goal startup checkpoint under a newly fenced Root.
+    pub async fn resume_goal_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint: crate::runtime::goal_restart::GoalRestartCheckpoint,
+        startup: chrono::DateTime<Utc>,
+    ) -> std::io::Result<()> {
+        let Some(mut reservation) = self.reserve_paced_loop_turn(session_id).await else {
+            return Ok(());
+        };
+        let guard = self.persistence.acquire_lock(session_id).await;
+        let Some(mut session) = self.storage.load_session(session_id).await? else {
+            return Ok(());
+        };
+        if crate::runtime::goal_restart::eligible_checkpoint(&session, startup).as_ref()
+            != Some(&checkpoint)
+        {
+            return Ok(());
+        }
+        let inbox = self
+            .agent
+            .session_inbox()
+            .ok_or_else(|| std::io::Error::other("Goal restart requires the Session Inbox"))?;
+        if inbox
+            .inspect(session_id)
+            .await
+            .map_err(std::io::Error::other)?
+            .activation_pending()
+        {
+            return Ok(());
+        }
+        self.prepare_paced_loop_turn(&mut reservation, &session)
+            .await?;
+        let writer = reservation.root_actor_writer().ok_or_else(|| {
+            std::io::Error::other("Goal restart requires the current Root writer")
+        })?;
+        if checkpoint.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(());
+        }
+        let expected = session.clone();
+        crate::runtime::goal_restart::consume(&mut session, &checkpoint);
+        let persistence = reservation
+            .execution_persistence()
+            .ok_or_else(|| std::io::Error::other("Goal restart requires fenced persistence"))?;
+        drop(guard);
+        if let Err(error) = persistence
+            .save_bound_startup_session(&mut session, &expected)
+            .await
+        {
+            reservation.abandon().await;
+            return Err(error);
+        }
+
+        let config_snapshot = self.config.read().await.clone();
+        let config = self.build_resume_config(&session, &config_snapshot);
+        let request = ResumeSpawnRequest {
+            session_id: session_id.to_owned(),
+            session,
+            execution_reservation: reservation,
+            event_sender: ResumeExecutionPort::get_or_create_event_sender(self, session_id).await,
+            config,
+        };
+        ResumeExecutionPort::dispatch_configured_resume_execution(self, request)
+            .map_err(|_| std::io::Error::other("Goal restart owner did not accept the checkpoint"))
+    }
+
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
     /// can distinguish a successful spawn (`Started`) from a gate-blocked
     /// attempt (`Completed`). The bash self-resume poll task uses this to
