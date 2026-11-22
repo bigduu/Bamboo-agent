@@ -87,6 +87,7 @@ async fn container_project_discovers_and_creates_from_selected_repo_without_rebi
     let result: Value = test::read_body_json(response).await;
     let checkout = destination.join("backend-task");
     assert_eq!(result["path"], checkout.to_str().unwrap());
+    assert!(result["project_owned_at_revision"].is_null());
     assert_eq!(
         git::repository(&checkout).unwrap(),
         git::repository(&backend).unwrap()
@@ -107,6 +108,49 @@ async fn container_project_discovers_and_creates_from_selected_repo_without_rebi
         .unwrap();
     assert_eq!(created["branch"], "feature/backend-task");
     assert_eq!(created["project_owned"], false);
+
+    let owned_destination = container.join("a-worktrees");
+    fs::create_dir(&owned_destination).unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&uri)
+            .set_json(json!({
+                "repository": backend,
+                "root": owned_destination,
+                "name": "owned-task",
+                "branch": "feature/owned-task"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    let owned: Value = test::read_body_json(response).await;
+    assert_eq!(
+        owned["path"],
+        owned_destination.join("owned-task").to_str().unwrap()
+    );
+    assert_eq!(owned["project_owned_at_revision"], project.revision);
+    let sources: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}?sources_only=true"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(sources["project_id"], project.id.to_string());
+    let repositories = sources["repositories"].as_array().unwrap();
+    let paths: HashSet<_> = repositories
+        .iter()
+        .map(|repo| repo["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        HashSet::from([frontend.to_str().unwrap(), backend.to_str().unwrap()])
+    );
+    assert!(repositories.iter().all(|repo| {
+        repo["error"].is_null() && repo["worktrees"].as_array().unwrap().is_empty()
+    }));
     assert_eq!(
         fs::read(&manifest).unwrap(),
         before,
