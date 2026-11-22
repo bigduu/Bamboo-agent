@@ -225,7 +225,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2929 changes the feature-sensitive prompt runner. The clock checks remain
 // in the default headless cases and the prompt and Skill tests retain their
 // existing owners. The four additive contexts and 20 cases stay intact.
-const FEATURE_SOURCE_SHA256 = "9234e24cef91cc16e1027ceca92b93c7c624e30c5f900695f9a66ee3733b466a";
+// #2936 retains the existing Engine, Server, and Skill test owners.
+const FEATURE_SOURCE_SHA256 = "c9f97b29b61b5b7eb792279cbacab42ca2b28258c9fec77600a61b90be42935c";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
