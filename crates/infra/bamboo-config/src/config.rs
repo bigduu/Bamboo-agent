@@ -2668,6 +2668,10 @@ pub struct FeatureFlags {
     /// Start new interactive chats in Root Ultra mode.
     #[serde(default)]
     pub chat_ultra_by_default: bool,
+    /// Use the highest supported reasoning tier for new Work. Managed Work
+    /// Roots also start in Ultra thinking mode.
+    #[serde(default)]
+    pub work_ultra_by_default: bool,
     /// Enable the ProviderModelRef system (multi-provider + unified model selection).
     #[serde(default)]
     pub provider_model_ref: bool,

@@ -225,12 +225,14 @@ impl Fixture {
     }
 
     async fn run(&mut self, expected_effort: Option<ReasoningEffort>) {
-        self.run_selected(expected_effort, expected_effort).await;
+        self.run_selected(expected_effort, expected_effort, expected_effort)
+            .await;
     }
 
     async fn run_selected(
         &mut self,
         role_effort: Option<ReasoningEffort>,
+        session_effort: Option<ReasoningEffort>,
         expected_effort: Option<ReasoningEffort>,
     ) {
         let (account, model) = (ACCOUNT, MODEL);
@@ -289,20 +291,17 @@ impl Fixture {
             child.model_ref.as_ref().unwrap().reasoning_effort,
             role_effort
         );
-        assert_eq!(child.reasoning_effort, expected_effort);
+        assert_eq!(child.reasoning_effort, session_effort);
+        assert!(!child.root_orchestration_only_enabled());
         // A replay must not re-resolve the role or create a second run after a config change.
-        self.state
-            .config
-            .write()
-            .await
-            .defaults
-            .as_mut()
-            .unwrap()
-            .subagent_models
-            .insert(
+        {
+            let mut config = self.state.config.write().await;
+            config.features.work_ultra_by_default = false;
+            config.defaults.as_mut().unwrap().subagent_models.insert(
                 "worker".into(),
                 ProviderModelRef::new("missing-account", "invalid-after-birth"),
             );
+        }
         let replay = self
             .state
             .tickets
@@ -371,7 +370,31 @@ async fn native_work_uses_the_supervisor_work_effort_for_the_actual_request() {
         .work_execution
         .reasoning_effort = Some(ReasoningEffort::Max);
     fixture
-        .run_selected(Some(ReasoningEffort::Low), Some(ReasoningEffort::Max))
+        .run_selected(
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Max),
+            Some(ReasoningEffort::Max),
+        )
+        .await;
+}
+
+#[actix_web::test]
+async fn work_child_uses_the_ultra_effort_without_changing_root_authority() {
+    let low = Some(ReasoningEffort::Low);
+    let mut fixture = Fixture::new(
+        Some(ProviderModelRef::new(ACCOUNT, MODEL).with_reasoning_effort(ReasoningEffort::Low)),
+        Some(ReasoningEffort::High),
+    )
+    .await;
+    fixture
+        .state
+        .config
+        .write()
+        .await
+        .features
+        .work_ultra_by_default = true;
+    fixture
+        .run_selected(low, low, Some(ReasoningEffort::Max))
         .await;
 }
 

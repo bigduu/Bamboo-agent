@@ -518,6 +518,13 @@ pub(crate) async fn execute_llm_round(
         .as_deref()
         .ok_or_else(|| AgentError::LLM("model_name is required in AgentLoopConfig".to_string()))?;
 
+    let highest_reasoning = session.root_orchestration_only_enabled()
+        || (session.kind == SessionKind::Child
+            && config.ticket_worker_plan.is_some()
+            && crate::ticket_runtime::read_dispatch(session)
+                .ok()
+                .flatten()
+                .is_some_and(|dispatch| dispatch.highest_reasoning));
     let frame = stream_execution::LlmStreamFrame {
         event_tx,
         cancel_token,
@@ -525,7 +532,7 @@ pub(crate) async fn execute_llm_round(
         model,
         provider_name: config.provider_name.as_deref(),
         provider_type: config.provider_type.as_deref(),
-        reasoning_effort: if session.root_orchestration_only_enabled() {
+        reasoning_effort: if highest_reasoning {
             ultra_reasoning_effort(config.provider_type.as_deref(), model)
         } else {
             config.reasoning_effort
