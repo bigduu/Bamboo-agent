@@ -1230,16 +1230,15 @@ async fn frontend_bootstrap_is_public_canonical_request_aware_and_secret_free() 
         .to_request();
     let verify_response = test::call_service(&app, verify).await;
     assert_eq!(verify_response.status(), StatusCode::OK);
-    let cookie = verify_response
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let set_cookie = verify_response.headers().get(header::SET_COOKIE).unwrap();
+    let cookie = cookie::Cookie::parse(set_cookie.to_str().unwrap()).unwrap();
+    assert_eq!(cookie.name(), "bamboo_access_verified");
+    assert_eq!(cookie.path(), Some("/"));
+    assert_eq!(cookie.http_only(), Some(true));
+    assert_eq!(cookie.same_site(), Some(cookie::SameSite::Lax));
+    assert_eq!(cookie.max_age(), Some(cookie::time::Duration::hours(12)));
+    assert!(!cookie.secure().unwrap_or(false));
+    let cookie = format!("{}={}", cookie.name(), cookie.value());
     let cookie_bootstrap = test::TestRequest::get()
         .uri("/api/v1/bootstrap")
         .insert_header((header::HOST, "bamboo.example.com"))
