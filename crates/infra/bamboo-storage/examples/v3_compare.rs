@@ -94,6 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         revision.history,
     )?;
     assert_eq!(history_page[0].id, session.messages[history_size].id);
+    // The search worker can still hold the V2 SQLite connection after a save.
+    rt.block_on(v2.flush_search_index());
     drop(v2);
     drop(v3);
     drop(monitor);
