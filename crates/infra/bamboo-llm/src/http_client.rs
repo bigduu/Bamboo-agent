@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use crate::provider::LLMError;
 use bamboo_config::Config;
-use reqwest::{header::HeaderMap, Client, ClientBuilder, NoProxy, Proxy, Response};
+use reqwest::{
+    header::HeaderMap, Client, ClientBuilder, NoProxy, Proxy, Request, RequestBuilder, Response,
+};
 
 const BAMBOO_USER_AGENT: &str = concat!("Bamboo/", env!("CARGO_PKG_VERSION"));
 
@@ -75,12 +77,27 @@ fn provider_client_builder() -> ClientBuilder {
         .connect_timeout(Duration::from_secs(30))
         .user_agent(BAMBOO_USER_AGENT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if crate::retry::output_limit_recovery_active() {
+            let different_origin = attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.origin() != attempt.url().origin());
+            if crate::retry::output_limit_recovery_active()
+                || (different_origin && crate::forward_headers::has_request_headers())
+            {
                 attempt.stop()
             } else {
                 reqwest::redirect::Policy::default().redirect(attempt)
             }
         }))
+}
+
+pub(crate) fn build_provider_request(
+    builder: RequestBuilder,
+) -> reqwest::Result<(Client, Request)> {
+    let (client, request) = builder.build_split();
+    let mut request = request?;
+    crate::forward_headers::apply_request(request.headers_mut());
+    Ok((client, request))
 }
 
 fn correlation_value<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
@@ -97,6 +114,7 @@ pub(crate) fn observe_provider_response(response: &Response) {
     use crate::providers::common::log_identity;
 
     let headers = response.headers();
+    crate::forward_headers::capture_response(headers);
     let request_id = correlation_value(
         headers,
         &[
