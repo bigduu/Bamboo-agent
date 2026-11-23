@@ -60,20 +60,20 @@ bamboo-projects = { path = "../../infra/bamboo-projects" }
 # server-side DTO that could drift from the wire record).
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 
-# Web framework. Preserve Actix's ordinary default surface except inbound
-# HTTP/2. Actix 4's `http2` feature still resolves vulnerable `h2 0.3`; Bamboo's
-# public WSS contract uses HTTP/1.1 Upgrade and is served by the explicit H1
-# builder in `server/h1.rs` (#849).
+# Bamboo's public WSS contract uses HTTP/1.1 Upgrade and the explicit H1
+# builder in `server/h1.rs` (#849). Actix 4's `http2` feature still resolves
+# vulnerable `h2 0.3`.
 actix-web = { version = "4.18.2", default-features = false, features = [
     "macros",
     "compress-brotli",
     "compress-gzip",
     "compress-zstd",
-    "cookies",
     "unicode",
     "compat",
     "ws",
 ] }
+# Actix's optional cookie integration still depends on cookie 0.16.
+cookie = { version = "0.18.3", features = ["percent-encode"] }
 # This minimum includes the Actix security fixes tracked in #2792.
 actix-http = { version = "3.21.3", default-features = false, features = ["rustls-0_23"] }
 actix-server = "2"

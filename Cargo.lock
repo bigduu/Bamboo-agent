@@ -206,7 +206,6 @@ dependencies = [
  "bytes",
  "bytestring",
  "cfg-if",
- "cookie",
  "derive_more",
  "encoding_rs",
  "foldhash 0.2.0",
@@ -1404,6 +1403,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "chrono-tz",
+ "cookie",
  "cron",
  "dashmap",
  "ed25519-dalek 3.0.0",
@@ -2260,9 +2260,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.16.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e859cd57d0710d9e06c381b550c06e76992472a8c6d527aecd2fc673dcc231fb"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
