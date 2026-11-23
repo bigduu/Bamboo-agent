@@ -57,7 +57,7 @@ struct Probe {
     calls: AtomicUsize,
     source_calls: AtomicUsize,
     source_inputs: StdMutex<Vec<Vec<Message>>>,
-    stall_source_stream: AtomicBool,
+    source_timeouts: StdMutex<usize>,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_dispatch: StdMutex<Option<Vec<ToolCall>>>,
@@ -357,7 +357,13 @@ impl LLMProvider for Probe {
             SOURCE => {
                 self.source_inputs.lock().unwrap().push(messages.to_vec());
                 self.source_calls.fetch_add(1, Ordering::SeqCst);
-                if self.stall_source_stream.load(Ordering::SeqCst) {
+                let stall = {
+                    let mut remaining = self.source_timeouts.lock().unwrap();
+                    let stall = *remaining != 0;
+                    *remaining = remaining.saturating_sub(1);
+                    stall
+                };
+                if stall {
                     use futures::StreamExt;
                     let started =
                         futures::stream::iter([Ok(LLMChunk::Token(WORKER_PARTIAL_OUTPUT.into()))]);
@@ -1233,10 +1239,12 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             admission_request(target, input),
         )
         .await;
+        assert!(admission["execution_started_at"].is_string(), "{admission}");
         assert_eq!(
             admission,
             json!({
                 "status":"admission_verified",
+                "execution_started_at":admission["execution_started_at"],
                 "admission":{
                     "target_session_id":target.session_id,
                     "target_created_at":target.created_at,
@@ -1249,7 +1257,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             })
         );
     }
-    let unconfirmed = json!({"status":"admission_unconfirmed"});
+    let unconfirmed = json!({"status":"admission_unconfirmed", "execution_started_at":null});
     let mut wrong_generation = admission_request(&first, &first_input);
     wrong_generation["input_receipt"]["generation"] =
         json!(first_input["generation"].as_u64().unwrap() + 1);
@@ -1376,6 +1384,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         )
         .await;
         assert_eq!(recovered["status"], "admission_verified");
+        assert_eq!(recovered["execution_started_at"], Value::Null);
         assert_eq!(recovered["admission"]["run_id"], *run);
         assert_eq!(
             recovered["admission"]["input"]["receipt_id"],
@@ -2818,7 +2827,7 @@ async fn dispatch_timed_out_worker(
     operation: &str,
     subscribe: bool,
 ) -> (String, bamboo_domain::LlmRequestDiagnostic) {
-    f.probe.stall_source_stream.store(true, Ordering::SeqCst);
+    *f.probe.source_timeouts.lock().unwrap() = if subscribe { 2 } else { 1 };
     f.state
         .config
         .write()
@@ -2902,7 +2911,7 @@ pub(in crate::app_state) async fn exercise_subscribed_worker_timeout_notice() {
     );
     assert!(notice.contains("phase=transport_idle"));
     assert!(!notice.contains(WORKER_PARTIAL_OUTPUT));
-    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
     f.state.shutdown().await;
 }
@@ -2926,8 +2935,68 @@ pub(in crate::app_state) async fn exercise_delayed_worker_timeout_notice() {
     assert!(notice.contains("Last persisted status: error"));
     assert!(!notice.contains(&second_run));
     assert!(!notice.contains("Diagnostic ID:"));
-    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 3);
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_worker_start_and_stream_recovery() {
+    let f = Fixture::new_with_native_source(true).await;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    f.state
+        .config
+        .write()
+        .await
+        .stream_timeout
+        .transport_idle_timeout_secs = 3;
+    *f.probe.source_timeouts.lock().unwrap() = 1;
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "recover-worker-stream",
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":"recover-worker-stream", "message":"Finish the original Worker task.",
+            "notify_on_material_event":true,
+        }),
+    )
+    .await;
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the stalled Worker must reach the provider again on its original run");
+    let start = invoke_managed_control(&f.state, &f.reference, "verify-worker-start", json!({
+        "action":"observe_run", "target_session_id":ROOT_A, "target_ref":target,
+        "input_receipt":{"receipt_id":dispatch["receipt_id"],"generation":dispatch["generation"]},
+    })).await;
+    assert_eq!(start["status"], "admission_verified");
+    assert!(start["execution_started_at"].is_string(), "{start}");
+    let run = start["admission"]["run_id"].as_str().unwrap();
+    f.probe.source_release[0].notify_one();
+    let worker = settled(&f.state, ROOT_A).await;
+    let notice = received_worker_notice(&f, run).await;
+    assert!(notice.contains("completed"), "{notice}");
+    let outcomes = worker
+        .runtime_metadata
+        .unwrap()
+        .supervised_root_outcomes
+        .unwrap();
+    assert_eq!(outcomes.facts.len(), 1);
+    assert_eq!(outcomes.facts[0].run_id, run);
+    assert_eq!(outcomes.facts[0].inputs.len(), 1);
+    assert!(worker
+        .messages
+        .iter()
+        .all(|message| !message.content.contains(WORKER_PARTIAL_OUTPUT)));
+    let provider_requests = f.probe.source_inputs.lock().unwrap();
+    assert_eq!(provider_requests.len(), 2);
+    assert!(provider_requests[1]
+        .iter()
+        .all(|message| !message.content.contains(WORKER_PARTIAL_OUTPUT)));
+    drop(provider_requests);
     f.state.shutdown().await;
 }
 

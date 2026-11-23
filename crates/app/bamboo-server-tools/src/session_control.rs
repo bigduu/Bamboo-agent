@@ -832,7 +832,7 @@ impl Tool for SessionControlTool {
             });
             schema["properties"]["input_receipt"] = json!({
                 "type":"object", "additionalProperties":false,
-                "description":"Optional for observe_run. Copy receipt_id and generation from the delivery to find the exact run that admitted it. Admission is separate from liveness and completion. Omit this field for a live run observation.",
+                "description":"Optional for observe_run. Copy receipt_id and generation from the delivery. An exact admitted receipt and non-null execution_started_at confirm startup for the returned run. Use wait_run or the subscribed Inbox for outcomes.",
                 "required":["receipt_id","generation"],
                 "properties":{
                     "receipt_id":{"type":"string","minLength":1,"maxLength":256},

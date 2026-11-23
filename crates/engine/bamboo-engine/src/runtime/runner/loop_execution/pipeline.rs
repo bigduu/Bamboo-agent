@@ -3692,6 +3692,7 @@ async fn run_pipeline_inner(
         .and_then(|_| state.runtime_state.waiting_for_children.clone());
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
+    let mut worker_text_timeout_retried = false;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
     // bottom of the loop). Cleared per-run. We also drop any stale
     // `runtime.completion_reason` carried over from a previous run on this
@@ -4124,6 +4125,16 @@ async fn run_pipeline_inner(
                     break;
                 }
                 Err(error) => {
+                    let recover_worker_timeout = attempt < MAX_LLM_TURN_ATTEMPTS
+                        && !worker_text_timeout_retried
+                        && crate::runtime::runner::round_lifecycle::can_recover_worker_stream(
+                            session, config, attempt_tail_message_id.as_deref(), &error,
+                        )
+                        && {
+                            let mut spent = state.runtime_state.round.clone();
+                            round_activity.apply_to_round(&mut spent);
+                            check_run_budget_exceeded(&spent, &config.run_budget).is_none()
+                        };
                     if is_overflow_recoverable(&error) && !overflow_recovery_attempted {
                         overflow_recovery_attempted = true;
                         if !state.overflow_recovery.can_attempt_recovery() {
@@ -4228,7 +4239,10 @@ async fn run_pipeline_inner(
                             terminal_error = Some(error);
                             break;
                         }
-                    } else if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                    } else if attempt < MAX_LLM_TURN_ATTEMPTS
+                        && (recover_worker_timeout || should_retry_turn_error(&error))
+                    {
+                        worker_text_timeout_retried |= recover_worker_timeout;
                         // A failed stream may have materialized already-visible
                         // output as an interrupted transcript record.  Keep it
                         // only when the error becomes terminal; a retry must not
