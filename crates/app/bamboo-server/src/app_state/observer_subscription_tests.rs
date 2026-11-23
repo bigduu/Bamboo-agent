@@ -58,6 +58,7 @@ struct Probe {
     source_calls: AtomicUsize,
     source_inputs: StdMutex<Vec<Vec<Message>>>,
     source_timeouts: StdMutex<usize>,
+    source_timeout_usage: StdMutex<Option<(u64, u64)>>,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_dispatch: StdMutex<Option<Vec<ToolCall>>>,
@@ -365,8 +366,19 @@ impl LLMProvider for Probe {
                 };
                 if stall {
                     use futures::StreamExt;
-                    let started =
-                        futures::stream::iter([Ok(LLMChunk::Token(WORKER_PARTIAL_OUTPUT.into()))]);
+                    let mut chunks = vec![Ok(LLMChunk::Token(WORKER_PARTIAL_OUTPUT.into()))];
+                    if let Some((input, output)) = *self.source_timeout_usage.lock().unwrap() {
+                        chunks.push(Ok(LLMChunk::ProviderUsage {
+                            input_tokens: Some(input),
+                            output_tokens: Some(output),
+                            total_tokens: Some(input + output),
+                            reasoning_tokens: None,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                            cache_write_input_tokens: None,
+                        }));
+                    }
+                    let started = futures::stream::iter(chunks);
                     return Ok(Box::pin(started.chain(futures::stream::pending())));
                 }
                 if messages
@@ -810,6 +822,21 @@ async fn supervisor_log_monitor_creates_session_notifies_on_new_lines_and_stops(
         .await
         .unwrap()
         .is_none());
+
+    let empty = Session::new("ordinary-empty-session", PARENT);
+    f.state.storage.save_session(&empty).await.unwrap();
+    let cleanup = f
+        .state
+        .session_store
+        .cleanup(bamboo_storage::CleanupMode::Empty, false)
+        .await
+        .unwrap();
+    assert!(cleanup.deleted_session_ids.contains(&empty.id));
+    assert!(!cleanup
+        .deleted_session_ids
+        .iter()
+        .any(|id| id == monitor_id));
+    assert_eq!(load(&f.state, monitor_id).await.id, monitor_id);
 
     let private_line = "PRIVATE_MONITOR_LOG_PAYLOAD";
     writeln!(
@@ -3221,6 +3248,23 @@ pub(in crate::app_state) async fn exercise_worker_start_and_stream_recovery() {
         .iter()
         .all(|message| !message.content.contains(WORKER_PARTIAL_OUTPUT)));
     drop(provider_requests);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_worker_timeout_respects_run_budget() {
+    let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.run_budget.max_total_tokens = Some(12_000);
+    *f.probe.source_timeout_usage.lock().unwrap() = Some((11_900, 200));
+    let (_, diagnostic) = dispatch_timed_out_worker(&f, "worker-timeout-at-budget", true).await;
+    assert!(diagnostic.error_message().contains("phase=transport_idle"));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+    let worker = load(&f.state, ROOT_A).await;
+    let round = worker
+        .agent_runtime_state
+        .expect("durable Worker runtime")
+        .round;
+    assert_eq!(round.total_prompt_tokens, 11_900);
+    assert_eq!(round.total_completion_tokens, 200);
     f.state.shutdown().await;
 }
 

@@ -41,7 +41,7 @@ pub(crate) use context_preparation::stage_user_context_compaction;
 pub(in crate::runtime::runner) use stream_execution::effective_tool_schemas;
 pub(in crate::runtime::runner) use stream_execution::required_tool_for_session;
 pub(crate) use stream_execution::{
-    can_recover_worker_stream, discard_latest_interrupted_assistant_output,
+    discard_latest_interrupted_assistant_output, worker_timeout_usage,
 };
 
 /// Select the highest tier for a known provider/model. Alias routes retain the

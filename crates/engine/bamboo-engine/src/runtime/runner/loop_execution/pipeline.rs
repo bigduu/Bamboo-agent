@@ -1112,10 +1112,7 @@ impl RoundActivity {
         stream_output: &StreamHandlingOutput,
         attempt_usage: MetricsTokenUsage,
     ) {
-        let mut accumulated = self.token_usage();
-        accumulated.add_assign_durable(attempt_usage);
-        self.prompt_tokens = accumulated.prompt_tokens;
-        self.completion_tokens = accumulated.completion_tokens;
+        self.absorb_usage(attempt_usage);
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -1126,6 +1123,13 @@ impl RoundActivity {
                 .filter(|call| is_child_spawn_call(call))
                 .count() as u32,
         );
+    }
+
+    fn absorb_usage(&mut self, attempt_usage: MetricsTokenUsage) {
+        let mut accumulated = self.token_usage();
+        accumulated.add_assign_durable(attempt_usage);
+        self.prompt_tokens = accumulated.prompt_tokens;
+        self.completion_tokens = accumulated.completion_tokens;
     }
 
     /// The exact token value persisted for this round. Runtime budget totals
@@ -4125,11 +4129,16 @@ async fn run_pipeline_inner(
                     break;
                 }
                 Err(error) => {
+                    let worker_timeout_usage =
+                        crate::runtime::runner::round_lifecycle::worker_timeout_usage(
+                            session, config, attempt_tail_message_id.as_deref(), &error,
+                        );
+                    if let Some(usage) = worker_timeout_usage {
+                        round_activity.absorb_usage(usage);
+                    }
                     let recover_worker_timeout = attempt < MAX_LLM_TURN_ATTEMPTS
                         && !worker_text_timeout_retried
-                        && crate::runtime::runner::round_lifecycle::can_recover_worker_stream(
-                            session, config, attempt_tail_message_id.as_deref(), &error,
-                        )
+                        && worker_timeout_usage.is_some()
                         && {
                             let mut spent = state.runtime_state.round.clone();
                             round_activity.apply_to_round(&mut spent);

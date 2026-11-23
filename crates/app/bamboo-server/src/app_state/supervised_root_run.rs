@@ -667,6 +667,12 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn subscribed_worker_charges_timed_out_attempt_before_retry() {
+        super::super::observer_subscriptions::tests::exercise_worker_timeout_respects_run_budget()
+            .await;
+    }
+
+    #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
     }
