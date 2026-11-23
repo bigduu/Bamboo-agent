@@ -1697,6 +1697,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         assert_settled_replay_retries_only_proof_contention().await;
     }
     let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.defaults = Some(
+        serde_json::from_value(json!({"chat": ProviderModelRef::new(PROVIDER, SOURCE)})).unwrap(),
+    );
     let workspace = f.home.path().join("subscribed-dispatch");
     std::fs::create_dir(&workspace).unwrap();
     let workspace = workspace.canonicalize().unwrap();
