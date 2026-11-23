@@ -1098,10 +1098,11 @@ struct CapturedBoundedRequest {
 #[derive(Debug, Clone, Copy)]
 enum BoundedFailureMode {
     None,
+    Empty,
     Call(usize),
     PartialWithoutDone(usize),
     Reduce,
-    FillFinalBudget,
+    FillFinalTarget,
 }
 
 struct BoundedCompressionProvider {
@@ -1138,6 +1139,7 @@ impl LLMProvider for BoundedCompressionProvider {
         });
 
         match self.failure_mode {
+            BoundedFailureMode::Empty => Ok(Box::pin(stream::iter([Ok(LLMChunk::Done)]))),
             BoundedFailureMode::Call(failed_call) if call_number == failed_call => {
                 Err(LLMError::Api(format!(
                     "injected map failure on call {call_number}"
@@ -1153,10 +1155,15 @@ impl LLMProvider for BoundedCompressionProvider {
                     LLMChunk::Token("partial summary that must not commit".to_string()),
                 )])))
             }
-            BoundedFailureMode::FillFinalBudget
+            BoundedFailureMode::FillFinalTarget
                 if messages.iter().any(|message| message.content.contains("final reduce stage")) =>
             {
-                let tokens = max_output_tokens.unwrap_or_default().saturating_sub(128).max(1);
+                let target = messages[1].content
+                    .split_once("## Summary Size Budget\nTarget approximately ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .and_then(|tokens| tokens.parse::<u32>().ok())
+                    .expect("requested summary length in final prompt");
+                let tokens = target.saturating_sub(128).max(1);
                 Ok(Box::pin(stream::iter(vec![
                     Ok(LLMChunk::Token(" evidence".repeat(tokens as usize))),
                     Ok(LLMChunk::Done),

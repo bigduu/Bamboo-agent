@@ -15,6 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use bamboo_compression::limits::DEFAULT_MAX_OUTPUT_TOKENS;
 use bamboo_compression::{
     HeuristicSummarizer, MessageSegmenter, Summarizer, TiktokenTokenCounter, TokenBudget,
     TokenCounter,
@@ -28,8 +29,7 @@ use bamboo_llm::LLMChunk;
 use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions};
 use serde::Deserialize;
 
-const COMPATIBILITY_CONTEXT_WINDOW_TOKENS: u32 = 32_000;
-const COMPATIBILITY_MAX_OUTPUT_TOKENS: u32 = 8_000;
+pub(crate) const COMPATIBILITY_SUMMARY_INPUT_TOKENS: u32 = 32_000;
 const COMPATIBILITY_SAFETY_MARGIN_TOKENS: u32 = 1_000;
 const COMPATIBILITY_SAFE_WINDOW_PERCENT: u8 = 80;
 const MAX_MAP_REASONING_HEADROOM_TOKENS: u32 = 8_192;
@@ -124,7 +124,7 @@ pub struct SummarizationProgress {
     pub stage_index: usize,
     pub stage_count: usize,
     pub estimated_input_tokens: u32,
-    pub requested_output_tokens: u32,
+    pub max_output_tokens: u32,
     pub safe_request_tokens: u32,
     pub model_context_tokens: u32,
 }
@@ -146,12 +146,6 @@ struct SummaryPart {
     represented_source_tokens: u32,
     first_message_id: String,
     last_message_id: String,
-}
-
-struct SummaryResponse {
-    content: String,
-    finish_reason: &'static str,
-    saw_reasoning: bool,
 }
 
 /// LLM-based summarizer that calls the current session's model to generate
@@ -606,9 +600,9 @@ impl LlmSummarizer {
             .map(|summary| counter.count_text(summary))
             .unwrap_or(0);
         SummaryRequestBudget {
-            context_window_tokens: COMPATIBILITY_CONTEXT_WINDOW_TOKENS,
-            max_input_tokens: None,
-            max_output_tokens: COMPATIBILITY_MAX_OUTPUT_TOKENS,
+            context_window_tokens: COMPATIBILITY_SUMMARY_INPUT_TOKENS + DEFAULT_MAX_OUTPUT_TOKENS,
+            max_input_tokens: Some(COMPATIBILITY_SUMMARY_INPUT_TOKENS),
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             safety_margin_tokens: COMPATIBILITY_SAFETY_MARGIN_TOKENS,
             safe_window_percent: COMPATIBILITY_SAFE_WINDOW_PERCENT,
             target_summary_tokens: previous_summary_tokens
@@ -621,12 +615,12 @@ impl LlmSummarizer {
     fn request_fits(
         &self,
         messages: &[Message],
-        requested_output_tokens: u32,
+        required_output_tokens: u32,
         budget: &SummaryRequestBudget,
     ) -> bool {
         let counter = TiktokenTokenCounter::default();
         let input_tokens = counter.count_messages(messages);
-        (1..=budget.output_ceiling_for_input(input_tokens)).contains(&requested_output_tokens)
+        (1..=budget.output_ceiling_for_input(input_tokens)).contains(&required_output_tokens)
     }
 
     fn map_request_fits(
@@ -635,9 +629,8 @@ impl LlmSummarizer {
         target_tokens: u32,
         budget: &SummaryRequestBudget,
     ) -> bool {
-        // A map chunk packed to its visible summary target can leave a retry
-        // almost no additional output tokens. Reserve part of the safe window
-        // for reasoning, while preserving the existing layout on small windows.
+        // Leave room for reasoning alongside the visible summary target when
+        // packing map inputs, while preserving the layout on small windows.
         let usable_window = budget
             .safe_request_tokens()
             .saturating_sub(budget.safety_margin_tokens);
@@ -741,9 +734,8 @@ impl LlmSummarizer {
                     last_message_id: unit.last_message_id.clone(),
                     continuation_part,
                 };
-                let requested_output = self.target_for_source(represented);
-                if self.map_request_fits(std::slice::from_ref(&candidate), requested_output, budget)
-                {
+                let target_tokens = self.target_for_source(represented);
+                if self.map_request_fits(std::slice::from_ref(&candidate), target_tokens, budget) {
                     break (prefix, represented);
                 }
                 if piece_token_budget <= 1 {
@@ -779,8 +771,8 @@ impl LlmSummarizer {
     ) -> Result<Vec<Vec<SourceUnit>>, bamboo_compression::types::BudgetError> {
         let mut bounded_units = Vec::new();
         for unit in self.source_units(messages) {
-            let requested_output = self.target_for_source(unit.represented_source_tokens);
-            if self.map_request_fits(std::slice::from_ref(&unit), requested_output, budget) {
+            let target_tokens = self.target_for_source(unit.represented_source_tokens);
+            if self.map_request_fits(std::slice::from_ref(&unit), target_tokens, budget) {
                 bounded_units.push(unit);
             } else {
                 bounded_units.extend(self.split_oversized_source_unit(unit, budget)?);
@@ -795,16 +787,16 @@ impl LlmSummarizer {
             let represented = candidate.iter().fold(0u32, |total, item| {
                 total.saturating_add(item.represented_source_tokens)
             });
-            let requested_output = self.target_for_source(represented);
-            if self.map_request_fits(&candidate, requested_output, budget) {
+            let target_tokens = self.target_for_source(represented);
+            if self.map_request_fits(&candidate, target_tokens, budget) {
                 current = candidate;
                 continue;
             }
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
             }
-            let requested_output = self.target_for_source(unit.represented_source_tokens);
-            if !self.map_request_fits(std::slice::from_ref(&unit), requested_output, budget) {
+            let target_tokens = self.target_for_source(unit.represented_source_tokens);
+            if !self.map_request_fits(std::slice::from_ref(&unit), target_tokens, budget) {
                 return Err(bamboo_compression::types::BudgetError::TokenCountError(
                     "split source unit still exceeds summarization request ceiling".to_string(),
                 ));
@@ -835,10 +827,10 @@ impl LlmSummarizer {
             let represented = candidate.iter().fold(0u32, |total, item| {
                 total.saturating_add(item.represented_source_tokens)
             });
-            let requested_output = self.target_for_source(represented);
+            let target_tokens = self.target_for_source(represented);
             if self.request_fits(
-                &self.build_reduce_messages(&candidate, requested_output, false),
-                requested_output,
+                &self.build_reduce_messages(&candidate, target_tokens, false),
+                target_tokens,
                 budget,
             ) {
                 current = candidate;
@@ -864,15 +856,15 @@ impl LlmSummarizer {
     ) -> Result<Vec<Vec<SummaryPart>>, bamboo_compression::types::BudgetError> {
         let mut bounded_parts = Vec::new();
         for part in parts {
-            let requested_output = self.target_for_source(part.represented_source_tokens);
+            let target_tokens = self.target_for_source(part.represented_source_tokens);
             if self.request_fits(
                 &self.build_multipart_finalize_messages(
                     std::slice::from_ref(part),
-                    requested_output,
+                    target_tokens,
                     shared_context_capsule,
                     retain_shared_context_capsule,
                 ),
-                requested_output,
+                target_tokens,
                 budget,
             ) {
                 bounded_parts.push(part.clone());
@@ -894,15 +886,15 @@ impl LlmSummarizer {
             let represented = candidate.iter().fold(0u32, |total, item| {
                 total.saturating_add(item.represented_source_tokens)
             });
-            let requested_output = self.target_for_source(represented);
+            let target_tokens = self.target_for_source(represented);
             if self.request_fits(
                 &self.build_multipart_finalize_messages(
                     &candidate,
-                    requested_output,
+                    target_tokens,
                     shared_context_capsule,
                     retain_shared_context_capsule,
                 ),
-                requested_output,
+                target_tokens,
                 budget,
             ) {
                 current = candidate;
@@ -962,15 +954,15 @@ impl LlmSummarizer {
                     first_message_id: part.first_message_id.clone(),
                     last_message_id: part.last_message_id.clone(),
                 };
-                let requested_output = self.target_for_source(represented);
+                let target_tokens = self.target_for_source(represented);
                 if self.request_fits(
                     &self.build_multipart_finalize_messages(
                         std::slice::from_ref(&candidate),
-                        requested_output,
+                        target_tokens,
                         shared_context_capsule,
                         retain_shared_context_capsule,
                     ),
-                    requested_output,
+                    target_tokens,
                     budget,
                 ) {
                     break (prefix, represented);
@@ -1005,18 +997,19 @@ impl LlmSummarizer {
         stage_index: usize,
         stage_count: usize,
         messages: &[Message],
-        requested_output_tokens: u32,
         budget: &SummaryRequestBudget,
     ) -> Result<String, bamboo_compression::types::BudgetError> {
         let counter = TiktokenTokenCounter::default();
         let input_tokens = counter.count_messages(messages);
         let input_limit = budget.input_ceiling();
         let safe_request_tokens = budget.safe_request_tokens();
-        let output_ceiling = budget.output_ceiling_for_input(input_tokens);
-        if !(1..=output_ceiling).contains(&requested_output_tokens) {
+        // The prompt carries the visible summary length target. The provider
+        // limit must also accommodate any reasoning performed during generation.
+        let max_output_tokens = budget.output_ceiling_for_input(input_tokens);
+        if max_output_tokens == 0 {
             return Err(bamboo_compression::types::BudgetError::TokenCountError(
                 format!(
-                    "bounded summarization invariant failed for {stage}: input={input_tokens}, input_limit={input_limit}, output={requested_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
+                    "bounded summarization invariant failed for {stage}: input={input_tokens}, input_limit={input_limit}, output={max_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
                     budget.safety_margin_tokens,
                 ),
             ));
@@ -1026,7 +1019,7 @@ impl LlmSummarizer {
             stage_index,
             stage_count,
             estimated_input_tokens: input_tokens,
-            requested_output_tokens,
+            max_output_tokens,
             safe_request_tokens,
             model_context_tokens: budget.context_window_tokens,
         };
@@ -1041,46 +1034,21 @@ impl LlmSummarizer {
             stage_count,
             input_tokens,
             input_limit,
-            requested_output_tokens,
+            max_output_tokens,
             safe_request_tokens,
             model_context_tokens = budget.context_window_tokens,
             model = %self.model,
             "Executing bounded summarization request"
         );
-        let stage_error = |error: LLMError| {
-            bamboo_compression::types::BudgetError::SummaryGenerationError(format!(
-                "{stage} stage {stage_index}/{stage_count} failed: {error}"
-            ))
-        };
-        let mut response = self
-            .collect_stream_response(messages, requested_output_tokens)
+        let (content, finish_reason) = self
+            .collect_stream_response(messages, max_output_tokens)
             .await
-            .map_err(stage_error)?;
-        if response.finish_reason == "length"
-            && response.saw_reasoning
-            && response.content.trim().is_empty()
-            && output_ceiling > requested_output_tokens
-        {
-            tracing::info!(
-                logical_pass_id = self.logical_pass_id.as_deref().unwrap_or("untracked"),
-                stage,
-                stage_index,
-                stage_count,
-                requested_output_tokens,
-                retry_output_tokens = output_ceiling,
-                "Retrying a summarization stage that exhausted its output on reasoning"
-            );
-            response = self
-                .collect_stream_response(messages, output_ceiling)
-                .await
-                .map_err(stage_error)?;
-            if response.finish_reason == "length" && !response.content.trim().is_empty() {
-                return Err(bamboo_compression::types::BudgetError::SummaryGenerationError(
-                    format!("{stage} stage {stage_index}/{stage_count} reached its output limit after retry"),
-                ));
-            }
-        }
-        if response.content.trim().is_empty() {
+            .map_err(|error| {
+                bamboo_compression::types::BudgetError::SummaryGenerationError(format!(
+                    "{stage} stage {stage_index}/{stage_count} failed: {error}"
+                ))
+            })?;
+        if content.trim().is_empty() {
             return Err(
                 bamboo_compression::types::BudgetError::EmptySummaryResponse {
                     stage: stage.to_string(),
@@ -1089,7 +1057,23 @@ impl LlmSummarizer {
                 },
             );
         }
-        Ok(response.content)
+        if matches!(
+            finish_reason,
+            "length"
+                | "max_tokens"
+                | "max_output_tokens"
+                | "MAX_TOKENS"
+                | "model_context_window_exceeded"
+        ) {
+            return Err(
+                bamboo_compression::types::BudgetError::IncompleteSummaryResponse {
+                    stage: stage.to_string(),
+                    stage_index,
+                    stage_count,
+                },
+            );
+        }
+        Ok(content)
     }
 
     async fn build_bounded_shared_context_capsule(
@@ -1208,10 +1192,10 @@ impl LlmSummarizer {
             let represented = group.iter().fold(0u32, |total, part| {
                 total.saturating_add(part.represented_source_tokens)
             });
-            let requested_output = self.target_for_source(represented);
+            let target_tokens = self.target_for_source(represented);
             let prompt = self.build_multipart_finalize_messages(
                 &group,
-                requested_output,
+                target_tokens,
                 &shared_context_capsule,
                 retain_shared_context_capsule,
             );
@@ -1221,7 +1205,6 @@ impl LlmSummarizer {
                     group_index + 1,
                     group_count,
                     &prompt,
-                    requested_output,
                     budget,
                 )
                 .await?;
@@ -1271,17 +1254,10 @@ impl LlmSummarizer {
             let represented = chunk.iter().fold(0u32, |total, unit| {
                 total.saturating_add(unit.represented_source_tokens)
             });
-            let requested_output = self.target_for_source(represented);
-            let prompt = self.build_map_messages(chunk, requested_output);
+            let target_tokens = self.target_for_source(represented);
+            let prompt = self.build_map_messages(chunk, target_tokens);
             let content = self
-                .execute_bounded_request(
-                    "map",
-                    index + 1,
-                    chunks.len(),
-                    &prompt,
-                    requested_output,
-                    budget,
-                )
+                .execute_bounded_request("map", index + 1, chunks.len(), &prompt, budget)
                 .await?;
             map_calls = map_calls.saturating_add(1);
             let first_message_id = chunk
@@ -1306,14 +1282,7 @@ impl LlmSummarizer {
             let final_prompt = self.build_reduce_messages(&parts, final_target, true);
             if self.request_fits(&final_prompt, final_target, budget) {
                 let content = self
-                    .execute_bounded_request(
-                        "final_reduce",
-                        1,
-                        1,
-                        &final_prompt,
-                        final_target,
-                        budget,
-                    )
+                    .execute_bounded_request("final_reduce", 1, 1, &final_prompt, budget)
                     .await?;
                 reduce_calls = reduce_calls.saturating_add(1);
                 let actual_summary_tokens = counter.count_text(&content);
@@ -1350,15 +1319,14 @@ impl LlmSummarizer {
                 let represented = group.iter().fold(0u32, |total, part| {
                     total.saturating_add(part.represented_source_tokens)
                 });
-                let requested_output = self.target_for_source(represented);
-                let prompt = self.build_reduce_messages(&group, requested_output, false);
+                let target_tokens = self.target_for_source(represented);
+                let prompt = self.build_reduce_messages(&group, target_tokens, false);
                 let content = self
                     .execute_bounded_request(
                         "intermediate_reduce",
                         group_index + 1,
                         group_count,
                         &prompt,
-                        requested_output,
                         budget,
                     )
                     .await?;
@@ -1490,12 +1458,12 @@ impl LlmSummarizer {
         }
     }
 
-    /// Collect visible text and the evidence needed to identify a reasoning cutoff.
+    /// Collect the visible text and the provider's completion reason.
     async fn collect_stream_response(
         &self,
         messages: &[Message],
         max_output_tokens: u32,
-    ) -> Result<SummaryResponse, LLMError> {
+    ) -> Result<(String, &'static str), LLMError> {
         let options = LLMRequestOptions {
             session_id: None,
             reasoning_effort: self.llm.default_compression_reasoning_effort(&self.model),
@@ -1519,22 +1487,10 @@ impl LlmSummarizer {
         .await?;
 
         let mut content = String::new();
-        let mut saw_reasoning = false;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result? {
                 LLMChunk::Token(text) => content.push_str(&text),
-                LLMChunk::ReasoningToken(text) => saw_reasoning |= !text.trim().is_empty(),
-                LLMChunk::ProviderUsage {
-                    reasoning_tokens: Some(tokens),
-                    ..
-                } => saw_reasoning |= tokens > 0,
-                LLMChunk::Done => {
-                    return Ok(SummaryResponse {
-                        content,
-                        finish_reason: completion.finish_reason(),
-                        saw_reasoning,
-                    });
-                }
+                LLMChunk::Done => return Ok((content, completion.finish_reason())),
                 _ => {}
             }
         }
@@ -1981,7 +1937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_summarizer_requests_low_reasoning_effort_for_summary_calls() {
+    async fn llm_summarizer_leaves_unconfigured_reasoning_to_the_provider() {
         let provider = Arc::new(ReasoningCaptureProvider::default());
         let summarizer = LlmSummarizer::new(
             provider.clone(),
@@ -2006,7 +1962,7 @@ mod tests {
             .expect("captured reasoning lock should not be poisoned");
         assert_eq!(
             captured.as_slice(),
-            [Some(ReasoningEffort::Low), Some(ReasoningEffort::Low)],
+            [None, None],
             "compatibility callers must use one map request followed by one reduce request"
         );
     }
@@ -2129,7 +2085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatibility_summarizer_uses_source_derived_output_budget_with_low_reasoning() {
+    async fn compatibility_summarizer_uses_the_standard_output_allowance() {
         let provider = Arc::new(RequestOptionsCaptureProvider::default());
         let summarizer = LlmSummarizer::new(
             provider.clone(),
@@ -2142,11 +2098,11 @@ mod tests {
             Message::assistant("已完成第一步并准备第二步", None),
         ];
 
-        let summary = summarizer
-            .summarize(&messages)
+        let report = summarizer
+            .summarize_with_report(&messages)
             .await
             .expect("summary generation should succeed");
-        assert_eq!(summary, "captured summary");
+        assert_eq!(report.content, "captured summary");
 
         let captured_reasoning = provider
             .captured_reasoning
@@ -2156,18 +2112,15 @@ mod tests {
             .captured_max_tokens
             .lock()
             .expect("lock should not be poisoned");
-        assert_eq!(
-            captured_reasoning.as_slice(),
-            [Some(ReasoningEffort::Low), Some(ReasoningEffort::Low)]
-        );
+        assert_eq!(captured_reasoning.as_slice(), [None, None]);
         let expected_target = ((TiktokenTokenCounter::default().count_messages(&messages) as f64)
             * 0.20)
             .ceil()
             .max(1.0) as u32;
+        assert_eq!(report.target_summary_tokens, expected_target);
         assert_eq!(
             captured_max_tokens.as_slice(),
-            [Some(expected_target), Some(expected_target)],
-            "both compatibility map and reduce requests use the source-derived 20% target"
+            [Some(DEFAULT_MAX_OUTPUT_TOKENS); 2],
         );
     }
 
@@ -2430,9 +2383,7 @@ mod tests {
             .and(path("/chat/completions"))
             .respond_with(|request: &Request| {
                 let body: serde_json::Value = request.body_json().unwrap();
-                let sse = if body["max_tokens"]
-                    .as_u64()
-                    .is_some_and(|limit| (1..=50).contains(&limit))
+                let sse = if body["max_tokens"] == 2_000
                     && body.get("max_completion_tokens").is_none()
                     && body.get("reasoning_effort").is_none()
                 {
@@ -2502,15 +2453,14 @@ mod tests {
                     .any(|message| message.content.contains("final reduce stage"))
             })
             .expect("small input must still use a final reduce request");
-        assert_eq!(reduce_request.1, 400);
+        assert!(reduce_request.0[1]
+            .content
+            .contains("Target approximately 400 tokens."));
         let counter = TiktokenTokenCounter::default();
         for (request, output) in [map_request, reduce_request] {
-            assert!(
-                counter
-                    .count_messages(request)
-                    .saturating_add(*output)
-                    .saturating_add(budget.safety_margin_tokens)
-                    <= budget.safe_request_tokens()
+            assert_eq!(
+                *output,
+                budget.output_ceiling_for_input(counter.count_messages(request))
             );
         }
     }
@@ -2535,7 +2485,7 @@ mod tests {
         assert!(source_tokens + 400 + budget.safety_margin_tokens <= budget.safe_request_tokens());
 
         let error = summarizer
-            .execute_bounded_request("final_reduce", 1, 1, &source, 400, &budget)
+            .execute_bounded_request("final_reduce", 1, 1, &source, &budget)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2573,12 +2523,8 @@ mod tests {
         assert_eq!(reduce_calls, 1);
         let requests = provider.requests.lock().expect("capture lock");
         assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|(_, output)| *output >= shared_tokens.saturating_sub(1)),
-            "the child map/reduce must preserve its allocated prior-summary size instead of applying 20% again"
-        );
+        let reduce = &requests[1].0[1].content;
+        assert!(reduce.contains(&format!("Target approximately {shared_tokens} tokens.")));
     }
 
     #[tokio::test]
@@ -2652,11 +2598,6 @@ mod tests {
             );
             assert!(*output_tokens <= budget.max_output_tokens);
         }
-        assert_eq!(
-            requests.last().map(|(_, output)| *output),
-            Some(600),
-            "the final reduce keeps the global source-derived target instead of taking 20% of map summaries"
-        );
         assert!(
             requests.iter().any(|(request, _)| request
                 .iter()
@@ -2682,6 +2623,7 @@ mod tests {
         assert!(final_rendered.contains("Previous durable summary evidence"));
         assert!(final_rendered.contains("Current Task List"));
         assert!(final_rendered.contains("Keep exact paths"));
+        assert!(final_rendered.contains("Target approximately 600 tokens."));
     }
 
     #[tokio::test]
@@ -2895,15 +2837,15 @@ mod tests {
             first_message_id: "first".to_string(),
             last_message_id: "last".to_string(),
         };
-        let requested_output = summarizer.target_for_source(part.represented_source_tokens);
+        let target_tokens = summarizer.target_for_source(part.represented_source_tokens);
         assert!(!summarizer.request_fits(
             &summarizer.build_multipart_finalize_messages(
                 std::slice::from_ref(&part),
-                requested_output,
+                target_tokens,
                 &capsule,
                 true,
             ),
-            requested_output,
+            target_tokens,
             &budget,
         ));
 
@@ -2923,15 +2865,15 @@ mod tests {
             let represented = group.iter().fold(0u32, |total, part| {
                 total.saturating_add(part.represented_source_tokens)
             });
-            let requested_output = summarizer.target_for_source(represented);
+            let target_tokens = summarizer.target_for_source(represented);
             assert!(summarizer.request_fits(
                 &summarizer.build_multipart_finalize_messages(
                     &group,
-                    requested_output,
+                    target_tokens,
                     &capsule,
                     true,
                 ),
-                requested_output,
+                target_tokens,
                 &budget,
             ));
         }

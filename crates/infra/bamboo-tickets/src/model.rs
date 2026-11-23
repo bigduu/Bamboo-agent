@@ -287,6 +287,8 @@ pub struct ManagedWorkRoot {
     pub scope_revision: u64,
     pub project_id: bamboo_domain::ProjectId,
     pub model: bamboo_domain::ProviderModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<bamboo_domain::RootThinkingMode>,
 }
 
 impl ManagedWorkRoot {

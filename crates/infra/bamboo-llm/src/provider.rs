@@ -715,8 +715,6 @@ pub(crate) fn required_tool_from_options<'a>(
     }
 }
 
-pub(crate) const DEFAULT_COMPRESSION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
-
 /// A provider request override can narrow the tools the session may offer.
 /// Names use the exact function identities in the provider's declarations.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -804,12 +802,11 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
-    /// Built-in effort for a compression request before any role override.
-    /// A provider can leave the setting to the upstream when its transport
-    /// cannot reserve a small output budget separately from reasoning.
+    /// A compression-specific preference exposed by the provider, before a
+    /// role override. Leaving it unset preserves the provider's normal policy.
     #[doc(hidden)]
     fn default_compression_reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
-        Some(DEFAULT_COMPRESSION_REASONING_EFFORT)
+        None
     }
 
     /// An immutable downstream handle through which this wrapper sends every

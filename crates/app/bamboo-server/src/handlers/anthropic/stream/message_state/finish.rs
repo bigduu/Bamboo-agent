@@ -34,9 +34,7 @@ impl AnthropicStreamState {
                 "stop_reason": map_stop_reason(reason),
                 "stop_sequence": null
             },
-            "usage": {
-                "output_tokens": 0
-            }
+            "usage": self.final_usage.take().unwrap_or_else(|| json!({"output_tokens": 0}))
         });
         output.push_str(&format_sse_event("message_delta", delta));
 
