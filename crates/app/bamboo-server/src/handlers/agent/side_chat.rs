@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Mutex, time::Duration};
 
-use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse, ResponseError, Result};
+use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_compression::ModelLimitsRegistry;
 use bamboo_domain::{
@@ -212,20 +212,15 @@ impl SideChatRuntime {
 }
 
 pub(crate) fn routes() -> actix_web::Scope {
-    let json_config = web::JsonConfig::default().error_handler(|error, _| {
-        request_error(error.status_code(), "Invalid side chat request body")
-    });
     web::scope("/sessions/{session_id}/side-chat")
-        .app_data(json_config.clone())
-        .app_data(
-            web::PathConfig::default().error_handler(|error, _| {
-                request_error(error.status_code(), "Invalid side chat path")
-            }),
-        )
+        .app_data(web::PathConfig::default().error_handler(|_, _| {
+            // Keep the default Path extractor response status.
+            request_error(StatusCode::NOT_FOUND, "Invalid side chat path")
+        }))
         .route("", web::get().to(get))
         .service(
             web::resource("/turns")
-                .app_data(json_config.limit(64 * 1024))
+                .app_data(web::JsonConfig::default().limit(64 * 1024))
                 .route(web::post().to(start)),
         )
         .route("/runs/{run_id}/stop", web::post().to(stop))
@@ -349,6 +344,15 @@ fn request_error(status: StatusCode, message: impl Into<String>) -> actix_web::E
     InternalError::from_response(message.clone(), json_error(status, message)).into()
 }
 
+fn request_body<T>(body: Result<web::Json<T>>) -> Result<T> {
+    body.map(web::Json::into_inner).map_err(|error| {
+        request_error(
+            error.as_response_error().status_code(),
+            "Invalid side chat request body",
+        )
+    })
+}
+
 fn side_chat_io_error(error: io::Error) -> actix_web::Error {
     match error.kind() {
         io::ErrorKind::InvalidInput => request_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -360,10 +364,10 @@ fn side_chat_io_error(error: io::Error) -> actix_web::Error {
 async fn start(
     state: web::Data<AppState>,
     path: web::Path<String>,
-    body: web::Json<TurnRequest>,
+    body: Result<web::Json<TurnRequest>>,
 ) -> Result<HttpResponse> {
     let source_id = path.into_inner();
-    let request = body.into_inner();
+    let request = request_body(body)?;
     let run_id = request.id;
     let generation = request.source_generation.clone();
     if request.id.is_nil()
@@ -693,9 +697,10 @@ async fn finish(
 async fn stop(
     state: web::Data<AppState>,
     path: web::Path<(String, Uuid)>,
-    request: web::Json<StopRequest>,
+    body: Result<web::Json<StopRequest>>,
 ) -> Result<HttpResponse> {
     let (source_id, run_id) = path.into_inner();
+    let request = request_body(body)?;
     {
         let active = state
             .side_chats
@@ -987,14 +992,19 @@ mod tests {
         .await;
         let endpoint = format!("/api/v1/sessions/{}/side-chat", source.id);
         for (path, payload, status) in [
-            ("turns", "{}".to_owned(), StatusCode::BAD_REQUEST),
+            ("turns".into(), "{}".to_owned(), StatusCode::BAD_REQUEST),
             (
-                "turns",
+                "turns".into(),
                 " ".repeat(64 * 1024 + 1),
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
             (
-                "runs/invalid-run-id/stop",
+                format!("runs/{}/stop", Uuid::new_v4()),
+                "{}".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "runs/invalid-run-id/stop".into(),
                 json!({"chat_id": Uuid::new_v4()}).to_string(),
                 StatusCode::NOT_FOUND,
             ),
