@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Mutex, time::Duration};
 
-use actix_web::{error, web, HttpResponse, Result};
+use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_compression::ModelLimitsRegistry;
 use bamboo_domain::{
@@ -21,7 +21,10 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::app_state::AppState;
+use crate::{
+    app_state::AppState,
+    error::{json_error, json_internal_server_error},
+};
 
 pub(crate) const FEATURE: &str = "session_side_chat";
 pub(crate) const CHANNEL_PREFIX: &str = "agent.side-chat/";
@@ -294,10 +297,15 @@ async fn view(state: &AppState, source_id: &str, mut chat: SideChat) -> io::Resu
 async fn get(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let source_id = path.into_inner();
     let source = read_record(&state, &source_id)
-        .await?
-        .ok_or_else(|| error::ErrorNotFound("Main chat not found"))?;
+        .await
+        .map_err(side_chat_io_error)?
+        .ok_or_else(|| request_error(StatusCode::NOT_FOUND, "Main chat not found"))?;
     let chat = match source.chat {
-        Some(record) => Some(view(&state, &source_id, record).await?),
+        Some(record) => Some(
+            view(&state, &source_id, record)
+                .await
+                .map_err(side_chat_io_error)?,
+        ),
         None => None,
     };
     Ok(response(HttpResponse::Ok(), &source.generation, chat))
@@ -327,11 +335,16 @@ fn conflict() -> io::Error {
     )
 }
 
-fn admission_error(error: io::Error) -> actix_web::Error {
+fn request_error(status: StatusCode, message: impl Into<String>) -> actix_web::Error {
+    let message = message.into();
+    InternalError::from_response(message.clone(), json_error(status, message)).into()
+}
+
+fn side_chat_io_error(error: io::Error) -> actix_web::Error {
     match error.kind() {
-        io::ErrorKind::InvalidInput => error::ErrorBadRequest(error),
-        io::ErrorKind::WouldBlock => error::ErrorConflict(error),
-        _ => error::ErrorInternalServerError("Could not save the side chat"),
+        io::ErrorKind::InvalidInput => request_error(StatusCode::BAD_REQUEST, error.to_string()),
+        io::ErrorKind::WouldBlock => request_error(StatusCode::CONFLICT, error.to_string()),
+        _ => json_internal_server_error("Could not access the side chat"),
     }
 }
 
@@ -356,37 +369,50 @@ async fn start(
             .as_ref()
             .is_some_and(|quote| quote.text.trim().is_empty() || quote.text.len() > QUOTE_BYTES)
     {
-        return Err(error::ErrorBadRequest(
+        return Err(request_error(
+            StatusCode::BAD_REQUEST,
             "Invalid side chat question or quote",
         ));
     }
     let mut account = state.account_sink.subscribe();
     // Missing or ineligible sources do not acquire on-disk turn leases.
     let source = read_record(&state, &source_id)
-        .await?
-        .ok_or_else(|| error::ErrorNotFound("Main chat not found"))?;
+        .await
+        .map_err(side_chat_io_error)?
+        .ok_or_else(|| request_error(StatusCode::NOT_FOUND, "Main chat not found"))?;
     if source.generation != generation {
-        return Err(admission_error(conflict()));
+        return Err(side_chat_io_error(conflict()));
     }
     let lease = state
         .session_store
         .try_lock_side_chat_run(&source_id)
-        .await?;
+        .await
+        .map_err(side_chat_io_error)?;
     let Some(lease) = lease else {
-        if let Some(source) = read_record(&state, &source_id).await? {
+        if let Some(source) = read_record(&state, &source_id)
+            .await
+            .map_err(side_chat_io_error)?
+        {
             if source.generation == generation {
                 if let Some(chat) = source.chat {
-                    if request.is_replay(&chat).map_err(admission_error)? {
+                    if request.is_replay(&chat).map_err(side_chat_io_error)? {
                         return Ok(response(
                             HttpResponse::Accepted(),
                             &generation,
-                            Some(view(&state, &source_id, chat).await?),
+                            Some(
+                                view(&state, &source_id, chat)
+                                    .await
+                                    .map_err(side_chat_io_error)?,
+                            ),
                         ));
                     }
                 }
             }
         }
-        return Err(error::ErrorConflict("The side chat is already answering"));
+        return Err(request_error(
+            StatusCode::CONFLICT,
+            "The side chat is already answering",
+        ));
     };
 
     let config = state.config.read().await.clone();
@@ -498,8 +524,8 @@ async fn start(
             ))
         })
         .await
-        .map_err(admission_error)?
-        .ok_or_else(|| error::ErrorNotFound("Main chat not found"))?;
+        .map_err(side_chat_io_error)?
+        .ok_or_else(|| request_error(StatusCode::NOT_FOUND, "Main chat not found"))?;
 
     let (chat, model, messages, output_tokens) = match planned {
         Admission::Start {
@@ -513,7 +539,11 @@ async fn start(
             return Ok(response(
                 HttpResponse::Accepted(),
                 &generation,
-                Some(view(&state, &source_id, record).await?),
+                Some(
+                    view(&state, &source_id, record)
+                        .await
+                        .map_err(side_chat_io_error)?,
+                ),
             ));
         }
     };
@@ -674,10 +704,13 @@ async fn stop(
     // A stop of an already terminal turn is safe to replay. An unknown run
     // cannot stop a successor or the independently owned main task.
     let record = read_record(&state, &source_id)
-        .await?
+        .await
+        .map_err(side_chat_io_error)?
         .and_then(|source| source.chat);
     if let Some(chat) = record.filter(|chat| chat.id == request.chat_id) {
-        let chat = view(&state, &source_id, chat).await?;
+        let chat = view(&state, &source_id, chat)
+            .await
+            .map_err(side_chat_io_error)?;
         if chat
             .turns
             .iter()
@@ -686,7 +719,8 @@ async fn stop(
             return Ok(HttpResponse::NoContent().finish());
         }
     }
-    Err(error::ErrorConflict(
+    Err(request_error(
+        StatusCode::CONFLICT,
         "That side chat run is no longer available on this server",
     ))
 }
@@ -958,6 +992,9 @@ mod tests {
                 .to_request(),
         ).await;
         assert_eq!(missing_source.status(), StatusCode::NOT_FOUND);
+        let missing_body: Value = test::read_body_json(missing_source).await;
+        assert_eq!(missing_body["error"]["message"], "Main chat not found");
+        assert_eq!(missing_body["error"]["type"], "api_error");
         assert!(!home.path().join("side-chat-locks").exists());
 
         let execute = test::call_service(
@@ -1197,6 +1234,12 @@ mod tests {
         )
         .await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let replay_body: Value = test::read_body_json(replay).await;
+        assert_eq!(
+            replay_body["error"]["message"],
+            "Side chat changed. Refresh and try again."
+        );
+        assert_eq!(replay_body["error"]["type"], "api_error");
         assert!(calls.try_recv().is_err());
     }
 }
