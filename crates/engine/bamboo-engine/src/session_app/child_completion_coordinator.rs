@@ -4164,17 +4164,21 @@ struct ChildReplayRetry {
     updated_at: chrono::DateTime<Utc>,
     launch_generation: u64,
     host_run_id: Option<String>,
-    status: String,
+    indexed_status: String,
+    saved_status: Option<String>,
+    source_fingerprint: Option<[u8; 32]>,
     retry_at: tokio::time::Instant,
 }
 
 impl ChildReplayRetry {
-    fn matches(&self, child: &Session, status: &str) -> bool {
+    fn matches(&self, child: &Session, indexed_status: &str) -> bool {
         self.created_at == child.created_at
             && self.updated_at == child.updated_at
             && self.launch_generation == child.child_launch_generation()
             && self.host_run_id.as_deref() == child.host_run_id()
-            && self.status == status
+            && self.indexed_status == indexed_status
+            && self.saved_status == child.last_run_status()
+            && self.source_fingerprint == ChildCompletionSource::replay_record_fingerprint(child)
     }
 }
 
@@ -4745,7 +4749,10 @@ impl ChildCompletionCoordinator {
                                 updated_at: observed_child.updated_at,
                                 launch_generation: observed_child.child_launch_generation(),
                                 host_run_id: observed_child.host_run_id().map(str::to_owned),
-                                status: completion.status,
+                                indexed_status: completion.status,
+                                saved_status: observed_child.last_run_status(),
+                                source_fingerprint:
+                                    ChildCompletionSource::replay_record_fingerprint(observed_child),
                                 retry_at,
                             },
                         );
@@ -7620,12 +7627,27 @@ mod tests {
 
     #[tokio::test]
     async fn watchdog_warns_once_until_a_blocked_child_can_replay() {
-        for changed_control_plane in [true, false] {
-            verify_blocked_child_replay_retry(changed_control_plane).await;
+        for recovery in [
+            ChildReplayRecovery::NewTimestamp,
+            ChildReplayRecovery::TranscriptOnly,
+        ] {
+            verify_blocked_child_replay_retry(recovery).await;
         }
     }
 
-    async fn verify_blocked_child_replay_retry(changed_control_plane: bool) {
+    #[tokio::test]
+    async fn watchdog_replays_a_committed_seal_at_the_next_sweep() {
+        verify_blocked_child_replay_retry(ChildReplayRecovery::CommittedSeal).await;
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum ChildReplayRecovery {
+        NewTimestamp,
+        TranscriptOnly,
+        CommittedSeal,
+    }
+
+    async fn verify_blocked_child_replay_retry(recovery: ChildReplayRecovery) {
         use tracing::instrument::WithSubscriber;
 
         #[derive(Clone, Default)]
@@ -7659,12 +7681,26 @@ mod tests {
         write_runtime_state(&mut parent, &runtime);
         parent.set_last_run_status("suspended");
         store.save_session(&parent).await.unwrap();
-        save_completion_test_child(&store, parent_id, child_id, "completed").await;
-        let mut sealed = store.load_session(child_id).await.unwrap().unwrap();
-        let mut unsealed = sealed.clone();
-        unsealed.messages[0].content = "later output that the seal does not cover".into();
-        store.save_session(&unsealed).await.unwrap();
-        if !changed_control_plane {
+        let run_id = "replay-retry-run";
+        let mut sealed = Session::new_child_of(child_id, &parent, "model", "Child");
+        sealed.add_message(Message::assistant("result-replay-retry-child", None));
+        sealed.set_last_run_status("completed");
+        ChildCompletionSource::prepare(&mut sealed, run_id, &Default::default());
+        let mut blocked = sealed.clone();
+        if recovery == ChildReplayRecovery::CommittedSeal {
+            assert!(
+                ChildCompletionSource::defer_for_durable_delivery(&mut blocked, run_id).unwrap()
+            );
+        } else {
+            blocked.messages[0].content = "later output that the seal does not cover".into();
+        }
+        store.save_session(&blocked).await.unwrap();
+        let before = store
+            .load_runtime_control_plane(child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if recovery == ChildReplayRecovery::TranscriptOnly {
             tokio::time::pause();
         }
 
@@ -7702,11 +7738,21 @@ mod tests {
         assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
         assert_eq!(launches.load(Ordering::SeqCst), 0);
 
-        if changed_control_plane {
+        if recovery == ChildReplayRecovery::NewTimestamp {
             sealed.updated_at += chrono::Duration::seconds(1);
         }
         store.save_session(&sealed).await.unwrap();
-        if !changed_control_plane {
+        if recovery == ChildReplayRecovery::CommittedSeal {
+            let after = store
+                .load_runtime_control_plane(child_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(before.updated_at, after.updated_at);
+            assert_eq!(before.last_run_status(), after.last_run_status());
+            assert_ne!(before.metadata, after.metadata);
+        }
+        if recovery == ChildReplayRecovery::TranscriptOnly {
             coordinator.sweep_child_waits(&mut wait_states).await;
             assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
             tokio::time::advance(CHILD_REPLAY_RETRY_INTERVAL).await;
