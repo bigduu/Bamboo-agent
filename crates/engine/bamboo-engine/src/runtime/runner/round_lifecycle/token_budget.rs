@@ -1,7 +1,9 @@
+use crate::llm_summarizer::COMPATIBILITY_SUMMARY_INPUT_TOKENS;
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
 use bamboo_compression::limits::{
     default_model_limit, load_model_limits_from_unified_config, ModelLimit,
+    DEFAULT_MAX_OUTPUT_TOKENS,
 };
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
@@ -10,10 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-const CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS: u32 = 32_000;
-const CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS: u32 = 8_000;
-const CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN: u32 = 1_000;
 const MODEL_INFO_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowMode {
+    AgentRound,
+    Child,
+    Summary,
+}
 
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
@@ -79,39 +85,14 @@ pub(super) async fn resolve_auxiliary_token_budget(
     let configured_limit =
         resolve_configured_model_limit(config, model_name, &model_limits_path, "summarization")
             .await;
-    let reported = reported_model_limits(llm, model_name).await.filter(|info| {
-        configured_limit.is_some()
-            || info.max_context_tokens.is_some()
-            || info.max_input_tokens.is_some()
-    });
-    match resolve_window(configured_limit.as_ref(), reported.as_ref(), false) {
-        Some((budget, _)) => budget,
-        None => {
-            let key = ("unknown-summarization-model-limit", model_name);
-            let error = "no configured or provider-reported limit";
-            if STATIC_WARNINGS.insert_if_new(&key, error) {
-                tracing::warn!(
-                    model = model_name,
-                    context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
-                    output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
-                    "No summarization-model limit is known; using conservative bounded fallback"
-                );
-            } else {
-                tracing::debug!(
-                    model = model_name,
-                    context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
-                    output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
-                    "No summarization-model limit is known; using conservative bounded fallback"
-                );
-            }
-            TokenBudget::with_safety_margin(
-                CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
-                CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
-                bamboo_compression::BudgetStrategy::default(),
-                CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN,
-            )
-        }
-    }
+    let reported = reported_model_limits(llm, model_name).await;
+    let (budget, _) = resolve_window(
+        configured_limit.as_ref(),
+        reported.as_ref(),
+        WindowMode::Summary,
+    )
+    .expect("summary budget has compatibility defaults");
+    budget
 }
 
 pub(super) async fn resolve_token_budget(
@@ -195,8 +176,13 @@ async fn resolve_token_budget_with_model_limits_path(
     let configured_limit =
         resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
     let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
+    let mode = if dynamic {
+        WindowMode::AgentRound
+    } else {
+        WindowMode::Child
+    };
     let (budget, provider_default_output) =
-        resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), dynamic).unwrap_or_else(
+        resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), mode).unwrap_or_else(
             || {
                 let fallback = default_model_limit();
                 tracing::info!(
@@ -392,7 +378,7 @@ async fn reported_model_limits(
 fn resolve_window(
     configured: Option<&ModelLimit>,
     reported: Option<&ProviderModelInfo>,
-    dynamic: bool,
+    mode: WindowMode,
 ) -> Option<(TokenBudget, bool)> {
     fn tighter(left: Option<u32>, right: Option<u32>) -> Option<u32> {
         match (left, right) {
@@ -405,7 +391,13 @@ fn resolve_window(
         configured.map(|limit| limit.max_context_tokens),
         reported.and_then(|info| info.max_context_tokens),
     );
-    let input_limit = reported.and_then(|info| info.max_input_tokens);
+    let reported_input_limit = reported.and_then(|info| info.max_input_tokens);
+    // With no known summary input limit, keep input chunks small and size the
+    // request with a separate output allowance for reasoning and summary text.
+    let input_limit = reported_input_limit.or_else(|| {
+        (joint_window.is_none() && mode == WindowMode::Summary)
+            .then_some(COMPATIBILITY_SUMMARY_INPUT_TOKENS)
+    });
     let output_limit = tighter(
         configured.and_then(|limit| limit.max_output_tokens),
         reported.and_then(|info| info.max_output_tokens),
@@ -415,9 +407,13 @@ fn resolve_window(
     }
 
     let fallback = default_model_limit();
+    let dynamic = mode == WindowMode::AgentRound;
     let provider_default_output =
         dynamic && output_limit.is_none() && configured.is_some_and(|limit| limit.unlimited_output);
     let output = output_limit.unwrap_or_else(|| {
+        if mode == WindowMode::Summary {
+            return DEFAULT_MAX_OUTPUT_TOKENS;
+        }
         let sizing_window = joint_window
             .or(input_limit)
             .unwrap_or(fallback.max_context_tokens);
@@ -446,8 +442,10 @@ fn resolve_window(
         configured = configured.is_some(),
         provider_metadata = reported.is_some(),
         ?joint_window,
+        ?reported_input_limit,
         ?input_limit,
         ?output_limit,
+        planned_output_limit = output,
         planning_window = context,
         "Resolved model token limits"
     );
@@ -1242,7 +1240,7 @@ mod tests {
             max_output_tokens: Some(48_000),
         };
         let (budget, provider_default) =
-            resolve_window(Some(&explicit), Some(&provider), true).unwrap();
+            resolve_window(Some(&explicit), Some(&provider), WindowMode::AgentRound).unwrap();
         assert!(!provider_default);
         assert_eq!(budget.max_context_tokens, 96_000);
         assert_eq!(budget.max_request_input_tokens(), 66_000);
@@ -1255,12 +1253,14 @@ mod tests {
     fn unlimited_output_respects_route_ceilings_and_allows_provider_defaults() {
         let mut configured = ModelLimit::new("fixture-model", 256_000);
         configured.safety_margin = Some(1_000);
-        let (automatic, provider_default) = resolve_window(Some(&configured), None, true).unwrap();
+        let (automatic, provider_default) =
+            resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
         assert!(!provider_default);
         assert_eq!(automatic.output_limit_for_input(32_000), 64_000);
 
         configured.unlimited_output = true;
-        let (unlimited, provider_default) = resolve_window(Some(&configured), None, true).unwrap();
+        let (unlimited, provider_default) =
+            resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
         assert!(provider_default);
         assert_eq!(unlimited.max_request_input_tokens(), 254_000);
         assert_eq!(unlimited.output_limit_for_input(32_000), 64_000);
@@ -1273,7 +1273,7 @@ mod tests {
             max_output_tokens: Some(80_000),
         };
         let (with_metadata, provider_default) =
-            resolve_window(Some(&configured), Some(&reported), true).unwrap();
+            resolve_window(Some(&configured), Some(&reported), WindowMode::AgentRound).unwrap();
         assert!(!provider_default);
         assert_eq!(with_metadata.output_limit_for_input(32_000), 80_000);
         assert_eq!(with_metadata.output_limit_for_input(108_000), 51_000);
@@ -1281,11 +1281,12 @@ mod tests {
 
         reported.max_output_tokens = None;
         let (joint_only, provider_default) =
-            resolve_window(Some(&configured), Some(&reported), true).unwrap();
+            resolve_window(Some(&configured), Some(&reported), WindowMode::AgentRound).unwrap();
         assert!(provider_default);
         assert_eq!(joint_only.output_limit_for_input(32_000), 40_000);
 
-        let (fixed, provider_default) = resolve_window(Some(&configured), None, false).unwrap();
+        let (fixed, provider_default) =
+            resolve_window(Some(&configured), None, WindowMode::Child).unwrap();
         assert!(!provider_default);
         assert_eq!(fixed.max_output_tokens, 64_000);
         assert_eq!(fixed.output_reserve_tokens, None);
@@ -1396,7 +1397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auxiliary_budget_uses_conservative_fallback_when_limit_is_unknown() {
+    async fn auxiliary_budget_defaults_input_and_output_independently() {
         let config = AgentLoopConfig::default();
         let provider = MetadataProvider::default();
 
@@ -1407,13 +1408,14 @@ mod tests {
         )
         .await;
         assert_eq!(
-            budget.max_context_tokens,
-            CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS
+            budget.max_input_tokens,
+            Some(COMPATIBILITY_SUMMARY_INPUT_TOKENS)
         );
         assert_eq!(
-            budget.max_output_tokens,
-            CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS
+            budget.max_context_tokens,
+            COMPATIBILITY_SUMMARY_INPUT_TOKENS + DEFAULT_MAX_OUTPUT_TOKENS
         );
-        assert_eq!(budget.safety_margin, CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
+        assert_eq!(budget.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(budget.safety_margin, 1_000);
     }
 }

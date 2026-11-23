@@ -552,7 +552,7 @@ async fn compact_session_refuses_pending_work_before_calling_a_model() {
 }
 
 #[actix_web::test]
-async fn compact_session_reports_empty_summary_with_reasoning_guidance() {
+async fn compact_session_reports_empty_summary_and_preserves_history() {
     let (_home, state, probe, _) = fixture(ContextManagementStrategy::Summary).await;
     let before = state.storage.load_session(ID).await.unwrap().unwrap();
     probe.return_empty_summary.store(true, Ordering::SeqCst);
@@ -562,10 +562,10 @@ async fn compact_session_reports_empty_summary_with_reasoning_guidance() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body: Value = test::read_body_json(response).await;
     assert_eq!(body["error"]["code"], "context_summary_empty");
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Lower the reasoning effort"));
+    assert_eq!(
+        body["error"]["message"],
+        "Context compression could not finish. Your conversation history was preserved."
+    );
     assert_eq!(probe.summaries.load(Ordering::SeqCst), 1);
     assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);
     let stored = state.storage.load_session(ID).await.unwrap().unwrap();

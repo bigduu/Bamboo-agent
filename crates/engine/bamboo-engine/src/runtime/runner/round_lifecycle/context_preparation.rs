@@ -2481,8 +2481,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // provider requests. Any failed map/reduce stage must surface without
     // substituting a heuristic summary, otherwise the caller could archive a
     // candidate set after only part of the source was successfully processed.
-    // The mid-turn caller still swallows this error as best-effort (#238);
-    // pre-turn/overflow callers retain the unchanged session and can retry.
+    // The mid-turn caller treats this as best-effort (#238). Pre-turn may
+    // continue after an empty automatic summary if the whole prompt still fits.
     let summarizer = LlmSummarizer::new(
         Arc::clone(summary_provider),
         summary_model.to_string(),
@@ -2532,7 +2532,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
                         progress.stage_index,
                         progress.stage_count,
                         progress.estimated_input_tokens,
-                        progress.requested_output_tokens,
+                        progress.max_output_tokens,
                         progress.safe_request_tokens,
                         progress.model_context_tokens,
                     );
@@ -3289,6 +3289,7 @@ pub(super) async fn prepare_round_context(
 
     let counter = TiktokenTokenCounter::default();
     let mut boundary_prepared = None;
+    let mut automatic_summary_was_empty = false;
 
     if retrieval_window_enabled {
         if session.force_manual_compression.is_some() {
@@ -3418,25 +3419,33 @@ pub(super) async fn prepare_round_context(
                 Err(error) => return Err(error),
             }
         }
-    } else if maybe_apply_summary_context_compression_with_budget(
-        session,
-        config,
-        model_name,
-        session_id,
-        tool_schemas,
-        llm,
-        &budget,
-        event_tx,
-        "pre-turn",
-        None,
-        Some(&mut boundary_prepared),
-    )
-    .await?
-    {
-        tracing::debug!(
-            "[{}] Recomputing prepared context after forced compression fallback",
-            session_id
-        );
+    } else {
+        let automatic = session.force_manual_compression.is_none();
+        match maybe_apply_summary_context_compression_with_budget(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            &budget,
+            event_tx,
+            "pre-turn",
+            None,
+            Some(&mut boundary_prepared),
+        )
+        .await
+        {
+            Ok(true) => tracing::debug!(
+                "[{}] Recomputing prepared context after forced compression fallback",
+                session_id
+            ),
+            Ok(false) => {}
+            Err(AgentError::EmptyContextSummary) if automatic => {
+                automatic_summary_was_empty = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     // Compression may have reset/coalesced the ledger, so measure it again at
@@ -3466,6 +3475,11 @@ pub(super) async fn prepare_round_context(
     );
 
     loop {
+        // Failed compaction never authorizes dropping messages from this
+        // request. Check both the initial fit and every exact provider refit.
+        if automatic_summary_was_empty && prepared_context.truncation_occurred {
+            return Err(AgentError::EmptyContextSummary);
+        }
         // Reconciliation may append snapshots that did not exist when the
         // durable ledger was measured above, especially after retention or
         // hard-truncation starts a fresh epoch. Project the exact final IR on a
