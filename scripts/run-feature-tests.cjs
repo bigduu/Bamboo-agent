@@ -237,7 +237,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2940 enables the Messages comparison in the existing bamboo-llm default owner.
 // #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
 // #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
-const FEATURE_SOURCE_SHA256 = "4060f10347dec1187b57a693745f48afc5999ec3244a4f02b0424c5819353853";
+// Managed Root and legacy Work Ultra cases use the existing native Work test
+// target. Ultra model ceilings retain their existing default Engine owner.
+// Messages cache checkpoints and SSE usage stay in the existing LLM,
+// Engine, and Server handler owners.
+const FEATURE_SOURCE_SHA256 = "a8c74adeba15eeb995d08e2523b8b55561458f1f4fc3f60175a06ea3000d91ca";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

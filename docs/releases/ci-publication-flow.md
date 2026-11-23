@@ -78,6 +78,10 @@ block continues to supply the machine-readable receipt.
 
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
+The frozen-source guard retries temporary GitHub metadata read failures using
+fresh GET requests. Each read permits three retries after 1, 2, and 4 seconds.
+Access errors and failed source checks still stop publication, and writes
+remain outside the retry.
 If infrastructure fails, retain successful outputs and retry only the missing
 work with the same source/version. If a crate build may have started but its
 original archive and signed checksum cannot be confirmed, stop for recovery;

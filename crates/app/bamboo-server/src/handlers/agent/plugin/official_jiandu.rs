@@ -38,7 +38,8 @@ struct Release {
 #[derive(Deserialize)]
 struct Catalog {
     release: Option<Release>,
-    legacy_release: Option<Release>,
+    #[serde(default)]
+    legacy_releases: Vec<Release>,
 }
 
 fn accepted_catalog() -> Catalog {
@@ -171,7 +172,7 @@ async fn setup(
     let entry = registry.get_unique("jiandu")?;
     // Setup reports the accepted release for the installed connector so its
     // external MCP configuration remains available until an explicit update.
-    let legacy_release = catalog.legacy_release.as_ref().filter(|release| {
+    let legacy_release = catalog.legacy_releases.iter().find(|release| {
         entry.is_some_and(|entry| {
             entry.status == PluginInstallStatus::Installed && valid_provenance(entry, release)
         })

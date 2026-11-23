@@ -125,6 +125,17 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
             guidance,
         ));
     }
+    if session.root_orchestration_only_enabled()
+        && crate::ticket_runtime::is_managed_work_root(session)
+    {
+        return Some(ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::Critical,
+            ContextBlockStability::SessionStable,
+            "Work Ultra thinking mode",
+            "Use the highest reasoning tier available on the primary model. Complete the assigned Work using only the tools permitted by its contract.",
+        ));
+    }
     (session.root_orchestration_prompt_enabled() || session.root_orchestration_only_enabled()).then(
         || {
             let guidance = if session.root_orchestration_only_enabled() {
