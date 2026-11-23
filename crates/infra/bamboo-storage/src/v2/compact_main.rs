@@ -69,7 +69,7 @@ pub(super) fn public_title(title: &str) -> String {
 }
 
 impl CompactMainAuthority {
-    fn from_session(session: &Session) -> io::Result<Self> {
+    pub(super) fn from_session(session: &Session) -> io::Result<Self> {
         let mut authority = Self {
             id: session.id.clone(),
             created_at: session.created_at,

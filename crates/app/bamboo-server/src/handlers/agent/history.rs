@@ -1,13 +1,21 @@
 //! Session history API handler.
 //!
 //! This module provides the HTTP endpoint for retrieving chat session history,
-//! with optional delta retrieval via a `since_message_id` cursor.
+//! with optional forward deltas and pages of earlier visible messages.
 
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{http::header, web, HttpRequest, HttpResponse, Responder};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use bamboo_agent_core::{Message, Role};
+use bamboo_agent_core::{Message, Role, Session};
+use bamboo_domain::session::history::{
+    history_page_start, is_hidden_from_ui, HistoryScope, SessionHistoryWindow,
+    RECENT_HISTORY_MESSAGE_LIMIT,
+};
+
+use bamboo_domain::MessagePart;
 
 use crate::app_state::AppState;
 
@@ -73,9 +81,69 @@ pub struct HistoryQuery {
     /// found (e.g. the client is far behind, or the message was edited away).
     #[serde(default)]
     pub since_message_id: Option<String>,
+    /// Maximum recent page size before extending left to keep a tool group.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// The opaque boundary returned by the previous page in this transcript.
+    #[serde(default)]
+    pub before_message_id: Option<String>,
     /// The default remains the existing full-fidelity history contract.
     #[serde(default)]
     pub projection: Option<HistoryProjection>,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryPageRequest<'a> {
+    limit: usize,
+    before: Option<&'a str>,
+}
+
+pub(super) enum HistoryPageError {
+    InvalidQuery,
+    StaleCursor,
+}
+
+impl HistoryPageError {
+    pub(super) fn response(self, session_id: &str) -> HttpResponse {
+        let (mut response, code, message) = match self {
+            Self::InvalidQuery => (
+                HttpResponse::BadRequest(),
+                "invalid_history_page",
+                "History pages require a limit from 1 to 100 and a valid cursor query",
+            ),
+            Self::StaleCursor => (
+                HttpResponse::Conflict(),
+                "history_cursor_stale",
+                "The history cursor is no longer present in the conversation",
+            ),
+        };
+        response.json(serde_json::json!({
+            "error": { "type": "api_error", "code": code, "message": message },
+            "session_id": session_id
+        }))
+    }
+}
+
+impl HistoryQuery {
+    fn page(&self) -> Result<Option<HistoryPageRequest<'_>>, HistoryPageError> {
+        if self.limit.is_none() && self.before_message_id.is_none() {
+            return Ok(None);
+        }
+        let limit = self.limit.unwrap_or(RECENT_HISTORY_MESSAGE_LIMIT);
+        let before = self.before_message_id.as_deref();
+        if !(1..=RECENT_HISTORY_MESSAGE_LIMIT).contains(&limit)
+            || self.since_message_id.is_some()
+            || self.projection.is_some()
+            || before.is_some_and(str::is_empty)
+        {
+            return Err(HistoryPageError::InvalidQuery);
+        }
+        Ok(Some(HistoryPageRequest { limit, before }))
+    }
+
+    pub(super) fn wants_page(&self) -> bool {
+        self.limit.is_some() || self.before_message_id.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -136,45 +204,33 @@ fn message_reference(message: &Message, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Retrieve message history for a chat session.
-///
-/// # HTTP Method
-///
-/// `GET /api/v1/sessions/{session_id}/history`
-///
-/// # Path Parameters
-///
-/// - `session_id` - The session identifier
-///
-/// # Response
-///
-/// Returns a JSON object containing the session ID and message history.
-///
-/// # Response Format
-///
-/// ```json
-/// {
-///   "session_id": "session-123",
-///   "messages": []
-/// }
-/// ```
-///
-/// # Note
-///
-/// Currently returns an empty messages array. Full history retrieval
-/// is planned for a future release.
-///
-/// # Example
-///
-/// ```bash
-/// curl http://localhost:9562/api/v1/sessions/session-123/history
-/// ```
+/// Return the conversation history in chronological order. The default
+/// response and forward delta stay compatible with existing readers.
 pub async fn handler(
     state: web::Data<AppState>,
+    request: HttpRequest,
     path: web::Path<String>,
     query: web::Query<HistoryQuery>,
 ) -> impl Responder {
     let session_id = path.into_inner();
+    let mut query = query.into_inner();
+    // The chat can opt in to the default initial page without changing its
+    // existing URL. An explicit query selects the requested representation.
+    if !query.wants_page()
+        && query.since_message_id.is_none()
+        && query.projection.is_none()
+        && request
+            .headers()
+            .get(header::ACCEPT)
+            .is_some_and(|value| value == "application/json; bamboo-history-limit=100")
+    {
+        query.limit = Some(RECENT_HISTORY_MESSAGE_LIMIT);
+    }
+    match query.page() {
+        Ok(Some(page)) => return read_history_page(&state, &session_id, &query, page).await,
+        Ok(None) => {}
+        Err(error) => return error.response(&session_id),
+    }
 
     // When an agent runner is active the in-memory session cache (`state.sessions`)
     // may lag behind disk because the loop works with a local `&mut Session` and only
@@ -289,21 +345,81 @@ pub async fn handler(
         }));
     };
 
-    HttpResponse::Ok().json(render_history(&session_id, session, &query))
+    match render_history(&session_id, session, &query) {
+        Ok(body) => history_response(body),
+        Err(error) => error.response(&session_id),
+    }
 }
 
-/// Render an already selected immutable Session using the legacy UI history
-/// rules. Callers choose and authenticate the snapshot before reaching here.
+fn history_response(body: serde_json::Value) -> HttpResponse {
+    HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .insert_header((header::VARY, "Accept"))
+        .json(body)
+}
+
+async fn read_history_page(
+    state: &AppState,
+    session_id: &str,
+    query: &HistoryQuery,
+    page: HistoryPageRequest<'_>,
+) -> HttpResponse {
+    let result = if page.before.is_some() {
+        state
+            .storage
+            .load_session(session_id)
+            .await
+            .map(|session| session.map(|session| render_history(session_id, session, query)))
+    } else {
+        state
+            .storage
+            .load_recent_session_history(session_id)
+            .await
+            .map(|window| {
+                window.map(|mut window| {
+                    let start =
+                        history_page_start(&window.messages, window.messages.len(), page.limit);
+                    window.messages.drain(..start);
+                    let oldest_index = window.total_message_count - window.messages.len();
+                    Ok(render_history_page(session_id, window, oldest_index))
+                })
+            })
+    };
+    match result {
+        Ok(Some(Ok(body))) => history_response(body),
+        Ok(Some(Err(error))) => error.response(session_id),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": crate::error::error_value("Session not found"),
+            "session_id": session_id
+        })),
+        Err(error) => {
+            tracing::error!(%session_id, %error, "committed history page could not be read");
+            if error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+            {
+                return authority_unavailable_response(session_id);
+            }
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value("Failed to load session history"),
+                "session_id": session_id
+            }))
+        }
+    }
+}
+
+/// Render a selected immutable Session after the caller has checked its authority.
 pub(super) fn render_history(
     session_id: &str,
-    session: bamboo_agent_core::Session,
+    session: Session,
     query: &HistoryQuery,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, HistoryPageError> {
+    let page = query.page()?;
     if query.projection == Some(HistoryProjection::Messages) {
         let mut messages: Vec<_> = session
             .messages
             .into_iter()
-            .filter(|message| !bamboo_engine::session_app::execute::is_hidden_from_ui(message))
+            .filter(|message| !is_hidden_from_ui(message))
             .filter_map(project_message)
             .collect();
 
@@ -328,21 +444,40 @@ pub(super) fn render_history(
             messages.drain(..messages.len() - MAX_HISTORY_MESSAGES);
         }
 
-        return serde_json::json!({
+        return Ok(serde_json::json!({
             "session_id": session_id,
             "projection": "messages",
             "messages": messages,
             "is_delta": is_delta,
             "truncated": truncated,
             "total_message_count": total_message_count
-        });
+        }));
     }
 
+    let scope = HistoryScope::from(&session);
     let mut messages: Vec<_> = session
         .messages
         .into_iter()
-        .filter(|message| !bamboo_engine::session_app::execute::is_hidden_from_ui(message))
+        .filter(|message| !is_hidden_from_ui(message))
         .collect();
+
+    if let Some(page) = page {
+        let total_message_count = messages.len();
+        let end = match page.before {
+            Some(cursor) => history_cursor_position(session_id, scope, &messages, cursor)
+                .ok_or(HistoryPageError::StaleCursor)?,
+            None => total_message_count,
+        };
+        let start = history_page_start(&messages, end, page.limit);
+        let window = SessionHistoryWindow {
+            scope,
+            messages: messages.drain(start..end).collect(),
+            total_message_count,
+            compression_events: session.compression_events,
+            metadata: session.metadata,
+        };
+        return Ok(render_history_page(session_id, window, start));
+    }
 
     // Delta mode: if the client supplied a cursor and we can locate it, return
     // only the messages after it. This naturally includes assistant and tool
@@ -364,9 +499,110 @@ pub(super) fn render_history(
     let total_message_count = messages.len();
     let truncated = cap_cold_history(&mut messages, is_delta, |m| matches!(m.role, Role::Tool));
 
+    let window = SessionHistoryWindow {
+        scope,
+        messages,
+        total_message_count,
+        compression_events: session.compression_events,
+        metadata: session.metadata,
+    };
+    Ok(render_full_history(session_id, window, is_delta, truncated))
+}
+
+/// A cursor identifies a visible occurrence, including legacy rows with missing
+/// or repeated IDs. The witness survives append, archive and prompt compaction;
+/// conversation reset or a changed boundary requires restarting at the tail.
+fn history_cursor(
+    session_id: &str,
+    scope: HistoryScope,
+    index: usize,
+    message: &Message,
+) -> String {
+    let mut witness = Sha256::new();
+    witness.update(b"bamboo-history-occurrence-v1");
+    witness.update(scope.created_at.timestamp().to_be_bytes());
+    witness.update(scope.created_at.timestamp_subsec_nanos().to_be_bytes());
+    witness.update(scope.conversation_revision.to_be_bytes());
+    witness.update((index as u64).to_be_bytes());
+    hash_history_field(&mut witness, session_id);
+    let role = match message.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    };
+    hash_history_field(&mut witness, role);
+    hash_history_field(&mut witness, &message.content);
+    hash_history_field(
+        &mut witness,
+        message.tool_call_id.as_deref().unwrap_or_default(),
+    );
+    for part in message.content_parts.as_deref().unwrap_or_default() {
+        match part {
+            MessagePart::Text { text } => {
+                hash_history_field(&mut witness, "text");
+                hash_history_field(&mut witness, text);
+            }
+            MessagePart::ImageUrl { image_url } => {
+                hash_history_field(&mut witness, "image_url");
+                hash_history_field(&mut witness, &image_url.url);
+            }
+        }
+    }
+    for call in message.tool_calls.as_deref().unwrap_or_default() {
+        hash_history_field(&mut witness, "call");
+        hash_history_field(&mut witness, &call.id);
+        hash_history_field(&mut witness, &call.function.name);
+        hash_history_field(&mut witness, &call.function.arguments);
+    }
+    format!("{index}.{}", URL_SAFE_NO_PAD.encode(witness.finalize()))
+}
+
+fn hash_history_field(witness: &mut Sha256, value: &str) {
+    witness.update((value.len() as u64).to_be_bytes());
+    witness.update(value.as_bytes());
+}
+
+fn history_cursor_position(
+    session_id: &str,
+    scope: HistoryScope,
+    messages: &[Message],
+    cursor: &str,
+) -> Option<usize> {
+    let index: usize = cursor.split_once('.')?.0.parse().ok()?;
+    let message = messages.get(index)?;
+    (index > 0
+        && history_page_start(messages, index + 1, 1) == index
+        && history_cursor(session_id, scope, index, message) == cursor)
+        .then_some(index)
+}
+
+fn render_history_page(
+    session_id: &str,
+    window: SessionHistoryWindow,
+    oldest_index: usize,
+) -> serde_json::Value {
+    let has_older = oldest_index > 0;
+    let next = window
+        .messages
+        .first()
+        .filter(|_| has_older)
+        .map(|message| history_cursor(session_id, window.scope, oldest_index, message));
+    let mut response = render_full_history(session_id, window, false, has_older);
+    response["next_before_message_id"] = serde_json::json!(next);
+    response["history_start_index"] = serde_json::json!(oldest_index);
+    response
+}
+
+fn render_full_history(
+    session_id: &str,
+    window: SessionHistoryWindow,
+    is_delta: bool,
+    truncated: bool,
+) -> serde_json::Value {
     // Include the session-level gold config so the frontend can update its
     // local session summary after sync-recovery without an extra round-trip.
-    let gold_config = session
+    let gold_config = window
         .metadata
         .get(bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY)
         .and_then(|raw| serde_json::from_str::<bamboo_engine::config::GoldConfig>(raw).ok());
@@ -375,20 +611,18 @@ pub(super) fn render_history(
     // side-channel double-check eval history) so the frontend can show live
     // goal progress, not just the configured objective. Stored as a JSON blob
     // under `goal.state` (see `bamboo_engine::runtime::goal_state`).
-    let goal_state = session
+    let goal_state = window
         .metadata
         .get("goal.state")
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
 
     let mut response = serde_json::json!({
         "session_id": session_id,
-        "messages": messages,
+        "messages": window.messages,
         "is_delta": is_delta,
-        // Whether the cold fetch dropped older messages to stay under the cap,
-        // and the pre-cap UI-visible count so a client can detect the gap (#252).
         "truncated": truncated,
-        "total_message_count": total_message_count,
-        "compression_events": session.compression_events
+        "total_message_count": window.total_message_count,
+        "compression_events": window.compression_events
     });
 
     if let Some(gc) = gold_config {
@@ -592,6 +826,223 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["error"]["code"], "session_authority_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn paged_history_recovers_originals_in_order_after_append_and_restart() {
+        use bamboo_domain::{FunctionCall, ImageUrlRef, MessagePart, ToolCall};
+
+        let home = tempdir().expect("tempdir");
+        let data_dir = home.path().to_path_buf();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let session_id = "paged-history";
+        let url = format!("/api/v1/sessions/{session_id}/history");
+        let accept = ("accept", "application/json; bamboo-history-limit=100");
+        let mut root = Session::new(session_id, "model");
+        let mut oldest = Message::user_with_parts(
+            "original archived question",
+            vec![MessagePart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: format!("/api/v1/sessions/{session_id}/attachments/original.png"),
+                    detail: None,
+                },
+            }],
+        );
+        oldest.compressed = true;
+        root.add_message(oldest);
+        for index in 1..2_004 {
+            let mut message = Message::user(format!("message {index}"));
+            message.compressed = index % 2 == 0;
+            root.add_message(message);
+        }
+        // The latest 100 would start inside the tool batch on its System row.
+        let mut call = Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "tool-pair".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "synthetic".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        );
+        call.compressed = true;
+        let tool_call_message_id = call.id.clone();
+        root.add_message(call);
+        root.add_message(Message::system("system within tool batch"));
+        let mut result = Message::tool_result("tool-pair", "original archived tool result");
+        result.compressed = true;
+        root.add_message(result);
+        for index in 0..98 {
+            root.add_message(Message::user(format!("tail {index}")));
+        }
+        let expected_ids = root
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        let mut internal = Message::user("internal notice");
+        internal.metadata = Some(serde_json::json!({"hidden_from_ui": true}));
+        root.add_message(internal);
+
+        let latest = {
+            let state = web::Data::new(AppState::new(data_dir.clone()).await.unwrap());
+            state.storage.save_session(&root).await.unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&url)
+                    .insert_header(accept)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+            let latest: Value = test::read_body_json(response).await;
+            assert_eq!(latest["total_message_count"], expected_ids.len());
+            assert_eq!(latest["messages"][0]["id"], tool_call_message_id);
+            assert_eq!(
+                latest["messages"][2]["content"],
+                "original archived tool result"
+            );
+            assert_eq!(latest["messages"].as_array().unwrap().len(), 101);
+            assert_eq!(latest["history_start_index"], 2_004);
+            assert!(latest["next_before_message_id"].is_string());
+            let legacy: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get().uri(&url).to_request(),
+            )
+            .await;
+            assert_eq!(legacy["messages"].as_array().unwrap().len(), 2_000);
+            assert!(legacy.get("next_before_message_id").is_none());
+
+            root.add_message(Message::assistant("appended between pages", None));
+            state.storage.save_session(&root).await.unwrap();
+            state.shutdown().await;
+            latest
+        };
+
+        let state = web::Data::new(AppState::new(data_dir).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let mut observed = latest["messages"].as_array().unwrap().clone();
+        let mut cursor = latest["next_before_message_id"].as_str().map(str::to_owned);
+        while let Some(before) = cursor {
+            let page: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("{url}?limit=100&before_message_id={before}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(page["total_message_count"], expected_ids.len() + 1);
+            let next = page["next_before_message_id"].as_str().map(str::to_owned);
+            assert_ne!(next.as_deref(), Some(before.as_str()));
+            observed.splice(0..0, page["messages"].as_array().unwrap().iter().cloned());
+            cursor = next;
+        }
+        let observed_ids = observed
+            .iter()
+            .map(|message| message["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(observed_ids, expected_ids);
+        assert_eq!(observed[0]["content"], "original archived question");
+        assert_eq!(observed[0]["compressed"], true);
+        assert_eq!(
+            observed[0]["content_parts"][0]["image_url"]["url"],
+            format!("/api/v1/sessions/{session_id}/attachments/original.png")
+        );
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{url}?limit=100&before_message_id=obsolete"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(stale).await;
+        assert_eq!(body["error"]["code"], "history_cursor_stale");
+        state.shutdown().await;
+    }
+
+    #[actix_web::test]
+    async fn paged_history_can_cross_legacy_missing_and_duplicate_ids() {
+        let (state, id) = app_state_with_session(
+            [
+                "oldest",
+                "duplicate left",
+                "legacy",
+                "duplicate right",
+                "newest",
+            ]
+            .into_iter()
+            .map(Message::user)
+            .collect(),
+        )
+        .await;
+        let canonical = state.storage.load_session(&id).await.unwrap().unwrap();
+        let mut legacy = serde_json::to_value(canonical).unwrap();
+        legacy["messages"][1]["id"] = Value::String("repeated".into());
+        let missing = legacy["messages"][2].as_object_mut().unwrap();
+        missing.remove("id");
+        missing.remove("created_at");
+        legacy["messages"][3]["id"] = Value::String("repeated".into());
+        let main = state
+            .session_store
+            .sessions_root_dir()
+            .join(&id)
+            .join("session.json");
+        tokio::fs::write(&main, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let base = format!("/api/v1/sessions/{id}/history?limit=1");
+        let mut next = Some(base.clone());
+        let mut observed = Vec::new();
+        while let Some(url) = next {
+            let page: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get().uri(&url).to_request(),
+            )
+            .await;
+            assert_eq!(page["total_message_count"], 5);
+            assert_eq!(page["history_start_index"], 4 - observed.len());
+            observed.extend(seqs(&page["messages"]));
+            next = page["next_before_message_id"]
+                .as_str()
+                .map(|cursor| format!("{base}&before_message_id={cursor}"));
+        }
+        assert_eq!(
+            observed,
+            [
+                "newest",
+                "duplicate right",
+                "legacy",
+                "duplicate left",
+                "oldest"
+            ]
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokio::fs::read(main).await.unwrap()).unwrap(),
+            legacy
+        );
+        state.shutdown().await;
     }
 
     #[actix_web::test]

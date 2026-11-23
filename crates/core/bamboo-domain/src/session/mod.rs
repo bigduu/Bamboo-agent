@@ -17,6 +17,7 @@ pub mod composition;
 pub mod context_block;
 pub mod conversation_generation;
 pub mod conversation_reset;
+pub mod history;
 pub mod hook_types;
 pub mod host_registry;
 pub mod inbox;

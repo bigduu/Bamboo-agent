@@ -5,6 +5,9 @@ use std::{
     time::Duration,
 };
 
+use bamboo_domain::session::history::{
+    APPROVAL_HANDOFF_INSTRUCTION as INSTRUCTION, APPROVAL_HANDOFF_SUBSYSTEM as SUBSYSTEM,
+};
 use bamboo_domain::{
     Session, SessionCallerReference, SessionMessageBody, SessionMessageContent,
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
@@ -43,8 +46,6 @@ pub fn select_candidates(
 }
 
 pub const DELAY: TimeDelta = TimeDelta::minutes(10);
-pub(super) const SUBSYSTEM: &str = "supervisor_approval_handoff";
-pub(super) const INSTRUCTION: &str = "supervisor_approval_handoff_v1";
 
 pub struct ApprovalHandoff {
     pub pending: PendingApproval,
