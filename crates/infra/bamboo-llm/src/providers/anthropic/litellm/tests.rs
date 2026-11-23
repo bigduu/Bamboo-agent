@@ -282,6 +282,7 @@ fn claude_reasoning_matches_pinned_messages_transform() {
                 false,
                 &[],
                 CapabilityLoadingMode::LegacyFullCatalog,
+                false,
             )
         };
         let mut expected = serialize_anthropic_request(content(), model, max_tokens, true, None);
@@ -597,6 +598,7 @@ fn native_tool_search_declarations_preserve_bamboo_wire_shape() {
             false,
             &[],
             CapabilityLoadingMode::Progressive,
+            false,
         )
     };
     let body = serde_json::to_value(messages_request(content(), MODEL, 4096, true, None).unwrap())

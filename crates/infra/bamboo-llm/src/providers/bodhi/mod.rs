@@ -26,7 +26,6 @@ use crate::providers::common::openai_compat::{
     ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use crate::providers::common::request_overrides;
-use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
@@ -430,40 +429,23 @@ impl BodhiProvider {
         cache_plan: Option<&crate::cache::PromptCachePlan>,
     ) -> Result<LLMStream> {
         use crate::providers::anthropic::{
-            apply_cache_ttl_header, apply_required_tool_choice, build_anthropic_request_with_cache,
-            parse_anthropic_sse_event, AnthropicStreamState,
+            anthropic_stream_with_usage_on_error, apply_cache_ttl_header,
+            apply_required_tool_choice, build_anthropic_proxy_request, AnthropicStreamState,
         };
+        use std::sync::{Arc, Mutex};
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        #[cfg(feature = "litellm-wire-types")]
-        let body = self
-            .litellm_wire_types
-            .then(|| {
-                crate::providers::anthropic::build_litellm_anthropic_proxy_request(
-                    messages,
-                    tools,
-                    model,
-                    max_tokens,
-                    reasoning_effort,
-                    cache_plan,
-                )
-            })
-            .transpose()?;
-        #[cfg(not(feature = "litellm-wire-types"))]
-        let body: Option<Value> = None;
-        let mut body = body.unwrap_or_else(|| {
-            build_anthropic_request_with_cache(
-                messages,
-                tools,
-                model,
-                max_tokens,
-                true,
-                reasoning_effort,
-                None,
-                cache_plan,
-            )
-        });
+        let mut body = build_anthropic_proxy_request(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            reasoning_effort,
+            cache_plan,
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types,
+        )?;
         #[cfg(feature = "litellm-wire-types")]
         let prepared_budget = body
             .pointer("/thinking/budget_tokens")
@@ -508,11 +490,10 @@ impl BodhiProvider {
 
         let mut state = AnthropicStreamState::default();
         state.completion_diagnostics = crate::provider::current_completion_diagnostics();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            parse_anthropic_sse_event(&mut state, event, data)
-        });
-
-        Ok(stream)
+        Ok(anthropic_stream_with_usage_on_error(
+            response,
+            Arc::new(Mutex::new(state)),
+        ))
     }
 
     async fn proxy_gemini(
@@ -786,6 +767,49 @@ mod tests {
             while let Some(chunk) = stream.next().await { chunk.unwrap(); }
             assert_eq!(diagnostics.finish_reason(), expected, "{target}");
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_reports_cumulative_cache_usage_before_done() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":8000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":4,\"cache_creation_input_tokens\":1100,\"cache_read_input_tokens\":64000}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic");
+        let chunks = provider
+            .chat_stream(&[Message::user("hello")], &[], Some(128), "fixture-model")
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. } | LLMChunk::Done))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            chunks.as_slice(),
+            [
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(73100),
+                    output_tokens: Some(9),
+                    cache_creation_input_tokens: Some(1100),
+                    cache_read_input_tokens: Some(64000),
+                    ..
+                },
+                LLMChunk::Done
+            ]
+        ));
     }
 
     #[tokio::test]

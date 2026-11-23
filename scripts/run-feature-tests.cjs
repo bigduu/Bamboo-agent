@@ -239,7 +239,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
 // Managed Root and legacy Work Ultra cases use the existing native Work test
 // target. Ultra model ceilings retain their existing default Engine owner.
-const FEATURE_SOURCE_SHA256 = "9159b57991d1c90afaeaf2b4efc402a97f64975bc034d541912f92cceca7745a";
+// Messages cache checkpoints and SSE usage stay in the existing LLM,
+// Engine, and Server handler owners.
+const FEATURE_SOURCE_SHA256 = "a8c74adeba15eeb995d08e2523b8b55561458f1f4fc3f60175a06ea3000d91ca";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

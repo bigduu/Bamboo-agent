@@ -18,6 +18,7 @@ struct ToolStreamState {
 pub(crate) struct AnthropicStreamState {
     message_started: bool,
     pub(crate) sent_message_stop: bool,
+    pub(crate) final_usage: Option<serde_json::Value>,
     next_block_index: usize,
     text_block_index: Option<usize>,
     tool_blocks: HashMap<u32, ToolStreamState>,
@@ -30,6 +31,7 @@ impl AnthropicStreamState {
         Self {
             message_started: false,
             sent_message_stop: false,
+            final_usage: None,
             next_block_index: 0,
             text_block_index: None,
             tool_blocks: HashMap::new(),
