@@ -44,9 +44,9 @@ pub(crate) fn active() -> bool {
 }
 
 pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Response> {
+    let (client, mut request) = crate::http_client::build_provider_request(request)?;
     let response = match WORK_TEXT.try_with(Clone::clone) {
         Ok(dispatch) => {
-            let request = request.build()?;
             if let Err(error) = (dispatch.admit)().await {
                 dispatch.admission_refused.store(true, Ordering::Release);
                 return Err(error);
@@ -57,8 +57,6 @@ pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Res
             dispatch.client.execute(request).await?
         }
         Err(_) if crate::retry::output_limit_recovery_active() => {
-            let (client, request) = request.build_split();
-            let mut request = request?;
             let body = request
                 .body()
                 .and_then(reqwest::Body::as_bytes)
@@ -78,7 +76,7 @@ pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Res
             })));
             client.execute(request).await?
         }
-        Err(_) => request.send().await?,
+        Err(_) => client.execute(request).await?,
     };
     crate::http_client::observe_provider_response(&response);
     Ok(response)

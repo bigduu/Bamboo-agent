@@ -829,6 +829,9 @@ where
         RateLimit::new(rate_limiter),
     ))
     .wrap(build_cors(bind_addr, port))
+    .wrap(actix_web::middleware::from_fn(
+        crate::handlers::llm_compat::forward_headers::expose,
+    ))
 }
 
 #[cfg(test)]
