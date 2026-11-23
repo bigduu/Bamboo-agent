@@ -2555,7 +2555,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 "Bounded context compression failed before commit"
             );
             let (status, error) = match error {
-                BudgetError::EmptySummaryResponse { .. } => (
+                BudgetError::EmptySummaryResponse { .. }
+                | BudgetError::IncompleteSummaryResponse { .. } => (
                     "failed_empty_summary".to_string(),
                     AgentError::EmptyContextSummary,
                 ),

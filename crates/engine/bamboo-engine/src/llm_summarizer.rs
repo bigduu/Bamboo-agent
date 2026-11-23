@@ -24,6 +24,7 @@ use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
     SessionMessageKind, SessionMessageSource,
 };
+use bamboo_llm::provider::{scope_completion_diagnostics, CompletionDiagnostics};
 use bamboo_llm::LLMChunk;
 use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions};
 use serde::Deserialize;
@@ -1039,7 +1040,7 @@ impl LlmSummarizer {
             model = %self.model,
             "Executing bounded summarization request"
         );
-        let content = self
+        let (content, finish_reason) = self
             .collect_stream_response(messages, max_output_tokens)
             .await
             .map_err(|error| {
@@ -1050,6 +1051,22 @@ impl LlmSummarizer {
         if content.trim().is_empty() {
             return Err(
                 bamboo_compression::types::BudgetError::EmptySummaryResponse {
+                    stage: stage.to_string(),
+                    stage_index,
+                    stage_count,
+                },
+            );
+        }
+        if matches!(
+            finish_reason,
+            "length"
+                | "max_tokens"
+                | "max_output_tokens"
+                | "MAX_TOKENS"
+                | "model_context_window_exceeded"
+        ) {
+            return Err(
+                bamboo_compression::types::BudgetError::IncompleteSummaryResponse {
                     stage: stage.to_string(),
                     stage_index,
                     stage_count,
@@ -1441,12 +1458,12 @@ impl LlmSummarizer {
         }
     }
 
-    /// Collect the summary text from a completed stream.
+    /// Collect the visible text and the provider's completion reason.
     async fn collect_stream_response(
         &self,
         messages: &[Message],
         max_output_tokens: u32,
-    ) -> Result<String, LLMError> {
+    ) -> Result<(String, &'static str), LLMError> {
         let options = LLMRequestOptions {
             session_id: None,
             reasoning_effort: self.llm.default_compression_reasoning_effort(&self.model),
@@ -1456,22 +1473,24 @@ impl LlmSummarizer {
             request_purpose: Some("compression".to_string()),
             cache: None,
         };
-        let mut stream = self
-            .llm
-            .chat_stream_with_options(
+        let completion = CompletionDiagnostics::default();
+        let mut stream = scope_completion_diagnostics(
+            completion.clone(),
+            self.llm.chat_stream_with_options(
                 messages,
                 &[],
                 Some(max_output_tokens.max(1)),
                 &self.model,
                 Some(&options),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         let mut content = String::new();
         while let Some(chunk_result) = stream.next().await {
             match chunk_result? {
                 LLMChunk::Token(text) => content.push_str(&text),
-                LLMChunk::Done => return Ok(content),
+                LLMChunk::Done => return Ok((content, completion.finish_reason())),
                 _ => {}
             }
         }
