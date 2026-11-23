@@ -18,7 +18,7 @@ pub(super) async fn track_task_progress(
 
     // IMPORTANT: First auto-update status (may set active_item)
     // Then track tool execution (so first tool is recorded)
-    let target_id = ctx.auto_update_status(&tool_call.function.name, result);
+    let target_id = ctx.update_status_for_tool(&tool_call.function.name, result);
     ctx.track_tool_execution(&tool_call.function.name, result, round as u32);
 
     if let Some(event) = target_id

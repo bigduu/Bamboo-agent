@@ -36,8 +36,17 @@ impl TaskLoopContext {
         }
     }
 
+    /// Auto-update status based on the tool execution result.
+    pub fn auto_update_status(&mut self, tool_name: &str, result: &ToolResult) {
+        self.update_status_for_tool(tool_name, result);
+    }
+
     /// Auto-update status and return the task targeted by this tool result.
-    pub fn auto_update_status(&mut self, tool_name: &str, result: &ToolResult) -> Option<String> {
+    pub(crate) fn update_status_for_tool(
+        &mut self,
+        tool_name: &str,
+        result: &ToolResult,
+    ) -> Option<String> {
         if self.active_item_id.is_none() {
             self.auto_match_tool_to_item(tool_name);
         }
