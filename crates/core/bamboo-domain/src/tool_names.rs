@@ -91,7 +91,7 @@ pub const SERVER_TOOL_NAMES: [&str; 12] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 27] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 29] = [
     "SubAgent",
     "Project",
     "archive_context",
@@ -110,6 +110,8 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 27] = [
     "session_control",
     "session_history",
     "session_history_current",
+    SESSION_LOOP_TOOL_NAME,
+    PACED_LOOP_WAKEUP_TOOL_NAME,
     "session_message",
     "workflow_run",
     "work_overview",
@@ -120,6 +122,9 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 27] = [
     "work_dispatch",
     "work_review",
 ];
+
+pub const SESSION_LOOP_TOOL_NAME: &str = "session_loop";
+pub const PACED_LOOP_WAKEUP_TOOL_NAME: &str = "schedule_loop_wakeup";
 
 /// Resolve any model- or host-facing tool reference to one canonical identity.
 ///
@@ -282,6 +287,14 @@ fn retired_shell_policy_name(reference: &str) -> Option<&'static str> {
         .find(|name| name.eq_ignore_ascii_case(normalized))
 }
 
+/// Suggest the current tool for an unavailable legacy shell reference.
+/// This is for recovery messages only. Foreign namespaces keep their own identities.
+pub fn retired_shell_tool_replacement(reference: &str) -> Option<&'static str> {
+    let reference = reference.trim();
+    let name = default_namespace_tool_name(reference).unwrap_or(reference);
+    retired_shell_policy_name(name).and_then(legacy_shell_replacement)
+}
+
 /// Preserve an old default-namespace deny after exact resolution misses.
 /// Use only where Bamboo's own terminal is installed.
 pub fn retired_default_shell_policy_name(reference: &str) -> Option<String> {
@@ -391,6 +404,24 @@ mod tests {
         );
         assert_eq!(legacy_shell_replacements("vendor::Bash").next(), None);
         assert_eq!(legacy_shell_replacements("exec_command").next(), None);
+    }
+
+    #[test]
+    fn retired_bash_guidance_recognizes_only_framework_shell_references() {
+        for (reference, replacement) in [
+            ("Bash", "exec_command"),
+            ("bash", "exec_command"),
+            ("execute_command", "exec_command"),
+            (" DEFAULT::bAsH ", "exec_command"),
+            ("BashInput", "write_stdin"),
+            ("default::BashOutput", "write_stdin"),
+            ("KillShell", "write_stdin"),
+        ] {
+            assert_eq!(retired_shell_tool_replacement(reference), Some(replacement));
+        }
+        for reference in ["Read", "exec_command", "vendor::Bash", "mcp__vendor__Bash"] {
+            assert_eq!(retired_shell_tool_replacement(reference), None);
+        }
     }
 
     #[test]

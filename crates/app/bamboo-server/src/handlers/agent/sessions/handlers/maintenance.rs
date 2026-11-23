@@ -67,6 +67,10 @@ pub async fn clear_session(
             return Ok(conflict);
         }
     }
+    let event_slot = match state.account_sink.reserve_session_mutation().await {
+        Ok(slot) => slot,
+        Err(error) => return Ok(crate::events::session_event_queue_unavailable(error)),
+    };
     let cleared = match state.session_store.clear_session(&session_id).await {
         Ok(cleared) => cleared,
         Err(error) => {
@@ -124,9 +128,9 @@ pub async fn clear_session(
 
     // Publish onto the account change feed so other clients drop their cached
     // messages for this session and refetch lazily.
-    state.account_sink.record(
-        Some(&session_id),
-        &bamboo_agent_core::AgentEvent::SessionCleared {
+    event_slot.enqueue(
+        &session_id,
+        bamboo_agent_core::AgentEvent::SessionCleared {
             session_id: session_id.clone(),
         },
     );

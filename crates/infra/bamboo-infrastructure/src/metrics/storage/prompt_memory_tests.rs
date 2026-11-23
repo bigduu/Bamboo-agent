@@ -403,8 +403,13 @@ fn legacy_rows(connection: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>>
     ["session_metrics", "round_metrics", "tool_call_metrics"]
         .iter()
         .map(|table| {
+            let columns = if *table == "tool_call_metrics" {
+                "tool_call_id, round_id, session_id, tool_name, started_at, completed_at, success, error"
+            } else {
+                "*"
+            };
             let mut statement = connection
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .prepare(&format!("SELECT {columns} FROM {table} ORDER BY 1"))
                 .unwrap();
             let columns = statement.column_count();
             statement
@@ -444,6 +449,14 @@ async fn prompt_memory_populated_migration_and_restart_preserve_rows_indexes_and
         );
         let connection = open_connection(&path).unwrap();
         assert_eq!(legacy_rows(&connection), before);
+        let scoped_legacy_tools: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call_metrics WHERE round_scoped != 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scoped_legacy_tools, 0);
         assert_eq!(counts(&connection), (1, 1));
         for index in [
             "idx_round_session_started_at",

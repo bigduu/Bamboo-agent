@@ -85,6 +85,106 @@ fn prepared_git_workspace(root: &Path) -> ExecutionWorkspace {
 }
 
 #[tokio::test]
+async fn parallel_work_limit_fences_batch_start_and_preserves_exact_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let config = config(true);
+    config.write().await.features.work_execution.max_parallel = std::num::NonZeroU32::new(1);
+    let app = TicketApplication::open(root.path(), storage, config).await;
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(principal.clone()).await.unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "parallel-create",
+            ["first", "second"]
+                .into_iter()
+                .flat_map(|id| {
+                    [
+                        Operation::Create {
+                            temp_id: id.into(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract: contract(),
+                            depends_on: BTreeSet::new(),
+                        },
+                        Operation::Ready { work_id: id.into() },
+                    ]
+                })
+                .collect(),
+        )
+        .unwrap();
+    let ids = app.update(principal.clone(), &create).await.unwrap().ids;
+    let start = |id: &str| Operation::Start {
+        work_id: ids[id].clone(),
+        temp_id: format!("{id}-assignment"),
+        workspace: None,
+    };
+    let batch = service
+        .prepare_command(
+            &authority,
+            "parallel-batch",
+            vec![start("first"), start("second")],
+        )
+        .unwrap();
+    let before = service.published().unwrap().0;
+    assert!(matches!(
+        app.dispatch(principal.clone(), &batch).await,
+        Err(Error::ResourceBlocked(reason)) if reason.contains("Parallel Work limit reached (1)")
+    ));
+    assert_eq!(service.published().unwrap().0, before);
+
+    let first = service
+        .prepare_command(&authority, "parallel-first", vec![start("first")])
+        .unwrap();
+    let first_response = app.dispatch(principal.clone(), &first).await.unwrap();
+    let second = service
+        .prepare_command(&authority, "parallel-second", vec![start("second")])
+        .unwrap();
+    assert!(matches!(
+        app.dispatch(principal.clone(), &second).await,
+        Err(Error::ResourceBlocked(_))
+    ));
+    let replay = app.dispatch(principal.clone(), &first).await.unwrap();
+    assert_eq!(replay["receipt"], first_response["receipt"]);
+    let assignment_id = first_response["receipt"]["ids"]["first-assignment"]
+        .as_str()
+        .unwrap();
+    let cancel = service
+        .prepare_command(
+            &authority,
+            "parallel-cancel",
+            vec![Operation::Cancel {
+                work_id: ids["first"].clone(),
+            }],
+        )
+        .unwrap();
+    app.update(principal.clone(), &cancel).await.unwrap();
+    assert_eq!(service.published().unwrap().1.occupied_dispatch_slots(), 1);
+
+    let (_, runtime) = app.authority(Principal::Runtime).await.unwrap();
+    let stopped = service
+        .prepare_command(
+            &runtime,
+            "parallel-stopped",
+            vec![Operation::ConfirmStopped {
+                assignment_id: assignment_id.into(),
+                effects_reconciled: true,
+            }],
+        )
+        .unwrap();
+    service.execute(&runtime, &stopped).unwrap();
+    assert_eq!(service.published().unwrap().1.occupied_dispatch_slots(), 0);
+    let retry = service
+        .prepare_command(&authority, "parallel-second", vec![start("second")])
+        .unwrap();
+    app.dispatch(principal, &retry).await.unwrap();
+    assert_eq!(service.published().unwrap().1.occupied_dispatch_slots(), 1);
+}
+
+#[tokio::test]
 async fn ticket_start_preflight_rejects_git_identity_before_publication_and_preserves_replay() {
     let root = tempfile::tempdir().unwrap();
     let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());

@@ -183,11 +183,7 @@ impl Fixture {
         serde_json::from_str(&result.result).unwrap()
     }
 
-    async fn set_supervisor_permission_mode(
-        &self,
-        mode: SessionPermissionMode,
-        auto_dispatch: bool,
-    ) {
+    async fn set_supervisor_permission_mode(&self, mode: SessionPermissionMode) {
         let supervisor = self
             .state
             .storage
@@ -201,10 +197,6 @@ impl Fixture {
                 .configure(crate::routes::configure_routes),
         )
         .await;
-        let mut payload = json!({"permission_mode": mode});
-        if auto_dispatch {
-            payload["supervisor_auto_dispatch"] = json!(true);
-        }
         let response = test::call_service(
             &app,
             test::TestRequest::patch()
@@ -214,7 +206,7 @@ impl Fixture {
                     actix_web::http::header::IF_MATCH,
                     format!("\"{}\"", supervisor.metadata_version),
                 ))
-                .set_json(payload)
+                .set_json(json!({"permission_mode": mode}))
                 .to_request(),
         )
         .await;
@@ -230,7 +222,10 @@ impl Fixture {
             .unwrap();
         let result: Value = test::read_body_json(response).await;
         assert_eq!(result["session"]["permission_mode"], json!(mode));
-        assert_eq!(result["session"]["supervisor_auto_dispatch"], auto_dispatch);
+        assert_eq!(
+            result["session"]["supervisor_dispatch_inherits_permission_mode"],
+            true
+        );
         assert_eq!(
             self.state
                 .session_store
@@ -455,9 +450,80 @@ const PERMISSION_PROBES: [(&str, &str); 4] = [
 const SHELL_PROBES_DONE: &str = "Worker permission checks finished.";
 
 #[actix_web::test]
-async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
+async fn supervisor_permission_change_checks_owner_and_scope_at_matching_revision() {
     let f = Fixture::new(false).await;
-    f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
+    let mut legacy_index_row = f
+        .state
+        .session_store
+        .get_index_entry(&f.supervisor.session_id)
+        .await
+        .unwrap();
+    legacy_index_row.supervisor_profile_revision = None;
+    let legacy_summary =
+        crate::handlers::agent::sessions::SessionSummary::from_entry(legacy_index_row, false);
+    assert_eq!(
+        legacy_summary.supervisor_dispatch_inherits_permission_mode,
+        Some(true)
+    );
+    assert_eq!(legacy_summary.supervisor_permission_etag, None);
+
+    let source = f
+        .state
+        .storage
+        .load_root_authority(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    for (peer, update, expected_status) in [
+        (
+            "192.0.2.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": true}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "192.0.2.1:12345",
+            json!({"bypass_permissions": true}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "127.0.0.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": false}),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            "127.0.0.1:12345",
+            json!({"permission_mode": "auto", "expected_supervisor_dispatch_inheritance": true}),
+            StatusCode::OK,
+        ),
+    ] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", source.id))
+                .peer_addr(peer.parse().unwrap())
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", source.metadata_version),
+                ))
+                .set_json(update)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), expected_status);
+    }
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_dispatch_reservation_orders_with_permission_change() {
+    let f = Fixture::new(false).await;
+    f.set_supervisor_permission_mode(SessionPermissionMode::Auto)
         .await;
     let store = f.state.session_store.clone();
     let current = f
@@ -473,32 +539,35 @@ async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
     let (release, proceed) = tokio::sync::oneshot::channel();
     let reservation = tokio::spawn(async move {
         store
-            .with_supervisor_dispatch_consent(&reserving_caller, |allowed| async move {
-                entered.send(allowed).unwrap();
+            .with_supervisor_dispatch_permission_mode(&reserving_caller, |mode| async move {
+                entered.send(mode).unwrap();
                 proceed.await.unwrap();
                 Ok(())
             })
             .await
             .unwrap()
     });
-    assert!(held.await.unwrap());
-    let revoke = f
+    assert_eq!(held.await.unwrap(), SessionPermissionMode::Auto);
+    let change = f
         .state
         .session_store
         .update_supervisor_execution_profile(&current, |session| {
-            session.set_supervisor_auto_dispatch(false);
+            session
+                .agent_runtime_state
+                .as_mut()
+                .unwrap()
+                .set_permission_mode(SessionPermissionMode::Default);
             session.metadata_version += 1;
             Ok::<_, std::io::Error>(())
         });
-    tokio::pin!(revoke);
-    assert!(timeout(Duration::from_millis(100), &mut revoke)
+    tokio::pin!(change);
+    assert!(timeout(Duration::from_millis(100), &mut change)
         .await
         .is_err());
     release.send(()).unwrap();
     reservation.await.unwrap();
-    revoke.await.unwrap().unwrap();
+    change.await.unwrap().unwrap();
     let mut stale_workspace_update = current.clone();
-    stale_workspace_update.metadata_version += 1;
     stale_workspace_update.set_workspace_path_meta(&f.workspace);
     let stale_error = f
         .state
@@ -508,13 +577,14 @@ async fn supervisor_dispatch_reservation_orders_with_consent_revocation() {
         .unwrap_err();
     assert!(stale_error
         .to_string()
-        .contains("Supervisor dispatch consent"));
-    assert!(!f
+        .contains("metadata revision regressed"));
+    let mode = f
         .state
         .session_store
-        .with_supervisor_dispatch_consent(&caller, |allowed| async move { Ok(allowed) })
+        .with_supervisor_dispatch_permission_mode(&caller, |mode| async move { Ok(mode) })
         .await
-        .unwrap());
+        .unwrap();
+    assert_eq!(mode, SessionPermissionMode::Default);
     f.state.shutdown().await;
 }
 
@@ -554,7 +624,7 @@ impl LLMProvider for WorkerPermissionProvider {
 }
 
 #[actix_web::test]
-async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
+async fn inherited_supervisor_auto_runs_three_commands_without_approval() {
     use bamboo_tools::permission::{
         DurablePermissionRule, PermissionRuleEffect, PermissionRuleScope, PermissionRuleSource,
     };
@@ -578,7 +648,7 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
                 std::collections::HashMap::from([("openai".into(), provider)]),
                 "openai".into(),
             ));
-        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, true)
+        f.set_supervisor_permission_mode(SessionPermissionMode::Auto)
             .await;
         let permissions = f.state.permission_checker.permission_config().unwrap();
         permissions.set_ask_rules(["Bash".into()]);
@@ -659,7 +729,7 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
             }
         }
 
-        f.set_supervisor_permission_mode(SessionPermissionMode::Auto, false)
+        f.set_supervisor_permission_mode(SessionPermissionMode::Bypass)
             .await;
         let replay = f.invoke_named(route, request).await;
         assert_eq!(replay["target_session_id"], id);
@@ -677,7 +747,7 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
             SessionPermissionMode::Auto
         );
         let next = f.invoke(f.request(uuid::Uuid::new_v4())).await;
-        let without_dispatch_auto = f
+        let bypass_worker = f
             .state
             .storage
             .load_root_authority(next["target_session_id"].as_str().unwrap())
@@ -685,7 +755,7 @@ async fn supervisor_auto_dispatch_runs_three_commands_without_approval() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            without_dispatch_auto
+            bypass_worker
                 .agent_runtime_state
                 .unwrap()
                 .effective_permission_mode(),
@@ -926,7 +996,7 @@ async fn supervisor_creates_and_continues_standalone_roots_without_inheriting_a_
                 .as_ref()
                 .unwrap()
                 .effective_permission_mode(),
-            bamboo_domain::SessionPermissionMode::Bypass
+            bamboo_domain::SessionPermissionMode::Default
         );
         let workspace = f
             .home
@@ -1092,12 +1162,20 @@ async fn supervisor_can_create_an_ordinary_ultra_worker_before_its_first_turn() 
             .await
             .expect("the worker's first turn reached the provider")
             .unwrap();
-        for name in ["Read", "Write", "Edit", "SubAgent"] {
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "SubAgent",
+            "exec_command",
+            "write_stdin",
+        ] {
             assert!(catalog.iter().any(|tool| tool == name), "{catalog:?}");
         }
-        for name in ["exec_command", "session_control"] {
-            assert!(!catalog.iter().any(|tool| tool == name), "{catalog:?}");
-        }
+        assert!(
+            !catalog.iter().any(|tool| tool == "session_control"),
+            "{catalog:?}"
+        );
         let root = f
             .state
             .storage

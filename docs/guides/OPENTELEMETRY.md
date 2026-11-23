@@ -154,12 +154,12 @@ buffered or logged by Bamboo's transport; HTTP success is not proof of durable
 collector storage. A shutdown timeout can leave the bounded exporter worker
 finishing in the background; it cannot delay the caller beyond its budget.
 
-Focused checks (run with the repository's Rust 1.95 toolchain):
+Focused checks on the minimum supported toolchain.
 
 ```sh
-cargo +1.95.0 test --locked -p bamboo-infrastructure telemetry
-cargo +1.95.0 test --locked -p bamboo-infrastructure --all-features telemetry
-cargo +1.95.0 test --locked -p bamboo-engine --lib runtime::runner::tests
+cargo +1.97.0 test --locked -p bamboo-infrastructure telemetry
+cargo +1.97.0 test --locked -p bamboo-infrastructure --all-features telemetry
+cargo +1.97.0 test --locked -p bamboo-engine --lib runtime::runner::tests
 ```
 
 Tests use isolated in-memory providers and loopback TCP collectors: no process-

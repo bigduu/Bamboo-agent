@@ -6,8 +6,8 @@ use actix_web::web;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
-    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session, SessionInboxPort,
-    SessionPermissionMode,
+    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session,
+    SessionInboxError, SessionInboxPort, SessionPermissionMode,
 };
 use bamboo_engine::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
@@ -166,6 +166,27 @@ impl LLMProvider for Probe {
         model: &str,
         options: Option<&bamboo_llm::provider::LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
+        if options.is_some_and(|options| {
+            options.request_purpose.as_deref() == Some("gold_evaluation")
+                && options.session_id.as_deref() == Some(ROOT_B)
+        }) {
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                    id: "managed-wait-goal-verdict".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "report_gold_evaluation".into(),
+                        arguments: json!({
+                            "decision": "continue",
+                            "confidence": "high",
+                            "reasoning": "The managed assignment still needs verification.",
+                        })
+                        .to_string(),
+                    },
+                }])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         if model == PARENT {
             let home = self.diagnostic_home.lock().unwrap().clone();
             let boundary = home.as_deref().map(provider_boundary_snapshot);
@@ -1093,6 +1114,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     };
     use bamboo_domain::{Role, SessionInboxReceipt, SessionMessageId, SupervisorCurrentUserTarget};
     use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
+    use bamboo_engine::runtime::goal_state::{read_goal_state, GoalRuntimeStatus, GoalStopReason};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
     use sha2::{Digest, Sha256};
 
@@ -1137,7 +1159,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     second.workspace = Some(workspace.to_string_lossy().into());
     second.set_workspace_path_meta(workspace.to_string_lossy());
     // With an active Goal, the terminal answer is committed before Stop runs.
-    // A zero continuation budget keeps this fixture on its single provider turn.
+    // Zero continuations admit a terminal Gold verdict after a single Root turn.
     second.metadata.insert(
         GOLD_CONFIG_METADATA_KEY.into(),
         json!({
@@ -1286,6 +1308,12 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         second_input["receipt_id"]
     );
     let second_main = load(&f.state, ROOT_B).await;
+    let goal = read_goal_state(&second_main).expect("the terminal Goal verdict is durable");
+    assert_eq!(goal.status, GoalRuntimeStatus::BudgetLimited);
+    assert_eq!(goal.stop_reason, Some(GoalStopReason::ContinuationBudget));
+    assert_eq!(goal.continuation_count, 0);
+    assert_eq!(goal.eval_history.len(), 1);
+    assert_eq!(goal.eval_history[0].decision, "continue");
     let hook_context = second_main.messages.last().unwrap();
     assert_eq!(hook_context.role, Role::System);
     assert!(hook_context.content.contains("Retained Stop hook context."));
@@ -1606,6 +1634,58 @@ async fn settle_material_notices(f: &Fixture) {
     .expect("unchanged sources must finish their finite proof I/O");
 }
 
+async fn replay_settled_material_notice<T>(
+    mut replay: impl AsyncFnMut() -> Result<T, SessionInboxError>,
+) -> Result<T, SessionInboxError> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match replay().await {
+                Err(SessionInboxError::Storage(reason))
+                    if reason == "Session proof I/O is busy" =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .expect("settled material notice proof must become available before the fixture deadline")
+}
+
+async fn assert_settled_replay_retries_only_proof_contention() {
+    let mut attempts = 0;
+    let result = replay_settled_material_notice(async || {
+        attempts += 1;
+        match attempts {
+            1 => Err(SessionInboxError::Storage(
+                "Session proof I/O is busy".into(),
+            )),
+            2 => Ok("settled receipt"),
+            _ => panic!("the replay should stop after the first success"),
+        }
+    })
+    .await;
+    assert_eq!(result.unwrap(), "settled receipt");
+    assert_eq!(attempts, 2);
+
+    let mut attempts = 0;
+    let error = replay_settled_material_notice(async || -> Result<(), SessionInboxError> {
+        attempts += 1;
+        assert_eq!(attempts, 1, "a different storage error must propagate");
+        Err(SessionInboxError::Storage(
+            "Session proof I/O is busy for an unrecognized reason".into(),
+        ))
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SessionInboxError::Storage(reason)
+            if reason == "Session proof I/O is busy for an unrecognized reason"
+    ));
+}
+
 pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     decision: Option<PermissionDecisionKind>,
     repeat: bool,
@@ -1613,6 +1693,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     use actix_web::{http::StatusCode, test, App};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
+    if repeat {
+        assert_settled_replay_retries_only_proof_contention().await;
+    }
     let f = Fixture::new_with_native_source(true).await;
     f.state.config.write().await.defaults = Some(
         serde_json::from_value(json!({"chat": ProviderModelRef::new(PROVIDER, SOURCE)})).unwrap(),
@@ -1951,7 +2034,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         panic!("exactly one durable handoff");
     };
     assert!(notice.content.contains(HANDOFF_HEAD), "{}", notice.content);
-    assert!(notice.content.contains("dispatch a bounded reproduction"));
+    assert!(!notice.content.contains("bounded reproduction"));
     assert!(notice.content.contains(HANDOFF_EVIDENCE));
     assert!(notice.content.contains(HANDOFF_RISK));
     assert!(!notice.content.contains('界'));
@@ -1962,9 +2045,21 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     assert!(notice.content.contains(&fact.run_id));
     assert!(notice.content.len() < 1_600);
     assert!(!notice.content.contains(HANDOFF_TAIL));
-    assert!(f.probe.parent_inputs.lock().unwrap()[expected_calls - 1]
-        .iter()
-        .any(|message| message.id == notice.id && message.content == notice.content));
+    {
+        let parent_inputs = f.probe.parent_inputs.lock().unwrap();
+        let delivered = &parent_inputs[expected_calls - 1];
+        assert!(delivered
+            .iter()
+            .any(|message| message.id == notice.id && message.content == notice.content));
+        assert!(delivered.iter().any(|message| {
+            message
+                .content
+                .contains("Supervisor delegation-first policy")
+                && message
+                    .content
+                    .contains("bounded reproduction or missing validation when needed")
+        }));
+    }
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
     if decision.is_some() {
         let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
@@ -2004,14 +2099,15 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .unwrap()
             .unwrap();
         assert_eq!(permanent.id.as_str(), notice.id);
-        let replayed = f
-            .state
-            .observer_subscriptions
-            .inbox
-            .deliver_managed_root_notification(&selected, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+        let inbox = &f.state.observer_subscriptions.inbox;
+        let replayed = replay_settled_material_notice(async || {
+            inbox
+                .deliver_managed_root_notification(&selected, Utc::now())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(replayed.delivery, permanent);
         assert!(!replayed.pending);
         assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
@@ -2062,14 +2158,15 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .unwrap()
             .unwrap();
         assert_eq!(receipt.id.as_str(), notice.id);
-        let retry = f
-            .state
-            .observer_subscriptions
-            .inbox
-            .deliver_managed_root_notification(&selected, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+        let inbox = &f.state.observer_subscriptions.inbox;
+        let retry = replay_settled_material_notice(async || {
+            inbox
+                .deliver_managed_root_notification(&selected, Utc::now())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(retry.delivery.id.as_str(), notice.id);
         assert!(!retry.pending);
         assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
@@ -2624,6 +2721,88 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         assert!(!std::path::Path::new(&file).exists());
     }
     state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_subscribed_wait_yields_to_inbox() {
+    let f = Fixture::new_with_native_source(true).await;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "subscribed-wait-dispatch",
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":"subscribed-wait-dispatch", "message":"Run the subscribed task.",
+            "notify_on_material_event":true,
+        }),
+    )
+    .await;
+    assert_eq!(dispatch["notify_on_material_event"], true);
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the subscribed Root must start");
+    let observed = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "subscribed-wait-observe",
+        json!({"action":"observe_run", "target_session_id":ROOT_A, "target_ref":target}),
+    )
+    .await;
+    assert_eq!(observed["status"], "running");
+    let run = observed["run_id"].as_str().unwrap();
+    let wait_id = "supervisor-wait-for-subscribed-root";
+    *f.probe.parent_dispatch.lock().unwrap() = Some(vec![ToolCall {
+        id: wait_id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_control".into(),
+            arguments: json!({
+                "action":"wait_run", "target_session_id":ROOT_A, "target_ref":target,
+                "expected_run_id":run,
+            })
+            .to_string(),
+        },
+    }]);
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            &f.reference.session_id,
+            "Wait for the subscribed task.",
+        ))
+        .await
+        .unwrap();
+    drive_material_notices(&f, 1).await;
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let tool_result = parent
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(wait_id))
+        .expect("the wait result must survive turn completion");
+    assert_eq!(
+        tool_result.tool_success,
+        Some(true),
+        "{}",
+        tool_result.content
+    );
+    let result: Value = serde_json::from_str(&tool_result.content).unwrap();
+    assert_eq!(result["status"], "waiting_for_notification");
+    assert_eq!(result["run_id"], run);
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .as_deref(),
+        Some(run)
+    );
+
+    f.probe.source_release[0].notify_one();
+    settled(&f.state, ROOT_A).await;
+    drive_material_notices(&f, 2).await;
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    f.state.shutdown().await;
 }
 
 pub(in crate::app_state) async fn exercise_material_root_notifications() {

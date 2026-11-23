@@ -222,11 +222,8 @@ async fn background_exec_handoff_releases_the_conversation_and_keeps_the_command
 }
 
 #[tokio::test(start_paused = true)]
-async fn quiet_exec_wait_ceiling_preserves_the_handle_without_rearming_the_wait() {
-    use bamboo_tools::tools::{
-        bash_runtime::get_shell,
-        exec_command::{reserve_background_job, reserve_quiet_exec_job},
-    };
+async fn quiet_exec_wait_ceiling_requires_a_fresh_empty_poll_to_wait_again() {
+    use bamboo_tools::tools::{bash_runtime::get_shell, exec_command::reserve_quiet_exec_job};
 
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
@@ -263,26 +260,65 @@ async fn quiet_exec_wait_ceiling_preserves_the_handle_without_rearming_the_wait(
 
     let job = reserve_quiet_exec_job(owner, handle).await.unwrap();
     let started = tokio::time::Instant::now();
-    let message = wait_for_quiet_exec(job, &CancellationToken::new())
-        .await
-        .unwrap();
+    let message = wait_for_exec(
+        job,
+        &CancellationToken::new(),
+        Some(QUIET_EXEC_WAIT_TIMEOUT),
+    )
+    .await
+    .unwrap();
     assert!(started.elapsed() >= QUIET_EXEC_WAIT_TIMEOUT);
     assert!(message.content.contains("reached its wait ceiling"));
     assert!(message.content.contains("Completion is not confirmed"));
     assert!(message.content.contains(handle));
     assert_eq!(get_shell(handle).unwrap().status(), "running");
-    poll.invoke(poll_args, context("poll-after-ceiling"))
+    assert!(reserve_quiet_exec_job(owner, handle).await.is_none());
+
+    let ToolOutcome::Completed(poll_after_ceiling) = poll
+        .invoke(poll_args.clone(), context("poll-after-ceiling"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected running result");
+    };
+    let result: Value = serde_json::from_str(&poll_after_ceiling.result).unwrap();
+    assert_eq!(result["status"], "running");
+    assert_eq!(result["session_id"], handle);
+    assert!(result.get("exit_code").is_none());
+    assert!(reserve_quiet_exec_job("another-owner", handle)
+        .await
+        .is_none());
+
+    let job = reserve_quiet_exec_job(owner, handle).await.unwrap();
+    poll.invoke(poll_args.clone(), context("poll-during-wait"))
         .await
         .unwrap();
     assert!(reserve_quiet_exec_job(owner, handle).await.is_none());
-
-    let job = reserve_background_job(owner, handle).unwrap();
     tokio::time::resume();
     tokio::fs::write(&gate, b"release").await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(5), job.completion())
+    let message = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_exec(
+            job,
+            &CancellationToken::new(),
+            Some(QUIET_EXEC_WAIT_TIMEOUT),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(message.content.contains(r#""exit_code":7"#));
+
+    let ToolOutcome::Completed(collected) = poll
+        .invoke(poll_args, context("collect-terminal-result"))
         .await
-        .unwrap();
-    assert_eq!(result.exit_code, Some(7));
+        .unwrap()
+    else {
+        panic!("expected terminal result");
+    };
+    let result: Value = serde_json::from_str(&collected.result).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["exit_code"], 7);
 }
 
 struct PollMonitoredExec {
@@ -573,12 +609,16 @@ async fn background_exec_checkpoint_failure_or_wrong_owner_cannot_publish_a_hand
     let (tx, mut rx) = mpsc::channel(16);
     let mut other = Session::new("wrong-background-owner", "model");
     let mut other_runtime = AgentRuntimeState::new(&other.id);
-    assert!(
-        !maybe_background_quiet_exec(&mut other, &config, &mut other_runtime, &tx, handle)
-            .await
-            .unwrap()
-    );
-    assert!(maybe_background_quiet_exec(
+    assert!(!maybe_suspend_for_background_exec(
+        &mut other,
+        &config,
+        &mut other_runtime,
+        &tx,
+        handle
+    )
+    .await
+    .unwrap());
+    assert!(maybe_suspend_for_background_exec(
         &mut session,
         &config,
         &mut state.runtime_state,
@@ -600,12 +640,157 @@ async fn background_exec_checkpoint_failure_or_wrong_owner_cannot_publish_a_hand
         "running"
     );
     drop(reservation);
-    tokio::fs::write(&gate, b"release").await.unwrap();
-    executor
+    let handles = [handle.to_owned()];
+    let cancel = CancellationToken::new();
+    let (waiting, released) = tokio::join!(
+        observe_explicit_exec_waits(
+            &mut session,
+            &config,
+            &mut state.runtime_state,
+            &tx,
+            &handles,
+            &cancel,
+        ),
+        tokio::fs::write(&gate, b"release"),
+    );
+    released.unwrap();
+    assert!(
+        !waiting.unwrap(),
+        "the current run observes the original process"
+    );
+    assert!(hook.jobs.lock().unwrap().is_empty());
+    assert!(state.runtime_state.waiting_for_bash.is_none());
+    let message = session.messages.last().unwrap();
+    assert!(message.content.contains(r#""exit_code":7"#));
+    assert!(message.content.contains("exec-finished"));
+    assert!(message
+        .content
+        .contains("If you need more unread output, use write_stdin"));
+    let ToolOutcome::Completed(pulled) = executor
         .registry()
         .get("write_stdin")
         .unwrap()
         .invoke(json!({"session_id": handle, "yield_time_ms": 30_000}), ctx)
         .await
+        .unwrap()
+    else {
+        panic!("ordinary exec result");
+    };
+    let pulled: Value = serde_json::from_str(&pulled.result).unwrap();
+    assert_eq!(pulled["status"], "completed");
+    assert!(pulled["output"].as_str().unwrap().contains("exec-finished"));
+}
+
+#[derive(Default)]
+struct MixedWaitProvider(AtomicUsize);
+
+#[async_trait::async_trait]
+impl LLMProvider for MixedWaitProvider {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+        Ok(Box::pin(stream::iter([
+            Ok(LLMChunk::ToolCalls(vec![
+                tool_call(
+                    "wait-exec",
+                    "SubAgent",
+                    json!({"intent":"wait", "target":"exec-handle"}),
+                ),
+                tool_call("ask-format", "choose_output_format", json!({})),
+            ])),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+struct MixedWaitTool(&'static str);
+
+#[async_trait::async_trait]
+impl bamboo_agent_core::tools::Tool for MixedWaitTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn description(&self) -> &str {
+        "Synthetic wait boundary."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+
+    async fn invoke(
+        &self,
+        _: Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, bamboo_agent_core::tools::ToolError> {
+        use bamboo_agent_core::tools::ToolResult;
+
+        if self.0 == "SubAgent" {
+            let mut receipt = ToolResult::text(
+                true,
+                json!({"status":"wait_requested", "session_id":"exec-handle"}).to_string(),
+            );
+            receipt.display_preference =
+                Some(bamboo_tools::tools::exec_command::WAIT_FOR_EXEC_DISPLAY.into());
+            return Ok(ToolOutcome::Completed(receipt));
+        }
+        Ok(ToolOutcome::NeedsHuman {
+            question: bamboo_agent_core::PendingQuestion {
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: self.0.into(),
+                question: "Which output format?".into(),
+                options: vec!["Text".into(), "JSON".into()],
+                allow_custom: false,
+                source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+            },
+            result: ToolResult::text(true, "Waiting for the output format."),
+        })
+    }
+}
+
+#[tokio::test]
+async fn background_exec_explicit_wait_is_reported_as_deferred_by_a_same_batch_question() {
+    let (mut session, config, mut state) = fixture("mixed-exec-wait");
+    let provider = Arc::new(MixedWaitProvider::default());
+    let executor = Arc::new(yielding_executor());
+    executor.register_tool(MixedWaitTool("SubAgent")).unwrap();
+    executor
+        .register_tool(MixedWaitTool("choose_output_format"))
         .unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    assert!(!run_pipeline(
+        &mut session,
+        &tx,
+        provider.clone(),
+        executor,
+        &CancellationToken::new(),
+        &config,
+        &mut state,
+    )
+    .await
+    .unwrap());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        result_for(&session.messages, "wait-exec")["status"],
+        "wait_requested"
+    );
+    assert_eq!(session.pending_question.unwrap().tool_call_id, "ask-format");
+    assert!(state.runtime_state.waiting_for_bash.is_none());
+    let deferred = session
+        .messages
+        .iter()
+        .find(|message| {
+            message.metadata.as_ref().is_some_and(|metadata| {
+                metadata["runtime_kind"] == "exec_wait_deferred"
+                    && metadata["hidden_from_ui"] == true
+            })
+        })
+        .unwrap();
+    assert!(deferred.content.contains("exec-handle"));
 }

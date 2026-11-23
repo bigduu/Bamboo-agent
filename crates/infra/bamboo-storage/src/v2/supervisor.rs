@@ -162,7 +162,7 @@ async fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     if !metadata.file_type().is_file() {
         return Err(invalid("canonical authority is not a regular file"));
     }
-    fs::read(path).await
+    cold_main::read_state_file(path).await
 }
 
 // The strict generic authority port retains the legacy main-pair check for
@@ -197,15 +197,15 @@ struct MainIdentity {
 }
 
 impl SessionStoreV2 {
-    /// Read current owner consent and retain its profile lock through the fresh
-    /// dispatch reservation. The callback must not reenter the Session store.
-    pub async fn with_supervisor_dispatch_consent<T, F, Fut>(
+    /// Read the Supervisor's current mode and retain its profile lock through
+    /// the fresh dispatch reservation. The callback must not reenter the store.
+    pub async fn with_supervisor_dispatch_permission_mode<T, F, Fut>(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
         reserve: F,
     ) -> io::Result<T>
     where
-        F: FnOnce(bool) -> Fut,
+        F: FnOnce(bamboo_domain::SessionPermissionMode) -> Fut,
         Fut: std::future::Future<Output = io::Result<T>>,
     {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
@@ -223,7 +223,12 @@ impl SessionStoreV2 {
         current
             .check_execution_compatibility()
             .map_err(|error| invalid(&error.to_string()))?;
-        reserve(current.supervisor_auto_dispatch()).await
+        let mode = current
+            .agent_runtime_state
+            .as_ref()
+            .map(|runtime| runtime.effective_permission_mode())
+            .unwrap_or_default();
+        reserve(mode).await
     }
 
     /// Apply a Host profile edit to the current Supervisor under the physical
@@ -246,8 +251,7 @@ impl SessionStoreV2 {
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session_lock = self.acquire_session_write_lock(id, SaveKind::Full).await?;
-        let guards =
-            DefaultWriterGuards::supervisor_execution_profile(lifecycle, task, session_lock);
+        let guards = DefaultWriterGuards::shared(lifecycle, task, session_lock);
         let mut current = self
             .load_execution_admission_unchecked(id)
             .await?

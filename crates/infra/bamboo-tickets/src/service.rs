@@ -11,6 +11,7 @@ use crate::{
 
 pub(crate) type ManagedRootSelection<'a> = dyn Fn(&DispatchSpec) -> Result<ManagedWorkRoot> + 'a;
 pub(crate) type ManagedInputValidation<'a> = dyn Fn(&crate::WorkContextPacket) -> Result<()> + 'a;
+pub(crate) type WorkStartCheck = dyn Fn(&Snapshot) -> Result<()> + Send + Sync;
 
 pub(crate) struct ManagedStart<'a> {
     pub select_root: &'a ManagedRootSelection<'a>,
@@ -119,6 +120,7 @@ impl Authority {
 #[derive(Clone)]
 pub struct TicketService {
     pub(crate) inner: Arc<Mutex<FileStore>>,
+    pub(crate) work_start_check: Option<Arc<WorkStartCheck>>,
 }
 
 impl TicketService {
@@ -215,7 +217,18 @@ impl TicketService {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(store)),
+            work_start_check: None,
         })
+    }
+
+    /// Install the trusted Host's admission policy before publishing this service.
+    /// It observes the projected scope under the existing transaction.
+    pub fn with_work_start_check(
+        mut self,
+        check: impl Fn(&Snapshot) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.work_start_check = Some(Arc::new(check));
+        self
     }
 
     pub fn health(&self) -> Health {
@@ -413,6 +426,7 @@ impl TicketService {
             &command.operations,
             store.root(),
             managed_start.as_ref().map(|start| start.select_root),
+            self.work_start_check.as_deref(),
         )?;
         validate_snapshot(&next)?;
         validate_new_assignment_contexts(
@@ -773,6 +787,7 @@ fn apply(
     operation: &Operation,
     ids: &mut BTreeMap<String, String>,
     select_root: Option<&ManagedRootSelection<'_>>,
+    work_start_check: Option<&WorkStartCheck>,
 ) -> Result<()> {
     use Operation::*;
     let seq = snapshot.seq;
@@ -949,6 +964,9 @@ fn apply(
                 return Err(invalid(
                     "start requires ready Work without an active Assignment",
                 ));
+            }
+            if let Some(check) = work_start_check {
+                check(snapshot)?;
             }
             validate_contract(&work.contract)?;
             if work
@@ -1975,14 +1993,17 @@ fn apply(
     Ok(())
 }
 
+fn has_unresolved_effects(assignment: &Assignment) -> bool {
+    assignment.effects.values().any(|effect| {
+        matches!(
+            effect.state,
+            EffectState::Started | EffectState::OutcomeUnknown
+        )
+    })
+}
+
 pub(crate) fn holds_resources(a: &Assignment) -> bool {
-    (!a.process_stopped
-        || a.effects.values().any(|effect| {
-            matches!(
-                effect.state,
-                EffectState::Started | EffectState::OutcomeUnknown
-            )
-        }))
+    (!a.process_stopped || has_unresolved_effects(a))
         && matches!(
             a.state,
             AssignmentState::DispatchPending
@@ -1993,6 +2014,48 @@ pub(crate) fn holds_resources(a: &Assignment) -> bool {
                 | AssignmentState::OutcomeUnknown
                 | AssignmentState::Submitted
         )
+}
+
+impl Snapshot {
+    /// Confirm that a local continuation can use this exact checkout. The
+    /// Host still verifies current Project, Work and Git identity separately.
+    pub fn verify_handoff_checkout_released(
+        &self,
+        prior_attempt: Option<&Assignment>,
+        canonical_checkout: &Path,
+    ) -> Result<()> {
+        if prior_attempt
+            .is_some_and(|attempt| !attempt.process_stopped || has_unresolved_effects(attempt))
+        {
+            return Err(Error::ResourceBlocked(
+                "Pause the Work and wait for Bamboo to confirm the attempt has stopped and its effects have settled".into(),
+            ));
+        }
+        let checkout_claim = format!("worktree:{}", canonical_checkout.display());
+        let overlaps_checkout = |root: &str| {
+            let root = Path::new(root);
+            canonical_checkout.starts_with(root) || root.starts_with(canonical_checkout)
+        };
+        if self
+            .assignments
+            .values()
+            .filter(|assignment| holds_resources(assignment))
+            .filter_map(|assignment| assignment.workspace.as_ref())
+            .any(|workspace| {
+                workspace.claims.contains(&checkout_claim)
+                    || overlaps_checkout(&workspace.worktree)
+                    || workspace
+                        .write_roots
+                        .iter()
+                        .any(|root| overlaps_checkout(root))
+            })
+        {
+            return Err(Error::ResourceBlocked(
+                "Work checkout has an active or unconfirmed owner".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Both typed commands and semantic groups must validate the complete native
@@ -2377,6 +2440,7 @@ pub(crate) fn apply_operations(
     operations: &[Operation],
     root: &Path,
     select_root: Option<&ManagedRootSelection<'_>>,
+    work_start_check: Option<&WorkStartCheck>,
 ) -> Result<BTreeMap<String, String>> {
     let mut ids = BTreeMap::new();
     for operation in operations {
@@ -2394,7 +2458,14 @@ pub(crate) fn apply_operations(
                 }
             }
         }
-        apply(snapshot, authority, operation, &mut ids, select_root)?;
+        apply(
+            snapshot,
+            authority,
+            operation,
+            &mut ids,
+            select_root,
+            work_start_check,
+        )?;
     }
     Ok(ids)
 }

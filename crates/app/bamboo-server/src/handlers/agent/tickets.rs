@@ -1,11 +1,12 @@
 //! Authenticated single-owner HTTP projections over the same Ticket service.
+pub mod codex_handoff;
 pub mod patrol;
 pub mod ready_policy;
 pub mod sprints;
 pub mod token_budget;
 use actix_web::{http::StatusCode, web, HttpMessage, HttpRequest, HttpResponse, ResponseError};
 use bamboo_engine::ticket_worker_plan::tickets::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -95,6 +96,42 @@ pub async fn overview(
     Ok(HttpResponse::Ok().json(service.work_overview(&authority)?))
 }
 
+pub async fn inspect_ingress(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    message_id: web::Path<String>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
+    let resolution = service.message_resolution(&authority, &message_id)?;
+    let ingress = resolution
+        .ingress
+        .ok_or_else(|| Error::ScopeDenied("canonical Host Human ingress missing".into()))?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message_id": resolution.message_id,
+        "text": ingress.text,
+        "proposal_saved": resolution.proposal.is_some(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DismissIngressRequest {
+    binding: ScopeBinding,
+}
+
+pub async fn dismiss_ingress(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    message_id: web::Path<String>,
+    body: web::Json<DismissIngressRequest>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    state
+        .tickets
+        .dismiss_ingress(user(&state, &req).await?, &body.binding, &message_id)
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({"message_id":message_id.into_inner()})))
+}
+
 pub async fn project_board(
     state: web::Data<AppState>,
     req: HttpRequest,
@@ -105,7 +142,17 @@ pub async fn project_board(
         .project_store
         .get(&body.project_id)
         .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(service.project_board(&authority, &body)?))
+    #[derive(Serialize)]
+    struct BoardResponse {
+        #[serde(flatten)]
+        page: ReadEnvelope<ProjectBoard>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        codex_handoff_available: bool,
+    }
+    Ok(HttpResponse::Ok().json(BoardResponse {
+        page: service.project_board(&authority, &body)?,
+        codex_handoff_available: codex_handoff::require_local(&req).is_ok(),
+    }))
 }
 
 #[derive(Deserialize)]

@@ -33,6 +33,34 @@ fn query_row_cached<
     statement.query_row(params, map)
 }
 
+pub(super) fn apply_write_on_connection(
+    connection: &Connection,
+    write: MetricsWrite,
+) -> MetricsResult<()> {
+    match write {
+        MetricsWrite::Ordinary(mutation) => apply_mutation_on_connection(connection, mutation),
+        MetricsWrite::ToolStartedInRound {
+            tool_call_id,
+            round_id,
+            session_id,
+            tool_name,
+            started_at,
+        } => start_tool_in_round(
+            connection,
+            &tool_call_id,
+            &round_id,
+            &session_id,
+            &tool_name,
+            &format_timestamp(started_at),
+        ),
+        MetricsWrite::ToolCompletedInRound {
+            round_id,
+            tool_call_id,
+            completion,
+        } => complete_tool_call(connection, &tool_call_id, Some(&round_id), completion),
+    }
+}
+
 pub(super) fn apply_mutation_on_connection(
     connection: &Connection,
     mutation: MetricsMutation,
@@ -195,18 +223,24 @@ pub(super) fn apply_mutation_on_connection(
             started_at,
         } => {
             let started_at_str = format_timestamp(started_at);
-
-            execute_cached(
+            // A replay through the legacy API can still move its own row
+            // while keeping completion fields. It cannot move an exact
+            // collector record, even if that is the only other match.
+            let changed = execute_cached(
                 connection,
                 r#"
                 INSERT INTO tool_call_metrics (
                     tool_call_id, round_id, session_id, tool_name, started_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(tool_call_id) DO UPDATE SET
-                    round_id = excluded.round_id,
+                )
+                SELECT ?1, COALESCE(MIN(round_id), ?2), ?3, ?4, ?5
+                FROM tool_call_metrics
+                WHERE tool_call_id = ?1 AND round_scoped = 0
+                ON CONFLICT(tool_call_id, round_id) DO UPDATE SET
+                    round_id = ?2,
                     session_id = excluded.session_id,
                     tool_name = excluded.tool_name,
                     started_at = excluded.started_at
+                WHERE tool_call_metrics.round_scoped = 0
                 "#,
                 params![
                     tool_call_id,
@@ -216,33 +250,17 @@ pub(super) fn apply_mutation_on_connection(
                     started_at_str
                 ],
             )?;
+            if changed == 0 {
+                return Err(MetricsError::InvalidData(
+                    "tool metrics identifier is owned by a round-scoped collector".into(),
+                ));
+            }
             Ok(())
         }
         MetricsMutation::ToolCompleted {
             tool_call_id,
             completion,
-        } => {
-            let completed_at = format_timestamp(completion.completed_at);
-            let success = if completion.success { 1_i64 } else { 0_i64 };
-            let error = completion.error;
-
-            with_immediate_transaction(connection, || {
-                let session_id: String = query_row_cached(
-                    connection,
-                    "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
-                    params![tool_call_id],
-                    |row| row.get(0),
-                )?;
-
-                execute_cached(connection,
-                    "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
-                    params![completed_at, success, error, tool_call_id],
-                )?;
-
-                refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
-                Ok(())
-            })
-        }
+        } => complete_tool_call(connection, &tool_call_id, None, completion),
         MetricsMutation::ExecuteSyncMismatch {
             reason,
             occurred_at,
@@ -375,4 +393,63 @@ pub(super) fn apply_mutation_on_connection(
         batch_probe::after_item(connection);
     }
     result
+}
+
+fn start_tool_in_round(
+    connection: &Connection,
+    tool_call_id: &str,
+    round_id: &str,
+    session_id: &str,
+    tool_name: &str,
+    started_at: &str,
+) -> MetricsResult<()> {
+    execute_cached(
+        connection,
+        r#"
+        INSERT INTO tool_call_metrics (
+            tool_call_id, round_id, session_id, tool_name, started_at, round_scoped
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 1)
+        ON CONFLICT(tool_call_id, round_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            tool_name = excluded.tool_name,
+            started_at = excluded.started_at,
+            round_scoped = 1
+        "#,
+        params![tool_call_id, round_id, session_id, tool_name, started_at],
+    )?;
+    Ok(())
+}
+
+fn complete_tool_call(
+    connection: &Connection,
+    tool_call_id: &str,
+    round_id: Option<&str>,
+    completion: ToolCallCompletion,
+) -> MetricsResult<()> {
+    let completed_at = format_timestamp(completion.completed_at);
+    let success = if completion.success { 1_i64 } else { 0_i64 };
+
+    with_immediate_transaction(connection, || {
+        let (round_id, session_id): (String, String) = query_row_cached(
+            connection,
+            "SELECT round_id, session_id FROM tool_call_metrics WHERE tool_call_id = ?1 \
+             AND ((?2 IS NULL AND round_scoped = 0) OR (round_id = ?2 AND round_scoped = 1))",
+            params![tool_call_id, round_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        execute_cached(
+            connection,
+            "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 \
+             WHERE tool_call_id = ?4 AND round_id = ?5",
+            params![
+                completed_at,
+                success,
+                completion.error,
+                tool_call_id,
+                round_id
+            ],
+        )?;
+        refresh_session_aggregates(connection, &session_id, completion.completed_at)
+    })
 }

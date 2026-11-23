@@ -55,6 +55,8 @@ impl ReasoningEffort {
 #[derive(Serialize, Clone, Debug)]
 pub struct ChatRequest {
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ChatImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +71,10 @@ pub struct ChatRequest {
     /// repeat the same id but cannot use chat to reassign membership.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// An initial workspace chosen by the client. Omit this field to use the
+    /// server default for a new session or the saved workspace for an existing one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// Optional model override. Omitted from the request body when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -81,6 +87,27 @@ pub struct ChatRequest {
     /// provider/session default instead of inventing a client-side level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// An image attachment accepted by the chat endpoint used by the web composer.
+#[derive(Serialize, Clone)]
+pub struct ChatImage {
+    pub base64: String,
+    pub name: String,
+    pub size: usize,
+    #[serde(rename = "type")]
+    pub mime_type: String,
+}
+
+impl std::fmt::Debug for ChatImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatImage")
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("mime_type", &self.mime_type)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -106,8 +133,10 @@ mod chat_request_tests {
             in_reply_to: None,
             correlation_id: None,
             message: "hello".to_string(),
+            images: Vec::new(),
             session_id: None,
             project_id: Some("project-client".to_string()),
+            workspace_path: None,
             model: Some("gpt-5".to_string()),
             provider: Some("openai".to_string()),
             reasoning_effort: Some(super::ReasoningEffort::High),
@@ -117,6 +146,7 @@ mod chat_request_tests {
         assert_eq!(value["provider"], "openai");
         assert_eq!(value["reasoning_effort"], "high");
         assert!(value.get("session_id").is_none());
+        assert!(value.get("images").is_none());
     }
 }
 

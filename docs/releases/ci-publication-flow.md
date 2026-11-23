@@ -18,6 +18,10 @@ workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
 
+The Linux `packages-1` shard owns the default LiteLLM wire-types suite. Its
+additive `schema` context runs the three schema-only cases with the same target
+directory and checks that the test names match the compiled catalog.
+
 Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
 frontend policy Node suites once. Manual Windows and macOS diagnostics run nine system cases:
 bounded file reading, canonical artifact paths, four process/listener binding
@@ -74,6 +78,10 @@ block continues to supply the machine-readable receipt.
 
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
+The frozen-source guard retries temporary GitHub metadata read failures using
+fresh GET requests. Each read permits three retries after 1, 2, and 4 seconds.
+Access errors and failed source checks still stop publication, and writes
+remain outside the retry.
 If infrastructure fails, retain successful outputs and retry only the missing
 work with the same source/version. If a crate build may have started but its
 original archive and signed checksum cannot be confirmed, stop for recovery;

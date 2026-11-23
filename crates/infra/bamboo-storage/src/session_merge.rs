@@ -50,7 +50,6 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
     "gold_config",
-    bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY,
     "workflow.run_ids.v1",
     "ticket.runtime.dispatch.v1",
     "ticket.runtime.owned_stop.v1",
@@ -3935,13 +3934,13 @@ fn validate_staged_retrieval_window_transition(
 
 /// Message-only summaries share the existing archive CAS/publication boundary.
 /// Validate their narrower projection separately: raw history is immutable,
-/// all eligible tool rows leave the active view, and only derived
+/// eligible tool rows leave the active view in complete batches, and only derived
 /// compression state may change with the provider-continuation reset.
 fn validate_staged_message_summary_transition(
     expected: &Session,
     staged: &Session,
 ) -> std::io::Result<()> {
-    use bamboo_domain::{CompressionEventKind, ModelContextResetReason, Role};
+    use bamboo_domain::{CompressionEventKind, ModelContextResetReason};
 
     if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
         return Err(invalid_retrieval_window_checkpoint(
@@ -3968,38 +3967,16 @@ fn validate_staged_message_summary_transition(
             "message-summary checkpoint has an invalid archive event",
         ));
     }
-    bamboo_domain::validate_message_summary_tool_protocol(expected).map_err(|error| {
-        invalid_retrieval_window_checkpoint(format!("message-summary checkpoint blocked: {error}"))
-    })?;
-    let latest_user_id = expected
-        .messages
-        .iter()
-        .rev()
-        .find(|message| !message.compressed && message.role == Role::User)
-        .map(|message| message.id.as_str());
+    let archive_ids =
+        bamboo_domain::message_summary_archive_message_ids(expected).map_err(|error| {
+            invalid_retrieval_window_checkpoint(format!(
+                "message-summary checkpoint blocked: {error}"
+            ))
+        })?;
     let mut canonical = expected.clone();
     let mut newly_archived = 0usize;
     for (before, canonical_message) in expected.messages.iter().zip(&mut canonical.messages) {
-        if before.compressed {
-            continue;
-        }
-        let has_calls = before
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty());
-        let has_tool_protocol =
-            has_calls || before.tool_call_id.is_some() || before.role == Role::Tool;
-        let generated_recovery = before.role == Role::Assistant
-            && before.content.starts_with("[post-compaction-recovery]\n");
-        let should_archive = before.role != Role::System
-            && Some(before.id.as_str()) != latest_user_id
-            && (!before.never_compress || generated_recovery);
-        if has_tool_protocol && !should_archive {
-            return Err(invalid_retrieval_window_checkpoint(
-                "message-summary checkpoint cannot retain active tool protocol",
-            ));
-        }
-        if should_archive {
+        if !before.compressed && archive_ids.contains(before.id.as_str()) {
             if before.compressed_by_event_id.is_some() {
                 return Err(invalid_retrieval_window_checkpoint(
                     "message-summary checkpoint has a pre-existing active archive correlation",
@@ -4185,12 +4162,37 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
     disk_audit.write_to(&mut session.metadata);
 }
 
+/// Preserve the Host-owned loop record from the current Session lifetime.
+pub(crate) fn preserve_paced_loop(session: &mut Session, latest: Option<&Session>) {
+    let key = bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+    let record = latest
+        .filter(|current| {
+            current.id == session.id
+                && current.created_at == session.created_at
+                && current.kind == session.kind
+                && current.authority_identity == session.authority_identity
+                && current.conversation_reset == session.conversation_reset
+        })
+        .and_then(|current| current.metadata.get(key));
+    match record {
+        Some(value) => {
+            session.metadata.insert(key.into(), value.clone());
+        }
+        None => {
+            session.metadata.remove(key);
+        }
+    }
+}
+
 /// Pure merge step: given a freshly-loaded on-disk copy, overwrite the
 /// in-memory authoritative metadata group when disk's `metadata_version` is at
 /// least the in-memory one. Split out so callers that have already loaded the
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    // Paced registration has its own compare-and-set under the physical writer
+    // and never advances the title / Project metadata revision.
+    preserve_paced_loop(session, Some(latest));
     if session.host_run_id().is_some() && session.host_run_id() == latest.host_run_id() {
         let key = "runtime.host_prior_activation_fence";
         match latest.metadata.get(key) {
@@ -7664,16 +7666,19 @@ mod tests {
     #[tokio::test]
     async fn message_summary_checkpoint_rebases_concurrent_durable_changes_without_writing_or_publishing(
     ) {
-        for append in [false, true] {
+        for mutation in ["pin", "output", "append"] {
             let (_temp, storage) = make_storage().await;
             let store = LockedSessionStore::new(storage.clone());
             let (expected, mut staged) = message_summary_fixture("message-summary-concurrent-base");
             storage.save_session(&expected).await.unwrap();
             let mut durable = expected.clone();
-            if append {
-                durable.add_message(bamboo_domain::Message::user("Concurrent current request"));
-            } else {
-                durable.messages[3].content = "Concurrent corrected tool output".into();
+            match mutation {
+                "pin" => durable.messages[3].never_compress = true,
+                "output" => durable.messages[3].content = "Concurrent corrected tool output".into(),
+                "append" => {
+                    durable.add_message(bamboo_domain::Message::user("Concurrent current request"))
+                }
+                _ => unreachable!(),
             }
             storage.save_session(&durable).await.unwrap();
             let published = AtomicBool::new(false);
@@ -7700,7 +7705,7 @@ mod tests {
     }
 
     #[test]
-    fn message_summary_checkpoint_rejects_raw_rewrites_and_incomplete_or_retained_tool_protocol() {
+    fn message_summary_checkpoint_rejects_raw_rewrites_and_unsafe_tool_batch_projection() {
         let (expected, valid) = message_summary_fixture("message-summary-invalid-projection");
         validate_staged_message_summary_transition(&expected, &valid).unwrap();
         for mutation in 0..9 {
@@ -7746,7 +7751,21 @@ mod tests {
         protected.messages[3].never_compress = true;
         let mut staged = valid;
         staged.messages[3].never_compress = true;
+        // Archiving the whole pinned batch is forbidden, even with a valid
+        // summary and matching event counts.
         assert!(validate_staged_message_summary_transition(&protected, &staged).is_err());
+        for index in [2, 3] {
+            staged.messages[index].compressed = false;
+            staged.messages[index].compressed_by_event_id = None;
+            staged.compression_events[0].messages_compressed -= 1;
+            staged.conversation_summary.as_mut().unwrap().message_count -= 1;
+            let validation = validate_staged_message_summary_transition(&protected, &staged);
+            if index == 2 {
+                assert!(validation.is_err(), "a pinned batch cannot be split");
+            } else {
+                validation.expect("the complete pinned batch can stay active");
+            }
+        }
     }
 
     #[tokio::test]
@@ -8457,6 +8476,39 @@ mod tests {
         // And the in-memory copy was corrected by the merge too.
         assert_eq!(stale_snapshot.title, "User Renamed");
         assert_eq!(stale_snapshot.metadata_version, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_save_preserves_paced_loop_registration_and_removal() {
+        use bamboo_domain::session::PACED_LOOP_METADATA_KEY;
+
+        let home = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let store = LockedSessionStore::new(storage.clone());
+        let mut stale = fresh("runtime-paced-loop");
+        storage.save_session(&stale).await.unwrap();
+
+        let registered = storage
+            .save_paced_loop_metadata(&stale, "registered".into())
+            .await
+            .unwrap();
+        store.merge_save_runtime(&mut stale).await.unwrap();
+        assert_eq!(
+            stale.metadata.get(PACED_LOOP_METADATA_KEY),
+            registered.metadata.get(PACED_LOOP_METADATA_KEY)
+        );
+
+        assert!(storage.clear_session(&stale.id).await.unwrap());
+        store.merge_save_runtime(&mut stale).await.unwrap();
+
+        assert!(!stale.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        let saved = storage.load_session(&stale.id).await.unwrap().unwrap();
+        assert!(!saved.metadata.contains_key(PACED_LOOP_METADATA_KEY));
+        assert_eq!(saved.metadata_version, registered.metadata_version);
     }
 
     #[tokio::test]

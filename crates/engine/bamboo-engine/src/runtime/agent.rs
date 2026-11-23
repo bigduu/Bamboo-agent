@@ -606,6 +606,16 @@ impl Agent {
             }))
     }
 
+    /// Bind paced behavior to the reserved execution that owns the Inbox input.
+    pub(crate) fn with_paced_loop_turn(
+        &self,
+        turn: super::paced_loop_wakeup::PacedLoopTurn,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.paced_loop_turn = Some(turn);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]
@@ -963,9 +973,16 @@ impl Agent {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
+        run_deadline: Option<crate::runtime::config::RunDeadline>,
     ) -> crate::runtime::runner::Result<()> {
         self.runtime
-            .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            .execute_with_inputs_and_upstream_retry(
+                session,
+                req,
+                inputs,
+                upstream_retry,
+                run_deadline,
+            )
             .await
     }
 
@@ -1196,7 +1213,7 @@ impl Agent {
         }
         let Some(router) = lease.router.take() else {
             return self
-                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry, None)
                 .await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
@@ -1237,13 +1254,19 @@ impl Agent {
                 // Bind before the runtime is first polled, so cancellation of
                 // this observer still leaves Drop the same sticky host proof.
                 registration.bind_tool_suspension_observation(token);
-                self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
-                    .await
+                self.execute_with_inputs_and_upstream_retry(
+                    session,
+                    req,
+                    inputs,
+                    upstream_retry,
+                    None,
+                )
+                .await
             })
             .await
             .0
         } else {
-            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry, None)
                 .await
         };
         if registration.observed_forbidden_running() {

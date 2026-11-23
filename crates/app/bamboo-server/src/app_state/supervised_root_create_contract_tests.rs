@@ -222,6 +222,111 @@ fn accepted(result: ToolResult) -> Value {
     result
 }
 
+#[test]
+fn historical_managed_work_input_requires_the_entire_receipt_fingerprint() {
+    let supervisor = SupervisorReference {
+        session_id: "supervisor-fixture".into(),
+        incarnation_id: uuid::Uuid::from_u128(1),
+    };
+    let authority = CreationAuthority::legacy_supervisor(supervisor);
+    let dispatch = TicketDispatchBinding {
+        dispatch_key: "dispatch-fixture".into(),
+        spec_hash: "spec-fixture".into(),
+        assignment_id: "assignment-fixture".into(),
+        binding: bamboo_tickets::ScopeBinding {
+            scope_id: "scope-fixture".into(),
+            supervisor_session_id: "supervisor-fixture".into(),
+            binding_revision: 1,
+        },
+        max_rounds: None,
+        highest_reasoning: false,
+        receipt: None,
+        receipt_created_at: None,
+    };
+    let mut contract = bamboo_tickets::Contract {
+        title: "Fixture".into(),
+        objective: "Deliver result".into(),
+        constraints: vec![],
+        acceptance: vec![],
+        user_acceptance_required: false,
+        allowed_tools: ["Task".into()].into(),
+    };
+    let message = concat!(
+        "Complete the Work contract below in the assigned workspace. ",
+        "Use Task to record and update your plan and progress. ",
+        "Finish with a handoff covering each acceptance item and any open findings ",
+        "for Supervisor review.\n\n{\"contract\":{\"allowed_tools\":[\"Task\"]}}"
+    );
+    let mut current = SupervisedRootCreateRequest {
+        operation_id: uuid::Uuid::from_u128(2),
+        expected_state_revision: 1,
+        project_id: None,
+        workspace_path: None,
+        message: message.into(),
+        title: Some("Fixture".into()),
+        notify_on_material_event: false,
+        thinking_mode: None,
+    };
+    let old_message = message.replacen(
+        "Finish with a handoff",
+        "Use absolute paths inside the assigned worktree for Read. Finish with a handoff",
+        1,
+    );
+    let (_, _, old_request_fingerprint) = authority
+        .operation_identity(&SupervisedRootCreateRequest {
+            message: old_message.clone(),
+            ..current.clone()
+        })
+        .unwrap();
+    let stored_fingerprint = payload_fingerprint(&(&old_request_fingerprint, &dispatch)).unwrap();
+
+    let foreign_dispatch = TicketDispatchBinding {
+        spec_hash: "different-spec".into(),
+        ..dispatch.clone()
+    };
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &foreign_dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    let mut foreign_request = SupervisedRootCreateRequest {
+        title: Some("Different title".into()),
+        ..current.clone()
+    };
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut foreign_request,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    contract.allowed_tools.insert("Read".into());
+    assert!(!restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    assert_eq!(current.message, message);
+
+    contract.allowed_tools.remove("Read");
+    assert!(restore_historical_managed_work_input(
+        &authority,
+        &mut current,
+        &contract,
+        &dispatch,
+        &stored_fingerprint,
+    )
+    .unwrap());
+    assert_eq!(current.message, old_message);
+}
+
 #[tokio::test]
 async fn supervisor_requires_a_model_before_publishing_a_new_root() {
     let f = Fixture::new().await;
@@ -1165,6 +1270,20 @@ async fn generic_spawn_forwards_only_original_root_child_callers_to_an_explicit_
 async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_first_task_on_reopen() {
     use bamboo_server_tools::session_control::versioned::SpawnSessionTool;
     let f = Fixture::new().await;
+    let project = f.creator.projects.get(f.project_id()).unwrap();
+    f.creator
+        .projects
+        .update(&project.id, project.revision, |manifest| {
+            manifest.new_chat_worktree = true;
+            Ok(())
+        })
+        .unwrap();
+    let mut missing_workspace = f.request.clone();
+    missing_workspace.workspace_path = None;
+    let rejected = f.creator.create(&f.supervisor, missing_workspace).await;
+    assert!(matches!(rejected, Err(ToolError::InvalidArguments(error))
+        if error.contains("provide both project_id and workspace_path")));
+    assert_eq!(f.count().await, 1);
     let main = f.home.path().join("workspaces").join("source-checkout");
     std::fs::create_dir_all(&main).unwrap();
     native_git(&main, &["init", "--initial-branch=fixture"]);

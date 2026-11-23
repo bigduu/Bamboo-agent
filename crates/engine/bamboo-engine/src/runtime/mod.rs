@@ -10,6 +10,7 @@ pub mod counted_loop;
 pub mod execution;
 pub(crate) mod final_evidence;
 pub mod goal_recovery;
+pub mod goal_restart;
 pub mod goal_state;
 pub mod gold_evaluation;
 pub mod guardian_state;
@@ -19,6 +20,8 @@ pub mod host_gold;
 pub mod loop_control;
 pub mod managers;
 pub mod model_roster;
+#[doc(hidden)]
+pub mod paced_loop_wakeup;
 pub mod runner;
 #[allow(clippy::module_inception)]
 pub mod runtime;

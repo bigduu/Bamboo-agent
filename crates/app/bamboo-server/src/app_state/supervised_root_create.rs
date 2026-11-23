@@ -10,8 +10,7 @@ use bamboo_agent_core::workspace_state::{
     preview_default_session_workspace_dir, preview_pin_workspace_path,
 };
 use bamboo_domain::{
-    RootThinkingMode, Session, SessionActivationDisposition, SessionPermissionMode, Storage,
-    SupervisorReference,
+    RootThinkingMode, Session, SessionActivationDisposition, Storage, SupervisorReference,
 };
 use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
 use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
@@ -50,6 +49,40 @@ struct ManagedRootCreation {
     service: bamboo_tickets::TicketService,
     spec: bamboo_tickets::DispatchSpec,
     dispatch: TicketDispatchBinding,
+}
+
+fn managed_work_fingerprint(
+    fingerprint: &str,
+    dispatch: &TicketDispatchBinding,
+) -> Result<String, ToolError> {
+    payload_fingerprint(&(fingerprint, dispatch))
+        .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+}
+
+fn restore_historical_managed_work_input(
+    authority: &CreationAuthority,
+    request: &mut SupervisedRootCreateRequest,
+    contract: &bamboo_tickets::Contract,
+    dispatch: &TicketDispatchBinding,
+    stored_fingerprint: &str,
+) -> Result<bool, ToolError> {
+    let Some(message) = bamboo_orchestration::managed_work::legacy_task_only_instruction_for_replay(
+        &request.message,
+        contract,
+    ) else {
+        return Ok(false);
+    };
+    let historical = SupervisedRootCreateRequest {
+        message,
+        ..request.clone()
+    };
+    let (_, _, historical_fingerprint) = authority.operation_identity(&historical)?;
+    if managed_work_fingerprint(&historical_fingerprint, dispatch)? != stored_fingerprint {
+        return Ok(false);
+    }
+    // The first input might already have been staged with the historical bytes.
+    *request = historical;
+    Ok(true)
 }
 
 fn blocked(
@@ -176,7 +209,7 @@ impl SupervisedRootCreator {
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. Workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. An observed dispatch starts the new Session in the Supervisor's current permission mode. After creation each worker owns its tool and approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
@@ -185,18 +218,19 @@ impl SupervisedRootCreator {
         service: &bamboo_tickets::TicketService,
         spec: &bamboo_tickets::DispatchSpec,
         dispatch: &TicketDispatchBinding,
-        request: SupervisedRootCreateRequest,
+        mut request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
+        let target = spec
+            .managed_root
+            .as_ref()
+            .ok_or_else(|| ToolError::Execution("managed Work target missing".into()))?;
+        request.thinking_mode = target.thinking_mode;
         request.validate()?;
         if request.project_id.is_none() {
             return Err(ToolError::InvalidArguments(
                 "managed Work Root creation requires a Project and workspace".into(),
             ));
         }
-        let target = spec
-            .managed_root
-            .as_ref()
-            .ok_or_else(|| ToolError::Execution("managed Work target missing".into()))?;
         let authority = CreationAuthority::Supervisor {
             reference: target
                 .supervisor()
@@ -233,18 +267,17 @@ impl SupervisedRootCreator {
     async fn create_authorized_inner(
         &self,
         authority: &CreationAuthority,
-        request: SupervisedRootCreateRequest,
+        mut request: SupervisedRootCreateRequest,
         managed: Option<&ManagedRootCreation>,
     ) -> Result<ToolResult, ToolError> {
         if request.thinking_mode == Some(RootThinkingMode::Ultra)
-            && (managed.is_some()
-                || !matches!(
-                    authority,
-                    CreationAuthority::Supervisor {
-                        original_caller: Some(_),
-                        ..
-                    }
-                ))
+            && !matches!(
+                authority,
+                CreationAuthority::Supervisor {
+                    original_caller: Some(_),
+                    ..
+                }
+            )
         {
             return Err(ToolError::InvalidArguments(
                 "Ultra creation requires an observed Supervisor creating an independent execution Session".into(),
@@ -253,8 +286,7 @@ impl SupervisedRootCreator {
         let operation_id = request.operation_id;
         let (digest, reserved_id, mut fingerprint) = authority.operation_identity(&request)?;
         if let Some(managed) = managed {
-            fingerprint = payload_fingerprint(&(&fingerprint, &managed.dispatch))
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            fingerprint = managed_work_fingerprint(&fingerprint, &managed.dispatch)?;
         }
         let state_revision = match authority.validate_request(self, &request).await {
             Ok(revision) => revision,
@@ -294,13 +326,25 @@ impl SupervisedRootCreator {
                 ));
             }
             if existing.payload_fingerprint != fingerprint {
-                return Ok(blocked(
-                    operation_id,
-                    Some(&existing.session_id),
-                    "reservation",
-                    "idempotency_conflict",
-                    "The operation UUID is already bound to a different request",
-                ));
+                let historical = match managed {
+                    Some(managed) => restore_historical_managed_work_input(
+                        authority,
+                        &mut request,
+                        &managed.spec.contract,
+                        &managed.dispatch,
+                        &existing.payload_fingerprint,
+                    )?,
+                    None => false,
+                };
+                if !historical {
+                    return Ok(blocked(
+                        operation_id,
+                        Some(&existing.session_id),
+                        "reservation",
+                        "idempotency_conflict",
+                        "The operation UUID is already bound to a different request",
+                    ));
+                }
             }
         }
         if request.notify_on_material_event
@@ -357,7 +401,14 @@ impl SupervisedRootCreator {
         let mut operation = existing.unwrap_or_else(|| {
             let mut operation =
                 SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id);
-            if !authority.is_host() && managed.is_none() {
+            if matches!(
+                authority,
+                CreationAuthority::Supervisor {
+                    original_caller: None,
+                    ..
+                }
+            ) && managed.is_none()
+            {
                 operation.supervisor_execution_permission_mode = Some(
                     bamboo_orchestration::managed_session::DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
                 );
@@ -455,16 +506,14 @@ impl SupervisedRootCreator {
                     let reserved = &mut operation;
                     let worker = &mut candidate;
                     self.store
-                        .with_supervisor_dispatch_consent(caller, |auto| async move {
-                            if auto {
-                                reserved.supervisor_execution_permission_mode =
-                                    Some(SessionPermissionMode::Auto);
-                                worker
-                                    .agent_runtime_state
-                                    .get_or_insert_with(Default::default)
-                                    .set_permission_mode(SessionPermissionMode::Auto);
-                            }
-                            self.operations.save(reserved).await
+                        .with_supervisor_dispatch_permission_mode(caller, |mode| async move {
+                            reserved.supervisor_execution_permission_mode = Some(mode);
+                            self.operations.save(reserved).await?;
+                            worker
+                                .agent_runtime_state
+                                .get_or_insert_with(Default::default)
+                                .set_permission_mode(mode);
+                            Ok(())
                         })
                         .await
                 }

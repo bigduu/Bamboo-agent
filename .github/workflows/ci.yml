@@ -648,22 +648,22 @@ jobs:
           retention-days: 14
 
   msrv:
-    name: MSRV (Rust 1.95)
+    name: MSRV (Rust 1.97)
     needs: validation-source
     if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.95
+      - name: Install Rust 1.97
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.97.0
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          shared-key: bamboo-ci-msrv-1.95-${{ runner.os }}
+          shared-key: bamboo-ci-msrv-1.97-${{ runner.os }}
           save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Test MSRV graph audit

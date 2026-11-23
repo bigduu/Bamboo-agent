@@ -143,6 +143,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::codex_handoff::configure)
                 .configure(agent::tickets::patrol::configure)
                 .configure(agent::tickets::ready_policy::configure)
                 .configure(agent::tickets::sprints::configure)
@@ -150,6 +151,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
+                .route(
+                    "/ingress/{message_id}",
+                    web::get().to(agent::tickets::inspect_ingress),
+                )
+                .route(
+                    "/ingress/{message_id}/dismiss",
+                    web::post().to(agent::tickets::dismiss_ingress),
+                )
                 .route("/search", web::post().to(agent::tickets::search))
                 .route(
                     "/project-board",
@@ -223,6 +232,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::browser::screenshot),
         )
         .route("/chat", web::post().to(agent::chat::handler))
+        .route(
+            "/sessions/{session_id}/goal/resume",
+            web::post().to(agent::chat::resume_goal),
+        )
         .route(
             "/prompt-presets",
             web::get().to(agent::prompt_presets::list_prompt_presets),
@@ -358,6 +371,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::resource("/sessions/{session_id}/version-migration")
                 .route(web::get().to(agent::sessions::inspect_session_version_migration))
                 .route(web::post().to(agent::sessions::migrate_session_version)),
+        )
+        .route(
+            "/session-storage/archive-preview",
+            web::get().to(agent::sessions::preview_session_archives),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive",
+            web::post().to(agent::sessions::archive_session),
+        )
+        .route(
+            "/sessions/{session_id}/storage-archive/restore",
+            web::post().to(agent::sessions::restore_session_archive),
         )
         .route(
             "/sessions/{session_id}/named-agent-profiles",
@@ -656,6 +681,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
     // access-password middleware as everything else in this scope — see
     // `ledger_scope`'s doc comment.
     scope = scope.service(ledger_scope());
+
+    scope = scope.service(
+        web::resource("/sessions/{session_id}/loop")
+            .route(web::get().to(agent::paced_loop::status))
+            .route(web::post().to(agent::paced_loop::mutate)),
+    );
 
     // Dev-only endpoints are a greenfield wipe of ALL sessions (`dev_reset`) with
     // no auth. Register them ONLY when explicitly enabled, so a production/Docker

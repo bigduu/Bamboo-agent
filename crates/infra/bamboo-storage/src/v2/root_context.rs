@@ -563,7 +563,7 @@ impl SessionStoreV2 {
                 {
                     return Err(conflict("legacy Root canonical pair is incomplete"));
                 }
-                let main_bytes = fs::read(main_path).await?;
+                let main_bytes = cold_main::read(main_path).await?;
                 let side_bytes = fs::read(side_path).await?;
                 compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
@@ -731,8 +731,7 @@ impl SessionStoreV2 {
         &self,
         incoming: &Session,
     ) -> io::Result<()> {
-        self.validate_root_context_for_write(incoming, false, false)
-            .await
+        self.validate_root_context_for_write(incoming, false).await
     }
 
     /// A full save may finish an interrupted create, or restore a missing main
@@ -741,17 +740,14 @@ impl SessionStoreV2 {
     pub(super) async fn validate_root_context_for_full_save(
         &self,
         incoming: &Session,
-        writes_supervisor_execution_profile: bool,
     ) -> io::Result<()> {
-        self.validate_root_context_for_write(incoming, true, writes_supervisor_execution_profile)
-            .await
+        self.validate_root_context_for_write(incoming, true).await
     }
 
     async fn validate_root_context_for_write(
         &self,
         incoming: &Session,
         full: bool,
-        writes_supervisor_execution_profile: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
         incoming
@@ -841,7 +837,7 @@ impl SessionStoreV2 {
             // A full save already serializes the transcript and must not
             // replace damaged or stale canonical history from a caller's
             // snapshot. Only runtime-only paths skip this large read.
-            let bytes = fs::read(directory.join("session.json"))
+            let bytes = cold_main::read(directory.join("session.json"))
                 .await
                 .map_err(|error| conflict(format!("canonical main file: {error}")))?;
             compact_main::validate_full_main(&bytes)
@@ -855,20 +851,6 @@ impl SessionStoreV2 {
         if incoming.metadata_version < current.metadata_version {
             return Err(conflict(
                 "metadata revision regressed; reload before saving",
-            ));
-        }
-        if current.supervisor_incarnation_id().is_some()
-            && incoming
-                .metadata
-                .get(bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY)
-                != current
-                    .metadata
-                    .get(bamboo_domain::SUPERVISOR_AUTO_DISPATCH_KEY)
-            && (!writes_supervisor_execution_profile
-                || current.metadata_version.checked_add(1) != Some(incoming.metadata_version))
-        {
-            return Err(conflict(
-                "Supervisor dispatch consent requires the current profile writer",
             ));
         }
         if incoming.root_mode_operations.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT {

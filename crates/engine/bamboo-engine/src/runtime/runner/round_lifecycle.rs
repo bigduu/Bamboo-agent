@@ -14,11 +14,12 @@ use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity, ProviderFamily,
     ProviderProtocol, ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
-    SessionKind,
+    ReasoningEffort, SessionKind,
 };
 use bamboo_llm::provider::{
     OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
 };
+use bamboo_llm::providers::gemini::{reasoning_control_for_model, GeminiReasoningControl};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -40,6 +41,127 @@ pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
 #[cfg(test)]
 pub(in crate::runtime::runner) use stream_execution::effective_tool_schemas;
 pub(in crate::runtime::runner) use stream_execution::required_tool_for_session;
+
+/// Select the highest tier for a known provider/model. Alias routes retain the
+/// canonical Max request unless their adapter prescribes a lower wire ceiling.
+fn ultra_reasoning_effort(provider_type: Option<&str>, model: &str) -> Option<ReasoningEffort> {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    let belongs_to = |family: &str| {
+        model == family
+            || model
+                .strip_prefix(family)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    };
+    // These routes have no named reasoning tier in their native request.
+    if ["gpt-4.1", "gpt-4o", "gpt-3.5-turbo"]
+        .iter()
+        .any(|family| belongs_to(family))
+        || model == "gemini-2.5"
+    {
+        return None;
+    }
+    if matches!(provider_type.map(str::trim), Some("anthropic" | "bodhi"))
+        && legacy_claude_model(model)
+    {
+        // The Messages adapters pair a named effort with adaptive thinking.
+        // Earlier Claude models use extended thinking and reject that mode.
+        return None;
+    }
+    match reasoning_control_for_model(model) {
+        GeminiReasoningControl::Level => return Some(ReasoningEffort::High),
+        GeminiReasoningControl::Budget | GeminiReasoningControl::Unsupported => return None,
+        GeminiReasoningControl::Unknown if provider_type == Some("gemini") => {
+            return Some(ReasoningEffort::High);
+        }
+        GeminiReasoningControl::Unknown => {}
+    }
+    if [
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.1-codex-max",
+    ]
+    .iter()
+    .any(|family| belongs_to(family))
+    {
+        return Some(ReasoningEffort::Xhigh);
+    }
+    if ["o1", "o3", "o4-mini", "gpt-5.1", "gpt-5", "claude-opus-4-5"]
+        .iter()
+        .any(|family| belongs_to(family))
+    {
+        return Some(ReasoningEffort::High);
+    }
+    Some(ReasoningEffort::Max)
+}
+
+fn legacy_claude_model(model: &str) -> bool {
+    // Dated snapshots and moving aliases use the same wire configuration as
+    // their family. Match exact 4.x families so newer tiers stay enabled.
+    let model = model.strip_suffix("-latest").unwrap_or(model);
+    let family = model
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(model, |(family, _)| family);
+    matches!(
+        family,
+        "claude-opus-4"
+            | "claude-opus-4-1"
+            | "claude-opus-4-5"
+            | "claude-sonnet-4"
+            | "claude-sonnet-4-5"
+            | "claude-haiku-4-5"
+            | "claude-2"
+            | "claude-3"
+    ) || family.starts_with("claude-3-")
+        || family.starts_with("claude-2.")
+        || family.starts_with("claude-instant-")
+}
+
+#[cfg(test)]
+#[test]
+fn ultra_effort_uses_the_selected_routes_named_ceiling() {
+    for (provider, model, expected) in [
+        ("openai", "gpt-6.2-sol", Some(ReasoningEffort::Max)),
+        ("openai", "gpt-5.5-2026-04-23", Some(ReasoningEffort::Xhigh)),
+        ("openai", "o3", Some(ReasoningEffort::High)),
+        ("openai", "gpt-4.1-mini", None),
+        (
+            "gemini",
+            "models/gemini-3.1-pro",
+            Some(ReasoningEffort::High),
+        ),
+        ("gemini", "models/gemini-2.5-flash", None),
+        ("bodhi", "gemini-2.0-flash", None),
+        ("bodhi", "gemini-3.5-flash", Some(ReasoningEffort::High)),
+        ("bodhi", "gemini-flash-latest", Some(ReasoningEffort::High)),
+        ("anthropic", "claude-3-7-sonnet-20250219", None),
+        ("anthropic", "claude-sonnet-4-20250514", None),
+        ("anthropic", "claude-opus-4-1-20250805", None),
+        ("anthropic", "claude-opus-4-5", None),
+        ("anthropic", "claude-sonnet-4-5-latest", None),
+        ("bodhi", "claude-haiku-4-5-20251001", None),
+        ("anthropic", "claude-sonnet-4-6", Some(ReasoningEffort::Max)),
+        (
+            "anthropic",
+            "claude-opus-4-8-20260830",
+            Some(ReasoningEffort::Max),
+        ),
+        (
+            "openai",
+            "anthropic/claude-opus-4-5",
+            Some(ReasoningEffort::High),
+        ),
+        ("openai", "local-alias", Some(ReasoningEffort::Max)),
+    ] {
+        assert_eq!(
+            ultra_reasoning_effort(Some(provider), model),
+            expected,
+            "{model}"
+        );
+    }
+}
 
 pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
     items: &[bamboo_domain::ProviderTranscriptItem],
@@ -209,6 +331,7 @@ pub(super) fn request_tool_schemas_for_loading_mode<'a>(
     let loaded =
         crate::runtime::runner::loop_execution::validated_sticky_fallback_loaded_tool_names(
             session,
+            tool_schemas,
         );
     let mut projected = tool_schemas
         .iter()
@@ -395,6 +518,13 @@ pub(crate) async fn execute_llm_round(
         .as_deref()
         .ok_or_else(|| AgentError::LLM("model_name is required in AgentLoopConfig".to_string()))?;
 
+    let highest_reasoning = session.root_orchestration_only_enabled()
+        || (session.kind == SessionKind::Child
+            && config.ticket_worker_plan.is_some()
+            && crate::ticket_runtime::read_dispatch(session)
+                .ok()
+                .flatten()
+                .is_some_and(|dispatch| dispatch.highest_reasoning));
     let frame = stream_execution::LlmStreamFrame {
         event_tx,
         cancel_token,
@@ -402,7 +532,11 @@ pub(crate) async fn execute_llm_round(
         model,
         provider_name: config.provider_name.as_deref(),
         provider_type: config.provider_type.as_deref(),
-        reasoning_effort: config.reasoning_effort,
+        reasoning_effort: if highest_reasoning {
+            ultra_reasoning_effort(config.provider_type.as_deref(), model)
+        } else {
+            config.reasoning_effort
+        },
         output_limit_recovery,
         budget: &prepared.budget,
         provider_default_output: prepared.provider_default_output,
@@ -1026,6 +1160,7 @@ mod tests {
             schema("Plan"),
             schema("Task"),
             schema("exec_command"),
+            schema("write_stdin"),
             schema("discover_capabilities"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -1049,17 +1184,17 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "SubAgent", "Task"]
+            vec!["Read", "SubAgent", "Task", "exec_command", "write_stdin"]
         );
         let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
             &session,
             &tools,
             CapabilityLoadingMode::StickyFallback,
         );
-        for name in ["Read", "SubAgent", "Task"] {
+        for name in ["Read", "SubAgent", "Task", "exec_command", "write_stdin"] {
             assert!(callable.contains_execution_name(name), "{name}");
         }
-        for name in ["Plan", "exec_command", "discover_capabilities"] {
+        for name in ["Plan", "discover_capabilities"] {
             assert!(!callable.contains_execution_name(name), "{name}");
         }
     }

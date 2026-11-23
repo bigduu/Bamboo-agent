@@ -45,12 +45,12 @@ fn parse_warning_log_details<'a>(
     warning: &'a str,
 ) -> (String, &'a str) {
     let canonical = canonical_tool_name(execution_name);
-    if ["browser", "browser_eval", "session_message"]
+    if ["browser", "browser_eval", "session_message", "session_loop"]
         .iter()
         .any(|name| canonical.eq_ignore_ascii_case(name))
     {
         // A repaired JSON warning embeds its own preview, so both strings
-        // must be hidden for private browser input or peer message text.
+        // must be hidden for private browser input, peer text, or loop prompts.
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(args_raw, 180), warning)
@@ -92,9 +92,11 @@ fn approval_permission_description(
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
-    if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_message") {
-        // Peer text and routing identifiers must not enter approval display
-        // events. Classification has already validated the exact action.
+    if ["session_message", "session_loop"]
+        .iter()
+        .any(|name| canonical_tool_name(tool_name).eq_ignore_ascii_case(name))
+    {
+        // Private prompts and routing identifiers stay out of approval events.
         return serde_json::json!({"action": args.get("action")});
     }
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
@@ -660,6 +662,12 @@ impl BuiltinToolExecutor {
         }
         let tool_name = execution_name.to_string();
         let args = resolved_args.clone();
+        let framework_session_loop =
+            crate::session_loop_permission::selected_framework_session_loop(
+                call,
+                execution_name,
+                &args,
+            );
         let framework_scoped_send = tool_name == "session_message"
             && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
             && (self.local_execution_contract(execution_name)
@@ -688,6 +696,11 @@ impl BuiltinToolExecutor {
             )));
         }
         let Some(permission_checker) = &self.permission_checker else {
+            if framework_session_loop {
+                return Err(ToolError::Execution(
+                    "Current-session loop requires the Host permission policy".into(),
+                ));
+            }
             if framework_scoped_send {
                 return Err(ToolError::Execution(
                     "scoped_session_send_permission_config_unsupported".into(),
@@ -813,7 +826,12 @@ impl BuiltinToolExecutor {
                         consume_once: true,
                         supported_decisions,
                     };
-                    let outcome = if framework_root_spawn {
+                    let outcome = if framework_session_loop {
+                        crate::session_loop_permission::record_framework_session_loop_evaluation(
+                            call, &args,
+                        );
+                        config.evaluate_current_session_loop(evaluation)
+                    } else if framework_root_spawn {
                         config.evaluate_framework_root_spawn(evaluation)
                     } else if framework_scoped_send {
                         crate::scoped_session_send_permission::record_framework_scoped_session_send_evaluation(call, &args);
@@ -843,6 +861,11 @@ impl BuiltinToolExecutor {
                         crate::permission::PermissionOutcome::Ask(request) => request,
                     }
                 } else {
+                    if framework_session_loop {
+                        return Err(ToolError::Execution(
+                            "Current-session loop requires the Host permission policy".into(),
+                        ));
+                    }
                     if framework_scoped_send {
                         return Err(ToolError::Execution(
                             "scoped_session_send_permission_config_unsupported".into(),
@@ -1501,6 +1524,10 @@ mod tests {
             (
                 "default::session_message",
                 r#"{"action":"send","message":"private peer text"#,
+            ),
+            (
+                "session_loop",
+                r#"{"action":"start","prompt":"private loop prompt"#,
             ),
         ] {
             let (_, warning) = parse_tool_args_best_effort(raw);

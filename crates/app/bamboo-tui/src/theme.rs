@@ -26,6 +26,8 @@ pub enum ThemePalette {
     System = 1,
     /// No foreground colour overrides.
     NoColor = 2,
+    /// Neutral light workspace and high-contrast text.
+    Light = 3,
 }
 
 impl ThemePalette {
@@ -35,6 +37,7 @@ impl ThemePalette {
             Self::TrueColor => "truecolor",
             Self::System => "system",
             Self::NoColor => "no-color",
+            Self::Light => "light",
         }
     }
 
@@ -49,6 +52,31 @@ impl ThemePalette {
             Self::TrueColor => role.truecolor(),
             Self::System => role.system_color(),
             Self::NoColor => Color::Reset,
+            Self::Light => role.light(),
+        }
+    }
+
+    pub(crate) const fn canvas(self) -> Color {
+        match self {
+            Self::TrueColor => Color::Rgb(33, 33, 33),
+            Self::Light => Color::Rgb(255, 255, 255),
+            Self::System | Self::NoColor => Color::Reset,
+        }
+    }
+
+    pub(crate) const fn surface(self) -> Color {
+        match self {
+            Self::TrueColor => Color::Rgb(48, 48, 48),
+            Self::Light => Color::Rgb(245, 245, 245),
+            Self::System | Self::NoColor => Color::Reset,
+        }
+    }
+
+    pub(crate) const fn text(self) -> Color {
+        match self {
+            Self::TrueColor => Color::Rgb(236, 236, 236),
+            Self::Light => Color::Rgb(32, 32, 32),
+            Self::System | Self::NoColor => Color::Reset,
         }
     }
 }
@@ -69,7 +97,7 @@ impl fmt::Display for ThemePaletteParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "unknown theme palette {:?}; expected truecolor, system, or no-color",
+            "unknown theme palette {:?}; expected truecolor, light, system, or no-color",
             self.value
         )
     }
@@ -83,7 +111,8 @@ impl FromStr for ThemePalette {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
-            "truecolor" | "true-color" | "24bit" | "24-bit" => Ok(Self::TrueColor),
+            "truecolor" | "true-color" | "24bit" | "24-bit" | "dark" => Ok(Self::TrueColor),
+            "light" => Ok(Self::Light),
             "system" | "ansi" => Ok(Self::System),
             "no-color" | "nocolor" | "none" => Ok(Self::NoColor),
             _ => Err(ThemePaletteParseError {
@@ -111,6 +140,17 @@ pub enum ColorRole {
 }
 
 impl ColorRole {
+    const fn light(self) -> Color {
+        match self {
+            Self::Brand => Color::Rgb(32, 32, 32),
+            Self::UserPrefix | Self::ToolRunning | Self::Thinking => Color::Rgb(36, 77, 160),
+            Self::ToolDone | Self::Success => Color::Rgb(39, 100, 65),
+            Self::ToolError | Self::Error => Color::Rgb(168, 39, 55),
+            Self::Inactive | Self::Subtle | Self::CodeBorder => Color::Rgb(98, 98, 98),
+            Self::Warning => Color::Rgb(128, 82, 13),
+        }
+    }
+
     const fn truecolor(self) -> Color {
         match self {
             Self::Brand => Color::Rgb(215, 119, 87),
@@ -242,6 +282,8 @@ mod tests {
             ("truecolor", ThemePalette::TrueColor),
             ("TRUE-COLOR", ThemePalette::TrueColor),
             ("24-bit", ThemePalette::TrueColor),
+            ("dark", ThemePalette::TrueColor),
+            ("light", ThemePalette::Light),
             ("system", ThemePalette::System),
             ("ansi", ThemePalette::System),
             ("no-color", ThemePalette::NoColor),
@@ -252,7 +294,7 @@ mod tests {
 
         let error = "rainbow".parse::<ThemePalette>().unwrap_err().to_string();
         assert!(error.contains("rainbow"));
-        assert!(error.contains("truecolor, system, or no-color"));
+        assert!(error.contains("truecolor, light, system, or no-color"));
     }
 
     #[test]

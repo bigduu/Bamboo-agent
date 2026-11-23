@@ -9,20 +9,21 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    build_active_workflow_context_block, build_agent_hook_context_block,
+    build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
     build_instruction_overlay_context_block, build_plan_mode_context_block,
     build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block_for_tools, build_session_identity_context_block,
-    build_task_list_context_block, build_workspace_context_block,
+    build_root_orchestration_context_block, build_session_identity_context_block,
+    build_supervisor_route_observation, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
 };
 use crate::runtime::stream::reasoning_repetition::stop_repeated_reasoning;
 use bamboo_agent_core::agent::events::{ProviderPromptUsage, TokenBudgetUsage};
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
@@ -31,12 +32,13 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
+use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    CompletionDiagnostics, ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT,
-    REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
+    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -75,6 +77,7 @@ const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
+const SESSION_LOOP_CONTROL_GUIDANCE: &str = "Use session_loop when the current user explicitly asks to set a fixed recurring task for this chat or to manage its loop. If the task or interval is unclear, ask the user. Require the current user's own request or confirmation before changing the loop, and confirm a change only after the tool succeeds.";
 #[cfg(test)]
 const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
     "Browser loaded. Its complete schema is in the tools for this request.";
@@ -684,9 +687,14 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
+    configured_mode: PermissionMode,
 ) -> Option<ContextBlock> {
-    if !session.allows_model_tool_execution("write_stdin")
-        || !effective_tool_schemas(session, tool_schemas)
+    let flags =
+        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let schemas = effective_tool_schemas(session, tool_schemas);
+    if flags.plan_read_only
+        || !session.allows_model_tool_execution("write_stdin")
+        || !schemas
             .iter()
             .any(|schema| schema.function.name == "write_stdin")
     {
@@ -696,13 +704,22 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
+    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && schemas
+            .iter()
+            .any(|schema| schema.function.name == "SubAgent")
+    {
+        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
+    } else {
+        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
+    };
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
         ContextBlockStability::RoundDynamic,
-        "Shell sessions awaiting a terminal result",
+        "Shell session handles",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
+            "{guidance}\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))
@@ -766,6 +783,7 @@ pub(super) async fn project_request_usage(
         effective_tool_schemas.as_ref(),
         model,
         loading_mode,
+        native_transcript_protocol_for(llm, model),
         None,
     );
     let tool_footprint = llm
@@ -797,9 +815,11 @@ fn build_request_envelope_reconciled(
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_request_envelope_reconciled_for_loading_mode<'a>(
     session: &mut Session,
     prepared_context: &PreparedContext,
@@ -807,16 +827,28 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
+    native_protocol: Option<ProviderProtocol>,
     request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
-    let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
+    let gemini_native = native_protocol == Some(ProviderProtocol::GeminiGenerateContentV1Beta);
+    let requested_family = if gemini_native {
+        Some(ProviderFamily::Gemini)
+    } else {
+        ProviderFamily::from_provider_type(config.provider_type.as_deref())
+            .filter(|family| *family != ProviderFamily::Gemini)
+    };
     let requested_protocol = requested_family.map(|family| match family {
         ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
         ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+        ProviderFamily::Gemini => ProviderProtocol::GeminiGenerateContentV1Beta,
     });
     let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
         config.provider_name.as_deref(),
-        config.provider_type.as_deref(),
+        if gemini_native {
+            Some("gemini")
+        } else {
+            config.provider_type.as_deref()
+        },
     );
     let had_prior_provider_route = session.provider_transcript.active_family().is_some()
         || session.provider_transcript.active_protocol().is_some()
@@ -846,7 +878,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
-    // Host-owned context (recalled memory, task list, plan state, summary) is
+    // Host-owned context (task list, plan state, summary) is
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
     // Session identity leads this run so a newly seeded ledger places it
@@ -854,8 +886,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    let mut orchestration =
-        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode);
+    let mut orchestration = build_root_orchestration_context_block(session);
+    let supervisor_policy_digest = orchestration
+        .as_ref()
+        .filter(|_| session.supervisor_incarnation_id().is_some())
+        .map(bamboo_domain::model_context_block_sha256);
     if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
         session,
         config.guidance_active_run_id.as_deref(),
@@ -903,12 +938,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ));
         }
     }
-    if let Some(block) = build_active_workflow_context_block(session) {
-        context_blocks.push(block);
-    }
-    if let Some(block) = build_external_memory_context_block(session) {
-        context_blocks.push(block);
-    }
+    let active_workflow = build_active_workflow_context_block(session);
+    let workflow_is_active = active_workflow.is_some();
+    context_blocks.extend(active_workflow);
     if let Some(block) = build_project_resources_context_block(session) {
         context_blocks.push(block);
     }
@@ -1015,7 +1047,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if let Some(last) = system_blocks.last_mut() {
         last.cache_anchor = true;
     }
-    let lane_system = system_blocks
+    let mut lane_system = system_blocks
         .iter()
         .map(|b| b.text.as_str())
         .collect::<Vec<_>>()
@@ -1047,8 +1079,12 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
             ContextBlockStability::RoundDynamic,
-            "Loaded Skills",
-            section("skill"),
+            "Available Skills",
+            if workflow_is_active {
+                String::new()
+            } else {
+                section("skill")
+            },
         ),
         (
             ContextBlockType::EnvSnapshot,
@@ -1080,21 +1116,12 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         stable_prefix_messages.push(message);
     }
 
-    // Keep Responses item annotations append-only too: a rolling breakpoint on
-    // the conversation tail would remove the marker from an item in the prior
-    // request. The stable tool-guide boundary is the only generated message
-    // breakpoint on the ledger path.
-    let mut breakpoint_message_ids = Vec::new();
-    // The relocated tool guide is large and session-stable, so it earns a
-    // dedicated breakpoint. For legacy/continuation paths this id simply isn't
-    // found in the message array, so the breakpoint is harmlessly ignored there.
-    if let Some(id) = tool_guide_breakpoint_id {
-        breakpoint_message_ids.push(id);
-    }
-    let cache_plan = PromptCachePlan {
+    let mut cache_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
-        breakpoint_message_ids,
+        // Responses replays item annotations byte-for-byte. Only the stable
+        // tool guide participates in its explicit message cache plan.
+        breakpoint_message_ids: tool_guide_breakpoint_id.into_iter().collect(),
         // Use the 1-hour extended cache TTL for the growing append-only prefix
         // (tools + system + tool guide + model transcript). The
         // default 5-minute TTL expires across any pause longer than 5 min
@@ -1105,13 +1132,15 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         // Gated behind the `extended-cache-ttl-2025-04-11` beta header, which
         // the Anthropic provider adds whenever the plan's TTL is Extended.
         ttl: CacheTtl::Extended,
+        ..PromptCachePlan::default()
     };
 
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
-    let cache_scope = serde_json::json!({
-        // Rebuild saved prompt prefixes that still contain unconditional memory guidance.
-        "external_memory_projection_version": 2,
+    bamboo_compression::project_file_change_results(&mut real_transcript);
+    let mut cache_scope = serde_json::json!({
+        // Retire old generated epochs that preserved withdrawn memory snapshots.
+        "external_memory_projection_version": 3,
         "model": model,
         "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
@@ -1121,6 +1150,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             .collect::<Vec<_>>(),
         "tools": tool_schemas,
     });
+    if let Some(digest) = supervisor_policy_digest {
+        // Refresh the generated prefix when the role policy changes. Current
+        // route facts stay outside the scope and the durable transcript.
+        cache_scope["supervisor_policy_sha256"] = digest.into();
+    }
     let cache_scope_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&cache_scope).expect("cache scope is serializable"),
     ));
@@ -1132,10 +1166,77 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
+    // Recall, Dream, and agenda are current read models. Keeping them outside
+    // the generated ledger prevents old snapshots from reappearing after an
+    // edit, archive, or project reassignment.
+    let external_memory_message_id = build_external_memory_context_block(session).map(|block| {
+        // Place the current snapshot before the user who owns this turn.
+        // Tool continuations then end with the same call/results as before.
+        let anchor = real_transcript
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::User
+                    && !crate::session_app::execute::is_hidden_from_ui(message)
+                    && message
+                        .metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.get("runtime_kind").is_none())
+            })
+            .or_else(|| real_transcript.first());
+        let index = anchor
+            .and_then(|anchor| {
+                model_transcript
+                    .iter()
+                    .rposition(|message| message.id == anchor.id)
+            })
+            .unwrap_or(0);
+        let message = block.render_runtime_context_message();
+        let id = message.id.clone();
+        model_transcript.insert(index, message);
+        id
+    });
+    cache_plan.anthropic_history = real_transcript.last().map(|newest| {
+        let previous_message_id = ledger
+            .prior_message_count
+            .checked_sub(1)
+            .and_then(|index| real_transcript.get(index))
+            .filter(|prior| prior.id != newest.id)
+            .map(|prior| prior.id.clone());
+        AnthropicHistoryCache {
+            newest_message_id: newest.id.clone(),
+            previous_message_id,
+            external_memory_message_id,
+        }
+    });
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
     model_transcript.extend(request_advisories.into_iter().map(Message::user));
-    if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
+    if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
+    if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
+        model_transcript.push(block.render_runtime_context_message());
+    }
+    if let Some(deadline) = config.run_deadline {
+        // Sample only the caller's explicit clock. A fresh reading belongs to
+        // this request, outside the durable ledger and the cacheable prefix.
+        let remaining = deadline.remaining();
+        let advice = if remaining <= deadline.delivery_reserve() {
+            " Save and verify the best available result now."
+        } else {
+            " Leave time to save and verify the deliverable."
+        };
+        model_transcript.push(Message::user(format!(
+            "Host execution deadline\nTime remaining: {}s.{advice}",
+            remaining.as_secs()
+        )));
+    }
+    if let Some(block) = build_exec_session_continuation_context_block(
+        session,
+        tool_schemas,
+        config.permission_mode.unwrap_or_default(),
+    ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
         // stale ID from the next request as soon as its terminal poll consumes it.
@@ -1157,6 +1258,37 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                 .collect()
         })
         .unwrap_or_default();
+    // Loop guidance is specific to this request and leaves the durable prompt
+    // and its cache prefix intact when the next turn uses a different surface.
+    let loop_guidance = config
+        .paced_loop_turn
+        .as_ref()
+        .and_then(|turn| turn.system_guidance.as_deref())
+        .or_else(|| {
+            tool_schemas
+                .iter()
+                .any(|schema| {
+                    schema.function.name
+                        == bamboo_agent_core::tools::context::SESSION_LOOP_TOOL_NAME
+                })
+                .then_some(SESSION_LOOP_CONTROL_GUIDANCE)
+        });
+    if let Some(guidance) = loop_guidance {
+        if !lane_system.is_empty() {
+            lane_system.push_str("\n\n");
+        }
+        lane_system.push_str(guidance);
+        if !system_blocks.is_empty() {
+            system_blocks.push(
+                bamboo_domain::PromptBlock::new(
+                    "paced_loop",
+                    ContextBlockType::CoreDirectives,
+                    guidance,
+                )
+                .with_stability(ContextBlockStability::RoundDynamic),
+            );
+        }
+    }
     let mut ir = PromptIR {
         system_text: lane_system,
         system_blocks,
@@ -1528,6 +1660,7 @@ pub(super) async fn execute_llm_stream(
             tool_schemas,
             model,
             loading_mode,
+            native_transcript_protocol_for(llm, model),
             observation_progress_hint
                 .into_iter()
                 .chain(convergence_hint),

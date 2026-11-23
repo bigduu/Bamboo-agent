@@ -440,6 +440,7 @@ async fn authoring_project_scope_uses_durable_session_and_remains_isolated() {
         state.clone(),
         web::Query(super::super::types::WorkflowCatalogQuery {
             session_id: Some("definition-project-session".to_string()),
+            orchestration_only: true,
         }),
     )
     .await

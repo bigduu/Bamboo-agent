@@ -32,6 +32,7 @@ pub struct TicketApplication {
     patrol_sources: OnceLock<patrol_adapter::EvidenceSources>,
     patrol_calls: Arc<bamboo_orchestration::patrol::calls::Calls>,
     work_reviews: bamboo_orchestration::work_review::WorkReviews,
+    codex_handoffs: codex_handoff::Offers,
     // Registration and close share a short, synchronous gate. TaskTracker's
     // close alone does not prevent a new task from retaining the writer.
     cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
@@ -51,6 +52,7 @@ struct CancellationProbe {
 }
 
 mod admission;
+pub(crate) mod codex_handoff;
 mod initialization;
 mod managed_work;
 mod memory_sources;
@@ -79,7 +81,9 @@ mod tests;
 
 impl TicketApplication {
     pub async fn open(root: &Path, storage: Arc<dyn Storage>, config: Arc<RwLock<Config>>) -> Self {
-        let opened = Self::open_scope(root, storage.as_ref(), &config).await;
+        let opened = Self::open_scope(root, storage.as_ref(), &config)
+            .await
+            .map(|service| Self::bind_work_start_check(service, config.clone()));
         let (service, unavailable) = match opened {
             Ok(service) => (Some(Arc::new(service)), None),
             Err(error) => (None, Some(error.to_string())),
@@ -108,10 +112,30 @@ impl TicketApplication {
             patrol_sources: OnceLock::new(),
             patrol_calls: Arc::default(),
             work_reviews: Default::default(),
+            codex_handoffs: Default::default(),
             cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
             #[cfg(test)]
             cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),
         }
+    }
+
+    fn bind_work_start_check(service: TicketService, config: Arc<RwLock<Config>>) -> TicketService {
+        service.with_work_start_check(move |snapshot| {
+            let config = config.try_read().map_err(|_| {
+                Error::ResourceBlocked(
+                    "Retry the dispatch after Work settings finish updating.".into(),
+                )
+            })?;
+            if !config.features.ticket_mutation {
+                return Err(Error::AuthorityUnavailable(
+                    "Ticket mutation feature is disabled".into(),
+                ));
+            }
+            bamboo_orchestration::check_work_dispatch_capacity(
+                snapshot,
+                config.features.work_execution.max_parallel,
+            )
+        })
     }
 
     pub(in crate::app_state) fn close_cancellation_tasks(&self) {
@@ -864,7 +888,14 @@ impl TicketApplication {
             }
             return self.ensure_managed_work(&service, key, spec).await;
         }
-        let enabled = self.config.read().await.features.ticket_dispatch;
+        let (enabled, reasoning_effort, highest_reasoning) = {
+            let config = self.config.read().await;
+            (
+                config.features.ticket_dispatch,
+                config.features.work_execution.reasoning_effort,
+                config.features.work_ultra_by_default,
+            )
+        };
         if enabled {
             // All paths, including semantic resolution and recovered pending
             // intents, pass here before fresh admission. Existing receipts keep
@@ -895,6 +926,8 @@ impl TicketApplication {
                     worker_role: "worker".into(),
                     workspace: self.workspace.clone(),
                     max_rounds,
+                    reasoning_effort,
+                    highest_reasoning,
                     admission_fence: fence.cloned(),
                 },
                 Box::pin(async {

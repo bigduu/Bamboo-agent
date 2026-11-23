@@ -5,13 +5,16 @@
 //! diagnostic state (budget events, tool execution, round progress).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::AgentEvent;
+
+use crate::events::account_sink::{reserve_account_slot, PendingEvent, ReservedAccountEvent};
+use crate::events::{AccountEventSink, PreparedRootActorEvent, RootActorEventPublication};
 
 use super::runner_state::AgentRunner;
 
@@ -28,7 +31,72 @@ fn visible_terminal_reason(event: &AgentEvent) -> Option<&'static str> {
 /// writer assigns a seq. Threaded as `Option` so engine-internal callers that
 /// have no feed (tests, standalone embeddings) can pass `None`. Defined here so
 /// the engine stays free of any `bamboo-server` dependency.
-pub type AccountFeedInbox = mpsc::Sender<(Option<String>, AgentEvent)>;
+pub type AccountFeedInbox = mpsc::Sender<PendingEvent>;
+
+#[derive(Clone)]
+pub(crate) enum SessionAccountFeed {
+    Legacy(Option<AccountFeedInbox>),
+    // Related Child lifecycle and history frames share the keyed completion's
+    // writer queue so it cannot overtake the public inbox bridge.
+    Host(Arc<AccountEventSink>),
+}
+
+impl SessionAccountFeed {
+    pub(crate) fn for_host(
+        inbox: Option<AccountFeedInbox>,
+        sink: Option<&Arc<AccountEventSink>>,
+    ) -> Self {
+        match sink {
+            Some(sink)
+                if inbox
+                    .as_ref()
+                    .is_some_and(|inbox| inbox.same_channel(&sink.inbox())) =>
+            {
+                Self::Host(sink.clone())
+            }
+            _ => Self::Legacy(inbox),
+        }
+    }
+
+    pub(crate) async fn reserve(
+        &self,
+        session_id: &str,
+        event: &AgentEvent,
+        completion_id: Option<String>,
+    ) -> std::io::Result<Option<ReservedSessionAccountEvent>> {
+        match self {
+            Self::Legacy(inbox) => reserve_account_inbox_event(inbox.as_ref(), session_id, event)
+                .await
+                .map(|permit| permit.map(ReservedSessionAccountEvent::Inbox)),
+            Self::Host(sink) => {
+                let route = event.session_id().unwrap_or(session_id);
+                if let Some(id) = completion_id {
+                    sink.reserve_child_terminal_event(route, event, id)
+                        .await
+                        .map(|permit| Some(ReservedSessionAccountEvent::Host(permit)))
+                } else {
+                    sink.reserve_session_event(route, event)
+                        .await
+                        .map(|permit| permit.map(ReservedSessionAccountEvent::Host))
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum ReservedSessionAccountEvent {
+    Inbox(ReservedInboxEvent),
+    Host(ReservedAccountEvent),
+}
+
+impl ReservedSessionAccountEvent {
+    pub(crate) fn enqueue(self, event: &AgentEvent) {
+        match self {
+            Self::Inbox(permit) => permit.enqueue(event),
+            Self::Host(permit) => permit.enqueue(),
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "root_actor_event_forwarder_tests.rs"]
@@ -41,28 +109,49 @@ mod root_actor_tests;
 #[derive(Clone, Debug)]
 pub struct HistoryCommitBarrier {
     revision: watch::Receiver<u64>,
+    child_source: ChildHistorySource,
 }
 
 /// Forwarder-owned half of [`HistoryCommitBarrier`].
 #[derive(Clone, Debug)]
 pub struct HistoryCommitAcknowledger {
     revision: watch::Sender<u64>,
+    child_source: ChildHistorySource,
 }
+
+type ChildHistorySource = Arc<Mutex<Option<(String, String)>>>;
 
 /// Create the acknowledgment pair shared by an event producer and forwarder.
 pub fn history_commit_barrier() -> (HistoryCommitAcknowledger, HistoryCommitBarrier) {
     let (revision_tx, revision_rx) = watch::channel(0);
+    let child_source = Arc::default();
     (
         HistoryCommitAcknowledger {
             revision: revision_tx,
+            child_source: Arc::clone(&child_source),
         },
         HistoryCommitBarrier {
             revision: revision_rx,
+            child_source,
         },
     )
 }
 
 impl HistoryCommitAcknowledger {
+    fn take_child_source(&self, session_id: &str) -> Option<String> {
+        let mut source = self
+            .child_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if source
+            .as_ref()
+            .is_some_and(|(child, _)| child == session_id)
+        {
+            return source.take().map(|(_, id)| id);
+        }
+        None
+    }
+
     /// Mark one history barrier as synchronously published to every configured
     /// sink. Call this only after the publication fence accepts the event.
     pub fn acknowledge(&self) {
@@ -79,14 +168,29 @@ impl HistoryCommitBarrier {
         event_tx: &mpsc::Sender<AgentEvent>,
         session_id: String,
     ) -> bool {
-        let observed = *self.revision.borrow_and_update();
-        if event_tx
-            .send(AgentEvent::SessionHistoryCommitted { session_id })
+        self.send_and_wait_with_child_source(event_tx, session_id, None)
             .await
-            .is_err()
-        {
+    }
+
+    pub(crate) async fn send_and_wait_with_child_source(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        session_id: String,
+        source_id: Option<String>,
+    ) -> bool {
+        let observed = *self.revision.borrow_and_update();
+        let Ok(permit) = event_tx.reserve().await else {
             return false;
+        };
+        if let Some(id) = source_id {
+            // Only the final SDK coordinator stages a committed Child source.
+            // The public marker stays unchanged on its dedicated run stream.
+            *self
+                .child_source
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((session_id.clone(), id));
         }
+        permit.send(AgentEvent::SessionHistoryCommitted { session_id });
 
         loop {
             if *self.revision.borrow() > observed {
@@ -99,18 +203,29 @@ impl HistoryCommitBarrier {
     }
 }
 
-/// Forward a durable change event onto the account feed, if an inbox is wired.
-///
-/// Ephemeral events (tokens, heartbeats, …) are filtered out before any clone,
-/// so this is near-free on the hot path. `session_id` is supplied explicitly so
-/// terminal events (which carry no id) still route to the right session.
-fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, event: &AgentEvent) {
-    if let Some(inbox) = inbox {
-        if event.is_durable_change() {
-            let route_session_id = event.session_id().unwrap_or(session_id);
-            let _ = inbox.try_send((Some(route_session_id.to_string()), event.clone()));
-        }
+pub(crate) struct ReservedInboxEvent {
+    permit: mpsc::OwnedPermit<PendingEvent>,
+    route: String,
+}
+
+impl ReservedInboxEvent {
+    pub(crate) fn enqueue(self, event: &AgentEvent) {
+        self.permit.send((Some(self.route), event.clone()));
     }
+}
+
+async fn reserve_account_inbox_event(
+    inbox: Option<&AccountFeedInbox>,
+    session_id: &str,
+    event: &AgentEvent,
+) -> std::io::Result<Option<ReservedInboxEvent>> {
+    let Some(inbox) = inbox.filter(|_| event.is_durable_change()) else {
+        return Ok(None);
+    };
+    Ok(Some(ReservedInboxEvent {
+        permit: reserve_account_slot(inbox).await?,
+        route: event.session_id().unwrap_or(session_id).to_owned(),
+    }))
 }
 
 #[cfg(test)]
@@ -304,7 +419,11 @@ mod tests {
             resolved_at: Some("2026-01-01T00:00:01Z".into()),
         };
 
-        mirror_to_account_feed(&Some(tx), "child-1", &event);
+        reserve_account_inbox_event(Some(&tx), "child-1", &event)
+            .await
+            .unwrap()
+            .unwrap()
+            .enqueue(&event);
         let (session_id, mirrored) = rx.recv().await.unwrap();
         assert_eq!(session_id.as_deref(), Some("parent-1"));
         assert!(matches!(mirrored, AgentEvent::ChildApprovalChanged { .. }));
@@ -554,20 +673,49 @@ pub fn create_event_forwarder_with_history_commit_barrier(
     )
 }
 
-async fn publish_forwarded_event(
-    root_actor: Option<&crate::events::RootActorEventPublication>,
+enum PreparedForwardedEvent {
+    Root(PreparedRootActorEvent),
+    Session(Option<ReservedSessionAccountEvent>),
+}
+
+impl PreparedForwardedEvent {
+    async fn publish(
+        self,
+        publish: impl FnOnce(Option<ReservedSessionAccountEvent>) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Root(root) => root.publish(Box::new(move || publish(None))).await,
+            Self::Session(account) => publish(account)
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other("event publication was retired")),
+        }
+    }
+}
+
+async fn prepare_forwarded_event(
+    root_actor: Option<&RootActorEventPublication>,
+    account_feed: &SessionAccountFeed,
     session_id: &str,
     event: &AgentEvent,
-    publish: Box<dyn FnOnce() -> bool + Send>,
-) -> std::io::Result<()> {
+    child_source_id: Option<String>,
+) -> std::io::Result<PreparedForwardedEvent> {
     if let Some(owner) = root_actor {
         owner
-            .publish(event.session_id().unwrap_or(session_id), event, publish)
+            .prepare(event.session_id().unwrap_or(session_id), event)
             .await
-    } else if publish() {
-        Ok(())
+            .map(PreparedForwardedEvent::Root)
     } else {
-        Err(std::io::Error::other("event publication was retired"))
+        match account_feed
+            .reserve(session_id, event, child_source_id)
+            .await
+        {
+            Ok(account) => Ok(PreparedForwardedEvent::Session(account)),
+            Err(error) if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) => Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "session event could not enter the account change feed");
+                Ok(PreparedForwardedEvent::Session(None))
+            }
+        }
     }
 }
 
@@ -680,6 +828,28 @@ pub async fn interrupt_root_on_authority_loss(
     .await;
 }
 
+/// Capture only the already installed run's live transport. The registry guard
+/// is released here, before waiting for account capacity.
+pub async fn capture_root_startup_transport(
+    runners: &RwLock<HashMap<String, AgentRunner>>,
+    session_id: &str,
+    run_id: &str,
+) -> Option<(
+    Arc<super::event_publication::EventPublication>,
+    Arc<super::visible_messages::VisibleMessageStream>,
+    CancellationToken,
+)> {
+    let guard = runners.read().await;
+    let runner = guard
+        .get(session_id)
+        .filter(|runner| runner.run_id == run_id)?;
+    Some((
+        runner.event_publication.clone(),
+        runner.visible_messages.clone(),
+        runner.cancel_token.clone(),
+    ))
+}
+
 /// The Root adapter passes its immutable capability before any Started frame.
 /// Legacy Child/Supervisor/standalone callers keep the existing queue behavior.
 pub fn create_event_forwarder_with_root_actor(
@@ -688,7 +858,29 @@ pub fn create_event_forwarder_with_root_actor(
     broadcast_tx: broadcast::Sender<AgentEvent>,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     account_feed_inbox: Option<AccountFeedInbox>,
-    root_actor: Option<crate::events::RootActorEventPublication>,
+    root_actor: Option<RootActorEventPublication>,
+) -> (
+    mpsc::Sender<AgentEvent>,
+    tokio::task::JoinHandle<()>,
+    HistoryCommitBarrier,
+) {
+    create_event_forwarder_for_account(
+        session_id,
+        run_id,
+        broadcast_tx,
+        runners,
+        SessionAccountFeed::Legacy(account_feed_inbox),
+        root_actor,
+    )
+}
+
+pub(crate) fn create_event_forwarder_for_account(
+    session_id: String,
+    run_id: String,
+    broadcast_tx: broadcast::Sender<AgentEvent>,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    account_feed: SessionAccountFeed,
+    root_actor: Option<RootActorEventPublication>,
 ) -> (
     mpsc::Sender<AgentEvent>,
     tokio::task::JoinHandle<()>,
@@ -705,15 +897,59 @@ pub fn create_event_forwarder_with_root_actor(
             return;
         }
         // A bound Root never enters the legacy account queue.
-        let legacy_feed = if root_actor.is_some() {
-            None
+        let account_feed = if root_actor.is_some() {
+            SessionAccountFeed::Legacy(None)
         } else {
-            account_feed_inbox
+            account_feed
         };
         let started_event = AgentEvent::ExecutionStarted {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
+        };
+        let startup_transport = if root_actor.is_some() {
+            capture_root_startup_transport(&runners, &session_id, &run_id).await
+        } else {
+            None
+        };
+        let started_reservation = match prepare_forwarded_event(
+            root_actor.as_ref(),
+            &account_feed,
+            &session_id,
+            &started_event,
+            None,
+        )
+        .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let diagnostic_id = record_publication_rejection(
+                    &error,
+                    &session_id,
+                    &run_id,
+                    Some(&started_event),
+                    root_actor.as_ref(),
+                    "root_started_feed_reservation",
+                );
+                let stale_transport = startup_transport.filter(|_| {
+                    error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                });
+                if let Some((publication, visible, cancel_token)) = stale_transport {
+                    RootInterruption {
+                        session_id: &session_id,
+                        run_id: &run_id,
+                        runners: &runners,
+                        publication: &publication,
+                        visible: &visible,
+                        cancel_token: &cancel_token,
+                    }
+                    .close(&diagnostic_id)
+                    .await;
+                }
+                return;
+            }
         };
         let (publication, visible_messages, cancel_token) = {
             let mut guard = runners.clone().write_owned().await;
@@ -726,23 +962,20 @@ pub fn create_event_forwarder_with_root_actor(
             let publication = runner.event_publication.clone();
             let visible_messages = runner.visible_messages.clone();
             let cancel_token = runner.cancel_token.clone();
-            let feed = legacy_feed.clone();
             let sid = session_id.clone();
             let tx = broadcast_tx.clone();
             let frame = started_event.clone();
-            if let Err(error) = publish_forwarded_event(
-                root_actor.as_ref(),
-                &session_id,
-                &frame,
-                Box::new(move || {
+            if let Err(error) = started_reservation
+                .publish(move |account| {
                     let runner = guard.get_mut(&sid).expect("retained exact runner guard");
                     runner.published_execution_started = Some(started_event.clone());
-                    mirror_to_account_feed(&feed, &sid, &started_event);
+                    if let Some(account) = account {
+                        account.enqueue(&started_event);
+                    }
                     let _ = tx.send(started_event);
                     true
-                }),
-            )
-            .await
+                })
+                .await
             {
                 let diagnostic_id = record_publication_rejection(
                     &error,
@@ -804,89 +1037,98 @@ pub fn create_event_forwarder_with_root_actor(
                         | AgentEvent::RunnerProgress { .. }
                 );
             let is_history_commit = matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
+            let child_source_id = match &event {
+                AgentEvent::SessionHistoryCommitted { session_id: child }
+                    if child == &session_id =>
+                {
+                    history_commit_acknowledger.take_child_source(child)
+                }
+                _ => None,
+            };
+            let terminal_reason = visible_terminal_reason(&event);
+            let owner = root_actor.as_ref().filter(|_| {
+                needs_runner_update || event.is_durable_change() || terminal_reason.is_some()
+            });
+            let reservation =
+                prepare_forwarded_event(owner, &account_feed, &session_id, &event, child_source_id)
+                    .await;
             let frame = event.clone();
-            let feed = legacy_feed.clone();
             let sid = session_id.clone();
             let tx = broadcast_tx.clone();
-            let result = if !needs_runner_update {
-                let visible_token = match &event {
-                    AgentEvent::Token { content } => Some(content.clone()),
-                    _ => None,
-                };
-                let terminal_reason = visible_terminal_reason(&event);
-                // Ephemeral token traffic retains its independent hot path.
-                let owner = root_actor
-                    .as_ref()
-                    .filter(|_| event.is_durable_change() || terminal_reason.is_some());
-                let publication = publication.clone();
-                let visible = visible_messages.clone();
-                publish_forwarded_event(
-                    owner,
-                    &session_id,
-                    &frame,
-                    Box::new(move || {
-                        publication.publish(|| {
-                            if let Some(content) = visible_token {
-                                visible.append(content);
-                            }
-                            mirror_to_account_feed(&feed, &sid, &event);
-                            let _ = tx.send(event);
-                            if let Some(reason) = terminal_reason {
-                                visible.mark_terminal(reason);
-                            }
-                            if is_history_commit {
-                                visible.history_committed();
-                            }
+            let result = match reservation {
+                Err(error) => Err(error),
+                Ok(reservation) if !needs_runner_update => {
+                    let visible_token = match &event {
+                        AgentEvent::Token { content } => Some(content.clone()),
+                        _ => None,
+                    };
+                    let publication = publication.clone();
+                    let visible = visible_messages.clone();
+                    reservation
+                        .publish(move |account| {
+                            publication.publish(|| {
+                                if let Some(content) = visible_token {
+                                    visible.append(content);
+                                }
+                                if let Some(account) = account {
+                                    account.enqueue(&event);
+                                }
+                                let _ = tx.send(event);
+                                if let Some(reason) = terminal_reason {
+                                    visible.mark_terminal(reason);
+                                }
+                                if is_history_commit {
+                                    visible.history_committed();
+                                }
+                            })
                         })
-                    }),
-                )
-                .await
-            } else {
-                let mut guard = runners.clone().write_owned().await;
-                if !guard
-                    .get(&session_id)
-                    .is_some_and(|runner| runner.run_id == run_id)
-                {
-                    return;
+                        .await
                 }
-                let publication = publication.clone();
-                publish_forwarded_event(
-                    root_actor.as_ref(),
-                    &session_id,
-                    &frame,
-                    Box::new(move || {
-                        let runner = guard.get_mut(&sid).expect("retained exact runner guard");
-                        runner.last_event_at = Some(Utc::now());
-                        publication.touch();
-                        if event.is_replayable_session_state() {
-                            runner.push_critical_event(event.clone());
-                        }
-                        match &event {
-                            AgentEvent::TokenBudgetUpdated { .. } => {
-                                runner.last_budget_event = Some(event.clone())
+                Ok(reservation) => {
+                    let mut guard = runners.clone().write_owned().await;
+                    if !guard
+                        .get(&session_id)
+                        .is_some_and(|runner| runner.run_id == run_id)
+                    {
+                        return;
+                    }
+                    let publication = publication.clone();
+                    reservation
+                        .publish(move |account| {
+                            let runner = guard.get_mut(&sid).expect("retained exact runner guard");
+                            runner.last_event_at = Some(Utc::now());
+                            publication.touch();
+                            if event.is_replayable_session_state() {
+                                runner.push_critical_event(event.clone());
                             }
-                            AgentEvent::ToolStart { tool_name, .. } => {
-                                runner.last_tool_name = Some(tool_name.clone());
-                                runner.last_tool_phase = Some("begin".into());
+                            match &event {
+                                AgentEvent::TokenBudgetUpdated { .. } => {
+                                    runner.last_budget_event = Some(event.clone())
+                                }
+                                AgentEvent::ToolStart { tool_name, .. } => {
+                                    runner.last_tool_name = Some(tool_name.clone());
+                                    runner.last_tool_phase = Some("begin".into());
+                                }
+                                AgentEvent::ToolLifecycle {
+                                    tool_name, phase, ..
+                                } => {
+                                    runner.last_tool_name = Some(tool_name.clone());
+                                    runner.last_tool_phase = Some(phase.clone());
+                                }
+                                AgentEvent::RunnerProgress { round_count, .. } => {
+                                    runner.round_count = *round_count;
+                                    runner.visible_messages.begin_round(*round_count);
+                                }
+                                _ => {}
                             }
-                            AgentEvent::ToolLifecycle {
-                                tool_name, phase, ..
-                            } => {
-                                runner.last_tool_name = Some(tool_name.clone());
-                                runner.last_tool_phase = Some(phase.clone());
+                            if let Some(account) = account {
+                                account.enqueue(&event);
                             }
-                            AgentEvent::RunnerProgress { round_count, .. } => {
-                                runner.round_count = *round_count;
-                                runner.visible_messages.begin_round(*round_count);
-                            }
-                            _ => {}
-                        }
-                        mirror_to_account_feed(&feed, &sid, &event);
-                        let _ = tx.send(event);
-                        true
-                    }),
-                )
-                .await
+                            let _ = tx.send(event);
+                            true
+                        })
+                        .await
+                }
             };
             if let Err(error) = result {
                 let diagnostic_id = record_publication_rejection(

@@ -812,7 +812,7 @@ mod tests {
         }
         let manifest = read_bundled_manifest(None).expect("embedded manifest should be valid");
         assert_eq!(manifest.frontend_name, "lotus-next");
-        assert_eq!(manifest.frontend_version, "2026.10.31");
+        assert_eq!(manifest.frontend_version, "2026.11.25");
 
         let package_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend_package/lotus-frontend.zip");
@@ -830,14 +830,14 @@ mod tests {
         .expect("universal manifest should parse");
         assert_eq!(
             universal["sourceRevision"],
-            "08e008d14a28209ba87b2a412b43b535ccfa3ef0"
+            "e7216f11be9526ffbd56e3fa2f0c0dee8902eb03"
         );
         assert_eq!(universal["sourceDirty"], false);
         assert_eq!(
             universal["resourcesSha256"],
-            "23b7f5a7a654024dd54969fc6cc3141380a4f22df13abc2ecea713bfce21f0c4"
+            "6f395932d1e7cc14e5ea66724eb40be1d15c04ed99c5458c90062dfe0a1268d8"
         );
-        assert_eq!(universal["resources"].as_array().unwrap().len(), 773);
+        assert_eq!(universal["resources"].as_array().unwrap().len(), 798);
     }
 
     #[test]

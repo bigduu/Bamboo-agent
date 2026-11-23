@@ -188,9 +188,62 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2807 changes guidance assembly in the feature-sensitive stream runner.
 // Guide/cache cases stay in default Engine/packages-3. The token-usage-log
 // cfg, four additive contexts and twenty feature-only cases are unchanged.
-// #2831 changes the default Storage save path. Supervisor dispatch consent
-// cases stay in the default Server owners; all 20 additive cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "55611f5e748bb53f8f14eba71acfdabc7547c1961e47755d3a18c1c52cc385d5";
+// #2850 retires the separate consent check in the default Storage save path.
+// Supervisor inheritance cases use the existing Server test owners.
+// #2447 keeps session activity API cases in server-handlers and runtime-only
+// wait projection and index rebuild cases in the default Storage packages-0
+// owner. No feature declarations or additive catalog entries changed.
+// #2868 binds deferred Runtime startup to its exact Inbox generation.
+// The real Actor regressions use default Engine packages-3. Storage and
+// Domain remain on their existing owners. The additive catalog is unchanged.
+// #2867 keeps reserved expiry receipts private through staging and startup.
+// Its expiry, interruption and rejection coverage belongs to the default
+// Engine packages-3 owner. Storage's feature-sensitive closure changes,
+// while its default owner and the additive cases stay unchanged.
+// #2851 keeps paced Loop host/HTTP tests in default server-app-state and
+// server-handlers. The #2875 Runtime append and wait regressions belong
+// to the existing Engine packages-3 owner.
+// #2872 runs optional catalog pressure in default SkillStore packages-1 and
+// the Native HTTP regression in server-other. The latter enables the scoped
+// test helper through its dev-dependency. The additive catalog stays at 20.
+// #2871 keeps Workflow authoring pressure in server-settings and retains
+// the existing SkillStore ownership and additive test catalog.
+// File-change receipt projection edits the stream runner covered by its
+// token-usage-log cfg. Receipt and wait regressions use the default Engine
+// and Compression owners. The four additive contexts and 20 cases stay intact.
+// #2882 changes live external-memory projection and legacy context fitting.
+// Its wire ordering and preparation regressions stay in the existing Engine owner.
+// #2909 changes the stream runner and Anthropic renderer. Their cache cases
+// use the default Engine packages-3 and LLM packages-2 owners.
+// #2916 retains the default Server library, native Work and Ready Work owners
+// for Chat and Work settings. The four additive contexts and 20 cases stay intact.
+// #2922 changes the existing feature-sensitive SubAgent adapter. Exec wait
+// cases use the default Agent, Engine and Server owners; nested creation stays
+// in default server-other. The additive contexts and case names are unchanged.
+// Session archive regressions use default Storage and server-handlers.
+// The capacity-bound HFS+ acceptance is explicitly selected on macOS.
+// #2929 changes the feature-sensitive prompt runner. The clock checks remain
+// in the default headless cases and the prompt and Skill tests retain their
+// existing owners. The four additive contexts and 20 cases stay intact.
+// #2935 keeps Supervisor route, prompt refresh and handoff cases in the default
+// Engine and Orchestration owners. Additive feature selections stay the same.
+// #2936 retains the existing Engine, Server, and Skill test owners.
+// Ordinary Ultra shell admission and Child guidance use the existing Engine,
+// SDK, Server, and CLI test owners. The additive contexts stay the same.
+// Shell wait guidance uses the existing Engine continuation and prompt tests.
+// #2939 adds the vendored LiteLLM default suite and three schema tests to packages-1.
+// Codex Work handoff uses the default server-app-state and server-tests-0
+// owners. Continuation formatting stays in the Orchestration packages-3 owner.
+// #2940 enables the Messages comparison in the existing bamboo-llm default owner.
+// #2943 adds OpenAI wire comparisons to the same default bamboo-llm owner.
+// #2942 adds the Gemini adapter and signed replay in the existing LLM and Engine owners.
+// Managed Root and legacy Work Ultra cases use the existing native Work test
+// target. Ultra model ceilings retain their existing default Engine owner.
+// Messages cache checkpoints and SSE usage stay in the existing LLM,
+// Engine, and Server handler owners.
+// Summary requests retain the default Compression, Engine, Agent Core, and LLM
+// owners. The session_compaction target stays in server-tests-0.
+const FEATURE_SOURCE_SHA256 = "6e283096bb42e282d50d8ff2aa02df5292d41b780faf221895f4c54be1d3369c";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
@@ -227,6 +280,11 @@ const FEATURE_CONTEXTS = [
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
     { name: "ticket_runtime_files", kind: "test", added: [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
+  { package: "bamboo-litellm-llms-types", features: ["schema"], targets: [
+    { name: "bamboo_litellm_llms_types", kind: "lib", added: [
+      "formats::messages::request::tests::content_block_type_schema_remains_a_string",
+      "formats::responses::streaming::tests::event_type_schema_accepts_unknown_strings",
+      "tests::wire_type_supports_schema_generation"] }] },
 ];
 
 const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",

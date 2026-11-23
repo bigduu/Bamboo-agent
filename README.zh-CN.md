@@ -62,7 +62,7 @@ cargo install bamboo-agent --locked
 bamboo --help
 ```
 
-若要构建本文描述的源码，需要 **Rust 1.95+**，在本仓库运行：
+若要构建本文描述的源码，需要 **Rust 1.97+**，在本仓库运行：
 
 ```bash
 node scripts/frontend-package.cjs stage

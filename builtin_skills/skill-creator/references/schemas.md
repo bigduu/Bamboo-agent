@@ -111,7 +111,7 @@ Output from the grader agent. Located at `<run-dir>/grading.json`.
     "tool_calls": {
       "Read": 5,
       "Write": 2,
-      "Bash": 8
+      "exec_command": 8
     },
     "total_tool_calls": 15,
     "total_steps": 6,
@@ -169,7 +169,7 @@ Output from the executor agent. Located at `<run-dir>/outputs/metrics.json`.
   "tool_calls": {
     "Read": 5,
     "Write": 2,
-    "Bash": 8,
+    "exec_command": 8,
     "Edit": 1,
     "Glob": 2,
     "Grep": 0

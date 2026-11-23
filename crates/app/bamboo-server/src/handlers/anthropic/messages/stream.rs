@@ -1,18 +1,19 @@
 use actix_web::{web, HttpResponse};
 use async_stream::stream;
 use bytes::Bytes;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{app_state::AppState, error::AppError};
 use bamboo_llm::api::models::ChatCompletionRequest;
+use bamboo_llm::types::{LLMChunk, ProviderUsageReplacement};
 use bamboo_llm::LLMRequestOptions;
-use bamboo_metrics::types::ForwardStatus;
+use bamboo_metrics::types::{ForwardStatus, ForwardTokenDetails, TokenUsage};
 
 use super::super::conversion::convert_llm_chunk_to_openai;
 use super::super::errors::{anthropic_error_response, AnthropicError};
 use super::super::stream::{format_sse_event, AnthropicStreamState};
 use super::shared::{map_prepare_error, prepare_internal_execution};
-use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::estimate_completion_tokens;
 
 pub(super) async fn handle_streaming_messages(
     app_state: web::Data<AppState>,
@@ -80,16 +81,22 @@ pub(super) async fn handle_streaming_messages(
 
     let stream = stream! {
         let mut state = AnthropicStreamState::new(model.clone());
-        let mut had_error = false;
+        let mut provider_usage = ProviderUsageReplacement::default();
+        let mut terminal_chunk = None;
         let mut completion_text = String::new();
         use futures::StreamExt;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
+                Ok(LLMChunk::Done) => {
+                    terminal_chunk = convert_llm_chunk_to_openai(LLMChunk::Done, &model);
+                    break;
+                }
                 Ok(chunk) => {
-                    if let bamboo_llm::types::LLMChunk::Token(text) = &chunk {
+                    if let LLMChunk::Token(text) = &chunk {
                         completion_text.push_str(text);
                     }
+                    capture_provider_usage(&mut provider_usage, &chunk);
                     // Convert LLMChunk to ChatCompletionStreamChunk.
                     if let Some(openai_chunk) = convert_llm_chunk_to_openai(chunk, &model) {
                         let payload = state.handle_chunk(&openai_chunk);
@@ -99,7 +106,6 @@ pub(super) async fn handle_streaming_messages(
                     }
                 }
                 Err(error) => {
-                    had_error = true;
                     metrics.forward_completed(
                         forward_id_clone.clone(),
                         chrono::Utc::now(),
@@ -120,35 +126,96 @@ pub(super) async fn handle_streaming_messages(
                     );
                     yield Ok::<Bytes, AppError>(Bytes::from(payload));
                     yield Ok::<Bytes, AppError>(Bytes::from("data: [DONE]\n\n"));
-                    break;
+                    return;
                 }
             }
         }
 
-        // Finish the stream.
-        if !state.sent_message_stop {
-            let payload = state.finish(None);
-            yield Ok::<Bytes, AppError>(Bytes::from(payload));
-        }
-        yield Ok::<Bytes, AppError>(Bytes::from("data: [DONE]\n\n"));
+        let prompt_tokens = provider_usage.input_tokens.unwrap_or(estimated_prompt_tokens);
+        let completion_tokens = provider_usage.output_tokens
+            .unwrap_or_else(|| estimate_completion_tokens(&completion_text));
+        let token_details = ForwardTokenDetails {
+            cache_creation_input_tokens: provider_usage.cache_creation_input_tokens,
+            cache_read_input_tokens: provider_usage.cache_read_input_tokens,
+            cache_write_input_tokens: provider_usage.cache_write_input_tokens,
+            reasoning_output_tokens: provider_usage.reasoning_tokens,
+        };
+        // Record before emitting the terminal event so closing the body after
+        // message_stop does not leave the request pending in the metrics DB.
+        metrics.forward_completed_with_details(
+            forward_id_clone,
+            chrono::Utc::now(),
+            Some(200),
+            ForwardStatus::Success,
+            Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: provider_usage.total_tokens
+                    .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens)),
+            }),
+            (!token_details.is_empty()).then_some(token_details),
+            None,
+        );
 
-        if !had_error {
-            let completion_tokens = estimate_completion_tokens(&completion_text);
-            metrics.forward_completed(
-                forward_id_clone,
-                chrono::Utc::now(),
-                Some(200),
-                ForwardStatus::Success,
-                Some(build_estimated_usage(
-                    estimated_prompt_tokens,
-                    completion_tokens,
-                )),
-                None,
-            );
-        }
+        state.final_usage = Some(message_delta_usage(provider_usage));
+        let payload = match terminal_chunk {
+            Some(chunk) => state.handle_chunk(&chunk),
+            None => state.finish(None),
+        };
+        yield Ok::<Bytes, AppError>(Bytes::from(payload));
+        yield Ok::<Bytes, AppError>(Bytes::from("data: [DONE]\n\n"));
     };
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .streaming(stream))
+}
+
+fn capture_provider_usage(usage: &mut ProviderUsageReplacement, chunk: &LLMChunk) {
+    match *chunk {
+        LLMChunk::ProviderUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            reasoning_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+        } => {
+            *usage = ProviderUsageReplacement {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                reasoning_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                ..Default::default()
+            };
+        }
+        LLMChunk::ProviderUsageReplace(replacement) => *usage = replacement,
+        _ => {}
+    }
+}
+
+fn message_delta_usage(usage: ProviderUsageReplacement) -> Value {
+    let fresh_input = usage.input_tokens.and_then(|total| {
+        total
+            .checked_sub(usage.cache_read_input_tokens.unwrap_or(0))?
+            .checked_sub(usage.cache_creation_input_tokens.unwrap_or(0))
+    });
+    Value::Object(
+        [
+            ("input_tokens", fresh_input),
+            ("output_tokens", Some(usage.output_tokens.unwrap_or(0))),
+            (
+                "cache_creation_input_tokens",
+                usage.cache_creation_input_tokens,
+            ),
+            ("cache_read_input_tokens", usage.cache_read_input_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(name, count)| count.map(|count| (name.to_owned(), Value::from(count))))
+        .collect(),
+    )
 }

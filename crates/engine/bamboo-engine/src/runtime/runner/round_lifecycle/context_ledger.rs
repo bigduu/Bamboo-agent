@@ -15,6 +15,7 @@ const ANCHOR_DOMAIN: &[u8] = b"bamboo/model-context-anchor/v1\0";
 #[derive(Debug)]
 pub(super) struct ContextLedgerOutcome {
     pub transcript: Vec<Message>,
+    pub prior_message_count: usize,
     pub changed: bool,
     pub prefix_epoch: u64,
     pub reset_reason: Option<ModelContextResetReason>,
@@ -108,6 +109,12 @@ pub(super) fn reconcile_model_context(
         session.reset_provider_transcript_for_model_context(reason);
     }
 
+    let prior_message_count =
+        if state.cache_scope_sha256.as_deref() == Some(cache_scope_sha256.as_str()) {
+            state.transcript_item_sha256.len()
+        } else {
+            0
+        };
     state.cache_scope_sha256 = Some(cache_scope_sha256);
     state.transcript_item_sha256 = current_item_sha256;
     // A reset already advances the revision. Otherwise advance exactly once
@@ -129,6 +136,7 @@ pub(super) fn reconcile_model_context(
 
     ContextLedgerOutcome {
         transcript,
+        prior_message_count,
         changed,
         prefix_epoch,
         reset_reason,

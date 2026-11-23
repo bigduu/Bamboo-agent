@@ -35,7 +35,7 @@ struct CapturedOutput {
     // readouts before delivering its single result.
     consecutive_empty_polls: usize,
     pending_empty_poll: Option<Arc<str>>,
-    quiet_wait_started: bool,
+    last_quiet_wait_poll_count: usize,
 }
 
 impl Default for CapturedOutput {
@@ -51,7 +51,7 @@ impl Default for CapturedOutput {
             consecutive_empty_readouts: 0,
             consecutive_empty_polls: 0,
             pending_empty_poll: None,
-            quiet_wait_started: false,
+            last_quiet_wait_poll_count: 0,
         }
     }
 }
@@ -60,7 +60,7 @@ impl CapturedOutput {
     fn reset_poll_advisory(&mut self) {
         self.consecutive_empty_polls = 0;
         self.pending_empty_poll = None;
-        self.quiet_wait_started = false;
+        self.last_quiet_wait_poll_count = 0;
     }
 
     fn record_empty_poll(&mut self) -> Option<&'static str> {
@@ -331,6 +331,19 @@ pub struct BackgroundExecJob {
     shell: Arc<bash_runtime::ShellSession>,
 }
 
+pub const WAIT_FOR_EXEC_DISPLAY: &str = "runtime_control:waiting_for_exec";
+
+pub(super) fn owned_exec(owner: &str, handle: &str) -> Option<Arc<bash_runtime::ShellSession>> {
+    bash_runtime::get_shell(handle)
+        .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
+}
+
+/// None leaves non-exec targets to the caller's ordinary dispatch.
+pub async fn exec_wait_target(owner: &str, handle: &str) -> Option<bool> {
+    let shell = owned_exec(owner, handle)?;
+    Some(!shell.stdin_is_open().await)
+}
+
 impl BackgroundExecJob {
     pub fn id(&self) -> &str {
         &self.shell.id
@@ -385,10 +398,7 @@ impl Drop for BackgroundExecJob {
 /// Reserve only an exact handle from this owner's pull-session registry.
 /// Legacy Bash shells and another owner's handles cannot be handed off.
 pub fn reserve_background_job(owner: &str, handle: &str) -> Option<BackgroundExecJob> {
-    let shell = bash_runtime::get_shell(handle)?;
-    if shell.session_id.as_deref() != Some(owner) {
-        return None;
-    }
+    let shell = owned_exec(owner, handle)?;
     shell
         .polled
         .as_ref()?
@@ -400,7 +410,7 @@ pub fn reserve_background_job(owner: &str, handle: &str) -> Option<BackgroundExe
 
 /// Reserve a same-run wait only after the model has received the quiet
 /// advisory and followed it with another empty poll of this owned command.
-/// An unchanged quiet period can start at most one such wait.
+/// Each wait needs a newly delivered empty poll, including after a wait ceiling.
 pub async fn reserve_quiet_exec_job(owner: &str, handle: &str) -> Option<BackgroundExecJob> {
     let job = reserve_background_job(owner, handle)?;
     if job.shell.stdin_is_open().await {
@@ -408,12 +418,15 @@ pub async fn reserve_quiet_exec_job(owner: &str, handle: &str) -> Option<Backgro
     }
     let state = job.shell.polled.as_ref().expect("validated exec capture");
     let mut output = state.output.lock().await;
-    let was_quiet = output.consecutive_empty_polls > QUIET_POLL_ADVISORY_POLLS;
+    let poll_count = output.consecutive_empty_polls;
     let new_output = !output.bytes.is_empty() || output.omitted_bytes > 0;
-    if !was_quiet || output.quiet_wait_started || (output.completion.is_none() && new_output) {
+    if poll_count <= QUIET_POLL_ADVISORY_POLLS
+        || poll_count <= output.last_quiet_wait_poll_count
+        || (output.completion.is_none() && new_output)
+    {
         return None;
     }
-    output.quiet_wait_started = true;
+    output.last_quiet_wait_poll_count = poll_count;
     drop(output);
     Some(job)
 }
@@ -736,7 +749,15 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command and wait up to yield_time_ms. Keep builds and tests you need to verify attached to this call. A running command returns a session_id. Use empty write_stdin on that handle to wait for output and the exit code. Preserve the command's own exit status when piping test output. interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
+        "Run a shell command and wait up to yield_time_ms. \
+         Group related commands with a known order and a shared working directory in one exec_command call. \
+         Set the shared directory with workdir and use && in cmd when the next step requires the previous one to succeed. \
+         Send independent checks as separate tool calls in the same response. \
+         Inspect a result before choosing any command that depends on it. \
+         Keep builds and tests you need to verify attached to this call. \
+         A running command returns a session_id. An ordinary Root with SubAgent can wait for a non-interactive command using intent=wait and that exact session_id. Use write_stdin for interactive input or output and exit status when needed. \
+         Preserve the command's own exit status when piping test output. \
+         interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

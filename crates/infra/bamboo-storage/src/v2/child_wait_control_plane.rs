@@ -148,6 +148,76 @@ mod incremental_wait_tests {
     use bamboo_domain::{AgentStatusState, SuspensionState};
 
     #[tokio::test]
+    async fn runtime_only_child_wait_registration_and_clear_update_the_index() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = SessionStoreV2::new(temp.path().into()).await?;
+        let parent = Session::new("runtime-only-parent", "model");
+        first.save_session(&parent).await?;
+        let main_path = first
+            .sessions_root_dir()
+            .join(&parent.id)
+            .join("session.json");
+        let original_main = fs::read(&main_path).await?;
+        let second = SessionStoreV2::new(temp.path().into()).await?;
+
+        let (registered, count) = first
+            .register_child_wait(
+                &parent,
+                &[("child".into(), Some("wait-call".into()))],
+                ChildWaitPolicy::All,
+                false,
+                Arc::new(|_| {}),
+            )
+            .await?;
+        assert_eq!(count, 1);
+        assert_eq!(
+            runtime(&first.load_session(&parent.id).await?.unwrap())
+                .waiting_for_children
+                .unwrap()
+                .child_session_ids,
+            ["child"]
+        );
+        assert!(
+            first
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+        // This writer opened before registration and its cached row still says no wait.
+        assert!(
+            !second
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+
+        let mut updated = registered.clone();
+        let mut state = runtime(&updated);
+        state.waiting_for_children = None;
+        write_runtime(&mut updated, state)?;
+        assert!(
+            second
+                .compare_exchange_child_wait(&registered, &mut updated, true, Arc::new(|_| {}))
+                .await?
+        );
+        assert!(runtime(&second.load_session(&parent.id).await?.unwrap())
+            .waiting_for_children
+            .is_none());
+        let reopened = SessionStoreV2::new(temp.path().into()).await?;
+        assert!(
+            !reopened
+                .get_index_entry(&parent.id)
+                .await
+                .unwrap()
+                .waiting_for_children
+        );
+        assert_eq!(fs::read(main_path).await?, original_main);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn partial_guardian_verdict_preserves_concurrently_activated_parent() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStoreV2::new(temp.path().into()).await.unwrap();
@@ -243,7 +313,7 @@ impl SessionStoreV2 {
         let Some(side) = side else {
             // Ordinary compatibility: legacy Child Main remains authoritative
             // when its optional sidecar is missing or corrupt.
-            let bytes = match fs::read(directory.join("session.json")).await {
+            let bytes = match cold_main::read(directory.join("session.json")).await {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
@@ -279,7 +349,7 @@ impl SessionStoreV2 {
         if !full {
             return Ok(Some(side));
         }
-        let bytes = match fs::read(directory.join("session.json")).await {
+        let bytes = match cold_main::read(directory.join("session.json")).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -401,6 +471,102 @@ impl SessionStoreV2 {
             .await?;
         self.publish_child_wait(&guards, &latest, publish).await?;
         Ok((latest, count))
+    }
+
+    pub(super) async fn expire_root_child_wait(
+        &self,
+        expected: &Session,
+        committed: &bamboo_domain::CommittedChildWaitExpiry,
+        inbox: &dyn bamboo_domain::SessionInboxPort,
+        now: DateTime<Utc>,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<bool> {
+        use crate::session_inbox::FileSessionInbox;
+
+        let inbox = inbox
+            .as_any()
+            .and_then(|any| any.downcast_ref::<FileSessionInbox>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Root child wait expiry requires the concrete Inbox",
+                )
+            })?;
+        let started = Instant::now();
+        let mut guards = self.child_wait_guards(&expected.id).await?;
+        let Some(mut latest) = self.load_session_unlocked(&expected.id).await? else {
+            return Ok(false);
+        };
+        validate_incarnation(expected, &latest)?;
+        let expiry = &committed.expiry;
+        let receipt = committed.receipt();
+        let mut state = runtime(&latest);
+        if latest.kind != SessionKind::Root
+            || !latest.authority_identity.is_ordinary()
+            || latest.metadata.contains_key("ticket.runtime.dispatch.v1")
+            || latest.has_pending_question()
+            || latest
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            || latest.last_run_status().as_deref() != Some("suspended")
+            || state.waiting_for_bash.is_some()
+            || latest
+                .metadata
+                .get("runtime.suspend_reason")
+                .is_some_and(|reason| reason != "waiting_for_children")
+            || state
+                .suspension
+                .as_ref()
+                .is_some_and(|suspension| suspension.reason != "waiting_for_children")
+            || state
+                .plan_mode
+                .as_ref()
+                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval)
+            || state.run_id != expiry.run_id
+            || state.waiting_for_children.as_ref() != Some(&expiry.wait)
+            || !expiry.matches_lifetime(&latest)
+            || !expiry.is_due(now)
+            || self
+                .child_wait_expiry_activation_id(&latest, &state.run_id)
+                .await?
+                .as_deref()
+                != Some(expiry.actor_activation_id.as_str())
+        {
+            return Ok(false);
+        }
+        let envelope = expiry.envelope(&latest.id)?;
+        let Some(filesystem) = inbox
+            .retain_staged_child_wait_expiry(
+                &self.sessions_dir,
+                &envelope,
+                &receipt,
+                guards.physical.clone(),
+            )
+            .await
+            .map_err(io::Error::other)?
+        else {
+            return Ok(false);
+        };
+        // Keep the staged receipt protected through the blocking runtime write.
+        Arc::get_mut(&mut guards)
+            .expect("new child wait guards are private")
+            ._input_filesystem = Some(filesystem);
+
+        state.waiting_for_children = None;
+        state.status = bamboo_domain::AgentStatusState::Idle;
+        state.suspension = None;
+        write_runtime(&mut latest, state)?;
+        latest.metadata.remove("runtime.suspend_reason");
+        latest.metadata.insert(
+            bamboo_domain::CHILD_WAIT_EXPIRY_RECEIPT_KEY.into(),
+            serde_json::to_string(committed)?,
+        );
+        latest.updated_at = now;
+        let rel = Self::default_writer_rel_path(&latest)?;
+        self.save_runtime_state_after_lock(&latest, &rel, started, &guards, None, None)
+            .await?;
+        self.publish_child_wait(&guards, &latest, publish).await?;
+        Ok(true)
     }
 
     pub(super) async fn compare_exchange_child_wait(

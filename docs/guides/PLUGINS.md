@@ -173,6 +173,13 @@ and uses the existing installer with strict trust, even if generic manual plugin
 enforcement was switched off. It does not add a key to a custom trust list or
 accept caller URLs, paths, commands or bypass flags.
 
+The official installer selects Jiandu 0.5.0. Verified 0.4.0 and 0.3.2 connectors
+keep their external MCP configuration until you update them. For an existing
+connector, use **Settings → Plugins → Installed → Update** with strict plugin trust.
+Enter the bundle URL and SHA-256 from the release's `catalog-entry.json`.
+The update reuses the same connector command path and memory root.
+[Jiandu 0.5.0 release](https://github.com/bigduu/Jiandu/releases/tag/v0.5.0)
+
 Only a completed, verified managed installation exposes `external_client`:
 an absolute `command` and `args: ["--data-dir", "<active canonical root>"]`.
 The root comes from the running MemoryStore, including an explicitly selected

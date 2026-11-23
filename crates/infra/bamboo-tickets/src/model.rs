@@ -287,6 +287,8 @@ pub struct ManagedWorkRoot {
     pub scope_revision: u64,
     pub project_id: bamboo_domain::ProjectId,
     pub model: bamboo_domain::ProviderModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<bamboo_domain::RootThinkingMode>,
 }
 
 impl ManagedWorkRoot {
@@ -374,6 +376,17 @@ pub struct MessageResolution {
     pub proposal_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_seq: Option<u64>,
+}
+
+impl MessageResolution {
+    pub fn is_pending_human(&self) -> bool {
+        self.ingress.is_some()
+            && (self.proposal.is_none()
+                || self
+                    .groups
+                    .iter()
+                    .any(|g| g.status == ResolutionStatus::Proposed))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

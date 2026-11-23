@@ -19,7 +19,7 @@ use bamboo_llm::LLMProvider;
 
 use crate::runtime::config::{
     AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, DisabledFilterResolver, GoldConfig,
-    GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+    GuardianConfig, GuardianSpawner, ImageFallbackConfig, RunDeadline,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
@@ -70,6 +70,7 @@ pub struct SessionExecutionReservation {
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     persistence_bound: bool,
     selected_input: bool,
+    run_deadline: Option<RunDeadline>,
     armed: bool,
 }
 
@@ -84,6 +85,35 @@ impl SessionExecutionReservation {
 
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Attach the clock supplied by this execution's local caller.
+    pub fn set_run_deadline(&mut self, deadline: Option<RunDeadline>) {
+        self.run_deadline = deadline;
+    }
+
+    /// Attach the canonical birth to this existing owner before accepting an
+    /// input restricted to its exact run.
+    pub(crate) async fn bind_reserved_session_lifetime(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        let (SessionExecutionActivationOwnership::Registered(registration), Some(router)) =
+            (&self.activation, agent.activation_router())
+        else {
+            return Err(std::io::Error::other(
+                "scheduled turn requires a registered Session owner",
+            ));
+        };
+        if self.cancel_token.is_cancelled()
+            || !router
+                .bind_run_lifetime(&registration.ownership(), session)
+                .await
+        {
+            return Err(std::io::Error::other("scheduled turn owner changed"));
+        }
+        Ok(())
     }
 
     /// Retain the no-execution cleanup until the exact reservation reaches the
@@ -255,6 +285,28 @@ impl SessionExecutionReservation {
         &mut self,
         receipt: bamboo_domain::SessionInboxReceipt,
     ) -> std::io::Result<()> {
+        self.bind_selected_root_receipt(receipt, |persistence, receipt| {
+            persistence.bind_root_inbox_receipt(receipt)
+        })
+    }
+
+    pub(crate) fn bind_paced_loop_inbox_receipt(
+        &mut self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<()> {
+        self.bind_selected_root_receipt(receipt, |persistence, receipt| {
+            persistence.bind_paced_loop_inbox_receipt(receipt)
+        })
+    }
+
+    fn bind_selected_root_receipt(
+        &mut self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+        bind: impl FnOnce(
+            &dyn bamboo_domain::RuntimeSessionPersistence,
+            bamboo_domain::SessionInboxReceipt,
+        ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    ) -> std::io::Result<()> {
         if !self.selected_input || self.root_actor.is_none() || self.cancel_token.is_cancelled() {
             return Err(std::io::Error::other(
                 "Root receipt requires a live bound reservation",
@@ -264,7 +316,7 @@ impl SessionExecutionReservation {
             .execution_persistence
             .as_ref()
             .ok_or_else(|| std::io::Error::other("Root execution persistence unavailable"))?;
-        self.execution_persistence = Some(persistence.bind_root_inbox_receipt(receipt)?);
+        self.execution_persistence = Some(bind(persistence.as_ref(), receipt)?);
         Ok(())
     }
 
@@ -367,6 +419,7 @@ impl SessionExecutionReservation {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         }
     }
@@ -397,6 +450,7 @@ impl SessionExecutionReservation {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         }
     }
@@ -787,6 +841,7 @@ async fn reserve_logical_session(
         child_startup: None,
         child_closure: None,
         selected_input: false,
+        run_deadline: None,
         armed: true,
     };
     let registration = register_reserved_activation(
@@ -1009,6 +1064,7 @@ async fn reserve_session_execution_inner(
         child_startup: None,
         child_closure: None,
         selected_input,
+        run_deadline: None,
         armed: true,
     };
     SessionExecutionReserveOutcome::Reserved(execution_reservation)
@@ -1615,6 +1671,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                         execute_request,
                         inputs,
                         upstream_retry,
+                        execution_reservation.run_deadline,
                     );
                     match &work {
                         Some(work) => work.resources.scope(execution).await,
@@ -2087,7 +2144,10 @@ fn initial_user_message_for_session(session: &Session) -> String {
     session
         .messages
         .last()
-        .filter(|message| matches!(message.role, bamboo_agent_core::Role::User))
+        .filter(|message| {
+            matches!(message.role, bamboo_agent_core::Role::User)
+                && !crate::session_app::execute::is_paced_loop_iteration_message(message)
+        })
         .map(|message| message.content.clone())
         .unwrap_or_default()
 }
@@ -2512,6 +2572,7 @@ mod reservation_tests {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         };
 
@@ -2549,6 +2610,7 @@ mod reservation_tests {
             child_startup: None,
             child_closure: None,
             selected_input: false,
+            run_deadline: None,
             armed: true,
         };
 

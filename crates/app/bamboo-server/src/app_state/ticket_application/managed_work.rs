@@ -98,7 +98,16 @@ impl TicketApplication {
             .store
             .inspect_supervisor_current_user_scope(&reference)
             .await?;
-        let model = host.fast_model(&*self.config.read().await)?;
+        let (model, thinking_mode) = {
+            let config = self.config.read().await;
+            (
+                host.fast_model(&config)?,
+                config
+                    .features
+                    .work_ultra_by_default
+                    .then_some(bamboo_domain::RootThinkingMode::Ultra),
+            )
+        };
         let mut projects = BTreeMap::new();
         for workspace in starts {
             let workspace = workspace.ok_or_else(|| {
@@ -146,6 +155,7 @@ impl TicketApplication {
                     scope_revision: scope.legacy_state_revision,
                     project_id,
                     model: model.clone(),
+                    thinking_mode,
                 })
             },
             &|packet| {
@@ -434,8 +444,11 @@ impl ManagedWorkHost {
             })?;
         Ok(ProviderModelRef {
             model,
-            reasoning_effort: configured
-                .and_then(|model| model.reasoning_effort)
+            reasoning_effort: config
+                .features
+                .work_execution
+                .reasoning_effort
+                .or_else(|| configured.and_then(|model| model.reasoning_effort))
                 .or_else(|| get_reasoning_effort_for_provider(config, &provider)),
             provider,
         })

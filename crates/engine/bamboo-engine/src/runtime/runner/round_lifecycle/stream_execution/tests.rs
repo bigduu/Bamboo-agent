@@ -365,13 +365,13 @@ async fn autonomous_goal_directives_reach_provider_payload_in_ordinary_gold_and_
                 1
             );
             for clause in [
-                "active objective, constraints, and acceptance criteria",
-                "a status question does not cancel unfinished work",
-                "Work autonomously toward the authorized end-to-end result",
-                "necessary exploration and prerequisite subtasks",
-                "repair recoverable failures",
-                "without automatically taking them on",
-                "pushing code, or waiting for another actor does not by itself complete the task",
+                "Carry the user's objective, constraints, and acceptance criteria",
+                "Explicit user updates steer unfinished work",
+                "A status question leaves it active",
+                "Deliver the smallest complete result",
+                "Repair recoverable failures within scope",
+                "Verify the work against the user's acceptance criteria",
+                "what is complete, what remains, and the concrete blocker",
             ] {
                 assert!(
                     instructions.contains(clause),
@@ -1499,6 +1499,248 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
         .messages
         .iter()
         .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+}
+
+#[tokio::test]
+async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
+    use bamboo_llm::providers::AnthropicProvider;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "text/event-stream",
+        ))
+        .expect(8)
+        .mount(&server)
+        .await;
+    let llm: Arc<dyn LLMProvider> = Arc::new(
+        AnthropicProvider::new("fixture-key").with_base_url(format!("{}/v1", server.uri())),
+    );
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let frame = LlmStreamFrame {
+        provider_default_output: false,
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "anthropic-cache-wire",
+        model: "test-model",
+        provider_name: Some("test-anthropic"),
+        provider_type: Some("anthropic"),
+        reasoning_effort: None,
+        output_limit_recovery: None,
+        budget: &TokenBudget::new(400_000, 128, Default::default()),
+        observation_progress_hint: None,
+        prompt_memory_exposure: None,
+    };
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("anthropic".into());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".into());
+    let tools = [ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "lookup".into(),
+            description: "look up a value".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    }];
+    let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let initial_history = format!(
+        "first history boundary\n{}",
+        "durable history ".repeat(4_000)
+    );
+    let larger_history = format!(
+        "larger history boundary\n{}",
+        "appended history ".repeat(4_000)
+    );
+    let mut session = Session::new(frame.session_id, frame.model);
+    session.add_message(Message::user("original request"));
+    session.add_message(Message::assistant("prior answer", None));
+    session.add_message(Message::user(initial_history.clone()));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Fixture task".into(),
+        items: vec![TaskItem {
+            id: "task-1".into(),
+            description: "task snapshot before tools".into(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+
+    for step in 0..8 {
+        if step == 1 {
+            // Resume from the serialized ledger without an in-process cache
+            // cursor. The prior boundary still has to survive the wide append.
+            session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+            // Exceed Anthropic's 20-block lookback even when parallel tool
+            // blocks are counted as a single position.
+            for index in 0..11 {
+                session.add_message(Message::assistant(format!("answer {index}"), None));
+                session.add_message(Message::user(format!("append {index}")));
+            }
+            session.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "cached-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            ));
+            session.add_message(Message::tool_result("cached-call", "retained tool output"));
+        } else if step == 3 {
+            session.add_message(Message::assistant("tool-based answer", None));
+            session.add_message(Message::user("new user turn"));
+        } else if step == 4 {
+            session.add_message(Message::assistant("second answer", None));
+            session.add_message(Message::user("short append"));
+        } else if step == 5 {
+            session.add_message(Message::assistant("answer before larger append", None));
+            session.add_message(Message::user(larger_history.clone()));
+        } else if step == 6 {
+            session.add_message(Message::assistant("answer after larger append", None));
+            session.add_message(Message::user("latest short append"));
+        } else if step == 7 {
+            session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+            session.add_message(Message::user("first request in a new epoch"));
+        }
+        if step < 3 {
+            session
+                .metadata
+                .insert(memory_key.into(), format!("live memory revision {step}"));
+        } else {
+            session.metadata.remove(memory_key);
+        }
+        if step == 2 {
+            session.task_list.as_mut().unwrap().items[0].description =
+                "task snapshot after tools".into();
+        }
+        let prepared = PreparedContext {
+            messages: session.messages.clone(),
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        execute_llm_stream(&mut session, &config, &llm, &prepared, &tools, &frame)
+            .await
+            .expect("dispatch fixture through Anthropic rendering");
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let mut prior_prefix = Vec::new();
+    let mut marked_prefix = Vec::new();
+    for (step, request) in requests.iter().enumerate() {
+        let body: serde_json::Value = request.body_json().unwrap();
+        let blocks = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        let endpoint = match step {
+            0 => &initial_history,
+            1 | 2 => "retained tool output",
+            3 => "new user turn",
+            4 => "short append",
+            5 => &larger_history,
+            6 => "latest short append",
+            _ => "first request in a new epoch",
+        };
+        let boundary = blocks
+            .iter()
+            .position(|block| block["text"] == endpoint || block["content"] == endpoint)
+            .expect("history endpoint on the wire");
+        assert_eq!(blocks[boundary]["cache_control"]["ttl"], "1h");
+        assert!(blocks[boundary + 1..]
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
+        let marked = [
+            body["tools"].as_array().unwrap(),
+            body["system"].as_array().unwrap(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(blocks.iter().copied())
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+        assert!(marked <= 4);
+
+        let prefix = blocks[..=boundary]
+            .iter()
+            .map(|block| {
+                let mut content = (*block).clone();
+                content.as_object_mut().unwrap().remove("cache_control");
+                content
+            })
+            .collect::<Vec<_>>();
+        if step == 7 {
+            assert!(blocks
+                .iter()
+                .any(|block| block["text"] == "latest short append"
+                    && block.get("cache_control").is_none()));
+        } else {
+            assert!(prefix.starts_with(&prior_prefix));
+            if !prior_prefix.is_empty() && step != 5 {
+                assert_eq!(blocks[prior_prefix.len() - 1]["cache_control"]["ttl"], "1h");
+            }
+        }
+        if step < 7 {
+            // A compatible gateway can hash this prefix including the marker
+            // properties. Comparing content with those properties removed
+            // would miss the invalidation we are guarding against.
+            let checkpoint = if step < 5 {
+                &initial_history
+            } else {
+                &larger_history
+            };
+            let checkpoint_idx = blocks
+                .iter()
+                .position(|block| block["text"].as_str() == Some(checkpoint))
+                .expect("history checkpoint on the wire");
+            assert_eq!(
+                blocks[checkpoint_idx]["cache_control"]["ttl"], "1h",
+                "step {step}"
+            );
+            let current =
+                serde_json::to_vec(&(&body["tools"], &body["system"], &blocks[..=checkpoint_idx]))
+                    .unwrap();
+            if step == 0 || step == 5 {
+                marked_prefix = current;
+            } else {
+                assert!(
+                    current == marked_prefix,
+                    "marked wire prefix changed on step {step}"
+                );
+            }
+        }
+        if step == 1 {
+            assert!(boundary + 1 - prior_prefix.len() > 20);
+        }
+        let memory = body["messages"].to_string();
+        for revision in 0..3 {
+            assert_eq!(
+                memory.contains(&format!("live memory revision {revision}")),
+                step == revision
+            );
+        }
+        if step < 3 {
+            assert!(blocks[boundary + 1..].iter().any(|block| block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("live memory revision {step}")))));
+        }
+        prior_prefix = prefix;
+    }
 }
 
 #[tokio::test]
@@ -3169,6 +3411,118 @@ fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
     );
 }
 
+#[tokio::test]
+async fn file_mutation_receipts_stay_intact_in_history_and_compact_on_the_wire() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("file-change-wire", "test-model");
+    session.add_message(Message::user("Update the fixture."));
+    let untouched = "unchanged middle source with repeated fields";
+    let middle = format!("{untouched}\n").repeat(160);
+    let before = format!("first\n{middle}last\n");
+    let after = format!("new first\n{middle}new last\n");
+    let mut originals = Vec::new();
+    for (name, call_id) in [("Write", "call_write"), ("Edit", "call_edit")] {
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: call_id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: serde_json::json!({"file_path": "/workspace/fixture.json"})
+                        .to_string(),
+                },
+            }]),
+        ));
+        let mut receipt = bamboo_tools::tools::file_change::build_file_change_payload_value(
+            name,
+            std::path::Path::new("/workspace/fixture.json"),
+            "Updated fixture".to_owned(),
+            serde_json::json!({"created": true, "path": "/checkpoint/fixture"}),
+            &before,
+            &after,
+        );
+        receipt["diagnostics"] = serde_json::json!({"format":"json","valid":false,"line":1});
+        let mut result = Message::tool_result(call_id, receipt.to_string());
+        if name == "Edit" {
+            // Legacy stored results can lack an explicit success bit.
+            result.tool_success = None;
+            result.content.push_str(
+                "\n\n<post_tool_use_feedback>\nvalidation hint\n</post_tool_use_feedback>",
+            );
+        }
+        assert!(result.content.matches(untouched).count() > 100);
+        originals.push((call_id, result.content.clone()));
+        session.add_message(result);
+    }
+
+    let config = test_config("BASE_IDENTITY");
+    let budget = TokenBudget::new(8_000, 128, Default::default());
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    let prepared = bamboo_compression::prepare_hybrid_context(&session, &budget, &counter).unwrap();
+    assert!(!prepared.truncation_occurred);
+    assert!(prepared.token_usage.window_tokens < 500);
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared,
+        &[],
+        &LlmStreamFrame {
+            provider_default_output: false,
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "file-change-wire",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            output_limit_recovery: None,
+            budget: &budget,
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("file change provider request");
+
+    let request = llm.requested_responses_body.lock().unwrap();
+    let input = request.as_ref().unwrap()["input"].as_array().unwrap();
+    for (call_id, original) in originals {
+        let result = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+            .expect("paired tool result on the wire");
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("fixture.json"));
+        let receipt = serde_json::Deserializer::from_str(output)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("compact receipt")
+            .expect("compact receipt JSON");
+        assert_eq!(
+            receipt["workspace"],
+            bamboo_config::paths::path_to_display_string(std::path::Path::new("/workspace"))
+        );
+        assert!(output.contains("\"valid\":false"));
+        assert!(output.contains("\"old_line_count\":162"));
+        assert!(!output.contains("unified"));
+        assert!(!output.contains(untouched));
+        if call_id == "call_edit" {
+            assert!(output.contains("validation hint"));
+        }
+        let stored = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+            .unwrap();
+        assert_eq!(stored.content, original);
+    }
+}
+
 #[test]
 fn build_request_envelope_relocates_session_context_after_tool_guide() {
     // Session-variable context (here: loaded-skill context) must leave the static
@@ -3399,6 +3753,119 @@ fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_on
         .body_chat()
         .iter()
         .all(|message| !message.content.contains("context_type: root_orchestration")));
+}
+
+#[test]
+fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
+    use bamboo_domain::{
+        ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+        ModelContextResetReason, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID,
+    };
+    use bamboo_llm::SegmentRole;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let config = test_config("BASE_IDENTITY");
+    let mut prepared = workspace_prepared_context();
+    prepared
+        .messages
+        .push(Message::assistant("Delivery pending.", None));
+    prepared.messages.push(Message::user("Check its progress."));
+    let mut saved = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+    saved.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    saved.messages = prepared.messages.clone();
+
+    let initial = super::build_request_envelope(&saved, &prepared, &config, &[]);
+    let old_scope = serde_json::json!({
+        "external_memory_projection_version": 3,
+        "model": "test-model",
+        "provider_boundary_sha256": null,
+        "system": initial.ir.system_text,
+        "stable_prefix": initial.ir.run(SegmentRole::StablePrefix)
+            .iter()
+            .map(|message| (&message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        "tools": [],
+    });
+    let legacy = ContextBlock::new(
+        ContextBlockType::RootOrchestration,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Supervisor Delegation Policy",
+        "LEGACY_SUPERVISOR_ROLE\n\nCurrent delegation route observation: {\"status\":\"routes_exposed\"}",
+    );
+    let prior = super::super::context_ledger::reconcile_model_context(
+        &mut saved,
+        vec![legacy],
+        &prepared.messages[1..],
+        bamboo_domain::sha256_hex(&serde_json::to_vec(&old_scope).unwrap()),
+        false,
+    );
+    let history = serde_json::to_value(&saved.messages).unwrap();
+    let mut restored: Session =
+        serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+    let refreshed = super::build_request_envelope_reconciled(
+        &mut restored,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(
+        refreshed.prefix_reset_reason,
+        Some(ModelContextResetReason::CacheScopeChanged)
+    );
+    assert_eq!(refreshed.prefix_epoch, prior.prefix_epoch + 1);
+    let wire = refreshed.ir.flatten();
+    assert!(wire
+        .iter()
+        .all(|message| !message.content.contains("LEGACY_SUPERVISOR_ROLE")));
+    assert!(wire
+        .iter()
+        .any(|message| message.content == "Check its progress."));
+    assert_eq!(
+        wire.iter()
+            .filter(|message| message
+                .content
+                .contains("Supervisor delegation-first policy"))
+            .count(),
+        1
+    );
+    let anthropic = bamboo_llm::providers::anthropic::build_anthropic_request_with_cache(
+        &wire,
+        &[],
+        "test-model",
+        128,
+        false,
+        None,
+        None,
+        Some(&refreshed.ir.cache),
+    );
+    let user = anthropic["messages"].as_array().unwrap().last().unwrap();
+    let blocks = user["content"].as_array().unwrap();
+    let last = blocks.last().unwrap();
+    assert!(last["text"]
+        .as_str()
+        .unwrap()
+        .contains("Current delegation route observation: "));
+    assert!(last.get("cache_control").is_none());
+    let newest = blocks
+        .iter()
+        .find(|block| block["text"] == "Check its progress.")
+        .unwrap();
+    assert_eq!(newest["cache_control"]["type"], "ephemeral");
+    let repeated = super::build_request_envelope_reconciled(
+        &mut restored,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(repeated.prefix_epoch, refreshed.prefix_epoch);
+    assert_eq!(repeated.prefix_reset_reason, None);
+    assert!(!repeated.ledger_changed);
+    assert_eq!(serde_json::to_value(&restored.messages).unwrap(), history);
 }
 
 #[test]
@@ -4585,7 +5052,7 @@ fn responses_continuation_enabled_requires_store_true_and_supported_provider() {
 }
 
 #[tokio::test]
-async fn execute_llm_stream_includes_external_memory_volatile_block() {
+async fn execute_llm_stream_preserves_tool_continuation_after_current_external_memory() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-2a", "test-model");
     // A stale continuation id may still be present (pre-fix persistence); under
@@ -4603,11 +5070,24 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let config = test_config("system");
+    let mut resume = Message::user("Resume the current turn.");
+    resume.metadata = Some(serde_json::json!({"runtime_kind":"retry_resume"}));
     let prepared_context = PreparedContext {
         messages: vec![
             Message::system("system"),
             Message::user("run a tool"),
-            Message::assistant("calling tool", None),
+            resume,
+            Message::assistant(
+                "calling tool",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "test_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            ),
             Message::tool_result("call_1", "{\"ok\":true}"),
         ],
         token_usage: usage(0, 22),
@@ -4654,17 +5134,23 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         .lock()
         .expect("messages lock")
         .clone();
-    // First epoch: external memory is seeded before the real transcript. Later
-    // revisions append after the then-current transcript boundary.
-    assert_eq!(requested_messages.len(), 6);
+    assert_eq!(requested_messages.len(), 7);
     assert!(matches!(requested_messages[0].role, Role::System));
     assert_session_identity_message(&requested_messages[1], "session-stream-2a");
-    assert!(matches!(requested_messages[2].role, Role::User));
     assert!(requested_messages[2]
         .content
         .contains("context_type: external_memory"));
     assert!(requested_messages[2].content.contains("Session note body"));
-    assert!(matches!(requested_messages[5].role, Role::Tool));
+    for (actual, original) in requested_messages[3..]
+        .iter()
+        .zip(&prepared_context.messages[1..])
+    {
+        assert_eq!(actual.id, original.id);
+    }
+    assert_eq!(
+        requested_messages.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
+    );
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -4672,6 +5158,22 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             .expect("previous_response_id lock")
             .as_deref(),
         None
+    );
+
+    let mut without_user = prepared_context;
+    without_user.messages.remove(1);
+    let envelope = super::build_request_envelope(&session, &without_user, &config, &[]);
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let first_real = transcript
+        .iter()
+        .position(|message| message.id == without_user.messages[1].id)
+        .expect("the first real row survives preparation");
+    assert!(transcript[first_real - 1]
+        .content
+        .contains("context_type: external_memory"));
+    assert_eq!(
+        transcript.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1"),
     );
 }
 
@@ -5301,6 +5803,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
+        None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
         "messages":before.ir.flatten(),"tools":before_tools.as_ref()
@@ -5327,6 +5830,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::Progressive,
         None,
+        None,
     );
     let duplicate_wire = serde_json::to_vec(&serde_json::json!({
         "messages":duplicate.ir.flatten(),"tools":loaded_tools.as_ref()
@@ -5339,6 +5843,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     let after_messages = after.ir.flatten();
@@ -5379,6 +5884,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     );
     assert_eq!(
         resumed_request
@@ -5399,6 +5905,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        None,
     );
     assert!(disabled
         .ir
@@ -5417,6 +5924,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        None,
         None,
     );
     assert!(sticky
@@ -5439,6 +5947,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     assert!(envelope
@@ -5489,6 +5998,7 @@ fn discovery_history_projection_omits_removed_tool_definitions() {
         &[browser],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
         None,
     );
     let transcript = envelope.ir.flatten();
@@ -6420,5 +6930,173 @@ async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_
         persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "an over-budget prepared request must be rejected before any checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn responses_input_contains_only_the_current_external_memory_projection() {
+    use bamboo_domain::ContextBlockType;
+    use bamboo_llm::SegmentRole;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let legacy = "bamboo legacy generated memory fixture";
+    let old = "bamboo memory fixture being withdrawn";
+    let replacement = "bamboo current replacement fixture";
+    let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let transcript = vec![
+        Message::user("Prior user transcript fixture."),
+        Message::assistant("Prior assistant transcript fixture.", None),
+        Message::user("Continue."),
+    ];
+    let mut session = Session::new("memory-wire-fixture", "test-model");
+    session.set_project_id_meta("memory-wire-project-a");
+    session.messages = transcript.clone();
+    let config = test_config("system");
+    let prepared = PreparedContext {
+        messages: std::iter::once(Message::system("system"))
+            .chain(transcript.iter().cloned())
+            .collect(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Rebuild the old v2 cache identity and use the existing reconciliation
+    // function to persist the same typed full snapshot old Hosts produced.
+    let envelope = super::build_request_envelope(&session, &prepared, &config, &[]);
+    let v2_cache_scope = serde_json::json!({
+        "external_memory_projection_version": 2,
+        "model": "test-model",
+        "provider_boundary_sha256": null,
+        "system": envelope.ir.system_text,
+        "stable_prefix": envelope.ir.run(SegmentRole::StablePrefix)
+            .iter()
+            .map(|message| (&message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        "tools": [],
+    });
+    session.metadata.insert(memory_key.into(), legacy.into());
+    let legacy_block = super::build_external_memory_context_block(&session).unwrap();
+    super::super::context_ledger::reconcile_model_context(
+        &mut session,
+        vec![legacy_block],
+        &transcript,
+        bamboo_domain::sha256_hex(&serde_json::to_vec(&v2_cache_scope).unwrap()),
+        false,
+    );
+    session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    assert!(session
+        .model_context_state
+        .as_ref()
+        .unwrap()
+        .events
+        .iter()
+        .any(|event| event.block_type == ContextBlockType::ExternalMemory
+            && event.rendered_text.contains(legacy)));
+
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let provider: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(256);
+    let frame = LlmStreamFrame {
+        provider_default_output: false,
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "memory-wire-fixture",
+        model: "test-model",
+        provider_name: Some("openai"),
+        provider_type: Some("openai"),
+        reasoning_effort: None,
+        output_limit_recovery: None,
+        budget: &TokenBudget::new(400_000, 128, Default::default()),
+        observation_progress_hint: None,
+        prompt_memory_exposure: None,
+    };
+
+    let mut actual = Vec::new();
+    let mut first_request_and_state = None;
+    for (step, (project, current)) in [
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-a"), Some(replacement)),
+        (Some("memory-wire-project-a"), None),
+        (Some("memory-wire-project-a"), Some(old)),
+        (Some("memory-wire-project-b"), Some(replacement)),
+        (None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match project {
+            Some(project) => session.set_project_id_meta(project),
+            None => session.clear_project_id_meta(),
+        }
+        // This is the live field set by refresh after editing or archiving a
+        // record, regenerating Dream, or closing an agenda item.
+        match current {
+            Some(current) => {
+                session.metadata.insert(memory_key.into(), current.into());
+            }
+            None => {
+                session.metadata.remove(memory_key);
+            }
+        }
+        execute_llm_stream(&mut session, &config, &provider, &prepared, &[], &frame)
+            .await
+            .expect("dispatch fixture through Responses rendering");
+        let body = llm.requested_responses_body.lock().unwrap();
+        let body = body.as_ref().expect("rendered body");
+        let input = body["input"].to_string();
+        let items = body["input"].as_array().expect("Responses input array");
+        let user = items.last().expect("final user input");
+        assert_eq!(user["role"], "user");
+        assert!(user.to_string().contains("Continue."));
+        if let Some(current) = current {
+            assert!(items[items.len() - 2].to_string().contains(current));
+        }
+        actual.push((
+            input.contains(legacy),
+            input.contains(old),
+            input.contains(replacement),
+        ));
+        assert!(input.contains("Prior user transcript fixture."));
+        assert!(input.contains("Prior assistant transcript fixture."));
+        assert_eq!(
+            serde_json::to_value(&session.messages).unwrap(),
+            serde_json::to_value(&transcript).unwrap(),
+            "memory reconciliation must not rewrite the original transcript"
+        );
+
+        let state = session.model_context_state.as_ref().unwrap();
+        assert!(state
+            .events
+            .iter()
+            .all(|event| event.block_type != ContextBlockType::ExternalMemory));
+        let request_and_state = (
+            body["instructions"].clone(),
+            body["input"].clone(),
+            state.clone(),
+        );
+        if step == 0 {
+            first_request_and_state = Some(request_and_state);
+        } else if step == 1 {
+            assert_eq!(first_request_and_state.as_ref(), Some(&request_and_state));
+        }
+    }
+
+    assert_eq!(
+        actual,
+        [
+            (false, true, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ],
+        "each complete Responses input must contain only the live external memory projection"
     );
 }

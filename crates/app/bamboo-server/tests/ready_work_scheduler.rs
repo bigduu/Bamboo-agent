@@ -1743,6 +1743,51 @@ async fn held_native_provider_occupies_capacity_and_revocation_prevents_next_wor
 }
 
 #[tokio::test]
+async fn supervisor_parallel_limit_holds_ready_work_until_a_slot_is_released() {
+    let mut fixture = Fixture::new(2).await;
+    fixture
+        .state
+        .config
+        .write()
+        .await
+        .features
+        .work_execution
+        .max_parallel = std::num::NonZeroU32::new(1);
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(2))
+        .await
+        .unwrap();
+    fixture.state.tickets.wake_ready_work();
+    let first = fixture.next_request().await;
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.assignments.len(), 1);
+    let first_work = &snapshot.assignments.values().next().unwrap().work_id;
+    assert!(matches!(
+        fixture.state.tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::CapacityBlocked {
+            occupied: 1,
+            capacity: 1
+        }
+    ));
+    fixture.assert_quiet(1).await;
+
+    first.complete();
+    fixture.wait_submitted(first_work).await;
+    fixture.state.tickets.wake_ready_work();
+    fixture.next_request().await.complete();
+    let second_work = fixture
+        .works
+        .iter()
+        .find(|work| &work.id != first_work)
+        .unwrap();
+    fixture.wait_submitted(&second_work.id).await;
+    assert_eq!(fixture.snapshot().submissions.len(), 2);
+    fixture.state.shutdown().await;
+}
+
+#[tokio::test]
 async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() {
     for relaxed_max_rounds in [None, Some(MAX_ROUNDS * 8)] {
         let mut fixture = Fixture::new(3).await;

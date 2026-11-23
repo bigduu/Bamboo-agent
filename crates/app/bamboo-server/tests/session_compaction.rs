@@ -178,6 +178,7 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
         ),
     ] {
         let (_home, state, probe, mut before) = fixture(strategy).await;
+        let mut pinned_discovery = Vec::new();
         let unanswered_poll = (strategy == ContextManagementStrategy::MessageSummary).then(|| {
             let poll = Message::assistant(
                 "",
@@ -192,6 +193,21 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
             );
             let id = poll.id.clone();
             before.messages.insert(2, poll);
+            let call = Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "pinned-discovery".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "discover_capabilities".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            );
+            let mut result = Message::tool_result("pinned-discovery", "Discovery guidance");
+            result.never_compress = true;
+            pinned_discovery.extend([call.id.clone(), result.id.clone()]);
+            before.messages.splice(4..4, [call, result]);
             id
         });
         before.set_last_run_status(prior_status);
@@ -251,6 +267,9 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
                 .unwrap();
             assert_eq!(saved.content, original.content);
             assert_eq!(json!(saved.tool_calls), json!(original.tool_calls));
+            if pinned_discovery.contains(&original.id) {
+                assert_eq!(json!(saved), json!(original));
+            }
             if unanswered_poll.as_deref() == Some(original.id.as_str()) {
                 assert!(saved.compressed);
                 assert_eq!(
@@ -258,6 +277,18 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
                     Some(event.id.as_str())
                 );
             }
+        }
+        if strategy == ContextManagementStrategy::MessageSummary {
+            let active_tool_ids = durable
+                .messages
+                .iter()
+                .filter(|message| !message.compressed)
+                .filter(|message| {
+                    message.role == bamboo_domain::Role::Tool || message.tool_calls.is_some()
+                })
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(active_tool_ids, pinned_discovery);
         }
         assert_eq!(
             durable
@@ -521,7 +552,7 @@ async fn compact_session_refuses_pending_work_before_calling_a_model() {
 }
 
 #[actix_web::test]
-async fn compact_session_reports_empty_summary_with_reasoning_guidance() {
+async fn compact_session_reports_empty_summary_and_preserves_history() {
     let (_home, state, probe, _) = fixture(ContextManagementStrategy::Summary).await;
     let before = state.storage.load_session(ID).await.unwrap().unwrap();
     probe.return_empty_summary.store(true, Ordering::SeqCst);
@@ -531,10 +562,10 @@ async fn compact_session_reports_empty_summary_with_reasoning_guidance() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body: Value = test::read_body_json(response).await;
     assert_eq!(body["error"]["code"], "context_summary_empty");
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Lower the reasoning effort"));
+    assert_eq!(
+        body["error"]["message"],
+        "Context compression could not finish. Your conversation history was preserved."
+    );
     assert_eq!(probe.summaries.load(Ordering::SeqCst), 1);
     assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);
     let stored = state.storage.load_session(ID).await.unwrap().unwrap();

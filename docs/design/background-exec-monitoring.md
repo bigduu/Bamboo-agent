@@ -5,6 +5,21 @@ yielding shell protocol. Explicit SDK catalogs can select foreground `bash`.
 
 An ordinary `exec_command` remains pull based: it yields an owner-scoped handle,
 and `write_stdin` retrieves incremental output and the real terminal result.
+
+An ordinary Root can ask the Host to wait for a non-interactive command with
+`SubAgent`, `intent=wait`, and `target` set to its exact `exec_command`
+`session_id`. A command continues running while the Root advances independent
+work. Wait when a dependent step needs the command's outcome. A supported chat
+Host commits the existing exec wait and delivers the terminal result through
+SessionInbox. Headless runs wait for the same capture in the active run, with
+run cancellation and the CLI timeout still available. Both paths use the
+original process and require zero model requests while waiting.
+
+For input or incremental output, use `write_stdin`. A process with open stdin
+must be handled there before waiting for exit. A lost command handle leaves
+its outcome unknown. The wait result reports the command's real exit code,
+including nonzero exits, and preserves the existing unread output cursor.
+
 When repeated empty polling reaches the existing trusted quiet-poll boundary in
 a Human-controlled Root, a capable Host can hand that exact command to background
 monitoring before spending another diagnostic model request.
@@ -23,8 +38,8 @@ results and the advisory, a sole follow-up empty poll of the same handle can
 hand off waiting to the runner. The tool result is paired first. The active run
 waits up to 180 seconds for the terminal capture and sends its bounded result
 before the next model request. On expiry, it reports the unconfirmed outcome
-and keeps the live command and handle available. An unchanged quiet period
-starts at most one automatic wait. Run cancellation interrupts the wait.
+and keeps the live command and handle available. A new empty poll is required
+before another bounded wait can start. Run cancellation interrupts the wait.
 
 A Human follow-up that repeatedly polls the same quiet handle yields back to
 the existing wait. It keeps the original monitor and waits for the actual

@@ -15,17 +15,19 @@ use crate::prompt_ir::PromptIR;
 use crate::provider::{
     required_tool_from_options, LLMError, LLMProvider, LLMRequestOptions, LLMStream,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
-    ResponsesRequestOptions, Result, DEFAULT_COMPRESSION_REASONING_EFFORT,
+    ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema};
 
 use super::common::model_fetcher;
+#[cfg(feature = "litellm-wire-types")]
+use super::common::openai_compat::build_litellm_chat_body;
 use super::common::openai_compat::{
     build_openai_compat_body, looks_like_responses_only_error, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
-    ChatCompletionsCorrection, ChatCompletionsResponse,
+    use_chat_completion_limit, ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use super::common::openai_responses::{
     build_responses_body_with_capability_loading, retain_provider_transcript_family,
@@ -40,6 +42,10 @@ use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
     client: Client,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_chat_messages: bool,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_responses_events: bool,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
@@ -70,6 +76,10 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_chat_messages: false,
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_responses_events: false,
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
@@ -100,6 +110,43 @@ impl OpenAIProvider {
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = client;
         self
+    }
+
+    /// Use the pinned LiteLLM message types for Chat Completions requests.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_chat_messages(mut self) -> Self {
+        self.litellm_chat_messages = true;
+        self
+    }
+
+    /// Decode Responses SSE envelopes and function calls with the pinned types.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_responses_events(mut self) -> Self {
+        self.litellm_responses_events = true;
+        self
+    }
+
+    /// Select Bamboo's original Chat and Responses wire adapters.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_chat_messages = false;
+        self.litellm_responses_events = false;
+        self
+    }
+
+    fn responses_sse_parser(
+        &self,
+        model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
+        retain_protocol_events: bool,
+    ) -> ResponsesSseParser {
+        let parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_responses_events {
+            return parser.with_litellm_wire_types();
+        }
+        parser
     }
 
     /// Configure models that must use Responses API upstream.
@@ -157,6 +204,38 @@ impl OpenAIProvider {
             model,
         );
         Ok(headers)
+    }
+
+    fn build_chat_completions_body(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        reasoning_effort: Option<ReasoningEffort>,
+        parallel_tool_calls: Option<bool>,
+    ) -> Value {
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_chat_messages {
+            return build_litellm_chat_body(
+                model,
+                messages,
+                tools,
+                None,
+                max_output_tokens,
+                reasoning_effort,
+                parallel_tool_calls,
+            );
+        }
+        build_openai_compat_body(
+            model,
+            messages,
+            tools,
+            None,
+            max_output_tokens,
+            reasoning_effort,
+            parallel_tool_calls,
+        )
     }
 
     fn matches_model_pattern(pattern: &str, model: &str) -> bool {
@@ -240,6 +319,17 @@ impl OpenAIProvider {
                     host == "api.openai.com" || host.ends_with(".openai.azure.com")
                 })
         })
+    }
+
+    fn uses_legacy_compression_limit(&self, model: &str) -> bool {
+        !self.uses_responses_api(model)
+            && !self.uses_native_chat_token_limit()
+            && self.default_reasoning_effort.is_none()
+            && !request_overrides::chat_completions_controls_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            )
+            && !crate::retry::work_request_budget_active()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -449,8 +539,7 @@ impl OpenAIProvider {
                 }
 
                 let mut parser =
-                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
-                        .with_protocol_events(retain_protocol_events);
+                    self.responses_sse_parser(model, reasoning_effort, retain_protocol_events);
                 let model_for_debug = model.to_string();
                 let completion_diagnostics = completion_diagnostics.clone();
                 let stream = llm_stream_from_sse_multi_requiring_done(
@@ -477,8 +566,7 @@ impl OpenAIProvider {
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
-            .with_protocol_events(retain_protocol_events);
+        let mut parser = self.responses_sse_parser(model, reasoning_effort, retain_protocol_events);
         let model_for_debug = model.to_string();
         let stream = llm_stream_from_sse_multi_requiring_done(
             response,
@@ -498,21 +586,6 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl LLMProvider for OpenAIProvider {
-    fn default_compression_reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
-        // On compatible gateways, max_completion_tokens can spend a small
-        // summary allowance entirely on server-controlled reasoning. Leaving
-        // effort unset selects max_tokens without trying to disable reasoning.
-        (self.uses_responses_api(model)
-            || self.uses_native_chat_token_limit()
-            || self.default_reasoning_effort.is_some()
-            || request_overrides::chat_completions_controls_overridden(
-                self.request_overrides.as_ref(),
-                model,
-            )
-            || crate::retry::work_request_budget_active())
-        .then_some(DEFAULT_COMPRESSION_REASONING_EFFORT)
-    }
-
     async fn request_tool_selection(
         &self,
         model: &str,
@@ -732,15 +805,19 @@ impl LLMProvider for OpenAIProvider {
                 .await;
         }
 
-        let mut body = build_openai_compat_body(
+        let mut body = self.build_chat_completions_body(
             model,
             messages,
             tools,
-            None,
             max_output_tokens,
             reasoning_effort,
             parallel_tool_calls,
         );
+        let compression = request_purpose == "compression";
+        let legacy_compression_limit = compression && self.uses_legacy_compression_limit(model);
+        if compression && !legacy_compression_limit {
+            use_chat_completion_limit(&mut body);
+        }
         request_overrides::validate_budgeted_overrides(
             self.request_overrides.as_ref(),
             request_overrides::ENDPOINT_CHAT_COMPLETIONS,
@@ -785,15 +862,8 @@ impl LLMProvider for OpenAIProvider {
             ("compression", Some(ReasoningEffort::Disabled)) if !self.is_official_base_url() => {
                 ChatCompletionsCorrection::ReasoningDisable
             }
-            ("compression", None)
-                if reasoning_effort.is_none()
-                    && self.default_compression_reasoning_effort(model).is_none() =>
-            {
-                ChatCompletionsCorrection::CompressionTokenLimit {
-                    reasoning_effort: self
-                        .masking_config
-                        .apply_masking(DEFAULT_COMPRESSION_REASONING_EFFORT.as_str()),
-                }
+            ("compression", None) if reasoning_effort.is_none() && legacy_compression_limit => {
+                ChatCompletionsCorrection::CompressionTokenLimit
             }
             _ => ChatCompletionsCorrection::None,
         };
@@ -834,12 +904,6 @@ impl LLMProvider for OpenAIProvider {
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)
                 );
-                let (reasoning_effort, reasoning_source) =
-                    if request_purpose == "compression" && reasoning_effort.is_none() {
-                        (Some(DEFAULT_COMPRESSION_REASONING_EFFORT), "request")
-                    } else {
-                        (reasoning_effort, reasoning_source)
-                    };
                 return self
                     .chat_stream_via_responses(
                         messages,
@@ -966,6 +1030,9 @@ impl LLMProvider for OpenAIProvider {
     }
 }
 
+#[cfg(all(test, feature = "litellm-wire-types"))]
+mod litellm_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,16 +1048,13 @@ mod tests {
     };
 
     #[test]
-    fn compression_default_preserves_native_routes_and_explicit_controls() {
+    fn compression_limit_uses_the_modern_field_on_known_routes() {
         for url in [
             "https://api.openai.com:443/v1",
             "https://fixture.openai.azure.com/openai/v1",
         ] {
             let provider = OpenAIProvider::new("fixture").with_base_url(url);
-            assert_eq!(
-                provider.default_compression_reasoning_effort("summary-model"),
-                Some(ReasoningEffort::Low)
-            );
+            assert!(!provider.uses_legacy_compression_limit("summary-model"));
         }
         let make_gateway =
             || OpenAIProvider::new("fixture").with_base_url("https://gateway.example/api/v1");
@@ -1008,15 +1072,9 @@ mod tests {
             patched,
             make_gateway().with_reasoning_effort(Some(ReasoningEffort::High)),
         ] {
-            assert_eq!(
-                provider.default_compression_reasoning_effort("summary-model"),
-                Some(ReasoningEffort::Low)
-            );
+            assert!(!provider.uses_legacy_compression_limit("summary-model"));
         }
-        assert_eq!(
-            make_gateway().default_compression_reasoning_effort("summary-model"),
-            None
-        );
+        assert!(make_gateway().uses_legacy_compression_limit("summary-model"));
     }
 
     #[tokio::test]
@@ -1038,7 +1096,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .and(body_partial_json(json!({"max_completion_tokens": 50, "reasoning_effort": "low"})))
+                .and(body_partial_json(json!({"max_completion_tokens": 50})))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .insert_header("content-type", "text/event-stream")
@@ -1051,7 +1109,6 @@ mod tests {
                 .with_base_url(gateway.uri())
                 .with_client(Client::builder().no_proxy().build().unwrap());
             let options = LLMRequestOptions {
-                reasoning_effort: provider.default_compression_reasoning_effort("summary-model"),
                 request_purpose: Some("compression".into()),
                 ..Default::default()
             };
@@ -1073,7 +1130,6 @@ mod tests {
                 let mut initial: Value = requests[0].body_json().unwrap();
                 initial.as_object_mut().unwrap().remove("max_tokens");
                 initial["max_completion_tokens"] = json!(50);
-                initial["reasoning_effort"] = json!("low");
                 assert_eq!(requests[1].body_json::<Value>().unwrap(), initial);
             } else {
                 assert!(matches!(result, Err(LLMError::Api(error)) if error.contains("HTTP 400")));

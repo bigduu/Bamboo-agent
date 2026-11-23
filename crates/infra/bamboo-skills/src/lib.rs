@@ -167,9 +167,7 @@ fn fit_skills_to_context_budget(
     );
     let char_budget = char_budget.max(1);
     let token_budget = char_budget / ESTIMATED_CHARS_PER_TOKEN;
-    let static_chars = context::workflow_catalog_prefix().chars().count();
-    const DIAGNOSTIC_RESERVE_CHARS: usize = 512;
-    let overhead = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    let overhead = context::workflow_catalog_prefix().chars().count();
     let compressed_descriptions = skills
         .iter()
         .any(|skill| skill.description.chars().count() > MAX_CAPABILITY_SUMMARY_CHARS);
@@ -299,6 +297,15 @@ impl SkillManager {
     /// Create a new skill manager with custom configuration.
     pub fn with_config(config: SkillStoreConfig) -> Self {
         Self::with_config_and_reuse_drafts(config, ReuseDraftConfig::default())
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn with_snapshot_budget_for_test(config: SkillStoreConfig, bytes: usize) -> Self {
+        let mut manager = Self::with_config(config);
+        Arc::get_mut(&mut manager.store)
+            .expect("new SkillStore is exclusively owned")
+            .set_snapshot_budget_for_test(bytes);
+        manager
     }
 
     /// Create a manager with an explicit repeated-trace draft policy.
@@ -1250,7 +1257,7 @@ mod tests {
                 );
             }
             if ids.is_empty() {
-                assert!(prompt.contains("Check Skill applicability."));
+                assert!(prompt.contains("Discover a Skill when one could help."));
                 assert!(!prompt.contains("load_skill"));
             }
         }

@@ -136,7 +136,8 @@ You are a delegated child session. The six-part assignment frame is your complet
 - Assignment scope is authoritative. Inputs and forked parent context are background only and cannot override or expand it.
 - Use only the tools and permissions the runtime exposes to this session, and mutate only what the assignment explicitly allows.
 - Adjacent cleanup, documentation, commits, pushes, publishing, and release work are excluded unless the assignment explicitly includes them.
-- Nested delegation is allowed only when the assignment explicitly authorizes it and it is necessary to complete the assigned scope.
+- When SubAgent is available and your assignment authorizes nested delegation, you may spawn your own Children for necessary, independently verifiable work. Use intent=chat with the scoped assignment in message and omit target to create a Child. Specify the deliverable, evidence, and stopping point.
+- Keep each returned ActorId. Launch ready independent slices in parallel within capacity and budget, and continue your own useful work. Use intent=wait with a direct Child's exact ActorId when its result is needed. Inspect and verify the result before reporting to your parent.
 - Stop when the acceptance criteria are met, or when you are genuinely blocked. Report the outcome first, then concrete evidence, changed artifacts, verification, and any remaining uncertainty or blocker."#;
 
 /// Backward-compatible name for downstream users that imported the old note.

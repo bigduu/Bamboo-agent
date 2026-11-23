@@ -36,7 +36,6 @@ pub(crate) struct DefaultWriterPhysicalGuards {
 }
 
 enum RetainedWriterAuthority {
-    SupervisorExecutionProfile,
     SupervisedCreation {
         _guard: Arc<super::supervisor_management::SupervisorManagementGuards>,
     },
@@ -87,28 +86,6 @@ impl DefaultWriterGuards {
             task,
             session,
             root_actor,
-            None,
-        )
-    }
-
-    pub(super) fn supervisor_execution_profile(
-        lifecycle: SessionLifecycleReadGuard,
-        task: RuntimeTaskTransactionReadGuard,
-        session: SessionWriteGuard,
-    ) -> Arc<Self> {
-        Self::with_shared_task(
-            LifecycleGuard::Shared { _guard: lifecycle },
-            task,
-            session,
-            None,
-            Some(RetainedWriterAuthority::SupervisorExecutionProfile),
-        )
-    }
-
-    pub(super) fn writes_supervisor_execution_profile(&self) -> bool {
-        matches!(
-            self.physical.authority.as_ref(),
-            Some(RetainedWriterAuthority::SupervisorExecutionProfile)
         )
     }
 
@@ -122,7 +99,6 @@ impl DefaultWriterGuards {
             task,
             session,
             None,
-            None,
         )
     }
 
@@ -131,7 +107,6 @@ impl DefaultWriterGuards {
         task: RuntimeTaskTransactionReadGuard,
         session: SessionWriteGuard,
         root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
-        authority: Option<RetainedWriterAuthority>,
     ) -> Arc<Self> {
         Arc::new(Self {
             root_mode_context: None,
@@ -151,7 +126,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
-                authority,
+                authority: None,
                 _task: Some(TaskGuard::Shared { _guard: task }),
                 _lifecycle: Some(lifecycle),
             }),
@@ -388,10 +363,12 @@ fn context_conflict() -> io::Error {
 
 async fn observe_file(path: &Path) -> ObservedFile {
     match fs::symlink_metadata(path).await {
-        Ok(meta) if meta.file_type().is_file() => match fs::read(path).await {
-            Ok(bytes) => ObservedFile::Bytes(bytes),
-            Err(_) => ObservedFile::Invalid,
-        },
+        Ok(meta) if meta.file_type().is_file() => {
+            match super::cold_main::read_state_file(path).await {
+                Ok(bytes) => ObservedFile::Bytes(bytes),
+                Err(_) => ObservedFile::Invalid,
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => ObservedFile::Absent,
         _ => ObservedFile::Invalid,
     }
@@ -446,6 +423,38 @@ impl SessionStoreV2 {
         let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
         let (record, marker) = self.default_actor_observation(&directory).await;
         Ok(!permits_unfenced_context(&record, &marker, Some(session)))
+    }
+
+    /// Project the installed, successful attempt. A read outside the physical
+    /// writer only supplies an observation for the definitive check under lock.
+    pub(super) async fn child_wait_expiry_activation_id(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<String>> {
+        let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
+        let (ObservedFile::Bytes(record), ObservedFile::Bytes(marker)) =
+            self.default_actor_observation(&directory).await
+        else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice::<ActorDirectoryEntry>(&record)?;
+        let marker = serde_json::from_slice::<InitializedMarker>(&marker)?;
+        if record.validate().is_err()
+            || !record.actor.matches_session(session)
+            || marker.schema_version != bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION
+            || marker.actor_id != session.id
+            || marker.session_created_at != session.created_at
+        {
+            return Ok(None);
+        }
+        Ok(record
+            .activation
+            .filter(|activation| {
+                activation.run_id == run_id
+                    && activation.status == bamboo_domain::ActorActivationStatus::Succeeded
+            })
+            .map(|activation| activation.activation_id))
     }
 
     /// File presence only selects a lock mode. It grants no identity, repair,

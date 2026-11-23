@@ -2,6 +2,8 @@
 
 pub mod api_types;
 pub mod conversion;
+#[cfg(feature = "litellm-wire-types")]
+mod litellm;
 pub mod stream;
 
 // Re-export commonly used types
@@ -31,7 +33,9 @@ use bamboo_domain::{
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
-use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
+use crate::cache::{
+    AnthropicHistoryCache, CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS,
+};
 use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
 use crate::provider::{
@@ -225,6 +229,8 @@ pub(super) fn apply_cache_ttl_header(headers: &mut HeaderMap, plan: Option<&Prom
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     client: Client,
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_messages: bool,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
     base_url: String,
@@ -257,6 +263,8 @@ impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: crate::http_client::default_http_client(),
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_messages: false,
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
@@ -290,6 +298,20 @@ impl AnthropicProvider {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self.max_tokens_configured = true;
+        self
+    }
+
+    /// Use the pinned LiteLLM wire types and Claude request rules for Messages.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_messages(mut self) -> Self {
+        self.litellm_messages = true;
+        self
+    }
+
+    /// Select Bamboo's original Messages wire adapter.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_messages = false;
         self
     }
 
@@ -527,6 +549,28 @@ impl LLMProvider for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    fn encode_messages_request(
+        content: PreparedAnthropicContent,
+        model: &str,
+        max_tokens: u32,
+        reasoning_effort: Option<ReasoningEffort>,
+        #[cfg(feature = "litellm-wire-types")] use_litellm_controls: bool,
+    ) -> Result<Value> {
+        #[cfg(feature = "litellm-wire-types")]
+        if use_litellm_controls {
+            let request =
+                litellm::messages_request(content, model, max_tokens, true, reasoning_effort)?;
+            return Ok(serde_json::to_value(request)?);
+        }
+        Ok(serialize_anthropic_request(
+            content,
+            model,
+            max_tokens,
+            true,
+            reasoning_effort,
+        ))
+    }
+
     /// Build and stream one Anthropic Messages request. `system_blocks`, when
     /// non-empty, is the canonical structured system field; otherwise the system
     /// is taken from the `System` messages in `messages`.
@@ -598,20 +642,49 @@ impl AnthropicProvider {
             log_identity(model)
         );
 
-        let mut body = build_anthropic_request_with_cache_blocks_native_mode(
+        // Operator-supplied reasoning/model controls use the established body
+        // patch path so they can take precedence over configured effort.
+        #[cfg(feature = "litellm-wire-types")]
+        let use_litellm_controls = self.litellm_messages
+            && !request_overrides::messages_reasoning_overridden(
+                self.request_overrides.as_ref(),
+                model,
+            );
+        let thinking_enabled =
+            reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Disabled);
+        #[cfg(feature = "litellm-wire-types")]
+        let thinking_enabled = if use_litellm_controls {
+            litellm::thinking_replay_enabled(model, reasoning_effort)
+        } else {
+            thinking_enabled
+        };
+        let content = prepare_anthropic_content(
             messages,
             system_blocks,
             tools,
-            model,
-            max_tokens,
-            true,
-            reasoning_effort,
+            thinking_enabled,
             parallel_tool_calls,
             cache_plan,
             self.thinking_replay_always,
             native_groups,
             capability_loading_mode,
+            compatible_gateway,
         );
+        let mut body = Self::encode_messages_request(
+            content,
+            model,
+            max_tokens,
+            reasoning_effort,
+            #[cfg(feature = "litellm-wire-types")]
+            use_litellm_controls,
+        )?;
+        #[cfg(feature = "litellm-wire-types")]
+        let prepared_budget = if use_litellm_controls {
+            body.pointer("/thinking/budget_tokens")
+                .and_then(Value::as_u64)
+        } else {
+            None
+        };
         request_overrides::validate_budgeted_overrides(
             self.request_overrides.as_ref(),
             request_overrides::ENDPOINT_MESSAGES,
@@ -623,7 +696,13 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             Some(model),
         );
-        remove_legacy_thinking_budget(&mut body, reasoning_effort);
+        #[cfg(feature = "litellm-wire-types")]
+        let retained_budget = litellm::retained_thinking_budget(&body, model, prepared_budget);
+        #[cfg(not(feature = "litellm-wire-types"))]
+        let retained_budget: Option<u64> = None;
+        if retained_budget.is_none() {
+            remove_legacy_thinking_budget(&mut body, reasoning_effort);
+        }
         apply_required_tool_choice(&mut body, required_tool);
         // A compatible gateway can enforce reasoning without advertising it
         // on the request. This identifies the wire controls for recovery.
@@ -641,19 +720,28 @@ impl AnthropicProvider {
             request_overrides::ENDPOINT_MESSAGES,
             model,
         )?;
+        #[cfg(feature = "litellm-wire-types")]
+        if let Some(budget) = retained_budget {
+            // Agent request preparation can lower the wire output ceiling.
+            litellm::clamp_thinking_budget(&mut body, budget)?;
+        }
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_messages {
+            litellm::normalize_claude_tool_ids(&mut body, !compatible_gateway);
+        }
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
         // body (top-level content blocks AND inside tool_result content arrays), so
         // we can tell with certainty whether a screenshot reaches the wire vs being
         // dropped before send. image_blocks_on_wire=0 with a screenshot in the
         // conversation means the image never left bamboo.
-        let image_blocks_on_wire: usize = body
+        let (image_blocks_on_wire, cache_message_breakpoints) = body
             .get("messages")
             .and_then(|m| m.as_array())
             .map(|msgs| {
                 msgs.iter()
                     .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
                     .flatten()
-                    .map(|block| {
+                    .fold((0, 0), |(images, breakpoints), block| {
                         let mut n = usize::from(
                             block.get("type").and_then(|t| t.as_str()) == Some("image"),
                         );
@@ -663,15 +751,18 @@ impl AnthropicProvider {
                                 .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
                                 .count();
                         }
-                        n
+                        (
+                            images + n,
+                            breakpoints + usize::from(block.get("cache_control").is_some()),
+                        )
                     })
-                    .sum()
             })
-            .unwrap_or(0);
+            .unwrap_or_default();
         tracing::info!(
-            "[session_hash={}] Anthropic request image_blocks_on_wire={} model_hash={}",
+            "[session_hash={}] Anthropic request image_blocks_on_wire={} cache_message_breakpoints={} model_hash={}",
             log_identity(session_log_id),
             image_blocks_on_wire,
+            cache_message_breakpoints,
             log_identity(model)
         );
         let applied_reasoning_effort = reasoning_effort;
@@ -811,6 +902,57 @@ pub fn build_anthropic_request_with_cache(
     )
 }
 
+pub(super) fn build_anthropic_proxy_request(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    effort: Option<ReasoningEffort>,
+    cache: Option<&PromptCachePlan>,
+    #[cfg(feature = "litellm-wire-types")] use_litellm_controls: bool,
+) -> Result<Value> {
+    let thinking_enabled = effort.is_some_and(|effort| effort != ReasoningEffort::Disabled);
+    #[cfg(feature = "litellm-wire-types")]
+    let thinking_enabled = if use_litellm_controls {
+        litellm::thinking_replay_enabled(model, effort)
+    } else {
+        thinking_enabled
+    };
+    let content = prepare_anthropic_content(
+        messages,
+        &[],
+        tools,
+        thinking_enabled,
+        None,
+        cache,
+        false,
+        &[],
+        CapabilityLoadingMode::LegacyFullCatalog,
+        true,
+    );
+    AnthropicProvider::encode_messages_request(
+        content,
+        model,
+        max_tokens,
+        effort,
+        #[cfg(feature = "litellm-wire-types")]
+        use_litellm_controls,
+    )
+}
+
+#[cfg(feature = "litellm-wire-types")]
+pub(super) fn finalize_litellm_anthropic_proxy_request(
+    body: &mut Value,
+    model: &str,
+    prepared_budget: Option<u64>,
+) -> Result<()> {
+    if let Some(budget) = litellm::retained_thinking_budget(body, model, prepared_budget) {
+        litellm::clamp_thinking_budget(body, budget)?;
+    }
+    litellm::normalize_claude_tool_ids(body, false);
+    Ok(())
+}
+
 /// Like [`build_anthropic_request_with_cache`] but renders the `system` field
 /// from Bamboo's canonical structured `system_blocks` — one Anthropic system text
 /// block per [`PromptBlock`] — when they are present. The single system
@@ -898,6 +1040,41 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     native_groups: &[ProviderTranscriptGroup],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> Value {
+    let content = prepare_anthropic_content(
+        messages,
+        system_blocks,
+        tools,
+        reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Disabled),
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        native_groups,
+        capability_loading_mode,
+        false,
+    );
+    serialize_anthropic_request(content, model, max_tokens, stream, reasoning_effort)
+}
+
+struct PreparedAnthropicContent {
+    system: Option<Vec<Value>>,
+    messages: Vec<PreparedAnthropicTurn>,
+    tools: Vec<Value>,
+    tool_choice: Option<Value>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_anthropic_content(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    thinking_enabled: bool,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
+    compatible_gateway: bool,
+) -> PreparedAnthropicContent {
     let default_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
@@ -905,26 +1082,36 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     };
     let plan = cache.unwrap_or(&default_plan);
     let ttl = plan.ttl;
+    let pin_history_prefix = compatible_gateway && plan.anthropic_history.is_some();
 
-    // Effort is transmitted independently of thinking-history replay. Keep
-    // signed block validation in the existing history/native transcript owners.
-    let thinking_enabled =
-        reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Disabled);
-
-    let (mut system, mut anthropic_messages, source_spans) = messages_to_anthropic_json(
+    let (mut system, mut anthropic_messages, source_spans) = prepare_anthropic_turns(
         messages,
         system_blocks,
         thinking_enabled,
         thinking_replay_always,
+        plan.anthropic_history
+            .as_ref()
+            .and_then(|history| history.external_memory_message_id.as_deref()),
     );
 
-    // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
-    // markers per request. Spend the budget on the most stable regions first
-    // (tools, then system), then on conversation breakpoints nearest the end.
     let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
+    if plan.cache_system {
+        if let Some(last_block) = system
+            .as_mut()
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(|block| block.as_object_mut())
+        {
+            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
 
+    // A system breakpoint includes the tools in its prefix. On compatible
+    // routes, use that slot for the history checkpoint so both rolling
+    // boundaries can still fit, even after appends beyond the lookback window.
+    let system_cached = budget < MAX_ANTHROPIC_CACHE_BREAKPOINTS;
     let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
-    if plan.cache_tools && budget > 0 {
+    if plan.cache_tools && !(pin_history_prefix && system_cached) {
         if let Some(last_tool) = tools_json.iter_mut().rev().find_map(|tool| {
             let object = tool.as_object_mut()?;
             (!object
@@ -938,19 +1125,7 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         }
     }
 
-    if plan.cache_system && budget > 0 {
-        if let Some(last_block) = system
-            .as_mut()
-            .and_then(|s| s.as_array_mut())
-            .and_then(|blocks| blocks.last_mut())
-            .and_then(|block| block.as_object_mut())
-        {
-            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
-            budget -= 1;
-        }
-    }
-
-    if budget > 0 && !plan.breakpoint_message_ids.is_empty() {
+    if budget > 0 && (!plan.breakpoint_message_ids.is_empty() || plan.anthropic_history.is_some()) {
         let mut breakpoint_targets: Vec<(usize, usize)> = source_spans
             .iter()
             .enumerate()
@@ -964,14 +1139,34 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
                     .map(|span| (message_idx, span.end_block - 1))
             })
             .collect();
-        // Keep only the breakpoints closest to the end of the conversation.
-        if breakpoint_targets.len() > budget {
-            breakpoint_targets = breakpoint_targets.split_off(breakpoint_targets.len() - budget);
+        if pin_history_prefix {
+            // Reserve the same slots from the first request. Filling a spare
+            // slot with a guide marker and removing it on a later append would
+            // also change the cached history prefix on these gateways.
+            let fixed_budget = budget.saturating_sub(3);
+            let excess = breakpoint_targets.len().saturating_sub(fixed_budget);
+            breakpoint_targets.drain(..excess);
         }
-        for (message_idx, block_idx) in breakpoint_targets {
-            if let Some(message) = anthropic_messages.get_mut(message_idx) {
-                add_cache_control_to_block(message, block_idx, ttl);
-            }
+        if let Some(history) = &plan.anthropic_history {
+            // The prior history write remains an explicit target, including
+            // when it falls outside the provider's 20-block lookback.
+            let history_targets = history_cache_targets(
+                &anthropic_messages,
+                &source_spans,
+                history,
+                native_groups,
+                capability_loading_mode,
+                pin_history_prefix,
+            );
+            breakpoint_targets.retain(|target| !history_targets.contains(target));
+            breakpoint_targets.extend(history_targets);
+        }
+        for (message_idx, block_idx) in breakpoint_targets.into_iter().rev().take(budget) {
+            add_cache_control_to_block(
+                &mut anthropic_messages[message_idx].content,
+                block_idx,
+                ttl,
+            );
         }
     }
 
@@ -984,16 +1179,34 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         capability_loading_mode,
     );
 
+    let tool_choice = parallel_tool_calls
+        .filter(|_| !tools.is_empty())
+        .map(|allow_parallel| json!({"type":"auto","disable_parallel_tool_use":!allow_parallel}));
+    PreparedAnthropicContent {
+        system,
+        messages: anthropic_messages,
+        tools: tools_json,
+        tool_choice,
+    }
+}
+
+fn serialize_anthropic_request(
+    content: PreparedAnthropicContent,
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Value {
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
         "stream": stream,
-        "messages": anthropic_messages,
-        "tools": tools_json,
+        "messages": content.messages,
+        "tools": content.tools,
     });
 
-    if let Some(system) = system {
-        body["system"] = system;
+    if let Some(system) = content.system {
+        body["system"] = Value::Array(system);
     }
 
     if let Some(effort) = reasoning_effort {
@@ -1007,23 +1220,112 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         });
     }
 
-    if !tools.is_empty() {
-        if let Some(parallel_tool_calls) = parallel_tool_calls {
-            body["tool_choice"] = json!({
-                "type": "auto",
-                "disable_parallel_tool_use": !parallel_tool_calls,
-            });
-        }
+    if let Some(tool_choice) = content.tool_choice {
+        body["tool_choice"] = tool_choice;
     }
 
     body
+}
+
+/// Map history boundaries to cacheable blocks before any native replacements.
+/// A boundary on omitted, thinking-only, or provider-owned content falls back
+/// to the nearest preceding block. History targets can share a coalesced
+/// message with each other or with the stable tool guide.
+fn history_cache_targets(
+    messages: &[PreparedAnthropicTurn],
+    source_spans: &[Vec<SourceSpan>],
+    history: &AnthropicHistoryCache,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
+    pin_history_prefix: bool,
+) -> Vec<(usize, usize)> {
+    let native_anchors: HashSet<_> = native_groups
+        .iter()
+        .filter(|group| {
+            capability_loading_mode == CapabilityLoadingMode::Progressive
+                && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+        })
+        .map(ProviderTranscriptGroup::anchor_message_id)
+        .collect();
+    let mut targets = Vec::with_capacity(3);
+    let mut last_cacheable = None;
+    let mut stable_prefix = true;
+    let mut checkpoint = None;
+    let mut prefix_size = 0usize;
+    let mut next_checkpoint_size = 0;
+    for (message_idx, spans) in source_spans.iter().enumerate() {
+        let blocks = &messages[message_idx].content;
+        for span in spans {
+            let id = span.id.as_str();
+            // The retained screenshots in the newest tool batch can be
+            // omitted as soon as a later tool batch produces images.
+            let retained_tool_image = span.is_tool_result
+                && blocks
+                    .get(span.start_block)
+                    .is_some_and(|block| block["content"].is_array());
+            stable_prefix &=
+                history.external_memory_message_id.as_deref() != Some(id) && !retained_tool_image;
+            if stable_prefix && !native_anchors.contains(id) {
+                for (offset, block) in blocks[span.start_block..span.end_block].iter().enumerate() {
+                    if !matches!(
+                        block["type"].as_str(),
+                        Some("text" | "image" | "document" | "tool_use" | "tool_result")
+                    ) {
+                        continue;
+                    }
+                    let target = (message_idx, span.start_block + offset);
+                    last_cacheable = Some(target);
+                    if pin_history_prefix {
+                        prefix_size += history_block_size_hint(block);
+                        if prefix_size >= next_checkpoint_size {
+                            checkpoint = Some(target);
+                            // Grow by at least 32 KiB or one eighth of the
+                            // current history. Replaying this scan gives the
+                            // same checkpoint after retry or process restart.
+                            next_checkpoint_size = prefix_size + (prefix_size / 8).max(32 * 1024);
+                        }
+                    }
+                }
+            }
+            if id == history.newest_message_id || history.previous_message_id.as_deref() == Some(id)
+            {
+                if let Some(target) = last_cacheable.filter(|target| targets.last() != Some(target))
+                {
+                    targets.push(target);
+                }
+            }
+            if id == history.newest_message_id {
+                if let Some(checkpoint) = checkpoint {
+                    // Rolling markers before this checkpoint would change its
+                    // cache key when they move. Only advance markers after it.
+                    targets.retain(|target| *target > checkpoint);
+                    targets.push(checkpoint);
+                }
+                return targets;
+            }
+        }
+    }
+    targets
+}
+
+/// Approximate wire size without copying or re-encoding large tool results.
+fn history_block_size_hint(block: &Value) -> usize {
+    match block {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(history_block_size_hint).sum(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| key.len() + history_block_size_hint(value))
+            .sum(),
+        _ => 1,
+    }
 }
 
 /// Replace only the normalized source contribution owned by each anchor. Cache
 /// markers are calculated first; an exact provider-owned block deliberately
 /// replaces (and therefore cannot inherit) a generated marker.
 fn apply_anthropic_native_groups(
-    messages: &mut [Value],
+    messages: &mut [PreparedAnthropicTurn],
     source_spans: &[Vec<SourceSpan>],
     groups: &[ProviderTranscriptGroup],
     thinking_enabled: bool,
@@ -1125,9 +1427,7 @@ fn apply_anthropic_native_groups(
         let native_starts_with_thinking = thinking_positions.first() == Some(&0);
         let normalized_starts_with_thinking = messages
             .get(message_index)
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_array)
-            .and_then(|content| content.get(start))
+            .and_then(|message| message.content.get(start))
             .is_some_and(|block| {
                 matches!(
                     block.get("type").and_then(Value::as_str),
@@ -1170,12 +1470,7 @@ fn apply_anthropic_native_groups(
             .then_with(|| right.span_index.cmp(&left.span_index))
     });
     for replacement in replacements {
-        let Some(content) = messages[replacement.message_index]
-            .get_mut("content")
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
+        let content = &mut messages[replacement.message_index].content;
         if replacement.start <= replacement.end && replacement.end <= content.len() {
             content.splice(replacement.start..replacement.end, replacement.items);
         }
@@ -1193,10 +1488,7 @@ fn cache_control_value(ttl: CacheTtl) -> Value {
 /// Add a breakpoint to a specific source-owned block. If a malformed/changed
 /// rendering makes the recorded index invalid, fall back defensively to the
 /// message's last block rather than dropping caching entirely.
-fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheTtl) {
-    let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
-        return;
-    };
+fn add_cache_control_to_block(blocks: &mut [Value], block_idx: usize, ttl: CacheTtl) {
     let target = if block_idx < blocks.len() {
         blocks.get_mut(block_idx)
     } else {
@@ -1207,32 +1499,24 @@ fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheT
     }
 }
 
-/// Render Bamboo's canonical structured system blocks into an Anthropic `system`
-/// value: an array with one `{ "type": "text", ... }` block per non-empty
+/// Render Bamboo's canonical structured system blocks as one text block per non-empty
 /// [`PromptBlock`]. Returns `None` when there are no non-empty blocks, so callers
 /// fall back to the legacy joined-text path.
-fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Value> {
+fn system_blocks_to_anthropic_blocks(system_blocks: &[PromptBlock]) -> Option<Vec<Value>> {
     let blocks: Vec<Value> = system_blocks
         .iter()
         .filter(|b| !b.text.trim().is_empty())
         .map(|b| json!({ "type": "text", "text": b.text }))
         .collect();
-    (!blocks.is_empty()).then_some(Value::Array(blocks))
+    (!blocks.is_empty()).then_some(blocks)
 }
 
-/// Convert internal messages to the Anthropic wire shape.
-///
-/// Returns the optional `system` block array, the message array, and parallel
-/// source spans recording where each source message's own rendered contribution
-/// starts and ends (so anchors and breakpoints remain stable through same-role /
-/// tool-result merging, including empty assistant sources).
-///
-/// When `system_blocks` is non-empty it is the canonical, structured source for
-/// the system field (each block → its own text block); otherwise the system field
-/// is the joined `System`-message text (legacy, byte-identical).
-///
-/// `thinking_enabled`/`thinking_replay_always` gate `thinking`-block replay on
-/// assistant turns — see [`build_anthropic_request_with_cache_blocks`] (#520).
+#[derive(serde::Serialize)]
+struct PreparedAnthropicTurn {
+    role: &'static str,
+    content: Vec<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceSpan {
     id: String,
@@ -1242,51 +1526,68 @@ struct SourceSpan {
     end_block: usize,
 }
 
-fn messages_to_anthropic_json(
+/// Prepare Anthropic turns and their source spans for cache placement and
+/// provider transcript replay. Structured system blocks take precedence over
+/// joined system-message text.
+fn prepare_anthropic_turns(
     messages: &[Message],
     system_blocks: &[PromptBlock],
     thinking_enabled: bool,
     thinking_replay_always: bool,
-) -> (Option<Value>, Vec<Value>, Vec<Vec<SourceSpan>>) {
+    external_memory_message_id: Option<&str>,
+) -> (
+    Option<Vec<Value>>,
+    Vec<PreparedAnthropicTurn>,
+    Vec<Vec<SourceSpan>>,
+) {
     let mut system_parts: Vec<&str> = Vec::new();
-    let mut out: Vec<Value> = Vec::new();
+    let mut out: Vec<PreparedAnthropicTurn> = Vec::new();
     // One entry per OUTPUT message: every source folded into it and the exact
     // last block contributed by that source. A cache breakpoint therefore ends
     // at the marked stable source, not at a later volatile coalesced tail.
     let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
 
+    let mut ordered_messages = messages.iter().collect::<Vec<_>>();
+    if let Some(id) = external_memory_message_id {
+        let source = messages.iter().position(|message| message.id == id);
+        let last_user_block = messages.iter().rposition(|message| {
+            matches!(message.role, Role::User | Role::Tool) && message.id != id
+        });
+        // Tool results are user blocks on this wire. Put memory after them
+        // and any other user blocks, preserving a trailing assistant prefill.
+        if let Some((source, last_user_block)) = source
+            .zip(last_user_block)
+            .filter(|(source, last)| source < last)
+        {
+            ordered_messages[source..=last_user_block].rotate_left(1);
+        }
+    }
+
     // Keep every image in the latest tool-result batch. Parallel ViewImage
     // calls must all reach their first subsequent request. Older batches retain
     // the existing explicit omission marker to bound accumulated screenshots.
     // User-attached images are untouched.
-    let last_image_tool_idx = messages
+    let last_image_tool_idx = ordered_messages
         .iter()
         .enumerate()
         .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
         .map(|(i, _)| i)
         .next_back();
     let latest_image_batch_start = last_image_tool_idx.map(|last| {
-        messages[..last]
+        ordered_messages[..last]
             .iter()
             .rposition(|m| !matches!(m.role, Role::Tool | Role::System))
             .map_or(0, |idx| idx + 1)
     });
 
-    for (idx, m) in messages.iter().enumerate() {
+    for (idx, m) in ordered_messages.into_iter().enumerate() {
         match m.role {
             Role::System => system_parts.push(m.content.as_str()),
             Role::User | Role::Assistant | Role::Tool => {
                 let keep_image = latest_image_batch_start.is_some_and(|start| idx >= start);
-                // `message_to_anthropic_json` returns `None` only for a stray
-                // System message; skip it (rather than emit a null/empty entry)
-                // so a malformed conversation never pollutes the `messages`
-                // array nor crashes the call (issue #22).
-                let Some(msg_json) = message_to_anthropic_json(
-                    m,
-                    keep_image,
-                    thinking_enabled,
-                    thinking_replay_always,
-                ) else {
+                let Some(turn) =
+                    prepare_anthropic_turn(m, keep_image, thinking_enabled, thinking_replay_always)
+                else {
                     continue;
                 };
                 // Coalesce consecutive SAME-ROLE messages into one. Anthropic
@@ -1301,55 +1602,28 @@ fn messages_to_anthropic_json(
                 // as the API requires. The merged-into message keeps its original
                 // source span, so a cache breakpoint on that turn still maps to
                 // the precise block where that source contribution ends.
-                if let Some(last) = out.last_mut() {
-                    let same_role = last.get("role").and_then(|r| r.as_str())
-                        == msg_json.get("role").and_then(|r| r.as_str());
-                    if same_role {
-                        if let (Some(last_content), Some(new_content)) = (
-                            last.get_mut("content").and_then(|c| c.as_array_mut()),
-                            msg_json.get("content").and_then(|c| c.as_array()),
-                        ) {
-                            // Drop any `thinking` block from the appended content:
-                            // Anthropic requires `thinking` to be the FIRST block of
-                            // an assistant turn, so a merged-in turn's thinking would
-                            // land in an illegal interior position. (Two consecutive
-                            // assistant turns don't occur in a well-formed
-                            // conversation, but coalescing must not itself produce an
-                            // invalid block order. User merges carry no thinking
-                            // blocks, so this is a no-op there.) #101.
-                            let appended: Vec<Value> = new_content
-                                .iter()
-                                .filter(|block| {
-                                    block.get("type").and_then(|t| t.as_str()) != Some("thinking")
-                                })
-                                .cloned()
-                                .collect();
-                            let start_block = last_content.len();
-                            last_content.extend(appended);
-                            // Record exactly where this source's contribution
-                            // starts and ends, not merely which merged output owns
-                            // it. An empty assistant source therefore owns the
-                            // valid insertion span `n..n` instead of aliasing the
-                            // preceding block.
-                            if let Some(last_spans) = out_spans.last_mut() {
-                                last_spans.push(SourceSpan {
-                                    id: m.id.clone(),
-                                    is_assistant: matches!(m.role, Role::Assistant),
-                                    is_tool_result: matches!(m.role, Role::Tool),
-                                    start_block,
-                                    end_block: last_content.len(),
-                                });
-                            }
-                            continue;
-                        }
+                if let Some(last) = out.last_mut().filter(|last| last.role == turn.role) {
+                    // Thinking is valid only at the start of an assistant turn.
+                    let start_block = last.content.len();
+                    last.content
+                        .extend(turn.content.into_iter().filter(|block| {
+                            block.get("type").and_then(Value::as_str) != Some("thinking")
+                        }));
+                    // A source with no appended blocks owns the empty insertion
+                    // span at the end of the prior content.
+                    if let Some(last_spans) = out_spans.last_mut() {
+                        last_spans.push(SourceSpan {
+                            id: m.id.clone(),
+                            is_assistant: matches!(m.role, Role::Assistant),
+                            is_tool_result: matches!(m.role, Role::Tool),
+                            start_block,
+                            end_block: last.content.len(),
+                        });
                     }
+                    continue;
                 }
-                let end_block = msg_json
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0);
-                out.push(msg_json);
+                let end_block = turn.content.len();
+                out.push(turn);
                 out_spans.push(vec![SourceSpan {
                     id: m.id.clone(),
                     is_assistant: matches!(m.role, Role::Assistant),
@@ -1368,9 +1642,9 @@ fn messages_to_anthropic_json(
     // joined System-message text when present: each block renders as its own
     // Anthropic system text block, so the provider consumes Bamboo's block array
     // structurally. With no blocks, fall back to the legacy join (byte-identical).
-    let system = system_blocks_to_anthropic_value(system_blocks).or_else(|| {
+    let system = system_blocks_to_anthropic_blocks(system_blocks).or_else(|| {
         (!system_parts.is_empty())
-            .then(|| json!([{ "type": "text", "text": system_parts.join("\n\n") }]))
+            .then(|| vec![json!({ "type": "text", "text": system_parts.join("\n\n") })])
     });
 
     (system, out, out_spans)
@@ -1387,7 +1661,7 @@ fn message_has_image(message: &Message) -> bool {
 
 /// `keep_image`: when false, a tool result's images are dropped (replaced by a
 /// short note) so only the most recent screenshot is sent — see
-/// `messages_to_anthropic_json`.
+/// `prepare_anthropic_turns`.
 ///
 /// Returns `None` for a stray `System` message (which should have been routed
 /// into the top-level `system` field by the caller). Skipping it — rather than
@@ -1399,15 +1673,15 @@ fn message_has_image(message: &Message) -> bool {
 /// `thinking_enabled`/`thinking_replay_always` gate whether `message.reasoning`
 /// is replayed as a `thinking` content block — see
 /// [`build_anthropic_request_with_cache_blocks`] (#520).
-fn message_to_anthropic_json(
+fn prepare_anthropic_turn(
     message: &Message,
     keep_image: bool,
     thinking_enabled: bool,
     thinking_replay_always: bool,
-) -> Option<Value> {
+) -> Option<PreparedAnthropicTurn> {
     match message.role {
         // A System message belongs in the top-level `system` field, not the
-        // `messages` array; the caller (`messages_to_anthropic_json`) routes it
+        // `messages` array; the caller (`prepare_anthropic_turns`) routes it
         // there. But a malformed/legacy session loaded from storage, or a future
         // bug in system extraction, could surface one here — so log and skip it
         // instead of bringing down the whole process mid-call (issue #22).
@@ -1418,10 +1692,10 @@ fn message_to_anthropic_json(
             );
             None
         }
-        Role::User => Some(json!({
-            "role": "user",
-            "content": user_content_to_anthropic_blocks(message),
-        })),
+        Role::User => Some(PreparedAnthropicTurn {
+            role: "user",
+            content: user_content_to_anthropic_blocks(message),
+        }),
         Role::Assistant => {
             let mut blocks: Vec<Value> = Vec::new();
 
@@ -1481,25 +1755,20 @@ fn message_to_anthropic_json(
                 }
             }
 
-            Some(json!({
-                "role": "assistant",
-                "content": blocks,
-            }))
+            Some(PreparedAnthropicTurn {
+                role: "assistant",
+                content: blocks,
+            })
         }
         Role::Tool => {
             let Some(tool_use_id) = message.tool_call_id.as_deref() else {
                 tracing::warn!(
                     "Anthropic conversion received tool message without tool_call_id; emitting plain text block"
                 );
-                return Some(json!({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": message.content,
-                        }
-                    ],
-                }));
+                return Some(PreparedAnthropicTurn {
+                    role: "user",
+                    content: vec![json!({"type": "text", "text": message.content})],
+                });
             };
 
             // Tool results that carry images (e.g. an MCP `screenshot`) embed the
@@ -1539,18 +1808,54 @@ fn message_to_anthropic_json(
                 json!(message.content)
             };
 
-            Some(json!({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": tool_result_content,
-                    }
-                ],
-            }))
+            Some(PreparedAnthropicTurn {
+                role: "user",
+                content: vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_result_content,
+                })],
+            })
         }
     }
+}
+
+#[cfg(test)]
+fn message_to_anthropic_json(
+    message: &Message,
+    keep_image: bool,
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
+) -> Option<Value> {
+    prepare_anthropic_turn(
+        message,
+        keep_image,
+        thinking_enabled,
+        thinking_replay_always,
+    )
+    .map(|turn| json!(turn))
+}
+
+#[cfg(test)]
+fn messages_to_anthropic_json(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
+    external_memory_message_id: Option<&str>,
+) -> (Option<Value>, Vec<Value>, Vec<Vec<SourceSpan>>) {
+    let (system, turns, spans) = prepare_anthropic_turns(
+        messages,
+        system_blocks,
+        thinking_enabled,
+        thinking_replay_always,
+        external_memory_message_id,
+    );
+    (
+        system.map(Value::Array),
+        turns.into_iter().map(|turn| json!(turn)).collect(),
+        spans,
+    )
 }
 
 fn user_content_to_anthropic_blocks(message: &Message) -> Vec<Value> {
@@ -1945,7 +2250,7 @@ impl AnthropicUsageSnapshot {
     }
 }
 
-fn anthropic_stream_with_usage_on_error(
+pub(super) fn anthropic_stream_with_usage_on_error(
     response: reqwest::Response,
     state: Arc<Mutex<AnthropicStreamState>>,
 ) -> LLMStream {
@@ -5148,7 +5453,7 @@ mod anthropic_request_building {
 
         let messages = [system, user, assistant];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // (a) The System message is routed into the top-level `system` field.
         let system_value =
@@ -5204,7 +5509,7 @@ mod anthropic_request_building {
             Message::assistant("Hi!", None),
         ];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // Both system messages are joined into the system field.
         let system_value =
@@ -5284,7 +5589,7 @@ mod anthropic_request_building {
             Message::tool_result("call_1", "found it"),
         ];
         let (system_val, out, out_ids) =
-            super::messages_to_anthropic_json(&messages, &[], false, false);
+            super::messages_to_anthropic_json(&messages, &[], false, false, None);
 
         // The wedged System message is routed to the system field, not dropped.
         assert!(
@@ -5327,13 +5632,38 @@ mod anthropic_request_building {
             Message::tool_result_with_images("first", "first shot", true, vec![img("FIRST")]),
             Message::tool_result_with_images("second", "second shot", true, vec![img("SECOND")]),
         ];
-        let out =
-            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let plan = crate::cache::PromptCachePlan {
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: messages[4].id.clone(),
+                previous_message_id: None,
+                external_memory_message_id: None,
+            }),
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
         let dumped = out.to_string();
         assert!(dumped.contains("FIRST"));
         assert!(dumped.contains("SECOND"));
         assert!(!dumped.contains("OLDER"));
         assert!(dumped.contains("omitted"));
+        assert_eq!(
+            out["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(out["messages"][2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
     }
 
     #[test]
@@ -5640,14 +5970,44 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn out_of_range_source_span_falls_back_to_last_block() {
-        let mut message = serde_json::json!({"role":"user","content":[{"type":"text","text":"x"}]});
-        super::add_cache_control_to_block(
-            &mut message,
-            usize::MAX,
-            crate::cache::CacheTtl::Default,
+    fn history_keeps_both_boundaries_in_one_coalesced_message() {
+        let prior = Message::user("prior user text");
+        let newest = Message::user("next user text");
+        let memory = Message::user("request-local memory");
+        let plan = crate::cache::PromptCachePlan {
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: newest.id.clone(),
+                previous_message_id: Some(prior.id.clone()),
+                external_memory_message_id: Some(memory.id.clone()),
+            }),
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &[prior, memory, newest, Message::assistant("prefill", None)],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
         );
-        assert_eq!(message["content"][0]["cache_control"]["type"], "ephemeral");
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], "prior user text");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "next user text");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[2]["text"], "request-local memory");
+        assert!(blocks[2].get("cache_control").is_none());
+        assert_eq!(out["messages"][1]["role"], "assistant");
+    }
+
+    #[test]
+    fn out_of_range_source_span_falls_back_to_last_block() {
+        let mut blocks = [json!({"type":"text","text":"x"})];
+        super::add_cache_control_to_block(&mut blocks, usize::MAX, crate::cache::CacheTtl::Default);
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

@@ -1296,6 +1296,27 @@ impl AppState {
                 tools,
                 Arc::new(crate::tools::BrowserEvalTool::new(browser.clone())),
             ));
+        let paced_loops = Arc::new(super::paced_loop::PacedLoops::new(
+            session_store.clone(),
+            persistence.clone(),
+            sessions.clone(),
+            session_inbox.clone(),
+            child_completion_coordinator.clone(),
+        ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(super::paced_loop::SessionLoopTool::new(Arc::downgrade(
+                    &paced_loops,
+                ))),
+            ));
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(crate::tools::OverlayToolExecutor::new(
+                tools,
+                Arc::new(super::paced_loop::ScheduleLoopWakeupTool::new(
+                    Arc::downgrade(&paced_loops),
+                )),
+            ));
 
         child_completion_coordinator
             .set_root_tools(tools.clone())
@@ -1387,7 +1408,9 @@ impl AppState {
                 session_activation_router.clone(),
                 mcp_proxy_shutdown.clone(),
                 observer_subscriptions.clone(),
+                paced_loops.clone(),
                 sessions.clone(),
+                child_completion_coordinator.clone(),
             )
             .await;
             if wake_report.attempted > 0
@@ -1589,6 +1612,7 @@ impl AppState {
             external_child_runner: external_runner,
             tickets,
             child_completion_coordinator,
+            paced_loops,
             guardian_spawner,
             bash_resume_hook,
             schedule_store,

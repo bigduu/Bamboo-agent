@@ -214,15 +214,14 @@ impl CapabilityDiscoveryIndex {
     }
 
     /// Build discovery from the exact classified catalog already resolved for
-    /// the current session/round, while capturing both command catalogs under
-    /// the store's publication read lock. Tool allow/disable references are not
-    /// applied twice; Skill/Workflow eligibility is still resolved here.
+    /// the current session/round. Capture Skills and executable Workflows under
+    /// the same publication read lock, then apply their invocation eligibility.
     pub async fn from_resolved_classified_store(
         tool_catalog: &[ClassifiedToolSchema],
         store: &crate::SkillStore,
         eligibility: &CapabilityDiscoveryEligibility,
     ) -> Self {
-        let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+        let (skill_catalog, workflow_catalog) = store.discovery_catalog_snapshots().await;
         let mut non_tool_eligibility = eligibility.clone();
         non_tool_eligibility.disabled_tool_names.clear();
         non_tool_eligibility.allowed_tool_names = None;
@@ -243,7 +242,7 @@ impl CapabilityDiscoveryIndex {
         store: &crate::SkillStore,
         eligibility: &CapabilityDiscoveryEligibility,
     ) -> Self {
-        let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+        let (skill_catalog, workflow_catalog) = store.discovery_catalog_snapshots().await;
         Self::from_snapshots(
             project_tool_capability_metadata(tool_schemas),
             &skill_catalog,

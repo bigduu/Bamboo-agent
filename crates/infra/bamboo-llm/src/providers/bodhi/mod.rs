@@ -18,19 +18,22 @@ use crate::provider::{
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
 };
 use crate::providers::common::model_fetcher;
+#[cfg(feature = "litellm-wire-types")]
+use crate::providers::common::openai_compat::build_litellm_chat_body;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
     ChatCompletionsCorrection, ChatCompletionsResponse,
 };
 use crate::providers::common::request_overrides;
-use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 
 pub struct BodhiProvider {
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_wire_types: bool,
     client: Client,
     model_info_cache: model_fetcher::ModelInfoCache,
     api_key: String,
@@ -44,6 +47,8 @@ pub struct BodhiProvider {
 impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_wire_types: false,
             client: crate::http_client::default_http_client(),
             model_info_cache: model_fetcher::ModelInfoCache::default(),
             api_key: api_key.into(),
@@ -84,6 +89,20 @@ impl BodhiProvider {
 
     pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
         self.request_overrides = overrides;
+        self
+    }
+
+    /// Use the same pinned wire types as the direct provider adapters.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn with_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = true;
+        self
+    }
+
+    /// Select Bamboo's original wire adapters for this gateway.
+    #[cfg(feature = "litellm-wire-types")]
+    pub fn without_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = false;
         self
     }
 
@@ -335,7 +354,14 @@ impl BodhiProvider {
         required_tool: Option<&str>,
         allow_disable_correction: bool,
     ) -> Result<LLMStream> {
-        let mut body = build_openai_compat_body(
+        let build_body = build_openai_compat_body;
+        #[cfg(feature = "litellm-wire-types")]
+        let build_body = if self.litellm_wire_types {
+            build_litellm_chat_body
+        } else {
+            build_body
+        };
+        let mut body = build_body(
             model,
             messages,
             tools,
@@ -403,22 +429,27 @@ impl BodhiProvider {
         cache_plan: Option<&crate::cache::PromptCachePlan>,
     ) -> Result<LLMStream> {
         use crate::providers::anthropic::{
-            apply_cache_ttl_header, apply_required_tool_choice, build_anthropic_request_with_cache,
-            parse_anthropic_sse_event, AnthropicStreamState,
+            anthropic_stream_with_usage_on_error, apply_cache_ttl_header,
+            apply_required_tool_choice, build_anthropic_proxy_request, AnthropicStreamState,
         };
+        use std::sync::{Arc, Mutex};
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let mut body = build_anthropic_request_with_cache(
+        let mut body = build_anthropic_proxy_request(
             messages,
             tools,
             model,
             max_tokens,
-            true,
             reasoning_effort,
-            None,
             cache_plan,
-        );
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types,
+        )?;
+        #[cfg(feature = "litellm-wire-types")]
+        let prepared_budget = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64);
         apply_required_tool_choice(&mut body, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut body,
@@ -427,6 +458,14 @@ impl BodhiProvider {
             request_overrides::ENDPOINT_MESSAGES,
             model,
         )?;
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            crate::providers::anthropic::finalize_litellm_anthropic_proxy_request(
+                &mut body,
+                model,
+                prepared_budget,
+            )?;
+        }
 
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
         apply_cache_ttl_header(&mut headers, cache_plan);
@@ -451,11 +490,10 @@ impl BodhiProvider {
 
         let mut state = AnthropicStreamState::default();
         state.completion_diagnostics = crate::provider::current_completion_diagnostics();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            parse_anthropic_sse_event(&mut state, event, data)
-        });
-
-        Ok(stream)
+        Ok(anthropic_stream_with_usage_on_error(
+            response,
+            Arc::new(Mutex::new(state)),
+        ))
     }
 
     async fn proxy_gemini(
@@ -467,26 +505,22 @@ impl BodhiProvider {
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
     ) -> Result<LLMStream> {
-        use crate::protocol::gemini::GeminiRequest;
-        use crate::protocol::ToProvider;
         use crate::providers::gemini::{
-            apply_generation_config, apply_required_tool_choice, parse_gemini_sse_event,
+            apply_required_tool_choice, build_gemini_request_body, parse_gemini_sse_event,
             GeminiStreamState,
         };
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
-        let messages_vec: Vec<Message> = messages.to_vec();
-        let mut request: GeminiRequest = messages_vec.to_provider()?;
-
-        if !tools.is_empty() {
-            let tools_vec: Vec<ToolSchema> = tools.to_vec();
-            request.tools = Some(tools_vec.to_provider()?);
-        }
-
-        apply_generation_config(&mut request, max_output_tokens, reasoning_effort);
-
-        // Serialize then run the last-moment scan over the body Value before send.
-        let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
+        let mut request_json = build_gemini_request_body(
+            messages,
+            tools,
+            max_output_tokens,
+            model,
+            reasoning_effort,
+            #[cfg(feature = "litellm-wire-types")]
+            self.litellm_wire_types
+                .then(crate::providers::gemini::LiteLlmRequestOptions::default),
+        )?;
         apply_required_tool_choice(&mut request_json, required_tool);
         request_overrides::mask_and_prepare_agent_request(
             &mut request_json,
@@ -526,6 +560,10 @@ impl BodhiProvider {
         }
 
         let mut state = GeminiStreamState::default();
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            state.enable_litellm_tool_ids();
+        }
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).
@@ -729,6 +767,49 @@ mod tests {
             while let Some(chunk) = stream.next().await { chunk.unwrap(); }
             assert_eq!(diagnostics.finish_reason(), expected, "{target}");
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_reports_cumulative_cache_usage_before_done() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":8000,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":4,\"cache_creation_input_tokens\":1100,\"cache_read_input_tokens\":64000}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic");
+        let chunks = provider
+            .chat_stream(&[Message::user("hello")], &[], Some(128), "fixture-model")
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. } | LLMChunk::Done))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            chunks.as_slice(),
+            [
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(73100),
+                    output_tokens: Some(9),
+                    cache_creation_input_tokens: Some(1100),
+                    cache_read_input_tokens: Some(64000),
+                    ..
+                },
+                LLMChunk::Done
+            ]
+        ));
     }
 
     #[tokio::test]

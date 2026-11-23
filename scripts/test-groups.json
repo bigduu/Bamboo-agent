@@ -181,6 +181,11 @@
     {
       "priority": 30,
       "group": "llm-retry",
+      "package": "bamboo-litellm-llms-types"
+    },
+    {
+      "priority": 30,
+      "group": "llm-retry",
       "kind": "test",
       "targetRegex": "^(provider_integration|provider_runtime_admission)$"
     },

@@ -7,6 +7,93 @@ use std::fmt;
 
 use types::*;
 
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ChatSubmission {
+    #[serde(flatten)]
+    pub(crate) response: ChatResponse,
+    pub(crate) loop_command: Option<LoopChatAcknowledgment>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChatStart {
+    pub(crate) session_id: String,
+    pub(crate) project_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChatRejected {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl ChatRejected {
+    fn unassigned_workspace_owner(&self) -> Option<String> {
+        if self.status != reqwest::StatusCode::CONFLICT {
+            return None;
+        }
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        if body["error"]["code"].as_str() != Some("project_workspace_conflict")
+            || body["session_project_id"].as_str() != Some("unassigned")
+        {
+            return None;
+        }
+        body["owner_project_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+    }
+}
+
+impl fmt::Display for ChatRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "chat failed ({}): {}", self.status, self.body.trim())
+    }
+}
+
+impl std::error::Error for ChatRejected {}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct LoopChatAcknowledgment {
+    pub(crate) should_execute: bool,
+    #[serde(rename = "loop")]
+    pub(crate) record: Option<LoopChatRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct LoopChatRecord {
+    pub(crate) id: Option<String>,
+    pub(crate) state: String,
+    next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) last_run_id: Option<String>,
+    pub(crate) last_run_status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionLoopStatus {
+    session_id: String,
+    #[serde(rename = "loop", deserialize_with = "serde::Deserialize::deserialize")]
+    record: Option<LoopChatRecord>,
+}
+
+impl LoopChatAcknowledgment {
+    pub(crate) fn status_text(&self) -> String {
+        let Some(record) = &self.record else {
+            return "No session loop".to_string();
+        };
+        let mut text = format!("Loop {}", record.state);
+        if let Some(next) = record.next_fire_at {
+            let next = next
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S");
+            text.push_str(&format!(" · next {next}"));
+        }
+        if let Some(last) = &record.last_run_status {
+            text.push_str(&format!(" · last run {last}"));
+        }
+        text
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VersionedSession {
     pub summary: SessionSummary,
@@ -291,20 +378,87 @@ impl BambooClient {
 
     // ── Chat ──
 
-    pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
+    pub(crate) async fn chat(&self, mut req: ChatRequest) -> Result<ChatStart> {
+        let from_launch_directory =
+            req.session_id.is_none() && req.project_id.is_none() && req.workspace_path.is_some();
+        let submission = match self.submit_chat(&req).await {
+            Err(error) if from_launch_directory => {
+                // This conflict rejects the turn before admission. Use the
+                // server's canonical workspace owner and retry only once.
+                let Some(project_id) = error
+                    .downcast_ref::<ChatRejected>()
+                    .and_then(ChatRejected::unassigned_workspace_owner)
+                else {
+                    return Err(error);
+                };
+                req.project_id = Some(project_id);
+                self.submit_chat(&req).await?
+            }
+            result => result?,
+        };
+        Ok(ChatStart {
+            session_id: submission.response.session_id,
+            project_id: req.project_id,
+        })
+    }
+
+    /// A backend without /loop support could accept a control as normal chat.
+    /// Confirm the existing Session's dedicated endpoint before posting it.
+    pub(crate) async fn submit_loop_chat(&self, req: ChatRequest) -> Result<ChatSubmission> {
+        let session_id = req
+            .session_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Open a Session before using /loop"))?;
+        self.session_loop_status(session_id).await?;
+        self.submit_chat(&req).await
+    }
+
+    pub(crate) async fn session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<LoopChatRecord>> {
+        let mut url = reqwest::Url::parse(&self.base_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Bamboo base URL cannot contain Session paths"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "sessions", session_id, "loop"]);
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-store")
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Session loop status failed ({status}): {}", body.trim());
+        }
+        let status: SessionLoopStatus = response.json().await?;
+        anyhow::ensure!(
+            status.session_id == session_id
+                && status.record.as_ref().is_none_or(|record| matches!(
+                    record.state.as_str(),
+                    "scheduled" | "paused" | "stopped" | "expired"
+                )),
+            "Invalid Session loop status"
+        );
+        Ok(status.record)
+    }
+
+    async fn submit_chat(&self, req: &ChatRequest) -> Result<ChatSubmission> {
         let resp = self
             .client
             .post(self.url("/api/v1/chat"))
-            .json(&req)
+            .json(req)
             .send()
             .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("chat failed ({status}): {}", body.trim());
+            return Err(ChatRejected { status, body }.into());
         }
-        let chat_resp = resp.json().await?;
-        Ok(chat_resp)
+        Ok(resp.json().await?)
     }
 
     pub async fn execute(
@@ -1144,6 +1298,96 @@ impl BambooClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_submission_accepts_both_ordinary_and_loop_control_replies() {
+        let mut reply = serde_json::json!({
+            "message_id": "accepted-message",
+            "session_id": "chat",
+            "stream_url": "/api/v1/events/chat",
+            "status": "accepted",
+        });
+        let normal: ChatSubmission = serde_json::from_value(reply.clone()).unwrap();
+        assert_eq!(
+            normal.response.message_id.as_deref(),
+            Some("accepted-message")
+        );
+        assert!(normal.loop_command.is_none());
+
+        reply["loop_command"] = serde_json::json!({
+            "action": "status", "should_execute": false, "loop": null,
+        });
+        let control: ChatSubmission = serde_json::from_value(reply).unwrap();
+        let acknowledgment = control.loop_command.unwrap();
+        assert!(!acknowledgment.should_execute);
+        assert_eq!(acknowledgment.status_text(), "No session loop");
+    }
+
+    #[tokio::test]
+    async fn loop_chat_posts_only_after_valid_session_loop_status() {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        for (http_status, body, supported) in [
+            ("404 Not Found", "{}", false),
+            ("200 OK", r#"{"session_id":"chat"}"#, false),
+            ("200 OK", r#"{"session_id":"other","loop":null}"#, false),
+            ("200 OK", r#"{"session_id":"chat","loop":null}"#, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let backend = tokio::spawn(async move {
+                let (mut status, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut status).await;
+                assert!(request.starts_with("GET /api/v1/sessions/chat/loop HTTP/1.1"));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("cache-control: no-store"));
+                respond(&mut status, http_status, "1", body).await;
+                if supported {
+                    let (mut chat, _) = listener.accept().await.unwrap();
+                    let request = read_request(&mut chat).await;
+                    assert!(request.starts_with("POST /api/v1/chat HTTP/1.1"));
+                    let body = request_json(&request);
+                    assert_eq!(body["session_id"], "chat");
+                    assert_eq!(body["message"], "/loop stop");
+                    respond(
+                        &mut chat,
+                        "200 OK",
+                        "1",
+                        r#"{"session_id":"chat","stream_url":"/events","status":"accepted","loop_command":{"action":"stop","should_execute":false,"loop":null}}"#,
+                    )
+                    .await;
+                } else {
+                    assert!(timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err());
+                }
+            });
+
+            let result = timeout(
+                Duration::from_secs(5),
+                client.submit_loop_chat(ChatRequest {
+                    message_id: None,
+                    thread_id: None,
+                    in_reply_to: None,
+                    correlation_id: None,
+                    message: "/loop stop".into(),
+                    images: Vec::new(),
+                    session_id: Some("chat".into()),
+                    project_id: None,
+                    workspace_path: None,
+                    model: None,
+                    provider: None,
+                    reasoning_effort: None,
+                }),
+            )
+            .await
+            .unwrap();
+            backend.await.unwrap();
+            assert_eq!(result.is_ok(), supported, "{http_status} {body}");
+        }
+    }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;

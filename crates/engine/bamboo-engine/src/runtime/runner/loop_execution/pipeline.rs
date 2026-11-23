@@ -113,7 +113,7 @@ pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     }
 
     let mut loaded_names = if uses_sticky_fallback(capability_loading_mode) {
-        validated_sticky_fallback_loaded_tool_names(session)
+        validated_sticky_fallback_loaded_tool_names(session, tool_schemas)
     } else {
         let transcript = &session.provider_transcript;
         let family = transcript.active_family();
@@ -529,7 +529,7 @@ fn sticky_definition_name(definition: &serde_json::Value) -> Option<&str> {
         .flatten()
 }
 
-fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
+fn validated_sticky_fallback_results(session: &Session) -> Vec<(&Message, Vec<serde_json::Value>)> {
     let call_ids = sticky_discovery_call_ids(session);
     session
         .messages
@@ -546,56 +546,95 @@ fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
                         && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
                         && metadata["canonical_new_names"].is_array()
                 })
-                && sticky_result_definition_values(message).is_some()
         })
+        .filter_map(|message| Some((message, sticky_result_definition_values(message)?)))
         .collect()
 }
 
-pub(in crate::runtime::runner) fn validated_sticky_fallback_loaded_tool_names(
-    session: &Session,
-) -> Vec<String> {
-    let mut loaded = Vec::new();
-    for message in validated_sticky_fallback_results(session) {
-        let definition_names = sticky_result_definition_values(message)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|definition| sticky_definition_name(&definition).map(str::to_string))
-            .collect::<BTreeSet<_>>();
-        let Some(names) = message
+fn legacy_scoped_gateway(name: &str) -> bool {
+    matches!(name, "load_skill" | "workflow_run")
+}
+
+fn latest_sticky_fallback_definitions<'a>(
+    results: &'a [(&Message, Vec<serde_json::Value>)],
+) -> BTreeMap<&'a str, &'a serde_json::Value> {
+    let mut loaded = BTreeMap::new();
+    for (message, definitions) in results {
+        let Some(first_loads) = message
             .metadata
             .as_ref()
             .and_then(|metadata| metadata["canonical_new_names"].as_array())
         else {
             continue;
         };
-        for name in names.iter().filter_map(serde_json::Value::as_str) {
-            if definition_names.contains(name) && !loaded.iter().any(|seen| seen == name) {
-                loaded.push(name.to_string());
+        for definition in definitions {
+            let Some(name) = sticky_definition_name(definition) else {
+                continue;
+            };
+            // V1 records only mark first admission. A later successful
+            // discovery can refresh that name without writing another marker.
+            if loaded.contains_key(name)
+                || first_loads.iter().any(|value| value.as_str() == Some(name))
+            {
+                loaded.insert(name, definition);
             }
         }
     }
     loaded
 }
 
-/// Keep persisted discovery results intact. On the wire, hide definitions
-/// removed by the current role or request selection and avoid repeating full
-/// definitions already declared on a compatibility request.
+pub(in crate::runtime::runner) fn validated_sticky_fallback_loaded_tool_names(
+    session: &Session,
+    eligible: &[bamboo_agent_core::tools::ToolSchema],
+) -> Vec<String> {
+    let history = validated_sticky_fallback_results(session);
+    let latest = latest_sticky_fallback_definitions(&history);
+    eligible
+        .iter()
+        .filter_map(|schema| {
+            let name = schema.function.name.as_str();
+            let definition = latest.get(name).copied()?;
+            (legacy_scoped_gateway(name)
+                || serde_json::to_value(schema).as_ref().ok() == Some(definition))
+            .then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Project validated discovery history against the current request catalog.
+/// Keep persisted call/result pairs intact and hide obsolete definitions from
+/// the provider. Deliberately narrowed legacy command gateways remain paired
+/// with the command IDs and revisions advertised by their original result.
 pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
     session: &Session,
     eligible: &[bamboo_agent_core::tools::ToolSchema],
     declared: &[bamboo_agent_core::tools::ToolSchema],
     mode: CapabilityLoadingMode,
 ) -> BTreeMap<String, (String, String)> {
-    let eligible_names = eligible
+    let history = validated_sticky_fallback_results(session);
+    if history.is_empty() {
+        return BTreeMap::new();
+    }
+    let latest = latest_sticky_fallback_definitions(&history);
+    let eligible_definitions = eligible
         .iter()
-        .filter(|tool| session.allows_model_tool_execution(&tool.function.name))
-        .map(|tool| tool.function.name.as_str())
-        .collect::<BTreeSet<_>>();
+        .filter(|tool| {
+            let name = tool.function.name.as_str();
+            session.allows_model_tool_execution(name)
+                && (latest.contains_key(name) || legacy_scoped_gateway(name))
+        })
+        .filter_map(|tool| {
+            serde_json::to_value(tool)
+                .ok()
+                .map(|definition| (tool.function.name.as_str(), definition))
+        })
+        .collect::<BTreeMap<_, _>>();
     let declared_definitions = if mode == CapabilityLoadingMode::Progressive {
         BTreeMap::new()
     } else {
         declared
             .iter()
+            .filter(|tool| eligible_definitions.contains_key(tool.function.name.as_str()))
             .filter_map(|tool| {
                 serde_json::to_value(tool)
                     .ok()
@@ -603,10 +642,9 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
             })
             .collect::<BTreeMap<_, _>>()
     };
-    validated_sticky_fallback_results(session)
-        .into_iter()
-        .filter_map(|message| {
-            let definitions = sticky_result_definition_values(message)?;
+    history
+        .iter()
+        .filter_map(|(message, definitions)| {
             let mut duplicate = false;
             let remaining = definitions
                 .iter()
@@ -614,7 +652,13 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
                     let Some(name) = sticky_definition_name(definition) else {
                         return false;
                     };
-                    if !eligible_names.contains(name) {
+                    let Some(current) = eligible_definitions.get(name) else {
+                        return false;
+                    };
+                    if !legacy_scoped_gateway(name)
+                        && (current != *definition
+                            || latest.get(name).copied() != Some(*definition))
+                    {
                         return false;
                     }
                     if declared_definitions.get(name) == Some(*definition) {
@@ -647,24 +691,27 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
         .collect()
 }
 
-fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
-    validated_sticky_fallback_results(session)
-        .into_iter()
-        .filter_map(sticky_result_definition_values)
-        .flatten()
-        .collect()
-}
-
 fn sticky_fallback_definition_delta(
     session: &Session,
     schemas: &[bamboo_agent_core::tools::ToolSchema],
 ) -> Result<Vec<serde_json::Value>, serde_json::Error> {
-    let previous = prior_sticky_fallback_definitions(session);
+    let history = validated_sticky_fallback_results(session);
+    let latest = latest_sticky_fallback_definitions(&history);
     let mut definitions = schemas
         .iter()
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()?;
-    definitions.retain(|definition| !previous.contains(definition));
+    definitions.retain(|definition| {
+        let Some(name) = sticky_definition_name(definition) else {
+            return true;
+        };
+        if legacy_scoped_gateway(name) {
+            return !history
+                .iter()
+                .any(|(_, previous)| previous.contains(definition));
+        }
+        latest.get(name).copied() != Some(definition)
+    });
     Ok(definitions)
 }
 
@@ -784,12 +831,11 @@ async fn commit_sticky_fallback_discovery_round(
         };
         let (content, success, new_names) = match definitions {
             Ok(definitions) => {
-                let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
+                let history = validated_sticky_fallback_results(session);
+                let already_loaded = latest_sticky_fallback_definitions(&history);
                 let mut canonical_new_names = Vec::new();
                 for name in definitions.iter().filter_map(sticky_definition_name) {
-                    if !already_loaded.contains(name)
+                    if !already_loaded.contains_key(name)
                         && !canonical_new_names.iter().any(|seen| seen == name)
                     {
                         canonical_new_names.push(name.to_string());
@@ -1602,16 +1648,14 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
-/// Yield an owned quiet command to background monitoring without spending
-/// another model recovery round. A new handoff commits its notice and wait
-/// together before the monitor starts.
-async fn maybe_background_quiet_exec(
+/// Commit the command wait before starting the Host monitor.
+async fn maybe_suspend_for_background_exec(
     session: &mut Session,
     config: &AgentLoopConfig,
     runtime: &mut AgentRuntimeState,
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
-) -> Result<bool, AgentError> {
+) -> std::io::Result<bool> {
     if !crate::runtime::runner::tool_execution::quiet_poll_guard_active(session, runtime, config) {
         return Ok(false);
     }
@@ -1672,14 +1716,7 @@ async fn maybe_background_quiet_exec(
     }
     notice.metadata = Some(notice_metadata);
     candidate.add_message(notice.clone());
-    persistence
-        .save_runtime_session(&mut candidate)
-        .await
-        .map_err(|error| {
-            AgentError::Tool(format!(
-                "Background command wait could not be saved: {error}"
-            ))
-        })?;
+    persistence.save_runtime_session(&mut candidate).await?;
     *session = candidate;
     *runtime = waiting_runtime;
     hook.arrange_exec_self_resume(job, session.created_at);
@@ -2593,6 +2630,7 @@ async fn handle_no_tool_calls_with_native(
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
     cancel_token: &CancellationToken,
+    goal_no_progress_limit: bool,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -2673,9 +2711,8 @@ async fn handle_no_tool_calls_with_native(
     // decide whether to keep working toward it INSTEAD of completing. The agent
     // self-reports completion via `update_goal`, and a side-channel Gold
     // double-check verifies the objective before the run actually stops. Running
-    // this inside the loop means the run emits a single terminal `Complete` only
-    // when the goal is truly done — keeping `is_running` accurate and the SSE
-    // stream open.
+    // this inside the loop keeps `is_running` accurate and the SSE stream open
+    // until the Goal has either been verified or reached a stopping condition.
     let decision = evaluate_gold_terminal(
         session,
         task_context,
@@ -2684,6 +2721,7 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
+        goal_no_progress_limit,
         if config.auxiliary_model_resolver.is_some() {
             main_llm.clone()
         } else {
@@ -2715,8 +2753,7 @@ async fn handle_no_tool_calls_with_native(
         });
     }
 
-    // Gold decided STOP: the goal is met, or no goal loop is configured. Only now
-    // review the genuinely-final state. Adversarial guardian review: before
+    // Gold has decided to stop. Adversarial guardian review: before
     // completing, spawn a read-only reviewer child to verify the work and suspend
     // until its verdict returns. `maybe_spawn_guardian_review` returns `Some` when
     // it engages a review (spawn + suspend); it is inert unless a guardian config
@@ -3023,6 +3060,7 @@ async fn handle_no_tool_calls(
         Vec::new(),
         llm,
         &CancellationToken::new(),
+        false,
     )
     .await
 }
@@ -3031,9 +3069,10 @@ async fn handle_no_tool_calls(
 
 const QUIET_EXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
-async fn wait_for_quiet_exec(
+async fn wait_for_exec(
     job: bamboo_tools::tools::exec_command::BackgroundExecJob,
     cancel_token: &CancellationToken,
+    ceiling: Option<Duration>,
 ) -> Result<Message, AgentError> {
     use crate::session_app::child_completion_coordinator::{
         exec_completion_message, exec_wait_resume_message,
@@ -3042,12 +3081,71 @@ async fn wait_for_quiet_exec(
     let result = tokio::select! {
         biased;
         _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
-        result = tokio::time::timeout(QUIET_EXEC_WAIT_TIMEOUT, job.completion()) => result,
+        result = async {
+            match ceiling {
+                Some(ceiling) => tokio::time::timeout(ceiling, job.completion()).await.ok(),
+                None => Some(job.completion().await),
+            }
+        } => result,
     };
     Ok(match result {
-        Ok(info) => exec_completion_message(&info),
-        Err(_) => exec_wait_resume_message(&[job.id().to_owned()], true),
+        Some(info) => exec_completion_message(&info),
+        None => exec_wait_resume_message(&[job.id().to_owned()], true),
     })
+}
+
+async fn observe_explicit_exec_waits(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    handles: &[String],
+    cancel_token: &CancellationToken,
+) -> Result<bool, AgentError> {
+    use crate::session_app::child_completion_coordinator::exec_wait_resume_message;
+    use bamboo_tools::tools::exec_command::reserve_background_job;
+
+    if let [handle] = handles {
+        match maybe_suspend_for_background_exec(session, config, runtime, event_tx, handle).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()) =>
+            {
+                return Err(AgentError::Tool(format!(
+                    "Background command wait could not be saved: {error}"
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    exec_session_id = %handle,
+                    %error,
+                    "Could not checkpoint exec wait; observing completion in the current run"
+                );
+            }
+        }
+    }
+
+    // Reserve every requested capture before awaiting any of them. A shorter
+    // command can finish and age out of the pull registry while another runs.
+    let jobs: Vec<_> = handles
+        .iter()
+        .map(|handle| reserve_background_job(&session.id, handle))
+        .collect();
+    for (handle, job) in handles.iter().zip(jobs) {
+        let message = match job {
+            Some(job) => wait_for_exec(job, cancel_token, None).await?,
+            None => exec_wait_resume_message(std::slice::from_ref(handle), false),
+        };
+        session.add_message(message.clone());
+        let _ = event_tx
+            .send(AgentEvent::message_appended(&session.id, &message))
+            .await;
+    }
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3190,7 +3288,26 @@ async fn handle_tool_calls_path(
         && session
             .metadata
             .contains_key(crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY);
-    if ticket_question_yield || awaiting_clarification || waiting_for_children {
+    if ticket_question_yield
+        || awaiting_clarification
+        || waiting_for_children
+        || tool_execution.yield_supervisor_wait
+    {
+        if !tool_execution.explicit_exec_waits.is_empty() {
+            let handles = tool_execution.explicit_exec_waits.join(", ");
+            let mut notice = Message::user(format!(
+                "Runtime notification: waiting for commands [{handles}] was deferred by another wait in this batch. If a later step needs a command's result, request a wait again with its original session_id."
+            ));
+            notice.metadata = Some(serde_json::json!({
+                "hidden_from_ui": true,
+                "runtime_kind": "exec_wait_deferred",
+            }));
+            session.add_message(notice.clone());
+            let _ = frame
+                .event_tx
+                .send(AgentEvent::message_appended(&session.id, &notice))
+                .await;
+        }
         crate::runtime::runner::metrics_lifecycle::record_round_completed(
             frame.metrics_collector,
             frame.round_id,
@@ -3245,16 +3362,30 @@ async fn handle_tool_calls_path(
         );
     }
 
+    let waiting_for_exec = observe_explicit_exec_waits(
+        session,
+        frame.config,
+        runtime_state,
+        frame.event_tx,
+        &tool_execution.explicit_exec_waits,
+        cancel_token,
+    )
+    .await?;
+
     // The poll has already returned and its tool result is paired. A sole
     // follow-up quiet read can now wait within this run, outside tool deadlines
     // and without spending another provider turn.
-    if !output_limit_recovery && round_status == MetricsRoundStatus::Success {
+    if tool_execution.explicit_exec_waits.is_empty()
+        && !output_limit_recovery
+        && round_status == MetricsRoundStatus::Success
+    {
         if let Some(handle) = tool_execution.quiet_exec_handle {
             if let Some(job) =
                 bamboo_tools::tools::exec_command::reserve_quiet_exec_job(&session.id, &handle)
                     .await
             {
-                let message = wait_for_quiet_exec(job, cancel_token).await?;
+                let message =
+                    wait_for_exec(job, cancel_token, Some(QUIET_EXEC_WAIT_TIMEOUT)).await?;
                 session.add_message(message.clone());
                 let _ = frame
                     .event_tx
@@ -3327,7 +3458,7 @@ async fn handle_tool_calls_path(
     );
 
     Ok(TurnOutcome {
-        should_break: false,
+        should_break: waiting_for_exec,
         sent_complete: false,
     })
 }
@@ -3593,6 +3724,7 @@ async fn run_pipeline_inner(
     let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
+        crate::runtime::goal_restart::disarm_before_round(session, config).await?;
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
             && cancel_token.is_cancelled()
         {
@@ -3800,15 +3932,19 @@ async fn run_pipeline_inner(
         );
         if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
-                if maybe_background_quiet_exec(
+                if maybe_suspend_for_background_exec(
                     session,
                     config,
                     &mut state.runtime_state,
                     event_tx,
                     handle,
                 )
-                .await?
-                {
+                .await
+                .map_err(|error| {
+                    AgentError::Tool(format!(
+                        "Background command wait could not be saved: {error}"
+                    ))
+                })? {
                     break;
                 }
             }
@@ -4570,6 +4706,8 @@ async fn run_pipeline_inner(
                         .clone()
                         .unwrap_or_else(|| llm.clone()),
                     cancel_token,
+                    no_tool_call_continuation_streak
+                        >= MAX_NO_TOOL_CALL_CONTINUATIONS - 1,
                 )
                 .await
                 {
@@ -5330,6 +5468,7 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
         "Read",
         "SubAgent",
         "exec_command",
+        "write_stdin",
         "load_skill",
         "workflow_run",
         "vendor::Read",
@@ -5396,8 +5535,19 @@ async fn orchestration_only_discovery_is_readonly_and_role_scoped() {
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        ["Read", "SubAgent"]
+        ["Read", "SubAgent", "exec_command", "write_stdin"]
     );
+    let request =
+        serde_json::from_value(serde_json::json!({"query":"exec_command","kinds":["tool"]}))
+            .unwrap();
+    assert!(discovery
+        .discover_complete_schemas(&request)
+        .unwrap()
+        .iter()
+        .all(|schema| !matches!(
+            schema.function.name.as_str(),
+            "exec_command" | "write_stdin"
+        )));
 }
 
 #[cfg(test)]
@@ -5960,7 +6110,10 @@ mod tests {
             "repeating the same scoped Skill B definition emits an empty delta"
         );
         assert_eq!(
-            super::prior_sticky_fallback_definitions(&session),
+            super::validated_sticky_fallback_results(&session)
+                .into_iter()
+                .flat_map(|(_, definitions)| definitions)
+                .collect::<Vec<_>>(),
             vec![
                 serde_json::to_value(&skill_a).unwrap(),
                 serde_json::to_value(&skill_b).unwrap()
@@ -6073,7 +6226,7 @@ mod tests {
             browser.function.parameters
         );
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&first_chat),
+            validated_sticky_fallback_loaded_tool_names(&first_chat, &tools),
             vec!["browser"]
         );
         let first_after = effective_callable_set_for_round(
@@ -6137,7 +6290,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            validated_sticky_fallback_loaded_tool_names(&second_chat, &tools),
             vec!["Glob"]
         );
 
@@ -6154,7 +6307,7 @@ mod tests {
             true,
         ));
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&second_chat),
+            validated_sticky_fallback_loaded_tool_names(&second_chat, &tools),
             vec!["Glob"]
         );
         assert!(!effective_callable_set_for_round(
@@ -6216,7 +6369,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&session),
+            validated_sticky_fallback_loaded_tool_names(&session, &tools),
             vec!["browser"]
         );
         assert_eq!(source.lookups.load(Ordering::SeqCst), 0);
@@ -6560,33 +6713,45 @@ mod tests {
             let messages = ir.flatten();
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
             let marker = "Current delegation route observation: ";
-            let latest = messages
+            let mut observations = messages
                 .iter()
-                .rev()
-                .find_map(|message| {
-                    message
-                        .content
-                        .rfind(marker)
-                        .map(|index| &message.content[index + marker.len()..])
-                })
+                .filter_map(|message| message.content.split_once(marker).map(|(_, facts)| facts));
+            let observation = observations
+                .next()
                 .expect("Supervisor request must report current delegation state");
-            let observation = serde_json::Deserializer::from_str(latest)
+            assert!(
+                observations.next().is_none(),
+                "historical route observations must not replay"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message
+                        .content
+                        .contains("Supervisor delegation-first policy"))
+                    .count(),
+                1,
+                "the stable policy appears exactly once across discovery"
+            );
+            let observation = serde_json::Deserializer::from_str(observation)
                 .into_iter::<serde_json::Value>()
                 .next()
                 .unwrap()
                 .unwrap();
-            if count == 0 {
-                assert_eq!(
-                    observation["status"], "discovery_required",
-                    "deferred definitions are not callable yet"
-                );
-            } else {
-                assert_eq!(
-                    observation["status"], "routes_exposed",
-                    "validated discovery must be reflected in the next request"
-                );
-                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
-            }
+            assert_eq!(
+                observation["auxiliary"]["SubAgent"],
+                if count == 0 {
+                    "discoverable"
+                } else {
+                    "callable"
+                },
+                "validated discovery must be reflected in the next request"
+            );
+            assert!(observation["main_execution"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|state| state == "unavailable"));
             if self.mode == CapabilityLoadingMode::StickyFallback {
                 assert!(tools.iter().any(|schema| schema.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
@@ -6651,7 +6816,7 @@ mod tests {
                         Ok(LLMChunk::ToolCalls(vec![activation_call(
                             "supervisor-delegate",
                             "SubAgent",
-                            r#"{"message":"Implement only the assigned change and return verification evidence."}"#,
+                            r#"{"message":"Review the proposed change and report verification evidence."}"#,
                         )])),
                         Ok(LLMChunk::Done),
                     ]
@@ -6758,7 +6923,7 @@ mod tests {
                     };
                     session.set_root_orchestration_only(ultra).unwrap();
                     session.add_message(Message::user(
-                        "Delegate the scoped implementation and report its admission or blocker.",
+                        "Delegate an auxiliary review and report its admission or blocker.",
                     ));
                     let provider = Arc::new(SupervisorLoadingProvider {
                         mode,
@@ -6807,11 +6972,25 @@ mod tests {
                         !removed.contains_execution_name("SubAgent"),
                         "a saved loading receipt cannot restore a removed tool"
                     );
-                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_supervisor_route_observation(
                         &restored, &[], mode,
                     ).unwrap();
-                    assert!(observation.content.contains("delegation_tools_unavailable"));
-                    assert!(!observation.content.contains("routes_exposed"));
+                    assert!(observation.content.contains("\"SubAgent\":\"unavailable\""));
+                    let ledger = restored.model_context_state.as_ref().unwrap();
+                    assert!(ledger.events.iter().all(|event| !event
+                        .rendered_text
+                        .contains("Current delegation route observation")));
+                    assert_eq!(
+                        ledger
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                event.block_type
+                                    == bamboo_domain::ContextBlockType::RootOrchestration
+                            })
+                            .count(),
+                        1
+                    );
                 }
             }
         }
@@ -7336,7 +7515,7 @@ mod tests {
             serde_json::json!(["ReadArchive"])
         );
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&session),
+            validated_sticky_fallback_loaded_tool_names(&session, &tools),
             vec!["ReadArchive"]
         );
 
@@ -7372,7 +7551,7 @@ mod tests {
             true,
         ));
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&resumed),
+            validated_sticky_fallback_loaded_tool_names(&resumed, &tools),
             vec!["ReadArchive"],
             "an ordinary function call/result cannot manufacture loaded state"
         );
@@ -7399,8 +7578,166 @@ mod tests {
         );
         assert!(resumed.messages[4].never_compress && repeated.never_compress);
         assert_eq!(
-            validated_sticky_fallback_loaded_tool_names(&resumed),
+            validated_sticky_fallback_loaded_tool_names(&resumed, &tools),
             vec!["ReadArchive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_discovery_revalidates_changed_schema_after_reopening_store() {
+        use crate::runtime::runner::round_lifecycle::request_tool_schemas_for_loading_mode;
+
+        let home = tempfile::tempdir().unwrap();
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut session = Session::new("schema-drift-fixture", "fixture-model");
+        let config = AgentLoopConfig::default();
+        let tool_name = "ReadArchive";
+        let mut old_schema =
+            loading_test_schema_with_description(tool_name, "Read a synthetic archive");
+        old_schema.function.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let mut changed_schema = old_schema.clone();
+        changed_schema.function.parameters = serde_json::json!({
+            "type": "object",
+            "properties": {"archive_id": {"type": "integer"}},
+            "required": ["archive_id"]
+        });
+        let discover = |id: &str| {
+            stream_output_with_tool_call(activation_call(
+                id,
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                r#"{"query":"ReadArchive","kinds":["tool"],"limit":1}"#,
+            ))
+        };
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-v1"),
+            &mut session,
+            &config,
+            std::slice::from_ref(&old_schema),
+        )
+        .await
+        .unwrap();
+        let original_result = session.messages.last().unwrap().clone();
+        storage.save_session(&session).await.unwrap();
+        drop(storage);
+
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut restored = storage.load_session(&session.id).await.unwrap().unwrap();
+        let mode = CapabilityLoadingMode::StickyFallback;
+        let old_catalog = std::slice::from_ref(&old_schema);
+        let unchanged = request_tool_schemas_for_loading_mode(&restored, old_catalog, mode, true);
+        assert_eq!(
+            unchanged
+                .iter()
+                .filter(|schema| schema.function.name == tool_name)
+                .count(),
+            1
+        );
+        assert!(
+            effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+
+        let changed_catalog = std::slice::from_ref(&changed_schema);
+        let changed = request_tool_schemas_for_loading_mode(&restored, changed_catalog, mode, true);
+        assert!(
+            changed
+                .iter()
+                .all(|schema| schema.function.name != tool_name),
+            "an updated definition is not declared by a persisted discovery of its old schema"
+        );
+        assert!(
+            !effective_callable_set_for_round(&restored, changed_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        let projection = super::projected_sticky_fallback_results(
+            &restored,
+            changed_catalog,
+            changed.as_ref(),
+            mode,
+        );
+        let (original, replacement) = &projection[&original_result.id];
+        assert_eq!(original, &original_result.content);
+        assert_eq!(
+            replacement,
+            "The previously discovered tools are unavailable for this request."
+        );
+        assert_eq!(
+            restored.messages.last().unwrap().content,
+            original_result.content
+        );
+
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-v2"),
+            &mut restored,
+            &config,
+            changed_catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sticky_result_definition_values(restored.messages.last().unwrap()).unwrap(),
+            vec![serde_json::to_value(&changed_schema).unwrap()]
+        );
+        assert_eq!(
+            restored.messages.last().unwrap().metadata.as_ref().unwrap()["canonical_new_names"],
+            serde_json::json!([]),
+            "V1 stores only the first name admission even when a definition is refreshed"
+        );
+        storage.save_session(&restored).await.unwrap();
+        drop(storage);
+
+        let storage = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut restored = storage.load_session(&restored.id).await.unwrap().unwrap();
+        assert!(
+            effective_callable_set_for_round(&restored, changed_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        assert!(
+            !effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
+        );
+        let reverted = request_tool_schemas_for_loading_mode(&restored, old_catalog, mode, true);
+        assert!(reverted
+            .iter()
+            .all(|schema| schema.function.name != tool_name));
+        let rollback_history = super::projected_sticky_fallback_results(
+            &restored,
+            old_catalog,
+            reverted.as_ref(),
+            mode,
+        );
+        assert_eq!(
+            rollback_history[&original_result.id].1,
+            "The previously discovered tools are unavailable for this request."
+        );
+        assert!(sticky_fallback_definition_delta(&restored, changed_catalog)
+            .unwrap()
+            .is_empty());
+        commit_sticky_fallback_discovery_round(
+            discover("lookup-reverted"),
+            &mut restored,
+            &config,
+            old_catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sticky_result_definition_values(restored.messages.last().unwrap()).unwrap(),
+            vec![serde_json::to_value(&old_schema).unwrap()]
+        );
+        assert!(
+            effective_callable_set_for_round(&restored, old_catalog, mode)
+                .contains_execution_name(tool_name)
         );
     }
 
@@ -10577,6 +10914,228 @@ mod tests {
         wiremock::ResponseTemplate::new(200)
             .insert_header("content-type", "text/event-stream")
             .set_body_string(sse)
+    }
+
+    #[tokio::test]
+    async fn retired_bash_recovers_on_next_model_request() {
+        use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer};
+
+        struct DelegateProbe;
+
+        #[async_trait::async_trait]
+        impl Tool for DelegateProbe {
+            fn name(&self) -> &str {
+                "SubAgent"
+            }
+
+            fn description(&self) -> &str {
+                "Delegate work to an authorized worker."
+            }
+
+            fn parameters_schema(&self) -> Value {
+                json!({"type":"object","properties":{"action":{"type":"string"}}})
+            }
+
+            async fn invoke(&self, _args: Value, _ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+                Ok(ToolOutcome::Completed(ToolResult::text(true, "delegated")))
+            }
+        }
+
+        let tool_response = |id: &str, name: &str, arguments: Value| {
+            mock_messages_completion(
+                json!({"type":"tool_use","id":id,"name":name,"input":{}}),
+                json!({"type":"input_json_delta","partial_json":arguments.to_string()}),
+                "tool_use",
+                Some(6),
+            )
+        };
+        let finished = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"Recovery complete."}),
+            "end_turn",
+            Some(3),
+        );
+        let retired = "Tool 'Bash' has been retired.";
+        for scenario in ["standard", "ultra", "disabled", "plan", "supervisor"] {
+            let direct = matches!(scenario, "standard" | "ultra");
+            let recovery_tool = match scenario {
+                "standard" | "ultra" => {
+                    Some(("exec_command", json!({"cmd":"echo recovered-shell"})))
+                }
+                "disabled" => Some(("SubAgent", json!({"action":"create"}))),
+                _ => None,
+            };
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(tool_response(
+                    "toolu_retired",
+                    "Bash",
+                    json!({"command":"echo retired-call-must-not-run"}),
+                ))
+                .with_priority(3)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let response = recovery_tool
+                .as_ref()
+                .map(|(name, args)| tool_response("toolu_recovery", name, args.clone()))
+                .unwrap_or_else(|| finished.clone());
+            Mock::given(method("POST"))
+                .and(body_string_contains(retired))
+                .and(body_string_contains(match scenario {
+                    "standard" | "ultra" => "call `exec_command` with the command in `cmd`",
+                    "plan" => "This session is in read-only Plan mode",
+                    _ => "Delegate it to an authorized execution session",
+                }))
+                .respond_with(response)
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            if let Some((name, _)) = &recovery_tool {
+                let output = if *name == "exec_command" {
+                    "recovered-shell"
+                } else {
+                    "delegated"
+                };
+                Mock::given(method("POST"))
+                    .and(body_string_contains(retired))
+                    .and(body_string_contains(output))
+                    .respond_with(finished.clone())
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let llm = bamboo_llm::AnthropicProvider::new("fixture")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+            let tools = bamboo_tools::BuiltinToolExecutor::new();
+            tools.registry().register(DelegateProbe).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(directory.path().into());
+            config.run_budget.max_rounds = Some(3);
+            if scenario == "disabled" {
+                config.disabled_tools.insert("exec_command".into());
+            } else if scenario == "plan" {
+                config.permission_mode = Some(bamboo_config::PermissionMode::Plan);
+            }
+            let mut session = if scenario == "supervisor" {
+                let mut supervisor =
+                    Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                supervisor.authority_identity =
+                    bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                assert!(supervisor.supervisor_incarnation_id().is_some());
+                supervisor
+            } else {
+                Session::new(&format!("retired-shell-{scenario}"), "model")
+            };
+            if direct {
+                bamboo_agent_core::workspace_state::publish_resolved_workspace(
+                    &session.id,
+                    directory.path().to_path_buf(),
+                );
+            }
+            session
+                .set_root_orchestration_only(scenario == "ultra")
+                .unwrap();
+            session.add_message(Message::user("Follow the available recovery path."));
+            let mut state = e2e_loop_state(&session.id);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                Arc::new(tools),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{scenario}: {error}"));
+            assert!(complete, "{scenario}");
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                2 + usize::from(recovery_tool.is_some()),
+                "{scenario}"
+            );
+            let next: Value = requests[1].body_json().unwrap();
+            let tool_result = next["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|block| block["tool_use_id"] == "toolu_retired")
+                .expect("model receives the retired tool result");
+            assert_eq!(tool_result["type"], "tool_result");
+            assert!(tool_result["content"].to_string().contains(retired));
+            assert_eq!(
+                tool_result["content"].to_string().contains("exec_command"),
+                direct
+            );
+            let rejected = session
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("toolu_retired"))
+                .expect("rejection is recorded against the original call");
+            assert_eq!(rejected.tool_success, Some(false));
+            for request in requests {
+                let body: Value = request.body_json().unwrap();
+                let definitions = body["tools"].as_array().unwrap();
+                assert!(
+                    definitions.iter().all(|tool| tool["name"] != "Bash"),
+                    "{scenario}"
+                );
+            }
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(|event| {
+                matches!(event, AgentEvent::ToolError { tool_call_id, error }
+                    if tool_call_id == "toolu_retired" && error.contains(retired))
+            }));
+            let started = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolStart { tool_name, .. } => Some(tool_name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                started,
+                recovery_tool
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+                "{scenario}",
+            );
+            if recovery_tool.is_some() {
+                let result = session
+                    .messages
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some("toolu_recovery"))
+                    .expect("recovery tool completes");
+                assert_eq!(
+                    result.tool_success,
+                    Some(true),
+                    "{scenario}: {}",
+                    result.content
+                );
+                assert!(result.content.contains(if direct {
+                    "recovered-shell"
+                } else {
+                    "delegated"
+                }));
+            }
+        }
     }
 
     #[derive(Default)]

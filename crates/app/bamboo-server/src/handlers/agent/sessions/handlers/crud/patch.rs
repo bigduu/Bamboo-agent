@@ -96,6 +96,7 @@ fn metadata_revision_exhausted(session_id: &str) -> HttpResponse {
 enum ConfigPatchError {
     StaleVersion(u64),
     RevisionExhausted,
+    PermissionScopeChanged,
     PermissionAudit(bamboo_domain::PermissionAuditRevisionExhausted),
 }
 
@@ -198,7 +199,7 @@ fn project_context_error_response(
 ///
 /// Title and pinned are routed through [`SessionMetadataService`] so they go
 /// through the canonical pipeline (load → re-check → bump version
-/// → locked save → cache → publish_replayable_session_event). Non-metadata
+/// → reserve account event → locked save → cache → replayable event). Non-metadata
 /// fields (`model_ref`, `reasoning_effort`) use a locked config update. The
 /// Supervisor applies these fields under its shared storage writer lock.
 ///
@@ -235,21 +236,6 @@ pub async fn patch_session(
             "session_id": session_id,
         })));
     }
-    if req.supervisor_auto_dispatch.is_some() {
-        if session_id != bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
-            || req.permission_mode != Some(bamboo_domain::SessionPermissionMode::Auto)
-        {
-            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": crate::error::error_value(
-                    "supervisor_auto_dispatch requires an explicit Supervisor Auto permission mode"
-                ),
-                "session_id": session_id,
-            })));
-        }
-        crate::handlers::agent::tickets::user(&state, &http_req)
-            .await
-            .map_err(|failure| crate::error::AppError::Forbidden(failure.to_string()))?;
-    }
     let request_precondition = parse_if_match(&http_req);
     if req.permission_mode.is_some() && request_precondition.is_none() {
         return Ok(HttpResponse::build(
@@ -271,6 +257,14 @@ pub async fn patch_session(
             }
         })
     });
+    // The canonical Supervisor's mode also governs its future dispatches.
+    if session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+        && requested_permission_mode.is_some()
+    {
+        crate::handlers::agent::tickets::user(&state, &http_req)
+            .await
+            .map_err(|failure| crate::error::AppError::Forbidden(failure.to_string()))?;
+    }
     // When present, carry the exact version produced by each preceding field
     // through the whole PATCH. Every authoritative step validates it under the
     // session lock and advances it only when that step actually changed data.
@@ -651,6 +645,9 @@ pub async fn patch_session(
             Err(MetadataError::VersionConflict { current, .. }) => {
                 return Ok(precondition_failed(&session_id, current));
             }
+            Err(MetadataError::EventQueueUnavailable(error)) => {
+                return Ok(crate::events::session_event_queue_unavailable(error));
+            }
             Err(err) => {
                 return Err(crate::error::json_internal_server_error(err.to_string()));
             }
@@ -674,6 +671,9 @@ pub async fn patch_session(
             }
             Err(MetadataError::VersionConflict { current, .. }) => {
                 return Ok(precondition_failed(&session_id, current));
+            }
+            Err(MetadataError::EventQueueUnavailable(error)) => {
+                return Ok(crate::events::session_event_queue_unavailable(error));
             }
             Err(err) => {
                 return Err(crate::error::json_internal_server_error(err.to_string()));
@@ -780,17 +780,20 @@ pub async fn patch_session(
         )
         .await;
         let supervisor = session.supervisor_incarnation_id().is_some();
-        if req.supervisor_auto_dispatch.is_some() && !supervisor {
-            return Ok(HttpResponse::Forbidden().json(serde_json::json!({
-                "error": crate::error::error_value("A canonical Supervisor is required"),
-                "session_id": session_id,
-            })));
-        }
         let edit = |session: &mut bamboo_domain::Session| {
             if let Some(expected) = config_expected_version {
                 if session.metadata_version != expected {
                     return Err(ConfigPatchError::StaleVersion(session.metadata_version));
                 }
+            }
+            if requested_permission_mode.is_some()
+                && req
+                    .expected_supervisor_dispatch_inheritance
+                    .is_some_and(|expected| {
+                        expected != session.supervisor_incarnation_id().is_some()
+                    })
+            {
+                return Err(ConfigPatchError::PermissionScopeChanged);
             }
 
             let prev_model = session.model.clone();
@@ -828,10 +831,6 @@ pub async fn patch_session(
                 .map(|(previous, effective)| {
                     (previous, effective, chrono::Utc::now().to_rfc3339())
                 });
-            let auto_dispatch_changed = supervisor
-                && requested_permission_mode.is_some()
-                && session
-                    .set_supervisor_auto_dispatch(req.supervisor_auto_dispatch.unwrap_or(false));
             if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
                 let audit = if let Some(config) = state.permission_checker.permission_config() {
                     record_bamboo_runtime_permission_transition_metadata(
@@ -858,10 +857,8 @@ pub async fn patch_session(
                 || session.model_ref != prev_model_ref
                 || (supervisor && session.provider_name() != prev_provider);
             let reasoning_changed = session.reasoning_effort != prev_reasoning;
-            let config_changed = model_changed
-                || reasoning_changed
-                || permission_transition.is_some()
-                || auto_dispatch_changed;
+            let config_changed =
+                model_changed || reasoning_changed || permission_transition.is_some();
             if config_changed {
                 session.metadata_version = match session.metadata_version.checked_add(1) {
                     Some(version) => version,
@@ -922,6 +919,16 @@ pub async fn patch_session(
             }
             Err(ConfigPatchError::RevisionExhausted) => {
                 return Ok(metadata_revision_exhausted(&session_id));
+            }
+            Err(ConfigPatchError::PermissionScopeChanged) => {
+                return Ok(HttpResponse::PreconditionFailed().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "session_permission_scope_changed",
+                        "message": "Refresh the session permission scope before changing its mode",
+                    },
+                    "session_id": session_id,
+                })));
             }
             Err(ConfigPatchError::PermissionAudit(error)) => {
                 return Err(crate::error::json_internal_server_error(format!(

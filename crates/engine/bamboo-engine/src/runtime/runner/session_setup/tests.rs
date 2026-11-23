@@ -544,7 +544,7 @@ async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candi
         .await
         .unwrap();
         assert_eq!(
-            before.contains("Check Skill applicability."),
+            before.contains("Discover a Skill when one could help."),
             shows_guidance
         );
         let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
@@ -1845,6 +1845,7 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
         "session_control",
         "session_history",
         "exec_command",
+        "write_stdin",
         "vendor::session_control",
         "default::session_control",
     ]);
@@ -1905,7 +1906,7 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        vec!["Read", "session_history"]
+        vec!["Read", "exec_command", "session_history", "write_stdin"]
     );
 }
 
@@ -2032,7 +2033,7 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
             .iter()
             .map(|schema| schema.function.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["Read"]
+        vec!["Read", "exec_command", "write_stdin"]
     );
     let guide = super::prompt_setup::build_tool_guide_context(
         &config,
@@ -2077,7 +2078,9 @@ fn default_delegation_prompts_use_the_compact_subagent_contract() {
         !base.contains("SubAgent"),
         "the schema supplies the SubAgent call contract"
     );
-    assert!(crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("delegate independent work"));
+    assert!(
+        crate::runtime::context::CORE_AGENT_DIRECTIVES.contains("send ready assignments together")
+    );
     for prompt in [base, crate::runtime::context::CORE_AGENT_DIRECTIVES] {
         for stale in [
             "set `workspace`",
@@ -2223,16 +2226,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
 
     assert_eq!(
         effective.execution_names().collect::<Vec<_>>(),
-        vec!["Edit", "Read"]
+        vec!["Edit", "Read", "exec_command", "write_stdin"]
     );
-    for denied in [
-        "Bash",
-        "default::Bash",
-        "exec_command",
-        "default::exec_command",
-        "write_stdin",
-        "mcp__x__run",
-    ] {
+    for denied in ["Bash", "default::Bash", "mcp__x__run"] {
         assert_eq!(
             effective.resolve_callable_reference(denied),
             None,
@@ -2242,6 +2238,10 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
     assert_eq!(
         effective.resolve_callable_reference("Edit"),
         Some("Edit".into())
+    );
+    assert_eq!(
+        effective.resolve_callable_reference("default::exec_command"),
+        Some("exec_command".into())
     );
     assert!(!catalog
         .iter()
@@ -3201,6 +3201,19 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
+    assert!(stable
+        .stable_instructions
+        .contains("record a plan before implementation and resume a matching plan"));
+    assert!(stable
+        .stable_instructions
+        .contains("build the session DAG from the objective and applicable Skill instructions"));
+    assert!(stable
+        .stable_instructions
+        .contains("Start a matching executable Workflow with `workflow_run`"));
+    assert!(stable
+        .stable_instructions
+        .contains("Use an active Workflow's steps and checks for its scope."));
+    assert!(!stable.stable_instructions.contains("`criteriaMet`"));
     assert!(!stable.stable_instructions.contains("Workspace path:"));
     assert!(!stable
         .stable_instructions
@@ -3223,10 +3236,13 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     // base prompt.
     assert!(stable
         .stable_instructions
-        .contains("Investigate before you conclude"));
+        .contains("Trace the actual source and execution path"));
     assert!(stable
         .stable_instructions
         .contains("Verify the work against the user's acceptance criteria."));
+    assert!(stable
+        .stable_instructions
+        .contains("Spend additional effort only when it can change the deliverable or acceptance"));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 

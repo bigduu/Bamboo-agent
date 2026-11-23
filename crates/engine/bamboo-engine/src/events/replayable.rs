@@ -34,6 +34,8 @@ use bamboo_agent_core::AgentEvent;
 
 use crate::app_context::AgentSessionContext;
 
+use super::account_sink::ReservedSessionMutation;
+
 /// Publishes a replayable session event with the correct cache-then-broadcast
 /// ordering. See module docs for the invariant.
 ///
@@ -52,6 +54,24 @@ pub async fn publish_replayable_session_event(
     session_id: &str,
     event: AgentEvent,
 ) {
+    publish_session_event(ctx, session_id, event, None).await;
+}
+
+pub(crate) async fn publish_reserved_session_mutation(
+    ctx: &dyn AgentSessionContext,
+    session_id: &str,
+    event: AgentEvent,
+    reservation: ReservedSessionMutation,
+) {
+    publish_session_event(ctx, session_id, event, Some(reservation)).await;
+}
+
+async fn publish_session_event(
+    ctx: &dyn AgentSessionContext,
+    session_id: &str,
+    event: AgentEvent,
+    reservation: Option<ReservedSessionMutation>,
+) {
     // Resolve the sender first so publishers and subscribers never invert the
     // session-event and runner lock order.
     let sender = ctx.get_session_event_sender(session_id).await;
@@ -61,10 +81,13 @@ pub async fn publish_replayable_session_event(
             runner.push_critical_event(event.clone());
         }
 
-        // Mirror onto the account-wide change feed (sequenced + journaled).
-        // The sink filters ephemeral events internally; metadata events
-        // published here (title/pinned) are durable and will be sequenced.
-        ctx.account_sink().record(Some(session_id), &event);
+        // A committed title/pin change brings a slot reserved before its save.
+        // The legacy helper remains usable for other session observations.
+        if let Some(reservation) = reservation {
+            reservation.enqueue(session_id, event.clone());
+        } else {
+            ctx.account_sink().record(Some(session_id), &event);
+        }
 
         // Keep cache mutation and live publication inside one runner-lock
         // boundary. Subscribers clone the cache while holding the matching

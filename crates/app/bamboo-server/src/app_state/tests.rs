@@ -51,10 +51,9 @@ fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options(
 }
 #[test]
 fn default_base_prompt_prefers_using_injected_context_before_reasking() {
-    assert!(DEFAULT_BASE_PROMPT.contains("treat it as available working context"));
+    assert!(DEFAULT_BASE_PROMPT.contains("Use injected workspace and environment context"));
     assert!(DEFAULT_BASE_PROMPT.contains("Prefer a minimal verifiable attempt first"));
-    assert!(DEFAULT_BASE_PROMPT
-        .contains("only ask follow-up questions for information that is still genuinely missing"));
+    assert!(DEFAULT_BASE_PROMPT.contains("before asking for missing information"));
 }
 
 #[tokio::test]
@@ -304,8 +303,8 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
         .await
         .expect("app state should initialize");
 
-    // Definitions stay resident so this executor can use a scope initialized
-    // later. Their presence does not initialize or authorize a Work service.
+    // Work and loop definitions stay resident for filtering at provider
+    // dispatch. Registration does not grant the execution's scope.
     assert!(state.tickets.service().is_err());
     let full = state.get_all_tool_schemas();
     let core_names = full
@@ -328,6 +327,8 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
             "ViewImage".to_string(),
             "Write".to_string(),
             "session_history_current".to_string(),
+            "session_loop".to_string(),
+            "schedule_loop_wakeup".to_string(),
             "work_overview".to_string(),
             "work_search".to_string(),
             "work_inspect".to_string(),

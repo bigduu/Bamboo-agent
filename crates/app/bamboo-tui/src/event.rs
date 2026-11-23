@@ -8,9 +8,10 @@ use crate::api::types::{
     TaskListResponse, ToolInfo,
 };
 use crate::api::{
-    PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
+    ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
+    SessionMutationFailure, VersionedSession,
 };
-use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
+use crate::app::{LoopObservation, OpenedSession, QuestionIdentity, SessionPickerIntent};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -27,7 +28,13 @@ pub enum AnswerSubmissionOutcome {
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),
+    ClipboardRead {
+        context_id: u64,
+        result: Loaded<crate::clipboard::ClipboardContents>,
+    },
     Mouse(MouseEvent),
+    WorkspaceAction(crate::ui::workspace::WorkspaceAction),
     /// Terminal resized; the next loop iteration redraws at the new size (the
     /// dimensions themselves aren't needed — ratatui re-measures on draw).
     Resize(u16, u16),
@@ -103,7 +110,26 @@ pub enum AppEvent {
     ChatStarted {
         context_id: u64,
         turn_id: String,
-        result: Loaded<String>,
+        result: Loaded<ChatStart>,
+    },
+    LoopChatFinished {
+        context_id: u64,
+        session_id: Option<String>,
+        message: String,
+        result: Loaded<ChatSubmission>,
+    },
+    SessionLoopDiscovered {
+        context_id: u64,
+        session_id: String,
+        token: String,
+        record: LoopChatRecord,
+    },
+    SessionLoopObserved {
+        context_id: u64,
+        session_id: String,
+        watch_token: String,
+        stream_epoch: u64,
+        result: Loaded<LoopObservation>,
     },
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
     /// Since no SSE terminal event will ever arrive for a run that never

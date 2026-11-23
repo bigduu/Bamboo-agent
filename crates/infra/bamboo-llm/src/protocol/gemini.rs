@@ -140,7 +140,7 @@ pub struct GeminiFunctionResponse {
     pub response: Value,
 }
 
-fn normalize_function_response(content: &str) -> Value {
+pub(crate) fn normalize_function_response(content: &str) -> Value {
     match serde_json::from_str(content) {
         Ok(Value::Object(response)) => Value::Object(response),
         Ok(response) => serde_json::json!({ "result": response }),
@@ -567,7 +567,7 @@ fn image_url_to_gemini_part(url: &str) -> Option<GeminiPart> {
     })
 }
 
-fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
     let data = data.trim();

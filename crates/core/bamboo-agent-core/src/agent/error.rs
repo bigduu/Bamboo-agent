@@ -268,7 +268,7 @@ pub enum AgentError {
     Budget(String),
 
     /// The compression model completed without usable summary text.
-    #[error("The model returned no summary. Lower the reasoning effort for the model used for context compression, then try again.")]
+    #[error("Context compression could not finish. Your conversation history was preserved.")]
     EmptyContextSummary,
 
     /// Agent execution was cancelled by user

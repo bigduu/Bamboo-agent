@@ -1,0 +1,3 @@
+invocation_policy:
+  explicit: true
+  automatic: false

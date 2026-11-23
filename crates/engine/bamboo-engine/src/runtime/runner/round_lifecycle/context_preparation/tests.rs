@@ -1098,10 +1098,11 @@ struct CapturedBoundedRequest {
 #[derive(Debug, Clone, Copy)]
 enum BoundedFailureMode {
     None,
+    Empty,
     Call(usize),
     PartialWithoutDone(usize),
     Reduce,
-    FillFinalBudget,
+    FillFinalTarget,
 }
 
 struct BoundedCompressionProvider {
@@ -1138,6 +1139,7 @@ impl LLMProvider for BoundedCompressionProvider {
         });
 
         match self.failure_mode {
+            BoundedFailureMode::Empty => Ok(Box::pin(stream::iter([Ok(LLMChunk::Done)]))),
             BoundedFailureMode::Call(failed_call) if call_number == failed_call => {
                 Err(LLMError::Api(format!(
                     "injected map failure on call {call_number}"
@@ -1153,10 +1155,15 @@ impl LLMProvider for BoundedCompressionProvider {
                     LLMChunk::Token("partial summary that must not commit".to_string()),
                 )])))
             }
-            BoundedFailureMode::FillFinalBudget
+            BoundedFailureMode::FillFinalTarget
                 if messages.iter().any(|message| message.content.contains("final reduce stage")) =>
             {
-                let tokens = max_output_tokens.unwrap_or_default().saturating_sub(128).max(1);
+                let target = messages[1].content
+                    .split_once("## Summary Size Budget\nTarget approximately ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .and_then(|tokens| tokens.parse::<u32>().ok())
+                    .expect("requested summary length in final prompt");
+                let tokens = target.saturating_sub(128).max(1);
                 Ok(Box::pin(stream::iter(vec![
                     Ok(LLMChunk::Token(" evidence".repeat(tokens as usize))),
                     Ok(LLMChunk::Done),
@@ -1845,6 +1852,73 @@ async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_contex
         .unwrap_or_default();
     assert!(system_prompt.contains("BAMBOO_SKILL_CONTEXT_START"));
     assert!(!system_prompt.contains("BAMBOO_TOOL_GUIDE_START"));
+}
+
+#[tokio::test]
+async fn prepare_round_context_retires_withdrawn_external_memory_before_budgeting() {
+    use bamboo_domain::{ContextBlock, ContextBlockPriority, ContextBlockStability};
+
+    let id = "retired-memory-budget-fixture";
+    let mut session = Session::new(id, "test-model");
+    let system = "system instruction ".repeat(2_000);
+    let current_request = Message::user("Keep the current request in the provider context.");
+    session.add_message(Message::system(&system));
+    session.add_message(current_request.clone());
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".into()),
+        system_prompt: Some(system),
+        ..Default::default()
+    };
+    let budget = TokenBudget::with_safety_margin(8_000, 2_400, BudgetStrategy::default(), 0);
+    session.token_budget = Some(budget.clone());
+
+    let withdrawn_memory = ContextBlock::new(
+        ContextBlockType::ExternalMemory,
+        ContextBlockPriority::Medium,
+        ContextBlockStability::RoundDynamic,
+        "Old external memory",
+        "withdrawn memory text ".repeat(600),
+    );
+    super::super::context_ledger::reconcile_model_context(
+        &mut session,
+        vec![withdrawn_memory],
+        std::slice::from_ref(&current_request),
+        "a".repeat(64),
+        false,
+    );
+    let previous_epoch = session.model_context_state.as_ref().unwrap().prefix_epoch;
+    let counter = TiktokenTokenCounter::default();
+    let historical_reserve = super::model_context_ledger_usage(&session, &counter).tokens;
+    assert!(matches!(
+        super::prepare_hybrid_context_with_fixed_tokens(
+            &session,
+            &budget,
+            &counter,
+            historical_reserve
+        ),
+        Err(bamboo_compression::BudgetError::SystemPromptTooLarge { .. })
+    ));
+
+    let (llm, model_calls) = recording_llm();
+    let prepared = prepare_round_context(&mut session, &config, "test-model", id, &[], &llm, None)
+        .await
+        .expect("withdrawn memory must not make the current request too large");
+
+    assert!(!prepared.prepared_context.truncation_occurred);
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| message.id == current_request.id));
+    let ledger = session.model_context_state.as_ref().unwrap();
+    assert_eq!(ledger.prefix_epoch, previous_epoch + 1);
+    assert_eq!(
+        ledger.last_reset_reason,
+        Some(ModelContextResetReason::CacheScopeChanged)
+    );
+    assert!(ledger.events.is_empty());
+    assert!(session.compression_events.is_empty());
+    assert!(model_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2821,6 +2895,65 @@ fn attach_durable_instruction_workflow(session: &mut Session) {
 }
 
 #[tokio::test]
+async fn idle_summary_omits_external_memory_from_the_previous_project() {
+    let mut session = Session::new("idle-summary-fixture", "test-model");
+    session.set_project_id_meta("current-fixture-project");
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.add_message(Message::system("summarize the example conversation"));
+    for index in 0..16 {
+        session.add_message(Message::user(format!(
+            "Ordinary historical user request {index}: {}",
+            "user conversation details ".repeat(140)
+        )));
+        session.add_message(Message::assistant(
+            format!(
+                "Ordinary historical assistant response {index}: {}",
+                "assistant conversation details ".repeat(140)
+            ),
+            None,
+        ));
+    }
+    let obsolete_project_memory = "External memory retained from the previous fixture project.";
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.into(),
+        obsolete_project_memory.into(),
+    );
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".into()),
+        background_model_name: Some("test-model".into()),
+        context_management: ContextManagementConfig {
+            strategy: ContextManagementStrategy::Summary,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (provider, captured) = prompt_capture_llm();
+
+    let applied =
+        super::stage_user_context_compaction(&mut session, &config, "test-model", &[], &provider)
+            .await
+            .expect("idle legacy Summary should complete");
+
+    assert!(applied);
+    assert!(session.conversation_summary.is_some());
+    let captured = captured.lock().unwrap();
+    let sent = captured.iter().flatten().collect::<Vec<_>>();
+    assert!(sent
+        .iter()
+        .any(|message| message.content.contains("Ordinary historical user request")));
+    assert!(
+        sent.iter()
+            .all(|message| !message.content.contains(obsolete_project_memory)),
+        "the dormant session's obsolete Project snapshot reached the summary provider"
+    );
+}
+
+#[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
     activate_plan_mode(&mut session);
@@ -2927,11 +3060,18 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 
     assert!(prompt.contains("## Compression Context Blocks"));
     assert!(prompt.contains("type: task_snapshot"));
-    assert!(prompt.contains("type: external_memory"));
+    assert!(!prompt.contains("type: external_memory"));
     assert!(prompt.contains("type: plan_mode_state"));
     assert!(prompt.contains("type: plan_runtime_state"));
     assert!(prompt.contains("Current Task List"));
-    assert!(prompt.contains("External Memory (Persistent)"));
+    assert!(!prompt.contains("External Memory (Persistent)"));
+    assert!(requests
+        .iter()
+        .flatten()
+        .all(|message| !message.content.contains("Session memory note")));
+    assert!(session
+        .metadata
+        .contains_key(crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY));
     assert!(prompt.contains("Plan Mode State"));
     assert!(prompt.contains("Durable Plan Execution Context"));
     assert!(prompt.contains("## Custom Compression Instructions"));

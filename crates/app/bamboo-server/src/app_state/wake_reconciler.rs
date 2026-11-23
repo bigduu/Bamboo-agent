@@ -1,8 +1,7 @@
-//! Startup and bounded runtime recovery for missed durable SessionInbox wakes.
-//!
-//! The Inbox remains the only source of eligible work. Each wake is backed by
-//! a storage-locked readiness proof and the eventual claim still uses CAS.
+//! Startup and bounded recovery for durable SessionInbox wakes and Goal
+//! checkpoints. The eventual execution claim still uses the current owner.
 
+use bamboo_engine::session_app::child_completion_coordinator::ChildCompletionCoordinator;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
@@ -33,6 +32,7 @@ struct TerminalRecovery {
     store: Arc<SessionStoreV2>,
     cutoff: DateTime<Utc>,
     cache: Option<bamboo_engine::SessionCache>,
+    goal_resume: Option<Arc<ChildCompletionCoordinator>>,
 }
 
 impl TerminalRecovery {
@@ -46,7 +46,8 @@ impl TerminalRecovery {
             };
             let cache = self.cache.clone();
             let selected = expected.clone();
-            self.store
+            let reconciled = self
+                .store
                 .reconcile_session_runtime(
                     &expected,
                     self.cutoff,
@@ -67,6 +68,9 @@ impl TerminalRecovery {
                     }),
                 )
                 .await?;
+            if reconciled.is_none() {
+                self.try_resume_goal(&expected).await?;
+            }
             Ok::<_, std::io::Error>(())
         }
         .await;
@@ -76,6 +80,37 @@ impl TerminalRecovery {
             // completion, changes Inbox eligibility or grants a Worker proof.
             tracing::warn!(session_id = %target, %error, "Session terminal reconciliation unconfirmed; retained for paced retry");
         }
+    }
+
+    async fn try_resume_goal(&self, session: &bamboo_domain::Session) -> std::io::Result<()> {
+        use bamboo_domain::ActorDirectoryPort;
+
+        let Some(coordinator) = self.goal_resume.as_ref() else {
+            return Ok(());
+        };
+        let Some(checkpoint) =
+            bamboo_engine::runtime::goal_restart::eligible_checkpoint(session, self.cutoff)
+        else {
+            return Ok(());
+        };
+        let actor = self
+            .store
+            .inspect_actor(&session.id)
+            .await
+            .map_err(std::io::Error::other)?;
+        if !actor.actor.matches_session(session)
+            || !actor.activation.is_some_and(|activation| {
+                activation.run_id == checkpoint.run_id
+                    && activation.lease_epoch == checkpoint.lease_epoch
+                    && activation.status.is_live()
+                    && activation.lease_expires_at <= Utc::now()
+            })
+        {
+            return Ok(());
+        }
+        coordinator
+            .resume_goal_checkpoint(&session.id, checkpoint, self.cutoff)
+            .await
     }
 }
 
@@ -195,6 +230,12 @@ impl WakeSchedule {
     }
 }
 
+struct HostWakeServices {
+    observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
+    paced_loops: Arc<super::paced_loop::PacedLoops>,
+    goal_resume: Arc<ChildCompletionCoordinator>,
+}
+
 /// One task handles exact due times and a paced index sweep. The index is
 /// copied once per cycle; at most 32 Inbox inspections run per second. At
 /// least 16 index slots remain available even under a continuous due backlog,
@@ -208,7 +249,7 @@ fn spawn_periodic(
     shutdown: CancellationToken,
     mut schedule: WakeSchedule,
     initial_ids: Vec<String>,
-    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
+    services: Option<HostWakeServices>,
     terminal: TerminalRecovery,
 ) {
     tokio::spawn(async move {
@@ -224,8 +265,9 @@ fn spawn_periodic(
                 _ = tick.tick() => {}
             }
             let now = Utc::now();
-            if let Some(observers) = &observers {
-                observers.tick(now).await;
+            if let Some(services) = &services {
+                services.observers.tick(now).await;
+                services.paced_loops.tick(now).await;
             }
             if cursor >= ids.len() && tokio::time::Instant::now() >= next_refresh {
                 ids = store
@@ -288,22 +330,38 @@ pub(super) async fn reconcile_startup_with_observers(
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
     observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
+    paced_loops: Arc<super::paced_loop::PacedLoops>,
     cache: bamboo_engine::SessionCache,
+    goal_resume: Arc<ChildCompletionCoordinator>,
 ) -> WakeReport {
-    reconcile_startup_inner(store, activation, shutdown, Some(observers), Some(cache)).await
+    reconcile_startup_inner(
+        store,
+        activation,
+        shutdown,
+        Some(HostWakeServices {
+            observers,
+            paced_loops,
+            goal_resume,
+        }),
+        Some(cache),
+    )
+    .await
 }
 
 async fn reconcile_startup_inner(
     store: Arc<SessionStoreV2>,
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
-    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
+    services: Option<HostWakeServices>,
     cache: Option<bamboo_engine::SessionCache>,
 ) -> WakeReport {
     let terminal = TerminalRecovery {
         store: store.clone(),
         cutoff: Utc::now(),
         cache,
+        goal_resume: services
+            .as_ref()
+            .map(|services| services.goal_resume.clone()),
     };
     let mut report = WakeReport::default();
     let mut schedule = WakeSchedule::default();
@@ -336,7 +394,7 @@ async fn reconcile_startup_inner(
     }
     report.queued = queued.len();
     spawn_periodic(
-        store, activation, shutdown, schedule, queued, observers, terminal,
+        store, activation, shutdown, schedule, queued, services, terminal,
     );
     report
 }
@@ -555,6 +613,7 @@ mod tests {
             store: reopened.clone(),
             cutoff: Utc::now() - chrono::Duration::hours(1),
             cache: Some(cache.clone()),
+            goal_resume: None,
         };
         for (id, typed, main, directory) in evidence {
             let repaired = reopened.load_session(&id).await.unwrap().unwrap();
@@ -739,3 +798,7 @@ mod tests {
         shutdown.cancel();
     }
 }
+
+#[cfg(test)]
+#[path = "goal_restart_tests.rs"]
+mod goal_restart_tests;

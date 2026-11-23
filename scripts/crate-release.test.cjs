@@ -1744,6 +1744,48 @@ test('minimal frozen publisher accepts an exact feature-tested normal Dev cut an
   assert.throws(() => source.frozenGuard(accepted, x.env, x.read))
 })
 
+test('a frozen publisher write waits for complete GitHub metadata after a truncated response', async t => {
+  const x = minimalFrozenFixture(t), source = require('./release-source.cjs')
+  const accepted = source.authorizeFrozenRelease(x.env, x.read, x.log)
+  const delays = []
+  let devReads = 0
+  const read = route => source.githubRead(route, args => {
+    assert.deepEqual(args, ['gh', 'api', '--hostname', 'github.com', '--method', 'GET',
+      'repos/bigduu/Bamboo-agent/' + route])
+    if (route === 'branches/dev') {
+      devReads++
+      if (devReads === 1) return { status: 1, stderr: 'unexpected end of JSON input\n' }
+      if (devReads === 2) return { status: 0, stdout: '{"name":"dev","protected":' }
+    }
+    return { status: 0, stdout: JSON.stringify(x.read(route)) }
+  }, delay => delays.push(delay))
+
+  const written = await currentMainWrite(() => source.frozenGuard(accepted, x.env, read), () => {
+    assert.equal(devReads, 3)
+    return 'retained original'
+  })
+  assert.equal(written, 'retained original')
+  assert.deepEqual(delays, [1000, 2000])
+})
+
+test('GitHub metadata retries are bounded and access errors fail immediately', () => {
+  const { githubRead } = require('./release-source.cjs')
+  const delays = []
+  const responses = [
+    { error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) },
+    { status: 1, stderr: 'Get "https://api.github.com/...": EOF\n' },
+    { status: 1, stderr: 'gh: Bad Gateway (HTTP 502)\n' },
+    { status: 1, stderr: 'unexpected end of JSON input\n' },
+  ]
+  assert.throws(() => githubRead('branches/dev', () => responses.shift(), delay => delays.push(delay)),
+    /unexpected end of JSON input/)
+  assert.equal(responses.length, 0)
+  assert.deepEqual(delays, [1000, 2000, 4000])
+
+  assert.throws(() => githubRead('branches/dev', () => ({ status: 1, stderr: 'gh: Forbidden (HTTP 403)' }),
+    () => assert.fail('Access denial must fail immediately')), /HTTP 403/)
+})
+
 test('minimal frozen publisher rejects incomplete, foreign, late and changed feature acceptance', t => {
   const source = require('./release-source.cjs')
   for (const change of [

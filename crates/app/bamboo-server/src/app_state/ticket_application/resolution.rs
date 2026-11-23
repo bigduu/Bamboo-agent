@@ -4,22 +4,46 @@ use bamboo_domain::{
     SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
     SessionMessageKind, SessionMessageSource, SessionProviderMessage, SessionRuntimeInstruction,
 };
+use serde::Deserialize;
 
 impl TicketApplication {
-    pub fn oldest_unresolved_human(&self) -> Result<Option<String>> {
-        let (_, snapshot) = self.service()?.published()?;
-        Ok(snapshot
+    async fn latest_admitted_human(&self, snapshot: &Snapshot) -> Result<Option<String>> {
+        if !snapshot
             .resolutions
             .values()
-            .filter(|r| {
-                r.ingress.is_some()
-                    && (r.proposal.is_none()
-                        || r.groups
-                            .iter()
-                            .any(|g| g.status == ResolutionStatus::Proposed))
+            .any(MessageResolution::is_pending_human)
+        {
+            return Ok(None);
+        }
+        let session = self
+            .storage
+            .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await?
+            .filter(|session| {
+                session
+                    .supervisor_incarnation_id()
+                    .is_some_and(|incarnation| {
+                        snapshot.binding.scope_id == format!("supervisor/{incarnation}")
+                    })
             })
-            .min_by_key(|r| r.ingress_seq)
-            .map(|r| r.message_id.clone()))
+            .ok_or_else(|| Error::ScopeDenied("canonical Supervisor session changed".into()))?;
+        // Ingress registration can run ahead of Inbox delivery. Pick the
+        // latest Human input checkpointed in the transcript, then test its
+        // resolution state. Older or queued input cannot become the default.
+        let latest = session.messages.iter().rev().find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("session_message"))
+                .and_then(|value| SessionMessageEnvelope::deserialize(value).ok())
+                .is_some_and(|envelope| {
+                    envelope.id.as_str() == message.id && envelope.is_human_interactive_input()
+                })
+        });
+        Ok(latest
+            .and_then(|message| snapshot.resolutions.get(&message.id))
+            .filter(|record| record.is_pending_human())
+            .map(|record| record.message_id.clone()))
     }
 
     /// The Host derives the User from its authenticated persisted ingress. No
@@ -36,12 +60,28 @@ impl TicketApplication {
         self.authority(Principal::User { user_id }).await
     }
 
-    pub async fn pending_message(&self) -> Result<Value> {
-        let Some(id) = self.oldest_unresolved_human()? else {
-            return Ok(Value::Null);
+    pub async fn pending_message(
+        &self,
+        message_id: Option<String>,
+        plan_read_only: bool,
+    ) -> Result<Value> {
+        let id = match message_id {
+            Some(id) => id,
+            None => {
+                let (_, snapshot) = self.service()?.published()?;
+                let Some(id) = self.latest_admitted_human(&snapshot).await? else {
+                    return Ok(Value::Null);
+                };
+                id
+            }
         };
         let (service, authority) = self.message_authority(&id).await?;
-        if !self.config.read().await.features.ticket_mutation {
+        if plan_read_only {
+            return Ok(json!({"read_only":true,"message_id":id}));
+        }
+        if !self.config.read().await.features.ticket_mutation
+            || service.health() != Health::Writable
+        {
             return Ok(
                 json!({"read_only":true,"message":service.message_resolution(&authority,&id)?}),
             );
@@ -70,13 +110,6 @@ impl TicketApplication {
             // Reuse the core's frozen identity check before mutable Host facts
             // can mask an altered retry. A saved proposal does not republish.
             service.save_message_proposal(&authority, message_id, proposal)?;
-        }
-        if prior.proposal.is_none()
-            && self.oldest_unresolved_human()?.as_deref() != Some(message_id)
-        {
-            return Err(Error::ResourceBlocked(
-                "resolve the oldest Human ingress first".into(),
-            ));
         }
         // Reject an unusable new Start before freezing its immutable proposal.
         // Already terminal groups replay their original receipts; the service
@@ -150,6 +183,34 @@ impl TicketApplication {
             }
         }
         Ok(json!({"status":"resolved","resolution":resolution,"dispatch":dispatch}))
+    }
+
+    pub(crate) async fn dismiss_ingress(
+        &self,
+        principal: Principal,
+        binding: &ScopeBinding,
+        message_id: &str,
+    ) -> Result<()> {
+        if !self.config.read().await.features.ticket_mutation {
+            return Err(Error::AuthorityUnavailable(
+                "Ticket mutation feature is disabled".into(),
+            ));
+        }
+        let (service, authority) = self.authority(principal).await?;
+        if &service.published()?.1.binding != binding {
+            return Err(Error::ScopeDenied(
+                "Supervisor scope binding changed".into(),
+            ));
+        }
+        // The store checks the owner and the immutable proposal under its
+        // writer lock. The exact dismissal can replay; a saved Work proposal
+        // conflicts with the empty proposal.
+        service.save_message_proposal(
+            &authority,
+            message_id,
+            &MessageProposal { groups: vec![] },
+        )?;
+        Ok(())
     }
 
     // Precise UI decisions wake the existing Inbox/activation machinery after

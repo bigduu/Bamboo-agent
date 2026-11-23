@@ -1223,6 +1223,8 @@ struct AccFnCall {
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
 /// - `response.completed` -> terminal output fallbacks, provider usage, then `LLMChunk::Done`
 pub struct ResponsesSseParser {
+    #[cfg(feature = "litellm-wire-types")]
+    litellm_wire_types: bool,
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
     // Text item IDs that already produced user-visible answer tokens.
@@ -1299,6 +1301,8 @@ impl ResponsesSseParser {
         requested_reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
         Self {
+            #[cfg(feature = "litellm-wire-types")]
+            litellm_wire_types: false,
             fn_calls: HashMap::new(),
             streamed_text_item_ids: HashSet::new(),
             saw_unkeyed_text_delta: false,
@@ -1335,67 +1339,79 @@ impl ResponsesSseParser {
         self
     }
 
-    fn event_type<'a>(&self, event: &'a str, v: &'a Value) -> &'a str {
-        v.get("type").and_then(|t| t.as_str()).unwrap_or(event)
+    #[cfg(feature = "litellm-wire-types")]
+    pub(crate) fn with_litellm_wire_types(mut self) -> Self {
+        self.litellm_wire_types = true;
+        self
+    }
+
+    fn decode_event(&self, event: &str, data: &str) -> Option<(String, Value)> {
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            use bamboo_litellm_llms_types::formats::responses::streaming::ResponsesStreamEvent;
+            if let Ok(typed) = serde_json::from_str::<ResponsesStreamEvent>(data) {
+                let kind = typed.event_type.to_string();
+                let mut payload = typed.data;
+                payload.insert("type".into(), Value::String(kind.clone()));
+                return Some((kind, Value::Object(payload)));
+            }
+        }
+        // Some gateways omit the JSON type and supply only an SSE event name.
+        let value: Value = serde_json::from_str(data).ok()?;
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or(event);
+        Some((kind.to_owned(), value))
     }
 
     fn ensure_fn_call(&mut self, item_id: &str) -> &mut AccFnCall {
         self.fn_calls.entry(item_id.to_string()).or_default()
     }
 
-    fn parse_fn_call_item(&mut self, item_id: &str, item: &Value) {
-        let entry = self.ensure_fn_call(item_id);
-
-        // Different upstreams use either `call_id` or overload `id`.
-        if entry.call_id.is_none() {
-            entry.call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-
-        if entry.name.is_none() {
-            entry.name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-        }
-
-        // Treat `output_item.added` arguments as a snapshot/seed (not a delta).
-        // Some upstreams also send `function_call_arguments.delta` and a full
-        // arguments snapshot at `output_item.done`; blindly appending here can
-        // duplicate JSON and break downstream tool arg parsing.
-        if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-            if !args.is_empty() && entry.arguments.is_empty() {
-                entry.arguments = args.to_string();
-                entry.seeded_from_snapshot = true;
+    fn function_call_fields(
+        &self,
+        item: &Value,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        #[cfg(feature = "litellm-wire-types")]
+        if self.litellm_wire_types {
+            use bamboo_litellm_llms_types::formats::responses::ResponsesFunctionCall;
+            use serde::Deserialize;
+            if let Ok(call) = ResponsesFunctionCall::deserialize(item) {
+                // A gateway can overload id when the call_id key is absent.
+                let id = if item.get("call_id").is_some() {
+                    call.call_id
+                } else {
+                    call.id
+                };
+                return (id, call.name, call.arguments);
             }
         }
+        (
+            item.get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            item.get("name").and_then(Value::as_str).map(str::to_owned),
+            item.get("arguments")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
     }
 
-    fn apply_done_fn_call_item(&mut self, item_id: &str, item: &Value) {
+    fn apply_fn_call_item(&mut self, item_id: &str, item: &Value, done: bool) {
+        let (call_id, name, arguments) = self.function_call_fields(item);
         let entry = self.ensure_fn_call(item_id);
-
         if entry.call_id.is_none() {
-            entry.call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            entry.call_id = call_id;
         }
-
         if entry.name.is_none() {
-            entry.name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            entry.name = name;
         }
-
-        // `output_item.done` is authoritative when it includes full arguments.
-        if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-            if !args.is_empty() {
-                entry.arguments = args.to_string();
+        // "added" is a snapshot seed. A non-empty "done" payload is authoritative.
+        if let Some(args) =
+            arguments.filter(|args| !args.is_empty() && (done || entry.arguments.is_empty()))
+        {
+            entry.arguments = args;
+            if !done {
+                entry.seeded_from_snapshot = true;
             }
         }
     }
@@ -1482,7 +1498,7 @@ impl ResponsesSseParser {
             return None;
         }
 
-        self.apply_done_fn_call_item(item_key.as_str(), item);
+        self.apply_fn_call_item(item_key.as_str(), item, true);
         let call = self.finalize_tool_call(item_key.as_str())?;
         self.mark_tool_call_emitted(item_key.as_str(), call.id.as_str(), output_index);
         Some(LLMChunk::ToolCalls(vec![call]))
@@ -2295,7 +2311,7 @@ impl ResponsesSseParser {
                             .or_else(|| v.get("item_id").and_then(|id| id.as_str()))
                             .unwrap_or("");
                         if !item_id.is_empty() {
-                            self.parse_fn_call_item(item_id, item);
+                            self.apply_fn_call_item(item_id, item, false);
                         }
                     }
                 }
@@ -2407,12 +2423,11 @@ impl ResponsesSseParser {
     /// in the same frame; returning a vector keeps all of them without deferring
     /// state to a later event that may never arrive.
     pub fn handle_event_multi(&mut self, event: &str, data: &str) -> Result<Vec<LLMChunk>> {
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
+        let Some((event_type, v)) = self.decode_event(event, data) else {
             // Be lenient: some upstreams occasionally send non-JSON keepalives.
             return Ok(Vec::new());
         };
 
-        let event_type = self.event_type(event, &v).to_string();
         if self.terminal_seen {
             return Ok(Vec::new());
         }
@@ -5098,8 +5113,15 @@ mod tests {
         volatile_a.id = "tail-a".to_string();
         let mut volatile_b = Message::user("volatile B");
         volatile_b.id = "tail-b".to_string();
-        let plan = PromptCachePlan {
+        // Anthropic-only rolling boundaries must never become Responses item
+        // annotations, even when explicit Responses caching is enabled.
+        let mut plan = PromptCachePlan {
             breakpoint_message_ids: vec!["stable".to_string()],
+            anthropic_history: Some(crate::cache::AnthropicHistoryCache {
+                newest_message_id: volatile_a.id.clone(),
+                previous_message_id: None,
+                external_memory_message_id: None,
+            }),
             ..Default::default()
         };
 
@@ -5113,6 +5135,7 @@ mod tests {
             None,
             Some(&plan),
         );
+        plan.anthropic_history.as_mut().unwrap().newest_message_id = volatile_b.id.clone();
         let second = build_responses_body(
             "gpt-5.6",
             &[stable, volatile_b],
@@ -5130,6 +5153,8 @@ mod tests {
             "explicit"
         );
         assert_ne!(first["input"][1], second["input"][1]);
+        assert_eq!(count_responses_explicit_breakpoints(&first["input"]), 1);
+        assert_eq!(count_responses_explicit_breakpoints(&second["input"]), 1);
     }
 
     #[test]

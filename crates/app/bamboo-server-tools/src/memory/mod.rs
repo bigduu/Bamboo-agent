@@ -8,10 +8,11 @@ use bamboo_agent_core::Session;
 use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
 use bamboo_memory::memory_store::{
     normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
-    MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
-    MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES,
-    MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS,
-    MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
+    DurableMemoryType, MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore,
+    DEFAULT_QUERY_LIMIT, MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS,
+    MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS,
+    MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT,
+    MAX_RETRIEVAL_TERM_CHARS,
 };
 use bamboo_projects::ProjectStore;
 use bamboo_tools::tools::session_memory::{
@@ -39,6 +40,34 @@ pub struct MemoryTool {
 struct ResolvedMemoryAccess {
     store: MemoryStore,
     project_key: Option<String>,
+}
+
+impl ResolvedMemoryAccess {
+    async fn maintenance_source(
+        &self,
+        id: &str,
+        error_context: &str,
+    ) -> Result<Option<(MemoryScope, DurableMemoryType)>, ToolError> {
+        // Resolve through the same authorized locator order as the mutation.
+        // An assigned Project alone does not make a Global source Project-scoped.
+        self.store
+            .get_memory(id, self.project_key.as_deref())
+            .await
+            .map(|source| source.map(|doc| (doc.frontmatter.scope, doc.frontmatter.r#type)))
+            .map_err(|error| ToolError::Execution(format!("{error_context}: {error}")))
+    }
+}
+
+fn validate_new_durable_type(
+    scope: MemoryScope,
+    memory_type: DurableMemoryType,
+) -> Result<(), ToolError> {
+    if scope == MemoryScope::Global && memory_type == DurableMemoryType::Project {
+        return Err(ToolError::InvalidArguments(
+            "Project-typed memory requires Project or an assigned Section scope".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn bound_retrieval_metadata(doc: &mut DurableMemoryDocument) -> bool {
@@ -590,12 +619,14 @@ impl Tool for MemoryTool {
                 let memory_access = self
                     .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
+                let memory_type = Self::parse_type(&r#type)?;
+                validate_new_durable_type(scope, memory_type)?;
                 let doc = memory_access
                     .store
                     .write_memory_with_retrieval(
                         scope,
                         memory_access.project_key.as_deref(),
-                        Self::parse_type(&r#type)?,
+                        memory_type,
                         &title,
                         &content,
                         &tags,
@@ -802,10 +833,23 @@ impl Tool for MemoryTool {
                         entities: piece.entities,
                     });
                 }
+                let id = id.trim();
+                let missing = || ToolError::Execution(format!("memory not found: {id}"));
+                let (scope, source_type) = memory_access
+                    .maintenance_source(id, "Failed to split memory")
+                    .await?
+                    .ok_or_else(missing)?;
+                // Jiandu resolves omitted types from the source. Validate the
+                // whole batch and pass the approved effective types explicitly.
+                for piece in &mut split_pieces {
+                    let memory_type = piece.r#type.unwrap_or(source_type);
+                    validate_new_durable_type(scope, memory_type)?;
+                    piece.r#type = Some(memory_type);
+                }
                 let Some(result) = memory_access
                     .store
                     .split_memory_with_retrieval(
-                        id.trim(),
+                        id,
                         memory_access.project_key.as_deref(),
                         &split_pieces,
                         &retrieval,
@@ -817,10 +861,7 @@ impl Tool for MemoryTool {
                         ToolError::Execution(format!("Failed to split memory: {error}"))
                     })?
                 else {
-                    return Err(ToolError::Execution(format!(
-                        "memory not found: {}",
-                        id.trim()
-                    )));
+                    return Err(missing());
                 };
                 Ok(ToolResult {
                     success: true,
@@ -942,13 +983,23 @@ impl Tool for MemoryTool {
                 let memory_access = self
                     .resolve_memory_access(project_key.as_deref(), &ctx, None)
                     .await?;
+                let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
+                let missing =
+                    || ToolError::Execution("one or more source memories not found".to_string());
+                // Jiandu inherits from the first distinct source. The first
+                // requested ID is still first when duplicate IDs are removed.
+                let (scope, source_type) = memory_access
+                    .maintenance_source(&ids[0], "Failed to consolidate memories")
+                    .await?
+                    .ok_or_else(missing)?;
+                let memory_type = r#type.unwrap_or(source_type);
+                validate_new_durable_type(scope, memory_type)?;
                 let merged = bamboo_memory::memory_store::MemorySplitPiece {
                     title,
-                    r#type,
+                    r#type: Some(memory_type),
                     content,
                     tags,
                 };
-                let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
                 let Some(result) = memory_access
                     .store
                     .consolidate_memories_with_retrieval(
@@ -964,9 +1015,7 @@ impl Tool for MemoryTool {
                         ToolError::Execution(format!("Failed to consolidate memories: {error}"))
                     })?
                 else {
-                    return Err(ToolError::Execution(
-                        "one or more source memories not found".to_string(),
-                    ));
+                    return Err(missing());
                 };
                 Ok(ToolResult {
                     success: true,

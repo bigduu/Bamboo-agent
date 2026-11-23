@@ -1,13 +1,37 @@
 {
   "release": {
-    "version": "0.3.2",
-    "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.3.2/jiandu-plugin-v0.3.2.tar.gz",
-    "sha256": "6c7ccbb36dd4f677ae50ea52019fe68ac9af977aa2108e97d39e88c5c2952ddd",
-    "manifest_sha256": "82c75bc77e4d7fcaa3d28229fd85ce193e57e8b213833ffd6ec6135d8273d33c",
+    "version": "0.5.0",
+    "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.5.0/jiandu-plugin-v0.5.0.tar.gz",
+    "sha256": "1b8675a8154e77d4d101a68badd5ec5b0b865e1fa9fbaec5e5954f84f1f11413",
+    "manifest_sha256": "73b05976dacbfab8c134c0526f598e78f77b8c669efd24795f929e5b8823b1c3",
     "executable_sha256": {
-      "macos": "ab29ec0bd1127daa85a0452868f8e06df41a87254888159a1cd3e9c679af7fbb",
-      "windows": "8a1b4b24a42f49ba4a24d061175c8c5106f7e8c3ab62ef6045b81ebc0ddd0e1e",
-      "linux": "99fb11c74776363aeeb15abf203fe3c04260a1a15768f18db7054e7d39e98c7c"
+      "macos": "8b90ca66b9afb44242a77f66a36c0cfa4c4f3ccb76be27362ceaf7afca3a66df",
+      "windows": "d109ea2f7f8c9dadf0df067b1a6576ea134416e41675931038d0e8e863d265cf",
+      "linux": "05618947ccb408f2772d25567af9d32d340c93e62b22211c773dd788753433db"
     }
-  }
+  },
+  "legacy_releases": [
+    {
+      "version": "0.4.0",
+      "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.4.0/jiandu-plugin-v0.4.0.tar.gz",
+      "sha256": "bee190c47afb42d07e6d31d1c6469db6ee190a5f182a14d39af2925cc3ec3553",
+      "manifest_sha256": "297dd2f0c1eec4335e5a940d13dafe0f4bf24e9bb04641f8365241e3f1e8872c",
+      "executable_sha256": {
+        "macos": "94074b770d2412687fa466ba9940fc2dc98af87805fb9be4f2acee3e2bbe4b6e",
+        "windows": "396890762135cd253b507fae13d2b23cb8fe6d7696678725d0dcac6384277e04",
+        "linux": "188d945982f0594e92b1d7a0bd6254924c3e04d5c6cab2d4a098b6d48d109b80"
+      }
+    },
+    {
+      "version": "0.3.2",
+      "manifest_url": "https://github.com/bigduu/Jiandu/releases/download/v0.3.2/jiandu-plugin-v0.3.2.tar.gz",
+      "sha256": "6c7ccbb36dd4f677ae50ea52019fe68ac9af977aa2108e97d39e88c5c2952ddd",
+      "manifest_sha256": "82c75bc77e4d7fcaa3d28229fd85ce193e57e8b213833ffd6ec6135d8273d33c",
+      "executable_sha256": {
+        "macos": "ab29ec0bd1127daa85a0452868f8e06df41a87254888159a1cd3e9c679af7fbb",
+        "windows": "8a1b4b24a42f49ba4a24d061175c8c5106f7e8c3ab62ef6045b81ebc0ddd0e1e",
+        "linux": "99fb11c74776363aeeb15abf203fe3c04260a1a15768f18db7054e7d39e98c7c"
+      }
+    }
+  ]
 }

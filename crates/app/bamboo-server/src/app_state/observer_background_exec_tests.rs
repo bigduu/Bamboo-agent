@@ -3,6 +3,7 @@ use bamboo_domain::{SessionMessageEnvelope, SupervisedRootOutcomeResult};
 
 pub(super) const INPUT: &str = "Verify the held background command and report its result.";
 const COMMAND: &str = "start-managed-background-exec";
+const COMMAND_WAIT: &str = "wait-for-managed-background-exec";
 const OUTPUT: &str = "managed-background-exec-finished";
 const RELEASE_FILE: &str = "managed-exec-release";
 const CRASH_STAGE: &str = "after-native-exec-final";
@@ -44,8 +45,15 @@ pub(super) async fn stream(probe: &Probe, messages: &[Message]) -> Result<LLMStr
         let data = instruction.data.unwrap();
         assert_eq!(data["status"], "completed");
         assert_eq!(data["exit_code"], 0);
+        let receipt = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(COMMAND_WAIT))
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
+        assert_eq!(receipt["status"], "wait_requested");
         let result: Value = serde_json::from_str(data["result"].as_str().unwrap()).unwrap();
         assert_eq!(result["output"], OUTPUT);
+        assert_eq!(receipt["session_id"], data["exec_session_id"]);
         LLMChunk::Token(format!(
             "<!-- bamboo-handoff:v1 -->\n- **Task** Verify held command\n- **Conclusion** {HANDOFF_HEAD}\n- **Evidence** `{HANDOFF_EVIDENCE}`\n- **Risk** {HANDOFF_RISK}\n<!-- /bamboo-handoff:v1 -->"
         ))
@@ -58,25 +66,12 @@ pub(super) async fn stream(probe: &Probe, messages: &[Message]) -> Result<LLMStr
         assert_eq!(started["status"], "running");
         assert!(!messages
             .iter()
-            .any(|message| { message.tool_call_id.as_deref() == Some("quiet-background-0") }));
-        // Age the actual tool's monotonic observations. The process stays
-        // held on the filesystem gate throughout the normal poll pipeline.
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(90)).await;
-        tokio::time::resume();
-        LLMChunk::ToolCalls(
-            (0..8)
-                .map(|index| {
-                    tool(
-                        format!("quiet-background-{index}"),
-                        "write_stdin",
-                        json!({
-                            "session_id":handle, "chars":"", "yield_time_ms":250,
-                        }),
-                    )
-                })
-                .collect(),
-        )
+            .any(|message| message.tool_call_id.as_deref() == Some(COMMAND_WAIT)));
+        LLMChunk::ToolCalls(vec![tool(
+            COMMAND_WAIT.into(),
+            "SubAgent",
+            json!({"intent":"wait","target":handle}),
+        )])
     } else {
         let gate = probe
             .diagnostic_home
@@ -120,8 +115,6 @@ async fn worker_before_delivery() {
     ).await;
     assert_eq!(admitted["notify_on_material_event"], true);
 
-    // The real quiet poll advances Tokio time; keep this fixture's outer
-    // deadline on wall time while waiting for the actual Actor checkpoint.
     let deadline = std::time::Instant::now() + WAIT;
     let (original_run, handle) = loop {
         let source = load(&f.state, ROOT_A).await;
@@ -153,8 +146,20 @@ async fn worker_before_delivery() {
             .status(),
         "running"
     );
-    drive_material_notices(&f, 1).await;
+    let mut source = load(&f.state, ROOT_A).await;
+    source.add_message(Message::assistant("Later transcript entry.", None));
+    assert!(
+        bamboo_orchestration::managed_session::notification_candidates(&source)
+            .unwrap()
+            .is_empty(),
+        "a later append must not turn the same wait into a notification"
+    );
     settle_material_notices(&f).await;
+    assert_eq!(
+        f.probe.parent_calls.load(Ordering::SeqCst),
+        0,
+        "an owned command wait must keep the Supervisor idle"
+    );
 
     std::fs::write(&gate.0, b"release").unwrap();
     let source = settled(&f.state, ROOT_A).await;
@@ -200,7 +205,7 @@ async fn worker_before_delivery() {
         .unwrap());
     let final_message = terminal.verified_final_message(&source).unwrap();
     assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
 
     let marker = std::path::PathBuf::from(std::env::var_os(MARKER_ENV).unwrap());
     write_crash_marker(

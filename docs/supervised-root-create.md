@@ -23,20 +23,20 @@ Project binding or permission is automatically changed.
 The worker is a new Ordinary Root. Standard is the default. An observed
 Supervisor can select `thinking_mode: "ultra"` in either `spawn_session` or
 `session_control create`. The first turn uses the ordinary Ultra tool catalog,
-including direct reads and edits and delegation of shell work to SubAgents.
+including direct reads, edits, and shell execution subject to its permissions.
 Keep the selected mode in the exact request when retrying a creation.
 
 The worker uses the same global defaults and Project context as `POST /sessions`.
-When the owner confirms Auto for dispatches on the Supervisor, fresh independent
-execution Sessions start in Auto. The revisioned Supervisor profile stores
-this distinct consent through `supervisor_auto_dispatch: true` together with
-`permission_mode: "auto"`. The plain Auto choice applies to the Supervisor Session.
-Bypass is the default for independent execution Sessions. It skips
-ordinary approvals and retains forced confirmations for shell operations such
-as `source` and `sudo`. The initial permission mode is saved with the creation
-reservation and reused on retry. The reservation holds the same physical
-profile lock as consent changes, so each new dispatch uses the consent valid
-when its reservation commits. Each existing Session owns its permission mode.
+A new independent execution Session inherits the dispatching Supervisor's
+current permission mode, whether Default, Bypass or Auto. The owner updates
+`permission_mode` to change the setting used for subsequent dispatches.
+Supervisor summaries advertise this behavior with
+`supervisor_dispatch_inherits_permission_mode: true`. Clients can send
+`expected_supervisor_dispatch_inheritance` with the current ETag to verify
+the presented scope when changing modes across a backend upgrade.
+The reservation reads and stores the mode under the same physical profile
+lock as permission updates. An exact retry uses that stored mode. Each worker
+has its own permission mode after creation.
 
 The new Root has its own history, prompt, model, workspace and Ordinary Root
 authority. A bounded SubAgent creates a Child, and formal Work/Ticket uses the

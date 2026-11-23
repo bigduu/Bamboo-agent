@@ -29,9 +29,9 @@ use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
 };
 use bamboo_domain::{
-    AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason, ResponseOccurrence,
-    RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
-    MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    AgentHookPoint, AgentRuntimeState, ContextBlockType, HookPayload, ModelContextResetReason,
+    ResponseOccurrence, RetrievalWindowCheckpointOutcome, TokenUsageBreakdown,
+    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::LLMProvider;
 use base64::Engine as _;
@@ -413,10 +413,21 @@ fn enforce_model_context_ledger_retention(
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
 ) -> ModelContextLedgerUsage {
-    let usage = model_context_ledger_usage(session, counter);
     let Some(state) = session.model_context_state.as_ref() else {
-        return usage;
+        return ModelContextLedgerUsage::default();
     };
+    // Legacy epochs include memory snapshots that the current request will
+    // discard. Reset before reserving their tokens for compression or fitting.
+    if state
+        .events
+        .iter()
+        .any(|event| event.block_type == ContextBlockType::ExternalMemory)
+    {
+        session.reset_model_context_epoch(ModelContextResetReason::CacheScopeChanged);
+        return ModelContextLedgerUsage::default();
+    }
+
+    let usage = model_context_ledger_usage(session, counter);
     let token_limit = budget
         .max_request_input_tokens()
         .saturating_mul(MODEL_CONTEXT_RETENTION_PERCENT)
@@ -1768,6 +1779,11 @@ pub(crate) async fn stage_user_context_compaction(
             "Lossy compaction is unavailable for required one-shot context".into(),
         ));
     }
+    // Idle compaction has no round refresh to establish the current Project's
+    // memory. Do not use a saved rendering even for preflight accounting.
+    session
+        .metadata
+        .remove(super::super::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY);
     let id = session.id.clone();
     let budget =
         super::token_budget::resolve_token_budget(session, config, model, provider.as_ref()).await;
@@ -2116,6 +2132,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             super::stream_execution::build_exec_session_continuation_context_block(
                 session,
                 tool_schemas,
+                config.permission_mode.unwrap_or_default(),
             )
             .map(|block| counter.count_message(&block.render_runtime_context_message()))
             .unwrap_or(0),
@@ -2464,8 +2481,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // provider requests. Any failed map/reduce stage must surface without
     // substituting a heuristic summary, otherwise the caller could archive a
     // candidate set after only part of the source was successfully processed.
-    // The mid-turn caller still swallows this error as best-effort (#238);
-    // pre-turn/overflow callers retain the unchanged session and can retry.
+    // The mid-turn caller treats this as best-effort (#238). Pre-turn may
+    // continue after an empty automatic summary if the whole prompt still fits.
     let summarizer = LlmSummarizer::new(
         Arc::clone(summary_provider),
         summary_model.to_string(),
@@ -2476,7 +2493,12 @@ async fn maybe_apply_summary_context_compression_with_budget(
     .with_context_blocks(if message_summary {
         Vec::new()
     } else {
+        // Current external memory is counted for normal inference, while
+        // copying it into a durable summary would defeat later withdrawal.
         compression_context_blocks
+            .into_iter()
+            .filter(|block| block.block_type != bamboo_domain::ContextBlockType::ExternalMemory)
+            .collect()
     })
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
@@ -2510,7 +2532,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
                         progress.stage_index,
                         progress.stage_count,
                         progress.estimated_input_tokens,
-                        progress.requested_output_tokens,
+                        progress.max_output_tokens,
                         progress.safe_request_tokens,
                         progress.model_context_tokens,
                     );
@@ -2533,7 +2555,8 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 "Bounded context compression failed before commit"
             );
             let (status, error) = match error {
-                BudgetError::EmptySummaryResponse { .. } => (
+                BudgetError::EmptySummaryResponse { .. }
+                | BudgetError::IncompleteSummaryResponse { .. } => (
                     "failed_empty_summary".to_string(),
                     AgentError::EmptyContextSummary,
                 ),
@@ -3267,6 +3290,7 @@ pub(super) async fn prepare_round_context(
 
     let counter = TiktokenTokenCounter::default();
     let mut boundary_prepared = None;
+    let mut automatic_summary_was_empty = false;
 
     if retrieval_window_enabled {
         if session.force_manual_compression.is_some() {
@@ -3396,25 +3420,33 @@ pub(super) async fn prepare_round_context(
                 Err(error) => return Err(error),
             }
         }
-    } else if maybe_apply_summary_context_compression_with_budget(
-        session,
-        config,
-        model_name,
-        session_id,
-        tool_schemas,
-        llm,
-        &budget,
-        event_tx,
-        "pre-turn",
-        None,
-        Some(&mut boundary_prepared),
-    )
-    .await?
-    {
-        tracing::debug!(
-            "[{}] Recomputing prepared context after forced compression fallback",
-            session_id
-        );
+    } else {
+        let automatic = session.force_manual_compression.is_none();
+        match maybe_apply_summary_context_compression_with_budget(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            &budget,
+            event_tx,
+            "pre-turn",
+            None,
+            Some(&mut boundary_prepared),
+        )
+        .await
+        {
+            Ok(true) => tracing::debug!(
+                "[{}] Recomputing prepared context after forced compression fallback",
+                session_id
+            ),
+            Ok(false) => {}
+            Err(AgentError::EmptyContextSummary) if automatic => {
+                automatic_summary_was_empty = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     // Compression may have reset/coalesced the ledger, so measure it again at
@@ -3444,6 +3476,11 @@ pub(super) async fn prepare_round_context(
     );
 
     loop {
+        // Failed compaction never authorizes dropping messages from this
+        // request. Check both the initial fit and every exact provider refit.
+        if automatic_summary_was_empty && prepared_context.truncation_occurred {
+            return Err(AgentError::EmptyContextSummary);
+        }
         // Reconciliation may append snapshots that did not exist when the
         // durable ledger was measured above, especially after retention or
         // hard-truncation starts a fresh epoch. Project the exact final IR on a
