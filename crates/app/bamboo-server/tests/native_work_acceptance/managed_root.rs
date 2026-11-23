@@ -207,15 +207,13 @@ async fn managed_work_root_submits_owned_result(ultra: bool) {
     let saved = owner_post!(
         app,
         "/api/v1/bamboo/config",
-        &json!({ "features": { "work_execution": {
-            "reasoning_effort": "xhigh", "ultra_by_default": ultra
-        } } }),
+        &json!({ "features": {
+            "work_ultra_by_default": ultra,
+            "work_execution": { "reasoning_effort": "xhigh" }
+        } }),
         StatusCode::OK
     );
-    assert_eq!(
-        saved["features"]["work_execution"]["ultra_by_default"],
-        ultra
-    );
+    assert_eq!(saved["features"]["work_ultra_by_default"], ultra);
     let readback: Value = test::call_and_read_body_json(
         &app,
         test::TestRequest::get()
@@ -223,9 +221,10 @@ async fn managed_work_root_submits_owned_result(ultra: bool) {
             .to_request(),
     )
     .await;
+    assert_eq!(readback["features"]["work_ultra_by_default"], ultra);
     assert_eq!(
         readback["features"]["work_execution"],
-        saved["features"]["work_execution"]
+        json!({ "reasoning_effort": "xhigh", "max_parallel": null })
     );
     let owner_principal = Principal::User {
         user_id: "host-owner".into(),
@@ -349,13 +348,10 @@ async fn managed_work_root_submits_owned_result(ultra: bool) {
         let saved = owner_post!(
             app,
             "/api/v1/bamboo/config",
-            &json!({ "features": { "work_execution": { "ultra_by_default": false } } }),
+            &json!({ "features": { "work_ultra_by_default": false } }),
             StatusCode::OK
         );
-        assert_eq!(
-            saved["features"]["work_execution"]["ultra_by_default"],
-            false
-        );
+        assert_eq!(saved["features"]["work_ultra_by_default"], false);
         assert_eq!(
             saved["features"]["work_execution"]["reasoning_effort"],
             "xhigh"

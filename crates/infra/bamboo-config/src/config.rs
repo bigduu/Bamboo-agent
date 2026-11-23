@@ -2668,6 +2668,10 @@ pub struct FeatureFlags {
     /// Start new interactive chats in Root Ultra mode.
     #[serde(default)]
     pub chat_ultra_by_default: bool,
+    /// Use the highest supported reasoning tier for new Work. Managed Work
+    /// Roots also start in Ultra thinking mode.
+    #[serde(default)]
+    pub work_ultra_by_default: bool,
     /// Enable the ProviderModelRef system (multi-provider + unified model selection).
     #[serde(default)]
     pub provider_model_ref: bool,
@@ -2684,9 +2688,6 @@ pub struct FeatureFlags {
 pub struct WorkExecutionSettings {
     /// Session override for future Work executions. Auto inherits the model route.
     pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
-    /// Use the model's highest supported tier for new Work. Independent
-    /// managed Roots also start in Ultra thinking mode.
-    pub ultra_by_default: bool,
     /// Maximum occupied Work dispatch slots. None uses the existing scheduler limits.
     pub max_parallel: Option<std::num::NonZeroU32>,
 }

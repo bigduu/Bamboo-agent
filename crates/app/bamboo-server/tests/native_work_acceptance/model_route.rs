@@ -296,7 +296,7 @@ impl Fixture {
         // A replay must not re-resolve the role or create a second run after a config change.
         {
             let mut config = self.state.config.write().await;
-            config.features.work_execution.ultra_by_default = false;
+            config.features.work_ultra_by_default = false;
             config.defaults.as_mut().unwrap().subagent_models.insert(
                 "worker".into(),
                 ProviderModelRef::new("missing-account", "invalid-after-birth"),
@@ -392,8 +392,7 @@ async fn work_child_uses_the_ultra_effort_without_changing_root_authority() {
         .write()
         .await
         .features
-        .work_execution
-        .ultra_by_default = true;
+        .work_ultra_by_default = true;
     fixture
         .run_selected(low, low, Some(ReasoningEffort::Max))
         .await;

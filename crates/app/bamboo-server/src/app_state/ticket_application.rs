@@ -888,11 +888,12 @@ impl TicketApplication {
             }
             return self.ensure_managed_work(&service, key, spec).await;
         }
-        let (enabled, work_execution) = {
+        let (enabled, reasoning_effort, highest_reasoning) = {
             let config = self.config.read().await;
             (
                 config.features.ticket_dispatch,
-                config.features.work_execution.clone(),
+                config.features.work_execution.reasoning_effort,
+                config.features.work_ultra_by_default,
             )
         };
         if enabled {
@@ -925,8 +926,8 @@ impl TicketApplication {
                     worker_role: "worker".into(),
                     workspace: self.workspace.clone(),
                     max_rounds,
-                    reasoning_effort: work_execution.reasoning_effort,
-                    highest_reasoning: work_execution.ultra_by_default,
+                    reasoning_effort,
+                    highest_reasoning,
                     admission_fence: fence.cloned(),
                 },
                 Box::pin(async {

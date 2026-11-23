@@ -38,7 +38,7 @@ ordinary `reasoning_effort` separately.
 - Chat and Work each have a Host-owned default for new sessions. The provider
   receives the selected route's native reasoning tier.
 
-Supervisor Work uses `features.work_execution.ultra_by_default`. A managed
+Supervisor Work uses `features.work_ultra_by_default`. A managed
 Work Root captures the mode in its dispatch intent and uses the tools allowed
 by its Work contract. A Work Child captures the highest-tier selection at
 creation and uses it for model requests under its existing Child authority.

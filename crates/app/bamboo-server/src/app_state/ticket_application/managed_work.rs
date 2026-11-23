@@ -104,8 +104,7 @@ impl TicketApplication {
                 host.fast_model(&config)?,
                 config
                     .features
-                    .work_execution
-                    .ultra_by_default
+                    .work_ultra_by_default
                     .then_some(bamboo_domain::RootThinkingMode::Ultra),
             )
         };
