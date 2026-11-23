@@ -11,3 +11,4 @@ pub(crate) mod usage;
 pub(crate) use reasoning::parse_reasoning_effort;
 
 pub(crate) mod activation;
+pub(crate) mod forward_headers;
