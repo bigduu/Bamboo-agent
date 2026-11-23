@@ -1,5 +1,6 @@
 use actix_web::web;
 
+use crate::handlers::llm_compat::forward_headers;
 use crate::handlers::{anthropic, gemini, openai, settings};
 
 /// Configure OpenAI-compatible API routes with an explicit prefix (/openai/v1/*)
@@ -10,6 +11,7 @@ use crate::handlers::{anthropic, gemini, openai, settings};
 pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/openai/v1")
+            .wrap(actix_web::middleware::from_fn(forward_headers::forward))
             .wrap(actix_web::middleware::from_fn(
                 settings::enforce_access_password_middleware,
             ))
@@ -26,6 +28,7 @@ pub fn openai_prefixed_routes(cfg: &mut web::ServiceConfig) {
 pub fn anthropic_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/anthropic/v1")
+            .wrap(actix_web::middleware::from_fn(forward_headers::forward))
             .wrap(actix_web::middleware::from_fn(
                 settings::enforce_access_password_middleware,
             ))
@@ -39,6 +42,7 @@ pub fn anthropic_routes(cfg: &mut web::ServiceConfig) {
 pub fn gemini_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/gemini/v1beta")
+            .wrap(actix_web::middleware::from_fn(forward_headers::forward))
             .wrap(actix_web::middleware::from_fn(
                 settings::enforce_access_password_middleware,
             ))
