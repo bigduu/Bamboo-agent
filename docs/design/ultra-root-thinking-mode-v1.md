@@ -35,8 +35,13 @@ ordinary `reasoning_effort` separately.
   historical committed receipt does not describe the current selection.
 - Generic PATCH rejects `thinking_mode` presence, including null/invalid values,
   before any write. It cannot bypass the mode operation.
-- `reasoning_effort: "ultra"` remains invalid. Global/provider/model-role defaults
-  cannot enable Root authority; product mode is never a provider parameter.
+- Chat and Work each have a Host-owned default for new sessions. The provider
+  receives the selected route's native reasoning tier.
+
+Supervisor Work uses `features.work_ultra_by_default`. A managed
+Work Root captures the mode in its dispatch intent and uses the tools allowed
+by its Work contract. A Work Child captures the highest-tier selection at
+creation and uses it for model requests under its existing Child authority.
 
 No second persisted field, proof version, journal or stage protocol is added.
 The existing birth token, terminal epoch/receipt and dispatch fences are kept.

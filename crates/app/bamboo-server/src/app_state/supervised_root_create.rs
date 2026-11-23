@@ -218,18 +218,19 @@ impl SupervisedRootCreator {
         service: &bamboo_tickets::TicketService,
         spec: &bamboo_tickets::DispatchSpec,
         dispatch: &TicketDispatchBinding,
-        request: SupervisedRootCreateRequest,
+        mut request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
+        let target = spec
+            .managed_root
+            .as_ref()
+            .ok_or_else(|| ToolError::Execution("managed Work target missing".into()))?;
+        request.thinking_mode = target.thinking_mode;
         request.validate()?;
         if request.project_id.is_none() {
             return Err(ToolError::InvalidArguments(
                 "managed Work Root creation requires a Project and workspace".into(),
             ));
         }
-        let target = spec
-            .managed_root
-            .as_ref()
-            .ok_or_else(|| ToolError::Execution("managed Work target missing".into()))?;
         let authority = CreationAuthority::Supervisor {
             reference: target
                 .supervisor()
@@ -270,14 +271,13 @@ impl SupervisedRootCreator {
         managed: Option<&ManagedRootCreation>,
     ) -> Result<ToolResult, ToolError> {
         if request.thinking_mode == Some(RootThinkingMode::Ultra)
-            && (managed.is_some()
-                || !matches!(
-                    authority,
-                    CreationAuthority::Supervisor {
-                        original_caller: Some(_),
-                        ..
-                    }
-                ))
+            && !matches!(
+                authority,
+                CreationAuthority::Supervisor {
+                    original_caller: Some(_),
+                    ..
+                }
+            )
         {
             return Err(ToolError::InvalidArguments(
                 "Ultra creation requires an observed Supervisor creating an independent execution Session".into(),

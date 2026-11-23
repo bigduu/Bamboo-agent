@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 const TERMINAL_SOURCE_KEY: &str = "runtime.child_completion_source_v1";
+const MAX_PENDING_TERMINAL_SOURCE_BYTES: usize = 8192;
 
 /// A seal stored by the final runtime writer in the existing Session commit.
 /// It is not a second outcome store: later input/output makes it unavailable.
@@ -200,7 +201,7 @@ impl ChildCompletionSource {
         let Some(raw) = session.metadata.get(TERMINAL_SOURCE_KEY) else {
             return Ok(false);
         };
-        if raw.len() > 8192 {
+        if raw.len() > MAX_PENDING_TERMINAL_SOURCE_BYTES {
             return Err("Pending Child delivery source exceeds its size bound".into());
         }
         let pending = match serde_json::from_str::<PendingDeliverySource>(raw) {
@@ -229,6 +230,13 @@ impl ChildCompletionSource {
         session.metadata.contains_key(TERMINAL_SOURCE_KEY)
     }
 
+    /// Observe a record change before validating it against the full transcript.
+    pub(crate) fn replay_record_fingerprint(session: &Session) -> Option<[u8; 32]> {
+        let raw = session.metadata.get(TERMINAL_SOURCE_KEY)?;
+        (raw.len() <= MAX_PENDING_TERMINAL_SOURCE_BYTES)
+            .then(|| Sha256::digest(raw.as_bytes()).into())
+    }
+
     /// A successor must retire an older pending publication before dispatch.
     /// Unknown/malformed records stay fail-closed rather than being erased.
     pub(crate) fn retire_pending_delivery_for_successor(
@@ -238,7 +246,7 @@ impl ChildCompletionSource {
         let retire = session
             .metadata
             .get(TERMINAL_SOURCE_KEY)
-            .filter(|raw| raw.len() <= 8192)
+            .filter(|raw| raw.len() <= MAX_PENDING_TERMINAL_SOURCE_BYTES)
             .and_then(|raw| serde_json::from_str::<PendingDeliverySource>(raw).ok())
             .is_some_and(|pending| {
                 pending.pending_confirmation.activation_run_id != activation_run_id

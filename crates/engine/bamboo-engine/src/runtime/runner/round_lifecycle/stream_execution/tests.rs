@@ -1515,7 +1515,7 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             "text/event-stream",
         ))
-        .expect(5)
+        .expect(8)
         .mount(&server)
         .await;
     let llm: Arc<dyn LLMProvider> = Arc::new(
@@ -1548,10 +1548,18 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
         },
     }];
     let memory_key = crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY;
+    let initial_history = format!(
+        "first history boundary\n{}",
+        "durable history ".repeat(4_000)
+    );
+    let larger_history = format!(
+        "larger history boundary\n{}",
+        "appended history ".repeat(4_000)
+    );
     let mut session = Session::new(frame.session_id, frame.model);
     session.add_message(Message::user("original request"));
     session.add_message(Message::assistant("prior answer", None));
-    session.add_message(Message::user("first history boundary"));
+    session.add_message(Message::user(initial_history.clone()));
     session.task_list = Some(TaskList {
         session_id: session.id.clone(),
         title: "Fixture task".into(),
@@ -1565,7 +1573,7 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
         updated_at: Utc::now(),
     });
 
-    for step in 0..5 {
+    for step in 0..8 {
         if step == 1 {
             // Resume from the serialized ledger without an in-process cache
             // cursor. The prior boundary still has to survive the wide append.
@@ -1592,6 +1600,15 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
             session.add_message(Message::assistant("tool-based answer", None));
             session.add_message(Message::user("new user turn"));
         } else if step == 4 {
+            session.add_message(Message::assistant("second answer", None));
+            session.add_message(Message::user("short append"));
+        } else if step == 5 {
+            session.add_message(Message::assistant("answer before larger append", None));
+            session.add_message(Message::user(larger_history.clone()));
+        } else if step == 6 {
+            session.add_message(Message::assistant("answer after larger append", None));
+            session.add_message(Message::user("latest short append"));
+        } else if step == 7 {
             session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
             session.add_message(Message::user("first request in a new epoch"));
         }
@@ -1622,6 +1639,7 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
 
     let requests = server.received_requests().await.unwrap();
     let mut prior_prefix = Vec::new();
+    let mut marked_prefix = Vec::new();
     for (step, request) in requests.iter().enumerate() {
         let body: serde_json::Value = request.body_json().unwrap();
         let blocks = body["messages"]
@@ -1631,9 +1649,12 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
             .flat_map(|message| message["content"].as_array().unwrap())
             .collect::<Vec<_>>();
         let endpoint = match step {
-            0 => "first history boundary",
+            0 => &initial_history,
             1 | 2 => "retained tool output",
             3 => "new user turn",
+            4 => "short append",
+            5 => &larger_history,
+            6 => "latest short append",
             _ => "first request in a new epoch",
         };
         let boundary = blocks
@@ -1663,15 +1684,44 @@ async fn anthropic_wire_reuses_history_across_tool_rounds_and_memory_updates() {
                 content
             })
             .collect::<Vec<_>>();
-        if step == 4 {
+        if step == 7 {
             assert!(blocks
                 .iter()
-                .any(|block| block["text"] == "new user turn"
+                .any(|block| block["text"] == "latest short append"
                     && block.get("cache_control").is_none()));
         } else {
             assert!(prefix.starts_with(&prior_prefix));
-            if !prior_prefix.is_empty() {
+            if !prior_prefix.is_empty() && step != 5 {
                 assert_eq!(blocks[prior_prefix.len() - 1]["cache_control"]["ttl"], "1h");
+            }
+        }
+        if step < 7 {
+            // A compatible gateway can hash this prefix including the marker
+            // properties. Comparing content with those properties removed
+            // would miss the invalidation we are guarding against.
+            let checkpoint = if step < 5 {
+                &initial_history
+            } else {
+                &larger_history
+            };
+            let checkpoint_idx = blocks
+                .iter()
+                .position(|block| block["text"].as_str() == Some(checkpoint))
+                .expect("history checkpoint on the wire");
+            assert_eq!(
+                blocks[checkpoint_idx]["cache_control"]["ttl"], "1h",
+                "step {step}"
+            );
+            let current =
+                serde_json::to_vec(&(&body["tools"], &body["system"], &blocks[..=checkpoint_idx]))
+                    .unwrap();
+            if step == 0 || step == 5 {
+                marked_prefix = current;
+            } else {
+                assert!(
+                    current == marked_prefix,
+                    "marked wire prefix changed on step {step}"
+                );
             }
         }
         if step == 1 {
