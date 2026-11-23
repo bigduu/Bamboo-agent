@@ -73,9 +73,35 @@ module.exports = { REQUIRED, validateDispatch }
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const FEATURE_CHECKS = ['Validation Source', 'Test', 'E2E Tests', 'Feature Unit and E2E']
-function githubRead(route) {
-  return JSON.parse(require('./crate-release.cjs').command(['gh', 'api', '--hostname', 'github.com',
-    'repos/' + REPOSITORY + '/' + route], { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }))
+const READ_INTERRUPTED = /(?:^|: )(?:unexpected end of JSON input|(?:unexpected )?EOF|TLS handshake timeout|i\/o timeout|connection reset by peer|context deadline exceeded)\s*$/i
+const READ_UNAVAILABLE = /^gh: [^\r\n]*\bHTTP (?:500|502|503|504)\)?\s*$/i
+const READ_DELAYS_MS = [0, 1000, 2000, 4000]
+
+function waitForReadRetry(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function githubRead(route, run = require('./crate-release.cjs').spawnCommand, wait = waitForReadRetry) {
+  const args = ['gh', 'api', '--hostname', 'github.com', '--method', 'GET',
+    'repos/' + REPOSITORY + '/' + route]
+  const options = { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }
+  for (const delay of READ_DELAYS_MS) {
+    if (delay) wait(delay)
+    const last = delay === READ_DELAYS_MS.at(-1)
+    const { error, status, stdout, stderr } = run(args, options)
+    if (error) {
+      if (last || error.code !== 'ETIMEDOUT') throw error
+      continue
+    }
+    const details = stderr || stdout || ''
+    if (!last && status !== 0 && (READ_INTERRUPTED.test(details) || READ_UNAVAILABLE.test(details))) continue
+    assert.equal(status, 0, args.join(' ') + ' failed: ' + details)
+    try {
+      return JSON.parse(stdout)
+    } catch (error) {
+      if (last || !(error instanceof SyntaxError)) throw error
+    }
+  }
 }
 function sourceEvent(env) {
   return JSON.parse(require('node:fs').readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
@@ -214,7 +240,8 @@ function assertFrozenSourceWorkflows(read = file => require('node:fs').readFileS
     assert.deepEqual(events.sort(), [...required].sort(), 'Source retains an old or unknown trigger: ' + file)
   }
 }
-module.exports = { ...module.exports, FEATURE_CHECKS, authorizeFrozenRelease, frozenGuard, authorizeFrozenRecovery, frozenRecoveryGuard, assertFrozenSourceWorkflows }
+module.exports = { ...module.exports, FEATURE_CHECKS, githubRead, authorizeFrozenRelease, frozenGuard,
+  authorizeFrozenRecovery, frozenRecoveryGuard, assertFrozenSourceWorkflows }
 if (require.main === module) {
   if (process.argv[2] === 'source-contract') {
     const source = frozenInputs(process.env, sourceEvent(process.env))
