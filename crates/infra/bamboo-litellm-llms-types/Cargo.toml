@@ -21,7 +21,7 @@ macro_rules_attribute = "0.2.3"
 schemars = { version = "1", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
-serde_with = { version = "=3.21.0", default-features = false, features = ["std", "macros"] }
+serde_with = { version = "=3.24.0", default-features = false, features = ["std", "macros"] }
 strum = { version = "0.28.0", features = ["derive"] }
 
 [dev-dependencies]
