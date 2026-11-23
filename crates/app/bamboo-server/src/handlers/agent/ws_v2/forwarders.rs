@@ -794,6 +794,54 @@ pub(crate) fn spawn_message_forwarder(
     })
 }
 
+/// Side updates use the same socket, with an identity separate from the main
+/// agent stream. A fresh subscription or gap reloads the durable transcript.
+pub(crate) fn spawn_side_chat_forwarder(
+    state: &AppState,
+    source_id: String,
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+) -> tokio::task::JoinHandle<()> {
+    use crate::handlers::agent::side_chat::Update;
+    let mut updates = state.side_chats.subscribe();
+    let mut changes = state.account_sink.subscribe();
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+        let send = |update| {
+            let value = serde_json::to_value(update).expect("side chat updates serialize");
+            send_env(
+                &out,
+                encoding,
+                ServerEnvelope::event(&ch, seq.next(), value),
+            )
+        };
+        if !send(Update::SideChatChanged).await {
+            return;
+        }
+        loop {
+            let update = tokio::select! {
+                update = updates.recv() => match update {
+                    Ok((id, update)) if id == source_id => update,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => Update::SideChatChanged,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                event = changes.recv() => match event {
+                    Ok(event) if event.session_id.as_deref() == Some(&source_id)
+                        && matches!(event.event, AgentEvent::SessionCleared { .. } | AgentEvent::SessionDeleted { .. }) => Update::SideChatChanged,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => Update::SideChatChanged,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            };
+            if !send(update).await {
+                return;
+            }
+        }
+    })
+}
+
 /// Spawn an `agent.{sid}` forwarder.
 ///
 /// Replays the active run's published identity, cached critical state events,

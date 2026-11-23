@@ -32,6 +32,7 @@ pub mod respond;
 pub mod run_output;
 pub mod schedules;
 pub mod sessions;
+pub(crate) mod side_chat;
 pub mod stop;
 pub mod stream;
 pub mod subagent_snapshot;

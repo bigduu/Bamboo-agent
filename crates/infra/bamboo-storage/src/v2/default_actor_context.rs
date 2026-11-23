@@ -759,6 +759,11 @@ impl SessionStoreV2 {
         #[cfg(test)]
         let hook = self.default_write_hook.lock().unwrap().clone();
         Self::default_writer_job(guards, move || {
+            match std::fs::remove_file(directory.join(super::side_chat::SIDE_CHAT_FILE)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             let attachments = directory.join("attachments");
             #[cfg(test)]
             if let Some(hook) = &hook {

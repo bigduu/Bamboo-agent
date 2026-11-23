@@ -856,6 +856,19 @@ async fn subscribe_with_actor_resume(
                 latest_at_start,
             )
         }
+        Channel::Agent(_) if ch.starts_with(crate::handlers::agent::side_chat::CHANNEL_PREFIX) => {
+            let source_id =
+                ch[crate::handlers::agent::side_chat::CHANNEL_PREFIX.len()..].to_owned();
+            if state
+                .session_store
+                .get_index_entry(&source_id)
+                .await
+                .is_none()
+            {
+                return;
+            }
+            forwarders::spawn_side_chat_forwarder(state, source_id, out_tx, encoding, ch.to_owned())
+        }
         Channel::Agent(sid) => {
             // The session must exist; otherwise ignore (parity with the v1
             // events handler's 404, but here we just skip the subscribe).

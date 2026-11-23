@@ -122,6 +122,8 @@ mod scoped_loop_control;
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 mod session_archive;
+mod side_chat;
+pub use side_chat::{SideChatRunLease, SIDE_CHAT_MAX_RECORD_BYTES};
 #[cfg(test)]
 mod session_compatibility_tests;
 pub use session_archive::{
