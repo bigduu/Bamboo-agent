@@ -75,14 +75,25 @@ function extractZip(archive, destination, windows) {
   else execute("unzip", ["-q", archive, "-d", destination]);
 }
 
+function committedBrowserHost(sourceRoot, revision) {
+  const limit = 8 * 1024 ** 2;
+  return new Map(HOST_FILES.map(name => {
+    const entry = execute("git", ["ls-tree", revision, "--", name], { cwd: sourceRoot }).trim();
+    assert.ok(entry.startsWith("100644 blob ") && entry.endsWith(`\t${name}`), `Expected a regular Browser Host asset ${name}`);
+    const bytes = execute("git", ["show", `${revision}:${name}`], { cwd: sourceRoot, encoding: "buffer", maxBuffer: limit });
+    assert.ok(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= limit);
+    return [path.basename(name), bytes];
+  }));
+}
+
 function pack(target, output, sourceRoot = ROOT) {
   const { pins, windows, nodeFolder, nodeArchive, browserArchive, browserUrl, nodeUrl } = releaseInputs(target);
   const sourceRevision = execute("git", ["rev-parse", "HEAD"], { cwd: sourceRoot }).trim();
   assert.match(sourceRevision, /^[a-f0-9]{40}$/);
-  execute("git", ["diff", "--quiet", "HEAD", "--", ...HOST_FILES, "browser-runtime/desktop.lock.json"], { cwd: sourceRoot });
-  const sourceLock = execute("git", ["show", "HEAD:browser-runtime/desktop.lock.json"], { cwd: sourceRoot });
+  const sourceLock = execute("git", ["show", `${sourceRevision}:browser-runtime/desktop.lock.json`], { cwd: sourceRoot });
   assert.deepEqual(JSON.parse(sourceLock), LOCK);
-  const lockedPlaywright = readJson(path.join(sourceRoot, "browser-runtime/package-lock.json")).packages?.["node_modules/playwright-core"];
+  const host = committedBrowserHost(sourceRoot, sourceRevision);
+  const lockedPlaywright = JSON.parse(host.get("package-lock.json")).packages?.["node_modules/playwright-core"];
   assert.equal(lockedPlaywright?.version, LOCK.playwrightCoreVersion);
   assert.equal(lockedPlaywright?.integrity, LOCK.playwrightCoreIntegrity);
 
@@ -114,11 +125,7 @@ function pack(target, output, sourceRoot = ROOT) {
       fs.renameSync(path.join(chromium, "chrome-linux"), browserDir);
       fs.renameSync(path.join(browserDir, "headless_shell"), browser);
     }
-    for (const name of HOST_FILES) {
-      const original = path.join(sourceRoot, name);
-      fileIdentity(original, 8 * 1024 ** 2);
-      fs.copyFileSync(original, path.join(runtime, path.basename(name)));
-    }
+    for (const [name, bytes] of host) fs.writeFileSync(path.join(runtime, name), bytes, { flag: "wx" });
     execute(windows ? "npm.cmd" : "npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-bin-links", "--no-audit", "--no-fund",
       "--registry=https://registry.npmjs.org"], { cwd: runtime, shell: windows });
     const playwright = path.join(runtime, "node_modules/playwright-core");
@@ -158,7 +165,7 @@ function pack(target, output, sourceRoot = ROOT) {
   }
 }
 
-module.exports = { pack, releaseInputs };
+module.exports = { committedBrowserHost, pack, releaseInputs };
 if (require.main === module) {
   const [target, directory] = process.argv.slice(2);
   try {
