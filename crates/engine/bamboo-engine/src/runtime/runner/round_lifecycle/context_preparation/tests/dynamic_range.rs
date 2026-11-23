@@ -593,7 +593,7 @@ async fn assert_summary_reserves_retained_native_image_cost(strategy: ContextMan
     ));
     session.force_manual_compression = Some(String::new());
     let (summary_provider, calls) =
-        bounded_compression_llm_with_limits(BoundedFailureMode::FillFinalBudget, 128_000, 32_000);
+        bounded_compression_llm_with_limits(BoundedFailureMode::FillFinalTarget, 128_000, 32_000);
     let mut config = bounded_compression_config(summary_provider);
     config.summary_target_ratio = 0.50;
     config.context_management.strategy = strategy;
@@ -637,8 +637,11 @@ async fn assert_summary_reserves_retained_native_image_cost(strategy: ContextMan
     );
     let calls = calls.lock().unwrap();
     let terminal = calls.last().unwrap();
-    assert_eq!(terminal.max_output_tokens, event.target_summary_tokens);
-    assert!((1..=6_000).contains(&terminal.max_output_tokens));
+    assert!(terminal.messages[1].content.contains(&format!(
+        "Target approximately {} tokens.",
+        event.target_summary_tokens,
+    )));
+    assert_eq!(terminal.max_output_tokens, 32_000);
     assert!(event.actual_summary_tokens > 1_000);
     assert!(event.fixed_prompt_tokens < 10_000);
 }
