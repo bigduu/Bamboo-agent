@@ -1,0 +1,154 @@
+name: Publish desktop browser runtimes
+run-name: Desktop browser runtimes from Bamboo publisher ${{ github.event.workflow_run.id }}
+
+on:
+  workflow_run:
+    workflows: [Publish Crate]
+    types: [completed]
+    branches: [dev]
+
+permissions:
+  actions: read
+  contents: read
+  checks: read
+
+concurrency:
+  group: bamboo-desktop-browser-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Verify the original executable release
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      ready: ${{ steps.release.outputs.ready }}
+      source: ${{ steps.release.outputs.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Select the exact approved frozen source
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -BI scripts/desktop-runtime-release.py plan
+
+  pack:
+    name: Pack browser runtime (${{ matrix.target }})
+    needs: plan
+    if: needs.plan.outputs.ready == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    outputs:
+      aarch64_apple_darwin: ${{ steps.pack.outputs.aarch64_apple_darwin }}
+      aarch64_pc_windows_msvc: ${{ steps.pack.outputs.aarch64_pc_windows_msvc }}
+      aarch64_unknown_linux_gnu: ${{ steps.pack.outputs.aarch64_unknown_linux_gnu }}
+      x86_64_pc_windows_msvc: ${{ steps.pack.outputs.x86_64_pc_windows_msvc }}
+      x86_64_unknown_linux_gnu: ${{ steps.pack.outputs.x86_64_unknown_linux_gnu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-latest, arch: arm64 }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, arch: arm64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, arch: arm64 }
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest, arch: x64 }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, arch: x64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: controller
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - name: Refuse rebuilding a verified original runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BAMBOO_BROWSER_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: python -BI controller/scripts/desktop-runtime-release.py guard "$BAMBOO_BROWSER_TARGET"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.source }}
+          persist-credentials: false
+          path: product
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Pack the native browser runtime
+        id: pack
+        env:
+          BAMBOO_BROWSER_TARGET: ${{ matrix.target }}
+          BAMBOO_BROWSER_SOURCE: ${{ needs.plan.outputs.source }}
+        working-directory: product
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BAMBOO_BROWSER_SOURCE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          mkdir "$RUNNER_TEMP/bamboo-desktop-browser"
+          node scripts/pack-browser-runtime.cjs "$BAMBOO_BROWSER_TARGET" "$RUNNER_TEMP/bamboo-desktop-browser" > "$RUNNER_TEMP/bamboo-desktop-browser.json"
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const native = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'bamboo-desktop-browser.json'), 'utf8'));
+          assert.equal(native.target, process.env.BAMBOO_BROWSER_TARGET);
+          assert.equal(native.sourceRevision, process.env.BAMBOO_BROWSER_SOURCE);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, native.target.replaceAll('-', '_') + '=' + JSON.stringify(native) + '\n');
+          NODE
+      - name: Retain the original archive
+        id: retain
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with: &archive
+          name: bamboo-desktop-browser-${{ matrix.target }}
+          path: ${{ runner.temp }}/bamboo-desktop-browser/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+      - name: Retry retention of the same archive
+        if: steps.retain.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with: *archive
+
+  publish:
+    name: Verify and publish original browser runtimes
+    needs: [plan, pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: bamboo-release
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: bamboo-desktop-browser-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/bamboo-original-browser
+      - name: Verify all original bytes and publish the companion manifest last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BAMBOO_BROWSER_BUILD_OUTPUTS: ${{ toJSON(needs.pack.outputs) }}
+        run: python3 -BI scripts/desktop-runtime-release.py publish "$RUNNER_TEMP/bamboo-original-browser"

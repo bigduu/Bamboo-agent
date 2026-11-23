@@ -189,6 +189,12 @@ retained v3 executables with the existing draft, source and tag.
 
 ## Main and consumers
 
+### Desktop browser runtime
+
+The desktop runtime consumer listens for the successful original `Publish Crate` workflow on protected Dev. A frozen v3 source with `browser-runtime/desktop.lock.json` opts into native desktop runtime packaging. The consumer authenticates the original executable manifest, packs the runtime for each of the five targets, and retains each archive before publication. The protected `bamboo-release` job verifies the original build outputs and uploads `bamboo-desktop-browser-runtimes-v1.json` after all five archives have been verified at the exact Bamboo release tag. The manifest binds the source and executable manifest SHA-256.
+
+Recover a publication failure by retrying the failed jobs of the same browser runtime workflow. Archives already verified by a successful pack step must be recovered from the original transport. This workflow uses the published executable release as its input and leaves its original asset digests and receipts intact.
+
 The frozen source selects the native executable contract. The five-target v3
 contract requires Linux ARM64 and Windows ARM64 feature evidence through the
 existing feature aggregate and requires both binaries in the completed Release.
