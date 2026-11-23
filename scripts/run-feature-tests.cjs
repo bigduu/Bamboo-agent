@@ -246,7 +246,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2475 retains the CLI cleanup and Ticket fixtures in their existing owners.
 // The ticket-runtime-fixtures context selects the same additive cases.
 // Session history cache and paging cases belong to the default Storage and Server library targets.
-const FEATURE_SOURCE_SHA256 = "b7355ea09fb13679fdaad643b187ec49a6eb30dcf40ed6ab9d893bc269da8df6";
+// #2995 keeps the ordinary Side Chat Actix fixture in server-handlers.
+// Main-owned clear metadata changes the sensitive Storage closure. Additive cases stay unchanged.
+const FEATURE_SOURCE_SHA256 = "2ea6e925c7c85b1ec4778277801d4265269f4bc91a027d37213dcfd99c0e5c80";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

@@ -104,7 +104,10 @@ pub async fn list_sessions(
         features: crate::handlers::agent::worktrees::FEATURES
             .iter()
             .copied()
-            .chain(["session_compaction_status"])
+            .chain([
+                "session_compaction_status",
+                crate::handlers::agent::side_chat::FEATURE,
+            ])
             .collect(),
     }))
 }

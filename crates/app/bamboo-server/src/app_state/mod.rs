@@ -475,6 +475,7 @@ pub struct AppState {
     /// terminal status) across every session are sequenced, journaled to disk,
     /// and broadcast here for resumable multi-client sync.
     pub account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    pub(crate) side_chats: crate::handlers::agent::side_chat::SideChatRuntime,
 
     /// Registry for tracking external processes.
     pub process_registry: Arc<ProcessRegistry>,
