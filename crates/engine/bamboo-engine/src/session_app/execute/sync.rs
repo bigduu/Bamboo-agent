@@ -1,7 +1,7 @@
 //! Client/server sync evaluation and the server execute snapshot.
 
-use bamboo_agent_core::Message;
-use bamboo_domain::Session;
+pub use bamboo_domain::session::history::is_hidden_from_ui;
+use bamboo_domain::{Message, Session};
 
 use super::super::types::{ExecuteClientSync, ExecuteSyncReason, ServerExecuteSnapshot};
 use super::resume_markers::has_pending_user_message;
@@ -54,18 +54,6 @@ pub fn evaluate_client_sync(
     }
 
     None
-}
-
-/// Internal runtime messages stay in the model transcript. History, live
-/// message publication and execute sync share this presentation predicate.
-pub fn is_hidden_from_ui(message: &Message) -> bool {
-    message
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("hidden_from_ui"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-        || bamboo_orchestration::managed_session::is_internal_handoff(message)
 }
 
 impl ServerExecuteSnapshot {

@@ -1035,6 +1035,18 @@ pub trait Storage: Send + Sync {
     /// Loads a session by ID, returns None if not found.
     async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
 
+    /// Read the newest committed visible messages. A storage adapter may keep
+    /// this bounded projection in memory after verifying its canonical source.
+    async fn load_recent_session_history(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<crate::session::history::SessionHistoryWindow>> {
+        use crate::session::history::{SessionHistoryWindow, RECENT_HISTORY_MESSAGE_LIMIT};
+        Ok(self.load_session(session_id).await?.map(|session| {
+            SessionHistoryWindow::from_session(session, RECENT_HISTORY_MESSAGE_LIMIT)
+        }))
+    }
+
     /// Read a full durable Session for execution admission without repairing an
     /// index or granting execution/write authority. Canonical backends retain
     /// their strict identity and lifetime checks, including the complete main

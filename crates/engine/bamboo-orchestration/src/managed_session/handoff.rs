@@ -1,9 +1,10 @@
 //! Worker-authored delivery summaries for subscribed Session runs.
+pub use bamboo_domain::session::history::is_internal_handoff;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
-    ManagedRootHandoffFormat, Message, ObserverSupervisedRootOutcome, Role,
-    RootFinalMessageReference, Session, SessionMessageContent, SessionProviderMessage,
-    SupervisedRootOutcomeFact, SupervisedRootOutcomeResult, SupervisorReference,
+    ManagedRootHandoffFormat, ObserverSupervisedRootOutcome, RootFinalMessageReference, Session,
+    SessionMessageContent, SessionProviderMessage, SupervisedRootOutcomeFact,
+    SupervisedRootOutcomeResult, SupervisorReference,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -256,42 +257,12 @@ fn worker_handoff_text(
     notice
 }
 
-/// The canonical Inbox envelope identifies runtime notices, including old
-/// receipts. A human message that quotes the same text is still visible.
-pub fn is_internal_handoff(message: &Message) -> bool {
-    let Some(marker) = message
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("session_message"))
-    else {
-        return false;
-    };
-    message.role == Role::User
-        && marker["id"].as_str() == Some(message.id.as_str())
-        && marker["source"]["type"].as_str() == Some("runtime")
-        && marker["kind"].as_str() == Some("runtime_instruction")
-        && marker["body"]["type"].as_str() == Some("runtime_instruction")
-        && matches!(
-            (
-                marker["source"]["subsystem"].as_str(),
-                marker["body"]["instruction"].as_str(),
-            ),
-            (
-                Some("supervised_root_outcome"),
-                Some("supervised_root_outcome_v1" | "managed_root_blocker_v1")
-            ) | (
-                Some(super::approval_handoff::SUBSYSTEM),
-                Some(super::approval_handoff::INSTRUCTION)
-            )
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_domain::{
-        SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
-        SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+        Message, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+        SessionMessageId, SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
     };
 
     fn completed() -> (ObserverSupervisedRootOutcome, RootFinalMessageReference) {
