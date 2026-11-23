@@ -7,13 +7,13 @@ use bamboo_domain::poison::PoisonRecover;
 
 use actix_web::{
     body::{EitherBody, MessageBody},
-    cookie::{time::Duration as CookieDuration, Cookie, SameSite},
     dev::{ServiceRequest, ServiceResponse},
     http::header,
     middleware::Next,
     web, HttpMessage, HttpRequest, HttpResponse, ResponseError,
 };
 use chrono::{SecondsFormat, Utc};
+use cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -594,21 +594,33 @@ fn request_has_verified_access_cookie(req: &HttpRequest, config: &Config) -> boo
         None => return false,
     };
 
-    req.cookie(ACCESS_VERIFIED_COOKIE_NAME)
-        .map(|cookie| cookie.value() == expected)
-        .unwrap_or(false)
+    presented_access_cookie(req).is_some_and(|cookie| cookie.value() == expected)
+}
+
+fn presented_access_cookie(req: &HttpRequest) -> Option<Cookie<'_>> {
+    let mut access_cookie = None;
+    for header in req.headers().get_all(header::COOKIE) {
+        // Check every field for valid UTF-8, including fields after a match.
+        let value = std::str::from_utf8(header.as_bytes()).ok()?;
+        if access_cookie.is_none() {
+            access_cookie = Cookie::split_parse_encoded(value)
+                .filter_map(Result::ok)
+                .find(|cookie| cookie.name() == ACCESS_VERIFIED_COOKIE_NAME);
+        }
+    }
+    access_cookie
 }
 
 fn build_access_verified_cookie(config: &Config, secure: bool) -> Option<Cookie<'static>> {
     let value = access_verification_cookie_value(config)?;
     Some(
-        Cookie::build(ACCESS_VERIFIED_COOKIE_NAME, value)
+        Cookie::build((ACCESS_VERIFIED_COOKIE_NAME, value))
             .path("/")
             .http_only(true)
             .same_site(SameSite::Lax)
             .secure(secure)
             .max_age(CookieDuration::seconds(ACCESS_VERIFIED_COOKIE_MAX_AGE_SECS))
-            .finish(),
+            .build(),
     )
 }
 
@@ -938,7 +950,7 @@ pub async fn verify_access_password(
         .ok_or_else(|| AppError::Unauthorized("access password is not enabled".to_string()))?;
 
     Ok(HttpResponse::Ok()
-        .cookie(cookie)
+        .append_header((header::SET_COOKIE, cookie.to_string()))
         .json(VerifyPasswordResponse { success: true }))
 }
 
@@ -2589,6 +2601,13 @@ mod tests {
         assert!(!request_is_authorized(&remote_req(), &config));
     }
 
+    fn access_cookie_header(value: &str) -> (header::HeaderName, String) {
+        (
+            header::COOKIE,
+            format!("{ACCESS_VERIFIED_COOKIE_NAME}={value}"),
+        )
+    }
+
     #[test]
     fn request_is_authorized_remote_with_valid_cookie_is_allowed() {
         let config = config_with_password();
@@ -2596,9 +2615,48 @@ mod tests {
             access_verification_cookie_value(&config).expect("password config yields a cookie");
         let req = TestRequest::default()
             .insert_header((header::HOST, "bamboo.example.com"))
-            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, cookie_value))
+            .insert_header(access_cookie_header(&cookie_value))
             .to_http_request();
         assert!(request_is_authorized(&req, &config));
+    }
+
+    #[test]
+    fn access_cookie_headers_preserve_decoding_and_first_match() {
+        let config = config_with_password();
+        let cookie_value = access_verification_cookie_value(&config).unwrap();
+        let encoded = format!(
+            "bamboo%5Faccess%5Fverified={}",
+            cookie_value.replace(':', "%3A")
+        );
+
+        let accepted = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .append_header((header::COOKIE, "companion=1; unparseable"))
+            .append_header((header::COOKIE, encoded))
+            .append_header(access_cookie_header("stale"))
+            .to_http_request();
+        assert!(request_is_authorized(&accepted, &config));
+
+        let shadowed = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .append_header(access_cookie_header("stale"))
+            .append_header(access_cookie_header(&cookie_value))
+            .to_http_request();
+        assert!(!request_is_authorized(&shadowed, &config));
+    }
+
+    #[test]
+    fn invalid_encoding_in_any_cookie_header_rejects_cookie_authentication() {
+        let config = config_with_password();
+        let cookie_value = access_verification_cookie_value(&config).unwrap();
+        let invalid_utf8 = header::HeaderValue::from_bytes(&[0xff]).unwrap();
+        let req = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .append_header(access_cookie_header(&cookie_value))
+            .append_header((header::COOKIE, invalid_utf8))
+            .to_http_request();
+
+        assert!(!request_is_authorized(&req, &config));
     }
 
     #[test]
@@ -2628,10 +2686,7 @@ mod tests {
 
         let remote_cookie = TestRequest::default()
             .insert_header((header::HOST, "bamboo.example.com"))
-            .cookie(Cookie::new(
-                ACCESS_VERIFIED_COOKIE_NAME,
-                previously_valid_cookie,
-            ))
+            .insert_header(access_cookie_header(&previously_valid_cookie))
             .to_http_request();
         let remote_device = TestRequest::default()
             .insert_header((header::HOST, "bamboo.example.com"))
@@ -2715,7 +2770,7 @@ mod tests {
             .expect("healthy password config yields a cookie");
         let valid_cookie = TestRequest::default()
             .insert_header((header::HOST, "bamboo.example.com"))
-            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, cookie_value))
+            .insert_header(access_cookie_header(&cookie_value))
             .to_http_request();
         assert_snapshot(
             &password_only,
@@ -2831,10 +2886,7 @@ mod tests {
         both.access_control.as_mut().unwrap().repair_required = true;
         let repair_remote = TestRequest::default()
             .insert_header((header::HOST, "bamboo.example.com"))
-            .cookie(Cookie::new(
-                ACCESS_VERIFIED_COOKIE_NAME,
-                stale_cookie.clone(),
-            ))
+            .insert_header(access_cookie_header(&stale_cookie))
             .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
             .insert_header((DEVICE_ID_HEADER, device_id.clone()))
             .to_http_request();
@@ -2848,7 +2900,7 @@ mod tests {
         );
         let repair_local = TestRequest::default()
             .insert_header((header::HOST, "localhost:9562"))
-            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, stale_cookie))
+            .insert_header(access_cookie_header(&stale_cookie))
             .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
             .insert_header((DEVICE_ID_HEADER, device_id))
             .to_http_request();
