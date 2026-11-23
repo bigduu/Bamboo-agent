@@ -11,6 +11,7 @@ pub mod child_approval;
 pub mod dead_letters;
 pub mod delete;
 pub mod dev;
+pub(crate) mod draft_completion;
 pub mod events;
 pub mod execute;
 pub mod guidance;

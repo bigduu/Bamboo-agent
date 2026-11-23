@@ -232,6 +232,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::browser::screenshot),
         )
         .route("/chat", web::post().to(agent::chat::handler))
+        .service(agent::draft_completion::resource())
         .route(
             "/sessions/{session_id}/goal/resume",
             web::post().to(agent::chat::resume_goal),
