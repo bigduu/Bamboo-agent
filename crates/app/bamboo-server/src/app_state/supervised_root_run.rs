@@ -673,6 +673,11 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn supervisor_log_monitor_creates_session_notifies_on_new_lines_and_stops() {
+        super::super::observer_subscriptions::tests::exercise_supervisor_log_monitor().await;
+    }
+
+    #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
     }

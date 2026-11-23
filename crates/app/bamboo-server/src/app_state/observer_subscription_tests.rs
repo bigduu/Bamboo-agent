@@ -713,8 +713,7 @@ async fn load(state: &AppState, id: &str) -> Session {
     state.storage.load_session(id).await.unwrap().unwrap()
 }
 
-#[actix_web::test]
-async fn supervisor_log_monitor_creates_session_notifies_on_new_lines_and_stops() {
+pub(in crate::app_state) async fn exercise_supervisor_log_monitor() {
     use crate::tools::ToolSurface;
     use bamboo_agent_core::ToolExecutionContext;
     use std::io::Write;
