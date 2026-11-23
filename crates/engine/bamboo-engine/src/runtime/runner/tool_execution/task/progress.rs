@@ -3,7 +3,6 @@ use tokio::sync::mpsc;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolResult};
 use bamboo_agent_core::AgentEvent;
-use bamboo_domain::TaskItemStatus;
 
 pub(super) async fn track_task_progress(
     task_context: &mut Option<TaskLoopContext>,
@@ -19,22 +18,23 @@ pub(super) async fn track_task_progress(
 
     // IMPORTANT: First auto-update status (may set active_item)
     // Then track tool execution (so first tool is recorded)
-    ctx.auto_update_status(&tool_call.function.name, result);
+    let target_id = ctx.auto_update_status(&tool_call.function.name, result);
     ctx.track_tool_execution(&tool_call.function.name, result, round as u32);
 
-    if let Some(event) = build_progress_event(ctx, session_id) {
+    if let Some(event) = target_id
+        .as_deref()
+        .and_then(|item_id| build_progress_event(ctx, session_id, item_id))
+    {
         let _ = event_tx.send(event).await;
     }
 }
 
-fn build_progress_event(ctx: &TaskLoopContext, session_id: &str) -> Option<AgentEvent> {
-    let target_item = if let Some(ref active_id) = ctx.active_item_id {
-        ctx.items.iter().find(|item| &item.id == active_id)
-    } else {
-        ctx.items
-            .iter()
-            .find(|item| item.status == TaskItemStatus::Completed)
-    }?;
+fn build_progress_event(
+    ctx: &TaskLoopContext,
+    session_id: &str,
+    item_id: &str,
+) -> Option<AgentEvent> {
+    let target_item = ctx.items.iter().find(|item| item.id == item_id)?;
 
     Some(AgentEvent::TaskListItemProgress {
         session_id: session_id.to_string(),
@@ -50,7 +50,8 @@ fn build_progress_event(ctx: &TaskLoopContext, session_id: &str) -> Option<Agent
 mod tests {
     use super::*;
     use crate::runtime::task_context::TaskLoopItem;
-    use bamboo_domain::{TaskBlocker, TaskBlockerKind};
+    use bamboo_agent_core::tools::FunctionCall;
+    use bamboo_domain::{TaskBlocker, TaskBlockerKind, TaskItemStatus};
     use chrono::Utc;
 
     #[test]
@@ -78,7 +79,7 @@ mod tests {
             task_list_dirty: false,
         };
 
-        let event = build_progress_event(&ctx, "child").expect("progress event");
+        let event = build_progress_event(&ctx, "child", "deploy").expect("progress event");
         assert!(matches!(
             event,
             AgentEvent::TaskListItemProgress {
@@ -88,6 +89,65 @@ mod tests {
                 ..
             } if session_id == "child"
                 && item.blockers[0].waiting_on.as_deref() == Some("operator")
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_reports_the_item_just_completed_when_active_focus_clears() {
+        let now = Utc::now();
+        let mut context = Some(TaskLoopContext {
+            session_id: "root".into(),
+            items: vec![
+                TaskLoopItem {
+                    id: "prepare".into(),
+                    status: TaskItemStatus::Completed,
+                    ..Default::default()
+                },
+                TaskLoopItem {
+                    id: "read".into(),
+                    description: "Read fixture".into(),
+                    status: TaskItemStatus::InProgress,
+                    ..Default::default()
+                },
+            ],
+            active_item_id: Some("read".into()),
+            current_round: 0,
+            max_rounds: None,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+            task_list_dirty: false,
+        });
+        let call = ToolCall {
+            id: "reader".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let result = ToolResult::text(true, "fixture");
+        let (tx, mut rx) = mpsc::channel(8);
+        for round in 1..=4 {
+            track_task_progress(&mut context, &tx, "root", &call, &result, round).await;
+        }
+        assert!(context.as_ref().unwrap().active_item_id.is_none());
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            last = Some(event);
+        }
+        assert!(
+            matches!(&last, Some(AgentEvent::TaskListItemProgress {
+                session_id, item_id, status: TaskItemStatus::Completed, item: Some(item), ..
+            }) if session_id == "root" && item_id == "read" && item.id == "read"
+                && item.status == TaskItemStatus::Completed),
+            "expected a completion event for read, got {last:?}"
+        );
+
+        track_task_progress(&mut context, &tx, "root", &call, &result, 5).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
     }
 }
