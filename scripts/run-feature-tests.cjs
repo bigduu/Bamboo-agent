@@ -243,7 +243,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Engine, and Server handler owners.
 // Summary requests retain the default Compression, Engine, Agent Core, and LLM
 // owners. The session_compaction target stays in server-tests-0.
-const FEATURE_SOURCE_SHA256 = "6e283096bb42e282d50d8ff2aa02df5292d41b780faf221895f4c54be1d3369c";
+// #2475 retains the CLI cleanup and Ticket fixtures in their existing owners.
+// The ticket-runtime-fixtures context selects the same additive cases.
+const FEATURE_SOURCE_SHA256 = "5cf056fee9f856d8b118c10cf81713c976e373e1cbc7b1447c384931b7cb19fe";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
