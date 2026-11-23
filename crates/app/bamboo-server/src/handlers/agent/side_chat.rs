@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Mutex, time::Duration};
 
-use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse, Result};
+use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse, ResponseError, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_compression::ModelLimitsRegistry;
 use bamboo_domain::{
@@ -212,11 +212,20 @@ impl SideChatRuntime {
 }
 
 pub(crate) fn routes() -> actix_web::Scope {
+    let json_config = web::JsonConfig::default().error_handler(|error, _| {
+        request_error(error.status_code(), "Invalid side chat request body")
+    });
     web::scope("/sessions/{session_id}/side-chat")
+        .app_data(json_config.clone())
+        .app_data(
+            web::PathConfig::default().error_handler(|error, _| {
+                request_error(error.status_code(), "Invalid side chat path")
+            }),
+        )
         .route("", web::get().to(get))
         .service(
             web::resource("/turns")
-                .app_data(web::JsonConfig::default().limit(64 * 1024))
+                .app_data(json_config.limit(64 * 1024))
                 .route(web::post().to(start)),
         )
         .route("/runs/{run_id}/stop", web::post().to(stop))
@@ -977,6 +986,32 @@ mod tests {
         )
         .await;
         let endpoint = format!("/api/v1/sessions/{}/side-chat", source.id);
+        for (path, payload, status) in [
+            ("turns", "{}".to_owned(), StatusCode::BAD_REQUEST),
+            (
+                "turns",
+                " ".repeat(64 * 1024 + 1),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "runs/invalid-run-id/stop",
+                json!({"chat_id": Uuid::new_v4()}).to_string(),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let rejected = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("{endpoint}/{path}"))
+                    .insert_header(("Content-Type", "application/json"))
+                    .set_payload(payload)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(rejected.status(), status);
+            let body: Value = test::read_body_json(rejected).await;
+            assert_eq!(body["error"]["type"], "api_error");
+        }
         let absent: Value = test::call_and_read_body_json(
             &app,
             test::TestRequest::get().uri(&endpoint).to_request(),
