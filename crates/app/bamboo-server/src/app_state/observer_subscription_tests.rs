@@ -432,7 +432,13 @@ impl LLMProvider for Probe {
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
                 self.parent_inputs.lock().unwrap().push(messages.to_vec());
                 match self.parent_dispatch.lock().unwrap().take() {
-                    Some(calls) => LLMChunk::ToolCalls(calls),
+                    Some(calls) => {
+                        let name = crate::schedule_app::log_monitor::TOOL_NAME;
+                        if calls.iter().any(|call| call.function.name == name) {
+                            assert!(tools.iter().any(|tool| tool.function.name == name));
+                        }
+                        LLMChunk::ToolCalls(calls)
+                    }
                     None => LLMChunk::Token("Parent processed its current canonical input.".into()),
                 }
             }
@@ -694,6 +700,224 @@ impl Fixture {
 async fn load(state: &AppState, id: &str) -> Session {
     state.storage.load_session(id).await.unwrap().unwrap()
 }
+
+#[actix_web::test]
+async fn supervisor_log_monitor_creates_session_notifies_on_new_lines_and_stops() {
+    use crate::tools::ToolSurface;
+    use bamboo_agent_core::ToolExecutionContext;
+    use std::io::Write;
+
+    fn tool_call(id: &str, args: &Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: crate::schedule_app::log_monitor::TOOL_NAME.into(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    async fn from_model(f: &Fixture, id: &str, args: &Value) -> Message {
+        *f.probe.parent_dispatch.lock().unwrap() = Some(vec![tool_call(id, args)]);
+        f.state
+            .session_messenger
+            .send(bamboo_domain::SessionMessageEnvelope::user_input(
+                &f.reference.session_id,
+                "Manage the periodic service log check for this Project.",
+            ))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(WAIT, async {
+            loop {
+                let supervisor = load(&f.state, &f.reference.session_id).await;
+                if let Some(message) = supervisor
+                    .messages
+                    .into_iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some(id))
+                {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("the canonical Supervisor must run and receive its monitor result");
+        settled(&f.state, &f.reference.session_id).await;
+        message
+    }
+
+    fn receipt(message: Message) -> Value {
+        assert_eq!(message.tool_success, Some(true), "{}", message.content);
+        serde_json::from_str(&message.content).unwrap()
+    }
+
+    let f = Fixture::new_with_native_source(true).await;
+    let workspace = f.home.path().join("service");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = workspace.join("service.log");
+    std::fs::write(&path, "ERROR before monitoring began\n").unwrap();
+    let project = f
+        .state
+        .project_store
+        .create_with_project_path(
+            "Service logs",
+            None,
+            &bamboo_config::paths::path_to_display_string(&workspace),
+            Vec::new(),
+        )
+        .unwrap();
+    let start = json!({
+        "action":"start", "operation_id":uuid::Uuid::new_v4(), "project_id":project.id,
+        "relative_path":"service.log", "every_seconds":15,
+    });
+    let untrusted = tool_call("monitor-unauthenticated", &start);
+    let mut untrusted_context = ToolExecutionContext::none(&untrusted.id);
+    untrusted_context.session_id = Some(&f.reference.session_id);
+    untrusted_context.root_session_id = Some(&f.reference.session_id);
+    assert!(f
+        .state
+        .tools_for(ToolSurface::Root)
+        .execute_with_context_outcome(&untrusted, untrusted_context)
+        .await
+        .is_err());
+    let view = receipt(from_model(&f, "monitor-start", &start).await);
+    let monitor_id = view["monitor_id"].as_str().unwrap();
+    assert_eq!(view["session_id"], monitor_id);
+    assert_eq!(view["active"], true);
+    assert_eq!(
+        receipt(from_model(&f, "monitor-start-retry", &start).await)["monitor_id"],
+        monitor_id
+    );
+    assert_eq!(
+        load(&f.state, monitor_id)
+            .await
+            .project_id_meta()
+            .as_deref(),
+        Some(project.id.as_str())
+    );
+    assert!(f
+        .state
+        .schedule_store
+        .get_schedule(monitor_id)
+        .await
+        .is_none());
+    assert!(f
+        .state
+        .schedule_store
+        .create_run_now(monitor_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let private_line = "PRIVATE_MONITOR_LOG_PAYLOAD";
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        "ERROR {private_line}\nINFO healthy check",
+    )
+    .unwrap();
+    tokio::time::timeout(WAIT * 2, async {
+        loop {
+            let runs = f
+                .state
+                .schedule_store
+                .list_run_records_for_schedule(monitor_id)
+                .await;
+            if runs.iter().any(|run| {
+                run.status == bamboo_domain::ScheduleRunStatus::Success
+                    && run.session_id.as_deref() == Some(monitor_id)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("the installed Scheduler must scan the new log bytes");
+    tokio::time::timeout(WAIT, async {
+        while !f
+            .probe
+            .parent_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|message| {
+                message.content.starts_with("A scheduled log check found ")
+                    && message.content.contains(monitor_id)
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("the alert alone must wake the Supervisor's provider");
+    let parent = settled(&f.state, &f.reference.session_id).await;
+    let notice = parent
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let body = message
+                .metadata
+                .as_ref()?
+                .get("session_message")?
+                .get("body")?;
+            (body["instruction"] == "log_monitor_alert_v1").then_some(body)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notice.len(), 1);
+    assert_eq!(notice[0]["data"]["matched_lines"], 1);
+    assert_eq!(notice[0]["data"]["monitor_session_id"], monitor_id);
+    assert!(f
+        .probe
+        .parent_inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .all(|message| !message.content.contains(private_line)));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 0);
+    let stopped = receipt(
+        from_model(
+            &f,
+            "monitor-stop",
+            &json!({"action":"stop","monitor_id":monitor_id}),
+        )
+        .await,
+    );
+    assert_eq!(stopped["active"], false);
+    assert!(stopped["next_check_at"].is_null());
+    let reopened = crate::schedule_app::ScheduleStore::new(f.home.path().to_owned())
+        .await
+        .unwrap();
+    assert!(reopened
+        .claim_due_runs(Utc::now() + chrono::Duration::minutes(3))
+        .await
+        .unwrap()
+        .is_empty());
+    f.state
+        .project_store
+        .archive(&project.id, project.revision)
+        .unwrap();
+    let rejected = from_model(
+        &f,
+        "monitor-resume-archived",
+        &json!({"action":"resume","monitor_id":monitor_id}),
+    )
+    .await;
+    assert_eq!(rejected.tool_success, Some(false));
+    assert!(
+        rejected.content.contains("Log monitor Project is archived"),
+        "{}",
+        rejected.content
+    );
+    f.state.shutdown().await;
+}
+
 async fn settled(state: &AppState, id: &str) -> Session {
     tokio::time::timeout(WAIT, async {
         loop {

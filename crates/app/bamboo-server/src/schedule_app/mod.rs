@@ -7,6 +7,7 @@
 //! a subsystem-independent capability.
 
 pub mod ledger_bridge;
+pub(crate) mod log_monitor;
 pub mod manager;
 pub mod scheduler_tool;
 pub mod session_factory;
