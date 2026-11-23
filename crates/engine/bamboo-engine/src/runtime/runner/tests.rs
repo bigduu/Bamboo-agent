@@ -2770,6 +2770,10 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
         .unwrap();
     assert_eq!(span.call_id.as_deref(), Some(event.call_id.as_str()));
     assert_eq!(span.usage.as_ref(), Some(&usage));
+    assert!(span.performance.contains_key("model_first_text_us"));
+    assert!(span.performance.contains_key("token_cache_process_hits"));
+    assert!(span.performance.contains_key("token_cache_process_misses"));
+    assert!(span.performance.contains_key("token_cache_process_entries"));
     assert!(!serde_json::to_string(&detail)
         .unwrap()
         .contains("PRIVATE_PROMPT_SENTINEL"));

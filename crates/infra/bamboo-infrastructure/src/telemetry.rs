@@ -13,12 +13,14 @@ use opentelemetry::{global, Context, InstrumentationScope, KeyValue};
 
 mod config;
 pub mod local;
+mod performance;
 mod propagation;
 mod timeout;
 
 pub use config::{
     init, init_from_env, init_local_from_env, TelemetryConfig, TelemetryError, TelemetryGuard,
 };
+pub use performance::{record_first_model_text, record_grep_performance, GrepPerformance};
 pub use propagation::TraceContext;
 pub use timeout::with_timeout;
 
