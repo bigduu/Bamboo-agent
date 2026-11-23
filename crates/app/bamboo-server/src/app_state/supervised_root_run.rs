@@ -620,6 +620,17 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn subscribed_worker_timeout_wakes_supervisor_with_verified_diagnostic() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_worker_timeout_notice()
+            .await;
+    }
+
+    #[actix_web::test]
+    async fn delayed_worker_timeout_notice_cannot_use_a_newer_runs_diagnostic() {
+        super::super::observer_subscriptions::tests::exercise_delayed_worker_timeout_notice().await;
+    }
+
+    #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
     }

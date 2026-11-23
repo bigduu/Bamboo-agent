@@ -42,6 +42,7 @@ const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
 const SUBSCRIBED_PERMISSION_INPUT: &str = "Produce a handoff after the gated command.";
 const SUBSCRIBED_DENY_INPUT: &str = "Produce a handoff if the gated command is declined.";
 const SUBSCRIBED_REPEAT_INPUT: &str = "Produce a handoff after two individually gated commands.";
+const WORKER_PARTIAL_OUTPUT: &str = "PRIVATE_PARTIAL_WORKER_OUTPUT";
 const HANDOFF_SECOND_PERMISSION_CALL: &str = "handoff-second-permission-command";
 const HANDOFF_PERMISSION_CALL: &str = "handoff-permission-command";
 const HANDOFF_COMMAND_OUTPUT: &str = "handoff-approval-executed";
@@ -56,6 +57,7 @@ struct Probe {
     calls: AtomicUsize,
     source_calls: AtomicUsize,
     source_inputs: StdMutex<Vec<Vec<Message>>>,
+    stall_source_stream: AtomicBool,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_dispatch: StdMutex<Option<Vec<ToolCall>>>,
@@ -355,6 +357,12 @@ impl LLMProvider for Probe {
             SOURCE => {
                 self.source_inputs.lock().unwrap().push(messages.to_vec());
                 self.source_calls.fetch_add(1, Ordering::SeqCst);
+                if self.stall_source_stream.load(Ordering::SeqCst) {
+                    use futures::StreamExt;
+                    let started =
+                        futures::stream::iter([Ok(LLMChunk::Token(WORKER_PARTIAL_OUTPUT.into()))]);
+                    return Ok(Box::pin(started.chain(futures::stream::pending())));
+                }
                 if messages
                     .iter()
                     .any(|message| message.content.contains("managed task blocker"))
@@ -2802,6 +2810,124 @@ pub(in crate::app_state) async fn exercise_subscribed_wait_yields_to_inbox() {
     drive_material_notices(&f, 2).await;
     settle_material_notices(&f).await;
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    f.state.shutdown().await;
+}
+
+async fn dispatch_timed_out_worker(
+    f: &Fixture,
+    operation: &str,
+    subscribe: bool,
+) -> (String, bamboo_domain::LlmRequestDiagnostic) {
+    f.probe.stall_source_stream.store(true, Ordering::SeqCst);
+    f.state
+        .config
+        .write()
+        .await
+        .stream_timeout
+        .transport_idle_timeout_secs = 1;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        operation,
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":operation, "message":"Run the assigned task.",
+            "notify_on_material_event":subscribe,
+        }),
+    )
+    .await;
+    assert_eq!(dispatch["admitted"], true);
+    assert_eq!(dispatch["notify_on_material_event"], subscribe);
+    let receipt = dispatch["receipt_id"].as_str().unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let worker = load(&f.state, ROOT_A).await;
+            let fact = worker
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+                .and_then(|outcomes| outcomes.facts.last())
+                .filter(|fact| {
+                    fact.inputs
+                        .iter()
+                        .any(|input| input.receipt_id.as_str() == receipt)
+                        && fact.result == Some(bamboo_domain::SupervisedRootOutcomeResult::Failed)
+                });
+            if let Some(fact) = fact {
+                if f.state
+                    .session_activation_router
+                    .current_run_id(ROOT_A)
+                    .await
+                    .is_none()
+                {
+                    let diagnostic = worker
+                        .last_run_diagnostic()
+                        .expect("the real watchdog persisted the failed Worker's diagnostic");
+                    return (fact.run_id.clone(), diagnostic);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the exact Worker run must record its failure")
+}
+
+async fn received_worker_notice(f: &Fixture, run_id: &str) -> String {
+    settled(&f.state, &f.reference.session_id).await;
+    f.probe
+        .parent_inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .find(|message| message.content.contains(ROOT_A) && message.content.contains(run_id))
+        .expect("the exact Worker failure must reach the Supervisor")
+        .content
+        .clone()
+}
+
+pub(in crate::app_state) async fn exercise_subscribed_worker_timeout_notice() {
+    let f = Fixture::new_with_native_source(true).await;
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let (run, diagnostic) = dispatch_timed_out_worker(&f, "subscribed-worker-timeout", true).await;
+    // The actual background coordinator wakes the idle Supervisor.
+    let notice = received_worker_notice(&f, &run).await;
+    assert!(
+        notice.contains(&diagnostic.error_message()),
+        "failure notice is missing its verified diagnostic: {notice}",
+    );
+    assert!(notice.contains("phase=transport_idle"));
+    assert!(!notice.contains(WORKER_PARTIAL_OUTPUT));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_delayed_worker_timeout_notice() {
+    let f = Fixture::new_with_native_source(true).await;
+    let (first_run, first_diagnostic) =
+        dispatch_timed_out_worker(&f, "first-worker-timeout", true).await;
+    let (second_run, second_diagnostic) =
+        dispatch_timed_out_worker(&f, "later-worker-timeout", false).await;
+    assert_ne!(first_run, second_run);
+    assert_ne!(
+        first_diagnostic.diagnostic_id(),
+        second_diagnostic.diagnostic_id()
+    );
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let notice = received_worker_notice(&f, &first_run).await;
+    assert!(notice.contains("Last persisted status: error"));
+    assert!(!notice.contains(&second_run));
+    assert!(!notice.contains("Diagnostic ID:"));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
     f.state.shutdown().await;
 }
 

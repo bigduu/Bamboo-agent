@@ -1476,14 +1476,17 @@ impl FileSessionInbox {
             _ => {}
         }
         let envelope = match event {
-            bamboo_domain::ManagedRootEvent::Outcome(outcome) => self.root_outcome_notice(
-                &supervisor,
-                authority.source.created_at,
-                &root,
-                &outcome.observed,
-                &outcome.observed.inputs[0],
-                now,
-            )?,
+            bamboo_domain::ManagedRootEvent::Outcome(outcome) => {
+                self.root_outcome_notice(
+                    &supervisor,
+                    &authority,
+                    &root,
+                    &outcome.observed,
+                    &outcome.observed.inputs[0],
+                    now,
+                )
+                .await?
+            }
             bamboo_domain::ManagedRootEvent::Blocker(blocker) => managed_root_blocker_envelope(
                 &supervisor,
                 authority.source.created_at,
@@ -1514,10 +1517,10 @@ impl FileSessionInbox {
 
     /// Both outcome writers use the same body for the same admitted input.
     /// Follow-up presentation can include a summary without rewriting the retained body.
-    fn root_outcome_notice(
+    async fn root_outcome_notice(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
-        supervisor_created_at: chrono::DateTime<Utc>,
+        authority: &crate::v2::CurrentUserTargetGuard,
         root: &bamboo_domain::Session,
         outcome: &bamboo_domain::ObserverSupervisedRootOutcome,
         input: &bamboo_domain::ObserverSupervisedRootInput,
@@ -1525,7 +1528,7 @@ impl FileSessionInbox {
     ) -> Result<SessionMessageEnvelope, SessionInboxError> {
         let mut envelope = supervised_root_outcome_envelope(
             supervisor,
-            supervisor_created_at,
+            authority.source.created_at,
             outcome,
             input,
             now,
@@ -1615,7 +1618,7 @@ impl FileSessionInbox {
                     .filter(|_| format.is_some())
                     .map(|content| content.text.as_str())
             });
-            instruction.provider_message =
+            let mut provider_message =
                 present(supervisor, root, fact, handoff_text).or_else(|| {
                     presented_handoff.map(|text| bamboo_domain::SessionProviderMessage {
                         content: bamboo_domain::SessionMessageContent::text(text),
@@ -1623,6 +1626,29 @@ impl FileSessionInbox {
                         never_compress: false,
                     })
                 });
+            if outcome.status == bamboo_domain::SupervisedRootOutcomeResult::Failed {
+                if let (Some(diagnostic), Some(status)) = (
+                    self.sessions
+                        .managed_root_failure_diagnostic(authority, root, &outcome.run_id)
+                        .await,
+                    instruction.content.as_ref(),
+                ) {
+                    // Keep the typed notice and its idempotency identity stable.
+                    // The validated diagnostic contains no raw provider output.
+                    let message = provider_message.get_or_insert_with(|| {
+                        bamboo_domain::SessionProviderMessage {
+                            content: status.clone(),
+                            metadata: Default::default(),
+                            never_compress: false,
+                        }
+                    });
+                    message.content.text.push_str(&format!(
+                        "\n\nThe provider reported an error. {}\nCheck the Worker's current run and recorded task effects before deciding whether the same Session can safely continue.",
+                        diagnostic.error_message(),
+                    ));
+                }
+            }
+            instruction.provider_message = provider_message;
         }
         Ok(envelope)
     }
@@ -1733,14 +1759,9 @@ impl FileSessionInbox {
             status: result.clone(),
             inputs: vec![input.clone()],
         };
-        let event = self.root_outcome_notice(
-            supervisor,
-            authority.source.created_at,
-            &root,
-            &outcome,
-            &input,
-            now,
-        )?;
+        let event = self
+            .root_outcome_notice(supervisor, &authority, &root, &outcome, &input, now)
+            .await?;
         let parent_inbox = self
             .sessions
             .sessions_root_dir()
