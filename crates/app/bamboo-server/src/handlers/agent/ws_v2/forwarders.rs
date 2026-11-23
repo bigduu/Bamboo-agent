@@ -803,7 +803,7 @@ pub(crate) fn spawn_side_chat_forwarder(
     encoding: Encoding,
     ch: String,
 ) -> tokio::task::JoinHandle<()> {
-    use crate::handlers::agent::side_chat::Update;
+    use crate::handlers::agent::side_chat::{source_changed, Update};
     let mut updates = state.side_chats.subscribe();
     let mut changes = state.account_sink.subscribe();
     tokio::spawn(async move {
@@ -829,7 +829,7 @@ pub(crate) fn spawn_side_chat_forwarder(
                 },
                 event = changes.recv() => match event {
                     Ok(event) if event.session_id.as_deref() == Some(&source_id)
-                        && matches!(event.event, AgentEvent::SessionCleared { .. } | AgentEvent::SessionDeleted { .. }) => Update::SideChatChanged,
+                        && source_changed(&event.event) => Update::SideChatChanged,
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => Update::SideChatChanged,
                     Err(broadcast::error::RecvError::Closed) => return,

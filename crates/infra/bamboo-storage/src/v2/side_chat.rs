@@ -2,6 +2,8 @@ use super::*;
 use serde::de::DeserializeOwned;
 
 pub(super) const SIDE_CHAT_FILE: &str = "side-chat.json";
+/// Main-owned marker. The legacy clear path changes it with the transcript.
+pub const SIDE_CHAT_CLEAR_EPOCH_KEY: &str = "side_chat_clear_epoch";
 pub const SIDE_CHAT_MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
 /// A separate writer lease keeps one side turn running per source even when
@@ -48,6 +50,13 @@ impl SessionStoreV2 {
         T: DeserializeOwned + Serialize,
     {
         validate_session_id(source_id)?;
+        if self
+            .get_index_entry(source_id)
+            .await
+            .is_none_or(|entry| entry.kind != SessionKind::Root)
+        {
+            return Ok(None);
+        }
         let lifecycle = self.lock_session_lifecycle_shared().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self.acquire_session_maintenance_lock(source_id).await?;

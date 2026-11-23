@@ -123,7 +123,7 @@ mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 mod session_archive;
 mod side_chat;
-pub use side_chat::{SideChatRunLease, SIDE_CHAT_MAX_RECORD_BYTES};
+pub use side_chat::{SideChatRunLease, SIDE_CHAT_CLEAR_EPOCH_KEY, SIDE_CHAT_MAX_RECORD_BYTES};
 #[cfg(test)]
 mod session_compatibility_tests;
 pub use session_archive::{
@@ -767,6 +767,7 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
 pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    snapshot.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
     // The handoff's acknowledgement shares the response's Main boundary.
     // Runtime-only writes cannot publish or consume it.
     snapshot
@@ -793,6 +794,19 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     snapshot
 }
 
+fn retain_side_chat_clear_epoch(main: &Session, target: &mut Session) {
+    match main.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY) {
+        Some(epoch) => {
+            target
+                .metadata
+                .insert(SIDE_CHAT_CLEAR_EPOCH_KEY.into(), epoch.clone());
+        }
+        None => {
+            target.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
+        }
+    }
+}
+
 /// Overlay the runtime sidecar onto the session loaded from `session.json`.
 ///
 /// The sidecar holds the freshest control-plane (metadata, `agent_runtime_state`,
@@ -814,6 +828,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
                     side.metadata.remove(paced_outcome_key);
                 }
             }
+            retain_side_chat_clear_epoch(&main, &mut side);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1963,6 +1978,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     // user-created session and must not inherit the source's
     // supervisor_created origin mark (same reset discipline as id/created_at).
     copy.metadata.remove("session.origin.v1");
+    copy.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -6695,6 +6711,12 @@ impl SessionStoreV2 {
             .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
         session.updated_at = Utc::now();
 
+        // Commit the epoch with Main so a first-question retry cannot cross
+        // this clear, including when no attached side chat existed yet.
+        session
+            .metadata
+            .insert(SIDE_CHAT_CLEAR_EPOCH_KEY.into(), Uuid::new_v4().to_string());
+
         // One started job owns cleanup and the resulting canonical files.
         let (revision_path, revision) = self
             .clear_default_session_files(&abs_dir, &session, &guards)
@@ -8050,6 +8072,7 @@ impl SessionStoreV2 {
         };
 
         if let Some(previous) = previous_main.as_ref() {
+            retain_side_chat_clear_epoch(previous, &mut normalized);
             let key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
             let owns_paced_outcome = guards.root_outcome_finalized
                 && guards.root_actor.as_ref().is_some_and(|actor| {

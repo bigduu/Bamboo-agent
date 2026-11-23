@@ -13,9 +13,10 @@ use bamboo_engine::{
     session_app::{execute::is_hidden_from_ui, provider_model::session_effective_model_ref},
 };
 use bamboo_llm::{Config, LLMChunk, LLMRequestOptions};
-use bamboo_storage::v2::{SideChatRunLease, SIDE_CHAT_MAX_RECORD_BYTES};
+use bamboo_storage::v2::{SideChatRunLease, SIDE_CHAT_CLEAR_EPOCH_KEY, SIDE_CHAT_MAX_RECORD_BYTES};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -67,6 +68,8 @@ struct SideChat {
     id: Uuid,
     source_birth: String,
     source_revision: u64,
+    #[serde(default)]
+    source_clear_epoch: Option<String>,
     source_project: Option<String>,
     model: ProviderModelRef,
     context: Vec<String>,
@@ -77,6 +80,7 @@ impl SideChat {
     fn belongs_to(&self, source: &Session) -> bool {
         self.source_birth == source.root_mode_birth_token()
             && self.source_revision == source.conversation_revision()
+            && self.source_clear_epoch.as_ref() == source.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY)
             && self.source_project == source.project_id_meta()
     }
 }
@@ -92,6 +96,7 @@ struct SideChatView {
 #[derive(Deserialize)]
 struct TurnRequest {
     id: Uuid,
+    source_generation: String,
     expected_chat_id: Option<Uuid>,
     previous_turn_id: Option<Uuid>,
     message: Option<String>,
@@ -214,11 +219,42 @@ pub(crate) fn routes() -> actix_web::Scope {
         .route("/runs/{run_id}/stop", web::post().to(stop))
 }
 
-async fn read_record(state: &AppState, source_id: &str) -> io::Result<Option<Option<SideChat>>> {
+struct SideChatSource {
+    generation: String,
+    chat: Option<SideChat>,
+}
+
+fn source_generation(source: &Session) -> String {
+    let scope = (
+        source.root_mode_birth_token(),
+        source.conversation_revision(),
+        source.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY),
+        source.project_id_meta(),
+    );
+    let bytes = serde_json::to_vec(&scope).expect("source lifetime fields serialize");
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn source_changed(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::SessionCleared { .. }
+            | AgentEvent::SessionDeleted { .. }
+            | AgentEvent::SessionProjectUpdated { .. }
+    )
+}
+
+async fn read_record(state: &AppState, source_id: &str) -> io::Result<Option<SideChatSource>> {
     state
         .session_store
         .with_side_chat(source_id, |source, record: Option<SideChat>| {
-            Ok((None, record.filter(|chat| chat.belongs_to(source))))
+            Ok((
+                None,
+                SideChatSource {
+                    generation: source_generation(source),
+                    chat: record.filter(|chat| chat.belongs_to(source)),
+                },
+            ))
         })
         .await
 }
@@ -257,23 +293,27 @@ async fn view(state: &AppState, source_id: &str, mut chat: SideChat) -> io::Resu
 
 async fn get(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let source_id = path.into_inner();
-    let record = read_record(&state, &source_id)
+    let source = read_record(&state, &source_id)
         .await?
         .ok_or_else(|| error::ErrorNotFound("Main chat not found"))?;
-    let chat = match record {
+    let chat = match source.chat {
         Some(record) => Some(view(&state, &source_id, record).await?),
         None => None,
     };
-    Ok(response(HttpResponse::Ok(), chat))
+    Ok(response(HttpResponse::Ok(), &source.generation, chat))
 }
 
 fn response(
     mut response: actix_web::HttpResponseBuilder,
+    generation: &str,
     chat: Option<SideChatView>,
 ) -> HttpResponse {
     response
         .insert_header(("Cache-Control", "no-store"))
-        .json(serde_json::json!({ "side_chat": chat }))
+        .json(serde_json::json!({
+            "source_generation": generation,
+            "side_chat": chat,
+        }))
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -303,7 +343,9 @@ async fn start(
     let source_id = path.into_inner();
     let request = body.into_inner();
     let run_id = request.id;
+    let generation = request.source_generation.clone();
     if request.id.is_nil()
+        || generation.len() != 64
         || (request.message.is_none() && request.quote.is_some())
         || request
             .message
@@ -318,32 +360,48 @@ async fn start(
             "Invalid side chat question or quote",
         ));
     }
+    let mut account = state.account_sink.subscribe();
+    // Missing or ineligible sources do not acquire on-disk turn leases.
+    let source = read_record(&state, &source_id)
+        .await?
+        .ok_or_else(|| error::ErrorNotFound("Main chat not found"))?;
+    if source.generation != generation {
+        return Err(admission_error(conflict()));
+    }
+    let lease = state
+        .session_store
+        .try_lock_side_chat_run(&source_id)
+        .await?;
+    let Some(lease) = lease else {
+        if let Some(source) = read_record(&state, &source_id).await? {
+            if source.generation == generation {
+                if let Some(chat) = source.chat {
+                    if request.is_replay(&chat).map_err(admission_error)? {
+                        return Ok(response(
+                            HttpResponse::Accepted(),
+                            &generation,
+                            Some(view(&state, &source_id, chat).await?),
+                        ));
+                    }
+                }
+            }
+        }
+        return Err(error::ErrorConflict("The side chat is already answering"));
+    };
+
     let config = state.config.read().await.clone();
     let mut limits =
         ModelLimitsRegistry::with_config_path(state.app_data_dir.join("model_limits.json"));
     if let Err(error) = limits.load_user_config().await {
         tracing::debug!(%error, "side chat is using compatibility model limits");
     }
-    let mut account = state.account_sink.subscribe();
-    let lease = state
-        .session_store
-        .try_lock_side_chat_run(&source_id)
-        .await?;
-    let Some(lease) = lease else {
-        if let Some(Some(chat)) = read_record(&state, &source_id).await? {
-            if request.is_replay(&chat).map_err(admission_error)? {
-                return Ok(response(
-                    HttpResponse::Accepted(),
-                    Some(view(&state, &source_id, chat).await?),
-                ));
-            }
-        }
-        return Err(error::ErrorConflict("The side chat is already answering"));
-    };
 
     let planned = state
         .session_store
         .with_side_chat(&source_id, |source, existing: Option<SideChat>| {
+            if source_generation(source) != generation {
+                return Err(conflict());
+            }
             let existing = existing.filter(|chat| chat.belongs_to(source));
             if let Some(chat) = existing.as_ref() {
                 if request.is_replay(chat)? {
@@ -368,6 +426,7 @@ async fn start(
                     id: Uuid::new_v4(),
                     source_birth: source.root_mode_birth_token(),
                     source_revision: source.conversation_revision(),
+                    source_clear_epoch: source.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY).cloned(),
                     source_project: source.project_id_meta(),
                     model: source_model(source, &config)?,
                     context: source_context(source),
@@ -453,6 +512,7 @@ async fn start(
             drop(lease);
             return Ok(response(
                 HttpResponse::Accepted(),
+                &generation,
                 Some(view(&state, &source_id, record).await?),
             ));
         }
@@ -531,7 +591,8 @@ async fn start(
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 if check
-                    && !matches!(read_record(&state, &source_id).await, Ok(Some(Some(chat))) if chat.id == chat_id)
+                    && !matches!(read_record(&state, &source_id).await, Ok(Some(source))
+                        if source.chat.as_ref().is_some_and(|chat| chat.id == chat_id))
                 {
                     break;
                 }
@@ -549,7 +610,7 @@ async fn start(
         finish(&state, &source_id, chat_id, run_id, status, answer, lease).await;
     });
 
-    Ok(response(HttpResponse::Accepted(), Some(chat)))
+    Ok(response(HttpResponse::Accepted(), &generation, Some(chat)))
 }
 
 async fn finish(
@@ -616,10 +677,10 @@ async fn stop(
     }
     // A stop of an already terminal turn is safe to replay. An unknown run
     // cannot stop a successor or the independently owned main task.
-    let record = read_record(&state, &source_id).await?;
-    if let Some(Some(chat)) =
-        record.filter(|chat| chat.as_ref().is_some_and(|chat| chat.id == request.chat_id))
-    {
+    let record = read_record(&state, &source_id)
+        .await?
+        .and_then(|source| source.chat);
+    if let Some(chat) = record.filter(|chat| chat.id == request.chat_id) {
         let chat = view(&state, &source_id, chat).await?;
         if chat
             .turns
@@ -818,7 +879,11 @@ mod tests {
     async fn wait_for_status(state: &AppState, source_id: &str, status: TurnStatus) -> SideChat {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(Some(chat)) = read_record(state, source_id).await.unwrap() {
+                if let Some(chat) = read_record(state, source_id)
+                    .await
+                    .unwrap()
+                    .and_then(|source| source.chat)
+                {
                     if chat.turns.last().is_some_and(|turn| turn.status == status) {
                         return chat;
                     }
@@ -888,6 +953,16 @@ mod tests {
         )
         .await;
         assert!(absent["side_chat"].is_null());
+        let generation = absent["source_generation"].as_str().unwrap();
+        let missing_source = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions/missing-side-source/side-chat/turns")
+                .set_json(json!({"id": Uuid::new_v4(), "source_generation": generation, "message": "Unowned"}))
+                .to_request(),
+        ).await;
+        assert_eq!(missing_source.status(), StatusCode::NOT_FOUND);
+        assert!(!home.path().join("side-chat-locks").exists());
 
         let execute = test::call_service(
             &app,
@@ -903,6 +978,7 @@ mod tests {
         let turn_id = Uuid::new_v4();
         let question = json!({
             "id": turn_id,
+            "source_generation": generation,
             "message": "Why would the lockfile fail?",
             "quote": { "message_id": quote_source, "text": "lockfile failure" },
         });
@@ -960,7 +1036,7 @@ mod tests {
         let retry_id = Uuid::new_v4();
         let retry = test::call_service(&app, test::TestRequest::post()
             .uri(&format!("{endpoint}/turns"))
-            .set_json(json!({ "id": retry_id, "expected_chat_id": chat_id, "previous_turn_id": turn_id }))
+            .set_json(json!({ "id": retry_id, "source_generation": generation, "expected_chat_id": chat_id, "previous_turn_id": turn_id }))
             .to_request()).await;
         assert_eq!(retry.status(), StatusCode::ACCEPTED);
         let second = next_call(&mut calls).await;
@@ -1046,16 +1122,56 @@ mod tests {
         clearable.add_message(Message::user("Context to clear."));
         state.storage.save_session(&clearable).await.unwrap();
         let clearable_endpoint = format!("/api/v1/sessions/{}/side-chat", clearable.id);
+        let previous: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&clearable_endpoint)
+                .to_request(),
+        )
+        .await;
+        let first_question = json!({
+            "id": Uuid::new_v4(),
+            "source_generation": previous["source_generation"],
+            "message": "Explain the context.",
+        });
         let send = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri(&format!("{clearable_endpoint}/turns"))
-                .set_json(json!({ "id": Uuid::new_v4(), "message": "Explain the context." }))
+                .set_json(&first_question)
                 .to_request(),
         )
         .await;
         assert_eq!(send.status(), StatusCode::ACCEPTED);
         let active = next_call(&mut calls).await;
+        let attachments = home
+            .path()
+            .join("sessions")
+            .join(&clearable.id)
+            .join("attachments");
+        std::fs::remove_dir_all(&attachments).unwrap();
+        std::fs::write(&attachments, "synthetic cleanup failure").unwrap();
+        let failed = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{}/clear", clearable.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let retained: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&clearable_endpoint)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(retained["source_generation"], previous["source_generation"]);
+        assert_eq!(retained["side_chat"]["turns"][0]["status"], "running");
+        assert!(!active.reply.is_closed());
+        std::fs::remove_file(&attachments).unwrap();
+        std::fs::create_dir(&attachments).unwrap();
+
         let clear = test::call_service(
             &app,
             test::TestRequest::post()
@@ -1075,5 +1191,16 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), active.reply.closed())
             .await
             .unwrap();
+        assert_ne!(absent["source_generation"], previous["source_generation"]);
+        let replay = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("{clearable_endpoint}/turns"))
+                .set_json(&first_question)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert!(calls.try_recv().is_err());
     }
 }
