@@ -245,7 +245,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // owners. The session_compaction target stays in server-tests-0.
 // #2475 retains the CLI cleanup and Ticket fixtures in their existing owners.
 // The ticket-runtime-fixtures context selects the same additive cases.
-const FEATURE_SOURCE_SHA256 = "978480066faa83680dd9458c0f099e47a48eaa862f07d19427dfdaeceb86681d";
+// Session history cache and paging cases belong to the default Storage and Server library targets.
+const FEATURE_SOURCE_SHA256 = "b7355ea09fb13679fdaad643b187ec49a6eb30dcf40ed6ab9d893bc269da8df6";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
