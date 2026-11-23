@@ -58,8 +58,9 @@ test("feature shards partition package targets and additive owners exactly once"
     .some(context => context.targets.some(target => target.name === "native_work_token_budget")),
   "Budget owner HTTP cases use their default integration owner without additive repetition");
   assert.equal(packageShard("bamboo-tickets"), "packages-0");
+  const sideChatCase = "handlers::agent::side_chat::tests::side_chat_runs_with_the_main_turn_retries_and_follows_its_source_lifecycle";
   for (const name of ["browser::one", "handlers::agent::chat::browser::two", "handlers::agent::execute::x",
-    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other",
+    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other", sideChatCase,
     "handlers::agent::tickets::token_budget::tests::verified_worker_credentials_cannot_read_or_configure_owner_budget",
     "handlers::agent::tickets::ready_policy::tests::verified_worker_credentials_cannot_observe_or_install_owner_policy"]) {
     const matches = SERVER_LIB_SHARDS.filter((shard, index) => {
@@ -68,6 +69,7 @@ test("feature shards partition package targets and additive owners exactly once"
     });
     assert.equal(matches.length, 1, `${name} must belong to exactly one server library shard`);
     assert.ok(defaultShardArguments(server, matches[0]).includes("--lib"));
+    if (name === sideChatCase) assert.deepEqual(matches, ["server-handlers"]);
   }
   assert.throws(() => selectShard(packages, FEATURE_CONTEXTS, "unknown"));
 });
