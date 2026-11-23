@@ -668,6 +668,7 @@ impl AnthropicProvider {
             self.thinking_replay_always,
             native_groups,
             capability_loading_mode,
+            compatible_gateway,
         );
         let mut body = Self::encode_messages_request(
             content,
@@ -901,29 +902,42 @@ pub fn build_anthropic_request_with_cache(
     )
 }
 
-#[cfg(feature = "litellm-wire-types")]
-pub(super) fn build_litellm_anthropic_proxy_request(
+pub(super) fn build_anthropic_proxy_request(
     messages: &[Message],
     tools: &[ToolSchema],
     model: &str,
     max_tokens: u32,
     effort: Option<ReasoningEffort>,
     cache: Option<&PromptCachePlan>,
+    #[cfg(feature = "litellm-wire-types")] use_litellm_controls: bool,
 ) -> Result<Value> {
+    let thinking_enabled = effort.is_some_and(|effort| effort != ReasoningEffort::Disabled);
+    #[cfg(feature = "litellm-wire-types")]
+    let thinking_enabled = if use_litellm_controls {
+        litellm::thinking_replay_enabled(model, effort)
+    } else {
+        thinking_enabled
+    };
     let content = prepare_anthropic_content(
         messages,
         &[],
         tools,
-        litellm::thinking_replay_enabled(model, effort),
+        thinking_enabled,
         None,
         cache,
         false,
         &[],
         CapabilityLoadingMode::LegacyFullCatalog,
+        true,
     );
-    Ok(serde_json::to_value(litellm::messages_request(
-        content, model, max_tokens, true, effort,
-    )?)?)
+    AnthropicProvider::encode_messages_request(
+        content,
+        model,
+        max_tokens,
+        effort,
+        #[cfg(feature = "litellm-wire-types")]
+        use_litellm_controls,
+    )
 }
 
 #[cfg(feature = "litellm-wire-types")]
@@ -1036,6 +1050,7 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         thinking_replay_always,
         native_groups,
         capability_loading_mode,
+        false,
     );
     serialize_anthropic_request(content, model, max_tokens, stream, reasoning_effort)
 }
@@ -1058,6 +1073,7 @@ fn prepare_anthropic_content(
     thinking_replay_always: bool,
     native_groups: &[ProviderTranscriptGroup],
     capability_loading_mode: CapabilityLoadingMode,
+    compatible_gateway: bool,
 ) -> PreparedAnthropicContent {
     let default_plan = PromptCachePlan {
         cache_tools: true,
@@ -1066,6 +1082,7 @@ fn prepare_anthropic_content(
     };
     let plan = cache.unwrap_or(&default_plan);
     let ttl = plan.ttl;
+    let pin_history_prefix = compatible_gateway && plan.anthropic_history.is_some();
 
     let (mut system, mut anthropic_messages, source_spans) = prepare_anthropic_turns(
         messages,
@@ -1077,13 +1094,24 @@ fn prepare_anthropic_content(
             .and_then(|history| history.external_memory_message_id.as_deref()),
     );
 
-    // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
-    // markers per request. Reserve the tools and system anchors, then
-    // prioritize history boundaries within the remaining message budget.
     let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
+    if plan.cache_system {
+        if let Some(last_block) = system
+            .as_mut()
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(|block| block.as_object_mut())
+        {
+            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
 
+    // A system breakpoint includes the tools in its prefix. On compatible
+    // routes, use that slot for the history checkpoint so both rolling
+    // boundaries can still fit, even after appends beyond the lookback window.
+    let system_cached = budget < MAX_ANTHROPIC_CACHE_BREAKPOINTS;
     let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
-    if plan.cache_tools && budget > 0 {
+    if plan.cache_tools && !(pin_history_prefix && system_cached) {
         if let Some(last_tool) = tools_json.iter_mut().rev().find_map(|tool| {
             let object = tool.as_object_mut()?;
             (!object
@@ -1093,17 +1121,6 @@ fn prepare_anthropic_content(
             .then_some(object)
         }) {
             last_tool.insert("cache_control".to_string(), cache_control_value(ttl));
-            budget -= 1;
-        }
-    }
-
-    if plan.cache_system && budget > 0 {
-        if let Some(last_block) = system
-            .as_mut()
-            .and_then(|blocks| blocks.last_mut())
-            .and_then(|block| block.as_object_mut())
-        {
-            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
             budget -= 1;
         }
     }
@@ -1122,6 +1139,14 @@ fn prepare_anthropic_content(
                     .map(|span| (message_idx, span.end_block - 1))
             })
             .collect();
+        if pin_history_prefix {
+            // Reserve the same slots from the first request. Filling a spare
+            // slot with a guide marker and removing it on a later append would
+            // also change the cached history prefix on these gateways.
+            let fixed_budget = budget.saturating_sub(3);
+            let excess = breakpoint_targets.len().saturating_sub(fixed_budget);
+            breakpoint_targets.drain(..excess);
+        }
         if let Some(history) = &plan.anthropic_history {
             // The prior history write remains an explicit target, including
             // when it falls outside the provider's 20-block lookback.
@@ -1131,6 +1156,7 @@ fn prepare_anthropic_content(
                 history,
                 native_groups,
                 capability_loading_mode,
+                pin_history_prefix,
             );
             breakpoint_targets.retain(|target| !history_targets.contains(target));
             breakpoint_targets.extend(history_targets);
@@ -1211,6 +1237,7 @@ fn history_cache_targets(
     history: &AnthropicHistoryCache,
     native_groups: &[ProviderTranscriptGroup],
     capability_loading_mode: CapabilityLoadingMode,
+    pin_history_prefix: bool,
 ) -> Vec<(usize, usize)> {
     let native_anchors: HashSet<_> = native_groups
         .iter()
@@ -1220,9 +1247,12 @@ fn history_cache_targets(
         })
         .map(ProviderTranscriptGroup::anchor_message_id)
         .collect();
-    let mut targets = Vec::with_capacity(2);
+    let mut targets = Vec::with_capacity(3);
     let mut last_cacheable = None;
     let mut stable_prefix = true;
+    let mut checkpoint = None;
+    let mut prefix_size = 0usize;
+    let mut next_checkpoint_size = 0;
     for (message_idx, spans) in source_spans.iter().enumerate() {
         let blocks = &messages[message_idx].content;
         for span in spans {
@@ -1236,16 +1266,25 @@ fn history_cache_targets(
             stable_prefix &=
                 history.external_memory_message_id.as_deref() != Some(id) && !retained_tool_image;
             if stable_prefix && !native_anchors.contains(id) {
-                let eligible = blocks[span.start_block..span.end_block]
-                    .iter()
-                    .rposition(|block| {
-                        matches!(
-                            block["type"].as_str(),
-                            Some("text" | "image" | "document" | "tool_use" | "tool_result")
-                        )
-                    });
-                if let Some(offset) = eligible {
-                    last_cacheable = Some((message_idx, span.start_block + offset));
+                for (offset, block) in blocks[span.start_block..span.end_block].iter().enumerate() {
+                    if !matches!(
+                        block["type"].as_str(),
+                        Some("text" | "image" | "document" | "tool_use" | "tool_result")
+                    ) {
+                        continue;
+                    }
+                    let target = (message_idx, span.start_block + offset);
+                    last_cacheable = Some(target);
+                    if pin_history_prefix {
+                        prefix_size += history_block_size_hint(block);
+                        if prefix_size >= next_checkpoint_size {
+                            checkpoint = Some(target);
+                            // Grow by at least 32 KiB or one eighth of the
+                            // current history. Replaying this scan gives the
+                            // same checkpoint after retry or process restart.
+                            next_checkpoint_size = prefix_size + (prefix_size / 8).max(32 * 1024);
+                        }
+                    }
                 }
             }
             if id == history.newest_message_id || history.previous_message_id.as_deref() == Some(id)
@@ -1255,9 +1294,31 @@ fn history_cache_targets(
                     targets.push(target);
                 }
             }
+            if id == history.newest_message_id {
+                if let Some(checkpoint) = checkpoint {
+                    // Rolling markers before this checkpoint would change its
+                    // cache key when they move. Only advance markers after it.
+                    targets.retain(|target| *target > checkpoint);
+                    targets.push(checkpoint);
+                }
+                return targets;
+            }
         }
     }
     targets
+}
+
+/// Approximate wire size without copying or re-encoding large tool results.
+fn history_block_size_hint(block: &Value) -> usize {
+    match block {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(history_block_size_hint).sum(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| key.len() + history_block_size_hint(value))
+            .sum(),
+        _ => 1,
+    }
 }
 
 /// Replace only the normalized source contribution owned by each anchor. Cache
@@ -2189,7 +2250,7 @@ impl AnthropicUsageSnapshot {
     }
 }
 
-fn anthropic_stream_with_usage_on_error(
+pub(super) fn anthropic_stream_with_usage_on_error(
     response: reqwest::Response,
     state: Arc<Mutex<AnthropicStreamState>>,
 ) -> LLMStream {
