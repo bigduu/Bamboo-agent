@@ -480,15 +480,15 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
 }
 
 #[tokio::test]
-async fn chat_message_summary_recovers_when_reasoning_exhausts_the_output_limit() {
+async fn chat_message_summary_gives_reasoning_room_from_the_first_request() {
     for unlimited_output in [true, false] {
         for effort in [None, Some(bamboo_domain::ReasoningEffort::High)] {
-            assert_chat_reasoning_cutoff_recovers(unlimited_output, effort).await;
+            assert_chat_summary_uses_model_output_limit(unlimited_output, effort).await;
         }
     }
 }
 
-async fn assert_chat_reasoning_cutoff_recovers(
+async fn assert_chat_summary_uses_model_output_limit(
     unlimited_output: bool,
     effort: Option<bamboo_domain::ReasoningEffort>,
 ) {
@@ -561,23 +561,19 @@ async fn assert_chat_reasoning_cutoff_recovers(
         .collect::<Vec<_>>();
     assert_eq!(
         bodies.len(),
-        4,
-        "one retry for each of map and final reduce"
+        2,
+        "map and final reduce succeed on the first request"
     );
     let expected_effort = effort.map(|value| serde_json::json!(value.as_str()));
-    for pair in bodies.chunks_exact(2) {
-        let first_limit = pair[0][limit_field].as_u64().unwrap();
-        assert!((1..MODEL_OUTPUT_LIMIT).contains(&first_limit));
-        assert_eq!(pair[0].get("reasoning_effort"), expected_effort.as_ref());
-        let mut expected_retry = pair[0].clone();
-        expected_retry[limit_field] = MODEL_OUTPUT_LIMIT.into();
-        assert_eq!(pair[1], expected_retry);
-        assert!(!pair[1].to_string().contains(REASONING));
+    for body in &bodies {
+        assert_eq!(body[limit_field], MODEL_OUTPUT_LIMIT);
+        assert_eq!(body.get("reasoning_effort"), expected_effort.as_ref());
+        assert!(!body.to_string().contains(REASONING));
     }
 }
 
 #[tokio::test]
-async fn chat_message_summary_keeps_retry_room_for_a_near_window_map() {
+async fn chat_message_summary_leaves_reasoning_room_for_a_near_window_map() {
     const MODEL: &str = "summary-secondary";
     const CONTEXT_TOKENS: u32 = 32_000;
     const OUTPUT_LIMIT: u64 = 64_000;
@@ -653,23 +649,240 @@ async fn chat_message_summary_keeps_retry_room_for_a_near_window_map() {
         .filter(|request| request.url.path() == "/chat/completions")
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    let first = bodies[0]["max_tokens"].as_u64().unwrap();
-    let retry = bodies[1]["max_tokens"].as_u64().unwrap();
-    assert!(first <= REASONING_TOKENS && retry > REASONING_TOKENS);
-    let mut expected_retry = bodies[0].clone();
-    expected_retry["max_tokens"] = retry.into();
-    assert_eq!(bodies[1], expected_retry);
+    assert!(bodies[0]["max_tokens"].as_u64().unwrap() > REASONING_TOKENS);
+}
+
+#[tokio::test]
+async fn messages_message_summary_keeps_effort_and_fits_reasoning_plus_visible_summary() {
+    for (reported_output, role_effort) in [(None, true), (Some(48_000), false), (Some(8_000), true)]
+    {
+        assert_messages_summary_capacity(reported_output, role_effort, None).await;
+    }
+}
+
+#[tokio::test]
+async fn messages_message_summary_does_not_archive_a_clipped_summary() {
+    for reason in ["max_tokens", "model_context_window_exceeded"] {
+        assert_messages_summary_capacity(Some(48_000), true, Some(reason)).await;
+    }
+}
+
+async fn assert_messages_summary_capacity(
+    reported_output: Option<u64>,
+    role_effort: bool,
+    truncated_stop_reason: Option<&'static str>,
+) {
+    const MODEL: &str = "dashscope.deepseek-v4.1-flash-1017";
+    const REASONING_TOKENS: u64 = 30_000;
+    let expected_limit = reported_output.unwrap_or(u64::from(
+        bamboo_compression::limits::DEFAULT_MAX_OUTPUT_TOKENS,
+    ));
+    let summary = " evidence".repeat(1_950).trim_start().to_owned();
+    let summary_tokens = TiktokenTokenCounter::default().count_text(&summary);
+    assert!((1_900..2_000).contains(&summary_tokens));
+    let output_needed = REASONING_TOKENS + u64::from(summary_tokens);
+
+    let server = MockServer::start().await;
+    let mut model_info = serde_json::json!({"id": MODEL});
+    if let Some(max_tokens) = reported_output {
+        model_info["max_tokens"] = max_tokens.into();
+    }
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [model_info],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let visible_summary = summary.clone();
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let max_tokens = body["max_tokens"].as_u64().unwrap();
+            if max_tokens >= output_needed {
+                return messages_summary_stream(
+                    Some(&visible_summary),
+                    output_needed,
+                    REASONING_TOKENS,
+                    truncated_stop_reason.unwrap_or("end_turn"),
+                );
+            }
+            messages_summary_stream(None, max_tokens, max_tokens, "max_tokens")
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut provider = bamboo_llm::AnthropicProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+    let mut target = bamboo_domain::ProviderModelRef::new("messages", MODEL);
+    if role_effort {
+        target = target.with_reasoning_effort(bamboo_domain::ReasoningEffort::Max);
+    } else {
+        provider = provider.with_reasoning_effort(Some(bamboo_domain::ReasoningEffort::Max));
+    }
+    let resolved = bamboo_llm::ResolvedModel::from_ref(Arc::new(provider), &target);
+    let mut config = message_summary_config(resolved.provider);
+    config.app_data_dir = Some(directory.path().to_path_buf());
+    config.summarization_model_name = Some(resolved.model_name);
+
+    let mut session = message_summary_session();
+    session.messages[1].content = " evidence".repeat(9_700);
+    let before = archive_state(&session);
+    let result = run_message_summary(&mut session, &config).await;
+    let complete = expected_limit >= output_needed && truncated_stop_reason.is_none();
+    if complete {
+        assert!(result.unwrap());
+        assert_eq!(session.compression_events.len(), 1);
+        assert_eq!(
+            session.compression_events[0].actual_summary_tokens,
+            summary_tokens
+        );
+        assert_eq!(session.conversation_summary.unwrap().content, summary);
+    } else {
+        assert!(matches!(result, Err(AgentError::EmptyContextSummary)));
+        assert_eq!(archive_state(&session), before);
+        assert!(session.conversation_summary.is_none());
+        assert!(session.compression_events.is_empty());
+    }
+
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/messages")
+        .map(|request| request.body_json::<serde_json::Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), if complete { 2 } else { 1 });
+    let map_prompt = bodies[0]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("map prompt");
+    let visible_target = map_prompt
+        .split_once("Target approximately ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|target| target.parse::<u64>().ok())
+        .expect("visible summary length guidance");
+    assert!((1_900..2_000).contains(&visible_target));
+    for body in bodies {
+        assert_eq!(body["model"], MODEL);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["max_tokens"], expected_limit);
+    }
+}
+
+fn messages_summary_stream(
+    text: Option<&str>,
+    output_tokens: u64,
+    thinking_tokens: u64,
+    stop_reason: &str,
+) -> ResponseTemplate {
+    let mut events = Vec::new();
+    if let Some(text) = text {
+        events.extend([
+            (
+                "content_block_start",
+                serde_json::json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ),
+            ("content_block_stop", serde_json::json!({"index": 0})),
+        ]);
+    }
+    events.extend([
+        (
+            "message_delta",
+            serde_json::json!({
+                "delta": {"stop_reason": stop_reason},
+                    "usage": {"output_tokens": output_tokens, "thinking_tokens": thinking_tokens},
+            }),
+        ),
+        ("message_stop", serde_json::json!({})),
+    ]);
+    let body = events
+        .into_iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect::<String>();
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(body)
+}
+
+#[tokio::test]
+async fn round_continues_after_empty_automatic_summary_only_when_context_still_fits() {
+    let _env = isolate_prompt_safe_env_cache();
+    for (forced, over_limit) in [(false, false), (false, true), (true, false)] {
+        let (provider, calls) = bounded_compression_llm(BoundedFailureMode::Empty);
+        let mut config = message_summary_config(provider);
+        let directory = tempfile::tempdir().unwrap();
+        config.app_data_dir = Some(directory.path().to_path_buf());
+        let mut session = message_summary_session();
+        session.force_manual_compression = forced.then(String::new);
+        session.token_usage = Some(pressure_usage(30_000, 32_000));
+        if over_limit {
+            session.messages[1].content = "detail ".repeat(32_000);
+        }
+        let before = archive_state(&session);
+        let result = prepare_round_context(
+            &mut session,
+            &config,
+            "test-model",
+            "message-summary-1827",
+            &[],
+            &noop_llm(),
+            None,
+        )
+        .await;
+        if forced || over_limit {
+            assert!(
+                matches!(result, Err(AgentError::EmptyContextSummary)),
+                "{result:?}"
+            );
+        } else {
+            let prepared = result.unwrap().prepared_context;
+            assert!(!prepared.truncation_occurred);
+            assert_eq!(
+                prepared
+                    .messages
+                    .iter()
+                    .map(|message| &message.id)
+                    .collect::<Vec<_>>(),
+                session
+                    .messages
+                    .iter()
+                    .map(|message| &message.id)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(archive_state(&session), before);
+        assert!(session.conversation_summary.is_none());
+        assert!(session.compression_events.is_empty());
+    }
 }
 
 #[tokio::test]
 async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
     for effort in [None, Some(bamboo_domain::ReasoningEffort::Low)] {
-        assert_chat_empty_reduce_preserves_history(effort).await;
+        assert_chat_failed_reduce_preserves_history(effort, false).await;
     }
 }
 
-async fn assert_chat_empty_reduce_preserves_history(
+#[tokio::test]
+async fn chat_message_summary_clipped_reduce_preserves_persisted_history() {
+    assert_chat_failed_reduce_preserves_history(Some(bamboo_domain::ReasoningEffort::High), true)
+        .await;
+}
+
+async fn assert_chat_failed_reduce_preserves_history(
     effort: Option<bamboo_domain::ReasoningEffort>,
+    clipped: bool,
 ) {
     use bamboo_agent_core::Storage;
 
@@ -700,12 +913,17 @@ async fn assert_chat_empty_reduce_preserves_history(
         .respond_with(
             move |_: &Request| match calls.fetch_add(1, Ordering::Relaxed) {
                 0 => chat_summary_stream("The chosen design is recorded."),
+                1 if clipped => chat_completion_stream(
+                    serde_json::json!({"content": "A partial summary that ends mid-sentence"}),
+                    "length",
+                ),
                 1 => chat_completion_stream(
                     serde_json::json!({"reasoning_content": "Reasoning without a summary"}),
                     "stop",
                 ),
-                _ => ResponseTemplate::new(400)
-                    .set_body_string("Unexpected retry after the model returned an empty summary"),
+                _ => ResponseTemplate::new(400).set_body_string(
+                    "Unexpected retry after the model returned an unusable summary",
+                ),
             },
         )
         .expect(2)
@@ -752,7 +970,7 @@ async fn assert_chat_empty_reduce_preserves_history(
     while let Some(event) = events.recv().await {
         match event {
             AgentEvent::ContextCompressionStatus { status, .. } => last_status = Some(status),
-            AgentEvent::ContextSummarized { .. } => panic!("An empty summary was committed"),
+            AgentEvent::ContextSummarized { .. } => panic!("An unusable summary was committed"),
             _ => {}
         }
     }
@@ -768,7 +986,7 @@ async fn assert_chat_empty_reduce_preserves_history(
         })
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(bodies.len(), 2, "one map and one empty reduce completion");
+    assert_eq!(bodies.len(), 2, "one map and one failed reduce completion");
     let (limit, other_limit) = if effort.is_some() {
         ("max_completion_tokens", "max_tokens")
     } else {

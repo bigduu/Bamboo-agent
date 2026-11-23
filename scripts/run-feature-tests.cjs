@@ -241,7 +241,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // target. Ultra model ceilings retain their existing default Engine owner.
 // Messages cache checkpoints and SSE usage stay in the existing LLM,
 // Engine, and Server handler owners.
-const FEATURE_SOURCE_SHA256 = "a8c74adeba15eeb995d08e2523b8b55561458f1f4fc3f60175a06ea3000d91ca";
+// Summary requests retain the default Compression, Engine, Agent Core, and LLM
+// owners. The session_compaction target stays in server-tests-0.
+const FEATURE_SOURCE_SHA256 = "6e283096bb42e282d50d8ff2aa02df5292d41b780faf221895f4c54be1d3369c";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

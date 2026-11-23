@@ -279,7 +279,7 @@ pub(crate) enum ChatCompletionsResponse {
 pub(crate) enum ChatCompletionsCorrection {
     None,
     ReasoningDisable,
-    CompressionTokenLimit { reasoning_effort: String },
+    CompressionTokenLimit,
 }
 
 /// Correct an explicit wire rejection once on the same Chat Completions route.
@@ -306,8 +306,8 @@ pub(crate) async fn send_chat_completions(
                 ChatCompletionsCorrection::ReasoningDisable => {
                     correct_rejected_chat_disable(&mut body, &rejection)
                 }
-                ChatCompletionsCorrection::CompressionTokenLimit { reasoning_effort } => {
-                    correct_rejected_compression_limit(&mut body, &rejection, reasoning_effort)
+                ChatCompletionsCorrection::CompressionTokenLimit => {
+                    correct_rejected_compression_limit(&mut body, &rejection)
                 }
             }
     }) {
@@ -339,11 +339,7 @@ pub(crate) async fn send_chat_completions(
     })
 }
 
-fn correct_rejected_compression_limit(
-    body: &mut Value,
-    rejection: &str,
-    reasoning_effort: &str,
-) -> bool {
+fn correct_rejected_compression_limit(body: &mut Value, rejection: &str) -> bool {
     let Ok(rejection) = serde_json::from_str::<Value>(rejection) else {
         return false;
     };
@@ -362,17 +358,23 @@ fn correct_rejected_compression_limit(
     ) {
         return false;
     }
+    if body.get("reasoning_effort").is_some() {
+        return false;
+    }
+    use_chat_completion_limit(body)
+}
+
+pub(crate) fn use_chat_completion_limit(body: &mut Value) -> bool {
     let Some(fields) = body.as_object_mut() else {
         return false;
     };
-    if fields.contains_key("max_completion_tokens") || fields.contains_key("reasoning_effort") {
+    if fields.contains_key("max_completion_tokens") {
         return false;
     }
     let Some(limit) = fields.remove("max_tokens") else {
         return false;
     };
     fields.insert("max_completion_tokens".into(), limit);
-    fields.insert("reasoning_effort".into(), json!(reasoning_effort));
     true
 }
 
