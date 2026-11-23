@@ -18,6 +18,7 @@ TARGETS = proof.TARGETS[3]
 MARKER = 'browser-runtime/desktop.lock.json'
 MANIFEST = 'bamboo-desktop-browser-runtimes-v1.json'
 HOST = 'browser-runtime/host.cjs'
+PACKAGE = 'browser-runtime/package.json'
 PACKAGE_LOCK = 'browser-runtime/package-lock.json'
 MAX_ARCHIVE = 768 * 1024 ** 2
 
@@ -39,7 +40,7 @@ def plan():
     manifest = json.loads(verified['manifest'])
     host = {entry['path']: entry['sha256'] for entry in manifest['browserHost']['files']}
     return {'version': version, 'source': source, 'manifest_sha': manifest_sha,
-            'host_sha': host[HOST], 'package_lock_sha': host[PACKAGE_LOCK]}
+            'host_sha': host[HOST], 'package_sha': host[PACKAGE], 'package_lock_sha': host[PACKAGE_LOCK]}
 
 
 def read_release(selection):
@@ -110,6 +111,8 @@ def runtime_receipt(file, record, target, selection):
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             checksum.update(block)
     assert checksum.hexdigest() == record['archive']['sha256']
+    host_hashes = {HOST: selection['host_sha'], PACKAGE: selection['package_sha'], PACKAGE_LOCK: selection['package_lock_sha']}
+    checked = set()
     with tarfile.open(file, 'r|gz') as archive:
         receipt = None
         for member in archive:
@@ -118,6 +121,11 @@ def runtime_receipt(file, record, target, selection):
                 raw = archive.extractfile(member).read()
                 assert hashlib.sha256(raw).hexdigest() == record['receiptSha256']
                 receipt = json.loads(raw)
+            elif member.name in host_hashes:
+                assert member.name not in checked and member.isfile() and 0 < member.size <= 8 * 1024 ** 2
+                assert hashlib.sha256(archive.extractfile(member).read()).hexdigest() == host_hashes[member.name]
+                checked.add(member.name)
+        assert checked == set(host_hashes), 'Browser runtime archive lacks required Host bytes'
         assert receipt and receipt['schemaVersion'] == 1
         assert receipt['target'] == target and receipt['sourceRevision'] == selection['source']
         assert receipt['hostSha256'] == selection['host_sha'] and receipt['packageLockSha256'] == selection['package_lock_sha']
@@ -161,6 +169,9 @@ def publish(directory, bindings):
     release = read_release(selection)
     expected = {record['assetName']: record['archive'] for record in records}
     expected[MANIFEST] = {'sha256': hashlib.sha256(raw).hexdigest(), 'sizeBytes': len(raw)}
+    for name, identity in expected.items():
+        if any(asset['name'] == name for asset in release['assets']):
+            proof.original(release['assets'], {'assetName': name, **identity}, name)
     for name, identity in expected.items():
         if not any(asset['name'] == name for asset in release['assets']):
             subprocess.run(['gh', 'release', 'upload', release['tag_name'], str(directory / name), '--repo', proof.REPOSITORY],
