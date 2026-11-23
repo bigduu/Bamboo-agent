@@ -232,6 +232,7 @@ fn historical_managed_work_input_requires_the_entire_receipt_fingerprint() {
             binding_revision: 1,
         },
         max_rounds: None,
+        highest_reasoning: false,
         receipt: None,
         receipt_created_at: None,
     };

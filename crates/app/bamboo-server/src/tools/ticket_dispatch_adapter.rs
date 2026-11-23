@@ -19,6 +19,7 @@ pub struct TicketDispatchPolicy {
     pub workspace: String,
     pub max_rounds: Option<u32>,
     pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    pub highest_reasoning: bool,
     pub admission_fence: Option<bamboo_orchestration::ReadyAdmissionFence>,
 }
 
@@ -92,6 +93,7 @@ impl ChildSessionAdapter {
         }
         match self.query_ticket_dispatch(&service, key, spec).await? {
             DispatchObservation::Missing => {
+                dispatch.highest_reasoning = policy.highest_reasoning;
                 ticket_runtime::require_dispatch_permission(&service, &dispatch)?;
                 if let Some(workspace) = &spec.workspace {
                     bamboo_engine::ticket_worker_plan::files::verify_workspace(workspace.clone())

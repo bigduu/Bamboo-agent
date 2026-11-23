@@ -33,6 +33,9 @@ pub struct TicketDispatchBinding {
     /// Immutable Host request ceiling, retained in canonical Child metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// Host reasoning selection frozen when a Work Child is created.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub highest_reasoning: bool,
     pub receipt: Option<RuntimeReceipt>,
     pub receipt_created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -131,6 +134,7 @@ pub fn dispatch_binding(
         assignment_id: spec.assignment_id.clone(),
         binding: snapshot.binding,
         max_rounds: None,
+        highest_reasoning: false,
         receipt: None,
         receipt_created_at: None,
     })
@@ -382,6 +386,7 @@ pub async fn query_dispatch(
     comparable.receipt = None;
     comparable.receipt_created_at = None;
     comparable.max_rounds = None;
+    comparable.highest_reasoning = false;
     if comparable != expected
         || child.kind != SessionKind::Child
         || child.parent_session_id.as_deref() != Some(&binding.supervisor_session_id)

@@ -2,14 +2,16 @@
 use super::*;
 use bamboo_agent_core::tools::{
     with_executing_session_caller, ExecutingSupervisorObservation, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolOutcome,
+    ToolExecutionSessionFlags, ToolOutcome, ToolSchema,
 };
 use bamboo_domain::{
-    ActorActivationStatus, ActorDirectoryPort, Session, SessionCallerReference, SessionKind,
+    ActorActivationStatus, ActorDirectoryPort, Message, ReasoningEffort, Session,
+    SessionCallerReference, SessionKind,
 };
 use bamboo_engine::session_activation::{
     SessionActivationReserveOutcome, SessionActivationSpawner,
 };
+use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 use bamboo_server::{tools::ToolSurface, AppState};
 use bamboo_tickets::{AssignmentState, Authority, Command, ExecutionWorkspace, TicketService};
 
@@ -118,6 +120,50 @@ fn prepare_start(
 
 #[actix_web::test]
 async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_result() {
+    managed_work_root_submits_owned_result(false).await;
+}
+
+#[actix_web::test]
+async fn supervisor_work_ultra_reaches_the_managed_root_and_its_model_requests() {
+    managed_work_root_submits_owned_result(true).await;
+}
+
+struct AssertEffort {
+    provider: Arc<LocalProvider>,
+    expected: ReasoningEffort,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for AssertEffort {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        panic!("managed Work must retain request options");
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(
+            options.and_then(|options| options.reasoning_effort),
+            Some(self.expected)
+        );
+        self.provider
+            .chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+}
+
+async fn managed_work_root_submits_owned_result(ultra: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -131,14 +177,56 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         calls: AtomicUsize::new(0),
         max_requests: 3,
     });
-    let state = web::Data::new(host(&path, provider.clone()).await);
+    let routed = Arc::new(AssertEffort {
+        provider: provider.clone(),
+        expected: if ultra {
+            ReasoningEffort::Max
+        } else {
+            ReasoningEffort::Xhigh
+        },
+    });
+    let state = web::Data::new(host(&path, routed).await);
+    // The provider is already installed in the fixture registry. Leave the
+    // synthetic plaintext key out of the config being persisted by the API.
     state
         .config
         .write()
         .await
-        .features
-        .work_execution
-        .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Xhigh);
+        .providers_mut()
+        .openai
+        .as_mut()
+        .unwrap()
+        .api_key
+        .clear();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let saved = owner_post!(
+        app,
+        "/api/v1/bamboo/config",
+        &json!({ "features": { "work_execution": {
+            "reasoning_effort": "xhigh", "ultra_by_default": ultra
+        } } }),
+        StatusCode::OK
+    );
+    assert_eq!(
+        saved["features"]["work_execution"]["ultra_by_default"],
+        ultra
+    );
+    let readback: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/bamboo/config")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        readback["features"]["work_execution"],
+        saved["features"]["work_execution"]
+    );
     let owner_principal = Principal::User {
         user_id: "host-owner".into(),
     };
@@ -230,9 +318,16 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         .unwrap()
         .unwrap();
     assert_eq!(root.kind, SessionKind::Root);
+    assert_eq!(root.root_thinking_mode().enabled(), ultra);
+    assert_eq!(root.reasoning_effort, Some(ReasoningEffort::Xhigh));
     assert_eq!(
-        root.reasoning_effort,
-        Some(bamboo_domain::ReasoningEffort::Xhigh)
+        intent
+            .immutable_spec
+            .managed_root
+            .as_ref()
+            .unwrap()
+            .thinking_mode,
+        ultra.then_some(bamboo_domain::RootThinkingMode::Ultra)
     );
     assert_eq!(root.created_at, admission.target_created_at);
     assert_eq!(root.project_id_meta().as_deref(), Some(project.id.as_str()));
@@ -250,6 +345,22 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         .messages
         .iter()
         .any(|message| message.content.contains(&work)));
+    if ultra {
+        let saved = owner_post!(
+            app,
+            "/api/v1/bamboo/config",
+            &json!({ "features": { "work_execution": { "ultra_by_default": false } } }),
+            StatusCode::OK
+        );
+        assert_eq!(
+            saved["features"]["work_execution"]["ultra_by_default"],
+            false
+        );
+        assert_eq!(
+            saved["features"]["work_execution"]["reasoning_effort"],
+            "xhigh"
+        );
+    }
     assert_eq!(
         dispatch(&state, &supervisor, &start, true).await["receipt"],
         first_dispatch["receipt"]
@@ -353,12 +464,6 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
         )
         .unwrap();
     assert!(service.work_update(&authority, &accept).is_err());
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(bamboo_server::configure_routes),
-    )
-    .await;
     owner_post!(app, "/api/v1/tickets/update", &accept, StatusCode::OK);
     drop(app);
     state.shutdown().await;
