@@ -536,7 +536,8 @@ impl GeminiProvider {
         // and `streamGenerateContent?alt=sse` sends no [DONE], so emitting all
         // chunks from the one event — rather than deferring — guarantees usage
         // is delivered even when the connection closes immediately afterwards.
-        let mut state = GeminiStreamState::default();
+        let mut state =
+            GeminiStreamState::with_diagnostics(crate::provider::current_completion_diagnostics());
         #[cfg(feature = "litellm-wire-types")]
         if self.litellm_wire_types {
             state.enable_litellm_tool_ids();
@@ -548,14 +549,9 @@ impl GeminiProvider {
         let model_for_log = model.to_string();
         let requested_reasoning_for_log = reasoning_effort;
         let mut logged_summary = false;
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
-
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
-                if let Some(diagnostics) = &completion_diagnostics {
-                    diagnostics.observe_sse(event, data);
-                }
                 let chunks = stream::parse_with_provider_usage(&mut state, event, data)?;
 
                 if !logged_summary
