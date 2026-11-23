@@ -581,11 +581,7 @@ async fn start(
                 let check = match account.recv().await {
                     Ok(event) => {
                         event.session_id.as_deref() == Some(&source_id)
-                            && matches!(
-                                event.event,
-                                AgentEvent::SessionCleared { .. }
-                                    | AgentEvent::SessionDeleted { .. }
-                            )
+                            && source_changed(&event.event)
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => true,
                     Err(broadcast::error::RecvError::Closed) => break,
