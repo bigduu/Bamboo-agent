@@ -18,6 +18,12 @@ workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
 
+The four Linux `agent-tests-*` jobs run Bamboo Agent integration targets.
+`agent-tests-0` retains both default Ticket runtime targets and their additive
+feature context. The slower Actor and Broker targets have explicit owners in
+`agent-tests-1` through `agent-tests-3`. Other integration targets are assigned
+by name hash, and the routing test checks complete, disjoint ownership.
+
 The Linux `packages-1` shard owns the default LiteLLM wire-types suite. Its
 additive `schema` context runs the three schema-only cases with the same target
 directory and checks that the test names match the compiled catalog.
