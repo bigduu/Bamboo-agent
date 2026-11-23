@@ -226,6 +226,7 @@ fn append_interrupted_assistant_output(
     let partial_tool_calls = (!partial.partial_tool_calls.is_empty()).then(|| {
         serde_json::to_value(&partial.partial_tool_calls).unwrap_or(serde_json::Value::Null)
     });
+    let plain_text_only = partial.plain_text_only;
     let mut message = Message::assistant_with_reasoning(
         partial.content,
         None,
@@ -241,9 +242,74 @@ fn append_interrupted_assistant_output(
         "interrupted": true,
         "interruption_kind": interruption_kind(error),
         "partial_tool_calls": partial_tool_calls,
+        "plain_text_only": plain_text_only,
     }));
     session.add_message(message);
     true
+}
+
+/// Consider only the fragment produced by this attempt. The original input
+/// and all completed tool results stay on the same run.
+pub(crate) fn worker_timeout_usage(
+    session: &Session,
+    config: &AgentLoopConfig,
+    previous_tail: Option<&str>,
+    error: &AgentError,
+) -> Option<bamboo_metrics::TokenUsage> {
+    let AgentError::StreamTimeout(timeout) = error else {
+        return None;
+    };
+    if !timeout.semantic_output_started()
+        || !matches!(
+            timeout.phase(),
+            bamboo_agent_core::StreamTimeoutPhase::TransportIdle
+                | bamboo_agent_core::StreamTimeoutPhase::SemanticIdle
+        )
+        || !session.messages.last().is_some_and(|message| {
+            Some(message.id.as_str()) != previous_tail
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == INTERRUPTED_ASSISTANT_OUTPUT_KIND
+                        && metadata["plain_text_only"] == true
+                })
+        })
+    {
+        return None;
+    }
+    let owner = config
+        .persistence
+        .as_ref()
+        .and_then(|port| port.root_actor_writer())?;
+    if owner.created_at != session.created_at
+        || owner.fence.actor_id.as_str() != session.id
+        || config.guidance_active_run_id.as_deref() != Some(owner.fence.run_id.as_str())
+    {
+        return None;
+    }
+    let is_work =
+        crate::ticket_runtime::is_managed_work_root(session) && config.ticket_worker_plan.is_some();
+    let is_subscribed = session
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        .is_some_and(|outcomes| {
+            outcomes.facts.last().is_some_and(|fact| {
+                fact.run_id == owner.fence.run_id
+                    && fact.result.is_none()
+                    && outcomes.material_inputs(fact).next().is_some()
+            })
+        });
+    if !is_work && !is_subscribed {
+        return None;
+    }
+    let (prompt_tokens, completion_tokens) = timeout.interrupted_attempt_tokens()?;
+    Some(
+        bamboo_metrics::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+        .clamped_for_durable_metrics(),
+    )
 }
 
 /// Remove the transient partial record before a retry.  A terminal attempt
@@ -2268,6 +2334,22 @@ pub(super) async fn execute_llm_stream(
                 AgentError::LLM(message) if replay_unsafe => AgentError::LLMNonRetryable(message),
                 other => other,
             };
+            if failure.partial_output.plain_text_only {
+                if let AgentError::StreamTimeout(timeout) = &mut failure.error {
+                    let partial = &failure.partial_output;
+                    let usage = super::canonical_token_usage(
+                        partial.provider_usage,
+                        partial.input_tokens,
+                        partial.output_tokens,
+                        u64::from(final_usage.input_tokens),
+                        super::token_estimation::estimate_completion_tokens(&partial.content, &[]),
+                    );
+                    timeout.record_interrupted_attempt_tokens(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                }
+            }
             if let Some(usage) = failure.partial_output.provider_usage {
                 observation.model_usage(&token_usage(usage));
             }

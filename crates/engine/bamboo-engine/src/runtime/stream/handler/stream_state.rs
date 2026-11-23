@@ -26,6 +26,7 @@ pub(super) struct StreamAccumulationState {
     provider_usage: Option<ProviderUsageSnapshot>,
     input_tokens: u64,
     provider_transcript_items: Vec<bamboo_domain::ProviderTranscriptItem>,
+    non_text_protocol_output: bool,
 }
 
 impl StreamAccumulationState {
@@ -46,6 +47,7 @@ impl StreamAccumulationState {
             provider_usage: None,
             input_tokens: 0,
             provider_transcript_items: Vec::new(),
+            non_text_protocol_output: false,
         }
     }
 
@@ -92,6 +94,23 @@ impl StreamAccumulationState {
         item: bamboo_domain::ProviderTranscriptItem,
     ) {
         self.provider_transcript_items.push(item);
+    }
+
+    pub(super) fn observe_responses_event(&mut self, event_type: &str, data: &serde_json::Value) {
+        let plain_text = match event_type {
+            "response.created"
+            | "response.in_progress"
+            | "response.output_text.delta"
+            | "response.output_text.done" => true,
+            "response.output_item.added" | "response.output_item.done" => {
+                data["item"]["type"] == "message"
+            }
+            "response.content_part.added" | "response.content_part.done" => {
+                data["part"]["type"] == "output_text"
+            }
+            _ => false,
+        };
+        self.non_text_protocol_output |= !plain_text;
     }
 
     pub(super) fn extend_tool_calls(
@@ -309,6 +328,13 @@ impl StreamAccumulationState {
     }
 
     pub(super) fn into_interrupted_output(self) -> InterruptedStreamOutput {
+        let plain_text_only = !self.content.is_empty()
+            && self.reasoning_content.is_empty()
+            && self.reasoning_signature.is_none()
+            && !self.reasoning_signature_invalidated
+            && self.tool_calls.parts().is_empty()
+            && self.provider_transcript_items.is_empty()
+            && !self.non_text_protocol_output;
         InterruptedStreamOutput {
             visible_message: self.visible_message,
             content: self.content,
@@ -319,6 +345,7 @@ impl StreamAccumulationState {
                 .iter()
                 .map(PartialToolCallSnapshot::from)
                 .collect(),
+            plain_text_only,
             provider_usage: self.provider_usage,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,

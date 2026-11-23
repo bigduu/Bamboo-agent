@@ -57,8 +57,23 @@ fn conflict(target: &str, run: Option<&str>, reason: &str) -> Value {
 
 fn finalized(target: &SupervisorCurrentUserTarget, runner: &AgentRunner) -> Value {
     json!({"status":"already_finished", "accepted":false, "target_session_id":target.session_id,
-        "run_id":runner.run_id, "completion_verified":false,
+        "run_id":runner.run_id, "execution_started_at": observed_start(target, runner),
+        "completion_verified":false,
         "note":"The exact execution finalizer ran; durable outcome and physical resource cleanup require their own evidence."})
+}
+
+fn observed_start<'a>(
+    target: &SupervisorCurrentUserTarget,
+    runner: &'a AgentRunner,
+) -> Option<&'a str> {
+    match runner.published_execution_started.as_ref() {
+        Some(AgentEvent::ExecutionStarted {
+            run_id,
+            session_id,
+            started_at,
+        }) if run_id == &runner.run_id && session_id == &target.session_id => Some(started_at),
+        _ => None,
+    }
 }
 
 fn yield_wait(response: Value) -> ToolResult {
@@ -235,10 +250,10 @@ fn run_control(
         } else {
             "running"
         };
-        Ok(
-            json!({"status":status, "target_session_id":target.session_id,
-            "run_id":candidate, "completion_verified":false}),
-        )
+        Ok(json!({
+            "status":status, "target_session_id":target.session_id, "run_id":candidate,
+            "execution_started_at": observed_start(target, runner), "completion_verified":false
+        }))
     }
 }
 
@@ -454,10 +469,25 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
                 tracing::debug!(%error, "Managed Root admission evidence unavailable");
                 ToolError::Execution("managed_root_admission_evidence_unavailable".into())
             })?;
-        let response = match admission {
-            Some(admission) => json!({"status":"admission_verified", "admission":admission}),
-            None => json!({"status":"admission_unconfirmed"}),
+        let Some(admission) = admission else {
+            return Ok(ToolResult::text(
+                true,
+                json!({"status":"admission_unconfirmed", "execution_started_at":null}).to_string(),
+            ));
         };
+        // Read the live owner independently. A newer run cannot confirm the
+        // start of the run that consumed this exact receipt.
+        let execution = self
+            .control(caller, target, None, None)
+            .await
+            .ok()
+            .filter(|result| result.success)
+            .and_then(|result| serde_json::from_str::<Value>(&result.result).ok())
+            .filter(|value| value["run_id"].as_str() == Some(admission.run_id.as_str()));
+        let response = json!({
+            "status":"admission_verified", "admission":admission,
+            "execution_started_at": execution.as_ref().and_then(|run| run["execution_started_at"].as_str()),
+        });
         Ok(ToolResult::text(true, response.to_string()))
     }
 
@@ -617,6 +647,34 @@ mod tests {
     async fn subscribed_wait_finishes_the_supervisor_turn_and_delivers_after_completion() {
         super::super::observer_subscriptions::tests::exercise_subscribed_wait_yields_to_inbox()
             .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_worker_timeout_wakes_supervisor_with_verified_diagnostic() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_worker_timeout_notice()
+            .await;
+    }
+
+    #[actix_web::test]
+    async fn delayed_worker_timeout_notice_cannot_use_a_newer_runs_diagnostic() {
+        super::super::observer_subscriptions::tests::exercise_delayed_worker_timeout_notice().await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_worker_confirms_real_start_and_recovers_in_the_same_run() {
+        super::super::observer_subscriptions::tests::exercise_worker_start_and_stream_recovery()
+            .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_worker_charges_timed_out_attempt_before_retry() {
+        super::super::observer_subscriptions::tests::exercise_worker_timeout_respects_run_budget()
+            .await;
+    }
+
+    #[actix_web::test]
+    async fn supervisor_log_monitor_creates_session_notifies_on_new_lines_and_stops() {
+        super::super::observer_subscriptions::tests::exercise_supervisor_log_monitor().await;
     }
 
     #[actix_web::test]

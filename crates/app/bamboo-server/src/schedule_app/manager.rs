@@ -511,6 +511,12 @@ async fn run_schedule_job(
     job: ScheduleRunJob,
     #[cfg(test)] progress: Option<Arc<ScheduleGuardProgress>>,
 ) -> Result<ScheduleRunLifecycleResult, String> {
+    if let Some(status) = super::log_monitor::run_log_monitor(&ctx, &job)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(ScheduleRunLifecycleResult::Terminal(status));
+    }
     #[cfg(test)]
     progress.at("session_preparation_pending");
     validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;

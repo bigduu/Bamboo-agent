@@ -56,6 +56,8 @@ pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "Set thinking_mode to ultra on explicit request. Use Standard by default.\n",
     "Reuse a Session only for the same verified assignment in the intended Project and workspace, or at the user's explicit direction. ",
     "Use session_control followup or an authorized session_message send, preserving the target's context and permissions. ",
+    "Use session_control observe_run with the original input receipt to verify its admission and actual Worker startup. ",
+    "For authorized recurring log checks, discover supervisor_log_monitor, use the registered Project and relative log path, and keep the returned monitor ID for stopping or resuming it. ",
     "Act only on requested assignments and their own fresh Host notifications."
 );
 

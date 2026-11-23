@@ -59,6 +59,7 @@ struct StreamTimeoutIdentity {
     diagnostic_id: uuid::Uuid,
     observed_at: chrono::DateTime<chrono::Utc>,
     last_http_retry: Option<(u16, Duration)>,
+    interrupted_attempt_tokens: Option<(u64, u64)>,
 }
 
 impl StreamTimeoutError {
@@ -79,6 +80,7 @@ impl StreamTimeoutError {
                 diagnostic_id: uuid::Uuid::new_v4(),
                 observed_at: chrono::Utc::now(),
                 last_http_retry: None,
+                interrupted_attempt_tokens: None,
             }),
             phase,
             deadline,
@@ -101,6 +103,16 @@ impl StreamTimeoutError {
 
     pub fn last_http_retry(&self) -> Option<(u16, Duration)> {
         self.identity.last_http_retry
+    }
+
+    /// Record accounting for a dispatched, interrupted stream. These
+    /// execution-local counters do not change the public watchdog diagnostic.
+    pub fn record_interrupted_attempt_tokens(&mut self, prompt: u64, completion: u64) {
+        self.identity.interrupted_attempt_tokens = Some((prompt, completion));
+    }
+
+    pub fn interrupted_attempt_tokens(&self) -> Option<(u64, u64)> {
+        self.identity.interrupted_attempt_tokens
     }
 
     /// Watchdog phase that expired.

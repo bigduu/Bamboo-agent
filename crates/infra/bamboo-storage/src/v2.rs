@@ -6782,7 +6782,13 @@ impl SessionStoreV2 {
                     if is_protected(root) {
                         continue;
                     }
-                    if mode == CleanupMode::Empty && root.message_count > 1 {
+                    // A recurring controller can use the schedule ID as its
+                    // durable Session ID, independent of chat message count.
+                    // Per-run scheduled Sessions have their own separate IDs.
+                    let schedule_controller =
+                        root.created_by_schedule_id.as_deref() == Some(root.id.as_str());
+                    if mode == CleanupMode::Empty && (root.message_count > 1 || schedule_controller)
+                    {
                         continue;
                     }
                     delete_root_ids.insert(root.id.clone());
