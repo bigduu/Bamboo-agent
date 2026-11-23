@@ -36,8 +36,16 @@ test("feature shards partition package targets and additive owners exactly once"
     for (let index = 0; index < count; index++) assert.ok(integrationTargets(owner, `${prefix}-tests-${index}`).length > 0);
   }
   const agent = packages.find(item => item.name === "bamboo-agent");
-  const agentFirst = integrationTargets(agent, "agent-tests-0");
-  for (const name of ["ticket_runtime_files", "ticket_runtime_publication"]) assert.ok(agentFirst.includes(name));
+  const agentShards = [
+    ["ticket_runtime_files", "ticket_runtime_publication"],
+    ["ordinary_root_actor_writer", "ordinary_root_inbox_lifecycle"],
+    ["compact_subagent_facade", "remote_broker_activation"],
+    ["local_zero_tool_actor", "native_tool_ceiling"],
+  ];
+  agentShards.forEach((names, index) => {
+    const targets = integrationTargets(agent, "agent-tests-" + index);
+    for (const name of names) assert.ok(targets.includes(name), name + " must belong to agent-tests-" + index);
+  });
   const server = packages.find(item => item.name === "bamboo-server");
   assert.deepEqual(["server-tests-0", "server-tests-1"].filter(shard =>
     integrationTargets(server, shard).includes("ready_work_scheduler")), ["server-tests-1"]);
