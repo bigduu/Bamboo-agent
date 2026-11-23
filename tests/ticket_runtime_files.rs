@@ -183,7 +183,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     })
     .await
     .unwrap();
-    let system = sysinfo::System::new_all();
+    let system = sysinfo::System::new_all().expect("initialize the test process table");
     let host_pid = f.host.as_ref().unwrap().0.id();
     let pids: Vec<_> = system
         .processes()
@@ -509,7 +509,7 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
     .await
     .unwrap();
     let host_pid = f.host.as_ref().unwrap().0.id();
-    let system = sysinfo::System::new_all();
+    let system = sysinfo::System::new_all().expect("initialize the test process table");
     let pids: Vec<_> = system
         .processes()
         .iter()

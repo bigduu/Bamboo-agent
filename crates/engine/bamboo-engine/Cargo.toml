@@ -59,7 +59,7 @@ toml = "1.1"
 dirs = "7"
 libc = "0.2"
 rand = "0.10"
-sysinfo = "0.39"
+sysinfo = "0.40"
 bytes = "1"
 
 [target.'cfg(windows)'.dependencies]

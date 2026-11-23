@@ -2062,7 +2062,13 @@ fn signal_process(pid: libc::pid_t, signal: ProcessSignal) {
 fn descendant_processes(root: libc::pid_t) -> Vec<libc::pid_t> {
     use sysinfo::{ProcessesToUpdate, System};
 
-    let mut system = System::new();
+    let mut system = match System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            tracing::warn!(%error, "codex: could not inspect child process tree");
+            return Vec::new();
+        }
+    };
     system.refresh_processes(ProcessesToUpdate::All, true);
     let mut known = HashSet::from([root]);
     let mut descendants = Vec::new();
