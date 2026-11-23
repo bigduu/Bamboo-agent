@@ -108,6 +108,7 @@ mod compact_main_tests;
 mod conversation_task_undo;
 mod default_actor_context;
 mod host_registry;
+mod recent_history;
 mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
@@ -1826,6 +1827,8 @@ pub struct SessionStoreV2 {
     /// allowing unrelated session ids to make progress independently.
     session_write_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     persistence_metrics: Arc<SessionPersistenceMetrics>,
+    #[cfg(test)]
+    recent_history_cold_reads: AtomicUsize,
     /// Coordinates destructive target lifecycle transitions with durable inbox
     /// operations. The Tokio lock covers one runtime; the file lock covers
     /// independent Bamboo processes sharing the same data directory.
@@ -2194,6 +2197,8 @@ impl SessionStoreV2 {
             write_lock: Mutex::new(()),
             session_write_locks: Arc::new(DashMap::new()),
             persistence_metrics,
+            #[cfg(test)]
+            recent_history_cold_reads: AtomicUsize::new(0),
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
             host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry::default(),
@@ -7503,16 +7508,42 @@ impl SessionStoreV2 {
             self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         }
+        let (session, _) = Self::load_session_main_at(&path).await?;
+        self.finish_session_read(session_id, session).await
+    }
+
+    async fn load_session_main_at(
+        path: &Path,
+    ) -> io::Result<(Session, Option<compact_main::CompactMainAuthority>)> {
         let raw = cold_main::read_text(path).await?;
-        compact_main::validate_full_main(raw.as_bytes())?;
-        let session: Session = serde_json::from_str(&raw)
-            .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
+        let authority = compact_main::validate_full_main(raw.as_bytes())?;
+        let session = serde_json::from_str(&raw)
+            .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+        Ok((session, authority))
+    }
+
+    async fn read_checked_runtime_sidecar(
+        &self,
+        session_id: &str,
+        main: &Session,
+    ) -> io::Result<Option<Session>> {
+        let sidecar = self.read_runtime_sidecar(session_id).await?;
+        supervisor::validate_overlay(main, sidecar.as_ref())?;
+        self.validate_root_tool_authority_overlay(session_id, main, sidecar.as_ref())
+            .await?;
+        Ok(sidecar)
+    }
+
+    async fn finish_session_read(
+        &self,
+        session_id: &str,
+        session: Session,
+    ) -> io::Result<Option<Session>> {
         if !self.session_lifetime_is_live(&session).await? {
             return Ok(None);
         }
-        let sidecar = self.read_runtime_sidecar(session_id).await?;
-        supervisor::validate_overlay(&session, sidecar.as_ref())?;
-        self.validate_root_tool_authority_overlay(session_id, &session, sidecar.as_ref())
+        let sidecar = self
+            .read_checked_runtime_sidecar(session_id, &session)
             .await?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
@@ -8394,6 +8425,7 @@ impl SessionStoreV2 {
             self.search_index_queue
                 .enqueue_upsert(session, revision_path, revision);
         stages.search_enqueue = enqueue_started.elapsed();
+        self.publish_recent_history(&path, session).await;
         let index_entry_count = self.index.read().await.sessions.len();
         let total = total_started.elapsed();
         self.persistence_metrics.record_save(
@@ -9220,6 +9252,13 @@ impl Storage for SessionStoreV2 {
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await
+    }
+
+    async fn load_recent_session_history(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<bamboo_domain::session::history::SessionHistoryWindow>> {
+        self.read_recent_history(session_id).await
     }
 
     async fn load_execution_admission_snapshot(
