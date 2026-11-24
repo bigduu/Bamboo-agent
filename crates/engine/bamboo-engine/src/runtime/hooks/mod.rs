@@ -53,6 +53,12 @@ impl HookRunner {
         use std::time::Duration;
         static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         let point = AgentHookPoint::AfterModelCallUsage;
+        if let Some(scope) = ordinary_root_resources() {
+            if !self.has_hooks_for(point) {
+                return;
+            }
+            scope.record_unconfirmed("ordinary Root model usage hooks have no resource proof");
+        }
         if !self.dispatcher.has_hooks_for(point) && self.plugin_root.is_none() {
             return;
         }
@@ -120,6 +126,7 @@ impl HookRunner {
         prompt: &str,
     ) -> Result<String, AgentError> {
         let prechecked = session.metadata.remove("runtime.plugin_prompt_prechecked");
+        self.observe_ordinary_root_hook(AgentHookPoint::BeforeSessionSetup);
         if prechecked.as_deref() == Some(prompt_fingerprint(prompt).as_str()) {
             return Ok(prompt.to_owned());
         }
@@ -209,6 +216,7 @@ impl HookRunner {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         inputs: bamboo_hooks::portable::PortableInputs<'_>,
     ) -> HookRunOutcome {
+        self.observe_ordinary_root_hook(point);
         let report = local_resources::run(self.dispatcher.run_hooks_with_resolved_shell(
             point,
             payload,
@@ -287,6 +295,7 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
+        self.observe_ordinary_root_hook(point);
         let report =
             local_resources::run(self.dispatcher.run_observer_hooks(point, payload, session)).await;
         record_dispatch_report(report, runtime_state, event_tx).await
@@ -298,6 +307,16 @@ impl HookRunner {
                 .plugin_root
                 .as_ref()
                 .is_some_and(|root| bamboo_hooks::portable::has_active_hooks_for(root, point)))
+    }
+
+    pub(crate) fn observe_ordinary_root_hook(&self, point: AgentHookPoint) {
+        if let Some(scope) = ordinary_root_resources() {
+            if self.has_hooks_for(point) {
+                scope.record_unconfirmed(format!(
+                    "ordinary Root {point:?} hooks have no resource proof"
+                ));
+            }
+        }
     }
 
     /// Future control seams in this runner, after the model can issue Start.
@@ -332,6 +351,11 @@ impl HookRunner {
                 .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))
             })
     }
+}
+
+fn ordinary_root_resources() -> Option<bamboo_tools::LocalTaskResources> {
+    bamboo_tools::LocalTaskResources::current()
+        .filter(bamboo_tools::LocalTaskResources::is_ordinary_root_update_scope)
 }
 
 fn prompt_fingerprint(prompt: &str) -> String {

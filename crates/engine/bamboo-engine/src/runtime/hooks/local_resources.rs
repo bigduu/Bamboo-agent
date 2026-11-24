@@ -28,7 +28,9 @@ impl Drop for HookInvocationGuard {
 }
 
 pub(super) async fn run<F: Future>(future: F) -> F::Output {
-    let Some(resources) = LocalTaskResources::current() else {
+    let Some(resources) =
+        LocalTaskResources::current().filter(|scope| !scope.is_ordinary_root_update_scope())
+    else {
         return future.await;
     };
     let mut guard = HookInvocationGuard {

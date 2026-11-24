@@ -227,23 +227,31 @@ pub(super) async fn initialize_loop_state(
     let local_resources = bamboo_tools::LocalTaskResources::current();
     if let Some(resources) = &local_resources {
         let owner = resources.identity();
+        let exact_root_writer = config
+            .persistence
+            .as_ref()
+            .and_then(|persistence| persistence.root_actor_writer())
+            .is_some_and(|writer| {
+                writer.fence.actor_id.as_str() == owner.session_id
+                    && writer.fence.run_id == owner.run_id
+                    && writer.created_at == owner.child_birth
+            });
         let managed_work_root = crate::ticket_runtime::is_managed_work_root(session)
             && config
                 .ticket_worker_plan
                 .as_ref()
                 .is_some_and(|plan| plan.run_id() == owner.run_id)
-            && config
-                .persistence
-                .as_ref()
-                .and_then(|persistence| persistence.root_actor_writer())
-                .is_some_and(|writer| {
-                    writer.fence.actor_id.as_str() == owner.session_id
-                        && writer.fence.run_id == owner.run_id
-                        && writer.created_at == owner.child_birth
-                });
+            && exact_root_writer;
+        let ordinary_root = resources.is_ordinary_root_update_scope()
+            && session.kind == bamboo_domain::SessionKind::Root
+            && session.authority_identity.is_ordinary()
+            && exact_root_writer;
         if owner.session_id != session.id
             || owner.child_birth != session.created_at
-            || session.kind != bamboo_domain::SessionKind::Child && !managed_work_root
+            || !(session.kind == bamboo_domain::SessionKind::Child
+                || managed_work_root
+                || ordinary_root)
+            || (resources.is_ordinary_root_update_scope() && !ordinary_root)
         {
             return Err(bamboo_agent_core::AgentError::LLM(
                 "local execution resource identity does not match canonical Session".into(),
@@ -262,6 +270,7 @@ pub(super) async fn initialize_loop_state(
     let mut runtime_state = AgentRuntimeState::new(
         local_resources
             .as_ref()
+            .filter(|scope| !scope.is_ordinary_root_update_scope())
             .map(|scope| scope.identity().run_id.as_str())
             .or_else(|| config.ticket_worker_plan.as_ref().map(|plan| plan.run_id()))
             .unwrap_or(&session_id),

@@ -957,6 +957,24 @@ impl AgentRuntime {
         session
             .check_execution_compatibility()
             .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        if session.kind == bamboo_domain::SessionKind::Root
+            && session.authority_identity.is_ordinary()
+            && !crate::ticket_runtime::is_managed_work_root(session)
+        {
+            if let Some(router) = &self.activation_router {
+                if router.tracks_ordinary_root_update()
+                    && !router.owns_ordinary_root_resources(
+                        bamboo_tools::LocalTaskResources::current().as_ref(),
+                        self.persistence.root_actor_writer().as_ref(),
+                    )
+                {
+                    router
+                        .observe_unowned_ordinary_root()
+                        .await
+                        .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+                }
+            }
+        }
         // Refusals are not executions: never reach SessionEnd or the generic
         // final checkpoint, and never mutate another counted owner's clone.
         super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
@@ -1453,6 +1471,8 @@ impl AgentRuntime {
 
         let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
+        session_end_runner
+            .observe_ordinary_root_hook(bamboo_domain::AgentHookPoint::AfterSessionEnd);
         let session_end_event_tx = event_tx.clone();
         let sdk_mode = loop_config.sdk_skill_execution_host.is_some();
         let loop_future = Box::pin(run_agent_loop_with_config(

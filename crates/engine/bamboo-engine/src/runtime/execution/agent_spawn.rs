@@ -1372,7 +1372,7 @@ pub fn spawn_session_execution_with_upstream_retry(
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
     let is_root = args.session.kind == bamboo_domain::SessionKind::Root;
-    let outer = if is_root {
+    let mut outer = if is_root {
         match args
             .execution_reservation
             .physical_admission
@@ -1399,8 +1399,20 @@ pub fn spawn_session_execution_with_upstream_retry(
     } else {
         None
     };
-    let task_outer = outer.clone();
     let managed_root = crate::ticket_runtime::is_managed_work_root(&args.session);
+    let managed_ordinary_root = is_root
+        && !managed_root
+        && args.session.authority_identity.is_ordinary()
+        && args
+            .agent
+            .activation_router()
+            .is_some_and(|router| router.tracks_ordinary_root_update());
+    let ordinary_join = if managed_ordinary_root {
+        outer.as_mut().map(|outer| outer.observe_update_join())
+    } else {
+        None
+    };
+    let task_outer = outer.clone();
     let (work_completion, joined_work) = if managed_root && outer.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel::<(
             crate::ticket_runtime::managed::ManagedWorkRun,
@@ -1525,6 +1537,31 @@ pub fn spawn_session_execution_with_upstream_retry(
                     .await;
                 execution_reservation.abandon().await;
                 return;
+            }
+            let ordinary_resources = match (
+                ordinary_join,
+                agent.activation_router(),
+                execution_reservation.root_actor_writer(),
+                ownership.as_ref(),
+            ) {
+                (Some(joined), Some(router), Some(writer), Some(ownership)) => {
+                    match router
+                        .enroll_ordinary_root_resources(&session, writer, ownership, joined)
+                        .await
+                    {
+                        Ok(resources) => Some(resources),
+                        Err(error) => {
+                            tracing::warn!(%session_id, %error, "ordinary Root update scope could not be enrolled");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(resources) = &ordinary_resources {
+                if on_complete.is_some() {
+                    resources.record_unconfirmed("ordinary Root completion hook has no resource proof");
+                }
             }
             let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
             let root_actor_bound = root_actor.is_some();
@@ -1689,8 +1726,12 @@ pub fn spawn_session_execution_with_upstream_retry(
                         upstream_retry,
                         execution_reservation.run_deadline,
                     );
-                    match &work {
-                        Some(work) => work.resources.scope(execution).await,
+                    match work
+                        .as_ref()
+                        .map(|work| &work.resources)
+                        .or(ordinary_resources.as_ref())
+                    {
+                        Some(resources) => resources.scope(execution).await,
                         None => execution.await,
                     }
                 };
