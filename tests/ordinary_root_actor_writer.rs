@@ -6,9 +6,10 @@
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::{storage::Storage, AgentEvent};
 use bamboo_domain::{
-    ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryPort, Role, Session,
+    ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryError, ActorDirectoryPort, Role,
+    Session, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort, SessionMessageEnvelope,
 };
-use bamboo_storage::SessionStoreV2;
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::Utc;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -310,6 +311,7 @@ impl Drop for Host {
 const UPDATE_MODEL: &str = "managed-update-root";
 const UPDATE_PROMPTS: [&str; 2] = ["MANAGED_UPDATE_FIRST", "MANAGED_UPDATE_SECOND"];
 const UPDATE_READBACK: &str = "durable result from the predecessor";
+const UPDATE_QUEUED_INPUT: &str = "Durable follow-up queued before successor startup";
 
 struct UpdateProbe {
     path: PathBuf,
@@ -614,19 +616,94 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     let intent: Value = serde_json::from_slice(&intent).unwrap();
     assert_eq!(intent["request"], request.to_string());
     assert_eq!(intent["roots"].as_array().unwrap().len(), 2);
-    let store = SessionStoreV2::new(data.clone()).await.unwrap();
-    let mut epochs = Vec::new();
+    let store = Arc::new(SessionStoreV2::new(data.clone()).await.unwrap());
+    let mut predecessors = Vec::new();
     for id in &roots {
         let session = store.load_session(id).await.unwrap().unwrap();
         assert_eq!(session.last_run_status().as_deref(), Some("suspended"));
+        assert!(session.is_parked_for_planned_update());
         let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
         assert_eq!(owner.status, ActorActivationStatus::Succeeded);
-        epochs.push(owner.lease_epoch);
+        predecessors.push((session, owner.fence()));
     }
+    // Seed a genuine wake-eligible Inbox entry between the two processes.
+    // Its durable delivery grants wake authority, with no transcript change.
+    let inbox = FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
+    let queued = inbox
+        .deliver_with_activation_intent(
+            &SessionMessageEnvelope::user_input(&roots[0], UPDATE_QUEUED_INPUT),
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let readiness = inbox
+        .inspect_wake_readiness(&roots[0], Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(readiness.ready.unwrap().generation, queued.generation);
 
     let mut new = Host::start_with_control(&data, "managed-new", Some(new_control.path()));
     Fixture::healthy(&client, &mut new).await;
     assert_ne!(old.child.id(), new.child.id());
+    // Startup has run its inline Inbox reconciliation by the time health is
+    // served. A direct execute also cannot claim the parked Root or its input.
+    let refused = client
+        .post(format!("{}/execute/{}", new.base, roots[0]))
+        .header("Bamboo-Input-Id", queued.id.as_str())
+        .header("Bamboo-Ingress-Seq", queued.generation)
+        .header(
+            "Bamboo-Session-Created-At",
+            predecessors[0].0.created_at.to_rfc3339(),
+        )
+        .header("Idempotency-Key", "planned-update-before-resume")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"]["code"],
+        "planned_update_resume_pending"
+    );
+    for (id, (snapshot, fence)) in roots.iter().zip(&predecessors) {
+        let parked = store.load_session(id).await.unwrap().unwrap();
+        assert!(parked.is_parked_for_planned_update());
+        assert_eq!(parked.last_run_status().as_deref(), Some("suspended"));
+        assert_eq!(
+            serde_json::to_value(&parked.messages).unwrap(),
+            serde_json::to_value(&snapshot.messages).unwrap()
+        );
+        let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
+        assert_eq!(&owner.fence(), fence);
+        assert_eq!(owner.status, ActorActivationStatus::Succeeded);
+    }
+    // The physical admission guard also rejects an ordinary caller whose
+    // observed candidate accidentally carries a different runtime view.
+    let (snapshot, _) = &predecessors[1];
+    let now = Utc::now();
+    assert!(matches!(
+        store
+            .claim_root_activation_observed(
+                &bamboo_domain::ActorActivationClaim {
+                    actor_id: snapshot.id.clone(),
+                    run_id: "unexpected-before-resume".into(),
+                    lease_owner: "fixture-ordinary-recovery".into(),
+                    lease_expires_at: now + chrono::Duration::seconds(15),
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now,
+                },
+                snapshot,
+            )
+            .await,
+        Err(ActorDirectoryError::Busy)
+    ));
+    let ready_after = inbox
+        .inspect_wake_readiness(&roots[0], Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(ready_after.ready.unwrap().id, queued.id);
     assert!(probe
         .calls
         .iter()
@@ -637,7 +714,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     assert_eq!(reply["status"], "resumed", "successor recovery: {reply}");
     assert_eq!(reply["report"]["resumed"], 2, "{reply}");
     assert_eq!(reply["report"]["pending_sessions"], json!([]));
-    for (id, epoch) in roots.iter().zip(epochs) {
+    for (id, (_, predecessor)) in roots.iter().zip(predecessors) {
         tokio::time::timeout(WAIT, async {
             loop {
                 let session = store.load_session(id).await.unwrap().unwrap();
@@ -647,7 +724,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
                         "Resumed after the planned update."
                     );
                     let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
-                    assert_eq!(owner.lease_epoch, epoch + 1);
+                    assert_eq!(owner.lease_epoch, predecessor.lease_epoch + 1);
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;

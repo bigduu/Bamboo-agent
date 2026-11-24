@@ -127,7 +127,7 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// persistence lock that commits the generic suspension clear.
 ///
 /// The boolean is false while a human response is pending or has its own
-/// successor, or while a child/Bash wait is respected.
+/// successor, a child/Bash wait is respected, or a managed update owns resume.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -143,7 +143,8 @@ async fn prepare_session_inbox_activation(
             // has already advanced the prefix's interrupt watermark.
             if expected_birth.is_some_and(|birth| {
                 latest.created_at != birth || crate::ticket_runtime::is_managed_work_root(latest)
-            }) || latest.has_pending_question()
+            }) || latest.is_parked_for_planned_update()
+                || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)

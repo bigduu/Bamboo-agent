@@ -1060,6 +1060,12 @@ impl ActorDirectoryPort for SessionStoreV2 {
         {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
+        // Only the update path may claim a parked Root with its exact
+        // completed predecessor. Fence stale ordinary callers under the
+        // same lock that commits the next Actor epoch.
+        if current.is_parked_for_planned_update() && predecessor.is_none() {
+            return Err(ActorDirectoryError::Busy);
+        }
         if bamboo_domain::is_root_compaction_lease_owner(&claim.lease_owner)
             && (matches!(
                 current.last_run_status().as_deref(),

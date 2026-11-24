@@ -8,7 +8,7 @@ use super::config::AgentLoopConfig;
 use crate::session_activation::ParkedUpdateRoot;
 use crate::session_app::provider_model::session_effective_model_ref;
 
-pub(crate) const SUSPEND_REASON: &str = "planned_update";
+pub(crate) use bamboo_domain::PLANNED_UPDATE_SUSPEND_REASON as SUSPEND_REASON;
 
 /// Called between complete rounds. Save through the old exact writer before
 /// reporting a parked round, then keep the original loop alive for an abort.

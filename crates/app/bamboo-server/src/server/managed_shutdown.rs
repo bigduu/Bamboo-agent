@@ -44,7 +44,14 @@ pub(super) struct ManagedShutdownCommit {
 impl ManagedShutdownCommit {
     pub(super) fn finalize(self) -> io::Result<()> {
         self.handoff.authorize()?;
-        publish_result(&self.directory, &self.result)
+        if let Err(error) = publish_result(&self.directory, &self.result) {
+            tracing::warn!(
+                %error,
+                request = %self.result.request_id,
+                "Cannot publish the shutdown reply after authorizing the planned update"
+            );
+        }
+        Ok(())
     }
 }
 
