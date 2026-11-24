@@ -632,6 +632,27 @@ mod tests {
     }
 
     #[test]
+    fn positional_arrays_follow_the_full_gemini_decoder() {
+        let mut state = GeminiStreamState::default();
+        let root_array = r#"[[{"content":{"parts":[{"text":"x"}]}}],null,null]"#;
+        assert!(matches!(
+            parse_gemini_sse_event(&mut state, "message", root_array),
+            Err(LLMError::Stream(message)) if message.contains("Missing candidates")
+        ));
+
+        let nested_arrays = [
+            r#"{"candidates":[[{"parts":[{"text":"x"}]},0]]}"#,
+            r#"{"candidates":[{"content":[[{"text":"x"}],"model"]}]}"#,
+            r#"{"candidates":[{"content":{"parts":[["x"]]}}]}"#,
+        ];
+        for data in nested_arrays {
+            assert!(parse_gemini_sse_event(&mut state, "message", data)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn repeated_usage_tracks_invalid_missing_zero_and_recovery() {
         let mut state = GeminiStreamState::default();
         let mut observe = |usage: &str| {
