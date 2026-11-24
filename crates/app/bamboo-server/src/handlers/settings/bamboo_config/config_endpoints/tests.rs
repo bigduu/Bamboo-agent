@@ -220,6 +220,58 @@ async fn compatibility_config_get_hides_all_access_control_verifiers() {
 }
 
 #[actix_web::test]
+async fn subagent_time_limits_are_saved_and_published_without_restart() {
+    use crate::app_state::AppState;
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::{json, Value};
+
+    let dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+    let saved: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(json!({"subagents": {"max_total_secs": 10800, "max_idle_secs": 1800}}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(saved["subagents"]["max_total_secs"], 10800);
+    assert_eq!(saved["subagents"]["max_idle_secs"], 1800);
+    let invalid = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(json!({"subagents": {"max_idle_secs": 0}}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, invalid).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let cleared: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(json!({"subagents": {"max_total_secs": null}}))
+            .to_request(),
+    )
+    .await;
+    assert!(cleared["subagents"].get("max_total_secs").is_none());
+    assert_eq!(cleared["subagents"]["max_idle_secs"], 1800);
+    let live = state.config.read().await;
+    assert_eq!(live.subagents().max_total_secs, None);
+    assert_eq!(live.subagents().max_idle_secs.map(|v| v.get()), Some(1800));
+    let sidecar: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("subagents.json")).unwrap()).unwrap();
+    assert!(sidecar["data"].get("max_total_secs").is_none());
+    assert_eq!(sidecar["data"]["max_idle_secs"], 1800);
+}
+
+#[actix_web::test]
 async fn context_management_patch_is_published_without_restart() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
