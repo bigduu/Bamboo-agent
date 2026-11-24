@@ -1127,6 +1127,42 @@ async fn local_child_time_limits_take_effect_at_launch_and_keep_session_override
 }
 
 #[tokio::test]
+async fn configured_short_limits_timeout_local_children_without_interval_overrides() {
+    for (idle, expected) in [(false, "max_total_secs=1"), (true, "max_idle_secs=1")] {
+        let home = tempfile::tempdir().unwrap();
+        let control = ProviderControl::new();
+        let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+        let limit = std::num::NonZeroU32::new(1);
+        {
+            let mut config = harness.config.write().await;
+            if idle {
+                config.subagents_mut().max_idle_secs = limit;
+            } else {
+                config.subagents_mut().max_total_secs = limit;
+            }
+        }
+        let child = harness
+            .child("held-provider", "Wait for the model response")
+            .await;
+        harness.launch(&child).await.unwrap();
+        let (id, status, error) =
+            tokio::time::timeout(Duration::from_secs(10), harness.completion())
+                .await
+                .expect("a one-second limit must expire before the default 15-second interval");
+        assert_eq!(id, child.id);
+        assert_eq!(status, "timeout");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected)),
+            "{error:?}"
+        );
+        harness.assert_terminal(&child, "timeout").await;
+        harness.runner.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn production_local_task_provider_error_confirms_stop_and_releases_slot() {
     let home = tempfile::tempdir().unwrap();
     let mut control = ProviderControl::new();

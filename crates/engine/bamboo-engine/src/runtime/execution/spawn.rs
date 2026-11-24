@@ -1193,15 +1193,13 @@ pub(crate) async fn watch_child_liveness(
         run_id,
         runtime,
     } = target;
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(policy.check_interval_secs.max(1) as u64));
-    // Skip the immediate tick.
-    ticker.tick().await;
+    let check_interval = Duration::from_secs(policy.check_interval_secs.max(1) as u64);
+    let mut next_check = Duration::ZERO;
 
     loop {
         tokio::select! {
             _ = done.cancelled() => return,
-            _ = ticker.tick() => {
+            _ = tokio::time::sleep(next_check) => {
                 if cancel_token.is_cancelled() {
                     return;
                 }
@@ -1218,7 +1216,8 @@ pub(crate) async fn watch_child_liveness(
                 }
 
                 let now = Utc::now();
-                let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
+                let total_elapsed = now.signed_duration_since(runner.started_at);
+                let total_secs = total_elapsed.num_seconds();
                 let current_native_work = if policy.needs_native_work_proof(total_secs, 0) {
                     current_native_work(runtime.as_ref(), &child_session_id, &run_id, child_birth).await
                 } else { false };
@@ -1240,7 +1239,8 @@ pub(crate) async fn watch_child_liveness(
 
                 let shell_wait = runtime.shell_wait_activity_at(&child_session_id, &run_id, child_birth, now);
                 let last_activity_at = runner.last_activity_at().max(shell_wait).unwrap_or(runner.started_at);
-                let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
+                let idle_elapsed = now.signed_duration_since(last_activity_at);
+                let idle_secs = idle_elapsed.num_seconds();
                 if idle_secs >= policy.max_idle_secs {
                     let reason = format!(
                         "Child session idle timeout after {} seconds without events (max_idle_secs={})",
@@ -1258,6 +1258,17 @@ pub(crate) async fn watch_child_liveness(
                     *timeout_reason.write().await = Some(reason);
                     cancel_token.cancel();
                     return;
+                }
+
+                let remaining_idle = Duration::from_secs(policy.max_idle_secs as u64)
+                    .saturating_sub(idle_elapsed.to_std().unwrap_or_default());
+                next_check = check_interval.min(remaining_idle);
+                // A managed Work past its default total limit was just verified.
+                // Recheck its ownership on the next normal wake.
+                if total_secs < policy.max_total_secs {
+                    let remaining_total = Duration::from_secs(policy.max_total_secs as u64)
+                        .saturating_sub(total_elapsed.to_std().unwrap_or_default());
+                    next_check = next_check.min(remaining_total);
                 }
             }
         }
