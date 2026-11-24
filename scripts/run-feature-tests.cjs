@@ -254,7 +254,13 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3005 uses the default Grep packages-2, Engine packages-3, and infrastructure
 // packages-4 owners. The new span attribution test is shared across telemetry
 // configurations, and the additive catalog retains its existing selection.
-const FEATURE_SOURCE_SHA256 = "4fa764d1b72063cac28fca02c676aedc9c7a6f575034c27d6061afb7ae3cd6f6";
+// #3012 adds default Config, Engine and Server settings tests to their existing owners.
+// The additive contexts and their case selections are unchanged.
+// #3018 keeps the session header rendering and provider request regressions in
+// the default bamboo-llm packages-2 owner. Additive contexts stay unchanged.
+// #3009 keeps Work handoff guidance in the default Engine owner. The existing
+// ticket_supervisor_tools integration target remains in agent-tests-1.
+const FEATURE_SOURCE_SHA256 = "fa5dafadd167293ee7fee2a5e5b11dccef12dde914a87e5cc7000b82c3b1234a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

@@ -110,16 +110,20 @@ pub struct UpstreamRetryDefaults {
     pub max_attempts: u32,
     pub total_budget_ms: u64,
     pub attempt_timeout_ms: u64,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
 }
 
 pub fn upstream_retry_defaults() -> UpstreamRetryDefaults {
-    let limits = initial_request_limits();
+    let (limits, retry) = policy_snapshot();
     UpstreamRetryDefaults {
         supported_modes: ["bounded", "until_cancelled"],
         default_mode: "bounded",
-        max_attempts: super::global().max_attempts,
+        max_attempts: retry.max_attempts,
         total_budget_ms: limits.total_budget.as_millis() as u64,
         attempt_timeout_ms: limits.attempt_timeout.as_millis() as u64,
+        base_delay_ms: retry.base_delay.as_millis() as u64,
+        max_delay_ms: retry.max_delay.as_millis() as u64,
     }
 }
 

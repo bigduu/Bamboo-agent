@@ -8,7 +8,7 @@ use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use serde_json::{json, Value};
 
 use crate::app_state::supervisor_owner_authorization::test_support::{
-    intent as approved_intent, ApprovedHostIntent,
+    intent as approved_intent, write_work_disabled_profile, ApprovedHostIntent,
 };
 use crate::{app_state::AppState, routes::configure_routes};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
+        write_work_disabled_profile(home.path());
         let state = web::Data::new(
             Box::pin(AppState::new(home.path().into()))
                 .await

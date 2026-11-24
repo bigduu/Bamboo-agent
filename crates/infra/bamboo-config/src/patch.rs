@@ -2378,6 +2378,33 @@ mod tests {
         assert_eq!(merged.subagents.max_concurrent, None);
     }
 
+    #[test]
+    fn subagent_time_limit_patch_saves_and_clears_limits_independently() {
+        let mut current = Config::default();
+        current.subagents.max_concurrent = Some(4);
+        let configured = merge_and_deserialize(
+            &current,
+            json!({"subagents": {"max_total_secs": 10800, "max_idle_secs": 1800}}),
+        );
+        assert_eq!(
+            configured.subagents.max_total_secs.map(|v| v.get()),
+            Some(10800)
+        );
+        assert_eq!(
+            configured.subagents.max_idle_secs.map(|v| v.get()),
+            Some(1800)
+        );
+        assert_eq!(configured.subagents.max_concurrent, Some(4));
+
+        let cleared =
+            merge_and_deserialize(&configured, json!({"subagents": {"max_total_secs": null}}));
+        assert_eq!(cleared.subagents.max_total_secs, None);
+        assert_eq!(cleared.subagents.max_idle_secs.map(|v| v.get()), Some(1800));
+        assert!(
+            serde_json::from_value::<crate::SubagentsConfig>(json!({"max_idle_secs": 0})).is_err()
+        );
+    }
+
     // ── #505: secret-field composition (intents recognize null as clear) ──
 
     #[test]

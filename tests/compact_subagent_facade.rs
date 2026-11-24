@@ -655,7 +655,11 @@ async fn fixture(role: Option<&'static str>, fast_grandchild: bool) {
         let binding: Value =
             serde_json::from_str(&child.metadata["child.named_profile.v1"]).unwrap();
         assert_eq!(binding["name"], role);
-        assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
+        assert!(!child.agent_runtime_state.as_ref().unwrap().read_only);
+        assert_eq!(
+            binding["tools"],
+            json!(["exec_command", "write_stdin", "Glob", "Read"])
+        );
         assert!(child.messages[0]
             .content
             .contains("Selected child role: explorer"));

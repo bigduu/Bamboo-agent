@@ -106,7 +106,12 @@ impl BodhiProvider {
         self
     }
 
-    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+    fn build_headers(
+        &self,
+        endpoint: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -118,11 +123,12 @@ impl BodhiProvider {
                 HeaderValue::from_static(super::anthropic::ANTHROPIC_API_VERSION),
             );
         }
-        request_overrides::apply_overrides_to_header_map(
+        request_overrides::apply_overrides_to_session_headers(
             &mut headers,
             self.request_overrides.as_ref(),
             endpoint,
             model,
+            session_id,
         );
         // This hop authenticates to Bodhi. The gateway selects the upstream credential.
         for name in [
@@ -226,9 +232,8 @@ impl LLMProvider for BodhiProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
-        let session_log_id = options
-            .and_then(|o| o.session_id.as_deref())
-            .unwrap_or("unknown-session");
+        let session_id = options.and_then(|options| options.session_id.as_deref());
+        let session_log_id = session_id.unwrap_or("unknown-session");
 
         tracing::info!(
             "[session_hash={}] Bodhi proxy request target_hash={} model_hash={} purpose_hash={}",
@@ -245,6 +250,7 @@ impl LLMProvider for BodhiProvider {
                     tools,
                     max_output_tokens,
                     model,
+                    session_id,
                     reasoning_effort,
                     parallel_tool_calls,
                     required_tool,
@@ -259,6 +265,7 @@ impl LLMProvider for BodhiProvider {
                     tools,
                     max_output_tokens,
                     model,
+                    session_id,
                     reasoning_effort,
                     required_tool,
                     options.and_then(|options| options.cache.as_ref()),
@@ -271,6 +278,7 @@ impl LLMProvider for BodhiProvider {
                     tools,
                     max_output_tokens,
                     model,
+                    session_id,
                     reasoning_effort,
                     required_tool,
                 )
@@ -285,7 +293,7 @@ impl LLMProvider for BodhiProvider {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         let url = self.proxy_url("v1/models");
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
 
         // Try to fetch models through the bodhi proxy.
         // If the bodhi server doesn't support this endpoint, return empty gracefully.
@@ -303,7 +311,7 @@ impl LLMProvider for BodhiProvider {
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
         use model_fetcher::ModelListFormat;
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = self.proxy_url("v1/models");
         let (format, generation_endpoints): (_, &'static [_]) = match self.target_provider.as_str()
         {
@@ -349,6 +357,7 @@ impl BodhiProvider {
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
+        session_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         parallel_tool_calls: Option<bool>,
         required_tool: Option<&str>,
@@ -379,8 +388,11 @@ impl BodhiProvider {
             model,
         )?;
 
-        let headers =
-            self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(model),
+            session_id,
+        )?;
         let url = self.proxy_url("v1/chat/completions");
 
         let response = match send_chat_completions(
@@ -418,12 +430,14 @@ impl BodhiProvider {
         Ok(stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_anthropic(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
+        session_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
         cache_plan: Option<&crate::cache::PromptCachePlan>,
@@ -467,7 +481,11 @@ impl BodhiProvider {
             )?;
         }
 
-        let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        let mut headers = self.build_headers(
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+            session_id,
+        )?;
         apply_cache_ttl_header(&mut headers, cache_plan);
         let url = self.proxy_url("v1/messages");
 
@@ -496,12 +514,14 @@ impl BodhiProvider {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_gemini(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
+        session_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         required_tool: Option<&str>,
     ) -> Result<LLMStream> {
@@ -533,6 +553,7 @@ impl BodhiProvider {
         let headers = self.build_headers(
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
             Some(model),
+            session_id,
         )?;
         let url = self.proxy_url(&format!(
             "v1beta/models/{}:streamGenerateContent?alt=sse",

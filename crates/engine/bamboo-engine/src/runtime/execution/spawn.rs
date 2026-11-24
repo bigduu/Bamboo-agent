@@ -1004,7 +1004,9 @@ pub(crate) struct ChildWatchdogPolicy {
     // stale beyond what the per-child liveness watchdog could still act on.
     pub(crate) max_total_secs: i64,
     total_is_explicit: bool,
+    total_from_config: bool,
     pub(crate) max_idle_secs: i64,
+    idle_from_config: bool,
 }
 
 impl Default for ChildWatchdogPolicy {
@@ -1016,8 +1018,10 @@ impl Default for ChildWatchdogPolicy {
             // sub-session runners.
             max_total_secs: 60 * 60,
             total_is_explicit: false,
+            total_from_config: false,
             // No child event for 15 minutes is considered stalled.
             max_idle_secs: 15 * 60,
+            idle_from_config: false,
         }
     }
 }
@@ -1067,14 +1071,23 @@ fn metadata_i64(session: &Session, key: &str) -> Option<i64> {
         .filter(|value| *value > 0)
 }
 
-pub(crate) fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPolicy {
+pub(crate) fn watchdog_policy_for_session(
+    session: &Session,
+    local_config: Option<&bamboo_config::SubagentsConfig>,
+) -> ChildWatchdogPolicy {
     let mut policy = ChildWatchdogPolicy::default();
     if let Some(value) = metadata_i64(session, "child_watchdog.max_total_secs") {
         policy.max_total_secs = value;
         policy.total_is_explicit = true;
+    } else if let Some(value) = local_config.and_then(|config| config.max_total_secs) {
+        policy.max_total_secs = i64::from(value.get());
+        policy.total_from_config = true;
     }
     if let Some(value) = metadata_i64(session, "child_watchdog.max_idle_secs") {
         policy.max_idle_secs = value;
+    } else if let Some(value) = local_config.and_then(|config| config.max_idle_secs) {
+        policy.max_idle_secs = i64::from(value.get());
+        policy.idle_from_config = true;
     }
     if let Some(value) = metadata_i64(session, "child_watchdog.check_interval_secs") {
         policy.check_interval_secs = value;
@@ -1186,13 +1199,26 @@ pub(crate) async fn watch_child_liveness(
     } = target;
     let mut ticker =
         tokio::time::interval(Duration::from_secs(policy.check_interval_secs.max(1) as u64));
-    // Skip the immediate tick.
+    // Host recovery uses the configured polling cadence. Public limits can
+    // request an additional check without advancing another limit's cadence.
     ticker.tick().await;
+    let mut config_deadline =
+        (policy.total_from_config || policy.idle_from_config).then(tokio::time::Instant::now);
 
     loop {
         tokio::select! {
             _ = done.cancelled() => return,
-            _ = ticker.tick() => {
+            interval_tick = async {
+                if let Some(deadline) = config_deadline {
+                    tokio::select! {
+                        _ = ticker.tick() => true,
+                        _ = tokio::time::sleep_until(deadline) => false,
+                    }
+                } else {
+                    ticker.tick().await;
+                    true
+                }
+            } => {
                 if cancel_token.is_cancelled() {
                     return;
                 }
@@ -1209,11 +1235,13 @@ pub(crate) async fn watch_child_liveness(
                 }
 
                 let now = Utc::now();
-                let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                let current_native_work = if policy.needs_native_work_proof(total_secs, 0) {
+                let total_elapsed = now.signed_duration_since(runner.started_at);
+                let total_secs = total_elapsed.num_seconds();
+                let check_total = interval_tick || policy.total_from_config;
+                let current_native_work = if check_total && policy.needs_native_work_proof(total_secs, 0) {
                     current_native_work(runtime.as_ref(), &child_session_id, &run_id, child_birth).await
                 } else { false };
-                if policy.total_timeout_reached(total_secs, 0, current_native_work) {
+                if check_total && policy.total_timeout_reached(total_secs, 0, current_native_work) {
                     let reason = format!(
                         "Child session timed out after {} seconds (max_total_secs={})",
                         total_secs, policy.max_total_secs
@@ -1231,8 +1259,9 @@ pub(crate) async fn watch_child_liveness(
 
                 let shell_wait = runtime.shell_wait_activity_at(&child_session_id, &run_id, child_birth, now);
                 let last_activity_at = runner.last_activity_at().max(shell_wait).unwrap_or(runner.started_at);
-                let idle_secs = now.signed_duration_since(last_activity_at).num_seconds();
-                if idle_secs >= policy.max_idle_secs {
+                let idle_elapsed = now.signed_duration_since(last_activity_at);
+                let idle_secs = idle_elapsed.num_seconds();
+                if (interval_tick || policy.idle_from_config) && idle_secs >= policy.max_idle_secs {
                     let reason = format!(
                         "Child session idle timeout after {} seconds without events (max_idle_secs={})",
                         idle_secs, policy.max_idle_secs
@@ -1250,6 +1279,19 @@ pub(crate) async fn watch_child_liveness(
                     cancel_token.cancel();
                     return;
                 }
+
+                let idle_delay = policy.idle_from_config.then(|| {
+                    Duration::from_secs(policy.max_idle_secs as u64)
+                        .saturating_sub(idle_elapsed.to_std().unwrap_or_default())
+                });
+                // After an exempt Work crosses its total limit, check its
+                // ownership again on the next regular interval tick.
+                let total_delay = (policy.total_from_config && total_secs < policy.max_total_secs).then(|| {
+                    Duration::from_secs(policy.max_total_secs as u64)
+                        .saturating_sub(total_elapsed.to_std().unwrap_or_default())
+                });
+                config_deadline = [idle_delay, total_delay].into_iter().flatten().min()
+                    .and_then(|delay| tokio::time::Instant::now().checked_add(delay));
             }
         }
     }

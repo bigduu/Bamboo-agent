@@ -90,6 +90,8 @@ pub struct AgentRunner {
     // an unqualified finalizer cannot prove which run it finalized.
     pub(super) execution_finalized: CancellationToken,
     pub(super) terminal_usage: Arc<OnceLock<TokenUsage>>,
+    /// Launch-time limits shared by the Child watchdog and parent wait recovery.
+    pub(crate) child_watchdog_policy: Option<super::spawn::ChildWatchdogPolicy>,
     child_completion_publication: Option<(DateTime<Utc>, Weak<()>)>,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
@@ -294,6 +296,7 @@ impl AgentRunner {
             completed_at: None,
             execution_finalized: CancellationToken::new(),
             terminal_usage: Arc::default(),
+            child_watchdog_policy: None,
             child_completion_publication: None,
             supervisor_run_target: None,
             supervisor_run_workspace: None,

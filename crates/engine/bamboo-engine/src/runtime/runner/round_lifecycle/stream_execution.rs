@@ -958,10 +958,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         .as_ref()
         .filter(|_| session.supervisor_incarnation_id().is_some())
         .map(bamboo_domain::model_context_block_sha256);
-    if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
-        session,
-        config.guidance_active_run_id.as_deref(),
-    ) {
+    // Work creation receipts cover the first input. Attach review guidance to
+    // the model context of the bound Worker without rewriting that input.
+    let handoff = if config.ticket_worker_plan.is_some() {
+        Some(ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Work Delivery Evidence",
+            bamboo_orchestration::managed_work::WORK_HANDOFF_GUIDANCE,
+        ))
+    } else {
+        bamboo_orchestration::managed_session::worker_handoff_context(
+            session,
+            config.guidance_active_run_id.as_deref(),
+        )
+    };
+    if let Some(handoff) = handoff {
         if let Some(block) = orchestration.as_mut() {
             block.content.push_str("\n\n");
             block.content.push_str(&handoff.content);
@@ -2099,6 +2112,13 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let progress_events = event_tx.clone();
+    http_retry_observer.report_progress(move |retry| {
+        let _ = progress_events.try_send(AgentEvent::UpstreamRetryScheduled {
+            http_status: retry.status,
+            retry_delay_ms: retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    });
     let recovery = recovery.map(|retry| match window_limit {
         Some(limit) => retry.tighten_output_limit(limit),
         None => retry,
