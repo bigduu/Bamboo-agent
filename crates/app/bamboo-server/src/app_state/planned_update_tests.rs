@@ -113,6 +113,7 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         run_id: owner.run_id,
         lease_epoch: owner.lease_epoch,
         conversation_reset_sha256: session.conversation_reset_sha256().unwrap(),
+        transcript_sha256: ParkedUpdateRoot::hash_transcript(&session.messages).unwrap(),
         root_tool_authority_revision: session.root_tool_authority_revision,
         project_id: session.project_id_meta(),
         workspace_path: session.workspace_path_meta(),
@@ -148,7 +149,9 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
     assert_eq!(before.last_run_status().as_deref(), Some("suspended"));
     assert_eq!(before.host_run_id(), Some(checkpoint.run_id.as_str()));
     let mut stale = checkpoint.clone();
-    stale.message_id = "changed-tail".into();
+    let mut changed_messages = session.messages.clone();
+    changed_messages[0].content = "Changed original request.".into();
+    stale.transcript_sha256 = ParkedUpdateRoot::hash_transcript(&changed_messages).unwrap();
     assert!(!state
         .child_completion_coordinator
         .resume_planned_update_root(&stale)
