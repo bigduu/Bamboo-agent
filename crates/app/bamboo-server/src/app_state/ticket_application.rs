@@ -581,10 +581,21 @@ impl TicketApplication {
         }
         let (service, authority) = self.authority(principal.clone()).await?;
         self.validate_project_operations(&service, command)?;
-        self.record_update_dispatch().await?;
-        let receipt = service.work_update(&authority, command)?;
-        self.wake_ready_work();
-        self.cancel_after_commit(&service, command);
+        let receipt = {
+            // Hold the mutation through retained cancellation registration.
+            // A planning edit with no runtime work leaves the gate reusable.
+            let mut admission = self
+                .update_admission
+                .enter()
+                .await
+                .map_err(|error| Error::ResourceBlocked(error.to_string()))?;
+            let receipt = service.work_update(&authority, command)?;
+            self.wake_ready_work();
+            if self.cancel_after_commit(&service, command) {
+                admission.record_dispatch();
+            }
+            receipt
+        };
         if matches!(principal, Principal::User { .. })
             && command.operations.iter().any(|op| {
                 matches!(
@@ -815,9 +826,9 @@ impl TicketApplication {
         )
     }
 
-    fn cancel_after_commit(&self, service: &Arc<TicketService>, command: &Command) {
+    fn cancel_after_commit(&self, service: &Arc<TicketService>, command: &Command) -> bool {
         let Ok((_, snapshot)) = service.published() else {
-            return;
+            return false;
         };
         let directly_cancelled = command
             .operations
@@ -831,8 +842,9 @@ impl TicketApplication {
             .collect::<BTreeSet<_>>();
         let tasks = self.cancellation_tasks.lock();
         if tasks.is_closed() {
-            return;
+            return false;
         }
+        let mut spawned = false;
         for assignment in snapshot.assignments.values().filter(|assignment| {
             !assignment.process_stopped
                 && (assignment.state == AssignmentState::Cancelling
@@ -856,6 +868,7 @@ impl TicketApplication {
                             tracing::warn!(%key, %error, "managed Work cancellation retained for reconciliation");
                         }
                     });
+                    spawned = true;
                 }
                 continue;
             }
@@ -958,11 +971,13 @@ impl TicketApplication {
                     }
                 }
             });
+            spawned = true;
             #[cfg(test)]
             if let Some(registered) = registered {
                 let _ = registered.send(_task);
             }
         }
+        spawned
     }
 
     async fn ensure(

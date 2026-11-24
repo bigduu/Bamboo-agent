@@ -1,6 +1,6 @@
 use std::{io, sync::Arc};
 
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 
 /// Close a live route whose detached work has no process replacement
 /// certificate. Once it dispatches, the process cannot prove its tails ended.
@@ -17,15 +17,19 @@ enum DispatchState {
 
 impl UntrackedUpdateAdmission {
     pub(crate) async fn record_dispatch(&self) -> io::Result<()> {
-        let mut state = self.0.lock().await;
+        self.enter().await?.record_dispatch();
+        Ok(())
+    }
+
+    pub(crate) async fn enter(&self) -> io::Result<DispatchPermit<'_>> {
+        let state = self.0.lock().await;
         if *state == DispatchState::Closed {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Host dispatch is closed for a planned update",
             ));
         }
-        *state = DispatchState::Dispatched;
-        Ok(())
+        Ok(DispatchPermit(state))
     }
 
     pub(crate) fn try_hold(
@@ -45,6 +49,14 @@ impl UntrackedUpdateAdmission {
             ));
         }
         Ok(DispatchHold(guard))
+    }
+}
+
+pub(crate) struct DispatchPermit<'a>(MutexGuard<'a, DispatchState>);
+
+impl DispatchPermit<'_> {
+    pub(crate) fn record_dispatch(&mut self) {
+        *self.0 = DispatchState::Dispatched;
     }
 }
 

@@ -100,6 +100,7 @@ async fn planned_update_seals_actual_ticket_admission_on_commit() {
             }],
         )
         .unwrap();
+    app.update(principal.clone(), &command).await.unwrap();
     let before = service.published().unwrap().0;
     drop(app.try_hold_for_planned_update().unwrap());
     let mut hold = app.try_hold_for_planned_update().unwrap();
