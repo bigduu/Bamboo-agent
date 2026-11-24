@@ -68,6 +68,7 @@ const MAX_TRACKED_RESOURCE_TASKS: usize = 1024;
 #[derive(Default)]
 struct State {
     closed: bool,
+    held_for_update: bool,
     tasks: Vec<TrackedTask>,
     failure: Option<String>,
     shell_wait_deadlines: Vec<Weak<Instant>>,
@@ -78,6 +79,22 @@ impl State {
         if self.closed {
             return Err(io::Error::other("local execution resource scope is closed"));
         }
+        if self.held_for_update {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "local execution resources are held for an update",
+            ));
+        }
+        self.reap_finished();
+        if self.tasks.len() >= MAX_TRACKED_RESOURCE_TASKS {
+            return Err(io::Error::other(
+                "local execution resource task capacity exhausted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reap_finished(&mut self) {
         let mut index = 0;
         while index < self.tasks.len() {
             if !self.tasks[index].task.is_finished() {
@@ -102,12 +119,6 @@ impl State {
                 self.failure.get_or_insert(error);
             }
         }
-        if self.tasks.len() >= MAX_TRACKED_RESOURCE_TASKS {
-            return Err(io::Error::other(
-                "local execution resource task capacity exhausted",
-            ));
-        }
-        Ok(())
     }
 }
 struct Inner {
@@ -118,6 +129,25 @@ struct Inner {
 }
 #[derive(Clone)]
 pub struct LocalTaskResources(Arc<Inner>);
+
+/// Keeps new tasks out of this resource registry while the owning execution
+/// prepares its update. Drop releases the hold without changing stop state.
+pub struct LocalTaskUpdateHold {
+    resources: LocalTaskResources,
+}
+
+impl Drop for LocalTaskUpdateHold {
+    fn drop(&mut self) {
+        let mut state = self
+            .resources
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.held_for_update = false;
+    }
+}
+
 tokio::task_local! {
     static RESOURCES: LocalTaskResources;
     static INLINE_INVOCATION_SAFE: Arc<AtomicBool>;
@@ -167,6 +197,29 @@ impl LocalTaskResources {
     }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
         RESOURCES.scope(self.clone(), future).await
+    }
+
+    /// At an execution safe point, join naturally completed tasks and seal this
+    /// exact registry against new work. A pending task keeps running.
+    /// The caller must independently account for work outside this registry.
+    pub fn try_hold_for_update(&self) -> io::Result<Option<LocalTaskUpdateHold>> {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.held_for_update {
+            return Err(io::Error::other(
+                "local execution resources are unavailable",
+            ));
+        }
+        state.reap_finished();
+        if let Some(error) = &state.failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        if !state.tasks.is_empty() {
+            return Ok(None);
+        }
+        state.held_for_update = true;
+        Ok(Some(LocalTaskUpdateHold {
+            resources: self.clone(),
+        }))
     }
 
     /// Sample activity from this exact execution's bounded shell waits.
@@ -825,6 +878,53 @@ mod tests {
 
     fn resources(run: &str) -> LocalTaskResources {
         LocalTaskResources::new("same-session", run, Utc::now())
+    }
+
+    #[tokio::test]
+    async fn planned_update_holds_resources_after_the_owned_task_finishes() {
+        let scope = resources("planned-update");
+        let (started_tx, started) = oneshot::channel();
+        let (finish, finish_rx) = oneshot::channel();
+        let result = scope
+            .spawn_owned(async {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                42
+            })
+            .unwrap();
+        started.await.unwrap();
+        assert!(scope.try_hold_for_update().unwrap().is_none());
+        assert!(!*scope.0.stop.borrow());
+        finish.send(()).unwrap();
+        assert_eq!(result.await.unwrap(), 42);
+
+        let hold = scope
+            .try_hold_for_update()
+            .unwrap()
+            .expect("the owned task has returned");
+        assert!(scope.try_hold_for_update().is_err());
+        assert_eq!(
+            scope.spawn_owned(async {}).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(hold);
+        scope.spawn_owned(async {}).unwrap().await.unwrap();
+        scope.close_and_drain().await.unwrap();
+        assert!(scope.try_hold_for_update().is_err());
+    }
+
+    #[tokio::test]
+    async fn planned_update_refuses_a_resource_registry_with_unconfirmed_cleanup() {
+        let scope = resources("planned-update-failure");
+        let result = scope
+            .spawn_owned(async { panic!("tool panicked") })
+            .unwrap();
+        assert!(result.await.is_err());
+        let Err(error) = scope.try_hold_for_update() else {
+            panic!("a failed registry can't hold for update");
+        };
+        assert!(error.to_string().contains("resource stop is unconfirmed"));
+        assert!(!*scope.0.stop.borrow());
     }
 
     #[tokio::test]
