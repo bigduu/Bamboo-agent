@@ -16,6 +16,12 @@ enum DispatchState {
 }
 
 impl UntrackedUpdateAdmission {
+    /// Let a periodic producer skip its tick while admission is held.
+    pub(crate) fn try_enter(&self) -> Option<DispatchPermit<'_>> {
+        let guard = self.0.try_lock().ok()?;
+        (*guard != DispatchState::Closed).then_some(DispatchPermit(guard))
+    }
+
     pub(crate) async fn record_dispatch(&self) -> io::Result<()> {
         self.enter().await?.record_dispatch();
         Ok(())

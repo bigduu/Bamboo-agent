@@ -984,6 +984,7 @@ async fn handle_chat(
         Some(state.app_data_dir.clone()),
         &mut session,
         &req.message,
+        state.managed_lifecycle_hook_admission(),
     )
     .await
     {
