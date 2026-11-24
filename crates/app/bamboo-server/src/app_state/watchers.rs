@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use super::update_admission::UntrackedUpdateAdmission;
 use bamboo_agent_core::AgentEvent;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -27,6 +28,7 @@ pub struct SessionWatchers {
     /// Internal observers are tracked by exact channel, independently of UI
     /// watchers. A relay cannot keep its own terminal session alive forever.
     relays: DashMap<String, RelayRegistration>,
+    lifecycle_hook_admission: Option<UntrackedUpdateAdmission>,
 }
 
 struct RelayRegistration {
@@ -75,7 +77,20 @@ impl Drop for NotificationRelaySubscription {
 
 impl SessionWatchers {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_lifecycle_hook_admission(None)
+    }
+
+    pub(crate) fn with_lifecycle_hook_admission(
+        lifecycle_hook_admission: Option<UntrackedUpdateAdmission>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            lifecycle_hook_admission,
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn lifecycle_hook_admission(&self) -> Option<&UntrackedUpdateAdmission> {
+        self.lifecycle_hook_admission.as_ref()
     }
 
     /// Registers one live watcher for `session_id`. Private: callers must go

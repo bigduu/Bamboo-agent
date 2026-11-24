@@ -114,10 +114,11 @@ impl NotificationDispatcher for ServerNotificationDispatcher {
             if let Some(sink_notification) = sink_notification {
                 let has_watcher = session_watchers.has_watcher(&session_id);
                 let config_snapshot = config.read().await.clone();
-                crate::notify_sinks::dispatch_to_sinks(
+                crate::notify_sinks::dispatch_with_hook_admission(
                     &config_snapshot,
                     has_watcher,
                     &sink_notification,
+                    session_watchers.lifecycle_hook_admission(),
                 );
             }
         });

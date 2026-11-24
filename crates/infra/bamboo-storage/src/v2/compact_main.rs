@@ -192,6 +192,29 @@ impl Write for BoundedPayload {
     }
 }
 
+/// The compact header has already written the session object's opening brace.
+struct MainBodyWriter<'a> {
+    output: &'a mut Vec<u8>,
+    needs_open_brace: bool,
+}
+
+impl Write for MainBodyWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.needs_open_brace && !bytes.is_empty() {
+            let body = bytes.strip_prefix(b"{").ok_or_else(invalid)?;
+            self.needs_open_brace = false;
+            self.output.extend_from_slice(body);
+        } else {
+            self.output.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Prepare before the named publisher starts its new state mutations. Runtime
 /// encoders remain separate, and no caller-provided header is trusted.
 pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
@@ -205,10 +228,7 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
     if section_len > SECTION_CAP {
         return Err(invalid());
     }
-    let flat = serde_json::to_vec_pretty(session).map_err(io::Error::other)?;
-    let suffix = flat.strip_prefix(b"{").ok_or_else(invalid)?;
-    let capacity = section_len.checked_add(suffix.len()).ok_or_else(invalid)?;
-    let mut output = Vec::with_capacity(capacity);
+    let mut output = Vec::with_capacity(section_len);
     output.extend_from_slice(if session.conversation_reset.is_some() {
         PREFIX_V3
     } else if session.parent_created_at.is_some() {
@@ -220,7 +240,14 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
     output.extend_from_slice(MIDDLE);
     output.extend_from_slice(&payload.0);
     output.extend_from_slice(CLOSE);
-    output.extend_from_slice(suffix);
+    let mut writer = MainBodyWriter {
+        output: &mut output,
+        needs_open_brace: true,
+    };
+    serde_json::to_writer_pretty(&mut writer, session).map_err(io::Error::other)?;
+    if writer.needs_open_brace {
+        return Err(invalid());
+    }
     Ok(output)
 }
 

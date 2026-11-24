@@ -876,20 +876,22 @@ async fn run_session(
     }
 
     // ---- final output ----
-    let final_reply = data
-        .storage
-        .load_session(&session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|session| {
-            session
-                .messages
-                .iter()
-                .rev()
-                .find(|m| matches!(m.role, Role::Assistant))
-                .map(|m| m.content.clone())
-        });
+    let final_session = data.storage.load_session(&session_id).await.ok().flatten();
+    if exit.is_ok()
+        && final_session
+            .as_ref()
+            .is_some_and(|session| session.pending_question.is_some())
+    {
+        exit = Err("run paused for input or approval in the saved session".into());
+    }
+    let final_reply = final_session.and_then(|session| {
+        session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::Assistant))
+            .map(|message| message.content.clone())
+    });
 
     if output.is_machine() {
         terminal.reply = final_reply;

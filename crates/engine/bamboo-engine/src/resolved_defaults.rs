@@ -128,13 +128,94 @@ pub fn default_chat_model_ref(config: &Config) -> Option<ProviderModelRef> {
         }
     }
     let provider = config.effective_default_provider();
-    let model = if let Some(instance) = config.provider_instances.get(provider) {
+    let legacy_model = if let Some(instance) = config.provider_instances.get(provider) {
         // A disabled configured target is still intent; admission reports it.
         instance.model.clone()
     } else {
         config.get_model()
-    }?;
-    (!model.trim().is_empty()).then(|| ProviderModelRef::new(provider, model.trim()))
+    };
+    if let Some(model) = legacy_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "unknown")
+    {
+        return Some(ProviderModelRef::new(provider, model));
+    }
+
+    // The provider editor may save the chat preference without setting a
+    // per-instance model. Even with legacy routing selected, this is a valid
+    // default for the same account.
+    config
+        .defaults
+        .as_ref()
+        .map(|defaults| &defaults.chat)
+        .filter(|target| target.provider == provider)
+        .cloned()
+}
+
+/// Result of a small, tool-free inference against an admitted model route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProbeStatus {
+    Ready,
+    AuthenticationFailed,
+    ModelUnavailable,
+    TimedOut,
+    RequestFailed,
+}
+
+pub async fn probe_chat_model(selected: &ResolvedDefaultRunConfig) -> ModelProbeStatus {
+    let (Some(provider), Some(model)) = (
+        &selected.model_provider,
+        selected.model_roster.model.as_deref(),
+    ) else {
+        return ModelProbeStatus::ModelUnavailable;
+    };
+    probe_model(provider.as_ref(), model).await
+}
+
+pub async fn probe_model(provider: &dyn LLMProvider, model: &str) -> ModelProbeStatus {
+    use bamboo_domain::Message;
+    use bamboo_llm::{LLMChunk, LLMError};
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    let probe = async {
+        let messages = [Message::user("Reply with OK.")];
+        // Legacy Claude thinking needs more than 1,024 output tokens.
+        // Stop as soon as the provider generates text or reasoning.
+        let mut stream = provider
+            .chat_stream(&messages, &[], Some(2_048), model)
+            .await?;
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk?, LLMChunk::Token(text) | LLMChunk::ReasoningToken(text) if !text.trim().is_empty())
+            {
+                return Ok::<_, LLMError>(true);
+            }
+        }
+        Ok(false)
+    };
+    match tokio::time::timeout(Duration::from_secs(15), probe).await {
+        Err(_) => ModelProbeStatus::TimedOut,
+        Ok(Ok(true)) => ModelProbeStatus::Ready,
+        Ok(Err(LLMError::Auth(_))) => ModelProbeStatus::AuthenticationFailed,
+        Ok(Err(error)) => {
+            let status = match &error {
+                LLMError::Http(error) => error.status().map(|status| status.as_u16()),
+                LLMError::Api(message) => message
+                    .strip_prefix("HTTP ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|status| status.parse::<u16>().ok()),
+                _ => None,
+            };
+            match status {
+                Some(401 | 403) => ModelProbeStatus::AuthenticationFailed,
+                Some(404) => ModelProbeStatus::ModelUnavailable,
+                _ => ModelProbeStatus::RequestFailed,
+            }
+        }
+        Ok(Ok(false)) => ModelProbeStatus::RequestFailed,
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +253,81 @@ mod tests {
         ) -> Result<LLMStream, LLMError> {
             Err(LLMError::Api("noop".to_string()))
         }
+    }
+
+    #[tokio::test]
+    async fn model_probe_requires_inference_and_categorizes_authentication_failure() {
+        struct ModelProbeFixture;
+        #[async_trait::async_trait]
+        impl LLMProvider for ModelProbeFixture {
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                tools: &[ToolSchema],
+                max_output_tokens: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                assert_eq!(messages.len(), 1);
+                assert!(tools.is_empty());
+                assert_eq!(max_output_tokens, Some(2_048));
+                if model == "catalog-only" {
+                    return Err(LLMError::Api("HTTP 401 Unauthorized".into()));
+                }
+                Ok(Box::pin(futures::stream::iter([Ok(
+                    bamboo_llm::LLMChunk::Token("OK".into()),
+                )])))
+            }
+        }
+
+        assert_eq!(
+            probe_model(&ModelProbeFixture, "responds").await,
+            ModelProbeStatus::Ready
+        );
+        assert_eq!(
+            probe_model(&ModelProbeFixture, "catalog-only").await,
+            ModelProbeStatus::AuthenticationFailed,
+        );
+    }
+
+    #[tokio::test]
+    async fn model_probe_sends_a_legacy_claude_thinking_request() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        let server = MockServer::start().await;
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Check\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = bamboo_llm::AnthropicProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_litellm_messages()
+            .with_reasoning_effort(Some(ReasoningEffort::High));
+
+        assert_eq!(
+            probe_model(&provider, "claude-sonnet-4-5").await,
+            ModelProbeStatus::Ready
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        let thinking_tokens = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(thinking_tokens >= 1_024);
+        assert!(thinking_tokens < body["max_tokens"].as_u64().unwrap());
+        assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
     }
 
     fn test_registry() -> Arc<ProviderRegistry> {

@@ -107,9 +107,9 @@ pub(super) fn parameters_schema() -> Value {
             "role": {
                 "type": "string",
                 "description": concat!(
-                    "Only chat without target: select a named profile. Defaults include explorer (read-only exploration), ",
-                    "implementer (bounded implementation), and reviewer (independent read-only review). ",
-                    "For commands, tests, or edits, choose a role that can perform them. Give read-only roles the relevant files, patch, and execution output they need. ",
+                    "Only chat without target: select a named profile. Defaults include explorer (investigation), ",
+                    "implementer (bounded implementation), and reviewer (independent review). ",
+                    "Roles can use shell tools when permitted by the runtime. Use implementer for file edits. Give the child the relevant files and evidence. ",
                     "Project overrides Global, then the builtin default. Omit for worker (no builtin role is implicitly selected). ",
                     "Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture. ",
                     "Keep assignments within the tools the runtime exposes to the child. Role cannot change an existing target."

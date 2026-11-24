@@ -9,17 +9,23 @@ use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload};
 use bamboo_engine::HookRunner;
 
 use super::{NotificationSink, SinkNotification};
+use crate::app_state::update_admission::UntrackedUpdateAdmission;
 
 pub(super) struct CommandSink {
     hooks: LifecycleHooksConfig,
     fallback_cwd: Option<std::path::PathBuf>,
+    admission: Option<UntrackedUpdateAdmission>,
 }
 
 impl CommandSink {
-    pub(super) fn from_config(config: &bamboo_llm::Config) -> Self {
+    pub(super) fn from_config(
+        config: &bamboo_llm::Config,
+        admission: Option<UntrackedUpdateAdmission>,
+    ) -> Self {
         Self {
             hooks: config.lifecycle_hooks.clone(),
             fallback_cwd: config.get_default_work_area_path(),
+            admission,
         }
     }
 }
@@ -32,11 +38,18 @@ impl NotificationSink for CommandSink {
     fn deliver(&self, notification: &SinkNotification) {
         let hooks = self.hooks.clone();
         let fallback_cwd = self.fallback_cwd.clone();
+        let admission = self.admission.clone();
         let notification = notification.clone();
         tokio::spawn(async move {
             let runner = HookRunner::new().with_lifecycle_config(&hooks, fallback_cwd);
             if !runner.has_hooks_for(AgentHookPoint::AfterNotification) {
                 return;
+            }
+            if let Some(admission) = admission {
+                if let Err(error) = admission.record_dispatch().await {
+                    tracing::debug!(%error, "Notification command admission closed");
+                    return;
+                }
             }
 
             let session = Session::new(&notification.session_id, "");
@@ -110,7 +123,7 @@ mod tests {
 
         let mut config = bamboo_llm::Config::default();
         config.lifecycle_hooks = hooks;
-        CommandSink::from_config(&config).deliver(&sample_notification());
+        CommandSink::from_config(&config, None).deliver(&sample_notification());
 
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {

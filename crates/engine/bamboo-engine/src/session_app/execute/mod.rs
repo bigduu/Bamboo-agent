@@ -218,6 +218,17 @@ pub(crate) fn resolve_execution_model(
         Ok(resolve_model_ref_cascade(session, input, config))
     } else {
         let (model, source) = resolve_model_cascade(session, input, config);
+        if model.is_none() {
+            if let Some(target) = config
+                .default_model_ref
+                .as_ref()
+                .filter(|target| target.provider == config.provider_name)
+            {
+                if let Some(model) = normalize_model(Some(&target.model)) {
+                    return Ok((Some(target.clone()), Some(model), "provider_default"));
+                }
+            }
+        }
         Ok((None, model, source))
     }
 }
@@ -230,19 +241,18 @@ pub(crate) fn resolve_model_cascade(
 ) -> (Option<String>, &'static str) {
     let session_model = normalize_model(Some(session.model.as_str()));
     let request_model = normalize_model(input.request_model.as_deref());
+    let default_model = normalize_model(config.default_model.as_deref());
     let request_model_used = request_model.is_some();
     let model_source = if session_model.is_some() {
         "session"
-    } else if config.default_model.is_some() {
+    } else if default_model.is_some() {
         "provider_default"
     } else if request_model_used {
         "request"
     } else {
         "none"
     };
-    let effective_model = session_model
-        .or_else(|| config.default_model.clone())
-        .or(request_model);
+    let effective_model = session_model.or(default_model).or(request_model);
 
     (effective_model, model_source)
 }

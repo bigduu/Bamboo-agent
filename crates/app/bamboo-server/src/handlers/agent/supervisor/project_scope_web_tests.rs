@@ -1,5 +1,6 @@
 //! Plain HTTP scope contract using the existing request access mode.
 //! No test principal, credentials, native channel or extra Origin gate.
+use crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile;
 use crate::{app_state::AppState, routes::configure_routes};
 use actix_web::{
     http::{Method, StatusCode},
@@ -19,6 +20,7 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
+        write_work_disabled_profile(home.path());
         let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
         let supervisor = SupervisorReference::from(
             &SupervisorSessionService::new(state.storage.clone())

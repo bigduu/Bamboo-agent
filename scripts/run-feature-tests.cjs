@@ -248,7 +248,23 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Session history cache and paging cases belong to the default Storage and Server library targets.
 // #2995 keeps the ordinary Side Chat Actix fixture in server-handlers.
 // Main-owned clear metadata changes the sensitive Storage closure. Additive cases stay unchanged.
-const FEATURE_SOURCE_SHA256 = "2ea6e925c7c85b1ec4778277801d4265269f4bc91a027d37213dcfd99c0e5c80";
+// #3003 keeps Gemini frame decoding and fallback cases in the default
+// bamboo-llm packages-2 owner. The litellm-wire-types replay guard uses the
+// existing feature, and the additive contexts retain their case selections.
+// #3005 uses the default Grep packages-2, Engine packages-3, and infrastructure
+// packages-4 owners. The new span attribution test is shared across telemetry
+// configurations, and the additive catalog retains its existing selection.
+// #3012 adds default Config, Engine and Server settings tests to their existing owners.
+// The additive contexts and their case selections are unchanged.
+// #3018 keeps the session header rendering and provider request regressions in
+// the default bamboo-llm packages-2 owner. Additive contexts stay unchanged.
+// #3009 keeps Work handoff guidance in the default Engine owner. The existing
+// ticket_supervisor_tools integration target remains in agent-tests-1.
+// #3040 places Ticket update readiness cases in the default server-app-state
+// owner. Existing feature-gated Ticket fixtures retain their additive owners.
+// #3027 keeps desktop recovery in the default Server, Storage and native
+// Root integration owners. The additive case selections are unchanged.
+const FEATURE_SOURCE_SHA256 = "0e8941620091b81827847c42080664286bd7ddd9ccdde6043c5bf883b4cd045e";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

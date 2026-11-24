@@ -179,7 +179,12 @@ impl GeminiProvider {
         self
     }
 
-    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+    fn build_headers(
+        &self,
+        endpoint: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         // Authenticate via header rather than a `?key=` URL query parameter so
@@ -194,11 +199,12 @@ impl GeminiProvider {
         );
         // `x-goog-api-key` is intentionally overridable: `request_overrides`
         // (applied next) may replace it for per-endpoint/operator auth overrides.
-        request_overrides::apply_overrides_to_header_map(
+        request_overrides::apply_overrides_to_session_headers(
             &mut headers,
             self.request_overrides.as_ref(),
             endpoint,
             model,
+            session_id,
         );
         Ok(headers)
     }
@@ -374,13 +380,13 @@ impl LLMProvider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = self.list_models_url();
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Gemini").await
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = self.list_models_url();
         let models = self
             .model_info_cache
@@ -428,15 +434,15 @@ impl GeminiProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
-        let session_log_id = options
-            .and_then(|o| o.session_id.as_deref())
-            .unwrap_or("unknown-session");
+        let session_id = options.and_then(|options| options.session_id.as_deref());
+        let session_log_id = session_id.unwrap_or("unknown-session");
 
         // Auth is supplied via the x-goog-api-key header (see build_headers).
         let url = self.stream_url(model);
         let headers = self.build_headers(
             request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
             Some(model),
+            session_id,
         )?;
         #[cfg(feature = "litellm-wire-types")]
         let scope = self
@@ -536,7 +542,8 @@ impl GeminiProvider {
         // and `streamGenerateContent?alt=sse` sends no [DONE], so emitting all
         // chunks from the one event — rather than deferring — guarantees usage
         // is delivered even when the connection closes immediately afterwards.
-        let mut state = GeminiStreamState::default();
+        let mut state =
+            GeminiStreamState::with_diagnostics(crate::provider::current_completion_diagnostics());
         #[cfg(feature = "litellm-wire-types")]
         if self.litellm_wire_types {
             state.enable_litellm_tool_ids();
@@ -548,14 +555,9 @@ impl GeminiProvider {
         let model_for_log = model.to_string();
         let requested_reasoning_for_log = reasoning_effort;
         let mut logged_summary = false;
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
-
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
-                if let Some(diagnostics) = &completion_diagnostics {
-                    diagnostics.observe_sse(event, data);
-                }
                 let chunks = stream::parse_with_provider_usage(&mut state, event, data)?;
 
                 if !logged_summary
@@ -737,7 +739,11 @@ mod tests {
         let provider = GeminiProvider::new("my_api_key_123");
 
         let stream_headers = provider
-            .build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None)
+            .build_headers(
+                request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+                None,
+                None,
+            )
             .expect("valid key should build headers");
         assert_eq!(
             stream_headers
@@ -749,7 +755,7 @@ mod tests {
         );
 
         let models_headers = provider
-            .build_headers(request_overrides::ENDPOINT_MODELS, None)
+            .build_headers(request_overrides::ENDPOINT_MODELS, None, None)
             .expect("valid key should build headers");
         assert_eq!(
             models_headers
@@ -767,8 +773,11 @@ mod tests {
     #[test]
     fn test_build_headers_rejects_invalid_api_key() {
         let provider = GeminiProvider::new("bad\nkey");
-        let result =
-            provider.build_headers(request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT, None);
+        let result = provider.build_headers(
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            None,
+            None,
+        );
         assert!(
             matches!(result, Err(LLMError::Auth(_))),
             "expected LLMError::Auth for invalid key"

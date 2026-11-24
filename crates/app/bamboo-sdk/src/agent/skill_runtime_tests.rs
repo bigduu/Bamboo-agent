@@ -1688,6 +1688,12 @@ async fn sdk_typed_registered_router_busy_cancel_and_drop_release_before_canonic
         let main = format!("{main}\n{}\n", "a".repeat(512 * 1024 + 4096));
         std::fs::write(home.path().join("skills/sdk-router-owner/SKILL.md"), &main).unwrap();
         write_config(home.path());
+        // The exact source replay fixture needs a large model window.
+        std::fs::write(
+            home.path().join("model_limits.json"),
+            r#"[{"model_pattern":"claude-test","max_context_tokens":1000000,"max_output_tokens":64000}]"#,
+        )
+        .unwrap();
         let task = home.path().join("router-retry-task.txt");
         std::fs::write(&task, "NORMAL_TASK_ACTION").unwrap();
         let provider = Arc::new(SkillsProvider {

@@ -3730,6 +3730,28 @@ async fn run_pipeline_inner(
 
     loop {
         crate::runtime::goal_restart::disarm_before_round(session, config).await?;
+        if split_recovery.is_none()
+            && crate::runtime::planned_update::pause_before_model_round(
+                session,
+                config,
+                cancel_token,
+            )
+            .await?
+        {
+            let reason = crate::runtime::planned_update::SUSPEND_REASON;
+            state.runtime_state.status = AgentStatusState::Suspended;
+            state.runtime_state.suspension = Some(SuspensionState {
+                reason: reason.into(),
+                suspended_at: Utc::now(),
+                resumable: true,
+                hook_point: None,
+            });
+            session
+                .metadata
+                .insert("runtime.suspend_reason".into(), reason.into());
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+            break;
+        }
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
             && cancel_token.is_cancelled()
         {

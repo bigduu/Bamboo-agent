@@ -336,7 +336,12 @@ impl AnthropicProvider {
         self
     }
 
-    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+    fn build_headers(
+        &self,
+        endpoint: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
         let mut headers = HeaderMap::new();
@@ -350,11 +355,12 @@ impl AnthropicProvider {
             HeaderValue::from_static(ANTHROPIC_API_VERSION),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        request_overrides::apply_overrides_to_header_map(
+        request_overrides::apply_overrides_to_session_headers(
             &mut headers,
             self.request_overrides.as_ref(),
             endpoint,
             model,
+            session_id,
         );
 
         Ok(headers)
@@ -522,13 +528,13 @@ impl LLMProvider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let models = self
             .model_info_cache
@@ -633,9 +639,8 @@ impl AnthropicProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
-        let session_log_id = options
-            .and_then(|o| o.session_id.as_deref())
-            .unwrap_or("unknown-session");
+        let session_id = options.and_then(|options| options.session_id.as_deref());
+        let session_log_id = session_id.unwrap_or("unknown-session");
 
         tracing::debug!(
             "Anthropic provider using model_hash={}",
@@ -783,7 +788,11 @@ impl AnthropicProvider {
             max_tokens,
             log_identity(request_purpose)
         );
-        let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        let mut headers = self.build_headers(
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+            session_id,
+        )?;
         apply_cache_ttl_header(&mut headers, cache_plan);
 
         // Retry the *initial* request establishment on transient failures
@@ -8416,7 +8425,11 @@ mod anthropic_provider_tests {
     fn test_request_headers() {
         let provider = AnthropicProvider::new("test_key");
         let headers = provider
-            .build_headers(request_overrides::ENDPOINT_MESSAGES, Some("claude-test"))
+            .build_headers(
+                request_overrides::ENDPOINT_MESSAGES,
+                Some("claude-test"),
+                None,
+            )
             .unwrap();
 
         assert!(headers.contains_key("x-api-key"));
@@ -8442,7 +8455,7 @@ mod anthropic_provider_tests {
     fn test_headers_with_invalid_api_key() {
         // Test that headers with non-ASCII characters in API key fail
         let provider = AnthropicProvider::new("test\u{0000}key"); // null byte
-        let result = provider.build_headers(request_overrides::ENDPOINT_MESSAGES, None);
+        let result = provider.build_headers(request_overrides::ENDPOINT_MESSAGES, None, None);
         assert!(result.is_err());
     }
 

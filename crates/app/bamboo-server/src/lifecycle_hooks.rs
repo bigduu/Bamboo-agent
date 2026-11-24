@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::app_state::update_admission::UntrackedUpdateAdmission;
 use bamboo_agent_core::Session;
 use bamboo_config::LifecycleHooksConfig;
 use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
@@ -17,6 +18,7 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
     fallback_cwd: Option<PathBuf>,
     session: &mut Session,
     raw_prompt: &str,
+    update_admission: Option<&UntrackedUpdateAdmission>,
 ) -> Result<String, String> {
     let runner = HookRunner::new().with_lifecycle_config(config, fallback_cwd);
     let mut runtime_state = session
@@ -33,6 +35,14 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
         session.agent_runtime_state = Some(runtime_state);
         HookRunner::mark_user_prompt_prechecked(session, raw_prompt);
         return Ok(raw_prompt.to_string());
+    }
+    // These effects can start before a Root owns the prompt or even when the
+    // prompt is rejected and no Root ever starts.
+    if let Some(admission) = update_admission {
+        admission
+            .record_dispatch()
+            .await
+            .map_err(|error| error.to_string())?;
     }
     let outcome = runner
         .run_hooks(
@@ -110,14 +120,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn portable_prompt_context_reaches_user_prompt_without_system_injection() {
+    async fn install_portable_prompt_fixture(profile: &std::path::Path, command: &str) {
         use bamboo_plugin::{
             InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginManifest, PluginSource,
             RegisteredCapabilities,
         };
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("plugins");
+        let root = profile.join("plugins");
         let bundle = root.join("fixture");
         std::fs::create_dir_all(&bundle).unwrap();
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -131,7 +139,16 @@ mod tests {
         )
         .unwrap();
         std::fs::write(bundle.join("script.sh"), "# reviewed fixture").unwrap();
-        std::fs::write(bundle.join("hooks.json"), serde_json::to_vec(&serde_json::json!({"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf 'portable context'","timeout":1}]}]}})).unwrap()).unwrap();
+        std::fs::write(
+            bundle.join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"UserPromptSubmit": [{"hooks": [
+                    {"type": "command", "command": command, "timeout": 1}
+                ]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mut hooks = bamboo_plugin::hooks::registrations(&manifest, &bundle).unwrap();
         let digest = hooks[0].digest.clone();
         hooks[0].confirm_review(&digest).unwrap();
@@ -154,12 +171,19 @@ mod tests {
         .save(&root.join("installed.json"))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_prompt_context_reaches_user_prompt_without_system_injection() {
+        let temp = tempfile::tempdir().unwrap();
+        install_portable_prompt_fixture(temp.path(), "printf 'portable context'").await;
         let mut session = Session::new("portable-prompt", "model");
         let prompt = apply_user_prompt_submit_hooks(
             &LifecycleHooksConfig::default(),
             Some(temp.path().to_owned()),
             &mut session,
             "raw prompt",
+            None,
         )
         .await
         .unwrap();
@@ -173,6 +197,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_update_host_refuses_a_portable_hook_that_rejected_a_prompt() {
+        use crate::app_state::{planned_update::HostUpdateReadiness, AppState};
+        use std::time::Duration;
+
+        let profile = tempfile::tempdir().unwrap();
+        install_portable_prompt_fixture(
+            profile.path(),
+            "printf 'managed portable fixture rejected the prompt' >&2; exit 2",
+        )
+        .await;
+        let state = AppState::new_for_managed_update(profile.path().to_owned())
+            .await
+            .unwrap();
+        state.wait_for_boot_reconcile_services().await;
+        let mut session = Session::new("blocked-portable-prompt", "model");
+        let error = apply_user_prompt_submit_hooks(
+            &LifecycleHooksConfig::default(),
+            Some(profile.path().to_owned()),
+            &mut session,
+            "raw prompt",
+            state.managed_lifecycle_hook_admission(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("managed portable fixture rejected the prompt"));
+        assert!(session.messages.is_empty());
+
+        let mut preparation = state.begin_planned_update().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match preparation.observe().await {
+                    Err(error) => break error,
+                    Ok(HostUpdateReadiness::Busy { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(HostUpdateReadiness::Ready) => panic!("untracked hook cannot prove closure"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("lifecycle hook"));
+        drop(preparation);
+        assert!(state.begin_planned_update().await.is_ok());
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn prompt_block_is_fail_closed_and_never_appends_a_message() {
         let mut session = Session::new("blocked-prompt", "model");
         let result = apply_user_prompt_submit_hooks(
@@ -180,6 +253,7 @@ mod tests {
             None,
             &mut session,
             "raw prompt",
+            None,
         )
         .await;
 
@@ -204,6 +278,7 @@ mod tests {
             None,
             &mut session,
             "raw prompt",
+            None,
         )
         .await
         .expect("context hook should pass");
@@ -223,6 +298,7 @@ mod tests {
             None,
             &mut session,
             "raw prompt",
+            None,
         )
         .await;
 

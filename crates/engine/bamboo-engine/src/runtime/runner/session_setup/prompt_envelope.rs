@@ -95,18 +95,18 @@ Inspect authoritative child progress and results when needed. Correct or revise 
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
-const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
+const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's explorer role for investigation and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
 Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
 Use exec_command for authorized shell commands. Prefer SubAgent intent=wait for non-interactive exit. Use write_stdin for input or unread output.\n\
-Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
+Use SubAgent's explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
 Use the highest reasoning tier available on the primary model.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
 Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized independent Sessions. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
-Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. Track parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
-Use SubAgent only for auxiliary planning, review or verification. Select the read-only explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Use work_dispatch only for existing explicit Work. Keep the coordinating role with the Supervisor.\n\
+Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. When selecting a target, locate parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
+Use SubAgent only for auxiliary planning, review or verification. Select the explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Use work_dispatch only for existing explicit Work. Keep the coordinating role with the Supervisor.\n\
 Use discovery for a discoverable route. Tool exposure describes the catalog. Use Host admission to verify target scope and worker readiness. When no authorized route or worker fits, report the specific blocker. Inspect the existing assignment or receipt before retrying. Reuse the complete request and operation UUID on an uncertain response.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
@@ -236,7 +236,7 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     let guidance = build_root_orchestration_context_block(&restored)
         .expect("durable orchestration-only mode supplies delegation guidance");
     assert_eq!(guidance.block_type, ContextBlockType::RootOrchestration);
-    assert!(guidance.content.contains("read-only explorer role"));
+    assert!(guidance.content.contains("explorer role"));
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance
         .content
@@ -308,13 +308,23 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             "nested delegation",
             "end the turn",
             "Resume on Inbox delivery",
+            "use a supported bounded wait for the exact Run",
+            "Do not poll the same assignment across tool rounds or turns",
+            "repeating or alternating inspect, read_messages, observe_run, directory or status views, or wait calls",
+            "one bounded, targeted check to confirm initial startup, answer an explicit status request",
+            "specific verification or recovery gap backed by fresh Run evidence",
+            "stop checking until a new material event or explicit status request",
+            "Treat route observations, recalled memory, compressed history and replayed handoffs as background",
+            "Do not acknowledge them or use them to restart checks",
+            "end the turn quietly without recapping unchanged progress",
+            "Answer an explicit status request once",
+            "Report a fresh handoff once when it contains a verified result, an actual test failure, an actionable blocker or a decision the user needs to make",
             "assigned acceptance criteria",
             "reject the exact current submission",
             "Verify the corrected result",
             "wait for explicit User acceptance of the exact current submission",
             "Dispatch independent slices in parallel with disjoint writes",
-            "parallel workstreams",
-            "session_control directory",
+            "When selecting a target, locate parallel workstreams with session_control directory",
             "Follow up a user-engaged Session again only when the user asks",
             "Use authoritative Run evidence for completion",
         ] {

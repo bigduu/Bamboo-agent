@@ -302,6 +302,10 @@ enum Commands {
         /// Data directory holding config.json (defaults to ~/.bamboo).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Verify the selected provider and model with a short inference request.
+        #[arg(long)]
+        probe: bool,
     },
 
     /// Show (or set) Bamboo configuration.
@@ -1264,6 +1268,13 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--managed-update-protocol"))
+        && arguments.next().is_none()
+    {
+        println!("1");
+        return;
+    }
     if let Some(code) = bamboo_agent::server::tailscale_serve_helper_entry() {
         std::process::exit(code);
     }
@@ -1637,7 +1648,21 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             // v2-P1 (#181): honor `server.tls` for in-process TLS termination
             // (fail-fast on bad/missing certs); absent → unchanged plaintext.
             let tls = config.server.tls.clone();
-            let result = if supervisor_scope_native_confirmation {
+            let shutdown_directory = parent_pid.and_then(|_| {
+                std::env::var_os(bamboo_agent::server::MANAGED_SHUTDOWN_DIR_ENV).map(PathBuf::from)
+            });
+            let result = if let Some(directory) = shutdown_directory {
+                bamboo_agent::server::run_with_managed_shutdown(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                    config.server.static_dir.clone(),
+                    tls,
+                    supervisor_scope_native_confirmation,
+                    directory,
+                )
+                .await
+            } else if supervisor_scope_native_confirmation {
                 bamboo_agent::server::run_with_native_scope_confirmation(
                     bamboo_home_dir,
                     config.server.port,
@@ -2031,8 +2056,8 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             }
         }
 
-        Commands::Doctor { data_dir } => {
-            match bamboo_agent::setup_cli::run_doctor(data_dir).await {
+        Commands::Doctor { data_dir, probe } => {
+            match bamboo_agent::setup_cli::run_doctor_with_probe(data_dir, probe).await {
                 Ok(true) => {}
                 Ok(false) => exit_after_telemetry(telemetry, 1),
                 Err(e) => {

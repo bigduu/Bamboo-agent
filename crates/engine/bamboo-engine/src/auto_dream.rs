@@ -3463,20 +3463,69 @@ async fn run_project_auto_dream_once_with_store(
     .await
 }
 
+/// Admission of the three Host-owned periodic memory workers.
+#[derive(Clone)]
+pub struct MemoryMaintenanceAdmission(Arc<tokio::sync::Semaphore>);
+
+impl Default for MemoryMaintenanceAdmission {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(3)))
+    }
+}
+
+impl MemoryMaintenanceAdmission {
+    pub(crate) async fn enter(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.0.acquire().await.ok()
+    }
+
+    pub fn try_hold_for_update(&self) -> std::io::Result<Option<MemoryMaintenanceUpdateHold>> {
+        match self.0.clone().try_acquire_many_owned(3) {
+            Ok(permit) => Ok(Some(MemoryMaintenanceUpdateHold {
+                admission: self.clone(),
+                _permit: permit,
+            })),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Ok(None),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                Err(std::io::Error::other("Memory maintenance is shutting down"))
+            }
+        }
+    }
+}
+
+pub struct MemoryMaintenanceUpdateHold {
+    admission: MemoryMaintenanceAdmission,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl MemoryMaintenanceUpdateHold {
+    pub fn close(self) {
+        self.admission.0.close();
+    }
+}
+
 pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
-    spawn_auto_dream_task_inner(ctx, None);
+    spawn_auto_dream_task_inner(ctx, None, None);
 }
 
 pub fn spawn_auto_dream_task_with_project_resolver(
     ctx: AutoDreamContext,
     project_resolver: ProjectContextResolver,
 ) {
-    spawn_auto_dream_task_inner(ctx, Some(project_resolver));
+    spawn_auto_dream_task_inner(ctx, Some(project_resolver), None);
+}
+
+pub fn spawn_guarded_auto_dream_task(
+    ctx: AutoDreamContext,
+    project_resolver: ProjectContextResolver,
+    admission: MemoryMaintenanceAdmission,
+) {
+    spawn_auto_dream_task_inner(ctx, Some(project_resolver), Some(admission));
 }
 
 fn spawn_auto_dream_task_inner(
     ctx: AutoDreamContext,
     project_resolver: Option<ProjectContextResolver>,
+    admission: Option<MemoryMaintenanceAdmission>,
 ) {
     tokio::spawn(async move {
         let interval_secs = ctx
@@ -3493,6 +3542,13 @@ fn spawn_auto_dream_task_inner(
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
+            let _permit = match &admission {
+                Some(admission) => match admission.enter().await {
+                    Some(permit) => Some(permit),
+                    None => break,
+                },
+                None => None,
+            };
             let result = match project_resolver.as_ref() {
                 Some(resolver) => run_auto_dream_once_with_project_resolver(&ctx, resolver).await,
                 None => run_auto_dream_once(&ctx).await,

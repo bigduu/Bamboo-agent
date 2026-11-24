@@ -1,11 +1,17 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_infrastructure::telemetry::{record_grep_performance, GrepPerformance};
 use globset::{GlobBuilder, GlobSet};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::time::Instant;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::{parameter_schema, search_traversal, workspace_state};
 
@@ -14,6 +20,7 @@ const MAX_RESULT_BYTES: usize = 256 * 1024;
 const MAX_MATCHES: usize = 2_000;
 const MAX_SCANNED_FILES: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+static GREP_WORKERS: Semaphore = Semaphore::const_new(4);
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
@@ -123,6 +130,7 @@ impl GrepTool {
         base: &Path,
         type_filter: Option<&str>,
         include_ignored: bool,
+        cancel: &CancellationToken,
     ) -> Vec<PathBuf> {
         #[cfg(test)]
         tests::pause_directory_discovery(base);
@@ -131,12 +139,13 @@ impl GrepTool {
         let allowed_ext = type_filter.and_then(|name| ext_map.get(name).copied());
 
         let mut files = Vec::new();
-        for entry in search_traversal::walk(base, include_ignored).filter_map(|entry| entry.ok()) {
+        for entry in search_traversal::walk(base, include_ignored) {
+            if cancel.is_cancelled() || files.len() >= MAX_SCANNED_FILES {
+                break;
+            }
+            let Ok(entry) = entry else { continue };
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
-            }
-            if files.len() >= MAX_SCANNED_FILES {
-                break;
             }
             let path = entry.path();
 
@@ -156,16 +165,36 @@ impl GrepTool {
         files
     }
 
-    async fn read_search_text(reader: impl AsyncRead + Unpin) -> Option<String> {
-        // Some virtual files report zero length, and files can grow after stat.
-        // Read one extra byte so an oversized file is skipped as a whole.
-        let mut content = String::new();
+    fn read_search_text(reader: impl Read, content: &mut String) -> bool {
+        // A file can grow after stat. Check one extra byte and skip the
+        // entire file if it is oversized or contains invalid UTF-8.
+        content.clear();
         reader
             .take(MAX_FILE_BYTES + 1)
-            .read_to_string(&mut content)
-            .await
-            .ok()?;
-        (content.len() as u64 <= MAX_FILE_BYTES).then_some(content)
+            .read_to_string(content)
+            .is_ok()
+            && content.len() as u64 <= MAX_FILE_BYTES
+    }
+
+    fn literal_matcher(
+        pattern: &str,
+        case_insensitive: bool,
+        multiline: bool,
+    ) -> Option<RegexMatcher> {
+        // Only accelerate patterns whose per-line match semantics are
+        // identical. The original regex handles anchors, escapes and flags.
+        if case_insensitive
+            || multiline
+            || pattern.is_empty()
+            || pattern.contains(['\r', '\n'])
+            || regex::escape(pattern) != pattern
+        {
+            return None;
+        }
+        RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(pattern)
+            .ok()
     }
 
     fn compile_glob(glob: Option<&str>) -> Result<Option<GlobSet>, ToolError> {
@@ -359,133 +388,180 @@ impl Tool for GrepTool {
         let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let root = Self::resolve_search_root(parsed.path.as_deref(), &cwd);
 
+        let multiline = parsed.multiline.unwrap_or(false);
+        let case_insensitive = parsed.case_insensitive.unwrap_or(false);
+        Self::validate_scope(
+            &parsed,
+            parsed.output_mode.unwrap_or_default(),
+            multiline,
+            &cwd,
+        )?;
+        let regex = Self::compile_regex(&parsed.pattern, case_insensitive, multiline)?;
+        let glob_filter = Self::compile_glob(parsed.glob.as_deref())?;
+
+        let queued_at = Instant::now();
+        let permit = GREP_WORKERS.acquire().await.expect("static Grep semaphore");
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        // Keep both filesystem and matching work off the Actix worker. One
+        // search uses one worker and reuses its read buffer between files.
+        let (result, performance) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let started_at = Instant::now();
+            let mut performance = GrepPerformance {
+                queue_time: started_at.duration_since(queued_at),
+                ..GrepPerformance::default()
+            };
+            let result = Self::search(
+                &parsed,
+                &root,
+                &regex,
+                glob_filter.as_ref(),
+                &cancel,
+                &mut performance,
+            );
+            performance.scan_time = started_at.elapsed();
+            (result, performance)
+        })
+        .await
+        .map_err(|error| ToolError::Execution(format!("Grep worker failed: {error}")))?;
+        record_grep_performance(&performance);
+        result
+    }
+}
+
+impl GrepTool {
+    fn search(
+        parsed: &GrepArgs,
+        root: &Path,
+        regex: &Regex,
+        glob_filter: Option<&GlobSet>,
+        cancel: &CancellationToken,
+        performance: &mut GrepPerformance,
+    ) -> Result<ToolOutcome, ToolError> {
         let output_mode = parsed.output_mode.unwrap_or_default();
         let context = parsed.context.unwrap_or(0);
         let before = parsed.before.unwrap_or(context);
         let after = parsed.after.unwrap_or(context);
         let line_numbers = parsed.line_numbers.unwrap_or(false);
-        let case_insensitive = parsed.case_insensitive.unwrap_or(false);
         let multiline = parsed.multiline.unwrap_or(false);
         let head_limit = parsed.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
+        let literal = Self::literal_matcher(
+            &parsed.pattern,
+            parsed.case_insensitive.unwrap_or(false),
+            multiline,
+        );
+        let mut searcher = literal
+            .as_ref()
+            .map(|_| SearcherBuilder::new().bom_sniffing(false).build());
 
-        Self::validate_scope(&parsed, output_mode, multiline, &cwd)?;
-
-        let regex = Self::compile_regex(&parsed.pattern, case_insensitive, multiline)?;
-        let glob_filter = Self::compile_glob(parsed.glob.as_deref())?;
-
-        let discovery_root = root.clone();
-        let type_filter = parsed.r#type.clone();
-        let include_ignored = parsed.include_ignored;
-        // Path inspection and ignore::Walk perform synchronous directory IO.
-        // Keep discovery off the runtime so a slow filesystem cannot delay
-        // lease renewal or other tasks on an Actix current-thread worker.
-        let files = tokio::task::spawn_blocking(move || {
-            if discovery_root.is_file() {
-                Ok(vec![discovery_root])
-            } else if discovery_root.is_dir() {
-                Ok(Self::collect_files(
-                    &discovery_root,
-                    type_filter.as_deref(),
-                    include_ignored,
-                ))
-            } else {
-                Err(ToolError::Execution(format!(
-                    "Path does not exist: {}",
-                    discovery_root.display()
-                )))
-            }
-        })
-        .await
-        .map_err(|error| {
-            ToolError::Execution(format!("Failed to discover search files: {}", error))
-        })??;
-
-        let mut matched_files = Vec::new();
-        let mut count_rows = Vec::new();
-        let mut content_rows = Vec::new();
-        let mut total_matches = 0usize;
+        let files = if root.is_file() {
+            vec![root.to_path_buf()]
+        } else if root.is_dir() {
+            Self::collect_files(
+                root,
+                parsed.r#type.as_deref(),
+                parsed.include_ignored,
+                cancel,
+            )
+        } else {
+            return Err(ToolError::Execution(format!(
+                "Path does not exist: {}",
+                root.display()
+            )));
+        };
+        let mut read_buffer = String::new();
+        let mut result_lines = Vec::new();
         let mut partial = false;
 
         for file in files {
-            if let Some(filter) = &glob_filter {
-                let relative = file.strip_prefix(&root).unwrap_or(&file);
+            if cancel.is_cancelled() {
+                return Err(ToolError::Execution("Grep cancelled".to_owned()));
+            }
+            if let Some(filter) = glob_filter {
+                let relative = file.strip_prefix(root).unwrap_or(&file);
                 if !filter.is_match(relative) && !filter.is_match(&file) {
                     continue;
                 }
             }
 
-            let Ok(metadata) = tokio::fs::metadata(&file).await else {
+            let Ok(metadata) = std::fs::metadata(&file) else {
                 continue;
             };
             if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
                 continue;
             }
 
-            let Ok(reader) = tokio::fs::File::open(&file).await else {
+            let Ok(reader) = std::fs::File::open(&file) else {
                 continue;
             };
-            let Some(content) = Self::read_search_text(reader).await else {
-                continue;
-            };
-
-            if content.contains('\0') {
+            if !Self::read_search_text(reader, &mut read_buffer) || read_buffer.contains('\0') {
                 continue;
             }
+            let content = read_buffer.as_str();
+            performance.files_scanned += 1;
+            performance.bytes_scanned += content.len() as u64;
 
-            let match_count = if multiline {
-                regex.find_iter(&content).count()
-            } else {
-                content.lines().filter(|line| regex.is_match(line)).count()
-            };
-
+            let fast_count =
+                searcher
+                    .as_mut()
+                    .zip(literal.as_ref())
+                    .and_then(|(searcher, matcher)| {
+                        let mut count = 0;
+                        searcher
+                            .search_slice(
+                                matcher,
+                                content.as_bytes(),
+                                UTF8(|_, _| {
+                                    count += 1;
+                                    Ok(true)
+                                }),
+                            )
+                            .ok()?;
+                        performance.ripgrep_files += 1;
+                        Some(count)
+                    });
+            let match_count = fast_count.unwrap_or_else(|| {
+                if multiline {
+                    regex.find_iter(content).count()
+                } else {
+                    content.lines().filter(|line| regex.is_match(line)).count()
+                }
+            });
             if match_count == 0 {
                 continue;
             }
 
-            total_matches = total_matches.saturating_add(match_count);
-            if total_matches > MAX_MATCHES {
+            performance.matches += match_count as u64;
+            if performance.matches > MAX_MATCHES as u64 {
                 return Err(ToolError::Execution(RESULT_TOO_LARGE_ERROR.to_string()));
             }
 
-            matched_files.push(bamboo_config::paths::path_to_display_string(&file));
-            count_rows.push(format!(
-                "{}:{}",
-                bamboo_config::paths::path_to_display_string(&file),
-                match_count
-            ));
-
-            if matches!(output_mode, OutputMode::Content) {
-                content_rows.extend(Self::format_content_hits(
-                    &file,
-                    &content,
-                    &regex,
-                    multiline,
-                    before,
-                    after,
-                    line_numbers,
-                ));
-                if content_rows.len() >= head_limit {
-                    content_rows.truncate(head_limit);
-                    partial = true;
-                    break;
+            match output_mode {
+                OutputMode::FilesWithMatches => {
+                    result_lines.push(bamboo_config::paths::path_to_display_string(&file));
+                }
+                OutputMode::Count => {
+                    let path = bamboo_config::paths::path_to_display_string(&file);
+                    result_lines.push(format!("{path}:{match_count}"));
+                }
+                OutputMode::Content => {
+                    result_lines.extend(Self::format_content_hits(
+                        &file,
+                        content,
+                        regex,
+                        multiline,
+                        before,
+                        after,
+                        line_numbers,
+                    ));
                 }
             }
-
-            if matches!(
-                output_mode,
-                OutputMode::FilesWithMatches | OutputMode::Count
-            ) && matched_files.len() >= head_limit
-            {
+            if result_lines.len() >= head_limit {
                 partial = true;
                 break;
             }
         }
-
-        let mut result_lines = match output_mode {
-            OutputMode::FilesWithMatches => matched_files,
-            OutputMode::Count => count_rows,
-            OutputMode::Content => content_rows,
-        };
 
         if result_lines.len() > head_limit {
             result_lines.truncate(head_limit);
@@ -789,6 +865,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn literal_search_preserves_unicode_crlf_and_counts_lines_not_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mixed.txt");
+        std::fs::write(&file, "\u{feff}中文\r\nnone\r\n中文 中文\n中文").unwrap();
+
+        for pattern in ["中文", "\u{feff}中文"] {
+            assert!(GrepTool::literal_matcher(pattern, false, false).is_some());
+            let result = run(
+                &GrepTool::new(),
+                json!({"pattern": pattern, "path": file, "output_mode": "count"}),
+            )
+            .await
+            .unwrap();
+            let expected = if pattern == "中文" { ":3" } else { ":1" };
+            assert!(result.result.ends_with(expected), "{}", result.result);
+        }
+    }
+
+    #[tokio::test]
     async fn grep_skips_project_worktree_checkout() {
         let dir = tempfile::tempdir().unwrap();
         let kept = dir.path().join("src/kept.txt");
@@ -1028,16 +1123,21 @@ mod tests {
         assert!(error.to_string().contains(RESULT_TOO_LARGE_ERROR));
     }
 
-    #[tokio::test]
-    async fn grep_bounds_reads_independently_of_file_metadata() {
+    #[test]
+    fn grep_bounds_reads_independently_of_file_metadata() {
         let bytes = vec![b'x'; MAX_FILE_BYTES as usize + 32];
         let at_limit = &bytes[..MAX_FILE_BYTES as usize];
-        let content = GrepTool::read_search_text(at_limit).await.unwrap();
-        assert_eq!(content.len() as u64, MAX_FILE_BYTES);
+        let mut buffer = String::new();
+        assert!(GrepTool::read_search_text(at_limit, &mut buffer));
+        assert_eq!(buffer.len() as u64, MAX_FILE_BYTES);
 
         let mut reader = std::io::Cursor::new(bytes);
-        assert!(GrepTool::read_search_text(&mut reader).await.is_none());
+        assert!(!GrepTool::read_search_text(&mut reader, &mut buffer));
         assert_eq!(reader.position(), MAX_FILE_BYTES + 1);
+        assert!(!GrepTool::read_search_text(&[0xFF][..], &mut buffer));
+        assert!(GrepTool::read_search_text(&b"hello"[..], &mut buffer));
+        assert_eq!(buffer, "hello");
+        assert!(buffer.capacity() >= MAX_FILE_BYTES as usize);
     }
 
     #[tokio::test]

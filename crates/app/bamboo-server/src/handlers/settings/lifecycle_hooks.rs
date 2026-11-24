@@ -105,6 +105,12 @@ pub async fn test_lifecycle_hook(
             LifecycleHookHandler::script(path, runner, timeout_ms)
         }
     };
+    if let Some(admission) = app_state.managed_lifecycle_hook_admission() {
+        admission
+            .record_dispatch()
+            .await
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    }
     let output = bamboo_engine::test_lifecycle_handler(&payload.event, &handler, fallback_cwd)
         .await
         .map_err(|error| {
@@ -118,6 +124,75 @@ pub async fn test_lifecycle_hook(
 mod tests {
     use super::*;
     use actix_web::{http::StatusCode, test, App};
+
+    #[actix_web::test]
+    async fn managed_update_host_refuses_after_settings_hook_dry_run() {
+        use crate::app_state::planned_update::HostUpdateReadiness;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new_for_managed_update(dir.path().to_owned())
+                .await
+                .unwrap(),
+        );
+        state.wait_for_boot_reconcile_services().await;
+        assert!(!state.config.read().await.lifecycle_hooks.enabled);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/hooks/test", web::post().to(test_lifecycle_hook)),
+        )
+        .await;
+        let invalid = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/hooks/test")
+                .set_json(serde_json::json!({"event": "Unknown", "command": "exit 99"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(state
+            .managed_lifecycle_hook_admission()
+            .unwrap()
+            .try_hold("busy", "dispatched")
+            .is_ok());
+        let executed = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/hooks/test")
+                .set_json(serde_json::json!({
+                    "event": "PreToolUse",
+                    "command": "printf 'managed dry-run fixture'; exit 7"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(executed.status(), StatusCode::OK);
+        let result: serde_json::Value = test::read_body_json(executed).await;
+        assert_eq!(result["stdout"], "managed dry-run fixture");
+        assert_eq!(result["exit_code"], 7);
+
+        let mut preparation = state.begin_planned_update().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match preparation.observe().await {
+                    Err(error) => break error,
+                    Ok(HostUpdateReadiness::Busy { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(HostUpdateReadiness::Ready) => panic!("untracked hook cannot prove closure"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("lifecycle hook"));
+        drop(preparation);
+        state.shutdown().await;
+    }
 
     #[actix_web::test]
     async fn dry_run_returns_raw_exit_and_captured_streams() {

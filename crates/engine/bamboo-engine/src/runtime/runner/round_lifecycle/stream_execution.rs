@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -957,10 +958,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         .as_ref()
         .filter(|_| session.supervisor_incarnation_id().is_some())
         .map(bamboo_domain::model_context_block_sha256);
-    if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
-        session,
-        config.guidance_active_run_id.as_deref(),
-    ) {
+    // Work creation receipts cover the first input. Attach review guidance to
+    // the model context of the bound Worker without rewriting that input.
+    let handoff = if config.ticket_worker_plan.is_some() {
+        Some(ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Work Delivery Evidence",
+            bamboo_orchestration::managed_work::WORK_HANDOFF_GUIDANCE,
+        ))
+    } else {
+        bamboo_orchestration::managed_session::worker_handoff_context(
+            session,
+            config.guidance_active_run_id.as_deref(),
+        )
+    };
+    if let Some(handoff) = handoff {
         if let Some(block) = orchestration.as_mut() {
             block.content.push_str("\n\n");
             block.content.push_str(&handoff.content);
@@ -2058,6 +2072,11 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let model_started = observation.is_recording().then(std::time::Instant::now);
+    if model_started.is_some() {
+        let cache = bamboo_compression::counter::token_count_cache_stats();
+        observation.token_cache_snapshot(cache.hits, cache.misses, cache.entries);
+    }
     let call_id = uuid::Uuid::new_v4().to_string();
     observation.model_call_id(&call_id);
     let trace_ids = observation.trace_ids();
@@ -2093,6 +2112,13 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let progress_events = event_tx.clone();
+    http_retry_observer.report_progress(move |retry| {
+        let _ = progress_events.try_send(AgentEvent::UpstreamRetryScheduled {
+            http_status: retry.status,
+            retry_delay_ms: retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    });
     let recovery = recovery.map(|retry| match window_limit {
         Some(limit) => retry.tighten_output_limit(limit),
         None => retry,
@@ -2220,6 +2246,19 @@ pub(super) async fn execute_llm_stream(
             return Err(error);
         }
     };
+    let stream: bamboo_llm::LLMStream = if let Some(model_started) = model_started {
+        let mut started = Some(model_started);
+        Box::pin(stream.inspect(move |chunk| {
+            if let Some(start) = started {
+                if matches!(chunk, Ok(bamboo_llm::LLMChunk::Token(text)) if !text.is_empty()) {
+                    bamboo_infrastructure::telemetry::record_first_model_text(start.elapsed());
+                    started = None;
+                }
+            }
+        }))
+    } else {
+        stream
+    };
     let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
     if provider_manages_retry_budget {
         timeout_context.managed_response_established();
@@ -2321,6 +2360,11 @@ pub(super) async fn execute_llm_stream(
             }
         })
         .await;
+    if observation.is_recording() {
+        if let Some((typed_text, full_json)) = completion.gemini_decode_counts() {
+            observation.gemini_decode_counts(typed_text, full_json);
+        }
+    }
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(mut failure) => {

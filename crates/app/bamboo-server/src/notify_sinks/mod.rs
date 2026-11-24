@@ -142,9 +142,20 @@ pub fn attempted_channels(config: &Config, has_watcher: bool, category: &str) ->
 /// (`run_completed`, `needs_*`) — push sinks (ntfy/bark) are never suppressed
 /// by a watcher: a phone push is still useful while the desktop UI is open.
 pub fn dispatch_to_sinks(config: &Config, has_watcher: bool, notification: &SinkNotification) {
+    dispatch_with_hook_admission(config, has_watcher, notification, None);
+}
+
+pub(crate) fn dispatch_with_hook_admission(
+    config: &Config,
+    has_watcher: bool,
+    notification: &SinkNotification,
+    admission: Option<&crate::app_state::update_admission::UntrackedUpdateAdmission>,
+) {
     for channel in attempted_channels(config, has_watcher, &notification.category) {
         match channel {
-            "command" => command::CommandSink::from_config(config).deliver(notification),
+            "command" => {
+                command::CommandSink::from_config(config, admission.cloned()).deliver(notification)
+            }
             "desktop" => desktop::DesktopSink.deliver(notification),
             "ntfy" => ntfy::NtfySink::from_config(&config.notifications.ntfy).deliver(notification),
             "bark" => bark::BarkSink::from_config(&config.notifications.bark).deliver(notification),

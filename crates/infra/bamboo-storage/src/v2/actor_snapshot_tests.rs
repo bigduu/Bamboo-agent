@@ -2740,6 +2740,38 @@ async fn snapshot_v2_suppresses_stale_malformed_foreign_and_root_diagnostics() {
 }
 
 #[tokio::test]
+async fn snapshot_v2_reads_more_than_eight_mib_with_default_limits() {
+    let f = Fixture::new().await;
+    let child_count = 67;
+    let private_context = "x".repeat(128 * 1024);
+    for index in 0..child_count {
+        let child = f
+            .child(&format!("snapshot-child-{index:02}"), &f.root)
+            .await;
+        f.edit(&child.id, RUNTIME_SIDECAR_FILE, |runtime| {
+            runtime["metadata"]["test-private-context"] = private_context.clone().into();
+        })
+        .await;
+    }
+
+    let limits = ActorSnapshotLimits::default();
+    let snapshot = f.snapshot_v2(&f.root.id, limits).await.unwrap();
+    assert_eq!(snapshot.nodes.len(), child_count + 1);
+    assert_eq!(
+        f.snapshot_v2(
+            &f.root.id,
+            ActorSnapshotLimits {
+                aggregate_read_bytes: 8 * 1024 * 1024,
+                ..limits
+            },
+        )
+        .await
+        .unwrap_err(),
+        Error::BudgetExceeded
+    );
+}
+
+#[tokio::test]
 async fn snapshot_v2_preserves_read_and_exact_wire_budgets() {
     let f = Fixture::new().await;
     let mut child = f.child("bounded-diagnostic-child", &f.root).await;
