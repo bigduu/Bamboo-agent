@@ -258,7 +258,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The additive contexts and their case selections are unchanged.
 // #3018 keeps the session header rendering and provider request regressions in
 // the default bamboo-llm packages-2 owner. Additive contexts stay unchanged.
-const FEATURE_SOURCE_SHA256 = "02c151b3f0a5a2f6550bd117b4bef9963a5040a297518e98a6101ce5191a4226";
+// #3009 keeps Work handoff guidance in the default Engine owner. The existing
+// ticket_supervisor_tools integration target remains in agent-tests-1.
+const FEATURE_SOURCE_SHA256 = "fa5dafadd167293ee7fee2a5e5b11dccef12dde914a87e5cc7000b82c3b1234a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

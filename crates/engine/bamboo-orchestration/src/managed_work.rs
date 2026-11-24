@@ -16,6 +16,14 @@ const READ_GUIDANCE: &str = "Use absolute paths inside the assigned worktree for
 const HANDOFF_GUIDANCE: &str =
     "Finish with a handoff covering each acceptance item and any open findings for Supervisor review.";
 
+pub const WORK_HANDOFF_GUIDANCE: &str = concat!(
+    "Verify each acceptance item with the tools and evidence authorized for this Work. ",
+    "In the final reply, give each item's status (passed, failed, or unverified), the check actually performed, its result, and an evidence reference when available. ",
+    "For code changes, give the changed paths and the exact commit SHA if one exists. ",
+    "For failed or unverified items, state the blocker and the next authorized check or decision. ",
+    "Submit this handoff for Supervisor review and leave final acceptance to the designated authority."
+);
+
 pub fn validate_start(spec: &DispatchSpec) -> Result<()> {
     if spec.workspace.is_none()
         || !spec.contract.allowed_tools.contains("Task")
