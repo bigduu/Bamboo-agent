@@ -550,8 +550,7 @@ pub struct ParkedUpdateRoot {
     pub update_id: uuid::Uuid,
     pub session_id: String,
     pub created_at: DateTime<Utc>,
-    pub run_id: String,
-    pub lease_epoch: u64,
+    pub fence: bamboo_domain::ActorActivationFence,
     pub conversation_reset_sha256: Option<String>,
     pub transcript_sha256: String,
     pub root_tool_authority_revision: u64,
@@ -1129,7 +1128,7 @@ impl SessionActivationRouter {
     ) -> Result<bool, bamboo_agent_core::AgentError> {
         let update = root.update_id;
         let session_id = root.session_id.clone();
-        let run_id = root.run_id.clone();
+        let run_id = root.fence.run_id.clone();
         let mut hold = self.update_hold.subscribe();
         {
             let mut states = self.states.lock().await;

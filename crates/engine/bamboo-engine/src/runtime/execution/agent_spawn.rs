@@ -205,9 +205,9 @@ impl SessionExecutionReservation {
         &mut self,
         agent: &Agent,
         session: &Session,
-        finished_epoch: u64,
+        predecessor: &bamboo_domain::ActorActivationFence,
     ) -> std::io::Result<()> {
-        self.bind_root_actor_inner(agent, session, false, Some(finished_epoch))
+        self.bind_root_actor_inner(agent, session, false, Some(predecessor))
             .await
     }
 
@@ -216,7 +216,7 @@ impl SessionExecutionReservation {
         agent: &Agent,
         session: &Session,
         for_compaction: bool,
-        finished_epoch: Option<u64>,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<()> {
         if self.root_actor.is_none() {
             if self.session_id != session.id {
@@ -226,9 +226,9 @@ impl SessionExecutionReservation {
                 ));
             }
             let persistence = agent.persistence();
-            let binding = if let Some(epoch) = finished_epoch {
+            let binding = if let Some(predecessor) = predecessor {
                 persistence
-                    .bind_root_actor_after_update(session, &self.run_id, epoch)
+                    .bind_root_actor_after_update(session, &self.run_id, predecessor)
                     .await?
             } else if for_compaction {
                 persistence

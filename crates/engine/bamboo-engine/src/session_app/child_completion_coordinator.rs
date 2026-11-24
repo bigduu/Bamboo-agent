@@ -1086,7 +1086,7 @@ impl ChildCompletionCoordinator {
         &self,
         reservation: &mut SessionExecutionReservation,
         session: &Session,
-        finished_epoch: Option<u64>,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<()> {
         if session.kind != SessionKind::Root
             || !session.authority_identity.is_ordinary()
@@ -1101,10 +1101,10 @@ impl ChildCompletionCoordinator {
         reservation
             .bind_reserved_session_lifetime(&self.agent, session)
             .await?;
-        match finished_epoch {
-            Some(epoch) => {
+        match predecessor {
+            Some(predecessor) => {
                 reservation
-                    .bind_root_actor_after_update(&self.agent, session, epoch)
+                    .bind_root_actor_after_update(&self.agent, session, predecessor)
                     .await
             }
             None => reservation.bind_root_actor(&self.agent, session).await,
@@ -1246,15 +1246,15 @@ impl ChildCompletionCoordinator {
             return Ok(false);
         };
         let guard = self.persistence.acquire_lock(&root.session_id).await;
-        let Some((saved, mut resumed)) = self
-            .storage
-            .load_session(&root.session_id)
-            .await?
-            .and_then(|saved| {
-                let resumed =
-                    crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
-                Some((saved, resumed))
-            })
+        let Some((saved, resumed)) =
+            self.storage
+                .load_session(&root.session_id)
+                .await?
+                .and_then(|saved| {
+                    let resumed =
+                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                    Some((saved, resumed))
+                })
         else {
             drop(guard);
             reservation.abandon().await;
@@ -1273,7 +1273,7 @@ impl ChildCompletionCoordinator {
             ));
         }
         if let Err(error) = self
-            .prepare_root_continuation(&mut reservation, &saved, Some(root.lease_epoch))
+            .prepare_root_continuation(&mut reservation, &saved, Some(&root.fence))
             .await
         {
             drop(guard);
@@ -1283,12 +1283,11 @@ impl ChildCompletionCoordinator {
         let writer = reservation.root_actor_writer().ok_or_else(|| {
             std::io::Error::other("Planned update resume requires the current Root writer")
         })?;
-        if root.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
+        if root.fence.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
             drop(guard);
             reservation.abandon().await;
             return Ok(false);
         }
-        resumed.set_host_run_id(&writer.fence.run_id);
         drop(guard);
         self.start_bound_root_continuation(resumed, &saved, reservation)
             .await?;

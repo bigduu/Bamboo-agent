@@ -217,7 +217,7 @@ impl SessionRepository {
         session: &Session,
         run_id: &str,
         for_compaction: bool,
-        finished_epoch: Option<u64>,
+        predecessor: Option<bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
         let repository = self.clone();
         let session = session.clone();
@@ -226,7 +226,7 @@ impl SessionRepository {
         // waiting. An unobserved returned binding drops its exact-fence cleanup.
         tokio::spawn(async move {
             repository
-                .bind_root_actor_inner(&session, &run_id, for_compaction, finished_epoch)
+                .bind_root_actor_inner(&session, &run_id, for_compaction, predecessor.as_ref())
                 .await
         })
         .await
@@ -238,7 +238,7 @@ impl SessionRepository {
         session: &Session,
         run_id: &str,
         for_compaction: bool,
-        finished_epoch: Option<u64>,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
         if session.kind != bamboo_domain::SessionKind::Root
             || !session.authority_identity.is_ordinary()
@@ -296,10 +296,10 @@ impl SessionRepository {
             placement_ref: None,
             now,
         };
-        let claimed = match finished_epoch {
-            Some(epoch) => {
+        let claimed = match predecessor {
+            Some(predecessor) => {
                 directory
-                    .claim_root_activation_observed_after(&claim, session, Some(epoch))
+                    .claim_root_activation_observed_after(&claim, session, Some(predecessor))
                     .await
             }
             None => {
@@ -856,9 +856,9 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         &self,
         session: &Session,
         run_id: &str,
-        finished_epoch: u64,
+        predecessor: &bamboo_domain::ActorActivationFence,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
-        self.bind_root_actor(session, run_id, false, Some(finished_epoch))
+        self.bind_root_actor(session, run_id, false, Some(predecessor.clone()))
             .await
     }
 

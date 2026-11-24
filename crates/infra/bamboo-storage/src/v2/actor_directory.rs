@@ -1025,7 +1025,7 @@ impl ActorDirectoryPort for SessionStoreV2 {
         &self,
         claim: &ActorActivationClaim,
         expected: &Session,
-        finished_epoch: Option<u64>,
+        predecessor: Option<&ActorActivationFence>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         validate_claim(claim)?;
         if claim.actor_id != expected.id || expected.kind != bamboo_domain::SessionKind::Root {
@@ -1073,14 +1073,15 @@ impl ActorDirectoryPort for SessionStoreV2 {
         let mut entry = self
             .read_or_create_actor_entry(&claim.actor_id, &rel, &path, &guards)
             .await?;
-        if let Some(epoch) = finished_epoch {
-            let predecessor_matches = entry.activation.as_ref().is_some_and(|activation| {
-                activation.lease_epoch == epoch
+        if let Some(predecessor) = predecessor {
+            let finished = entry.activation.as_ref().is_some_and(|activation| {
+                activation.matches_fence(predecessor)
                     && activation.status == ActorActivationStatus::Succeeded
-                    && expected.host_run_id() == Some(activation.run_id.as_str())
-                    && current.host_run_id() == expected.host_run_id()
             });
-            if !predecessor_matches {
+            if !finished
+                || !super::root_terminal_runtime::matches_observation(&current, predecessor)
+                    .map_err(storage)?
+            {
                 return Err(ActorDirectoryError::StaleFence);
             }
         }

@@ -261,7 +261,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         &self,
         _session: &Session,
         _run_id: &str,
-        _finished_epoch: u64,
+        _predecessor: &crate::ActorActivationFence,
     ) -> io::Result<Option<RootActorExecutionBinding>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -856,10 +856,10 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         &self,
         session: &Session,
         run_id: &str,
-        finished_epoch: u64,
+        predecessor: &crate::ActorActivationFence,
     ) -> io::Result<Option<RootActorExecutionBinding>> {
         (**self)
-            .bind_root_actor_after_update(session, run_id, finished_epoch)
+            .bind_root_actor_after_update(session, run_id, predecessor)
             .await
     }
 
