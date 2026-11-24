@@ -6,6 +6,7 @@ use super::log_identity;
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::provider::{
@@ -24,6 +25,8 @@ pub const ENDPOINT_MESSAGES: &str = "messages";
 pub const ENDPOINT_STREAM_GENERATE_CONTENT: &str = "stream_generate_content";
 pub const ENDPOINT_MODELS: &str = "models";
 
+const SESSION_AFFINITY_PLACEHOLDER: &str = "{session_affinity}";
+
 const FORBIDDEN_HEADER_NAMES: [&str; 4] =
     ["host", "content-length", "transfer-encoding", "connection"];
 
@@ -39,8 +42,7 @@ pub fn apply_overrides_to_header_map(
     endpoint: &str,
     model: Option<&str>,
 ) {
-    let env_vars = bamboo_config::Config::current_env_vars();
-    apply_overrides_to_header_map_with_env(headers, overrides, endpoint, model, &env_vars);
+    apply_overrides_to_session_headers(headers, overrides, endpoint, model, None);
 }
 
 pub fn apply_overrides_to_header_map_with_env(
@@ -48,6 +50,28 @@ pub fn apply_overrides_to_header_map_with_env(
     overrides: Option<&RequestOverridesConfig>,
     endpoint: &str,
     model: Option<&str>,
+    env_vars: &HashMap<String, String>,
+) {
+    apply_header_overrides(headers, overrides, endpoint, model, None, env_vars);
+}
+
+pub(crate) fn apply_overrides_to_session_headers(
+    headers: &mut HeaderMap,
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
+) {
+    let env_vars = bamboo_config::Config::current_env_vars();
+    apply_header_overrides(headers, overrides, endpoint, model, session_id, &env_vars);
+}
+
+fn apply_header_overrides(
+    headers: &mut HeaderMap,
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
     env_vars: &HashMap<String, String>,
 ) {
     let Some(overrides) = overrides else {
@@ -69,7 +93,22 @@ pub fn apply_overrides_to_header_map_with_env(
             continue;
         }
 
-        let Some(value) = resolve_template_expr(&expr, env_vars) else {
+        let value = if let Some(template) = session_affinity_template(&expr) {
+            let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
+                continue;
+            };
+            let mut digest = Sha256::new();
+            digest.update(b"bamboo.provider-header.session-affinity.v1\0");
+            digest.update(session_id.as_bytes());
+            let key = hex::encode(digest.finalize());
+            Some(render_format_template(
+                &template.replace(SESSION_AFFINITY_PLACEHOLDER, &key),
+                env_vars,
+            ))
+        } else {
+            resolve_template_expr(&expr, env_vars)
+        };
+        let Some(value) = value else {
             tracing::warn!(
                 "Skipping request override header_hash={} because its value did not resolve",
                 log_identity(header_name)
@@ -99,6 +138,17 @@ pub fn apply_overrides_to_header_map_with_env(
         };
 
         headers.insert(parsed_name, parsed_value);
+    }
+}
+
+fn session_affinity_template(expr: &TemplateExpr) -> Option<&str> {
+    match expr {
+        TemplateExpr::Structured(TemplateExprSpec::Format { template })
+            if template.contains(SESSION_AFFINITY_PLACEHOLDER) =>
+        {
+            Some(template)
+        }
+        _ => None,
     }
 }
 
@@ -300,9 +350,14 @@ pub(crate) fn bind_catalog_limits(
 ) -> Vec<ProviderModelInfo> {
     let Some(overrides) = overrides.filter(|overrides| {
         overrides
-            .endpoints
+            .common
+            .headers
             .values()
-            .any(|scope| !scope.headers.is_empty())
+            .any(|expr| session_affinity_template(expr).is_some())
+            || overrides
+                .endpoints
+                .values()
+                .any(|scope| !scope.headers.is_empty())
             || overrides
                 .rules
                 .iter()
@@ -310,7 +365,8 @@ pub(crate) fn bind_catalog_limits(
     }) else {
         return models;
     };
-    let catalog_headers = resolve_scope(overrides, ENDPOINT_MODELS, None).headers;
+    let mut catalog_headers = resolve_scope(overrides, ENDPOINT_MODELS, None).headers;
+    catalog_headers.retain(|_, expr| session_affinity_template(expr).is_none());
     for model in &mut models {
         if generation_endpoints(&model.id).iter().any(|endpoint| {
             resolve_scope(overrides, endpoint, Some(&model.id)).headers != catalog_headers
@@ -1433,6 +1489,175 @@ mod tests {
                 .expect("valid header"),
             "ok"
         );
+    }
+
+    #[test]
+    fn provider_headers_render_a_stable_value_only_when_a_session_is_present() {
+        let overrides: RequestOverridesConfig = serde_json::from_value(serde_json::json!({
+            "common": {
+                "headers": {
+                    "X-Session-Id": {
+                        "type": "format",
+                        "template": "tenant-{env:REGION}-{session_affinity}"
+                    },
+                    "X-Session-Label": "{session_affinity}"
+                }
+            }
+        }))
+        .unwrap();
+        let env = HashMap::from([("REGION".to_string(), "lab".to_string())]);
+        let render = |session_id| {
+            let mut headers = HeaderMap::new();
+            apply_header_overrides(
+                &mut headers,
+                Some(&overrides),
+                ENDPOINT_MESSAGES,
+                Some("test-model"),
+                session_id,
+                &env,
+            );
+            headers
+        };
+        let first = render(Some("original-session"));
+        let value = first["x-session-id"].to_str().unwrap();
+        let digest = value.strip_prefix("tenant-lab-").unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!value.contains("original-session"));
+        assert_eq!(
+            first["x-session-id"],
+            render(Some("original-session"))["x-session-id"]
+        );
+        assert_ne!(
+            first["x-session-id"],
+            render(Some("different-session"))["x-session-id"]
+        );
+        for session_id in [None, Some("  ")] {
+            let headers = render(session_id);
+            assert!(!headers.contains_key("x-session-id"));
+            assert_eq!(headers["x-session-label"], "{session_affinity}");
+        }
+    }
+
+    #[test]
+    fn catalog_limits_are_unbound_when_generation_headers_depend_on_a_session() {
+        let overrides: RequestOverridesConfig = serde_json::from_value(serde_json::json!({
+            "common": {
+                "headers": {
+                    "X-Session-Id": {"type": "format", "template": "{session_affinity}"}
+                }
+            }
+        }))
+        .unwrap();
+        let model = ProviderModelInfo {
+            max_context_tokens: Some(100_000),
+            max_output_tokens: Some(4_096),
+            ..ProviderModelInfo::from_id("test-model")
+        };
+        let models = bind_catalog_limits(vec![model], Some(&overrides), |_| &[ENDPOINT_MESSAGES]);
+        assert_eq!(models[0], ProviderModelInfo::from_id("test-model"));
+    }
+
+    #[tokio::test]
+    async fn session_affinity_reaches_each_provider_generation_endpoint() {
+        use crate::provider::{LLMProvider, LLMRequestOptions};
+        use crate::providers::{
+            anthropic::AnthropicProvider, bodhi::BodhiProvider, gemini::GeminiProvider,
+            openai::OpenAIProvider,
+        };
+        use bamboo_domain::Message;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+        let base = upstream.uri();
+        let chat_model = "test-chat-model";
+        let responses_model = "test-responses-model";
+        let overrides: RequestOverridesConfig = serde_json::from_value(serde_json::json!({
+            "common": {
+                "headers": {
+                    "Provider-Session": {"type": "format", "template": "{session_affinity}"}
+                }
+            }
+        }))
+        .unwrap();
+
+        let openai = OpenAIProvider::new("fixture-auth")
+            .with_base_url(format!("{base}/v1"))
+            .with_responses_only_models(vec![responses_model.to_owned()])
+            .with_request_overrides(Some(overrides.clone()));
+        let anthropic = AnthropicProvider::new("fixture-auth")
+            .with_base_url(format!("{base}/v1"))
+            .with_request_overrides(Some(overrides.clone()));
+        let gemini = GeminiProvider::new("fixture-auth")
+            .with_base_url(format!("{base}/v1beta"))
+            .with_request_overrides(Some(overrides.clone()));
+        let bodhi = |target| {
+            BodhiProvider::new("fixture-auth")
+                .with_base_url(base.clone())
+                .with_target_provider(target)
+                .with_request_overrides(Some(overrides.clone()))
+        };
+        let bodhi_openai = bodhi("openai");
+        let bodhi_anthropic = bodhi("anthropic");
+        let bodhi_gemini = bodhi("gemini");
+        let cases: [(&dyn LLMProvider, &str, &str); 7] = [
+            (&openai, chat_model, "/v1/chat/completions"),
+            (&openai, responses_model, "/v1/responses"),
+            (&anthropic, chat_model, "/v1/messages"),
+            (
+                &gemini,
+                chat_model,
+                "/v1beta/models/test-chat-model:streamGenerateContent",
+            ),
+            (
+                &bodhi_openai,
+                chat_model,
+                "/proxy/openai/v1/chat/completions",
+            ),
+            (&bodhi_anthropic, chat_model, "/proxy/anthropic/v1/messages"),
+            (
+                &bodhi_gemini,
+                chat_model,
+                "/proxy/gemini/v1beta/models/test-chat-model:streamGenerateContent",
+            ),
+        ];
+
+        let options = LLMRequestOptions {
+            session_id: Some("fixture-session".to_owned()),
+            ..Default::default()
+        };
+        for (provider, model, _) in cases {
+            let messages = [Message::user("A provider header fixture")];
+            for options in [Some(&options), None] {
+                // The upstream records the outbound request before rejecting it.
+                assert!(provider
+                    .chat_stream_with_options(&messages, &[], Some(32), model, options)
+                    .await
+                    .is_err());
+            }
+        }
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), cases.len() * 2);
+        for ((_, _, path), pair) in cases.into_iter().zip(requests.chunks_exact(2)) {
+            let [session, standalone] = pair else {
+                unreachable!()
+            };
+            assert_eq!(session.url.path(), path);
+            assert_eq!(standalone.url.path(), path);
+            let value = session
+                .headers
+                .get("provider-session")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(value.len(), 64);
+            assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(!standalone.headers.contains_key("provider-session"));
+        }
     }
 
     #[test]
