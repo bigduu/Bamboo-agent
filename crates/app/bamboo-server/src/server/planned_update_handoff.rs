@@ -229,11 +229,7 @@ pub(super) async fn resume(
                                     &owner.fence(),
                                 )
                                 .unwrap_or(false)
-                                    && session
-                                        .metadata
-                                        .get("runtime.suspend_reason")
-                                        .map(String::as_str)
-                                        != Some("planned_update")
+                                    && !session.is_parked_for_planned_update()
                             })
                         })
                 {
