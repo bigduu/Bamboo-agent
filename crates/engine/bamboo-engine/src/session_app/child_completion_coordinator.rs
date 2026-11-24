@@ -1246,15 +1246,15 @@ impl ChildCompletionCoordinator {
             return Ok(false);
         };
         let guard = self.persistence.acquire_lock(&root.session_id).await;
-        let Some((saved, resumed)) =
-            self.storage
-                .load_session(&root.session_id)
-                .await?
-                .and_then(|saved| {
-                    let resumed =
-                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
-                    Some((saved, resumed))
-                })
+        let Some((saved, mut resumed)) = self
+            .storage
+            .load_session(&root.session_id)
+            .await?
+            .and_then(|saved| {
+                let resumed =
+                    crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                Some((saved, resumed))
+            })
         else {
             drop(guard);
             reservation.abandon().await;
@@ -1288,6 +1288,7 @@ impl ChildCompletionCoordinator {
             reservation.abandon().await;
             return Ok(false);
         }
+        resumed.set_host_run_id(&writer.fence.run_id);
         drop(guard);
         self.start_bound_root_continuation(resumed, &saved, reservation)
             .await?;

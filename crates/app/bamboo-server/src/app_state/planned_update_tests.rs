@@ -209,6 +209,7 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         .unwrap();
     assert_ne!(new_owner.run_id, checkpoint.run_id);
     assert_eq!(new_owner.lease_epoch, checkpoint.lease_epoch + 1);
+    assert_eq!(saved.host_run_id(), Some(new_owner.run_id.as_str()));
     assert!(!state
         .child_completion_coordinator
         .resume_planned_update_root(&checkpoint)
