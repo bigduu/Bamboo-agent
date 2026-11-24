@@ -123,6 +123,7 @@ impl State {
 }
 struct Inner {
     identity: LocalTaskResourceIdentity,
+    ordinary_root: bool,
     state: Mutex<State>,
     stop: watch::Sender<bool>,
     drained: watch::Sender<Option<Result<(), String>>>,
@@ -134,6 +135,24 @@ pub struct LocalTaskResources(Arc<Inner>);
 /// prepares its update. Drop releases the hold without changing stop state.
 pub struct LocalTaskUpdateHold {
     resources: LocalTaskResources,
+}
+
+impl LocalTaskUpdateHold {
+    pub fn ensure_current(&self) -> io::Result<()> {
+        let state = self
+            .resources
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("local execution resource registry poisoned"))?;
+        if let Some(error) = &state.failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        if state.closed || !state.held_for_update || !state.tasks.is_empty() {
+            return Err(io::Error::other("local execution resource hold changed"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for LocalTaskUpdateHold {
@@ -151,6 +170,64 @@ impl Drop for LocalTaskUpdateHold {
 tokio::task_local! {
     static RESOURCES: LocalTaskResources;
     static INLINE_INVOCATION_SAFE: Arc<AtomicBool>;
+    static ORDINARY_ROOT_INVOCATION: OrdinaryRootInvocation;
+}
+
+struct OrdinaryRootInvocation {
+    resources: LocalTaskResources,
+    name: String,
+    call_id: String,
+    owned: AtomicBool,
+}
+
+impl Drop for OrdinaryRootInvocation {
+    fn drop(&mut self) {
+        if !self.owned.load(Ordering::Acquire) {
+            self.resources.record_unconfirmed(format!(
+                "ordinary Root tool {} has no confirmed update resource owner",
+                self.name
+            ));
+        }
+    }
+}
+
+/// Observe actual ordinary Root dispatch, including custom executors that return
+/// a normal result but may have started effects outside the local registry.
+pub async fn observe_ordinary_root_tool<F: Future>(
+    name: &str,
+    call_id: &str,
+    tool: F,
+) -> F::Output {
+    let Some(resources) = LocalTaskResources::current().filter(|scope| scope.0.ordinary_root)
+    else {
+        return tool.await;
+    };
+    ORDINARY_ROOT_INVOCATION
+        .scope(
+            OrdinaryRootInvocation {
+                resources,
+                name: name.to_owned(),
+                call_id: call_id.to_owned(),
+                owned: AtomicBool::new(false),
+            },
+            tool,
+        )
+        .await
+}
+
+pub(crate) fn mark_ordinary_root_tool_owned(
+    resources: &LocalTaskResources,
+    name: &str,
+    call_id: &str,
+) {
+    let _ = ORDINARY_ROOT_INVOCATION.try_with(|invocation| {
+        if Arc::ptr_eq(&resources.0, &invocation.resources.0)
+            && invocation.name == name
+            && invocation.call_id == call_id
+        {
+            invocation.owned.store(true, Ordering::Release);
+        }
+    });
 }
 
 // Called only at the provenance-checked BuiltinToolExecutor dispatch after
@@ -177,6 +254,23 @@ impl LocalTaskResources {
         run_id: impl Into<String>,
         child_birth: DateTime<Utc>,
     ) -> Self {
+        Self::with_scope_kind(session_id, run_id, child_birth, false)
+    }
+
+    pub fn new_for_ordinary_root(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self::with_scope_kind(session_id, run_id, created_at, true)
+    }
+
+    fn with_scope_kind(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        child_birth: DateTime<Utc>,
+        ordinary_root: bool,
+    ) -> Self {
         Self(Arc::new(Inner {
             identity: LocalTaskResourceIdentity {
                 session_id: session_id.into(),
@@ -184,16 +278,31 @@ impl LocalTaskResources {
                 child_birth,
                 owner_id: uuid::Uuid::new_v4(),
             },
+            ordinary_root,
             state: Mutex::new(State::default()),
             stop: watch::channel(false).0,
             drained: watch::channel(None).0,
         }))
     }
+    pub fn is_ordinary_root_update_scope(&self) -> bool {
+        self.0.ordinary_root
+    }
     pub fn identity(&self) -> &LocalTaskResourceIdentity {
         &self.0.identity
     }
     pub fn current() -> Option<Self> {
-        RESOURCES.try_with(Clone::clone).ok()
+        RESOURCES
+            .try_with(|scope| {
+                // Ordinary Root initially certifies only the framework Read
+                // path. Other tools retain their legacy execution semantics.
+                let legacy_tool = scope.0.ordinary_root
+                    && ORDINARY_ROOT_INVOCATION
+                        .try_with(|invocation| invocation.name != "Read")
+                        .unwrap_or(false);
+                (!legacy_tool).then(|| scope.clone())
+            })
+            .ok()
+            .flatten()
     }
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
         RESOURCES.scope(self.clone(), future).await

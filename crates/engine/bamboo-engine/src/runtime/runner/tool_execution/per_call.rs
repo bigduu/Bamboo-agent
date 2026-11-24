@@ -882,6 +882,11 @@ async fn execute_tool_call_only_with_execution_name_inner(
         &ctx.tool_call.id,
         dispatch,
     ));
+    let dispatch = bamboo_tools::local_task_resources::observe_ordinary_root_tool(
+        execution_name,
+        &ctx.tool_call.id,
+        dispatch,
+    );
     let await_quiet_exec = ctx.await_quiet_exec && execution_name == "write_stdin";
     let observed_dispatch = if await_quiet_exec {
         bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await
