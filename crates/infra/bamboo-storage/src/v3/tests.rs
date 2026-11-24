@@ -233,3 +233,20 @@ fn malformed_root_identity_is_rejected_before_the_first_write() {
     ));
     assert!(store.load(&session.id).unwrap().is_none());
 }
+
+#[test]
+fn canonical_buffers_keep_the_prior_row_bytes() {
+    let value = serde_json::json!({
+        "z": [{ "z": "中文", "a": "\n" }],
+        "a": { "y": [3, 2, 1], "b": "escaped \"value\"" }
+    });
+    let expected = bamboo_domain::canonical_json_bytes(&value);
+    assert_eq!(super::canonical(&value).unwrap(), expected);
+
+    let mut reuse = vec![b'x'; expected.len() * 2];
+    let capacity = reuse.capacity();
+    reuse.clear();
+    super::write_canonical(&value, &mut reuse).unwrap();
+    assert_eq!(reuse, expected);
+    assert_eq!(reuse.capacity(), capacity);
+}

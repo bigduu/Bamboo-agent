@@ -173,11 +173,11 @@ impl SessionStoreV3 {
                 .get_or_insert_with(Default::default)
                 .session_inbox_admission = Some(admission);
         }
-        let rows = message_rows(&tx, id)?;
-        session.messages = rows
-            .into_iter()
-            .map(|row| serde_json::from_slice(&row))
-            .collect::<std::result::Result<_, _>>()?;
+        session.messages = {
+            let mut query = tx.prepare_cached(MESSAGE_ROWS_SQL)?;
+            let mut rows = query.query([id])?;
+            read_messages(&mut rows)?
+        };
         validate_session(&session)?;
         check_identity(&session, &stored)?;
         tx.commit()?;
@@ -228,12 +228,9 @@ impl SessionStoreV3 {
             return Err(V3Error::Conflict);
         }
         let result = {
-            let mut query = tx.prepare("SELECT payload FROM messages WHERE session_id=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3")?;
-            let rows = query.query_map(params![id, offset as i64, limit as i64], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })?;
-            rows.map(|row| Ok(serde_json::from_slice(&row?)?))
-                .collect::<Result<Vec<_>>>()?
+            let mut query = tx.prepare_cached("SELECT payload FROM messages WHERE session_id=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3")?;
+            let mut rows = query.query(params![id, offset as i64, limit as i64])?;
+            read_messages(&mut rows)?
         };
         tx.commit()?;
         Ok(result)
@@ -307,19 +304,69 @@ fn check_identity(session: &Session, stored: &Header) -> Result<()> {
     }
     Ok(())
 }
+fn write_canonical<T: Serialize>(value: &T, buffer: &mut Vec<u8>) -> Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    value.sort_all_objects();
+    serde_json::to_writer(buffer, &value)?;
+    Ok(())
+}
+
 fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    Ok(bamboo_domain::canonical_json_bytes(&serde_json::to_value(
-        value,
-    )?))
+    let mut buffer = Vec::new();
+    write_canonical(value, &mut buffer)?;
+    Ok(buffer)
 }
 fn runtime_bytes(session: &Session) -> Result<Vec<u8>> {
     canonical(&crate::v2::runtime_sidecar_snapshot(session))
 }
-fn message_rows(connection: &Connection, id: &str) -> Result<Vec<Vec<u8>>> {
-    let mut query =
-        connection.prepare("SELECT payload FROM messages WHERE session_id=?1 ORDER BY ordinal")?;
-    let rows = query.query_map([id], |row| row.get(0))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+const MESSAGE_ROWS_SQL: &str = "SELECT payload FROM messages WHERE session_id=?1 ORDER BY ordinal";
+
+fn message_payload<'a>(row: &'a rusqlite::Row<'_>) -> Result<&'a [u8]> {
+    let value = row.get_ref(0)?;
+    Ok(value.as_blob().map_err(|_| {
+        rusqlite::Error::InvalidColumnType(0, "payload".to_owned(), value.data_type())
+    })?)
+}
+
+fn read_messages(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next()? {
+        messages.push(serde_json::from_slice(message_payload(row)?)?);
+    }
+    Ok(messages)
+}
+
+struct MessageChanges {
+    updates: Vec<(usize, Vec<u8>)>,
+    truncate: bool,
+}
+
+fn changed_messages(tx: &Transaction<'_>, session: &Session) -> Result<MessageChanges> {
+    let mut query = tx.prepare_cached(MESSAGE_ROWS_SQL)?;
+    let mut rows = query.query([&session.id])?;
+    let mut updates = Vec::new();
+    // Borrow each old BLOB from SQLite until the next step of its cursor.
+    // Stage only changed rows so no statements modify the table mid-scan.
+    let mut has_previous = true;
+    let mut payload = Vec::new();
+    for (ordinal, message) in session.messages.iter().enumerate() {
+        payload.clear();
+        write_canonical(message, &mut payload)?;
+        if has_previous {
+            match rows.next()? {
+                Some(row) if message_payload(row)? == payload => continue,
+                Some(_) => {}
+                None => has_previous = false,
+            }
+        }
+        updates.push((ordinal, std::mem::take(&mut payload)));
+    }
+    let mut truncate = false;
+    while let Some(row) = rows.next()? {
+        message_payload(row)?;
+        truncate = true;
+    }
+    Ok(MessageChanges { updates, truncate })
 }
 fn validate_session(session: &Session) -> Result<()> {
     if session.id.trim().is_empty() {
@@ -367,14 +414,10 @@ fn put_in_transaction(
             .as_ref()
             .and_then(|metadata| metadata.session_inbox_admission.clone()),
     })?;
-    let messages = session
-        .messages
-        .iter()
-        .map(canonical)
-        .collect::<Result<Vec<_>>>()?;
-    let previous = message_rows(tx, &session.id)?;
-    let history_changed =
-        previous != messages || existing.as_ref().is_none_or(|stored| stored.proof != proof);
+    let changes = changed_messages(tx, session)?;
+    let history_changed = changes.truncate
+        || !changes.updates.is_empty()
+        || existing.as_ref().is_none_or(|stored| stored.proof != proof);
     let runtime_changed = existing
         .as_ref()
         .is_none_or(|stored| stored.runtime != runtime);
@@ -401,16 +444,19 @@ fn put_in_transaction(
             ON CONFLICT(session_id) DO UPDATE SET history_rev=excluded.history_rev,runtime_rev=excluded.runtime_rev,runtime_json=excluded.runtime_json,proof_json=excluded.proof_json",
             params![session.id, root_id(session), session.created_at.to_rfc3339(), revision.history, revision.runtime, runtime, proof])?;
     }
-    for (ordinal, payload) in messages.iter().enumerate() {
-        if previous.get(ordinal) != Some(payload) {
-            tx.execute("INSERT INTO messages(session_id,ordinal,payload) VALUES(?1,?2,?3) ON CONFLICT(session_id,ordinal) DO UPDATE SET payload=excluded.payload",
-                params![session.id, ordinal as i64, payload])?;
+    if !changes.updates.is_empty() {
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO messages(session_id,ordinal,payload) VALUES(?1,?2,?3)
+             ON CONFLICT(session_id,ordinal) DO UPDATE SET payload=excluded.payload",
+        )?;
+        for (ordinal, payload) in changes.updates {
+            upsert.execute(params![session.id, ordinal as i64, payload])?;
         }
     }
-    if previous.len() > messages.len() {
+    if changes.truncate {
         tx.execute(
             "DELETE FROM messages WHERE session_id=?1 AND ordinal>=?2",
-            params![session.id, messages.len() as i64],
+            params![session.id, session.messages.len() as i64],
         )?;
     }
     Ok(revision)
