@@ -528,6 +528,12 @@ pub enum AgentEvent {
         status: Option<bamboo_domain::PlanModeStatus>,
     },
 
+    /// The active model request scheduled a bounded HTTP retry.
+    UpstreamRetryScheduled {
+        http_status: u16,
+        retry_delay_ms: u64,
+    },
+
     /// Runner progress update emitted at the start of each agent turn.
     ///
     /// Used to track live execution progress (round count, current activity)

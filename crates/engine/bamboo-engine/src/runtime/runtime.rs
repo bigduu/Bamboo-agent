@@ -1233,6 +1233,7 @@ impl AgentRuntime {
             live_bootstrap_host: self.live_bootstrap_host.clone(),
             gold_target_resolver: self.gold_target_resolver.clone(),
             session_activation_notifications,
+            session_update_router: self.activation_router.clone(),
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,

@@ -216,6 +216,7 @@ struct ActiveOwner {
     session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
+    parked_update: Option<ParkedUpdateRoot>,
     /// Scheduling boundary for this owner, not durable queue/authority state.
     /// Keep wait/Guardian outcomes together until this exact Run leaves.
     child_completions_need_successor: bool,
@@ -515,7 +516,7 @@ impl ExpectedRunDeliveryGuard {
 pub struct SessionActivationRouter {
     runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
-    update_hold: watch::Sender<bool>,
+    update_hold: watch::Sender<UpdateHold>,
     /// Live operations for one logical target share a fence. Weak entries are
     /// pruned on access; idle/deleted targets retain no separate lock state.
     publication_fences: TargetPublicationFences,
@@ -531,6 +532,41 @@ pub struct SessionActivationRouter {
 #[must_use = "dropping the hold reopens session admissions"]
 pub struct SessionUpdateAdmission {
     router: SessionActivationRouter,
+    id: uuid::Uuid,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UpdateHold {
+    #[default]
+    Open,
+    Preparing(uuid::Uuid),
+    Committed(uuid::Uuid),
+}
+
+/// An exact Root owner that reached and saved a model-round boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParkedUpdateRoot {
+    pub update_id: uuid::Uuid,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub fence: bamboo_domain::ActorActivationFence,
+    pub conversation_reset_sha256: Option<String>,
+    pub transcript_sha256: String,
+    pub root_tool_authority_revision: u64,
+    pub project_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub message_id: String,
+    pub message_count: usize,
+    pub model: bamboo_domain::ProviderModelRef,
+}
+
+impl ParkedUpdateRoot {
+    pub fn hash_transcript(messages: &[bamboo_domain::Message]) -> serde_json::Result<String> {
+        let value = serde_json::to_value(messages)?;
+        let bytes = bamboo_domain::session::inbox::canonical_json_bytes(&value);
+        Ok(bamboo_domain::session::model_context::sha256_hex(&bytes))
+    }
 }
 
 impl SessionUpdateAdmission {
@@ -546,11 +582,73 @@ impl SessionUpdateAdmission {
         outstanding.sort_unstable();
         outstanding
     }
+
+    /// Snapshot of prepared Root rounds. Other resource lifetimes and final
+    /// process-replacement readiness are separate host checks.
+    pub async fn parked_roots(&self) -> Vec<ParkedUpdateRoot> {
+        let states = self.router.states.lock().await;
+        let mut parked: Vec<_> = states
+            .values()
+            .filter_map(|state| self.parked_root(state).cloned())
+            .collect();
+        parked.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        parked
+    }
+
+    fn parked_root<'a>(&self, target: &'a TargetActivationState) -> Option<&'a ParkedUpdateRoot> {
+        let owner = target.owner.as_ref().filter(|owner| !owner.finalizing)?;
+        owner
+            .parked_update
+            .as_ref()
+            .filter(|root| root.update_id == self.id)
+    }
+
+    /// After checking physical work on the host, publish a durable handoff
+    /// under the same lock as the complete parked-owner inventory. The
+    /// publisher performs the bounded atomic write and must not call the
+    /// activation router. Failed writes keep the original runs parked and
+    /// abortable. Committed admission remains closed until process exit.
+    pub async fn commit_parked_roots(
+        &self,
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()> + Send,
+    ) -> std::io::Result<()> {
+        let states = self.router.states.lock().await;
+        let busy = || {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session update preparation is incomplete",
+            )
+        };
+        if self.router.preparing_update() != Some(self.id) {
+            return Err(busy());
+        }
+        let mut parked = Vec::new();
+        for state in states.values() {
+            if state.activation_reserved {
+                return Err(busy());
+            }
+            if state.owner.is_some() {
+                parked.push(self.parked_root(state).ok_or_else(busy)?.clone());
+            }
+        }
+        parked.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        publish(&parked)?;
+        self.router
+            .update_hold
+            .send_replace(UpdateHold::Committed(self.id));
+        Ok(())
+    }
 }
 
 impl Drop for SessionUpdateAdmission {
     fn drop(&mut self) {
-        self.router.update_hold.send_replace(false);
+        self.router.update_hold.send_if_modified(|hold| {
+            if *hold == UpdateHold::Preparing(self.id) {
+                *hold = UpdateHold::Open;
+                return true;
+            }
+            false
+        });
     }
 }
 
@@ -999,13 +1097,83 @@ impl SessionActivationRouter {
     /// with registration and Inbox reservation, including in-flight launches.
     pub async fn hold_admissions_for_update(&self) -> Option<SessionUpdateAdmission> {
         let _states = self.states.lock().await;
-        if *self.update_hold.borrow() {
+        if self.admissions_held() {
             return None;
         }
-        self.update_hold.send_replace(true);
+        let id = uuid::Uuid::new_v4();
+        self.update_hold.send_replace(UpdateHold::Preparing(id));
         Some(SessionUpdateAdmission {
             router: self.clone(),
+            id,
         })
+    }
+
+    pub(crate) fn preparing_update(&self) -> Option<uuid::Uuid> {
+        match *self.update_hold.borrow() {
+            UpdateHold::Preparing(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn admissions_held(&self) -> bool {
+        *self.update_hold.borrow() != UpdateHold::Open
+    }
+
+    /// Wait between model rounds under the exact registered Root. An aborted
+    /// update releases the same loop, with its original execution budget.
+    pub(crate) async fn park_root_for_update(
+        &self,
+        root: ParkedUpdateRoot,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, bamboo_agent_core::AgentError> {
+        let update = root.update_id;
+        let session_id = root.session_id.clone();
+        let run_id = root.fence.run_id.clone();
+        let mut hold = self.update_hold.subscribe();
+        {
+            let mut states = self.states.lock().await;
+            if cancel.is_cancelled() {
+                return Err(bamboo_agent_core::AgentError::Cancelled);
+            }
+            if self.preparing_update() != Some(update) {
+                return Ok(false);
+            }
+            let Some(owner) = states
+                .get_mut(&session_id)
+                .and_then(|state| state.owner.as_mut())
+                .filter(|owner| {
+                    owner.run_id == run_id
+                        && owner.session_created_at == Some(root.created_at)
+                        && owner.registrations > 0
+                        && !owner.finalizing
+                })
+            else {
+                return Ok(false);
+            };
+            owner.parked_update = Some(root);
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
+            phase = hold.wait_for(|phase| *phase != UpdateHold::Preparing(update)) => {
+                Ok(phase.is_ok_and(|phase| *phase == UpdateHold::Committed(update)))
+            }
+        };
+        let mut states = self.states.lock().await;
+        if let Some(owner) = states
+            .get_mut(&session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                owner.run_id == run_id
+                    && owner
+                        .parked_update
+                        .as_ref()
+                        .is_some_and(|root| root.update_id == update)
+            })
+        {
+            owner.parked_update = None;
+        }
+        result
     }
 
     /// Late-bind the real server/SDK reservation adapter after its dependency
@@ -1165,7 +1333,7 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(candidate.generation);
-                if *self.update_hold.borrow() {
+                if self.admissions_held() {
                     return Ok(SessionWakeReconcileResult {
                         disposition: None,
                         next_due_at: Some(now + Duration::seconds(1)),
@@ -1258,6 +1426,7 @@ impl SessionActivationRouter {
             session_created_at: None,
             finalizing: false,
             registrations: 0,
+            parked_update: None,
             child_completions_need_successor: false,
             delivery_sink: None,
             scoped_loop: None,
@@ -1435,7 +1604,7 @@ impl SessionActivationRouter {
             let (notifications, reservation_wait) = {
                 let publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
-                if *self.update_hold.borrow()
+                if self.admissions_held()
                     && states
                         .get(target_session_id)
                         .is_none_or(|state| state.owner.is_none())
@@ -1443,7 +1612,7 @@ impl SessionActivationRouter {
                     let mut update = self.update_hold.subscribe();
                     drop(states);
                     drop(publication);
-                    let _ = update.wait_for(|held| !held).await;
+                    let _ = update.wait_for(|phase| *phase == UpdateHold::Open).await;
                     continue;
                 }
                 let state = states.entry(target_session_id.to_string()).or_default();
@@ -1505,6 +1674,7 @@ impl SessionActivationRouter {
                             session_created_at: birth,
                             finalizing: false,
                             registrations: 1,
+                            parked_update: None,
                             child_completions_need_successor: false,
                             delivery_sink: None,
                             scoped_loop: None,
@@ -1617,6 +1787,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: true,
                     registrations: 0,
+                    parked_update: None,
                     child_completions_need_successor: false,
                     delivery_sink: None,
                     scoped_loop: None,
@@ -1741,7 +1912,7 @@ impl SessionActivationRouter {
             if (state.latest_generation > state.last_dispatched_generation
                 || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
-                && !*self.update_hold.borrow()
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1848,7 +2019,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
-                && !*self.update_hold.borrow()
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1931,7 +2102,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
-                && !*self.update_hold.borrow()
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -2086,6 +2257,7 @@ impl SessionActivationRouter {
                         session_created_at: None,
                         finalizing: false,
                         registrations: 0,
+                        parked_update: None,
                         child_completions_need_successor: false,
                         delivery_sink: None,
                         scoped_loop: None,
@@ -2119,6 +2291,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: false,
                     registrations: 0,
+                    parked_update: None,
                     child_completions_need_successor: false,
                     delivery_sink: None,
                     scoped_loop: None,
@@ -2428,7 +2601,7 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(inbox_generation);
-                if *self.update_hold.borrow() {
+                if self.admissions_held() {
                     if let Some(startup) = runtime_startup
                         .as_ref()
                         .filter(|startup| startup.receipt.generation == state.latest_generation)

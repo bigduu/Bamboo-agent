@@ -87,6 +87,9 @@ fn intent(
 }
 async fn state() -> (tempfile::TempDir, web::Data<AppState>) {
     let home = tempfile::tempdir().unwrap();
+    crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile(
+        home.path(),
+    );
     let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
     (home, state)
 }

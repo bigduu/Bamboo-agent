@@ -1078,6 +1078,16 @@ impl ChildCompletionCoordinator {
         reservation: &mut SessionExecutionReservation,
         session: &Session,
     ) -> std::io::Result<()> {
+        self.prepare_root_continuation(reservation, session, None)
+            .await
+    }
+
+    async fn prepare_root_continuation(
+        &self,
+        reservation: &mut SessionExecutionReservation,
+        session: &Session,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
+    ) -> std::io::Result<()> {
         if session.kind != SessionKind::Root
             || !session.authority_identity.is_ordinary()
             || crate::ticket_runtime::is_managed_work_root(session)
@@ -1091,7 +1101,14 @@ impl ChildCompletionCoordinator {
         reservation
             .bind_reserved_session_lifetime(&self.agent, session)
             .await?;
-        reservation.bind_root_actor(&self.agent, session).await
+        match predecessor {
+            Some(predecessor) => {
+                reservation
+                    .bind_root_actor_after_update(&self.agent, session, predecessor)
+                    .await
+            }
+            None => reservation.bind_root_actor(&self.agent, session).await,
+        }
     }
 
     /// Publish and hand off this exact reserved turn. Success records Inbox
@@ -1214,8 +1231,67 @@ impl ChildCompletionCoordinator {
         let expected = session.clone();
         crate::runtime::goal_restart::consume(&mut session, &checkpoint);
         drop(guard);
-        self.start_bound_goal_turn(session, &expected, reservation)
+        self.start_bound_root_continuation(session, &expected, reservation)
             .await
+    }
+
+    /// Resume a Root from the owning host's committed update handoff. The
+    /// caller verifies the predecessor process, update receipt and Actor
+    /// closure before proposing a member.
+    pub async fn resume_planned_update_root(
+        &self,
+        root: &crate::session_activation::ParkedUpdateRoot,
+    ) -> std::io::Result<bool> {
+        let Some(mut reservation) = self.reserve_paced_loop_turn(&root.session_id).await else {
+            return Ok(false);
+        };
+        let guard = self.persistence.acquire_lock(&root.session_id).await;
+        let Some((saved, resumed)) =
+            self.storage
+                .load_session(&root.session_id)
+                .await?
+                .and_then(|saved| {
+                    let resumed =
+                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                    Some((saved, resumed))
+                })
+        else {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(false);
+        };
+        let config = self.config.read().await.clone();
+        let provider =
+            resolve_provider_routing_key(&config, &root.model.provider, &self.provider_registry);
+        if !provider.is_ok_and(|provider| provider == root.model.provider)
+            || self.provider_router.route_with_origin(&root.model).is_err()
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(std::io::Error::other(
+                "The saved update model is unavailable",
+            ));
+        }
+        if let Err(error) = self
+            .prepare_root_continuation(&mut reservation, &saved, Some(&root.fence))
+            .await
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(error);
+        }
+        let writer = reservation.root_actor_writer().ok_or_else(|| {
+            std::io::Error::other("Planned update resume requires the current Root writer")
+        })?;
+        if root.fence.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(false);
+        }
+        drop(guard);
+        self.start_bound_root_continuation(resumed, &saved, reservation)
+            .await?;
+        Ok(true)
     }
 
     /// Admit the explicitly requested resume during this Root activation.
@@ -1285,19 +1361,19 @@ impl ChildCompletionCoordinator {
         resumed.set_last_run_status("running");
         resumed.clear_last_run_error();
         drop(guard);
-        self.start_bound_goal_turn(resumed, &current, reservation)
+        self.start_bound_root_continuation(resumed, &current, reservation)
             .await
     }
 
-    async fn start_bound_goal_turn(
+    async fn start_bound_root_continuation(
         &self,
         mut session: Session,
         expected: &Session,
         reservation: SessionExecutionReservation,
     ) -> std::io::Result<()> {
-        let persistence = reservation
-            .execution_persistence()
-            .ok_or_else(|| std::io::Error::other("Goal restart requires fenced persistence"))?;
+        let persistence = reservation.execution_persistence().ok_or_else(|| {
+            std::io::Error::other("Root continuation requires fenced persistence")
+        })?;
         if let Err(error) = persistence
             .save_bound_startup_session(&mut session, expected)
             .await
@@ -1315,8 +1391,9 @@ impl ChildCompletionCoordinator {
             execution_reservation: reservation,
             config,
         };
-        ResumeExecutionPort::dispatch_configured_resume_execution(self, request)
-            .map_err(|_| std::io::Error::other("Goal restart owner did not accept the checkpoint"))
+        ResumeExecutionPort::dispatch_configured_resume_execution(self, request).map_err(|_| {
+            std::io::Error::other("Root continuation owner did not accept the checkpoint")
+        })
     }
 
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
@@ -4683,12 +4760,13 @@ impl ChildCompletionCoordinator {
                         .unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                    let policy = match &control_plane {
-                        Some(child) => {
-                            crate::runtime::execution::spawn::watchdog_policy_for_session(child)
-                        }
-                        None => Default::default(),
-                    };
+                    let policy = runner.child_watchdog_policy.unwrap_or_else(|| {
+                        control_plane
+                            .as_ref()
+                            .map_or_else(Default::default, |child| {
+                                crate::execution::spawn::watchdog_policy_for_session(child, None)
+                            })
+                    });
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
                     let current_native_work =
                         if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {

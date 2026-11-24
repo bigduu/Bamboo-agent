@@ -302,6 +302,10 @@ enum Commands {
         /// Data directory holding config.json (defaults to ~/.bamboo).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Verify the selected provider and model with a short inference request.
+        #[arg(long)]
+        probe: bool,
     },
 
     /// Show (or set) Bamboo configuration.
@@ -2045,8 +2049,8 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             }
         }
 
-        Commands::Doctor { data_dir } => {
-            match bamboo_agent::setup_cli::run_doctor(data_dir).await {
+        Commands::Doctor { data_dir, probe } => {
+            match bamboo_agent::setup_cli::run_doctor_with_probe(data_dir, probe).await {
                 Ok(true) => {}
                 Ok(false) => exit_after_telemetry(telemetry, 1),
                 Err(e) => {

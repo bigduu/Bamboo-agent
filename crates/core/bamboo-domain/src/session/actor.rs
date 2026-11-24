@@ -487,8 +487,19 @@ pub trait ActorDirectoryPort: Send + Sync {
     /// fall back to the selector-only claim or refresh the caller observation.
     async fn claim_root_activation_observed(
         &self,
+        claim: &ActorActivationClaim,
+        expected: &super::Session,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        self.claim_root_activation_observed_after(claim, expected, None)
+            .await
+    }
+    /// Check the recorded terminal predecessor inside the successor's claim
+    /// transaction when the Host has prepared a planned update.
+    async fn claim_root_activation_observed_after(
+        &self,
         _claim: &ActorActivationClaim,
         _expected: &super::Session,
+        _predecessor: Option<&ActorActivationFence>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         Err(ActorDirectoryError::InvalidTransition)
     }

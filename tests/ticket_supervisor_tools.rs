@@ -11,6 +11,40 @@ use std::{sync::atomic::Ordering, time::Duration};
 #[actix_web::test]
 async fn actual_supervisor_work_tools_return_before_held_native_worker_finishes() {
     let f = Fixture::new().await;
+    *f.probe.controlled_response.lock().unwrap() = Some(|body, _| {
+        let tools = body["tools"].as_array().unwrap();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .and_then(|tool| tool["function"]["description"].as_str())
+        };
+        let messages = body["messages"].to_string();
+        let handoff = "the check actually performed, its result, and an evidence reference";
+        if let Some(update) = description("work_update") {
+            for clause in [
+                "concrete deliverable in objective",
+                "scope, non-goals, supplied limits, and the reviewer in constraints",
+                "observable result, a concrete check, and the evidence to return",
+                "beyond the Work's authority",
+            ] {
+                assert!(
+                    update.contains(clause),
+                    "missing Work brief clause: {clause}"
+                );
+            }
+            assert!(description("work_inspect")
+                .unwrap()
+                .contains("Match each acceptance item to a performed check and evidence"));
+            assert!(!messages.contains(handoff));
+        } else if tools.len() == 1 && description("Task").is_some() {
+            assert!(messages.contains("Exact output"));
+            assert!(messages.contains("passed, failed, or unverified"));
+            assert!(messages.contains(handoff));
+            assert!(messages.contains("the next authorized check or decision"));
+        }
+        None
+    });
     post(&f.client, &f.base, "/chat", &json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"thread_id":"ticket-supervisor-tools-e2e",
         "message":"TICKET_SUPERVISOR_E2E create and start one Work then reply without waiting for the Worker.", "model":"ticket-model","provider":"openai",
         "model_ref":{"provider":"openai","model":"ticket-model"}})).await;
