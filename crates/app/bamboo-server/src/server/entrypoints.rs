@@ -513,7 +513,10 @@ async fn run_with_static_options(
     // Gracefully stop AppState-owned background tasks (the #47 MCP-proxy reconnect
     // supervisor + MCP servers) once the server stops, instead of leaking them
     // until process exit. Runs on both the clean and error exit paths. #119.
-    app_state_for_shutdown.shutdown().await;
+    // A committed managed handoff has already drained the exact Child owner.
+    app_state_for_shutdown
+        .finish_shutdown(committed_update.is_some())
+        .await;
 
     if let Err(e) = result {
         error!("Server error: {}", e);
