@@ -251,7 +251,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3003 keeps Gemini frame decoding and fallback cases in the default
 // bamboo-llm packages-2 owner. The litellm-wire-types replay guard uses the
 // existing feature, and the additive contexts retain their case selections.
-const FEATURE_SOURCE_SHA256 = "41c0d7bd8a1f7f772a86135c7964a28296c90a56726fb645d5d884d08b114648";
+// #3005 uses the default Grep packages-2, Engine packages-3, and infrastructure
+// packages-4 owners. The new span attribution test is shared across telemetry
+// configurations, and the additive catalog retains its existing selection.
+const FEATURE_SOURCE_SHA256 = "4fa764d1b72063cac28fca02c676aedc9c7a6f575034c27d6061afb7ae3cd6f6";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
