@@ -1079,8 +1079,7 @@ impl ActorDirectoryPort for SessionStoreV2 {
                     && activation.status == ActorActivationStatus::Succeeded
             });
             if !finished
-                || !super::root_terminal_runtime::matches_observation(&current, predecessor)
-                    .map_err(storage)?
+                || !Self::root_runtime_matches_activation(&current, predecessor).map_err(storage)?
             {
                 return Err(ActorDirectoryError::StaleFence);
             }

@@ -45,10 +45,7 @@ fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<Ro
             .unwrap_or_else(|| format!("{:x}", Sha256::digest(b"bamboo.root-runtime.no-reset.v1"))),
     })
 }
-pub(super) fn matches_observation(
-    session: &Session,
-    fence: &ActorActivationFence,
-) -> io::Result<bool> {
+fn matches_observation(session: &Session, fence: &ActorActivationFence) -> io::Result<bool> {
     let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else {
         return Ok(false);
     };
