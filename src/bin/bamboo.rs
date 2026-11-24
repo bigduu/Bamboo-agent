@@ -1268,6 +1268,13 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--managed-update-protocol"))
+        && arguments.next().is_none()
+    {
+        println!("1");
+        return;
+    }
     if let Some(code) = bamboo_agent::server::tailscale_serve_helper_entry() {
         std::process::exit(code);
     }
