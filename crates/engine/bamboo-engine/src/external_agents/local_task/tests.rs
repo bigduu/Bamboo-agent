@@ -462,7 +462,7 @@ impl Harness {
         let expected = match status {
             "completed" => ActorActivationStatus::Succeeded,
             "cancelled" => ActorActivationStatus::Cancelled,
-            "error" => ActorActivationStatus::Failed,
+            "error" | "timeout" => ActorActivationStatus::Failed,
             other => panic!("unsupported expected terminal {other}"),
         };
         assert_eq!(activation.status, expected);
@@ -474,7 +474,7 @@ impl Harness {
         );
         assert_eq!(
             actor.actor.state,
-            if status == "error" {
+            if expected == ActorActivationStatus::Failed {
                 ActorLogicalState::Failed
             } else {
                 ActorLogicalState::Cold
