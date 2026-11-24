@@ -75,6 +75,17 @@ The application attribute allowlist is:
 - `bamboo.session.birth`, `bamboo.model_call.id`
 - `bamboo.root_session.id`, `bamboo.execution.id`, `bamboo.run.id`, `bamboo.round.id`
 - `bamboo.tool.observation` (`dispatch`), `bamboo.outcome`, `error.type`
+- `bamboo.perf.grep.*` includes worker queue and scan durations (microseconds),
+  scanned files/bytes, matches and files scanned with the literal matcher.
+- `bamboo.perf.token_cache.process_hits`, `process_misses` and `process_entries`
+  are process-wide snapshots taken before provider dispatch and available
+  through OTel export. Use successive samples from the same process for
+  hit-rate calculations.
+- `bamboo.perf.model.first_text_us` measures dispatch to the first non-empty
+  upstream text chunk, including on silent streams.
+- `bamboo.perf.gemini.typed_text_frames` and `full_json_frames` count decode
+  paths used by a Gemini stream. The local trace detail returns available
+  operation-level measurements under `performance`.
 
 Identifiers must be 1–128 ASCII letters, digits, underscores, hyphens or periods;
 other values are omitted, and span names fall back to the operation alone. The
@@ -148,7 +159,7 @@ authorization, fencing or attempt authority. That protocol is separate (#886).
 Bamboo uses a nonblocking batch queue of 256 ended spans, batches of at most 64,
 a 500 ms scheduled delay, no export retry, one-second connection/request
 timeouts and a two-second shutdown wait. Overflow or collector outage drops
-telemetry rather than waiting in the execution path. At most 16 attributes and
+telemetry rather than waiting in the execution path. At most 24 attributes and
 zero events/links are retained per span. Collector response bodies are not
 buffered or logged by Bamboo's transport; HTTP success is not proof of durable
 collector storage. A shutdown timeout can leave the bounded exporter worker

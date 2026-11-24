@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -2058,6 +2059,11 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let model_started = observation.is_recording().then(std::time::Instant::now);
+    if model_started.is_some() {
+        let cache = bamboo_compression::counter::token_count_cache_stats();
+        observation.token_cache_snapshot(cache.hits, cache.misses, cache.entries);
+    }
     let call_id = uuid::Uuid::new_v4().to_string();
     observation.model_call_id(&call_id);
     let trace_ids = observation.trace_ids();
@@ -2227,6 +2233,19 @@ pub(super) async fn execute_llm_stream(
             return Err(error);
         }
     };
+    let stream: bamboo_llm::LLMStream = if let Some(model_started) = model_started {
+        let mut started = Some(model_started);
+        Box::pin(stream.inspect(move |chunk| {
+            if let Some(start) = started {
+                if matches!(chunk, Ok(bamboo_llm::LLMChunk::Token(text)) if !text.is_empty()) {
+                    bamboo_infrastructure::telemetry::record_first_model_text(start.elapsed());
+                    started = None;
+                }
+            }
+        }))
+    } else {
+        stream
+    };
     let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
     if provider_manages_retry_budget {
         timeout_context.managed_response_established();
@@ -2328,6 +2347,11 @@ pub(super) async fn execute_llm_stream(
             }
         })
         .await;
+    if observation.is_recording() {
+        if let Some((typed_text, full_json)) = completion.gemini_decode_counts() {
+            observation.gemini_decode_counts(typed_text, full_json);
+        }
+    }
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(mut failure) => {
