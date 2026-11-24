@@ -37,10 +37,12 @@ mod tool_loading_http_tests;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;
 pub(crate) use context_preparation::stage_user_context_compaction;
-pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
 #[cfg(test)]
 pub(in crate::runtime::runner) use stream_execution::effective_tool_schemas;
 pub(in crate::runtime::runner) use stream_execution::required_tool_for_session;
+pub(crate) use stream_execution::{
+    discard_latest_interrupted_assistant_output, worker_timeout_usage,
+};
 
 /// Select the highest tier for a known provider/model. Alias routes retain the
 /// canonical Max request unless their adapter prescribes a lower wire ceiling.

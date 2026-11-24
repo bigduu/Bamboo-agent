@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "nodeVersion": "24.21.0",
+  "playwrightCoreVersion": "1.62.1",
+  "playwrightCoreIntegrity": "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==",
+  "chromiumVersion": "151.0.7922.34",
+  "chromiumRevision": "1234",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "platform": "mac-arm64",
+      "nodeSha256": "bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057",
+      "browserSha256": "cb46a336dbe3d6f1339c5039c3083e4e5dd8e4379710790e34f8f4a865e2452d"
+    },
+    "aarch64-pc-windows-msvc": {
+      "platform": "win64",
+      "browserTarget": "x86_64-pc-windows-msvc",
+      "nodeSha256": "8779b1bde1d39f8d420e3b57aa657b39891af434d3de44a919044cec06785921",
+      "browserSha256": "46cc69ef55ba29268ffe32dda4192a9d2165be42c3f4e923241153d519493aea"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "platform": "linux-arm64",
+      "browserSource": "playwright",
+      "nodeSha256": "724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5",
+      "browserSha256": "b03443e1e1a60d06e07b6cdfe650b8c2bfcbb3db497d2b652f73dc6912f4ae15"
+    },
+    "x86_64-pc-windows-msvc": {
+      "platform": "win64",
+      "nodeSha256": "158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541",
+      "browserSha256": "46cc69ef55ba29268ffe32dda4192a9d2165be42c3f4e923241153d519493aea"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "platform": "linux64",
+      "nodeSha256": "6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff",
+      "browserSha256": "3cfc2bd00d1bafcf8a68dc74c9c92bb7150ddc8d26ade948a776316e1cec4f14"
+    }
+  }
+}

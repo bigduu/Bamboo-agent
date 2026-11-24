@@ -1087,6 +1087,21 @@ pub(crate) async fn publish_child_completion(
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
 ) {
+    publish_child_completion_with(publisher, completion, move |completion| async move {
+        if let Some(handler) = completion_handler {
+            handler.on_child_completed(completion).await;
+        }
+    })
+    .await;
+}
+
+pub(crate) async fn publish_child_completion_with<F>(
+    publisher: &super::session_events::ReplayableSessionEventPublisher,
+    completion: ChildCompletion,
+    on_completion: impl FnOnce(ChildCompletion) -> F + Send,
+) where
+    F: std::future::Future<Output = ()> + Send,
+{
     let completion_id = completion
         .source
         .as_ref()
@@ -1105,27 +1120,21 @@ pub(crate) async fn publish_child_completion(
         )
         .await;
 
-    if let Some(handler) = completion_handler {
-        // Contain a panicking handler: this call frequently runs on the caller's
-        // only liveness-critical task (the child's terminal block, or the spawn
-        // scheduler worker for early failures). Unwinding here would kill that
-        // task after the child already looks terminal everywhere — the classic
-        // stranded-parent signature. The child-wait watchdog backstops the wake
-        // that a panicked handler failed to deliver.
-        use futures::FutureExt;
-        let parent_session_id = completion.parent_session_id.clone();
-        let child_session_id = completion.child_session_id.clone();
-        if std::panic::AssertUnwindSafe(handler.on_child_completed(completion))
-            .catch_unwind()
-            .await
-            .is_err()
-        {
-            tracing::error!(
-                %parent_session_id,
-                %child_session_id,
-                "child completion handler panicked; child-wait watchdog will backstop the parent wake"
-            );
-        }
+    // This callback can run on the child's only liveness-critical task.
+    // Contain panics so watchdog recovery can deliver the missed parent wake.
+    use futures::FutureExt;
+    let parent_session_id = completion.parent_session_id.clone();
+    let child_session_id = completion.child_session_id.clone();
+    if std::panic::AssertUnwindSafe(async { on_completion(completion).await })
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            %parent_session_id,
+            %child_session_id,
+            "child completion handler panicked; child-wait watchdog will backstop the parent wake"
+        );
     }
 }
 

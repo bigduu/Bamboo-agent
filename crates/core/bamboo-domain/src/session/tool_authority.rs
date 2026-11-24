@@ -80,7 +80,7 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 /// These are delegation or bounded business views, never raw workspace/file,
 /// process, Skill, Workflow or external-provider execution. Concrete Session
 /// ports still require their live Host instance proof; names grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 15] = [
     "SubAgent",
     "spawn_session",
     "Task",
@@ -88,6 +88,7 @@ pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
     "session_history",
     "session_message",
     "session_control",
+    "supervisor_log_monitor",
     "work_overview",
     "work_search",
     "work_inspect",
@@ -199,7 +200,7 @@ impl Session {
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
         let supervisor = self.supervisor_incarnation_id().is_some();
-        if supervisor_work_tool(execution_name) {
+        if supervisor_work_tool(execution_name) || execution_name == "supervisor_log_monitor" {
             return supervisor;
         }
         !self.model_orchestration_only_enabled()

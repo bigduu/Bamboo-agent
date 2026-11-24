@@ -32,9 +32,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(ultra: bool) -> Self {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("fixture-root-model".into()),
+            ..Default::default()
+        });
         Self::with_provider(
             ultra,
-            Config::default(),
+            config,
             Arc::new(super::UnconfiguredProvider {
                 message: "no external model is available in this fixture".into(),
             }),
@@ -313,7 +319,7 @@ async fn assert_create_is_independent_and_exact_retry(ultra: bool) {
     );
     assert_eq!(root.supervisor_incarnation_id(), None);
     assert!(!root.root_orchestration_only_enabled());
-    assert_ne!(root.model, "supervisor-private-model");
+    assert_eq!(root.model, "fixture-root-model");
     let link = f
         .state
         .storage
@@ -360,6 +366,79 @@ async fn supervisor_standard_creates_independent_root_and_retries_once() {
 #[actix_web::test]
 async fn supervisor_ultra_creates_independent_root_and_retries_once() {
     assert_create_is_independent_and_exact_retry(true).await;
+}
+
+#[actix_web::test]
+async fn supervised_root_uses_chat_default_with_model_ref_rollout_disabled() {
+    use crate::model_routing_test_support::CaptureProvider;
+
+    for (ultra, mode) in [
+        (false, RootThinkingMode::Standard),
+        (true, RootThinkingMode::Ultra),
+    ] {
+        let startup = Arc::new(CaptureProvider::default());
+        let worker = Arc::new(CaptureProvider::default());
+        let target = bamboo_domain::ProviderModelRef::new("worker-instance", "worker-model");
+        let mut config = Config::default();
+        config.features.provider_model_ref = false;
+        config.default_provider_instance = Some("startup-instance".into());
+        for (id, model) in [
+            ("startup-instance", "fast-model"),
+            ("worker-instance", "worker-model"),
+        ] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(json!({
+                    "provider_type": "openai", "enabled": true, "runtime_models": [model]
+                }))
+                .unwrap(),
+            );
+        }
+        config.defaults = Some(
+            serde_json::from_value(json!({
+                "chat": target,
+                "fast": {"provider": "startup-instance", "model": "fast-model"},
+            }))
+            .unwrap(),
+        );
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        assert!(config.get_model().is_none());
+
+        let f = Fixture::with_provider(ultra, config, startup.clone()).await;
+        f.state
+            .provider_registry
+            .replace_with(ProviderRegistry::new(
+                std::collections::HashMap::from([
+                    ("startup-instance".into(), startup as Arc<dyn LLMProvider>),
+                    (
+                        "worker-instance".into(),
+                        worker.clone() as Arc<dyn LLMProvider>,
+                    ),
+                ]),
+                "startup-instance".into(),
+            ));
+        let mut request = f.request(uuid::Uuid::new_v4());
+        request["request"]["thinking_mode"] = json!(mode);
+        let receipt = f.invoke(request).await;
+        let id = receipt["target_session_id"].as_str().unwrap();
+        let root = f.state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(root.model, target.model);
+        assert_eq!(root.model_ref.as_ref(), Some(&target));
+        assert_eq!(root.root_thinking_mode(), mode);
+
+        timeout(Duration::from_secs(20), async {
+            while worker.models.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worker's first turn reached the configured chat provider");
+        assert_eq!(worker.models.lock().unwrap().first(), Some(&target.model));
+        f.state.shutdown().await;
+    }
 }
 
 const PERMISSION_PROBES: [(&str, &str); 4] = [

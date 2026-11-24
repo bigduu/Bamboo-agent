@@ -215,7 +215,9 @@ pub async fn inspect_managed_history(
         ));
     }
     if body.clear_readback
-        && (body.query.since_message_id.is_some() || body.query.projection.is_some())
+        && (body.query.since_message_id.is_some()
+            || body.query.projection.is_some()
+            || body.query.wants_page())
     {
         return Ok(history_error(
             StatusCode::BAD_REQUEST,
@@ -358,7 +360,10 @@ pub async fn inspect_managed_history(
         })
     });
     let mut result =
-        crate::handlers::agent::history::render_history(&session_id, session, &body.query);
+        match crate::handlers::agent::history::render_history(&session_id, session, &body.query) {
+            Ok(result) => result,
+            Err(error) => return Ok(error.response(&session_id)),
+        };
     let object = result
         .as_object_mut()
         .expect("history renderer always returns an object");

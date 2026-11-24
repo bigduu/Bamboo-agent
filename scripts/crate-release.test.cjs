@@ -1827,6 +1827,37 @@ test('minimal frozen publisher never recompiles a successful or unverifiable nat
     () => { throw new Error('No metadata read for another publisher run') }, { receipt: { publisherRunId: '88' } }), /original publisher run 88/)
 })
 
+test('native retry admits a matrix that never expanded after the original preflight failed', () => {
+  const { assertNoNativeRebuild } = require('./sidecar-build.cjs')
+  const target = 'aarch64-apple-darwin'
+  const workflowRevision = 'a'.repeat(40)
+  const identity = { workflowRevision, runId: '77', runAttempt: 2, validation: { kind: 'bamboo-frozen-dev-release/v1' } }
+  const preparation = { receipt: { publisherRunId: '77' } }
+  const earlier = { run_id: 77, run_attempt: 1, head_sha: workflowRevision, status: 'completed' }
+  const preflight = { ...earlier, name: 'automatic', conclusion: 'failure' }
+  const placeholder = { ...earlier, name: 'Complete executable (${{ matrix.target }})', conclusion: 'skipped', steps: [] }
+  const guard = jobs => assertNoNativeRebuild(identity, target, route => {
+    assert.equal(route, 'actions/runs/77/attempts/1/jobs?per_page=100&page=1')
+    return { total_count: jobs.length, jobs }
+  }, preparation)
+
+  assert.doesNotThrow(() => guard([preflight, placeholder]))
+  for (const ambiguous of [
+    [preflight],
+    [placeholder],
+    [preflight, { ...placeholder, conclusion: 'cancelled' }],
+    [preflight, { ...placeholder, run_attempt: 2 }],
+    [preflight, { ...placeholder, head_sha: 'b'.repeat(40) }],
+    [preflight, { ...placeholder, steps: [{ name: 'Build', conclusion: 'success' }] }],
+    [{ ...preflight, conclusion: 'success' }, placeholder],
+    [{ ...preflight, run_id: 78 }, placeholder],
+    [preflight, placeholder, placeholder],
+    [preflight, placeholder, { ...placeholder, name: 'Complete executable (' + target + ')' }],
+  ]) {
+    assert.throws(() => guard(ambiguous), /Unknown previous native target history/)
+  }
+})
+
 test('minimal frozen publisher seals the original run and requires failed-job recovery until the native checkpoint exists', async () => {
   const { context } = fixture({ publisherRunId: '77' })
   const result = await plan(context)

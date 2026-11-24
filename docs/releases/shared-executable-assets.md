@@ -67,6 +67,10 @@ verified executable and receipt still exist on the runner. Both upload steps
 use the same path and artifact name with overwrite disabled. If the retry
 fails, the native job fails and finalization stops. A later workflow attempt
 cannot rebuild a target whose original build step already succeeded.
+If preflight fails before the native matrix expands, Actions records one
+skipped placeholder with no steps. A failed-only retry may build the targets
+for the first time when that placeholder and the failed preflight are both
+confirmed in the same original attempt.
 
 The final job depends on both the completed crate publisher and the native
 matrix. Native completion cannot finalize a failed crate closure. Preparation

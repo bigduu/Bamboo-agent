@@ -1,8 +1,8 @@
 //! Root logical terminal repair. No lease or cache observation proves Worker stop.
 use super::*;
 use bamboo_domain::{
-    is_root_compaction_lease_owner, AgentRuntimeState, AgentStatusState, RootActorRuntimeWrite,
-    SessionKind, SupervisedRootOutcomeResult,
+    is_root_compaction_lease_owner, AgentRuntimeState, AgentStatusState, LlmRequestDiagnostic,
+    RootActorRuntimeWrite, SessionKind, SupervisedRootOutcomeResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -150,6 +150,34 @@ fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
     }
 }
 impl SessionStoreV2 {
+    /// Attribute the provider diagnostic to an already authorized failed run.
+    /// The saved writer observation binds the pipeline state to the Root Actor.
+    pub(crate) async fn managed_root_failure_diagnostic(
+        &self,
+        authority: &crate::v2::CurrentUserTargetGuard,
+        root: &Session,
+        run_id: &str,
+    ) -> Option<LlmRequestDiagnostic> {
+        let diagnostic = root.last_run_diagnostic()?;
+        if !authority.reference.matches(root) || root.last_run_status().as_deref() != Some("error")
+        {
+            return None;
+        }
+        let path = authority.inbox_dir.with_file_name(ACTOR_AUTHORITY_FILE);
+        let entry = self.observed_runtime_actor(&path, root).await.ok()??;
+        let fence = entry.activation?.fence();
+        if fence.run_id != run_id || !matches_observation(root, &fence).ok()? {
+            return None;
+        }
+        let outcomes = root
+            .runtime_metadata
+            .as_ref()?
+            .supervised_root_outcomes
+            .as_ref()?;
+        let result = outcomes.finalized_for_fence(root, &fence).ok()??;
+        (result == SupervisedRootOutcomeResult::Failed).then_some(diagnostic)
+    }
+
     /// Only the fully validated title/pinned transaction calls this.
     /// Advance a matching observation; never create one or change its fence.
     pub(in crate::v2) fn advance_root_presentation_observation(

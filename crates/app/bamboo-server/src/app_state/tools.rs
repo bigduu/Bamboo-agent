@@ -419,6 +419,12 @@ pub(super) fn build_root_tools(
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
     // do not get this management tool by default.
+    let log_monitor_tool = Arc::new(crate::schedule_app::log_monitor::SupervisorLogMonitorTool {
+        store: schedule_store.clone(),
+        storage: storage.clone(),
+        projects: project_store.clone(),
+        workspace: workspace_resolver.clone(),
+    });
     let schedule_tasks_tool = Arc::new(crate::schedule_app::ScheduleTasksTool::new(
         schedule_store,
         schedule_manager,
@@ -430,6 +436,9 @@ pub(super) fn build_root_tools(
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
+    );
+    let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(tools_with_schedule, log_monitor_tool),
     );
 
     // Session discovery and fresh Root creation already belong to the shared

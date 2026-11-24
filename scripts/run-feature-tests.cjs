@@ -73,7 +73,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Host output-cap and compressor checks also belong to packages-3. The existing
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
-// cases were added. Actual compact/actor integration targets stay in agent-tests-0.
+// cases were added. The compact/actor integration targets are default cases.
 // Bound Supervisor history adds four ordinary Actix cases to server-handlers.
 // Its two storage guard cases belong to the existing serial storage owner;
 // they are excluded from the ordinary storage run and executed once serially.
@@ -241,7 +241,14 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // target. Ultra model ceilings retain their existing default Engine owner.
 // Messages cache checkpoints and SSE usage stay in the existing LLM,
 // Engine, and Server handler owners.
-const FEATURE_SOURCE_SHA256 = "a8c74adeba15eeb995d08e2523b8b55561458f1f4fc3f60175a06ea3000d91ca";
+// Summary requests retain the default Compression, Engine, Agent Core, and LLM
+// owners. The session_compaction target stays in server-tests-0.
+// #2475 retains the CLI cleanup and Ticket fixtures in their existing owners.
+// The ticket-runtime-fixtures context selects the same additive cases.
+// Session history cache and paging cases belong to the default Storage and Server library targets.
+// #2995 keeps the ordinary Side Chat Actix fixture in server-handlers.
+// Main-owned clear metadata changes the sensitive Storage closure. Additive cases stay unchanged.
+const FEATURE_SOURCE_SHA256 = "2ea6e925c7c85b1ec4778277801d4265269f4bc91a027d37213dcfd99c0e5c80";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
@@ -292,6 +299,18 @@ const SERVER_LIB_SHARDS = ["server-browser", "server-chat", "server-execute", "s
 const FEATURE_SHARDS = ["agent-core", "agent-tests-0", "agent-tests-1", "agent-tests-2", "agent-tests-3",
   ...SERVER_LIB_SHARDS, "server-tests-0", "server-tests-1",
   "packages-0", "packages-1", "packages-2", "packages-3", "packages-4"];
+const AGENT_INTEGRATION_OVERRIDES = new Map([
+  // The additive Ticket owner needs both default catalogs in the same job.
+  ["ticket_runtime_publication", 0],
+  ["ticket_runtime_files", 0],
+  // Spread the slowest default Actor and Broker harnesses across the existing jobs.
+  ["ordinary_root_actor_writer", 1],
+  ["ordinary_root_inbox_lifecycle", 1],
+  ["compact_subagent_facade", 2],
+  ["remote_broker_activation", 2],
+  ["local_zero_tool_actor", 3],
+  ["native_tool_ceiling", 3],
+]);
 function packageShard(name) {
   if (name === "bamboo-agent") return "agent";
   if (name === "bamboo-server") return "server";
@@ -314,9 +333,8 @@ function integrationTargets(owner, shard) {
   return owner.targets.filter((target) => target.test && target.kind.includes("test") &&
     (target["required-features"] || []).every((feature) => enabled.has(feature)))
     .filter((target) => {
-      // Both default catalogs must be available to the additive Ticket owner.
-      if (agent && ["ticket_runtime_publication", "ticket_runtime_files"].includes(target.name)) return index === 0;
-      return createHash("sha256").update(target.name).digest().readUInt32BE(0) % count === index;
+      const assigned = agent ? AGENT_INTEGRATION_OVERRIDES.get(target.name) : undefined;
+      return (assigned ?? createHash("sha256").update(target.name).digest().readUInt32BE(0) % count) === index;
     }).map((target) => target.name).sort();
 }
 function defaultShardArguments(owner, shard) {

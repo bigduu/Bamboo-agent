@@ -108,6 +108,7 @@ mod compact_main_tests;
 mod conversation_task_undo;
 mod default_actor_context;
 mod host_registry;
+mod recent_history;
 mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
@@ -121,6 +122,8 @@ mod scoped_loop_control;
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 mod session_archive;
+mod side_chat;
+pub use side_chat::{SideChatRunLease, SIDE_CHAT_CLEAR_EPOCH_KEY, SIDE_CHAT_MAX_RECORD_BYTES};
 #[cfg(test)]
 mod session_compatibility_tests;
 pub use session_archive::{
@@ -764,6 +767,7 @@ impl<'de> Deserialize<'de> for SessionControlPlane {
 pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    snapshot.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
     // The handoff's acknowledgement shares the response's Main boundary.
     // Runtime-only writes cannot publish or consume it.
     snapshot
@@ -790,6 +794,19 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     snapshot
 }
 
+fn retain_side_chat_clear_epoch(main: &Session, target: &mut Session) {
+    match main.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY) {
+        Some(epoch) => {
+            target
+                .metadata
+                .insert(SIDE_CHAT_CLEAR_EPOCH_KEY.into(), epoch.clone());
+        }
+        None => {
+            target.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
+        }
+    }
+}
+
 /// Overlay the runtime sidecar onto the session loaded from `session.json`.
 ///
 /// The sidecar holds the freshest control-plane (metadata, `agent_runtime_state`,
@@ -811,6 +828,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
                     side.metadata.remove(paced_outcome_key);
                 }
             }
+            retain_side_chat_clear_epoch(&main, &mut side);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1826,6 +1844,8 @@ pub struct SessionStoreV2 {
     /// allowing unrelated session ids to make progress independently.
     session_write_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     persistence_metrics: Arc<SessionPersistenceMetrics>,
+    #[cfg(test)]
+    recent_history_cold_reads: AtomicUsize,
     /// Coordinates destructive target lifecycle transitions with durable inbox
     /// operations. The Tokio lock covers one runtime; the file lock covers
     /// independent Bamboo processes sharing the same data directory.
@@ -1958,6 +1978,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     // user-created session and must not inherit the source's
     // supervisor_created origin mark (same reset discipline as id/created_at).
     copy.metadata.remove("session.origin.v1");
+    copy.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -2194,6 +2215,8 @@ impl SessionStoreV2 {
             write_lock: Mutex::new(()),
             session_write_locks: Arc::new(DashMap::new()),
             persistence_metrics,
+            #[cfg(test)]
+            recent_history_cold_reads: AtomicUsize::new(0),
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
             host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry::default(),
@@ -6688,6 +6711,12 @@ impl SessionStoreV2 {
             .remove(bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY);
         session.updated_at = Utc::now();
 
+        // Commit the epoch with Main so a first-question retry cannot cross
+        // this clear, including when no attached side chat existed yet.
+        session
+            .metadata
+            .insert(SIDE_CHAT_CLEAR_EPOCH_KEY.into(), Uuid::new_v4().to_string());
+
         // One started job owns cleanup and the resulting canonical files.
         let (revision_path, revision) = self
             .clear_default_session_files(&abs_dir, &session, &guards)
@@ -6777,7 +6806,13 @@ impl SessionStoreV2 {
                     if is_protected(root) {
                         continue;
                     }
-                    if mode == CleanupMode::Empty && root.message_count > 1 {
+                    // A recurring controller can use the schedule ID as its
+                    // durable Session ID, independent of chat message count.
+                    // Per-run scheduled Sessions have their own separate IDs.
+                    let schedule_controller =
+                        root.created_by_schedule_id.as_deref() == Some(root.id.as_str());
+                    if mode == CleanupMode::Empty && (root.message_count > 1 || schedule_controller)
+                    {
                         continue;
                     }
                     delete_root_ids.insert(root.id.clone());
@@ -7503,16 +7538,42 @@ impl SessionStoreV2 {
             self.ensure_no_unindexed_root(session_id).await?;
             return Ok(None);
         }
+        let (session, _) = Self::load_session_main_at(&path).await?;
+        self.finish_session_read(session_id, session).await
+    }
+
+    async fn load_session_main_at(
+        path: &Path,
+    ) -> io::Result<(Session, Option<compact_main::CompactMainAuthority>)> {
         let raw = cold_main::read_text(path).await?;
-        compact_main::validate_full_main(raw.as_bytes())?;
-        let session: Session = serde_json::from_str(&raw)
-            .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
+        let authority = compact_main::validate_full_main(raw.as_bytes())?;
+        let session = serde_json::from_str(&raw)
+            .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+        Ok((session, authority))
+    }
+
+    async fn read_checked_runtime_sidecar(
+        &self,
+        session_id: &str,
+        main: &Session,
+    ) -> io::Result<Option<Session>> {
+        let sidecar = self.read_runtime_sidecar(session_id).await?;
+        supervisor::validate_overlay(main, sidecar.as_ref())?;
+        self.validate_root_tool_authority_overlay(session_id, main, sidecar.as_ref())
+            .await?;
+        Ok(sidecar)
+    }
+
+    async fn finish_session_read(
+        &self,
+        session_id: &str,
+        session: Session,
+    ) -> io::Result<Option<Session>> {
         if !self.session_lifetime_is_live(&session).await? {
             return Ok(None);
         }
-        let sidecar = self.read_runtime_sidecar(session_id).await?;
-        supervisor::validate_overlay(&session, sidecar.as_ref())?;
-        self.validate_root_tool_authority_overlay(session_id, &session, sidecar.as_ref())
+        let sidecar = self
+            .read_checked_runtime_sidecar(session_id, &session)
             .await?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
@@ -8011,6 +8072,7 @@ impl SessionStoreV2 {
         };
 
         if let Some(previous) = previous_main.as_ref() {
+            retain_side_chat_clear_epoch(previous, &mut normalized);
             let key = bamboo_domain::session::PACED_LOOP_OUTCOME_METADATA_KEY;
             let owns_paced_outcome = guards.root_outcome_finalized
                 && guards.root_actor.as_ref().is_some_and(|actor| {
@@ -8394,6 +8456,7 @@ impl SessionStoreV2 {
             self.search_index_queue
                 .enqueue_upsert(session, revision_path, revision);
         stages.search_enqueue = enqueue_started.elapsed();
+        self.publish_recent_history(&path, session).await;
         let index_entry_count = self.index.read().await.sessions.len();
         let total = total_started.elapsed();
         self.persistence_metrics.record_save(
@@ -9220,6 +9283,13 @@ impl Storage for SessionStoreV2 {
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await
+    }
+
+    async fn load_recent_session_history(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<bamboo_domain::session::history::SessionHistoryWindow>> {
+        self.read_recent_history(session_id).await
     }
 
     async fn load_execution_admission_snapshot(

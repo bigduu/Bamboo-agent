@@ -42,6 +42,7 @@ const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
 const SUBSCRIBED_PERMISSION_INPUT: &str = "Produce a handoff after the gated command.";
 const SUBSCRIBED_DENY_INPUT: &str = "Produce a handoff if the gated command is declined.";
 const SUBSCRIBED_REPEAT_INPUT: &str = "Produce a handoff after two individually gated commands.";
+const WORKER_PARTIAL_OUTPUT: &str = "PRIVATE_PARTIAL_WORKER_OUTPUT";
 const HANDOFF_SECOND_PERMISSION_CALL: &str = "handoff-second-permission-command";
 const HANDOFF_PERMISSION_CALL: &str = "handoff-permission-command";
 const HANDOFF_COMMAND_OUTPUT: &str = "handoff-approval-executed";
@@ -56,6 +57,8 @@ struct Probe {
     calls: AtomicUsize,
     source_calls: AtomicUsize,
     source_inputs: StdMutex<Vec<Vec<Message>>>,
+    source_timeouts: StdMutex<usize>,
+    source_timeout_usage: StdMutex<Option<(u64, u64)>>,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_dispatch: StdMutex<Option<Vec<ToolCall>>>,
@@ -355,6 +358,29 @@ impl LLMProvider for Probe {
             SOURCE => {
                 self.source_inputs.lock().unwrap().push(messages.to_vec());
                 self.source_calls.fetch_add(1, Ordering::SeqCst);
+                let stall = {
+                    let mut remaining = self.source_timeouts.lock().unwrap();
+                    let stall = *remaining != 0;
+                    *remaining = remaining.saturating_sub(1);
+                    stall
+                };
+                if stall {
+                    use futures::StreamExt;
+                    let mut chunks = vec![Ok(LLMChunk::Token(WORKER_PARTIAL_OUTPUT.into()))];
+                    if let Some((input, output)) = *self.source_timeout_usage.lock().unwrap() {
+                        chunks.push(Ok(LLMChunk::ProviderUsage {
+                            input_tokens: Some(input),
+                            output_tokens: Some(output),
+                            total_tokens: Some(input + output),
+                            reasoning_tokens: None,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                            cache_write_input_tokens: None,
+                        }));
+                    }
+                    let started = futures::stream::iter(chunks);
+                    return Ok(Box::pin(started.chain(futures::stream::pending())));
+                }
                 if messages
                     .iter()
                     .any(|message| message.content.contains("managed task blocker"))
@@ -418,7 +444,13 @@ impl LLMProvider for Probe {
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
                 self.parent_inputs.lock().unwrap().push(messages.to_vec());
                 match self.parent_dispatch.lock().unwrap().take() {
-                    Some(calls) => LLMChunk::ToolCalls(calls),
+                    Some(calls) => {
+                        let name = crate::schedule_app::log_monitor::TOOL_NAME;
+                        if calls.iter().any(|call| call.function.name == name) {
+                            assert!(tools.iter().any(|tool| tool.function.name == name));
+                        }
+                        LLMChunk::ToolCalls(calls)
+                    }
                     None => LLMChunk::Token("Parent processed its current canonical input.".into()),
                 }
             }
@@ -680,6 +712,238 @@ impl Fixture {
 async fn load(state: &AppState, id: &str) -> Session {
     state.storage.load_session(id).await.unwrap().unwrap()
 }
+
+pub(in crate::app_state) async fn exercise_supervisor_log_monitor() {
+    use crate::tools::ToolSurface;
+    use bamboo_agent_core::ToolExecutionContext;
+    use std::io::Write;
+
+    fn tool_call(id: &str, args: &Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: crate::schedule_app::log_monitor::TOOL_NAME.into(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    async fn from_model(f: &Fixture, id: &str, args: &Value) -> Message {
+        *f.probe.parent_dispatch.lock().unwrap() = Some(vec![tool_call(id, args)]);
+        f.state
+            .session_messenger
+            .send(bamboo_domain::SessionMessageEnvelope::user_input(
+                &f.reference.session_id,
+                "Manage the periodic service log check for this Project.",
+            ))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(WAIT, async {
+            loop {
+                let supervisor = load(&f.state, &f.reference.session_id).await;
+                if let Some(message) = supervisor
+                    .messages
+                    .into_iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some(id))
+                {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("the canonical Supervisor must run and receive its monitor result");
+        settled(&f.state, &f.reference.session_id).await;
+        message
+    }
+
+    fn receipt(message: Message) -> Value {
+        assert_eq!(message.tool_success, Some(true), "{}", message.content);
+        serde_json::from_str(&message.content).unwrap()
+    }
+
+    let f = Fixture::new_with_native_source(true).await;
+    let workspace = f.home.path().join("service");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let path = workspace.join("service.log");
+    std::fs::write(&path, "ERROR before monitoring began\n").unwrap();
+    let project = f
+        .state
+        .project_store
+        .create_with_project_path(
+            "Service logs",
+            None,
+            &bamboo_config::paths::path_to_display_string(&workspace),
+            Vec::new(),
+        )
+        .unwrap();
+    let start = json!({
+        "action":"start", "operation_id":uuid::Uuid::new_v4(), "project_id":project.id,
+        "relative_path":"service.log", "every_seconds":15,
+    });
+    let untrusted = tool_call("monitor-unauthenticated", &start);
+    let mut untrusted_context = ToolExecutionContext::none(&untrusted.id);
+    untrusted_context.session_id = Some(&f.reference.session_id);
+    untrusted_context.root_session_id = Some(&f.reference.session_id);
+    assert!(f
+        .state
+        .tools_for(ToolSurface::Root)
+        .execute_with_context_outcome(&untrusted, untrusted_context)
+        .await
+        .is_err());
+    let view = receipt(from_model(&f, "monitor-start", &start).await);
+    let monitor_id = view["monitor_id"].as_str().unwrap();
+    assert_eq!(view["session_id"], monitor_id);
+    assert_eq!(view["active"], true);
+    assert_eq!(
+        receipt(from_model(&f, "monitor-start-retry", &start).await)["monitor_id"],
+        monitor_id
+    );
+    assert_eq!(
+        load(&f.state, monitor_id)
+            .await
+            .project_id_meta()
+            .as_deref(),
+        Some(project.id.as_str())
+    );
+    assert!(f
+        .state
+        .schedule_store
+        .get_schedule(monitor_id)
+        .await
+        .is_none());
+    assert!(f
+        .state
+        .schedule_store
+        .create_run_now(monitor_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let empty = Session::new("ordinary-empty-session", PARENT);
+    f.state.storage.save_session(&empty).await.unwrap();
+    let cleanup = f
+        .state
+        .session_store
+        .cleanup(bamboo_storage::CleanupMode::Empty, false)
+        .await
+        .unwrap();
+    assert!(cleanup.deleted_session_ids.contains(&empty.id));
+    assert!(!cleanup
+        .deleted_session_ids
+        .iter()
+        .any(|id| id == monitor_id));
+    assert_eq!(load(&f.state, monitor_id).await.id, monitor_id);
+
+    let private_line = "PRIVATE_MONITOR_LOG_PAYLOAD";
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+        "ERROR {private_line}\nINFO healthy check",
+    )
+    .unwrap();
+    tokio::time::timeout(WAIT * 2, async {
+        loop {
+            let runs = f
+                .state
+                .schedule_store
+                .list_run_records_for_schedule(monitor_id)
+                .await;
+            if runs.iter().any(|run| {
+                run.status == bamboo_domain::ScheduleRunStatus::Success
+                    && run.session_id.as_deref() == Some(monitor_id)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("the installed Scheduler must scan the new log bytes");
+    tokio::time::timeout(WAIT, async {
+        while !f
+            .probe
+            .parent_inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|message| {
+                message.content.starts_with("A scheduled log check found ")
+                    && message.content.contains(monitor_id)
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("the alert alone must wake the Supervisor's provider");
+    let parent = settled(&f.state, &f.reference.session_id).await;
+    let notice = parent
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let body = message
+                .metadata
+                .as_ref()?
+                .get("session_message")?
+                .get("body")?;
+            (body["instruction"] == "log_monitor_alert_v1").then_some(body)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notice.len(), 1);
+    assert_eq!(notice[0]["data"]["matched_lines"], 1);
+    assert_eq!(notice[0]["data"]["monitor_session_id"], monitor_id);
+    assert!(f
+        .probe
+        .parent_inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .all(|message| !message.content.contains(private_line)));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 0);
+    let stopped = receipt(
+        from_model(
+            &f,
+            "monitor-stop",
+            &json!({"action":"stop","monitor_id":monitor_id}),
+        )
+        .await,
+    );
+    assert_eq!(stopped["active"], false);
+    assert!(stopped["next_check_at"].is_null());
+    let reopened = crate::schedule_app::ScheduleStore::new(f.home.path().to_owned())
+        .await
+        .unwrap();
+    assert!(reopened
+        .claim_due_runs(Utc::now() + chrono::Duration::minutes(3))
+        .await
+        .unwrap()
+        .is_empty());
+    f.state
+        .project_store
+        .archive(&project.id, project.revision)
+        .unwrap();
+    let rejected = from_model(
+        &f,
+        "monitor-resume-archived",
+        &json!({"action":"resume","monitor_id":monitor_id}),
+    )
+    .await;
+    assert_eq!(rejected.tool_success, Some(false));
+    assert!(
+        rejected.content.contains("Log monitor Project is archived"),
+        "{}",
+        rejected.content
+    );
+    f.state.shutdown().await;
+}
+
 async fn settled(state: &AppState, id: &str) -> Session {
     tokio::time::timeout(WAIT, async {
         loop {
@@ -1225,10 +1489,12 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             admission_request(target, input),
         )
         .await;
+        assert!(admission["execution_started_at"].is_string(), "{admission}");
         assert_eq!(
             admission,
             json!({
                 "status":"admission_verified",
+                "execution_started_at":admission["execution_started_at"],
                 "admission":{
                     "target_session_id":target.session_id,
                     "target_created_at":target.created_at,
@@ -1241,7 +1507,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             })
         );
     }
-    let unconfirmed = json!({"status":"admission_unconfirmed"});
+    let unconfirmed = json!({"status":"admission_unconfirmed", "execution_started_at":null});
     let mut wrong_generation = admission_request(&first, &first_input);
     wrong_generation["input_receipt"]["generation"] =
         json!(first_input["generation"].as_u64().unwrap() + 1);
@@ -1368,6 +1634,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         )
         .await;
         assert_eq!(recovered["status"], "admission_verified");
+        assert_eq!(recovered["execution_started_at"], Value::Null);
         assert_eq!(recovered["admission"]["run_id"], *run);
         assert_eq!(
             recovered["admission"]["input"]["receipt_id"],
@@ -1697,6 +1964,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         assert_settled_replay_retries_only_proof_contention().await;
     }
     let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.defaults = Some(
+        serde_json::from_value(json!({"chat": ProviderModelRef::new(PROVIDER, SOURCE)})).unwrap(),
+    );
     let workspace = f.home.path().join("subscribed-dispatch");
     std::fs::create_dir(&workspace).unwrap();
     let workspace = workspace.canonicalize().unwrap();
@@ -2799,6 +3069,201 @@ pub(in crate::app_state) async fn exercise_subscribed_wait_yields_to_inbox() {
     drive_material_notices(&f, 2).await;
     settle_material_notices(&f).await;
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    f.state.shutdown().await;
+}
+
+async fn dispatch_timed_out_worker(
+    f: &Fixture,
+    operation: &str,
+    subscribe: bool,
+) -> (String, bamboo_domain::LlmRequestDiagnostic) {
+    *f.probe.source_timeouts.lock().unwrap() = if subscribe { 2 } else { 1 };
+    f.state
+        .config
+        .write()
+        .await
+        .stream_timeout
+        .transport_idle_timeout_secs = 1;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        operation,
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":operation, "message":"Run the assigned task.",
+            "notify_on_material_event":subscribe,
+        }),
+    )
+    .await;
+    assert_eq!(dispatch["admitted"], true);
+    assert_eq!(dispatch["notify_on_material_event"], subscribe);
+    let receipt = dispatch["receipt_id"].as_str().unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let worker = load(&f.state, ROOT_A).await;
+            let fact = worker
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+                .and_then(|outcomes| outcomes.facts.last())
+                .filter(|fact| {
+                    fact.inputs
+                        .iter()
+                        .any(|input| input.receipt_id.as_str() == receipt)
+                        && fact.result == Some(bamboo_domain::SupervisedRootOutcomeResult::Failed)
+                });
+            if let Some(fact) = fact {
+                if f.state
+                    .session_activation_router
+                    .current_run_id(ROOT_A)
+                    .await
+                    .is_none()
+                {
+                    let diagnostic = worker
+                        .last_run_diagnostic()
+                        .expect("the real watchdog persisted the failed Worker's diagnostic");
+                    return (fact.run_id.clone(), diagnostic);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the exact Worker run must record its failure")
+}
+
+async fn received_worker_notice(f: &Fixture, run_id: &str) -> String {
+    settled(&f.state, &f.reference.session_id).await;
+    f.probe
+        .parent_inputs
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .find(|message| message.content.contains(ROOT_A) && message.content.contains(run_id))
+        .expect("the exact Worker failure must reach the Supervisor")
+        .content
+        .clone()
+}
+
+pub(in crate::app_state) async fn exercise_subscribed_worker_timeout_notice() {
+    let f = Fixture::new_with_native_source(true).await;
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let (run, diagnostic) = dispatch_timed_out_worker(&f, "subscribed-worker-timeout", true).await;
+    // The actual background coordinator wakes the idle Supervisor.
+    let notice = received_worker_notice(&f, &run).await;
+    assert!(
+        notice.contains(&diagnostic.error_message()),
+        "failure notice is missing its verified diagnostic: {notice}",
+    );
+    assert!(notice.contains("phase=transport_idle"));
+    assert!(!notice.contains(WORKER_PARTIAL_OUTPUT));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_delayed_worker_timeout_notice() {
+    let f = Fixture::new_with_native_source(true).await;
+    let (first_run, first_diagnostic) =
+        dispatch_timed_out_worker(&f, "first-worker-timeout", true).await;
+    let (second_run, second_diagnostic) =
+        dispatch_timed_out_worker(&f, "later-worker-timeout", false).await;
+    assert_ne!(first_run, second_run);
+    assert_ne!(
+        first_diagnostic.diagnostic_id(),
+        second_diagnostic.diagnostic_id()
+    );
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let notice = received_worker_notice(&f, &first_run).await;
+    assert!(notice.contains("Last persisted status: error"));
+    assert!(!notice.contains(&second_run));
+    assert!(!notice.contains("Diagnostic ID:"));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_worker_start_and_stream_recovery() {
+    let f = Fixture::new_with_native_source(true).await;
+    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    f.state
+        .config
+        .write()
+        .await
+        .stream_timeout
+        .transport_idle_timeout_secs = 3;
+    *f.probe.source_timeouts.lock().unwrap() = 1;
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    f.state
+        .observer_subscriptions
+        .spawn_material_notifications(f.state.mcp_proxy_shutdown.clone());
+    let dispatch = invoke_managed_control(
+        &f.state,
+        &f.reference,
+        "recover-worker-stream",
+        json!({
+            "action":"followup", "target_session_id":ROOT_A, "target_ref":target,
+            "operation_id":"recover-worker-stream", "message":"Finish the original Worker task.",
+            "notify_on_material_event":true,
+        }),
+    )
+    .await;
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the stalled Worker must reach the provider again on its original run");
+    let start = invoke_managed_control(&f.state, &f.reference, "verify-worker-start", json!({
+        "action":"observe_run", "target_session_id":ROOT_A, "target_ref":target,
+        "input_receipt":{"receipt_id":dispatch["receipt_id"],"generation":dispatch["generation"]},
+    })).await;
+    assert_eq!(start["status"], "admission_verified");
+    assert!(start["execution_started_at"].is_string(), "{start}");
+    let run = start["admission"]["run_id"].as_str().unwrap();
+    f.probe.source_release[0].notify_one();
+    let worker = settled(&f.state, ROOT_A).await;
+    let notice = received_worker_notice(&f, run).await;
+    assert!(notice.contains("completed"), "{notice}");
+    let outcomes = worker
+        .runtime_metadata
+        .unwrap()
+        .supervised_root_outcomes
+        .unwrap();
+    assert_eq!(outcomes.facts.len(), 1);
+    assert_eq!(outcomes.facts[0].run_id, run);
+    assert_eq!(outcomes.facts[0].inputs.len(), 1);
+    assert!(worker
+        .messages
+        .iter()
+        .all(|message| !message.content.contains(WORKER_PARTIAL_OUTPUT)));
+    let provider_requests = f.probe.source_inputs.lock().unwrap();
+    assert_eq!(provider_requests.len(), 2);
+    assert!(provider_requests[1]
+        .iter()
+        .all(|message| !message.content.contains(WORKER_PARTIAL_OUTPUT)));
+    drop(provider_requests);
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_worker_timeout_respects_run_budget() {
+    let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.run_budget.max_total_tokens = Some(12_000);
+    *f.probe.source_timeout_usage.lock().unwrap() = Some((11_900, 200));
+    let (_, diagnostic) = dispatch_timed_out_worker(&f, "worker-timeout-at-budget", true).await;
+    assert!(diagnostic.error_message().contains("phase=transport_idle"));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+    let worker = load(&f.state, ROOT_A).await;
+    let round = worker
+        .agent_runtime_state
+        .expect("durable Worker runtime")
+        .round;
+    assert_eq!(round.total_prompt_tokens, 11_900);
+    assert_eq!(round.total_completion_tokens, 200);
     f.state.shutdown().await;
 }
 

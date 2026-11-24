@@ -651,7 +651,11 @@ where
         false,
         0,
         || async {
-            match build().send().await {
+            let sent = match crate::http_client::build_provider_request(build()) {
+                Ok((client, request)) => client.execute(request).await,
+                Err(error) => Err(error),
+            };
+            match sent {
                 Ok(response) => {
                     crate::http_client::observe_provider_response(&response);
                     let status = response.status();

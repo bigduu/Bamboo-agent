@@ -185,6 +185,19 @@ forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 `target_provider` to select `openai`, `anthropic` or `gemini`.
 
+The Anthropic, OpenAI and Gemini compatible inference endpoints forward
+end-to-end HTTP headers in both directions for JSON and streaming calls.
+Custom fields such as `Provider-Route` and `X-LiteLLM-Session-ID` work with
+any header prefix, including repeated values. Supported browser origins can
+read the forwarded response headers. A retry replaces the headers from its
+previous attempt.
+
+Provider-configured request fields and Bamboo-owned response fields take
+precedence on a name collision. `Anthropic-Beta` combines provider and caller
+flags. Authentication, connection, body framing, browser security and Bamboo
+control headers belong to their respective HTTP boundaries. A cross-origin
+redirect ends an upstream request carrying forwarded client headers.
+
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
 The [model limits](#model-limits-model_limitsjson) determine the output cap for

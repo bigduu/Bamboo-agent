@@ -788,6 +788,15 @@ impl SessionStoreV2 {
                     Ok(())
                 })?;
             }
+            // Main already carries the new epoch. The previous side chat is
+            // unreachable even if a crash or cleanup error leaves its file.
+            if let Err(error) =
+                std::fs::remove_file(directory.join(super::side_chat::SIDE_CHAT_FILE))
+            {
+                if error.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "could not remove invalidated side chat record");
+                }
+            }
             Ok(())
         })
         .await?;

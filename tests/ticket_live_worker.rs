@@ -424,7 +424,7 @@ impl LiveWork {
         loop {
             if self.worker_pid.is_none() {
                 let host = self.host.as_ref().unwrap().0.id();
-                let system = sysinfo::System::new_all();
+                let system = sysinfo::System::new_all().expect("initialize the test process table");
                 let workers: Vec<_> = system
                     .processes()
                     .iter()

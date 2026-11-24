@@ -154,17 +154,15 @@ bamboo-tui = { path = "crates/app/bamboo-tui" }
 tokio = { version = "1", features = ["full"] }
 
 # Web framework
-# Bamboo's inbound face is intentionally HTTP/1.1-only. Keep Actix's ordinary
-# default surface except for `http2`: Actix 4 still resolves the vulnerable
-# `h2 0.3` line (RUSTSEC-2026-0258), while Bamboo's WSS transport uses the
-# HTTP/1.1 Upgrade protocol. Outbound provider clients retain HTTP/2 through
-# Reqwest's patched `h2 0.4` dependency.
+# Bamboo serves WSS over HTTP/1.1 Upgrade. Actix 4's `http2` feature still
+# resolves vulnerable `h2 0.3` (RUSTSEC-2026-0258). Outbound provider clients
+# retain HTTP/2 through Reqwest's patched `h2 0.4` dependency.
+# Bamboo Server manages its access cookie with the patched `cookie` crate.
 actix-web = { version = "4.18.2", default-features = false, features = [
     "macros",
     "compress-brotli",
     "compress-gzip",
     "compress-zstd",
-    "cookies",
     "unicode",
     "compat",
     "ws",
@@ -229,7 +227,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Process management
-sysinfo = "0.39"
+sysinfo = "0.40"
 libc = "0.2"
 
 # Database

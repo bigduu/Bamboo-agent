@@ -60,6 +60,15 @@ pub enum BudgetError {
         stage_count: usize,
     },
 
+    #[error(
+        "The model returned a truncated summary during {stage} stage {stage_index}/{stage_count}"
+    )]
+    IncompleteSummaryResponse {
+        stage: String,
+        stage_index: usize,
+        stage_count: usize,
+    },
+
     #[error("Failed to segment messages: {0}")]
     SegmentationError(String),
 }

@@ -1139,6 +1139,13 @@ impl SessionStoreV2 {
                 SessionAuthorityConflict("Supervisor state changed before Root creation".into()),
             ));
         }
+        // Check only a new birth. An exact replay uses the canonical Root's
+        // binding even if the current default model has been removed.
+        if matches!(candidate.model.trim(), "" | "unknown") {
+            return Err(invalid(
+                "Configure a Chat model in Settings (defaults.chat) before creating a Supervisor Root",
+            ));
+        }
         // The existing reservation and normal Root writer retain the original
         // caller, candidate, lifecycle/Task/Session locks through publication.
         // No global Project grant or management-link entry is manufactured.

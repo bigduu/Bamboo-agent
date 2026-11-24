@@ -1642,6 +1642,7 @@ impl AppState {
             session_event_senders,
             actor_event_hub,
             account_sink,
+            side_chats: Default::default(),
             process_registry,
             metrics_bus: None, // Will be set by server if needed
             agent,

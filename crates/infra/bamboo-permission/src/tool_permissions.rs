@@ -1321,6 +1321,17 @@ pub fn check_permissions(
                 )),
             }
         }
+        "supervisor_log_monitor" => match required_string_arg(args, "action")? {
+            "list" => Ok(None),
+            action @ ("start" | "stop" | "resume") => Ok(Some(vec![PermissionContext::new(
+                PermissionType::WriteFile,
+                format!("supervisor_log_monitor {action}"),
+                "Change a Supervisor log monitor schedule".to_owned(),
+            )])),
+            _ => Err(PermissionError::CheckFailed(
+                "unsupported log monitor action".into(),
+            )),
+        },
         "scheduler" => {
             let action = required_string_arg(args, "action")?
                 .trim()

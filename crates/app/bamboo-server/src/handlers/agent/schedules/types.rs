@@ -182,6 +182,7 @@ mod tests {
                 ..Default::default()
             },
             run_config: ScheduleRunConfig::default(),
+            log_monitor: None,
         };
         let view = ScheduleView::from(entry);
 
