@@ -254,7 +254,7 @@
       "default": true,
       "example": false,
       "key": "memory.project_first_dream",
-      "meaning": "Prefer project Dream over the global fallback.",
+      "meaning": "Include the authorized Project Dream in model prompts.",
       "section": "memory",
       "type": "bool"
     },

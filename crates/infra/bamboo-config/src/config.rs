@@ -479,7 +479,7 @@ pub struct MemoryConfig {
     /// using the configured memory/background model.
     #[serde(default, alias = "memory_relevant_recall_rerank")]
     pub relevant_recall_rerank: bool,
-    /// Whether Dream prompt injection should prefer project Dream and only use global Dream as fallback.
+    /// Whether to include the authorized Project Dream in the model prompt.
     #[serde(
         default = "default_true_memory_project_first_dream",
         alias = "memory_project_first_dream"

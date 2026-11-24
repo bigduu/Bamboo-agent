@@ -579,7 +579,7 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
 | `relevant_recall` | `true` | Retrieve relevant durable memories for the current turn. |
 | `relevant_recall_rerank` | `false` | Rerank recalled memories (extra model call) before injecting. |
-| `project_first_dream` | `true` | Prefer project-scoped memory on a session's first dream pass. |
+| `project_first_dream` | `true` | Include the authorized Project Dream in model prompts. |
 | `ledger_agenda_injection` / `ledger_gardener_enabled` / `ledger_distillation_enabled` | `true` | Personal-assistant ledger subsystem toggles. |
 | `ledger_gardener_interval_secs` | `21600` (6h) | Ledger gardener cadence. |
 | `gardener_enabled` | `true` | Background job that splits "multi-topic blob" memories; **calls no LLM when its deterministic pre-screen finds no candidates.** |
