@@ -1,13 +1,18 @@
+use super::{managed_shutdown::ManagedShutdown, planned_update_handoff};
 use crate::app_state::AppState;
+use actix_web::{App, HttpServer};
 use bamboo_agent_core::{FunctionCall, Message, Session, ToolCall, ToolSchema};
 use bamboo_domain::{
     ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
-    AgentStatusState, ProviderModelRef, Storage, SuspensionState,
+    AgentStatusState, PendingQuestion, PlanModeState, PlanModeStatus, ProviderModelRef, Storage,
+    SuspensionState,
 };
 use bamboo_engine::session_activation::ParkedUpdateRoot;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::io::Write;
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +50,7 @@ impl LLMProvider for ProviderProbe {
 }
 
 #[actix_web::test]
-async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once() {
+async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(dir.path()).unwrap();
     let store = bamboo_storage::SessionStoreV2::new(workspace.clone())
@@ -123,7 +128,34 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
     };
     let checkpoint: ParkedUpdateRoot =
         serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+
+    let mut waiting = Session::new("waiting-for-plan-approval", MODEL);
+    waiting.set_provider_name(PROVIDER);
+    waiting.set_last_run_status("suspended");
+    let question = PendingQuestion {
+        tool_call_id: "plan-call".into(),
+        tool_name: "ExitPlanMode".into(),
+        question: "Approve the plan?".into(),
+        options: vec!["Approve".into(), "Revise".into()],
+        allow_custom: false,
+        source: Default::default(),
+    };
+    waiting.pending_question = Some(question.clone());
+    let mut state = AgentRuntimeState::new(&waiting.id);
+    state.status = AgentStatusState::Suspended;
+    state.plan_mode = Some(PlanModeState {
+        entered_at: now,
+        pre_permission_mode: "default".into(),
+        plan_file_path: None,
+        status: PlanModeStatus::AwaitingApproval,
+    });
+    waiting.agent_runtime_state = Some(state);
+    store.save_session(&waiting).await.unwrap();
     drop(store);
+
+    let request = uuid::Uuid::new_v4();
+    planned_update_handoff::publish(&workspace, request, std::slice::from_ref(&checkpoint))
+        .unwrap();
 
     let probe = Arc::new(ProviderProbe::default());
     let mut config = Config::from_data_dir(Some(workspace.clone()));
@@ -135,7 +167,8 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
     let state =
         AppState::new_with_provider_for_legacy_ingress_test(workspace, config, probe.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .into_http_data();
     state.provider_registry.replace_with(ProviderRegistry::new(
         HashMap::from([(PROVIDER.into(), probe.clone() as Arc<dyn LLMProvider>)]),
         PROVIDER.into(),
@@ -158,11 +191,50 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         .await
         .unwrap());
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
-    assert!(state
-        .child_completion_coordinator
-        .resume_planned_update_root(&checkpoint)
-        .await
-        .unwrap());
+
+    let control = tempfile::tempdir().unwrap();
+    let managed = ManagedShutdown::new(control.path().to_path_buf()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = HttpServer::new(App::new)
+        .disable_signals()
+        .workers(1)
+        .listen(listener)
+        .unwrap()
+        .run();
+    let managed = actix_web::rt::spawn(managed.run(server, Some(state.clone())));
+    let read_marker = |name: &str| {
+        let path = control.path().join(name);
+        async move {
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    match std::fs::read(&path) {
+                        Ok(value) => return value,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                        Err(error) => panic!("cannot read managed update marker: {error}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert!(read_marker("ready").await.is_empty());
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    let mut marker = tempfile::NamedTempFile::new_in(control.path()).unwrap();
+    write!(marker, "{request}").unwrap();
+    marker
+        .persist(control.path().join("resume-update"))
+        .unwrap();
+    let result: serde_json::Value =
+        serde_json::from_slice(&read_marker("resume-update-result.json").await).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "request": request,
+            "report": {"resumed": 1, "advanced": 0, "pending_sessions": []}
+        })
+    );
     let saved = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let saved = state
@@ -193,10 +265,24 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         .unwrap();
     assert_ne!(new_owner.run_id, checkpoint.run_id);
     assert_eq!(new_owner.lease_epoch, checkpoint.lease_epoch + 1);
-    assert!(!state
-        .child_completion_coordinator
-        .resume_planned_update_root(&checkpoint)
+    let report = planned_update_handoff::resume(&state, request)
         .await
-        .unwrap());
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(report).unwrap(),
+        serde_json::json!({"resumed": 0, "advanced": 1, "pending_sessions": []})
+    );
+    let still_waiting = state
+        .session_store
+        .load_session(&waiting.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_waiting.pending_question, Some(question));
+    assert!(still_waiting.has_runtime_wait());
     assert_eq!(probe.0.load(Ordering::SeqCst), 1);
+
+    std::fs::File::create_new(control.path().join("stop")).unwrap();
+    managed.await.unwrap().unwrap();
+    state.shutdown().await;
 }

@@ -23,4 +23,6 @@ pub use tailscale::helper_entry as tailscale_serve_helper_entry;
 pub use web_service::WebService;
 
 #[cfg(test)]
+mod planned_update_tests;
+#[cfg(test)]
 mod tests;
