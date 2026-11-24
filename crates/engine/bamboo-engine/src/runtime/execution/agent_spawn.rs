@@ -197,7 +197,18 @@ impl SessionExecutionReservation {
         agent: &Agent,
         session: &Session,
     ) -> std::io::Result<()> {
-        self.bind_root_actor_inner(agent, session, false).await
+        self.bind_root_actor_inner(agent, session, false, None)
+            .await
+    }
+
+    pub(crate) async fn bind_root_actor_after_update(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+        predecessor: &bamboo_domain::ActorActivationFence,
+    ) -> std::io::Result<()> {
+        self.bind_root_actor_inner(agent, session, false, Some(predecessor))
+            .await
     }
 
     async fn bind_root_actor_inner(
@@ -205,6 +216,7 @@ impl SessionExecutionReservation {
         agent: &Agent,
         session: &Session,
         for_compaction: bool,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<()> {
         if self.root_actor.is_none() {
             if self.session_id != session.id {
@@ -214,7 +226,11 @@ impl SessionExecutionReservation {
                 ));
             }
             let persistence = agent.persistence();
-            let binding = if for_compaction {
+            let binding = if let Some(predecessor) = predecessor {
+                persistence
+                    .bind_root_actor_after_update(session, &self.run_id, predecessor)
+                    .await?
+            } else if for_compaction {
                 persistence
                     .bind_root_actor_compaction(session, &self.run_id)
                     .await?
@@ -725,7 +741,7 @@ impl SessionPreparationReservation {
         self.reservation
             .as_mut()
             .expect("live preparation")
-            .bind_root_actor_inner(agent, session, true)
+            .bind_root_actor_inner(agent, session, true, None)
             .await
     }
 

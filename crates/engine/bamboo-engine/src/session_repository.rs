@@ -217,6 +217,7 @@ impl SessionRepository {
         session: &Session,
         run_id: &str,
         for_compaction: bool,
+        predecessor: Option<bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
         let repository = self.clone();
         let session = session.clone();
@@ -225,7 +226,7 @@ impl SessionRepository {
         // waiting. An unobserved returned binding drops its exact-fence cleanup.
         tokio::spawn(async move {
             repository
-                .bind_root_actor_inner(&session, &run_id, for_compaction)
+                .bind_root_actor_inner(&session, &run_id, for_compaction, predecessor.as_ref())
                 .await
         })
         .await
@@ -237,6 +238,7 @@ impl SessionRepository {
         session: &Session,
         run_id: &str,
         for_compaction: bool,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
         if session.kind != bamboo_domain::SessionKind::Root
             || !session.authority_identity.is_ordinary()
@@ -279,27 +281,34 @@ impl SessionRepository {
             .unwrap_or_else(|| std::time::Duration::from_secs(60));
         let lease_seconds = chrono::Duration::from_std(lease_duration).expect("bounded Root lease");
         let now = chrono::Utc::now();
-        let claimed = directory
-            .claim_root_activation_observed(
-                &bamboo_domain::ActorActivationClaim {
-                    actor_id: session.id.clone(),
-                    run_id: run_id.to_string(),
-                    lease_owner: if for_compaction {
-                        bamboo_domain::new_root_compaction_lease_owner()
-                    } else {
-                        format!("root-execution-{}", uuid::Uuid::new_v4())
-                    },
-                    lease_expires_at: now + lease_seconds,
-                    inbox_generation: session
-                        .session_inbox_admission()
-                        .map_or(0, |a| a.last_admitted_sequence),
-                    placement_ref: None,
-                    now,
-                },
-                session,
-            )
-            .await
-            .map_err(root_actor_binding_error)?;
+        let claim = bamboo_domain::ActorActivationClaim {
+            actor_id: session.id.clone(),
+            run_id: run_id.to_string(),
+            lease_owner: if for_compaction {
+                bamboo_domain::new_root_compaction_lease_owner()
+            } else {
+                format!("root-execution-{}", uuid::Uuid::new_v4())
+            },
+            lease_expires_at: now + lease_seconds,
+            inbox_generation: session
+                .session_inbox_admission()
+                .map_or(0, |a| a.last_admitted_sequence),
+            placement_ref: None,
+            now,
+        };
+        let claimed = match predecessor {
+            Some(predecessor) => {
+                directory
+                    .claim_root_activation_observed_after(&claim, session, Some(predecessor))
+                    .await
+            }
+            None => {
+                directory
+                    .claim_root_activation_observed(&claim, session)
+                    .await
+            }
+        }
+        .map_err(root_actor_binding_error)?;
         let owner = bamboo_domain::RootActorRuntimeWrite {
             fence: claimed.fence(),
             created_at: durable.created_at,
@@ -840,7 +849,17 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         session: &Session,
         run_id: &str,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
-        self.bind_root_actor(session, run_id, false).await
+        self.bind_root_actor(session, run_id, false, None).await
+    }
+
+    async fn bind_root_actor_after_update(
+        &self,
+        session: &Session,
+        run_id: &str,
+        predecessor: &bamboo_domain::ActorActivationFence,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        self.bind_root_actor(session, run_id, false, Some(predecessor.clone()))
+            .await
     }
 
     async fn bind_root_actor_compaction(
@@ -848,7 +867,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         session: &Session,
         run_id: &str,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
-        self.bind_root_actor(session, run_id, true).await
+        self.bind_root_actor(session, run_id, true, None).await
     }
 
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {

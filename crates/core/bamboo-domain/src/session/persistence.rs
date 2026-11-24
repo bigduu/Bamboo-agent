@@ -257,6 +257,18 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    async fn bind_root_actor_after_update(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+        _predecessor: &crate::ActorActivationFence,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "planned update requires a fenced Root predecessor",
+        ))
+    }
+
     /// Claim the same fenced Root writer for direct compaction without
     /// attributing its writes or completion to a chat run.
     async fn bind_root_actor_compaction(
@@ -838,6 +850,17 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         run_id: &str,
     ) -> io::Result<Option<RootActorExecutionBinding>> {
         (**self).bind_root_actor_execution(session, run_id).await
+    }
+
+    async fn bind_root_actor_after_update(
+        &self,
+        session: &Session,
+        run_id: &str,
+        predecessor: &crate::ActorActivationFence,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        (**self)
+            .bind_root_actor_after_update(session, run_id, predecessor)
+            .await
     }
 
     async fn bind_root_actor_compaction(

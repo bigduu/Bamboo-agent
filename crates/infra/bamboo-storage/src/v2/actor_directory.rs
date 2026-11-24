@@ -1021,10 +1021,11 @@ impl ActorDirectoryPort for SessionStoreV2 {
             .await
     }
 
-    async fn claim_root_activation_observed(
+    async fn claim_root_activation_observed_after(
         &self,
         claim: &ActorActivationClaim,
         expected: &Session,
+        predecessor: Option<&ActorActivationFence>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         validate_claim(claim)?;
         if claim.actor_id != expected.id || expected.kind != bamboo_domain::SessionKind::Root {
@@ -1072,6 +1073,17 @@ impl ActorDirectoryPort for SessionStoreV2 {
         let mut entry = self
             .read_or_create_actor_entry(&claim.actor_id, &rel, &path, &guards)
             .await?;
+        if let Some(predecessor) = predecessor {
+            let finished = entry.activation.as_ref().is_some_and(|activation| {
+                activation.matches_fence(predecessor)
+                    && activation.status == ActorActivationStatus::Succeeded
+            });
+            if !finished
+                || !Self::root_runtime_matches_activation(&current, predecessor).map_err(storage)?
+            {
+                return Err(ActorDirectoryError::StaleFence);
+            }
+        }
         let Mutation { value, changed, .. } = claim_entry(&mut entry, claim)?;
         if changed {
             entry.revision = checked_next(entry.revision)?;
