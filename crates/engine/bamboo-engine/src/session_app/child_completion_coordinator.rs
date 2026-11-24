@@ -1214,8 +1214,42 @@ impl ChildCompletionCoordinator {
         let expected = session.clone();
         crate::runtime::goal_restart::consume(&mut session, &checkpoint);
         drop(guard);
-        self.start_bound_goal_turn(session, &expected, reservation)
+        self.start_bound_root_continuation(session, &expected, reservation)
             .await
+    }
+
+    /// Resume a Root from the owning host's committed update handoff. The
+    /// caller verifies the predecessor process, update receipt and Actor
+    /// closure before proposing a member.
+    pub async fn resume_planned_update_root(
+        &self,
+        root: &crate::session_activation::ParkedUpdateRoot,
+    ) -> std::io::Result<bool> {
+        let Some(mut reservation) = self.reserve_paced_loop_turn(&root.session_id).await else {
+            return Ok(false);
+        };
+        let guard = self.persistence.acquire_lock(&root.session_id).await;
+        let Some(saved) = self.storage.load_session(&root.session_id).await? else {
+            return Ok(false);
+        };
+        let Some(resumed) = crate::runtime::planned_update::prepare_resuming_session(root, &saved)
+        else {
+            return Ok(false);
+        };
+        self.prepare_paced_loop_turn(&mut reservation, &saved)
+            .await?;
+        let writer = reservation.root_actor_writer().ok_or_else(|| {
+            std::io::Error::other("Planned update resume requires the current Root writer")
+        })?;
+        if root.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(false);
+        }
+        drop(guard);
+        self.start_bound_root_continuation(resumed, &saved, reservation)
+            .await?;
+        Ok(true)
     }
 
     /// Admit the explicitly requested resume during this Root activation.
@@ -1285,19 +1319,19 @@ impl ChildCompletionCoordinator {
         resumed.set_last_run_status("running");
         resumed.clear_last_run_error();
         drop(guard);
-        self.start_bound_goal_turn(resumed, &current, reservation)
+        self.start_bound_root_continuation(resumed, &current, reservation)
             .await
     }
 
-    async fn start_bound_goal_turn(
+    async fn start_bound_root_continuation(
         &self,
         mut session: Session,
         expected: &Session,
         reservation: SessionExecutionReservation,
     ) -> std::io::Result<()> {
-        let persistence = reservation
-            .execution_persistence()
-            .ok_or_else(|| std::io::Error::other("Goal restart requires fenced persistence"))?;
+        let persistence = reservation.execution_persistence().ok_or_else(|| {
+            std::io::Error::other("Root continuation requires fenced persistence")
+        })?;
         if let Err(error) = persistence
             .save_bound_startup_session(&mut session, expected)
             .await
@@ -1315,8 +1349,9 @@ impl ChildCompletionCoordinator {
             execution_reservation: reservation,
             config,
         };
-        ResumeExecutionPort::dispatch_configured_resume_execution(self, request)
-            .map_err(|_| std::io::Error::other("Goal restart owner did not accept the checkpoint"))
+        ResumeExecutionPort::dispatch_configured_resume_execution(self, request).map_err(|_| {
+            std::io::Error::other("Root continuation owner did not accept the checkpoint")
+        })
     }
 
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers

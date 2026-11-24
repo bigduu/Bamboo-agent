@@ -990,6 +990,8 @@ pub struct AgentLoopConfig {
     /// provider/tool operation.
     pub(crate) session_activation_notifications:
         Option<Arc<parking_lot::Mutex<tokio::sync::watch::Receiver<u64>>>>,
+    pub(crate) session_update_router:
+        Option<Arc<crate::session_activation::SessionActivationRouter>>,
     /// Optional attachment reader for resolving `bamboo-attachment://...` references
     /// into `data:` URLs for upstream providers. This must not mutate session storage.
     pub(crate) attachment_reader: Option<Arc<dyn AttachmentReader>>,
@@ -1235,6 +1237,7 @@ impl Default for AgentLoopConfig {
             gold_target_resolver: None,
             host_gold_run: None,
             session_activation_notifications: None,
+            session_update_router: None,
             attachment_reader: None,
             metrics_collector: None,
             model_name: None,
