@@ -471,7 +471,10 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     std::fs::write(
         data.join("config.json"),
         serde_json::to_vec(&json!({
-            "provider":"openai","features":{"provider_model_ref":true,"ticket_mutation":false,"ticket_dispatch":false},
+            "provider":"openai","features":{
+                "provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true,
+                "work_execution":{"max_parallel":1}
+            },
             "providers":{"openai":{"api_key":"fixture","base_url":url,"model":UPDATE_MODEL,"fast_model":"update-auxiliary"}},
             "defaults":{"chat":{"provider":"openai","model":UPDATE_MODEL},"fast":{"provider":"openai","model":"update-auxiliary"}},
             "memory":{"auto_dream_enabled":false},
