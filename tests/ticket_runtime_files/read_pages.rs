@@ -105,6 +105,21 @@ fn response(body: &Value, probe: &fixture::Probe) -> Option<(Value, &'static str
 #[actix_web::test]
 async fn native_read_task_handoff_crosses_retry_window_and_survives_restart() {
     let mut f = Fixture::new().await;
+    // This fixture exercises hundreds of kilobytes of exact source reads using
+    // a synthetic model that supplies no capacity metadata.
+    post(
+        &f.client,
+        &f.base,
+        "/bamboo/config",
+        &json!({
+            "model_limits": [{
+                "model_pattern": "ticket-model",
+                "max_context_tokens": 1_000_000,
+                "max_output_tokens": 64_000
+            }]
+        }),
+    )
+    .await;
     let repo = f.temp.join("repo");
     let workspace = f.temp.join(".bamboo/worktrees/source-audit");
     std::fs::create_dir_all(&repo).unwrap();

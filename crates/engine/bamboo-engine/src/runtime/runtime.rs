@@ -1182,11 +1182,6 @@ impl AgentRuntime {
             });
 
         let mut effective_run_budget = config.run_budget.merged_with_override(run_budget.as_ref());
-        if managed_root || ticket_worker_plan.is_some() {
-            effective_run_budget
-                .max_rounds
-                .get_or_insert(bamboo_orchestration::managed_work::DEFAULT_WORK_MAX_ROUNDS);
-        }
         let legacy_vision_model_resolver = image_fallback
             .as_ref()
             .filter(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)

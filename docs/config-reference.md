@@ -86,9 +86,8 @@ default. The full field list of `Config`:
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
 
-Manually dispatched Work uses the configured run budget, with a fallback of
-40 rounds when the budget has no round ceiling. Automatic dispatch requires a
-separate owner policy.
+Manually dispatched Work uses the configured run budget. Automatic dispatch
+requires a separate owner policy.
 
 Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
 `revision` is the env-domain CAS revision stored in the credential envelope;
