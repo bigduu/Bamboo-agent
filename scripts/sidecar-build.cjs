@@ -154,7 +154,21 @@ function assertNoNativeRebuild(identity, target, read, preparation) {
       assert.equal(data.jobs.length, 100)
     }
     assert.equal(jobs.length, total)
-    const prior = jobs.filter(job => job.name === 'Complete executable (' + target + ')')
+    const nativeJobs = jobs.filter(job => job.name.startsWith('Complete executable ('))
+    const placeholder = nativeJobs.find(job => job.name === 'Complete executable (${{ matrix.target }})')
+    if (placeholder) {
+      // Actions leaves a single skipped placeholder when preflight fails before
+      // producing the matrix. In that attempt no native target started.
+      const preflight = jobs.filter(job => job.name === 'automatic')
+      const sameAttempt = job => String(job.run_id) === identity.runId && job.run_attempt === attempt &&
+        job.head_sha === identity.workflowRevision && job.status === 'completed'
+      assert.ok(nativeJobs.length === 1 && sameAttempt(placeholder) &&
+        placeholder.conclusion === 'skipped' && Array.isArray(placeholder.steps) && placeholder.steps.length === 0 &&
+        preflight.length === 1 && sameAttempt(preflight[0]) && preflight[0].conclusion === 'failure',
+        'Unknown previous native target history')
+      continue
+    }
+    const prior = nativeJobs.filter(job => job.name === 'Complete executable (' + target + ')')
     assert.equal(prior.length, 1, 'Unknown previous native target history')
     const build = prior[0].steps.find(step => step.name === 'Build and verify the standard versioned Bamboo executable')
     assert.ok(!build || build.conclusion === 'skipped' || build.conclusion === 'failure',
