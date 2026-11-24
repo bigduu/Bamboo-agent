@@ -515,6 +515,7 @@ impl ExpectedRunDeliveryGuard {
 pub struct SessionActivationRouter {
     runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    update_hold: watch::Sender<bool>,
     /// Live operations for one logical target share a fence. Weak entries are
     /// pruned on access; idle/deleted targets retain no separate lock state.
     publication_fences: TargetPublicationFences,
@@ -522,6 +523,35 @@ pub struct SessionActivationRouter {
     inbox: Arc<StdRwLock<Option<Arc<dyn SessionInboxPort>>>>,
     #[cfg(test)]
     terminal_inspection_pause: Arc<Mutex<Option<TerminalInspectionPause>>>,
+}
+
+/// The owning host's temporary hold on new logical execution admissions.
+/// Existing reservations and live owners retain their normal completion paths.
+/// Dropping the hold reopens admission, including after an aborted update.
+#[must_use = "dropping the hold reopens session admissions"]
+pub struct SessionUpdateAdmission {
+    router: SessionActivationRouter,
+}
+
+impl SessionUpdateAdmission {
+    /// Logical sessions whose activation or preparation was already admitted.
+    /// Physical work and durable checkpoint verification belong to the host.
+    pub async fn outstanding_sessions(&self) -> Vec<String> {
+        let states = self.router.states.lock().await;
+        let mut outstanding: Vec<_> = states
+            .iter()
+            .filter(|(_, state)| state.owner.is_some() || state.activation_reserved)
+            .map(|(target, _)| target.clone())
+            .collect();
+        outstanding.sort_unstable();
+        outstanding
+    }
+}
+
+impl Drop for SessionUpdateAdmission {
+    fn drop(&mut self) {
+        self.router.update_hold.send_replace(false);
+    }
 }
 
 type TargetPublicationFences = Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>;
@@ -965,6 +995,19 @@ impl SessionActivationRouter {
         Arc::new(Self::default())
     }
 
+    /// Hold new admissions for a planned update. The state lock orders this
+    /// with registration and Inbox reservation, including in-flight launches.
+    pub async fn hold_admissions_for_update(&self) -> Option<SessionUpdateAdmission> {
+        let _states = self.states.lock().await;
+        if *self.update_hold.borrow() {
+            return None;
+        }
+        self.update_hold.send_replace(true);
+        Some(SessionUpdateAdmission {
+            router: self.clone(),
+        })
+    }
+
     /// Late-bind the real server/SDK reservation adapter after its dependency
     /// graph has been assembled.
     pub async fn set_spawner(&self, spawner: Arc<dyn SessionActivationSpawner>) {
@@ -1122,6 +1165,12 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(candidate.generation);
+                if *self.update_hold.borrow() {
+                    return Ok(SessionWakeReconcileResult {
+                        disposition: None,
+                        next_due_at: Some(now + Duration::seconds(1)),
+                    });
+                }
                 if let Some(owner) = state.owner.as_mut() {
                     if !owner.finalizing {
                         state.notify.send_replace(candidate.generation);
@@ -1384,8 +1433,19 @@ impl SessionActivationRouter {
     ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
         loop {
             let (notifications, reservation_wait) = {
-                let _publication = self.lock_publication(target_session_id).await;
+                let publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
+                if *self.update_hold.borrow()
+                    && states
+                        .get(target_session_id)
+                        .is_none_or(|state| state.owner.is_none())
+                {
+                    let mut update = self.update_hold.subscribe();
+                    drop(states);
+                    drop(publication);
+                    let _ = update.wait_for(|held| !held).await;
+                    continue;
+                }
                 let state = states.entry(target_session_id.to_string()).or_default();
                 match state.owner.as_mut() {
                     Some(owner)
@@ -1681,6 +1741,7 @@ impl SessionActivationRouter {
             if (state.latest_generation > state.last_dispatched_generation
                 || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !*self.update_hold.borrow()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1787,6 +1848,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !*self.update_hold.borrow()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1869,6 +1931,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !*self.update_hold.borrow()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -2365,6 +2428,15 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(inbox_generation);
+                if *self.update_hold.borrow() {
+                    if let Some(startup) = runtime_startup
+                        .as_ref()
+                        .filter(|startup| startup.receipt.generation == state.latest_generation)
+                    {
+                        state.runtime_startup = Some(startup.clone());
+                    }
+                    return Ok(SessionActivationDisposition::ActivationCoalesced);
+                }
                 if let Some(owner) = state.owner.as_mut() {
                     if let Some(startup) = runtime_startup
                         .as_ref()
@@ -2976,6 +3048,123 @@ mod tests {
             entered: None,
             release: None,
         })
+    }
+
+    #[tokio::test]
+    async fn update_admission_defers_new_runs_and_preserves_the_durable_inbox() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        for id in ["active", "manual"] {
+            store
+                .save_session(&Session::new(id, "model"))
+                .await
+                .unwrap();
+        }
+        let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+        let router = SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut active = router.register_run("active", "previous").await.unwrap();
+
+        let update = router.hold_admissions_for_update().await.unwrap();
+        assert!(router.hold_admissions_for_update().await.is_none());
+        assert_eq!(update.outstanding_sessions().await, ["active"]);
+        assert!(router.owns_run("active", "previous").await);
+
+        let mut manual = {
+            let router = router.clone();
+            tokio::spawn(async move { router.register_run("manual", "fresh").await.unwrap() })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut manual)
+                .await
+                .is_err()
+        );
+        assert_eq!(update.outstanding_sessions().await, ["active"]);
+
+        let receipt = inbox
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input("active", "queued during update"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .request_activation("active", receipt.generation)
+                .await
+                .unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        active.begin_finalization().await;
+        assert_eq!(active.finish(0).await.unwrap(), None);
+        assert!(update.outstanding_sessions().await.is_empty());
+        let now = Utc::now();
+        let deferred = router.reconcile_wake("active", now).await.unwrap();
+        assert!(deferred.disposition.is_none() && deferred.next_due_at.is_some());
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+
+        drop(update);
+        let manual = tokio::time::timeout(std::time::Duration::from_secs(5), manual)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(router.owns_run("manual", "fresh").await);
+        assert_eq!(
+            router
+                .reconcile_wake("active", now)
+                .await
+                .unwrap()
+                .disposition,
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+        manual.abandon().await;
+    }
+
+    #[tokio::test]
+    async fn update_admission_keeps_a_preexisting_reservation_visible_until_finalization() {
+        let router = SessionActivationRouter::new();
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let spawner = Arc::new(RecordingSpawner {
+            reservations: AtomicUsize::new(0),
+            launches: Arc::new(AtomicUsize::new(0)),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        });
+        router.set_spawner(spawner.clone()).await;
+        let dispatch = {
+            let router = router.clone();
+            tokio::spawn(async move { router.request_activation("prior", 1).await.unwrap() })
+        };
+        entered.wait().await;
+
+        let update = router.hold_admissions_for_update().await.unwrap();
+        assert_eq!(update.outstanding_sessions().await, ["prior"]);
+        assert_eq!(
+            router.request_activation("later", 1).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        release.notify_one();
+        assert_eq!(
+            dispatch.await.unwrap(),
+            SessionActivationDisposition::ActivationReserved
+        );
+        let mut admitted = router.register_run("prior", "run-1").await.unwrap();
+        assert_eq!(update.outstanding_sessions().await, ["prior"]);
+        admitted.begin_finalization().await;
+        assert_eq!(admitted.finish(1).await.unwrap(), None);
+        assert!(update.outstanding_sessions().await.is_empty());
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
     }
 
     struct BlockingInspectInbox {
