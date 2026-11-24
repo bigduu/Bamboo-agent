@@ -7,6 +7,40 @@ use crate::{AgentRuntimeState, AgentStatusState};
 const HOST_RUN_ID: &str = "runtime.host_run_id";
 
 impl Session {
+    /// A managed replacement must explicitly resume this Root before normal
+    /// execution or Inbox wake can take ownership of its parked round.
+    pub fn is_parked_for_planned_update(&self) -> bool {
+        let parked = |state: &AgentRuntimeState| {
+            state
+                .suspension
+                .as_ref()
+                .is_some_and(|wait| wait.reason == super::PLANNED_UPDATE_SUSPEND_REASON)
+        };
+        self.metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| reason == super::PLANNED_UPDATE_SUSPEND_REASON)
+            || match self.agent_runtime_state.as_ref() {
+                Some(state) => parked(state),
+                None => self
+                    .metadata
+                    .get("agent.runtime.state")
+                    .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok())
+                    .as_ref()
+                    .is_some_and(parked),
+            }
+    }
+
+    /// Shape of a saved managed resume before the successor enters execution.
+    /// Its Actor provenance and checkpoint revision are verified by Storage.
+    pub fn is_initializing_planned_update_resume(&self) -> bool {
+        self.last_run_status().as_deref() == Some("running")
+            && self
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.status == AgentStatusState::Initializing)
+            && !self.has_runtime_wait()
+    }
+
     pub fn host_run_id(&self) -> Option<&str> {
         self.metadata.get(HOST_RUN_ID).map(String::as_str)
     }

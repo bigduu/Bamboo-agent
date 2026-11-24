@@ -201,6 +201,16 @@ async fn handle_execute_inner(
             if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
                 return response;
             }
+            if session.is_parked_for_planned_update() {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "session_id": session_id,
+                    "error": {
+                        "message": "The managed update must resume this session before execution",
+                        "type": "api_error",
+                        "code": "planned_update_resume_pending"
+                    },
+                }));
+            }
             // Receipt selection can admit input before execute preparation.
             if session.metadata.contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY) {
                 return pending_permission_response(&session_id);

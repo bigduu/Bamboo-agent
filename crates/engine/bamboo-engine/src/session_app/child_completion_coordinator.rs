@@ -127,7 +127,7 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// persistence lock that commits the generic suspension clear.
 ///
 /// The boolean is false while a human response is pending or has its own
-/// successor, or while a child/Bash wait is respected.
+/// successor, a child/Bash wait is respected, or a managed update owns resume.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -143,7 +143,8 @@ async fn prepare_session_inbox_activation(
             // has already advanced the prefix's interrupt watermark.
             if expected_birth.is_some_and(|birth| {
                 latest.created_at != birth || crate::ticket_runtime::is_managed_work_root(latest)
-            }) || latest.has_pending_question()
+            }) || latest.is_parked_for_planned_update()
+                || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
@@ -1280,16 +1281,8 @@ impl ChildCompletionCoordinator {
             reservation.abandon().await;
             return Err(error);
         }
-        let writer = reservation.root_actor_writer().ok_or_else(|| {
-            std::io::Error::other("Planned update resume requires the current Root writer")
-        })?;
-        if root.fence.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
-            drop(guard);
-            reservation.abandon().await;
-            return Ok(false);
-        }
         drop(guard);
-        self.start_bound_root_continuation(resumed, &saved, reservation)
+        self.dispatch_bound_root_continuation(resumed, reservation)
             .await?;
         Ok(true)
     }
@@ -1382,6 +1375,15 @@ impl ChildCompletionCoordinator {
             return Err(error);
         }
 
+        self.dispatch_bound_root_continuation(session, reservation)
+            .await
+    }
+
+    async fn dispatch_bound_root_continuation(
+        &self,
+        session: Session,
+        reservation: SessionExecutionReservation,
+    ) -> std::io::Result<()> {
         let config_snapshot = self.config.read().await.clone();
         let config = self.build_resume_config(&session, &config_snapshot);
         let request = ResumeSpawnRequest {

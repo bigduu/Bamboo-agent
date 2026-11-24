@@ -5,8 +5,11 @@
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::{storage::Storage, AgentEvent};
-use bamboo_domain::{ActorActivationStatus, ActorDirectoryEntry, Role, Session};
-use bamboo_storage::SessionStoreV2;
+use bamboo_domain::{
+    ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryError, ActorDirectoryPort, Role,
+    Session, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort, SessionMessageEnvelope,
+};
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::Utc;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -171,12 +174,17 @@ struct Host {
 
 impl Host {
     fn start(data: &Path, name: &str) -> Self {
+        Self::start_with_control(data, name, None)
+    }
+
+    fn start_with_control(data: &Path, name: &str, control: Option<&Path>) -> Self {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         drop(socket);
         let path = data.join(format!("host-{name}.log"));
         let log = std::fs::File::create(&path).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_bamboo"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bamboo"));
+        command
             .args([
                 "serve",
                 "--bind",
@@ -190,9 +198,13 @@ impl Host {
             .env("BAMBOO_JIANDU_DATA_DIR", data.join("jiandu"))
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::from(log));
+        if let Some(control) = control {
+            command
+                .args(["--parent-pid", &std::process::id().to_string()])
+                .env("BAMBOO_MANAGED_SHUTDOWN_DIR", control);
+        }
+        let child = command.spawn().unwrap();
         Self {
             child,
             base: format!("http://127.0.0.1:{port}/api/v1"),
@@ -294,6 +306,543 @@ impl Drop for Host {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+const UPDATE_MODEL: &str = "managed-update-root";
+const UPDATE_PROMPTS: [&str; 3] = [
+    "MANAGED_UPDATE_FIRST",
+    "MANAGED_UPDATE_SECOND",
+    "MANAGED_UPDATE_CRASH",
+];
+const UPDATE_READBACK: &str = "durable result from the predecessor";
+const UPDATE_QUEUED_INPUT: &str = "Durable follow-up queued before successor startup";
+
+struct UpdateProbe {
+    path: PathBuf,
+    calls: [AtomicUsize; UPDATE_PROMPTS.len()],
+    release_predecessor: tokio::sync::watch::Sender<bool>,
+    release_successor: [tokio::sync::watch::Sender<bool>; UPDATE_PROMPTS.len()],
+}
+
+async fn update_provider(body: web::Json<Value>, probe: web::Data<UpdateProbe>) -> HttpResponse {
+    let (delta, finish) = if body["model"] != UPDATE_MODEL {
+        (json!({"content":"auxiliary"}), "stop")
+    } else {
+        let messages = body["messages"].as_array().unwrap();
+        let index = UPDATE_PROMPTS
+            .iter()
+            .position(|prompt| {
+                messages.iter().any(|message| {
+                    message["role"] == "user" && message["content"].to_string().contains(prompt)
+                })
+            })
+            .expect("the foreground call retains the original User input");
+        let tool_id = format!("managed-update-read-{index}");
+        match probe.calls[index].fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let mut release = probe.release_predecessor.subscribe();
+                release.wait_for(|ready| *ready).await.unwrap();
+                (
+                    json!({"role":"assistant","tool_calls":[{
+                        "index":0,"id":tool_id,"type":"function","function":{
+                            "name":"Read","arguments":json!({"file_path":probe.path}).to_string()
+                        }
+                    }]}),
+                    "tool_calls",
+                )
+            }
+            1 => {
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message["role"] == "tool"
+                                && message["tool_call_id"] == tool_id
+                                && message["content"].to_string().contains(UPDATE_READBACK)
+                        })
+                        .count(),
+                    1,
+                    "the successor receives the one persisted tool result"
+                );
+                let mut release = probe.release_successor[index].subscribe();
+                release.wait_for(|ready| *ready).await.unwrap();
+                (
+                    json!({"content":"Resumed after the planned update."}),
+                    "stop",
+                )
+            }
+            _ => panic!("recovery must not schedule the same continuation twice"),
+        }
+    };
+    HttpResponse::Ok().content_type("text/event-stream").body(
+        [
+            chunk(delta, Some(finish)),
+            web::Bytes::from_static(b"data: [DONE]\n\n"),
+        ]
+        .concat(),
+    )
+}
+
+async fn send_update_command(
+    control: &Path,
+    host: &Host,
+    request: uuid::Uuid,
+    sequence: &mut u64,
+    command: &str,
+) -> Value {
+    *sequence += 1;
+    let file = tempfile::NamedTempFile::new_in(control).unwrap();
+    serde_json::to_writer(
+        file.as_file(),
+        &json!({"version":1,"request_id":request,"sequence":*sequence,"command":command}),
+    )
+    .unwrap();
+    file.persist(control.join("planned-update-command.json"))
+        .unwrap();
+    let reply = control.join("planned-update-result.json");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match std::fs::read(&reply) {
+                Ok(bytes) => {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    if value["sequence"] == *sequence {
+                        assert_eq!(value["request_id"], request.to_string());
+                        assert_eq!(value["version"], 1);
+                        return value;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("read managed update response: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("managed update {command} timed out: {}", host.tail()))
+}
+
+async fn expect_graceful_exit(host: &mut Host) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(status) = host.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "managed Host exit: {status}: {}",
+                    host.tail()
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("managed Host is still running: {}", host.tail()));
+}
+
+#[actix_web::test]
+async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successor() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let data = root.join("profile");
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    let path = workspace.join("predecessor.txt");
+    std::fs::write(&path, UPDATE_READBACK).unwrap();
+    let probe = web::Data::new(UpdateProbe {
+        path,
+        calls: std::array::from_fn(|_| AtomicUsize::new(0)),
+        release_predecessor: tokio::sync::watch::channel(false).0,
+        release_successor: std::array::from_fn(|_| tokio::sync::watch::channel(false).0),
+    });
+    let captured = probe.clone();
+    let gateway = HttpServer::new(move || {
+        App::new()
+            .app_data(captured.clone())
+            .route("/v1/chat/completions", web::post().to(update_provider))
+            .route(
+                "/v1/models",
+                web::get().to(|| async {
+                    HttpResponse::Ok()
+                        .json(json!({"data":[{"id":UPDATE_MODEL},{"id":"update-auxiliary"}]}))
+                }),
+            )
+    })
+    .workers(1)
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+    let url = format!("http://{}/v1", gateway.addrs()[0]);
+    let gateway = gateway.run();
+    let gateway_handle = gateway.handle();
+    let gateway_task = actix_web::rt::spawn(gateway);
+    std::fs::write(
+        data.join("config.json"),
+        serde_json::to_vec(&json!({
+            "provider":"openai","features":{
+                "provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true,
+                "work_execution":{"max_parallel":1}
+            },
+            "providers":{"openai":{"api_key":"fixture","base_url":url,"model":UPDATE_MODEL,"fast_model":"update-auxiliary"}},
+            "defaults":{"chat":{"provider":"openai","model":UPDATE_MODEL},"fast":{"provider":"openai","model":"update-auxiliary"}},
+            "memory":{"auto_dream_enabled":false},
+            "stream_timeout":{"transport_idle_timeout_secs":120,"first_semantic_timeout_secs":120,"semantic_idle_timeout_secs":120}
+        })).unwrap(),
+    ).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(WAIT)
+        .build()
+        .unwrap();
+    let old_control = tempfile::tempdir_in(&root).unwrap();
+    let new_control = tempfile::tempdir_in(&root).unwrap();
+    let mut old = Host::start_with_control(&data, "managed-old", Some(old_control.path()));
+    Fixture::healthy(&client, &mut old).await;
+    assert!(old_control.path().join("planned-update-v1").is_file());
+
+    let mut roots = Vec::new();
+    for prompt in UPDATE_PROMPTS {
+        let model = json!({"provider":"openai","model":UPDATE_MODEL});
+        let created: Value = client
+            .post(format!("{}/sessions", old.base))
+            .json(&json!({
+                "title":prompt,"provider":"openai","model":UPDATE_MODEL,"model_ref":model,
+                "permission_mode":"default","workspace_path":workspace
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["session"]["id"].as_str().unwrap();
+        client
+            .post(format!("{}/chat", old.base))
+            .json(&json!({
+                "session_id":id,"message":prompt,"provider":"openai","model":UPDATE_MODEL,
+                "model_ref":model,"permission_mode":"default","workspace_path":workspace
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(format!("{}/execute/{id}", old.base))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        roots.push(id.to_string());
+    }
+    tokio::time::timeout(WAIT, async {
+        while probe
+            .calls
+            .iter()
+            .any(|calls| calls.load(Ordering::SeqCst) == 0)
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all ordinary Roots entered the live provider");
+
+    let mut sequence = 0;
+    let abandoned = uuid::Uuid::new_v4();
+    let first = send_update_command(
+        old_control.path(),
+        &old,
+        abandoned,
+        &mut sequence,
+        "prepare",
+    )
+    .await;
+    assert_eq!(
+        first["status"], "busy",
+        "live ordinary Roots still own work: {first}"
+    );
+    let aborted =
+        send_update_command(old_control.path(), &old, abandoned, &mut sequence, "abort").await;
+    assert_eq!(aborted["status"], "aborted");
+    let stale =
+        send_update_command(old_control.path(), &old, abandoned, &mut sequence, "commit").await;
+    assert_eq!(stale["status"], "revoked");
+    old.alive();
+
+    let request = uuid::Uuid::new_v4();
+    let preparing =
+        send_update_command(old_control.path(), &old, request, &mut sequence, "prepare").await;
+    assert_eq!(
+        preparing["status"], "busy",
+        "new request can replace the aborted preparation: {preparing}"
+    );
+    probe.release_predecessor.send_replace(true);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let reply =
+                send_update_command(old_control.path(), &old, request, &mut sequence, "prepare")
+                    .await;
+            match reply["status"].as_str() {
+                Some("ready") => break,
+                Some("busy") => (),
+                _ => panic!("managed preparation failed: {reply}: {}", old.tail()),
+            }
+        }
+    })
+    .await
+    .expect("all old Roots finish Read and park before the next provider call");
+    assert!(probe
+        .calls
+        .iter()
+        .all(|calls| calls.load(Ordering::SeqCst) == 1));
+
+    let receipts = data.join("managed-update");
+    let ready = receipts.join(format!("{request}.ready"));
+    assert!(!ready.exists());
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let reply =
+                send_update_command(old_control.path(), &old, request, &mut sequence, "commit")
+                    .await;
+            match reply["status"].as_str() {
+                Some("committed") => break,
+                Some("committing") => (),
+                _ => panic!("managed commit failed: {reply}: {}", old.tail()),
+            }
+        }
+    })
+    .await
+    .expect("the predecessor authorizes replacement after finalization");
+    expect_graceful_exit(&mut old).await;
+    let intent = std::fs::read(receipts.join(format!("{request}.json"))).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ready).unwrap(),
+        bamboo_domain::session::model_context::sha256_hex(&intent)
+    );
+    assert!(!receipts.join(format!("{abandoned}.ready")).exists());
+    let intent: Value = serde_json::from_slice(&intent).unwrap();
+    assert_eq!(intent["request"], request.to_string());
+    assert_eq!(intent["roots"].as_array().unwrap().len(), roots.len());
+    let store = Arc::new(SessionStoreV2::new(data.clone()).await.unwrap());
+    let mut predecessors = Vec::new();
+    for id in &roots {
+        let session = store.load_session(id).await.unwrap().unwrap();
+        assert_eq!(session.last_run_status().as_deref(), Some("suspended"));
+        assert!(session.is_parked_for_planned_update());
+        let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
+        assert_eq!(owner.status, ActorActivationStatus::Succeeded);
+        predecessors.push((session, owner.fence()));
+    }
+    // Seed a genuine wake-eligible Inbox entry between the two processes.
+    // Its durable delivery grants wake authority, with no transcript change.
+    let inbox = FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
+    let queued = inbox
+        .deliver_with_activation_intent(
+            &SessionMessageEnvelope::user_input(&roots[0], UPDATE_QUEUED_INPUT),
+            SessionActivationPolicy::InterruptSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let readiness = inbox
+        .inspect_wake_readiness(&roots[0], Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(readiness.ready.unwrap().generation, queued.generation);
+
+    let mut new = Host::start_with_control(&data, "managed-new", Some(new_control.path()));
+    Fixture::healthy(&client, &mut new).await;
+    assert_ne!(old.child.id(), new.child.id());
+    // Startup has run its inline Inbox reconciliation by the time health is
+    // served. A direct execute also cannot claim the parked Root or its input.
+    let refused = client
+        .post(format!("{}/execute/{}", new.base, roots[0]))
+        .header("Bamboo-Input-Id", queued.id.as_str())
+        .header("Bamboo-Ingress-Seq", queued.generation)
+        .header(
+            "Bamboo-Session-Created-At",
+            predecessors[0].0.created_at.to_rfc3339(),
+        )
+        .header("Idempotency-Key", "planned-update-before-resume")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"]["code"],
+        "planned_update_resume_pending"
+    );
+    for (id, (snapshot, fence)) in roots.iter().zip(&predecessors) {
+        let parked = store.load_session(id).await.unwrap().unwrap();
+        assert!(parked.is_parked_for_planned_update());
+        assert_eq!(parked.last_run_status().as_deref(), Some("suspended"));
+        assert_eq!(
+            serde_json::to_value(&parked.messages).unwrap(),
+            serde_json::to_value(&snapshot.messages).unwrap()
+        );
+        let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
+        assert_eq!(&owner.fence(), fence);
+        assert_eq!(owner.status, ActorActivationStatus::Succeeded);
+    }
+    // The physical admission guard also rejects an ordinary caller whose
+    // observed candidate accidentally carries a different runtime view.
+    let (snapshot, _) = &predecessors[1];
+    let now = Utc::now();
+    assert!(matches!(
+        store
+            .claim_root_activation_observed(
+                &bamboo_domain::ActorActivationClaim {
+                    actor_id: snapshot.id.clone(),
+                    run_id: "unexpected-before-resume".into(),
+                    lease_owner: "fixture-ordinary-recovery".into(),
+                    lease_expires_at: now + chrono::Duration::seconds(15),
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now,
+                },
+                snapshot,
+            )
+            .await,
+        Err(ActorDirectoryError::Busy)
+    ));
+    let ready_after = inbox
+        .inspect_wake_readiness(&roots[0], Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(ready_after.ready.unwrap().id, queued.id);
+    assert!(probe
+        .calls
+        .iter()
+        .all(|calls| calls.load(Ordering::SeqCst) == 1));
+    let mut sequence = 0;
+    let reply =
+        send_update_command(new_control.path(), &new, request, &mut sequence, "resume").await;
+    assert_eq!(reply["status"], "resumed", "successor recovery: {reply}");
+    tokio::time::timeout(WAIT, async {
+        while probe
+            .calls
+            .iter()
+            .any(|calls| calls.load(Ordering::SeqCst) < 2)
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all successor Roots reach their gated provider request");
+    let crash_index = roots.len() - 1;
+    let crash_root = &roots[crash_index];
+    let in_progress =
+        send_update_command(new_control.path(), &new, request, &mut sequence, "resume").await;
+    assert_eq!(in_progress["status"], "resumed", "{in_progress}");
+    // This Root has no queued follow-up and the provider has produced no
+    // response. Its saved startup projection alone cannot confirm recovery.
+    assert!(
+        in_progress["report"]["pending_sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(crash_root)),
+        "{in_progress}"
+    );
+    assert!(probe
+        .calls
+        .iter()
+        .all(|calls| calls.load(Ordering::SeqCst) == 2));
+    for release in &probe.release_successor[..crash_index] {
+        release.send_replace(true);
+    }
+    for (id, (_, predecessor)) in roots[..crash_index].iter().zip(&predecessors) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let session = store.load_session(id).await.unwrap().unwrap();
+                if session.last_run_status().as_deref() == Some("completed") {
+                    assert_eq!(
+                        session.messages.last().unwrap().content,
+                        "Resumed after the planned update."
+                    );
+                    let owner = store.inspect_actor(id).await.unwrap().activation.unwrap();
+                    assert_eq!(owner.lease_epoch, predecessor.lease_epoch + 1);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the successor finishes the same Root");
+    }
+    let before_crash = tokio::time::timeout(WAIT, async {
+        loop {
+            let reply =
+                send_update_command(new_control.path(), &new, request, &mut sequence, "resume")
+                    .await;
+            assert_eq!(reply["status"], "resumed", "{reply}");
+            if reply["report"]["advanced"] == crash_index {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the two released Roots confirm durable progress");
+    assert_eq!(
+        before_crash["report"],
+        json!({"resumed":0,"advanced":crash_index,"pending_sessions":[crash_root]})
+    );
+    let interrupted = store
+        .inspect_actor(crash_root)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(interrupted.status, ActorActivationStatus::Running);
+    assert_eq!(
+        interrupted.lease_epoch,
+        predecessors[crash_index].1.lease_epoch + 1
+    );
+    let projected = store.load_session(crash_root).await.unwrap().unwrap();
+    assert!(
+        SessionStoreV2::root_runtime_matches_activation(&projected, &interrupted.fence()).unwrap()
+    );
+    // The real provider received this request but has not sent a response.
+    // Kill and reap the exact successor before a different Host reads its
+    // profile. It cannot count the startup projection as durable progress.
+    new.child.kill().unwrap();
+    assert!(!new.child.wait().unwrap().success());
+    let recovery_control = tempfile::tempdir_in(&root).unwrap();
+    let mut recovery =
+        Host::start_with_control(&data, "managed-recovery", Some(recovery_control.path()));
+    Fixture::healthy(&client, &mut recovery).await;
+    assert_ne!(new.child.id(), recovery.child.id());
+    let mut sequence = 0;
+    let repeated = send_update_command(
+        recovery_control.path(),
+        &recovery,
+        request,
+        &mut sequence,
+        "resume",
+    )
+    .await;
+    assert_eq!(repeated["status"], "resumed", "{repeated}");
+    assert_eq!(repeated["report"], before_crash["report"]);
+    let still_pending = store
+        .inspect_actor(crash_root)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(still_pending.fence(), interrupted.fence());
+    std::fs::File::create_new(recovery_control.path().join("stop")).unwrap();
+    expect_graceful_exit(&mut recovery).await;
+    assert!(probe
+        .calls
+        .iter()
+        .all(|calls| calls.load(Ordering::SeqCst) == 2));
+    probe.release_successor[crash_index].send_replace(true);
+    gateway_handle.stop(true).await;
+    gateway_task.await.unwrap().unwrap();
 }
 
 struct EventTap {
