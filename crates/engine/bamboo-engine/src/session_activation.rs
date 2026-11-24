@@ -554,6 +554,8 @@ pub struct ParkedUpdateRoot {
     pub lease_epoch: u64,
     pub conversation_reset_sha256: Option<String>,
     pub root_tool_authority_revision: u64,
+    pub project_id: Option<String>,
+    pub workspace_path: Option<String>,
     pub message_id: String,
     pub message_count: usize,
     pub model: bamboo_domain::ProviderModelRef,
@@ -1122,6 +1124,9 @@ impl SessionActivationRouter {
         let mut hold = self.update_hold.subscribe();
         {
             let mut states = self.states.lock().await;
+            if cancel.is_cancelled() {
+                return Err(bamboo_agent_core::AgentError::Cancelled);
+            }
             if self.preparing_update() != Some(update) {
                 return Ok(false);
             }
