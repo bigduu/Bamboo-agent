@@ -108,10 +108,11 @@ pub fn ensure_notification_relay(
                         if let Some(sink_notification) = sink_notification {
                             let has_watcher = watchers.has_watcher(&sid);
                             let config_snapshot = config.read().await.clone();
-                            super::AppState::dispatch_to_sinks(
+                            crate::notify_sinks::dispatch_with_hook_admission(
                                 &config_snapshot,
                                 has_watcher,
                                 &sink_notification,
+                                watchers.lifecycle_hook_admission(),
                             );
                         }
                     }

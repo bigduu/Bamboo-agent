@@ -515,7 +515,12 @@ impl AppState {
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
             bamboo_home_dir.join("notification_preferences.json"),
         ));
-        let session_watchers = super::watchers::SessionWatchers::new();
+        let managed_lifecycle_hooks = startup
+            .manages_updates()
+            .then(super::update_admission::UntrackedUpdateAdmission::default);
+        let session_watchers = super::watchers::SessionWatchers::with_lifecycle_hook_admission(
+            managed_lifecycle_hooks.clone(),
+        );
         let (mcp_manager, _legacy_mcp_bootstrap) =
             init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
@@ -892,14 +897,13 @@ impl AppState {
         let config_snapshot = config.read().await.clone();
         let memory_maintenance_admission =
             bamboo_engine::auto_dream::MemoryMaintenanceAdmission::default();
-        let managed_update_runtime =
-            startup
-                .manages_updates()
-                .then(|| super::planned_update::ManagedUpdateRuntime {
-                    boot_refusal: super::planned_update::unsupported_host_routes(&config_snapshot),
-                    memory: memory_maintenance_admission.clone(),
-                    lifecycle_hooks: Default::default(),
-                });
+        let managed_update_runtime = managed_lifecycle_hooks.map(|lifecycle_hooks| {
+            super::planned_update::ManagedUpdateRuntime {
+                boot_refusal: super::planned_update::unsupported_host_routes(&config_snapshot),
+                memory: memory_maintenance_admission.clone(),
+                lifecycle_hooks,
+            }
+        });
 
         // When a broker is configured, run the MCP proxy service under a
         // supervisor (issue #47): deployed workers forward their (host-bound)

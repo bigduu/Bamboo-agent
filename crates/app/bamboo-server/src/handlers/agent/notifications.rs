@@ -62,7 +62,12 @@ pub async fn send_test_notification(state: web::Data<AppState>) -> impl Responde
         created_at: None,
         click_url: None,
     };
-    crate::notify_sinks::dispatch_to_sinks(&config_snapshot, false, &notification);
+    crate::notify_sinks::dispatch_with_hook_admission(
+        &config_snapshot,
+        false,
+        &notification,
+        state.managed_lifecycle_hook_admission(),
+    );
 
     HttpResponse::Ok().json(serde_json::json!({ "attempted": attempted }))
 }
@@ -84,6 +89,111 @@ mod tests {
                 .await
                 .expect("app state"),
         )
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn managed_update_refuses_after_notification_hook_is_enabled_run_and_disabled() {
+        use crate::app_state::{planned_update::HostUpdateReadiness, ConfigUpdateEffects};
+        use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler};
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new_for_managed_update(dir.path().to_owned())
+                .await
+                .unwrap(),
+        );
+        state.wait_for_boot_reconcile_services().await;
+        assert!(!state.config.read().await.lifecycle_hooks.enabled);
+        let marker = dir.path().join("notification-hook-executed");
+        let command = format!("printf 'notification hook ran' > '{}'", marker.display());
+        state
+            .update_config(
+                |config| {
+                    config.notifications.desktop.enabled = Some(false);
+                    config.notifications.ntfy.enabled = false;
+                    config.notifications.bark.enabled = false;
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        state
+            .update_config(
+                |config| {
+                    config.lifecycle_hooks.enabled = true;
+                    config.lifecycle_hooks.notification = vec![LifecycleHookGroup {
+                        enabled: true,
+                        matcher: None,
+                        hooks: vec![LifecycleHookHandler::command(command, 2_000)],
+                    }];
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/api/v1/notifications/test",
+            web::post().to(super::send_test_notification),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/notifications/test")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["attempted"], serde_json::json!(["command"]));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if std::fs::read_to_string(&marker)
+                    .is_ok_and(|content| content == "notification hook ran")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state
+            .update_config(
+                |config| {
+                    config.lifecycle_hooks.enabled = false;
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!state.config.read().await.lifecycle_hooks.enabled);
+        let mut preparation = state.begin_planned_update().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match preparation.observe().await {
+                    Err(error) => break error,
+                    Ok(HostUpdateReadiness::Busy { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(HostUpdateReadiness::Ready) => {
+                        panic!("executed notification hook has no closure proof")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("dispatched a lifecycle hook"));
+        drop(preparation);
+        state.shutdown().await;
     }
 
     #[actix_web::test]
