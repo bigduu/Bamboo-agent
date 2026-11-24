@@ -2112,6 +2112,13 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let progress_events = event_tx.clone();
+    http_retry_observer.report_progress(move |retry| {
+        let _ = progress_events.try_send(AgentEvent::UpstreamRetryScheduled {
+            http_status: retry.status,
+            retry_delay_ms: retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    });
     let recovery = recovery.map(|retry| match window_limit {
         Some(limit) => retry.tighten_output_limit(limit),
         None => retry,

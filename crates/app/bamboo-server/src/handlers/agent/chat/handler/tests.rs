@@ -1961,6 +1961,9 @@ mod optional_model_e2e {
 
     async fn title_test_state(provider: Arc<BlockingTitleProvider>) -> web::Data<AppState> {
         let data_dir = tempdir().expect("tempdir").keep();
+        crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile(
+            &data_dir,
+        );
         bamboo_config::paths::init_bamboo_dir(data_dir.clone());
         let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
         config.provider = "openai".to_string();

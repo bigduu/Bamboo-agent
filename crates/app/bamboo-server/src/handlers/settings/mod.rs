@@ -58,7 +58,7 @@ pub use permission::{
 pub use provider::{fetch_catalog_models, get_provider_catalog, reload_provider_config};
 pub use provider_instances::{
     create_provider_instance, delete_provider_instance, list_provider_instances,
-    set_default_provider_instance, update_provider_instance,
+    probe_provider_model, set_default_provider_instance, update_provider_instance,
 };
 pub use redaction::{redact_config_for_api, redact_providers_for_api};
 pub use setup::{get_setup_status, mark_setup_complete, mark_setup_incomplete};

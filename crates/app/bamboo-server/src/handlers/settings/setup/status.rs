@@ -7,6 +7,8 @@ use bamboo_llm::Config;
 pub(super) struct SetupStatus {
     /// Whether setup is complete.
     pub(super) is_complete: bool,
+    /// Clients with in-app model setup can open the chat draft directly.
+    pub(super) model_setup_in_app: bool,
     /// Whether proxy config exists in config.json.
     pub(super) has_proxy_config: bool,
     /// Whether proxy env vars are detected.
@@ -24,6 +26,7 @@ pub(super) fn build_setup_status(config: &Config, proxy_environment_flags: &[&st
 
     SetupStatus {
         is_complete,
+        model_setup_in_app: true,
         has_proxy_config,
         has_proxy_env,
         message,
