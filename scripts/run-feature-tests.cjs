@@ -248,7 +248,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Session history cache and paging cases belong to the default Storage and Server library targets.
 // #2995 keeps the ordinary Side Chat Actix fixture in server-handlers.
 // Main-owned clear metadata changes the sensitive Storage closure. Additive cases stay unchanged.
-const FEATURE_SOURCE_SHA256 = "2ea6e925c7c85b1ec4778277801d4265269f4bc91a027d37213dcfd99c0e5c80";
+// #3003 keeps Gemini frame decoding and fallback cases in the default
+// bamboo-llm packages-2 owner. The litellm-wire-types replay guard uses the
+// existing feature, and the additive contexts retain their case selections.
+const FEATURE_SOURCE_SHA256 = "41c0d7bd8a1f7f772a86135c7964a28296c90a56726fb645d5d884d08b114648";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
