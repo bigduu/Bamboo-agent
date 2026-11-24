@@ -1,7 +1,7 @@
 //! A bounded, process-local projection of Bamboo's own finished OTel spans.
 //! Only explicitly allowlisted attributes are copied out of the SDK span.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +39,8 @@ pub struct LocalSpan {
     pub run_id: Option<String>,
     pub call_id: Option<String>,
     pub usage: Option<ModelTokenUsage>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub performance: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -488,6 +490,10 @@ fn project(data: SpanData) -> Option<Record> {
             run_id: identifier(&data, "bamboo.run.id"),
             call_id: identifier(&data, "bamboo.model_call.id"),
             usage,
+            performance: super::performance::LOCAL_FIELDS
+                .iter()
+                .filter_map(|&(key, field)| count(&data, key).map(|value| (field, value)))
+                .collect(),
         },
     })
 }
