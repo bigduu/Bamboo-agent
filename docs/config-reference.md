@@ -74,7 +74,7 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
+| `features` | `FeatureFlags` | Runtime feature settings. New profiles enable manual Work recording and dispatch with one concurrent Work. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `context_management` | `ContextManagementConfig` | Selects conversation summary, prose-only message summary, or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
@@ -85,6 +85,10 @@ default. The full field list of `Config`:
 | `connect` | `ConnectConfig` | **Not actually stored here** — see [connect](#connect--the-im-bridge). |
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
+
+Manually dispatched Work uses the configured run budget, with a fallback of
+40 rounds when the budget has no round ceiling. Automatic dispatch requires a
+separate owner policy.
 
 Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
 `revision` is the env-domain CAS revision stored in the credential envelope;
@@ -441,7 +445,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the compatibility defaults, a 1M window with 64K output and 10K safety
+For a reported or configured 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -861,9 +865,10 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 The file stores explicit overrides. With no matching user or provider limit,
-the runtime and the defaults API use 1,000,000 total context tokens and 64,000
-output tokens. When the window is known and the output ceiling is absent,
-the fallback output is one quarter of the window, up to 64,000. Set
+ordinary Agent turns and the defaults API use 32,768 total context tokens and
+4,096 output tokens. If only the provider's input or combined window is known,
+Bamboo uses at most 4,096 output tokens. For a user-configured window with no
+output ceiling, the fallback is one quarter of the window, up to 64,000. Set
 `unlimited_output` to `true` and omit `max_output_tokens` to let ordinary Agent
 turns use the selected route's output ceiling and the available joint window.
 When the route does not report an output ceiling, Bamboo leaves the optional

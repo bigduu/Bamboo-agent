@@ -7,7 +7,7 @@
 //! - `DELETE /bamboo/settings/provider-instances/{id}`    — delete an instance
 //! - `POST   /bamboo/settings/provider-instances/default` — set default instance
 
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -589,6 +589,43 @@ pub async fn create_provider_instance(
         created,
         instance_credential_configured(&app_state, created),
     )))
+}
+
+#[derive(Deserialize)]
+pub struct ProbeModelRequest {
+    model: String,
+}
+
+/// Verify the exact saved provider/model with a bounded, tool-free inference.
+pub async fn probe_provider_model(
+    app_state: web::Data<AppState>,
+    request: HttpRequest,
+    path: web::Path<String>,
+    payload: web::Json<ProbeModelRequest>,
+) -> Result<HttpResponse, AppError> {
+    if !crate::handlers::agent::actor_snapshot::host_owner_authorized(&app_state, &request).await {
+        return Err(AppError::Unauthorized(
+            "Owner access is required to verify a model".into(),
+        ));
+    }
+    let instance_id = path.into_inner();
+    validate_instance_id(&instance_id)?;
+    let target = bamboo_domain::ProviderModelRef::new(instance_id, payload.model.as_str());
+    let config = app_state.config.read().await.clone();
+    let selected = bamboo_engine::model_config_helper::try_resolve_primary_model(
+        &config,
+        &app_state.provider_registry,
+        &target,
+    )
+    .map_err(|_| {
+        AppError::BadRequest("Choose an enabled provider and a saved runtime model".into())
+    })?;
+    let status = bamboo_engine::resolved_defaults::probe_model(
+        selected.provider.as_ref(),
+        &selected.target.model,
+    )
+    .await;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "status": status })))
 }
 
 /// PUT /bamboo/settings/provider-instances/{instance_id}

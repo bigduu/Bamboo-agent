@@ -1,4 +1,7 @@
 //! Explicit Work dispatch policy over the existing Ticket and Root facts.
+/// Finite fallback for a manually launched Work turn with no operator round cap.
+pub const DEFAULT_WORK_MAX_ROUNDS: u32 = 40;
+
 use bamboo_domain::{
     ManagedRootAdmission, Message, Session, SessionAuthorityIdentity, SessionInboxReceipt,
     SessionKind, SupervisedRootOutcomeResult,

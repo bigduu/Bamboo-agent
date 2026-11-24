@@ -417,7 +417,12 @@ fn resolve_window(
         let sizing_window = joint_window
             .or(input_limit)
             .unwrap_or(fallback.max_context_tokens);
-        ModelLimit::new("", sizing_window).get_max_output_tokens()
+        let derived = ModelLimit::new("", sizing_window).get_max_output_tokens();
+        if configured.is_none() {
+            derived.min(fallback.get_max_output_tokens())
+        } else {
+            derived
+        }
     });
     // Separate input/output limits give a planning bound. They do not
     // establish a provider's joint context window.
@@ -896,8 +901,8 @@ mod tests {
         };
 
         let fallback = resolve_token_budget(&mut session, &config, model, &provider).await;
-        assert_eq!(fallback.max_context_tokens, 1_000_000);
-        assert_eq!(fallback.max_output_tokens, 64_000);
+        assert_eq!(fallback.max_context_tokens, 32_768);
+        assert_eq!(fallback.max_output_tokens, 4_096);
 
         let path = model_limits_path(&config);
         let stored = r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#;
