@@ -191,7 +191,7 @@ async fn admitted_native_work_outlives_implicit_child_total_and_publishes_result
     policy_source
         .metadata
         .insert("child_watchdog.check_interval_secs".into(), "1".into());
-    let mut policy = crate::execution::spawn::watchdog_policy_for_session(&policy_source);
+    let mut policy = crate::execution::spawn::watchdog_policy_for_session(&policy_source, None);
     // Test the default branch without installing an explicit total override.
     policy.max_total_secs = 1;
     let done = CancellationToken::new();
@@ -331,7 +331,7 @@ async fn native_work_preserves_explicit_total_and_idle_timeouts_without_submissi
         let done = CancellationToken::new();
         let reason = Arc::new(RwLock::new(None));
         let watchdog = if idle {
-            let mut policy = crate::execution::spawn::watchdog_policy_for_session(&f.child);
+            let mut policy = crate::execution::spawn::watchdog_policy_for_session(&f.child, None);
             policy.max_idle_secs = 1;
             let entry = ctx.agent_runners.read().await[&f.child.id].clone();
             // Exercise the production idle watchdog against this entered task.
@@ -396,7 +396,7 @@ async fn native_work_preserves_explicit_total_and_idle_timeouts_without_submissi
 #[test]
 fn total_limit_origin_is_preserved_for_direct_and_parent_backstop() {
     let mut child = Session::new("ordinary-child", "fixture-model");
-    let default = crate::execution::spawn::watchdog_policy_for_session(&child);
+    let default = crate::execution::spawn::watchdog_policy_for_session(&child, None);
     for slack in [0, 600] {
         assert!(default.total_timeout_reached(3600 + slack, slack, false));
         assert!(!default.total_timeout_reached(3600 + slack, slack, true));
@@ -406,13 +406,13 @@ fn total_limit_origin_is_preserved_for_direct_and_parent_backstop() {
         child
             .metadata
             .insert("child_watchdog.max_total_secs".into(), value.into());
-        let implicit = crate::execution::spawn::watchdog_policy_for_session(&child);
+        let implicit = crate::execution::spawn::watchdog_policy_for_session(&child, None);
         assert!(!implicit.total_timeout_reached(4200, 600, true));
     }
     child
         .metadata
         .insert("child_watchdog.max_total_secs".into(), "3600".into());
-    let explicit = crate::execution::spawn::watchdog_policy_for_session(&child);
+    let explicit = crate::execution::spawn::watchdog_policy_for_session(&child, None);
     assert!(explicit.total_timeout_reached(3600, 0, true));
     assert!(explicit.total_timeout_reached(4200, 600, true));
     assert!(!explicit.needs_native_work_proof(4200, 600));

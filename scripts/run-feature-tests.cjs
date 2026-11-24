@@ -254,9 +254,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3005 uses the default Grep packages-2, Engine packages-3, and infrastructure
 // packages-4 owners. The new span attribution test is shared across telemetry
 // configurations, and the additive catalog retains its existing selection.
+// #3012 adds default Config, Engine and Server settings tests to their existing owners.
+// The additive contexts and their case selections are unchanged.
 // #3009 keeps Work handoff guidance in the default Engine owner. The existing
 // ticket_supervisor_tools integration target remains in agent-tests-1.
-const FEATURE_SOURCE_SHA256 = "c584a57bf7c4ce615420798d5e2f937beb43bc0419de7364327ae21d53fbf857";
+const FEATURE_SOURCE_SHA256 = "cc952c771364e0a6dfc0dc23833d15f09f0ec09e92025b1f03a8fd992cb0c5c3";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
