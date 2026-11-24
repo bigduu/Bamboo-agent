@@ -1,8 +1,9 @@
 //! Cooperative shutdown for a desktop host's own Bamboo process.
 
 use actix_server::Server;
+use actix_web::web;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,7 +24,12 @@ impl ManagedShutdown {
                 "managed shutdown requires an absolute, private directory",
             ));
         }
-        for name in ["ready", "stop"] {
+        for name in [
+            "ready",
+            "stop",
+            "resume-update",
+            "resume-update-result.json",
+        ] {
             match fs::symlink_metadata(directory.join(name)) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error),
@@ -38,7 +44,11 @@ impl ManagedShutdown {
         Ok(Self { directory })
     }
 
-    pub(super) async fn run(self, server: Server) -> io::Result<()> {
+    pub(super) async fn run(
+        self,
+        server: Server,
+        state: Option<web::Data<crate::app_state::AppState>>,
+    ) -> io::Result<()> {
         File::create_new(self.directory.join("ready"))?;
         let handle = server.handle();
         let marker = self.directory.join("stop");
@@ -46,12 +56,61 @@ impl ManagedShutdown {
 
         tokio::select! {
             result = &mut server => result,
+            () = resume_when_authorized(&self.directory, state) => unreachable!("recovery watcher stays attached"),
             () = wait_for_marker(&marker) => {
                 tracing::info!("Managed Bamboo shutdown requested");
                 let ((), result) = tokio::join!(handle.stop(true), server);
                 result
             }
         }
+    }
+}
+
+async fn resume_when_authorized(
+    directory: &Path,
+    state: Option<web::Data<crate::app_state::AppState>>,
+) {
+    if let Some(state) = state {
+        let result = match wait_for_resume_request(&directory.join("resume-update")).await {
+            Ok(request) => super::planned_update_handoff::resume(&state, request)
+                .await
+                .map(|report| serde_json::json!({ "request": request, "report": report })),
+            Err(error) => Err(error),
+        };
+        let result =
+            result.unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        let written = (|| -> io::Result<()> {
+            let mut file = tempfile::NamedTempFile::new_in(directory)?;
+            serde_json::to_writer(file.as_file_mut(), &result)?;
+            file.as_file().sync_all()?;
+            file.persist_noclobber(directory.join("resume-update-result.json"))?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            tracing::warn!(%error, "Cannot publish desktop update recovery result");
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn wait_for_resume_request(path: &Path) -> io::Result<uuid::Uuid> {
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() && meta.len() == 36 => {
+                let mut text = String::with_capacity(36);
+                File::open(path)?.take(37).read_to_string(&mut text)?;
+                return uuid::Uuid::parse_str(&text).map_err(io::Error::other);
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid desktop update request",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -112,7 +171,7 @@ mod tests {
         .listen(listener)
         .unwrap()
         .run();
-        let stopping = actix_web::rt::spawn(shutdown.run(server));
+        let stopping = actix_web::rt::spawn(shutdown.run(server, None));
         let request = actix_web::rt::spawn(async move {
             reqwest::Client::builder()
                 .no_proxy()

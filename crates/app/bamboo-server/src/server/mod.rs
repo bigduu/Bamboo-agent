@@ -7,6 +7,7 @@ mod entrypoints;
 mod h1;
 mod listeners;
 mod managed_shutdown;
+mod planned_update_handoff;
 mod supervisor_host_protocol;
 pub(crate) mod tailscale;
 mod tls;

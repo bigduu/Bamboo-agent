@@ -484,7 +484,11 @@ async fn run_with_static_options(
         .as_ref()
         .map(|access| TailscaleAccess::reconcile(access.clone(), app_state_for_shutdown.clone()));
     let result = match shutdown {
-        Some(shutdown) => shutdown.run(server).await,
+        Some(shutdown) => {
+            shutdown
+                .run(server, Some(app_state_for_shutdown.clone()))
+                .await
+        }
         None => server.await,
     };
     if let Some(reconcile) = reconcile {
