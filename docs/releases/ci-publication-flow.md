@@ -187,6 +187,29 @@ compilation, `receipt.completed=false` and `publisherRunId=44437436231`. Retry
 only the original run's failed jobs. The original pipeline publishes its
 retained v3 executables with the existing draft, source and tag.
 
+### Fixed v2026.11.43 crate recovery
+
+Issue #3053 binds draft 457147104 and source
+`d9a04783cc9eff82e406a78e291136537eff10c6` to [publisher 45451853467](https://github.com/bigduu/Bamboo-agent/actions/runs/45451853467).
+The first 24 crates were verified in the registry. The publisher retained and
+recorded the `bamboo-projects` archive before its upload returned HTTP 500.
+Recovery checks the registry before uploading that original again. It preserves
+the signed crate prefix, sealed frontend and all five original native transports.
+The six crates from `bamboo-server-tools` through `bamboo-agent` use the existing
+signed first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev.
+
+```bash
+gh workflow run recover-crate-2026-11-43.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Require authenticated remote readback with `recovery20261143.completed=true`,
+no pending compilation, `receipt.completed=false` and
+`publisherRunId=45451853467`. Retry the original failed jobs to finalize the
+same version with the retained native outputs.
+
 ## Main and consumers
 
 ### Desktop browser runtime
