@@ -1067,8 +1067,17 @@ fn metadata_i64(session: &Session, key: &str) -> Option<i64> {
         .filter(|value| *value > 0)
 }
 
-pub(crate) fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPolicy {
+pub(crate) fn watchdog_policy_for_session(
+    session: &Session,
+    local_config: Option<&bamboo_config::SubagentsConfig>,
+) -> ChildWatchdogPolicy {
     let mut policy = ChildWatchdogPolicy::default();
+    if let Some(value) = local_config.and_then(|config| config.max_total_secs) {
+        policy.max_total_secs = i64::from(value.get());
+    }
+    if let Some(value) = local_config.and_then(|config| config.max_idle_secs) {
+        policy.max_idle_secs = i64::from(value.get());
+    }
     if let Some(value) = metadata_i64(session, "child_watchdog.max_total_secs") {
         policy.max_total_secs = value;
         policy.total_is_explicit = true;
