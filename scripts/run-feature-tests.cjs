@@ -262,7 +262,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // ticket_supervisor_tools integration target remains in agent-tests-1.
 // #3040 places Ticket update readiness cases in the default server-app-state
 // owner. Existing feature-gated Ticket fixtures retain their additive owners.
-const FEATURE_SOURCE_SHA256 = "c4772b400c2a6eb4a83057500922259dd4e44249e2e589d87092e604a4febc66";
+// Scoped prompt recall retains the ordinary Engine, Memory, and Config cases.
+const FEATURE_SOURCE_SHA256 = "1e963b7ba0cda5d5111da71581b465e9ae2d73adc19e5fd86db84b4d787db043";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
