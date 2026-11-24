@@ -427,8 +427,8 @@ impl TicketApplication {
         .await
         .map_err(|_| Error::AuthorityUnavailable("semantic patrol worker stopped".into()))??;
         if let (Some(submission), Some(io)) = (submission, io) {
-            journal.fence.check()?;
             self.record_update_dispatch().await?;
+            journal.fence.check()?;
             self.patrol_calls
                 .launch(submission, SystemClock::current()?.now_ms(), io)
                 .map_err(patrol_error)?;

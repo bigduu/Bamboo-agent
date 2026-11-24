@@ -579,8 +579,6 @@ impl TicketApplication {
                 "Ticket mutation feature is disabled".into(),
             ));
         }
-        let (service, authority) = self.authority(principal.clone()).await?;
-        self.validate_project_operations(&service, command)?;
         let receipt = {
             // Hold the mutation through retained cancellation registration.
             // A planning edit with no runtime work leaves the gate reusable.
@@ -589,6 +587,8 @@ impl TicketApplication {
                 .enter()
                 .await
                 .map_err(|error| Error::ResourceBlocked(error.to_string()))?;
+            let (service, authority) = self.authority(principal.clone()).await?;
+            self.validate_project_operations(&service, command)?;
             let receipt = service.work_update(&authority, command)?;
             self.wake_ready_work();
             if self.cancel_after_commit(&service, command) {
@@ -721,11 +721,11 @@ impl TicketApplication {
             )
             .await?;
         }
+        self.record_update_dispatch().await?;
         self.validate_project_operations(&service, command)?;
         if let Some(fence) = fence {
             fence.check()?;
         }
-        self.record_update_dispatch().await?;
         let receipt = service.work_dispatch(&authority, command)?;
         self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds, fence)
             .await
