@@ -2,8 +2,8 @@ use crate::app_state::AppState;
 use bamboo_agent_core::{FunctionCall, Message, Session, ToolCall, ToolSchema};
 use bamboo_domain::{
     ActorActivationClaim, ActorActivationFinish, ActorActivationStatus, ActorDirectoryPort,
-    AgentRuntimeState, AgentStatusState, ProviderModelRef, RootActorRuntimeWrite,
-    RuntimeSessionPersistence, Storage, SuspensionState,
+    AgentRuntimeState, AgentStatusState, ProviderModelRef, RootActorRuntimeWrite, Storage,
+    SuspensionState,
 };
 use bamboo_engine::session_activation::ParkedUpdateRoot;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
@@ -230,11 +230,9 @@ impl LLMProvider for ProviderProbe {
 async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(dir.path()).unwrap();
-    let store = Arc::new(
-        bamboo_storage::SessionStoreV2::new(workspace.clone())
-            .await
-            .unwrap(),
-    );
+    let store = bamboo_storage::SessionStoreV2::new(workspace.clone())
+        .await
+        .unwrap();
     let mut session = Session::new("planned-update-root", MODEL);
     session.title_generated = true;
     session.set_workspace_path_meta(workspace.to_string_lossy());
@@ -285,23 +283,19 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         .await
         .unwrap();
     store.start_activation(&owner.fence(), now).await.unwrap();
-    let repository = bamboo_engine::SessionRepository::new(
-        Default::default(),
-        store.clone(),
-        Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
-    )
-    .with_root_actor_directory(store.clone())
-    .bind_root_response_writer(RootActorRuntimeWrite {
-        fence: owner.fence(),
-        created_at: session.created_at,
-        conversation_generation: session.conversation_generation_observation(),
-    })
-    .unwrap();
-    repository
-        .checkpoint_runtime_session(&mut session)
+    store
+        .save_root_actor_runtime(
+            &RootActorRuntimeWrite {
+                fence: owner.fence(),
+                created_at: session.created_at,
+                conversation_generation: session.conversation_generation_observation(),
+            },
+            &session,
+            false,
+            Arc::new(|_| {}),
+        )
         .await
         .unwrap();
-    drop(repository);
     store
         .finish_activation(&owner.fence(), Utc::now(), ActorActivationFinish::Succeeded)
         .await
