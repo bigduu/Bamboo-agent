@@ -264,7 +264,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // owner. Existing feature-gated Ticket fixtures retain their additive owners.
 // #3027 keeps desktop recovery in the default Server, Storage and native
 // Root integration owners. The additive case selections are unchanged.
-const FEATURE_SOURCE_SHA256 = "0e8941620091b81827847c42080664286bd7ddd9ccdde6043c5bf883b4cd045e";
+// Scoped prompt recall retains the ordinary Engine, Memory, and Config cases.
+const FEATURE_SOURCE_SHA256 = "a69cede7572103287c1db54430cdd20bf0de003880779a5103b5262af904493e";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

@@ -173,7 +173,7 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
 }
 
 #[tokio::test]
-async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown() {
+async fn external_memory_keeps_session_notes_without_global_dream_when_project_unknown() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     publish_global_dream(
@@ -200,8 +200,8 @@ async fn external_memory_includes_global_dream_fallback_and_session_note_when_pr
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
 
-    assert!(system_prompt.contains("Global Dream Summary (fallback)"));
-    assert!(system_prompt.contains("Durable cross-session insight"));
+    assert!(!system_prompt.contains("Global Dream Summary (fallback)"));
+    assert!(!system_prompt.contains("Durable cross-session insight"));
     assert!(system_prompt.contains("Session Memory Note"));
     assert!(system_prompt.contains("Session durable note"));
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
@@ -1016,7 +1016,7 @@ async fn external_memory_prefers_project_dream_over_global_fallback() {
 }
 
 #[tokio::test]
-async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index_are_missing() {
+async fn external_memory_omits_global_dream_when_authorized_project_has_no_memory() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let workspace = temp_dir.path().join("workspace-global-dream-fallback");
@@ -1026,7 +1026,12 @@ async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index
 
     let mut session =
         bamboo_agent_core::Session::new("session-global-dream-fallback", "test-model");
+    session.set_project_id_meta("different-project".to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
+    session.metadata.insert(
+        super::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+        "### Global Dream Summary (fallback)\nGlobal fallback dream".to_string(),
+    );
     session.metadata.insert(
         "workspace_path".to_string(),
         workspace.to_string_lossy().to_string(),
@@ -1046,12 +1051,21 @@ async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index
         bamboo_metrics::types::PromptMemoryRecallOutcome::NoQuery
     );
 
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
-    assert!(system_prompt.contains("Global fallback dream"));
-    assert!(!system_prompt.contains("### Project Dream Summary"));
+    assert!(super::render_external_memory_section(&session).is_none());
+    let observability = session
+        .metadata
+        .get("runtime_prompt_memory_observability")
+        .and_then(|raw| {
+            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
+        })
+        .expect("observability should be recorded");
+    assert_eq!(
+        observability.resolved_project_key.as_deref(),
+        Some("different-project")
+    );
+    assert_eq!(observability.project_dream_status, "missing");
+    assert_eq!(observability.global_dream_fallback_status, "disabled");
+    assert_eq!(observability.dream_source, "none");
 }
 
 #[tokio::test]
@@ -1123,15 +1137,12 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
     assert!(!observability.relevant_recall_rerank_enabled);
     assert_eq!(observability.project_memory_index_status, "disabled");
     assert_eq!(observability.project_dream_status, "loaded");
-    assert_eq!(
-        observability.global_dream_fallback_status,
-        "skipped_project_memory_or_dream_present"
-    );
+    assert_eq!(observability.global_dream_fallback_status, "disabled");
     assert_eq!(observability.dream_source, "project");
 }
 
 #[tokio::test]
-async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled() {
+async fn external_memory_omits_dream_and_relevant_recall_when_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let project_id =
@@ -1195,8 +1206,8 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
         .expect("external memory section should be rendered");
 
     assert!(!system_prompt.contains("### Relevant Durable Memories"));
-    assert!(system_prompt.contains("### Global Dream Summary (fallback)"));
-    assert!(system_prompt.contains("Global dream fallback"));
+    assert!(!system_prompt.contains("### Global Dream Summary (fallback)"));
+    assert!(!system_prompt.contains("Global dream fallback"));
     assert!(!system_prompt.contains("### Project Dream Summary"));
     assert!(!system_prompt.contains("Project dream context"));
 
@@ -1211,8 +1222,10 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
     assert!(!observability.relevant_recall_rerank_enabled);
     assert!(!observability.project_first_dream_enabled);
     assert_eq!(observability.relevant_memory_status, "disabled");
-    assert_eq!(observability.global_dream_fallback_status, "forced_loaded");
-    assert_eq!(observability.dream_source, "global_fallback");
+    assert_eq!(observability.project_dream_status, "disabled");
+    assert_eq!(observability.global_dream_fallback_status, "disabled");
+    assert_eq!(observability.global_dream_fallback_section_chars, 0);
+    assert_eq!(observability.dream_source, "none");
 }
 
 #[tokio::test]

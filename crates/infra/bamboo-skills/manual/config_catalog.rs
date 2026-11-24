@@ -70,7 +70,7 @@ pub fn entries() -> Vec<Entry> {
         project_prompt_injection => ("bool", false, "Inject the project durable-memory index into the main prompt.", ["memory.memory_project_prompt_injection"]),
         relevant_recall => ("bool", false, "Enable automatic relevant durable-memory recall.", ["memory.memory_relevant_recall"]),
         relevant_recall_rerank => ("bool", true, "Optional model reranking of lexical candidates; fallback remains lexical.", ["memory.memory_relevant_recall_rerank"]),
-        project_first_dream => ("bool", false, "Prefer project Dream over the global fallback.", ["memory.memory_project_first_dream"]),
+        project_first_dream => ("bool", false, "Include the authorized Project Dream in model prompts.", ["memory.memory_project_first_dream"]),
         ledger_agenda_injection => ("bool", false, "Inject the applicable ledger agenda; an empty agenda adds no section.", ["memory.memory_ledger_agenda_injection"]),
         ledger_gardener_enabled => ("bool", false, "Enable background ledger maintenance; expiry and reconciliation are deterministic.", []),
         ledger_gardener_interval_secs => ("u64", 43200, "Seconds between ledger gardener runs.", []),
