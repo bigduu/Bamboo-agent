@@ -1078,6 +1078,16 @@ impl ChildCompletionCoordinator {
         reservation: &mut SessionExecutionReservation,
         session: &Session,
     ) -> std::io::Result<()> {
+        self.prepare_root_continuation(reservation, session, None)
+            .await
+    }
+
+    async fn prepare_root_continuation(
+        &self,
+        reservation: &mut SessionExecutionReservation,
+        session: &Session,
+        finished_epoch: Option<u64>,
+    ) -> std::io::Result<()> {
         if session.kind != SessionKind::Root
             || !session.authority_identity.is_ordinary()
             || crate::ticket_runtime::is_managed_work_root(session)
@@ -1091,7 +1101,14 @@ impl ChildCompletionCoordinator {
         reservation
             .bind_reserved_session_lifetime(&self.agent, session)
             .await?;
-        reservation.bind_root_actor(&self.agent, session).await
+        match finished_epoch {
+            Some(epoch) => {
+                reservation
+                    .bind_root_actor_after_update(&self.agent, session, epoch)
+                    .await
+            }
+            None => reservation.bind_root_actor(&self.agent, session).await,
+        }
     }
 
     /// Publish and hand off this exact reserved turn. Success records Inbox
@@ -1229,15 +1246,15 @@ impl ChildCompletionCoordinator {
             return Ok(false);
         };
         let guard = self.persistence.acquire_lock(&root.session_id).await;
-        let Some((saved, resumed)) =
-            self.storage
-                .load_session(&root.session_id)
-                .await?
-                .and_then(|saved| {
-                    let resumed =
-                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
-                    Some((saved, resumed))
-                })
+        let Some((saved, mut resumed)) = self
+            .storage
+            .load_session(&root.session_id)
+            .await?
+            .and_then(|saved| {
+                let resumed =
+                    crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                Some((saved, resumed))
+            })
         else {
             drop(guard);
             reservation.abandon().await;
@@ -1255,8 +1272,14 @@ impl ChildCompletionCoordinator {
                 "The saved update model is unavailable",
             ));
         }
-        self.prepare_paced_loop_turn(&mut reservation, &saved)
-            .await?;
+        if let Err(error) = self
+            .prepare_root_continuation(&mut reservation, &saved, Some(root.lease_epoch))
+            .await
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(error);
+        }
         let writer = reservation.root_actor_writer().ok_or_else(|| {
             std::io::Error::other("Planned update resume requires the current Root writer")
         })?;
@@ -1265,6 +1288,7 @@ impl ChildCompletionCoordinator {
             reservation.abandon().await;
             return Ok(false);
         }
+        resumed.set_host_run_id(&writer.fence.run_id);
         drop(guard);
         self.start_bound_root_continuation(resumed, &saved, reservation)
             .await?;

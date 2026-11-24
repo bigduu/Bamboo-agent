@@ -190,6 +190,22 @@ async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
         .resume_planned_update_root(&stale)
         .await
         .unwrap());
+    let mut stale_actor = checkpoint.clone();
+    stale_actor.lease_epoch += 1;
+    assert!(state
+        .child_completion_coordinator
+        .resume_planned_update_root(&stale_actor)
+        .await
+        .is_err());
+    let still_previous = state
+        .session_store
+        .inspect_actor(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        still_previous.activation.unwrap().lease_epoch,
+        checkpoint.lease_epoch
+    );
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
 
     let control = tempfile::tempdir().unwrap();
@@ -265,6 +281,7 @@ async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
         .unwrap();
     assert_ne!(new_owner.run_id, checkpoint.run_id);
     assert_eq!(new_owner.lease_epoch, checkpoint.lease_epoch + 1);
+    assert_eq!(saved.host_run_id(), Some(new_owner.run_id.as_str()));
     let report = planned_update_handoff::resume(&state, request)
         .await
         .unwrap();
