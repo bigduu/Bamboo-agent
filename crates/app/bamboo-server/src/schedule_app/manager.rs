@@ -524,7 +524,12 @@ async fn notify_schedule_run_outcome(
     if let Some(sink_notification) = sink_notification {
         let has_watcher = relay.session_watchers.has_watcher(session_id);
         let config_snapshot = relay.config.read().await.clone();
-        crate::AppState::dispatch_to_sinks(&config_snapshot, has_watcher, &sink_notification);
+        crate::notify_sinks::dispatch_with_hook_admission(
+            &config_snapshot,
+            has_watcher,
+            &sink_notification,
+            relay.session_watchers.lifecycle_hook_admission(),
+        );
     }
 }
 
