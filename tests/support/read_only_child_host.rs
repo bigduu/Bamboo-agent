@@ -1,4 +1,4 @@
-//! Real CLI Host fixture for the built-in read-only Child route.
+//! Real CLI Host fixture with an explicitly read-only Explorer profile.
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::Session;
@@ -17,6 +17,22 @@ pub struct Host {
 
 impl Host {
     pub async fn start(data: &Path) -> Self {
+        let agents = data.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("explorer.md"),
+            r#"---
+schema_version: 1
+name: explorer
+description: Read-only workspace inspection for the fixture
+tools:
+  allow: [Read, Glob]
+  deny: [Bash, Edit, Write]
+---
+Inspect the assigned workspace using Read and Glob. Report the evidence to the parent.
+"#,
+        )
+        .unwrap();
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .unwrap()
             .local_addr()

@@ -10,7 +10,9 @@ use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::app_state::supervisor_owner_authorization::test_support::ApprovedHostIntent;
+use crate::app_state::supervisor_owner_authorization::test_support::{
+    write_work_disabled_profile, ApprovedHostIntent,
+};
 use crate::{app_state::AppState, routes::configure_routes};
 
 const URI: &str = "/api/v1/supervisor/default/sessions";
@@ -23,6 +25,7 @@ struct Fixture {
 impl Fixture {
     async fn new(exact_authorizer: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
+        write_work_disabled_profile(home.path());
         let memory = bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu"));
         let mut state = Box::pin(AppState::new_with_memory_store(home.path().into(), memory))
             .await

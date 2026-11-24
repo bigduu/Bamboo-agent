@@ -74,7 +74,7 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
+| `features` | `FeatureFlags` | Runtime feature settings. New profiles enable manual Work recording and dispatch with one concurrent Work. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `context_management` | `ContextManagementConfig` | Selects conversation summary, prose-only message summary, or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
@@ -85,6 +85,9 @@ default. The full field list of `Config`:
 | `connect` | `ConnectConfig` | **Not actually stored here** — see [connect](#connect--the-im-bridge). |
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
+
+Manually dispatched Work uses the configured run budget. Automatic dispatch
+requires a separate owner policy.
 
 Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
 `revision` is the env-domain CAS revision stored in the credential envelope;
@@ -197,6 +200,32 @@ precedence on a name collision. `Anthropic-Beta` combines provider and caller
 flags. Authentication, connection, body framing, browser security and Bamboo
 control headers belong to their respective HTTP boundaries. A cross-origin
 redirect ends an upstream request carrying forwarded client headers.
+
+A Provider can use `{session_affinity}` in a structured `format` header
+override. The value is a domain-separated hash of the Bamboo session ID. It is
+stable across turns and retries, and distinct for different sessions. Bamboo
+omits the configured value on calls that have no session, including model
+discovery. Other header overrides keep their normal precedence.
+
+In the Provider's **Advanced Request Overrides (JSON)** editor, merge this
+example into the existing overrides. In file configuration, use the same
+object as the Provider's `request_overrides` value.
+
+```json
+{
+  "endpoints": {
+    "messages": {
+      "headers": {
+        "X-Session-Id": { "type": "format", "template": "{session_affinity}" }
+      }
+    }
+  }
+}
+```
+
+Choose the header name accepted by your gateway. Use `common.headers` for all
+generation endpoints or an endpoint or model rule for a narrower scope. This
+sends a routing hint the gateway can use for cache affinity.
 
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
@@ -441,7 +470,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the compatibility defaults, a 1M window with 64K output and 10K safety
+For a reported or configured 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -581,13 +610,14 @@ minimal-cost deployment.
 
 ## Sub-agents + external CLI executors
 
-Key `subagents` (`SubagentsConfig`). Sub-agents always run as independent
-actor subprocesses (crash isolation + real parallelism) — there is no
-in-process runtime toggle.
+Key `subagents` (`SubagentsConfig`). The built-in local runtime runs Child
+sessions in the Host, with separate executors for the external actor backends.
 
 | Field | Purpose |
 |---|---|
 | `max_concurrent` | Cap on simultaneously running sub-agents (default: 200). |
+| `max_total_secs` | Total time limit for a built-in local Child run in seconds (default: 3600). |
+| `max_idle_secs` | Time without recognized activity before cancelling a built-in local Child run, in seconds (default: 900). |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
 | `fabric_dir` | Where the actor fabric's mailbox/state files live. |
 | `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` \| `"codex"`. |
@@ -609,6 +639,11 @@ in-process runtime toggle.
 | `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
+
+Set the time limits in System Settings under Sub-agent or send a config patch
+such as `{"subagents":{"max_total_secs":10800}}`. Both fields take positive
+integer seconds. Clear an override with `null`. The next local Child run reads
+the saved limits at launch, with Host-owned per-session overrides taking precedence.
 
 ```json
 {
@@ -861,9 +896,10 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 The file stores explicit overrides. With no matching user or provider limit,
-the runtime and the defaults API use 1,000,000 total context tokens and 64,000
-output tokens. When the window is known and the output ceiling is absent,
-the fallback output is one quarter of the window, up to 64,000. Set
+ordinary Agent turns and the defaults API use 32,768 total context tokens and
+4,096 output tokens. If only the provider's input or combined window is known,
+Bamboo uses at most 4,096 output tokens. For a user-configured window with no
+output ceiling, the fallback is one quarter of the window, up to 64,000. Set
 `unlimited_output` to `true` and omit `max_output_tokens` to let ordinary Agent
 turns use the selected route's output ceiling and the available joint window.
 When the route does not report an output ceiling, Bamboo leaves the optional

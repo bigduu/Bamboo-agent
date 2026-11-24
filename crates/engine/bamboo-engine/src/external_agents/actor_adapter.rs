@@ -4722,11 +4722,12 @@ impl PlainActorActivation {
             {
                 return Err(plain_actor_unsupported());
             }
-            let duration = crate::runtime::execution::spawn::watchdog_policy_for_session(session)
-                .max_total_secs
-                .checked_add(60)
-                .and_then(chrono::Duration::try_seconds)
-                .ok_or_else(|| plain_actor_unsupported())?;
+            let duration =
+                crate::runtime::execution::spawn::watchdog_policy_for_session(session, None)
+                    .max_total_secs
+                    .checked_add(60)
+                    .and_then(chrono::Duration::try_seconds)
+                    .ok_or_else(|| plain_actor_unsupported())?;
             let expires = now
                 .checked_add_signed(duration)
                 .ok_or_else(|| plain_actor_unsupported())?;

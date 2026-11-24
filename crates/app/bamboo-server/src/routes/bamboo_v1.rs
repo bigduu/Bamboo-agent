@@ -389,6 +389,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::delete().to(settings::delete_provider_instance),
         )
         .route(
+            "/bamboo/settings/provider-instances/{instance_id}/probe",
+            web::post().to(settings::probe_provider_model),
+        )
+        .route(
             "/bamboo/settings/provider-instances/default",
             web::post().to(settings::set_default_provider_instance),
         )

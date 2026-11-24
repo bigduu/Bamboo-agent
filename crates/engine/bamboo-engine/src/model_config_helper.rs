@@ -272,7 +272,32 @@ pub fn get_default_model_for_provider(
 /// Get the default model for the current provider from config.
 /// Returns an error if no model is configured.
 pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError> {
-    get_default_model_for_provider(config, config.effective_default_provider())
+    let target = crate::resolved_defaults::default_chat_model_ref(config);
+    let provider = target
+        .as_ref()
+        .map_or(config.effective_default_provider(), |target| {
+            target.provider.as_str()
+        });
+    if config
+        .provider_instances
+        .get(provider)
+        .is_some_and(|instance| !instance.enabled)
+    {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{provider}' is disabled"
+        )));
+    }
+    let model = match target.as_ref() {
+        Some(target) => target.model.clone(),
+        None => get_default_model_for_provider(config, provider)?,
+    };
+    let model = model.trim();
+    if model.is_empty() || model == "unknown" {
+        return Err(LLMError::Auth(format!(
+            "Model must be specified for provider '{provider}'"
+        )));
+    }
+    Ok(model.to_string())
 }
 
 /// Get the schedule auto-execute model for the current provider from config.
@@ -1460,6 +1485,32 @@ mod tests {
         let result = get_default_model_from_config(&config);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn saved_chat_default_bootstraps_supervisor_without_an_instance_model() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "runtime_models": ["verified-model"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+        config.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider": "work", "model": "verified-model"}
+            }))
+            .unwrap(),
+        );
+        assert!(!config.features.provider_model_ref);
+        assert_eq!(
+            get_default_model_from_config(&config).unwrap(),
+            "verified-model"
+        );
     }
 
     #[test]

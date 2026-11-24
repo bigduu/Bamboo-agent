@@ -511,6 +511,11 @@ async fn run_output_waits_for_root_recreation_and_rechecks_supervisor_owner() {
     let _proof = HTTP_PROOF.lock().await;
     for supervisor in [false, true] {
         let home = tempfile::tempdir().unwrap();
+        // This starts with an ordinary Root and installs Supervisor only via
+        // the explicit replacement below.
+        crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile(
+            home.path(),
+        );
         let provider = OutputProvider::new(false);
         let state = state(home.path(), provider.clone()).await;
         let id = if supervisor {
