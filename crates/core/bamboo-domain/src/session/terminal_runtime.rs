@@ -30,6 +30,17 @@ impl Session {
             }
     }
 
+    /// Shape of a saved managed resume before the successor enters execution.
+    /// Its Actor provenance and checkpoint revision are verified by Storage.
+    pub fn is_initializing_planned_update_resume(&self) -> bool {
+        self.last_run_status().as_deref() == Some("running")
+            && self
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.status == AgentStatusState::Initializing)
+            && !self.has_runtime_wait()
+    }
+
     pub fn host_run_id(&self) -> Option<&str> {
         self.metadata.get(HOST_RUN_ID).map(String::as_str)
     }

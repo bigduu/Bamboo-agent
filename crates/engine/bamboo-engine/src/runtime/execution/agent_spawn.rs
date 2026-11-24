@@ -208,7 +208,12 @@ impl SessionExecutionReservation {
         predecessor: &bamboo_domain::ActorActivationFence,
     ) -> std::io::Result<()> {
         self.bind_root_actor_inner(agent, session, false, Some(predecessor))
-            .await
+            .await?;
+        let actor = self.root_actor.as_mut().ok_or_else(|| {
+            std::io::Error::other("Planned update resume requires the current Root writer")
+        })?;
+        actor.planned_update_startup = Some(Box::new(session.clone()));
+        Ok(())
     }
 
     async fn bind_root_actor_inner(
@@ -1563,8 +1568,27 @@ pub fn spawn_session_execution_with_upstream_retry(
                     resources.record_unconfirmed("ordinary Root completion hook has no resource proof");
                 }
             }
-            let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
-            let root_actor_bound = root_actor.is_some();
+            // Keep the saved pause retryable until this exact runner owns
+            // the continuation. Publish before it can enter the agent loop.
+            let planned_update = if let Some(expected) = execution_reservation
+                .root_actor
+                .as_mut()
+                .and_then(|actor| actor.planned_update_startup.take())
+            {
+                let startup = if execution_reservation.cancel_token().is_cancelled() {
+                    Err(std::io::Error::other("Planned update continuation was cancelled"))
+                } else {
+                    admission_persistence.save_bound_startup_session(&mut session, &expected).await
+                };
+                if let Err(error) = startup {
+                    tracing::warn!(%session_id, %error, "Planned update continuation checkpoint remains pending");
+                    execution_reservation.abandon().await;
+                    return;
+                }
+                true
+            } else {
+                false
+            };
             let persistence = execution_reservation
                 .execution_persistence()
                 .unwrap_or_else(|| agent.persistence().clone());
@@ -1607,8 +1631,7 @@ pub fn spawn_session_execution_with_upstream_retry(
             }
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
             session.root_final_message_candidate = None;
-            let (cancel_token, mut activation_registration) =
-                execution_reservation.disarm_for_execution();
+            let cancel_token = execution_reservation.cancel_token().clone();
 
             // The primary model is required for a spawn; the roster stores it as
             // `Option<String>` for uniformity, so recover the owned String here
@@ -1698,6 +1721,31 @@ pub fn spawn_session_execution_with_upstream_retry(
                     run_budget,
                 },
             );
+
+            if planned_update {
+                let actor = execution_reservation.root_actor.as_ref().expect(
+                    "Planned update startup is bound to the current Root Actor",
+                );
+                // Revision zero proves that an abandoned startup could not
+                // have invoked any continuation hooks, model calls or tools.
+                let effect_entry = if execution_reservation.cancel_token().is_cancelled() {
+                    Err(bamboo_domain::ActorDirectoryError::InvalidTransition)
+                } else {
+                    actor.binding.directory.checkpoint_activation(
+                        &actor.binding.owner.fence,
+                        chrono::Utc::now(),
+                        0,
+                    ).await
+                };
+                if let Err(error) = effect_entry {
+                    tracing::warn!(%session_id, %error, "Planned update continuation did not enter execution");
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+            let mut root_actor = execution_reservation.root_actor.take().map(|owner| *owner);
+            let root_actor_bound = root_actor.is_some();
+            let (_, mut activation_registration) = execution_reservation.disarm_for_execution();
 
             // Panic containment (issue #546): everything below — the terminal
             // status persist, finalize_runner, and the child-completion
@@ -2234,6 +2282,7 @@ pub(super) struct RootActorExecution {
     stop_renewal: CancellationToken,
     renewal: Option<tokio::task::JoinHandle<()>>,
     response_events: Vec<AgentEvent>,
+    planned_update_startup: Option<Box<Session>>,
 }
 
 impl RootActorExecution {
@@ -2278,6 +2327,7 @@ impl RootActorExecution {
             stop_renewal,
             renewal: Some(renewal),
             response_events: Vec::new(),
+            planned_update_startup: None,
         }
     }
 

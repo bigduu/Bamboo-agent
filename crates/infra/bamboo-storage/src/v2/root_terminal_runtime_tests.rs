@@ -607,6 +607,239 @@ async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch
         .is_none());
     assert_eq!(fs::read(f.path("runtime.json")).await.unwrap(), before);
 }
+
+#[tokio::test]
+async fn planned_update_pre_startup_retry_preserves_original_runtime_observation() {
+    let f = Fixture::new(false, 300).await;
+    let now = Utc::now();
+    let mut parked = f.current().await;
+    let reason = bamboo_domain::PLANNED_UPDATE_SUSPEND_REASON;
+    let state = parked.agent_runtime_state.as_mut().unwrap();
+    state.status = AgentStatusState::Suspended;
+    state.suspension = Some(SuspensionState {
+        reason: reason.into(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: None,
+    });
+    parked
+        .metadata
+        .insert("runtime.suspend_reason".into(), reason.into());
+    parked.set_last_run_status("suspended");
+    f.store
+        .save_root_actor_runtime(&f.owner, &parked, false, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    f.store
+        .finish_root_activation_observed(&f.owner, now, ActorActivationFinish::Succeeded, None)
+        .await
+        .unwrap();
+
+    let predecessor = &f.owner.fence;
+    let parked = f.current().await;
+    assert!(SessionStoreV2::root_runtime_matches_activation(&parked, predecessor).unwrap());
+    let runtime_path = f.path("runtime.json");
+    let runtime_before = fs::read(&runtime_path).await.unwrap();
+    let claim = |run_id: &str, now| ActorActivationClaim {
+        actor_id: parked.id.clone(),
+        run_id: run_id.into(),
+        lease_owner: bamboo_domain::new_root_planned_update_lease_owner(predecessor),
+        lease_expires_at: now + chrono::Duration::seconds(60),
+        inbox_generation: 0,
+        placement_ref: None,
+        now,
+    };
+    let mut unrelated = claim("unrelated", now);
+    unrelated.lease_owner = "unrelated-owner".into();
+    assert!(matches!(
+        f.store
+            .claim_root_activation_observed_after(&unrelated, &parked, Some(predecessor))
+            .await,
+        Err(ActorDirectoryError::StaleFence)
+    ));
+    let first = f
+        .store
+        .claim_root_activation_observed_after(&claim("first", now), &parked, Some(predecessor))
+        .await
+        .unwrap();
+    let first = f.store.start_activation(&first.fence(), now).await.unwrap();
+    assert!(matches!(
+        f.store
+            .claim_root_activation_observed_after(
+                &claim("overlap", now),
+                &parked,
+                Some(predecessor)
+            )
+            .await,
+        Err(ActorDirectoryError::Busy)
+    ));
+    let owner_for = |activation: &ActorActivation| RootActorRuntimeWrite {
+        fence: activation.fence(),
+        created_at: parked.created_at,
+        conversation_generation: parked.conversation_generation_observation(),
+    };
+    let cancelled = f
+        .store
+        .finish_root_activation_observed(
+            &owner_for(&first),
+            now,
+            ActorActivationFinish::Cancelled,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, ActorActivationStatus::Cancelled);
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), runtime_before);
+
+    let second = f
+        .store
+        .claim_root_activation_observed_after(&claim("second", now), &parked, Some(predecessor))
+        .await
+        .unwrap();
+    assert_eq!(second.lease_epoch, first.lease_epoch + 1);
+    let third = f
+        .store
+        .claim_root_activation_observed_after(
+            &claim("third", second.lease_expires_at),
+            &parked,
+            Some(predecessor),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third.lease_epoch, second.lease_epoch + 1);
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), runtime_before);
+
+    // A replacement may write the Runtime sidecar, then die before it starts.
+    // The next claim must survive a second death before replacing this copy.
+    let mut initializing = parked.clone();
+    initializing.metadata.remove("runtime.suspend_reason");
+    initializing.set_last_run_status("running");
+    let state = initializing.agent_runtime_state.as_mut().unwrap();
+    state.status = AgentStatusState::Initializing;
+    state.suspension = None;
+    f.store
+        .start_activation(&third.fence(), second.lease_expires_at)
+        .await
+        .unwrap();
+    f.store
+        .save_root_actor_runtime(&owner_for(&third), &initializing, true, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    let initializing = f.current().await;
+    assert!(
+        SessionStoreV2::root_has_unstarted_planned_update_projection(&initializing, &third)
+            .unwrap()
+    );
+    let initializing_bytes = fs::read(&runtime_path).await.unwrap();
+    f.store
+        .finish_root_activation_observed(
+            &owner_for(&third),
+            second.lease_expires_at,
+            ActorActivationFinish::Cancelled,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), initializing_bytes);
+
+    let fourth = f
+        .store
+        .claim_root_activation_observed_after(
+            &claim("fourth", third.lease_expires_at),
+            &initializing,
+            Some(predecessor),
+        )
+        .await
+        .unwrap();
+    assert!(
+        SessionStoreV2::root_has_unstarted_planned_update_projection(&initializing, &fourth)
+            .unwrap()
+    );
+    assert!(matches!(
+        f.store
+            .claim_root_activation_observed(
+                &claim("ordinary", fourth.lease_expires_at),
+                &initializing,
+            )
+            .await,
+        Err(ActorDirectoryError::Busy)
+    ));
+    let mut forged = claim("supplied-carry", fourth.lease_expires_at);
+    forged.lease_owner = fourth.lease_owner.clone();
+    assert!(matches!(
+        f.store
+            .claim_root_activation_observed_after(&forged, &initializing, Some(predecessor))
+            .await,
+        Err(ActorDirectoryError::StaleFence)
+    ));
+    let fifth = f
+        .store
+        .claim_root_activation_observed_after(
+            &claim("fifth", fourth.lease_expires_at),
+            &initializing,
+            Some(predecessor),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fifth.lease_epoch, fourth.lease_epoch + 1);
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), initializing_bytes);
+
+    f.store
+        .start_activation(&fifth.fence(), fourth.lease_expires_at)
+        .await
+        .unwrap();
+    f.store
+        .save_root_actor_runtime(&owner_for(&fifth), &initializing, true, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    let entered = f
+        .store
+        .checkpoint_activation(&fifth.fence(), fourth.lease_expires_at, 0)
+        .await
+        .unwrap();
+    let current = f.current().await;
+    assert!(
+        !SessionStoreV2::root_has_unstarted_planned_update_projection(&current, &entered).unwrap()
+    );
+    assert!(matches!(
+        f.store
+            .claim_root_activation_observed_after(
+                &claim("replay-after-entry", entered.lease_expires_at),
+                &current,
+                Some(predecessor),
+            )
+            .await,
+        Err(ActorDirectoryError::StaleFence)
+    ));
+
+    let mut finished = current;
+    finished.set_last_run_status("completed");
+    finished.synchronize_terminal_runtime_status();
+    f.store
+        .save_root_actor_runtime(&owner_for(&fifth), &finished, false, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    f.store
+        .finish_root_activation_observed(
+            &owner_for(&fifth),
+            fourth.lease_expires_at,
+            ActorActivationFinish::Succeeded,
+            None,
+        )
+        .await
+        .unwrap();
+    let next = f.successor("ordinary-after-update").await;
+    let mut running = f.current().await;
+    running.set_last_run_status("running");
+    f.store
+        .save_root_actor_runtime(&next, &running, false, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    assert!(SessionStoreV2::root_completed_planned_update(
+        &f.current().await,
+        predecessor
+    ));
+}
 #[tokio::test]
 async fn root_terminal_wait_pending_and_later_idle_gate_are_preserved() {
     for mode in ["wait", "pending", "idle"] {

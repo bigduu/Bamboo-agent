@@ -1281,16 +1281,8 @@ impl ChildCompletionCoordinator {
             reservation.abandon().await;
             return Err(error);
         }
-        let writer = reservation.root_actor_writer().ok_or_else(|| {
-            std::io::Error::other("Planned update resume requires the current Root writer")
-        })?;
-        if root.fence.lease_epoch.checked_add(1) != Some(writer.fence.lease_epoch) {
-            drop(guard);
-            reservation.abandon().await;
-            return Ok(false);
-        }
         drop(guard);
-        self.start_bound_root_continuation(resumed, &saved, reservation)
+        self.dispatch_bound_root_continuation(resumed, reservation)
             .await?;
         Ok(true)
     }
@@ -1383,6 +1375,15 @@ impl ChildCompletionCoordinator {
             return Err(error);
         }
 
+        self.dispatch_bound_root_continuation(session, reservation)
+            .await
+    }
+
+    async fn dispatch_bound_root_continuation(
+        &self,
+        session: Session,
+        reservation: SessionExecutionReservation,
+    ) -> std::io::Result<()> {
         let config_snapshot = self.config.read().await.clone();
         let config = self.build_resume_config(&session, &config_snapshot);
         let request = ResumeSpawnRequest {

@@ -90,7 +90,7 @@ pub(super) async fn pause_before_model_round(
         );
         return Ok(false);
     }
-    if !matches_checkpoint(&parked, session) || session.has_runtime_wait() {
+    if !parked.matches_checkpoint(session) || session.has_runtime_wait() {
         return Ok(false);
     }
     router.park_root_for_update(parked, cancel).await
@@ -98,27 +98,29 @@ pub(super) async fn pause_before_model_round(
 
 /// Match the persisted history against the planned update controller's exact
 /// prepared member. The successor still needs to acquire the genuine writer.
-pub(crate) fn matches_checkpoint(root: &ParkedUpdateRoot, session: &Session) -> bool {
-    session.kind == SessionKind::Root
-        && session.authority_identity.is_ordinary()
-        && !crate::ticket_runtime::is_managed_work_root(session)
-        && session.id == root.session_id
-        && session.created_at == root.created_at
-        && session.root_tool_authority_revision == root.root_tool_authority_revision
-        && session.project_id_meta() == root.project_id
-        && session.workspace_path_meta() == root.workspace_path
-        && session
-            .conversation_reset_sha256()
-            .is_ok_and(|hash| hash == root.conversation_reset_sha256)
-        && session.messages.len() == root.message_count
-        && session
-            .messages
-            .last()
-            .is_some_and(|message| message.id == root.message_id)
-        && ParkedUpdateRoot::hash_transcript(&session.messages)
-            .is_ok_and(|hash| hash == root.transcript_sha256)
-        && session_effective_model_ref(session)
-            .is_some_and(|model| model.to_pair() == root.model.to_pair())
+impl ParkedUpdateRoot {
+    pub fn matches_checkpoint(&self, session: &Session) -> bool {
+        session.kind == SessionKind::Root
+            && session.authority_identity.is_ordinary()
+            && !crate::ticket_runtime::is_managed_work_root(session)
+            && session.id == self.session_id
+            && session.created_at == self.created_at
+            && session.root_tool_authority_revision == self.root_tool_authority_revision
+            && session.project_id_meta() == self.project_id
+            && session.workspace_path_meta() == self.workspace_path
+            && session
+                .conversation_reset_sha256()
+                .is_ok_and(|hash| hash == self.conversation_reset_sha256)
+            && session.messages.len() == self.message_count
+            && session
+                .messages
+                .last()
+                .is_some_and(|message| message.id == self.message_id)
+            && ParkedUpdateRoot::hash_transcript(&session.messages)
+                .is_ok_and(|hash| hash == self.transcript_sha256)
+            && session_effective_model_ref(session)
+                .is_some_and(|model| model.to_pair() == self.model.to_pair())
+    }
 }
 
 pub(crate) fn prepare_resuming_session(
@@ -127,8 +129,15 @@ pub(crate) fn prepare_resuming_session(
 ) -> Option<Session> {
     use crate::runtime::runner::state_bridge::{read_runtime_state, write_runtime_state};
 
-    if !matches_checkpoint(root, saved)
-        || saved.last_run_status().as_deref() != Some("suspended")
+    if !root.matches_checkpoint(saved) {
+        return None;
+    }
+    // The exact Actor claim must still prove that this saved startup had
+    // never entered execution before it can be acquired again.
+    if saved.is_initializing_planned_update_resume() {
+        return Some(saved.clone());
+    }
+    if saved.last_run_status().as_deref() != Some("suspended")
         || saved
             .metadata
             .get("runtime.suspend_reason")
@@ -269,7 +278,7 @@ mod tests {
         let tail = saved.messages.last().unwrap();
         assert_eq!(tail.role, Role::Tool);
         assert_eq!(tail.id, result_id);
-        assert!(matches_checkpoint(&parked, &saved));
+        assert!(parked.matches_checkpoint(&saved));
         assert!(prepare_resuming_session(&parked, &saved).is_none());
         assert!(!task.is_finished());
         let failed_write = update

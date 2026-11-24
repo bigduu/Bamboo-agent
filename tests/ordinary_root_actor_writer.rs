@@ -309,14 +309,19 @@ impl Drop for Host {
 }
 
 const UPDATE_MODEL: &str = "managed-update-root";
-const UPDATE_PROMPTS: [&str; 2] = ["MANAGED_UPDATE_FIRST", "MANAGED_UPDATE_SECOND"];
+const UPDATE_PROMPTS: [&str; 3] = [
+    "MANAGED_UPDATE_FIRST",
+    "MANAGED_UPDATE_SECOND",
+    "MANAGED_UPDATE_CRASH",
+];
 const UPDATE_READBACK: &str = "durable result from the predecessor";
 const UPDATE_QUEUED_INPUT: &str = "Durable follow-up queued before successor startup";
 
 struct UpdateProbe {
     path: PathBuf,
-    calls: [AtomicUsize; 2],
-    release: tokio::sync::watch::Sender<bool>,
+    calls: [AtomicUsize; UPDATE_PROMPTS.len()],
+    release_predecessor: tokio::sync::watch::Sender<bool>,
+    release_successor: [tokio::sync::watch::Sender<bool>; UPDATE_PROMPTS.len()],
 }
 
 async fn update_provider(body: web::Json<Value>, probe: web::Data<UpdateProbe>) -> HttpResponse {
@@ -335,7 +340,7 @@ async fn update_provider(body: web::Json<Value>, probe: web::Data<UpdateProbe>) 
         let tool_id = format!("managed-update-read-{index}");
         match probe.calls[index].fetch_add(1, Ordering::SeqCst) {
             0 => {
-                let mut release = probe.release.subscribe();
+                let mut release = probe.release_predecessor.subscribe();
                 release.wait_for(|ready| *ready).await.unwrap();
                 (
                     json!({"role":"assistant","tool_calls":[{
@@ -359,6 +364,8 @@ async fn update_provider(body: web::Json<Value>, probe: web::Data<UpdateProbe>) 
                     1,
                     "the successor receives the one persisted tool result"
                 );
+                let mut release = probe.release_successor[index].subscribe();
+                release.wait_for(|ready| *ready).await.unwrap();
                 (
                     json!({"content":"Resumed after the planned update."}),
                     "stop",
@@ -442,11 +449,11 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     std::fs::create_dir(&workspace).unwrap();
     let path = workspace.join("predecessor.txt");
     std::fs::write(&path, UPDATE_READBACK).unwrap();
-    let (release, _) = tokio::sync::watch::channel(false);
     let probe = web::Data::new(UpdateProbe {
         path,
         calls: std::array::from_fn(|_| AtomicUsize::new(0)),
-        release,
+        release_predecessor: tokio::sync::watch::channel(false).0,
+        release_successor: std::array::from_fn(|_| tokio::sync::watch::channel(false).0),
     });
     let captured = probe.clone();
     let gateway = HttpServer::new(move || {
@@ -467,7 +474,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     let url = format!("http://{}/v1", gateway.addrs()[0]);
     let gateway = gateway.run();
     let gateway_handle = gateway.handle();
-    actix_web::rt::spawn(gateway);
+    let gateway_task = actix_web::rt::spawn(gateway);
     std::fs::write(
         data.join("config.json"),
         serde_json::to_vec(&json!({
@@ -541,7 +548,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
         }
     })
     .await
-    .expect("both ordinary Roots entered the live provider");
+    .expect("all ordinary Roots entered the live provider");
 
     let mut sequence = 0;
     let abandoned = uuid::Uuid::new_v4();
@@ -572,7 +579,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
         preparing["status"], "busy",
         "new request can replace the aborted preparation: {preparing}"
     );
-    probe.release.send_replace(true);
+    probe.release_predecessor.send_replace(true);
     tokio::time::timeout(WAIT, async {
         loop {
             let reply =
@@ -586,7 +593,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
         }
     })
     .await
-    .expect("both old Roots finish Read and park before the next provider call");
+    .expect("all old Roots finish Read and park before the next provider call");
     assert!(probe
         .calls
         .iter()
@@ -618,7 +625,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     assert!(!receipts.join(format!("{abandoned}.ready")).exists());
     let intent: Value = serde_json::from_slice(&intent).unwrap();
     assert_eq!(intent["request"], request.to_string());
-    assert_eq!(intent["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(intent["roots"].as_array().unwrap().len(), roots.len());
     let store = Arc::new(SessionStoreV2::new(data.clone()).await.unwrap());
     let mut predecessors = Vec::new();
     for id in &roots {
@@ -715,9 +722,39 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
     let reply =
         send_update_command(new_control.path(), &new, request, &mut sequence, "resume").await;
     assert_eq!(reply["status"], "resumed", "successor recovery: {reply}");
-    assert_eq!(reply["report"]["resumed"], 2, "{reply}");
-    assert_eq!(reply["report"]["pending_sessions"], json!([]));
-    for (id, (_, predecessor)) in roots.iter().zip(predecessors) {
+    tokio::time::timeout(WAIT, async {
+        while probe
+            .calls
+            .iter()
+            .any(|calls| calls.load(Ordering::SeqCst) < 2)
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all successor Roots reach their gated provider request");
+    let crash_index = roots.len() - 1;
+    let crash_root = &roots[crash_index];
+    let in_progress =
+        send_update_command(new_control.path(), &new, request, &mut sequence, "resume").await;
+    assert_eq!(in_progress["status"], "resumed", "{in_progress}");
+    // This Root has no queued follow-up and the provider has produced no
+    // response. Its saved startup projection alone cannot confirm recovery.
+    assert!(
+        in_progress["report"]["pending_sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(crash_root)),
+        "{in_progress}"
+    );
+    assert!(probe
+        .calls
+        .iter()
+        .all(|calls| calls.load(Ordering::SeqCst) == 2));
+    for release in &probe.release_successor[..crash_index] {
+        release.send_replace(true);
+    }
+    for (id, (_, predecessor)) in roots[..crash_index].iter().zip(&predecessors) {
         tokio::time::timeout(WAIT, async {
             loop {
                 let session = store.load_session(id).await.unwrap().unwrap();
@@ -736,19 +773,76 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
         .await
         .expect("the successor finishes the same Root");
     }
-    let repeated =
-        send_update_command(new_control.path(), &new, request, &mut sequence, "resume").await;
+    let before_crash = tokio::time::timeout(WAIT, async {
+        loop {
+            let reply =
+                send_update_command(new_control.path(), &new, request, &mut sequence, "resume")
+                    .await;
+            assert_eq!(reply["status"], "resumed", "{reply}");
+            if reply["report"]["advanced"] == crash_index {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the two released Roots confirm durable progress");
     assert_eq!(
-        repeated["report"],
-        json!({"resumed":0,"advanced":2,"pending_sessions":[]})
+        before_crash["report"],
+        json!({"resumed":0,"advanced":crash_index,"pending_sessions":[crash_root]})
     );
+    let interrupted = store
+        .inspect_actor(crash_root)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(interrupted.status, ActorActivationStatus::Running);
+    assert_eq!(
+        interrupted.lease_epoch,
+        predecessors[crash_index].1.lease_epoch + 1
+    );
+    let projected = store.load_session(crash_root).await.unwrap().unwrap();
+    assert!(
+        SessionStoreV2::root_runtime_matches_activation(&projected, &interrupted.fence()).unwrap()
+    );
+    // The real provider received this request but has not sent a response.
+    // Kill and reap the exact successor before a different Host reads its
+    // profile. It cannot count the startup projection as durable progress.
+    new.child.kill().unwrap();
+    assert!(!new.child.wait().unwrap().success());
+    let recovery_control = tempfile::tempdir_in(&root).unwrap();
+    let mut recovery =
+        Host::start_with_control(&data, "managed-recovery", Some(recovery_control.path()));
+    Fixture::healthy(&client, &mut recovery).await;
+    assert_ne!(new.child.id(), recovery.child.id());
+    let mut sequence = 0;
+    let repeated = send_update_command(
+        recovery_control.path(),
+        &recovery,
+        request,
+        &mut sequence,
+        "resume",
+    )
+    .await;
+    assert_eq!(repeated["status"], "resumed", "{repeated}");
+    assert_eq!(repeated["report"], before_crash["report"]);
+    let still_pending = store
+        .inspect_actor(crash_root)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(still_pending.fence(), interrupted.fence());
+    std::fs::File::create_new(recovery_control.path().join("stop")).unwrap();
+    expect_graceful_exit(&mut recovery).await;
     assert!(probe
         .calls
         .iter()
         .all(|calls| calls.load(Ordering::SeqCst) == 2));
-    std::fs::File::create_new(new_control.path().join("stop")).unwrap();
-    expect_graceful_exit(&mut new).await;
+    probe.release_successor[crash_index].send_replace(true);
     gateway_handle.stop(true).await;
+    gateway_task.await.unwrap().unwrap();
 }
 
 struct EventTap {

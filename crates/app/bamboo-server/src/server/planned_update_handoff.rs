@@ -1,7 +1,10 @@
 //! Durable handoff between two desktop-owned Bamboo processes.
 
 use bamboo_domain::session::model_context::sha256_hex;
-use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, Storage};
+use bamboo_domain::{
+    is_root_planned_update_attempt, ActorActivationStatus, ActorDirectoryPort, AgentStatusState,
+    Role, Session, Storage,
+};
 use bamboo_engine::session_activation::ParkedUpdateRoot;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -198,9 +201,104 @@ fn read(profile: &Path, request: Uuid) -> io::Result<UpdateHandoff> {
     Ok(handoff)
 }
 
-/// Called after the desktop has verified its replacement runtime. Reopen the
-/// recorded profile and prove that each exact old Actor finished before
-/// asking the ordinary coordinator to claim the continuation.
+enum RootReplay {
+    Retry,
+    Advanced,
+    Pending,
+}
+
+fn continued_checkpoint(root: &ParkedUpdateRoot, session: &Session) -> bool {
+    if session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|runtime| runtime.status == AgentStatusState::Initializing)
+    {
+        return false;
+    }
+    let Some((before, after)) = session.messages.split_at_checked(root.message_count) else {
+        return false;
+    };
+    after
+        .iter()
+        .any(|message| matches!(message.role, Role::Assistant | Role::Tool))
+        && before
+            .last()
+            .is_some_and(|message| message.id == root.message_id)
+        && ParkedUpdateRoot::hash_transcript(before)
+            .is_ok_and(|hash| hash == root.transcript_sha256)
+}
+
+async fn observe_root(state: &crate::app_state::AppState, root: &ParkedUpdateRoot) -> RootReplay {
+    let Ok(actor) = state.session_store.inspect_actor(&root.session_id).await else {
+        return RootReplay::Pending;
+    };
+    let Some(owner) = actor
+        .activation
+        .filter(|_| actor.actor.session_created_at == root.created_at)
+    else {
+        return RootReplay::Pending;
+    };
+    let Ok(Some(session)) = state.session_store.load_session(&root.session_id).await else {
+        return RootReplay::Pending;
+    };
+    if session.created_at != root.created_at
+        || session.project_id_meta() != root.project_id
+        || !session
+            .conversation_reset_sha256()
+            .is_ok_and(|hash| hash == root.conversation_reset_sha256)
+    {
+        return RootReplay::Pending;
+    }
+    if bamboo_storage::SessionStoreV2::root_completed_planned_update(&session, &root.fence) {
+        return RootReplay::Advanced;
+    }
+    let original =
+        owner.matches_fence(&root.fence) && owner.status == ActorActivationStatus::Succeeded;
+    let same_origin = owner.lease_epoch > root.fence.lease_epoch
+        && is_root_planned_update_attempt(&owner.lease_owner, &root.fence);
+    if same_origin
+        && owner.checkpoint_revision != 0
+        && !session.is_parked_for_planned_update()
+        && bamboo_storage::SessionStoreV2::root_runtime_matches_activation(&session, &owner.fence())
+            .unwrap_or(false)
+        && ((owner.status == ActorActivationStatus::Succeeded
+            && session.last_run_status().as_deref() == Some("completed"))
+            || continued_checkpoint(root, &session))
+    {
+        return RootReplay::Advanced;
+    }
+
+    let abandoned_attempt = same_origin
+        && owner.checkpoint_revision == 0
+        && (matches!(
+            owner.status,
+            ActorActivationStatus::Cancelled | ActorActivationStatus::Failed
+        ) || (owner.status.is_live() && owner.lease_expires_at <= chrono::Utc::now()));
+    if !original && !abandoned_attempt {
+        return RootReplay::Pending;
+    }
+    let original_pause = session.is_parked_for_planned_update()
+        && bamboo_storage::SessionStoreV2::root_runtime_matches_activation(&session, &root.fence)
+            .unwrap_or(false);
+    let unstarted_startup = abandoned_attempt
+        && bamboo_storage::SessionStoreV2::root_has_unstarted_planned_update_projection(
+            &session, &owner,
+        )
+        .unwrap_or(false);
+    if (original_pause || unstarted_startup)
+        && root.matches_checkpoint(&session)
+        && !state
+            .session_activation_router
+            .owns_run(&root.session_id, &owner.run_id)
+            .await
+    {
+        return RootReplay::Retry;
+    }
+    RootReplay::Pending
+}
+
+/// Called after the desktop has verified its replacement runtime. Only durable
+/// progress by the authorized continuation completes a recorded member.
 pub(super) async fn resume(
     state: &crate::app_state::AppState,
     request: Uuid,
@@ -211,48 +309,25 @@ pub(super) async fn resume(
         .map_err(io::Error::other)??;
     let mut report = UpdateResumeReport::default();
     for root in &handoff.roots {
-        let activation = state.session_store.inspect_actor(&root.session_id).await;
-        if let Ok(actor) = activation {
-            if let Some(owner) = actor
-                .activation
-                .filter(|_| actor.actor.session_created_at == root.created_at)
-            {
-                if owner.lease_epoch > root.fence.lease_epoch
-                    && state
-                        .session_store
-                        .load_session(&root.session_id)
-                        .await
-                        .is_ok_and(|saved| {
-                            saved.is_some_and(|session| {
-                                bamboo_storage::SessionStoreV2::root_runtime_matches_activation(
-                                    &session,
-                                    &owner.fence(),
-                                )
-                                .unwrap_or(false)
-                                    && !session.is_parked_for_planned_update()
-                            })
-                        })
+        match observe_root(state, root).await {
+            RootReplay::Advanced => {
+                report.advanced += 1;
+                continue;
+            }
+            RootReplay::Retry => {
+                if let Err(error) = state
+                    .child_completion_coordinator
+                    .resume_planned_update_root(root)
+                    .await
                 {
-                    report.advanced += 1;
+                    tracing::warn!(session_id = %root.session_id, %error, "Planned update session recovery remains pending");
+                }
+                if matches!(observe_root(state, root).await, RootReplay::Advanced) {
+                    report.resumed += 1;
                     continue;
                 }
-                if owner.fence() == root.fence && owner.status == ActorActivationStatus::Succeeded {
-                    match state
-                        .child_completion_coordinator
-                        .resume_planned_update_root(root)
-                        .await
-                    {
-                        Ok(true) => {
-                            report.resumed += 1;
-                            continue;
-                        }
-                        Ok(false) => (),
-                        Err(error) => {
-                            tracing::warn!(session_id = %root.session_id, %error, "Planned update session recovery remains pending")
-                        }
-                    }
-                }
             }
+            RootReplay::Pending => (),
         }
         report.pending_sessions.push(root.session_id.clone());
     }

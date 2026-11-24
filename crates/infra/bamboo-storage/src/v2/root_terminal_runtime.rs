@@ -1,12 +1,14 @@
 //! Root logical terminal repair. No lease or cache observation proves Worker stop.
 use super::*;
 use bamboo_domain::{
-    is_root_compaction_lease_owner, AgentRuntimeState, AgentStatusState, LlmRequestDiagnostic,
-    RootActorRuntimeWrite, SessionKind, SupervisedRootOutcomeResult,
+    is_root_compaction_lease_owner, root_planned_update_predecessor_sha256, AgentRuntimeState,
+    AgentStatusState, LlmRequestDiagnostic, RootActorRuntimeWrite, SessionKind,
+    SupervisedRootOutcomeResult,
 };
 use sha2::{Digest, Sha256};
 
 pub(super) const ROOT_OBSERVATION: &str = "runtime.root_writer_observation_v1";
+const PLANNED_UPDATE_COMPLETED: &str = "runtime.planned_update_completed_v1";
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RootObservation {
@@ -24,10 +26,19 @@ fn invalid() -> io::Error {
     )
 }
 fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<RootObservation> {
-    if session.kind != SessionKind::Root
-        || !session.authority_identity.is_ordinary()
-        || session.id != fence.actor_id
-    {
+    if session.id != fence.actor_id {
+        return Err(invalid());
+    }
+    observation_for_fence_sha256(
+        session,
+        format!("{:x}", Sha256::digest(serde_json::to_vec(fence)?)),
+    )
+}
+fn observation_for_fence_sha256(
+    session: &Session,
+    fence_sha256: String,
+) -> io::Result<RootObservation> {
+    if session.kind != SessionKind::Root || !session.authority_identity.is_ordinary() {
         return Err(invalid());
     }
     Ok(RootObservation {
@@ -38,7 +49,7 @@ fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<Ro
             Sha256::digest(serde_json::to_vec(&session.project_id_meta())?)
         ),
         metadata_version: session.metadata_version,
-        fence_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(fence)?)),
+        fence_sha256,
         conversation_reset_sha256: session
             .conversation_reset_sha256()
             .map_err(|_| invalid())?
@@ -46,17 +57,44 @@ fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<Ro
     })
 }
 fn matches_observation(session: &Session, fence: &ActorActivationFence) -> io::Result<bool> {
-    let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else {
+    let Some(recorded) = read_observation(session)? else {
         return Ok(false);
     };
-    if raw.len() > 2048 {
-        return Err(invalid());
-    }
-    let recorded: RootObservation = serde_json::from_str(raw).map_err(|_| invalid())?;
     Ok(compatible_observation(
         &recorded,
         &observation(session, fence)?,
     ))
+}
+fn read_observation(session: &Session) -> io::Result<Option<RootObservation>> {
+    let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else {
+        return Ok(None);
+    };
+    if raw.len() > 2048 {
+        return Err(invalid());
+    }
+    serde_json::from_str(raw).map(Some).map_err(|_| invalid())
+}
+fn parked_update_predecessor_sha256<'a>(
+    session: &Session,
+    activation: &'a ActorActivation,
+) -> io::Result<Option<&'a str>> {
+    if activation.checkpoint_revision != 0
+        || session.last_run_status().as_deref() != Some("suspended")
+        || !session.is_parked_for_planned_update()
+    {
+        return Ok(None);
+    }
+    let Some(digest) = root_planned_update_predecessor_sha256(&activation.lease_owner) else {
+        return Ok(None);
+    };
+    let Some(recorded) = read_observation(session)? else {
+        return Ok(None);
+    };
+    Ok(compatible_observation(
+        &recorded,
+        &observation_for_fence_sha256(session, digest.to_owned())?,
+    )
+    .then_some(digest))
 }
 fn compatible_observation(recorded: &RootObservation, current: &RootObservation) -> bool {
     recorded.schema_version == 1
@@ -107,7 +145,16 @@ pub(super) fn stamp_owned_observation(
     session
         .metadata
         .remove("runtime.reconciled_activation_fence");
+    preserve_completed_update(session, Some(canonical));
     Ok(())
+}
+fn preserve_completed_update(incoming: &mut Session, canonical: Option<&Session>) {
+    incoming.metadata.remove(PLANNED_UPDATE_COMPLETED);
+    if let Some(digest) = canonical.and_then(|s| s.metadata.get(PLANNED_UPDATE_COMPLETED)) {
+        incoming
+            .metadata
+            .insert(PLANNED_UPDATE_COMPLETED.into(), digest.clone());
+    }
 }
 pub(super) fn preserve_observation(incoming: &mut Session, canonical: Option<&Session>) {
     incoming.metadata.remove(ROOT_OBSERVATION);
@@ -116,6 +163,7 @@ pub(super) fn preserve_observation(incoming: &mut Session, canonical: Option<&Se
             .metadata
             .insert(ROOT_OBSERVATION.into(), raw.clone());
     }
+    preserve_completed_update(incoming, canonical);
 }
 pub(super) fn validate_projection_identity(
     entry: &ActorDirectoryEntry,
@@ -150,12 +198,68 @@ fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
     }
 }
 impl SessionStoreV2 {
+    pub(in crate::v2) fn same_root_runtime_observation(left: &Session, right: &Session) -> bool {
+        left.metadata.get(ROOT_OBSERVATION) == right.metadata.get(ROOT_OBSERVATION)
+    }
+
     /// Verify that the persisted Root runtime was written under this Actor.
     pub fn root_runtime_matches_activation(
         session: &Session,
         fence: &ActorActivationFence,
     ) -> io::Result<bool> {
         matches_observation(session, fence)
+    }
+
+    /// A planned update has saved its successor projection, but no execution
+    /// effects are authorized until this exact Actor consumes revision zero.
+    pub fn root_has_unstarted_planned_update_projection(
+        session: &Session,
+        activation: &ActorActivation,
+    ) -> io::Result<bool> {
+        Ok(Self::root_unstarted_planned_update_projection_sha256(session, activation)?.is_some())
+    }
+
+    /// A completed replacement can no longer be the current Actor after an
+    /// ordinary Inbox activation. Its last exact handoff remains observable.
+    pub fn root_completed_planned_update(
+        session: &Session,
+        predecessor: &ActorActivationFence,
+    ) -> bool {
+        session
+            .metadata
+            .get(PLANNED_UPDATE_COMPLETED)
+            .is_some_and(|digest| {
+                observation(session, predecessor)
+                    .is_ok_and(|predecessor| predecessor.fence_sha256 == *digest)
+            })
+    }
+
+    pub(super) fn root_unstarted_planned_update_projection_sha256(
+        session: &Session,
+        activation: &ActorActivation,
+    ) -> io::Result<Option<String>> {
+        if activation.checkpoint_revision != 0
+            || root_planned_update_predecessor_sha256(&activation.lease_owner).is_none()
+            || !session.is_initializing_planned_update_resume()
+        {
+            return Ok(None);
+        }
+        let Some(recorded) = read_observation(session)? else {
+            return Ok(None);
+        };
+        if compatible_observation(&recorded, &observation(session, &activation.fence())?) {
+            return Ok(Some(recorded.fence_sha256));
+        }
+        let Some(prior) =
+            bamboo_domain::root_planned_update_prior_projection_sha256(&activation.lease_owner)
+        else {
+            return Ok(None);
+        };
+        Ok(compatible_observation(
+            &recorded,
+            &observation_for_fence_sha256(session, prior.into())?,
+        )
+        .then_some(recorded.fence_sha256))
     }
 
     /// Attribute the provider diagnostic to an already authorized failed run.
@@ -199,10 +303,25 @@ impl SessionStoreV2 {
         let Some(activation) = entry.activation.as_ref() else {
             return Ok(());
         };
-        if matches_observation(previous, &activation.fence()).unwrap_or(false) {
-            let encoded = serde_json::to_string(&observation(incoming, &activation.fence())?)?;
-            incoming.metadata.insert(ROOT_OBSERVATION.into(), encoded);
-        }
+        let updated = if matches_observation(previous, &activation.fence()).unwrap_or(false) {
+            observation(incoming, &activation.fence())?
+        } else {
+            let digest =
+                Self::root_unstarted_planned_update_projection_sha256(previous, activation)
+                    .unwrap_or(None)
+                    .or_else(|| {
+                        parked_update_predecessor_sha256(previous, activation)
+                            .unwrap_or(None)
+                            .map(str::to_owned)
+                    });
+            let Some(digest) = digest else {
+                return Ok(());
+            };
+            observation_for_fence_sha256(incoming, digest)?
+        };
+        incoming
+            .metadata
+            .insert(ROOT_OBSERVATION.into(), serde_json::to_string(&updated)?);
         Ok(())
     }
 
@@ -213,12 +332,12 @@ impl SessionStoreV2 {
         fence: &ActorActivationFence,
         guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<Option<SupervisedRootOutcomeResult>, ActorDirectoryError> {
-        if entry.actor.parent_actor_id.is_some()
-            || !entry
-                .activation
-                .as_ref()
-                .is_some_and(|a| a.matches_fence(fence))
-        {
+        let activation = entry
+            .activation
+            .as_ref()
+            .filter(|activation| activation.matches_fence(fence))
+            .ok_or(ActorDirectoryError::StaleFence)?;
+        if entry.actor.parent_actor_id.is_some() {
             return Err(ActorDirectoryError::StaleFence);
         }
         let path = self.abs_path_from_rel(rel).join("session.json");
@@ -232,21 +351,38 @@ impl SessionStoreV2 {
         let main: Session =
             serde_json::from_slice(&bytes).map_err(|_| ActorDirectoryError::Corrupt)?;
         super::super::reject_incompatible_session_write(&main).map_err(storage)?;
-        let Some(outcomes) = main
+        let mut outcome = main
             .runtime_metadata
             .as_ref()
             .and_then(|m| m.supervised_root_outcomes.as_ref())
-        else {
-            return Ok(None);
-        };
-        let outcome = outcomes
-            .finalized_for_fence(&main, fence)
+            .map(|outcomes| outcomes.finalized_for_fence(&main, fence))
+            .transpose()
             .map_err(|reason| {
                 tracing::warn!(%reason, "Root Main terminal fact failed validation");
                 ActorDirectoryError::Corrupt
-            })?;
-        let outcome =
-            outcome.filter(|result| *result != SupervisedRootOutcomeResult::InterruptedUnknown);
+            })?
+            .flatten();
+        if outcome == Some(SupervisedRootOutcomeResult::InterruptedUnknown) {
+            return Ok(None);
+        }
+        if outcome.is_none()
+            && activation.checkpoint_revision > 0
+            && root_planned_update_predecessor_sha256(&activation.lease_owner).is_some()
+        {
+            // Ordinary Roots do not have a Supervisor ledger. Their actual
+            // final save records the exact writer and terminal status in Main.
+            // A leading Runtime write alone cannot attest completion.
+            let status = match main.last_run_status().as_deref() {
+                Some("completed" | "skipped") => Some(SupervisedRootOutcomeResult::Completed),
+                Some("suspended") => Some(SupervisedRootOutcomeResult::Suspended),
+                Some("cancelled") => Some(SupervisedRootOutcomeResult::Cancelled),
+                Some("error" | "failed" | "timeout") => Some(SupervisedRootOutcomeResult::Failed),
+                _ => None,
+            };
+            if status.is_some() && matches_observation(&main, fence).map_err(storage)? {
+                outcome = status;
+            }
+        }
         if outcome.is_none() {
             return Ok(None);
         }
@@ -302,7 +438,14 @@ impl SessionStoreV2 {
         requested: Option<ActorActivationFinish>,
         now: DateTime<Utc>,
         guards: &Arc<ActorAuthorityGuards>,
-    ) -> Result<(ActorActivation, Option<SupervisedRootOutcomeResult>), ActorDirectoryError> {
+    ) -> Result<
+        (
+            ActorActivation,
+            Option<SupervisedRootOutcomeResult>,
+            Option<String>,
+        ),
+        ActorDirectoryError,
+    > {
         let activation = entry
             .activation
             .as_ref()
@@ -328,11 +471,8 @@ impl SessionStoreV2 {
                 .ok_or(ActorDirectoryError::InvalidTransition)?,
         };
         let selected_status = finish_status(selected);
-        if activation.status == selected_status {
-            self.confirm_actor_file_durable(path, guards).await?;
-            return Ok((activation.clone(), main));
-        }
-        if !activation.status.is_live() && main.is_none() {
+        let repeated = activation.status == selected_status;
+        if !repeated && !activation.status.is_live() && main.is_none() {
             return Err(ActorDirectoryError::InvalidTransition);
         }
         if activation.status.is_live() {
@@ -347,6 +487,16 @@ impl SessionStoreV2 {
             if requested.is_none() && (activation.lease_expires_at > now || main.is_none()) {
                 return Err(ActorDirectoryError::InvalidTransition);
             }
+        }
+        let completed_update = if main.is_some() {
+            self.record_planned_update_completion(entry, rel, activation, guards)
+                .await?
+        } else {
+            None
+        };
+        if repeated {
+            self.confirm_actor_file_durable(path, guards).await?;
+            return Ok((activation.clone(), main, completed_update));
         }
         let activation = entry
             .activation
@@ -364,7 +514,35 @@ impl SessionStoreV2 {
         }
         entry.revision = checked_next(entry.revision)?;
         self.write_actor_entry(path, entry, guards).await?;
-        Ok((result, main))
+        Ok((result, main, completed_update))
+    }
+
+    async fn record_planned_update_completion(
+        &self,
+        entry: &ActorDirectoryEntry,
+        rel: &str,
+        activation: &ActorActivation,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<Option<String>, ActorDirectoryError> {
+        let Some(digest) = root_planned_update_predecessor_sha256(&activation.lease_owner)
+            .filter(|_| activation.checkpoint_revision > 0)
+        else {
+            return Ok(None);
+        };
+        let current = self
+            .projection_target(&activation.actor_id, rel)
+            .await
+            .map_err(storage)?
+            .ok_or(ActorDirectoryError::InvalidIdentity)?;
+        validate_projection_identity(entry, &current)?;
+        let mut completed = current.clone();
+        completed
+            .metadata
+            .insert(PLANNED_UPDATE_COMPLETED.into(), digest.into());
+        // Seal the prior handoff before the Actor becomes replaceable by Inbox.
+        self.commit_runtime_projection(&current, &completed, rel, guards)
+            .await?;
+        Ok(Some(digest.into()))
     }
 
     async fn project_root_terminal(
@@ -473,7 +651,7 @@ impl SessionStoreV2 {
         if is_root_compaction_lease_owner(&fence.lease_owner) {
             // Compaction owns this exact fence and can close it even if its
             // HTTP waiter was dropped. It has no chat outcome to project.
-            let (finished, _) = self
+            let (finished, ..) = self
                 .settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards)
                 .await?;
             return Ok(finished);
@@ -492,6 +670,22 @@ impl SessionStoreV2 {
             if main.is_none() && terminal_finish(active.status) != Some(outcome) {
                 return Err(ActorDirectoryError::InvalidTransition);
             }
+        }
+        if matches!(
+            outcome,
+            ActorActivationFinish::Cancelled | ActorActivationFinish::Failed
+        ) && (Self::root_has_unstarted_planned_update_projection(&initial, active)
+            .map_err(storage)?
+            || parked_update_predecessor_sha256(&initial, active)
+                .map_err(storage)?
+                .is_some())
+        {
+            // This replacement never crossed the execution checkpoint. Close
+            // its Actor attempt without consuming the exact retry projection.
+            let (finished, ..) = self
+                .settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards)
+                .await?;
+            return Ok(finished);
         }
         let mut marked = initial.clone();
         let was_attributed = matches_observation(&initial, fence).unwrap_or(false);
@@ -516,9 +710,14 @@ impl SessionStoreV2 {
         }
         self.commit_root_observation(&initial, &marked, &rel, &guards)
             .await?;
-        let (finished, main) = self
+        let (finished, main, completed_update) = self
             .settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards)
             .await?;
+        if let Some(digest) = completed_update {
+            marked
+                .metadata
+                .insert(PLANNED_UPDATE_COMPLETED.into(), digest);
+        }
         if main != Some(SupervisedRootOutcomeResult::Suspended)
             && !marked.has_runtime_wait()
             && marked.last_run_status().as_deref() != Some("pending")
@@ -562,7 +761,7 @@ impl SessionStoreV2 {
         {
             return Err(invalid());
         }
-        let Some(latest) = self.projection_target(&expected.id, &rel).await? else {
+        let Some(mut latest) = self.projection_target(&expected.id, &rel).await? else {
             return Ok(None);
         };
         super::super::reject_incompatible_session_write(&latest)?;
@@ -591,6 +790,10 @@ impl SessionStoreV2 {
                 // supplies no evidence about the preceding chat run.
                 return Ok(None);
             }
+            if Self::root_has_unstarted_planned_update_projection(&latest, activation)? {
+                // The desktop handoff can still retry this unused attempt.
+                return Ok(None);
+            }
             let fence = activation.fence();
             let attributed = matches_observation(&latest, &fence)?;
             if (!attributed
@@ -617,10 +820,15 @@ impl SessionStoreV2 {
             {
                 return Ok(None);
             }
-            let (settled, main) = self
+            let (settled, main, completed_update) = self
                 .settle_root_entry(&mut entry, &rel, &path, &fence, None, Utc::now(), &guards)
                 .await
                 .map_err(io::Error::other)?;
+            if let Some(digest) = completed_update {
+                latest
+                    .metadata
+                    .insert(PLANNED_UPDATE_COMPLETED.into(), digest);
+            }
             if main == Some(SupervisedRootOutcomeResult::Suspended) {
                 self.commit_runtime_projection(&latest, &latest, &rel, &guards)
                     .await
