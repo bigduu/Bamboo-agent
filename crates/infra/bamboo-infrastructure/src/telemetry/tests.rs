@@ -73,6 +73,58 @@ async fn finite_invocations_parent_real_operations_and_preserve_usage_presence()
 }
 
 #[tokio::test]
+async fn performance_fields_attach_only_to_the_observed_operation() {
+    use std::time::Duration;
+
+    let test = test_support::TraceTest::default();
+    test.scope(async {
+        let model = Observation::llm(Some("gemini"), "gemini-test", "session-1");
+        assert!(model.is_recording());
+        model.token_cache_snapshot(1024, 32, 50);
+        model
+            .scope(async {
+                record_first_model_text(Duration::from_micros(1234));
+            })
+            .await;
+        model.finish(Outcome::Success);
+
+        let tool = Observation::tool("Grep", "call-1", "session-1", "round-1");
+        tool.scope(async {
+            record_grep_performance(&GrepPerformance {
+                queue_time: Duration::from_micros(10),
+                scan_time: Duration::from_micros(100),
+                files_scanned: 4,
+                bytes_scanned: 4096,
+                matches: 0,
+                ripgrep_files: 3,
+            });
+        })
+        .await;
+        tool.finish(Outcome::Success);
+    })
+    .await;
+    let spans = test.spans();
+    let model = &spans[0];
+    let tool = &spans[1];
+    assert_eq!(
+        attr(model, "bamboo.perf.model.first_text_us"),
+        Some(&Value::I64(1234))
+    );
+    assert_eq!(
+        attr(model, "bamboo.perf.token_cache.process_hits"),
+        Some(&Value::I64(1024))
+    );
+    assert_eq!(
+        attr(tool, "bamboo.perf.grep.bytes_scanned"),
+        Some(&Value::I64(4096))
+    );
+    assert_eq!(attr(tool, "bamboo.perf.grep.matches"), Some(&Value::I64(0)));
+    assert!(attr(model, "bamboo.perf.grep.bytes_scanned").is_none());
+    assert!(attr(tool, "bamboo.perf.token_cache.process_hits").is_none());
+    assert!(spans.iter().all(|span| span.events.is_empty()));
+}
+
+#[tokio::test]
 async fn context_isolated_between_parallel_and_explicitly_spawned_futures() {
     let test = test_support::TraceTest::default();
     test.scope(async {

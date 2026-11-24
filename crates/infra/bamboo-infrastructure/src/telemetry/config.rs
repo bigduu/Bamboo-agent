@@ -255,6 +255,9 @@ pub fn init_local_from_env() -> Result<TelemetryGuard, TelemetryError> {
     })
 }
 
+// Leave room for usage, performance and outcome on the same model span.
+const MAX_SPAN_ATTRIBUTES: u32 = 24;
+
 fn build_local_provider(store: std::sync::Arc<super::local::LocalTraceStore>) -> SdkTracerProvider {
     use opentelemetry_sdk::trace::Sampler;
     SdkTracerProvider::builder()
@@ -262,7 +265,7 @@ fn build_local_provider(store: std::sync::Arc<super::local::LocalTraceStore>) ->
         .with_sampler(LocalSampler(Sampler::ParentBased(Box::new(
             Sampler::AlwaysOn,
         ))))
-        .with_max_attributes_per_span(16)
+        .with_max_attributes_per_span(MAX_SPAN_ATTRIBUTES)
         .with_max_events_per_span(0)
         .with_max_links_per_span(0)
         .with_resource(opentelemetry_sdk::Resource::builder_empty().build())
@@ -340,7 +343,7 @@ fn build_provider_with_local(
     };
     Ok(builder
         .with_sampler(sampler)
-        .with_max_attributes_per_span(16)
+        .with_max_attributes_per_span(MAX_SPAN_ATTRIBUTES)
         .with_max_events_per_span(0)
         .with_max_links_per_span(0)
         // No environment/process/host detector: resource metadata is allowlisted.
