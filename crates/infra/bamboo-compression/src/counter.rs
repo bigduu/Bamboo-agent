@@ -8,12 +8,12 @@
 //! than panicking.
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use bamboo_domain::Message;
+use quick_cache::sync::Cache;
 use tiktoken_rs::o200k_base;
 use tiktoken_rs::CoreBPE;
 
@@ -347,93 +347,50 @@ fn valid_utf8_suffix(bytes: Vec<u8>) -> String {
 /// never on `message.id`. A prepared message can carry different content under
 /// the same id, and keying on the id alone would return a stale count.
 struct TokenCountCache {
-    shards: Vec<Mutex<HashMap<(u64, u32), u32>>>,
-    shard_entries: usize,
+    counts: Cache<(u64, u32), u32>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
 impl TokenCountCache {
-    fn new(shard_entries: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            shards: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
-            shard_entries,
+            counts: Cache::new(capacity),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
-    fn shard_for(&self, hash: u64) -> &Mutex<HashMap<(u64, u32), u32>> {
-        // `shards` is non-empty, so the remainder is always in range.
-        &self.shards[(hash as usize) % self.shards.len()]
-    }
-
     fn get(&self, key: (u64, u32)) -> Option<u32> {
-        let found = self
-            .shard_for(key.0)
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&key).copied());
-        match found {
-            Some(tokens) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(tokens)
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        }
+        let found = self.counts.get(&key);
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
     }
 
     fn insert(&self, key: (u64, u32), tokens: u32) {
-        let Ok(mut map) = self.shard_for(key.0).lock() else {
-            // A poisoned mutex only means another thread panicked mid-lookup;
-            // skipping the insert keeps counting correct, just uncached.
-            return;
-        };
-        if map.len() >= self.shard_entries {
-            map.clear();
-        }
-        map.insert(key, tokens);
+        self.counts.insert(key, tokens);
     }
 
     fn clear(&self) {
-        for shard in &self.shards {
-            if let Ok(mut map) = shard.lock() {
-                map.clear();
-            }
-        }
+        self.counts.clear();
     }
 
     fn stats(&self) -> TokenCountCacheStats {
-        let entries = self
-            .shards
-            .iter()
-            .filter_map(|shard| shard.lock().ok().map(|map| map.len()))
-            .sum();
         TokenCountCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
-            entries,
+            entries: self.counts.len(),
         }
     }
 }
 
-/// Number of shards in the process-wide token count memo.
-///
-/// Sharding keeps concurrent agent workers from serializing on one mutex: an
-/// agent round re-counts its transcript from several tasks at once, and a single
-/// lock would turn that concurrency into contention.
-const CACHE_SHARDS: usize = 16;
-
-/// Per-shard entry cap. A full shard is cleared rather than evicted entry by
-/// entry, because the working set is a handful of transcripts: exceeding the cap
-/// means the process moved on to a different corpus and the old entries are no
-/// longer hot. This keeps the memo bounded without an LRU clock in the hot path.
-const CACHE_SHARD_ENTRIES: usize = 4096;
+/// Keep the same entry budget and evict individual entries as it fills.
+const CACHE_ENTRIES: usize = 65_536;
 
 /// Texts below this size are cheaper to encode again than to hash and look up
 /// (tool-call ids, function names). Only real payloads are memoized.
@@ -460,7 +417,7 @@ impl TokenCountCacheStats {
 static TOKEN_COUNT_CACHE: OnceLock<TokenCountCache> = OnceLock::new();
 
 fn token_count_cache() -> &'static TokenCountCache {
-    TOKEN_COUNT_CACHE.get_or_init(|| TokenCountCache::new(CACHE_SHARD_ENTRIES))
+    TOKEN_COUNT_CACHE.get_or_init(|| TokenCountCache::new(CACHE_ENTRIES))
 }
 
 /// Snapshot the process-wide token count memo counters.
@@ -487,13 +444,10 @@ pub fn clear_token_count_cache() {
 /// deterministic instead.
 #[cfg(test)]
 fn token_count_cache_contains(text: &str) -> bool {
-    let cache = token_count_cache();
-    let key = token_cache_key(text);
-    cache
-        .shard_for(key.0)
-        .lock()
-        .map(|map| map.contains_key(&key))
-        .unwrap_or(false)
+    token_count_cache()
+        .counts
+        .get(&token_cache_key(text))
+        .is_some()
 }
 
 /// Per-process randomized hash keys for the memo fingerprint.
@@ -945,7 +899,7 @@ mod tests {
 
     /// Serializes the memo-statistics tests. The memo is process-wide, so tests
     /// that assert on hit/miss deltas must not overlap with each other.
-    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A payload long enough to be memoized (`>= CACHE_MIN_TEXT_BYTES`).
     fn memoized_payload(seed: &str) -> String {
@@ -1062,23 +1016,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_stays_bounded_by_the_shard_cap() {
-        // Exercise the cache directly so the bound is asserted without encoding
-        // thousands of payloads.
-        let cap = 4;
-        let cache = TokenCountCache::new(cap);
-
-        for i in 0..(cap * CACHE_SHARDS * 3) as u64 {
-            cache.insert((i, 8), i as u32);
+    fn cache_retains_hot_counts_under_scan_pressure() {
+        let capacity = 64;
+        let cache = TokenCountCache::new(capacity);
+        let hot = (0, 128);
+        cache.insert(hot, 7);
+        for key in 1..=(capacity * 4) as u64 {
+            cache.insert((key, 128), 1);
+            assert_eq!(cache.get(hot), Some(7));
         }
-
         let stats = cache.stats();
-        assert!(
-            stats.entries <= cap * CACHE_SHARDS,
-            "memo must stay bounded: entries={} cap={}",
-            stats.entries,
-            cap * CACHE_SHARDS
-        );
+        assert!(stats.entries <= capacity);
+        assert_eq!(stats.hits, (capacity * 4) as u64);
+        assert_eq!(stats.misses, 0);
+
+        cache.clear();
+        assert_eq!(cache.get(hot), None);
+        assert_eq!(cache.stats().misses, 1);
     }
 
     /// Measures the real cost of re-counting one agent-round transcript six
