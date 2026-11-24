@@ -16,6 +16,7 @@ use futures::FutureExt;
 use std::{
     collections::HashMap,
     future::Future,
+    io,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -23,7 +24,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -222,6 +223,14 @@ pub struct LocalTaskChildRunner {
     approval_reviewer: Option<Arc<dyn super::actor_adapter::ChildApprovalReviewer>>,
 }
 
+const MAX_CHILD_PREPARATIONS: u32 = 128;
+
+/// Holds the actual native Child preparation gate while an update is prepared.
+#[must_use = "dropping the hold reopens native Child preparation"]
+pub struct NativeChildUpdateHold {
+    _preparations: OwnedSemaphorePermit,
+}
+
 type CoordinatorHandle = tokio::task::JoinHandle<Result<(), String>>;
 
 /// Shutdown may be cancelled while a publication tail still owns a writer.
@@ -340,6 +349,56 @@ impl LocalTaskChildRunner {
         }
     }
 
+    fn reap_coordinators(&self, handles: &mut Vec<CoordinatorHandle>) {
+        handles.retain_mut(|handle| {
+            if !handle.is_finished() {
+                return true;
+            }
+            match handle.now_or_never() {
+                Some(Err(error)) => self.retain_shutdown_error(error.to_string()),
+                Some(Ok(Err(error))) => self.retain_shutdown_error(error),
+                Some(Ok(Ok(()))) => (),
+                None => return true,
+            }
+            false
+        });
+    }
+
+    /// Keep native launches closed once every admitted preparation and
+    /// execution has settled and its real finalizer has been joined. A still
+    /// running Child keeps its existing lifetime. This scope covers only this
+    /// runner, and the Host releases it before entering terminal shutdown.
+    pub fn try_hold_for_update(&self) -> io::Result<Option<NativeChildUpdateHold>> {
+        let preparations = match self
+            .preparations
+            .clone()
+            .try_acquire_many_owned(MAX_CHILD_PREPARATIONS)
+        {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Ok(None),
+            Err(TryAcquireError::Closed) => {
+                return Err(io::Error::other("local Child preparation is closed"))
+            }
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::other("local Child runner is shutting down"));
+        }
+        if !lock(&self.executions).is_empty() {
+            return Ok(None);
+        }
+        let mut coordinators = lock(&self.coordinators);
+        self.reap_coordinators(&mut coordinators);
+        if let Some(error) = lock(&self.coordinator_errors).first() {
+            return Err(io::Error::other(error.clone()));
+        }
+        if !coordinators.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(NativeChildUpdateHold {
+            _preparations: preparations,
+        }))
+    }
+
     pub fn new(
         config: &Config,
         ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
@@ -363,9 +422,9 @@ impl LocalTaskChildRunner {
                     .max_concurrent
                     .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS)
                     .max(1)
-                    .saturating_add(128),
+                    .saturating_add(MAX_CHILD_PREPARATIONS as usize),
             )),
-            preparations: Arc::new(Semaphore::new(128)),
+            preparations: Arc::new(Semaphore::new(MAX_CHILD_PREPARATIONS as usize)),
             closed: AtomicBool::new(false),
             ceiling,
             permission,
@@ -1263,21 +1322,8 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 result
             });
             let mut handles = lock(&self.coordinators);
-            let mut pending = Vec::with_capacity(handles.len() + 1);
-            for mut handle in handles.drain(..) {
-                if handle.is_finished() {
-                    match (&mut handle).now_or_never() {
-                        Some(Err(error)) => lock(&self.coordinator_errors).push(error.to_string()),
-                        Some(Ok(Err(error))) => lock(&self.coordinator_errors).push(error),
-                        Some(Ok(Ok(()))) => {}
-                        None => pending.push(handle),
-                    }
-                } else {
-                    pending.push(handle);
-                }
-            }
-            pending.push(supervisor);
-            *handles = pending;
+            self.reap_coordinators(&mut handles);
+            handles.push(supervisor);
             execution.launch_handoff.send_replace(true);
             None
         } else {
@@ -1405,7 +1451,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         // and serializes shutdown callers through all joins and cache release.
         let _preparations = self
             .preparations
-            .acquire_many(128)
+            .acquire_many(MAX_CHILD_PREPARATIONS)
             .await
             .map_err(|e| e.to_string())?;
         let executions: Vec<_> = lock(&self.executions).values().cloned().collect();

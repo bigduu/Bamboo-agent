@@ -21,6 +21,60 @@ mod owned_bash_publication;
 mod writer_lifecycle;
 
 #[tokio::test]
+async fn planned_update_waits_for_child_preparation_and_actual_finalization() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let preparing = runner.preparations.try_acquire().unwrap();
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    drop(preparing);
+
+    let (finish, finished) = oneshot::channel();
+    let finalizer = tokio::spawn(async move {
+        finished.await.unwrap();
+        Ok(())
+    });
+    lock(&runner.coordinators).push(finalizer);
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    assert!(!runner.closed.load(Ordering::Acquire));
+    finish.send(()).unwrap();
+    let hold = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(hold) = runner.try_hold_for_update().unwrap() {
+                return hold;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(lock(&runner.coordinators).is_empty());
+    assert!(runner.preparations.try_acquire().is_err());
+    drop(hold);
+    assert!(runner.preparations.try_acquire().is_ok());
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn planned_update_refuses_a_child_finalizer_with_unconfirmed_completion() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let task = tokio::spawn(async { Err("child publication unconfirmed".to_string()) });
+    lock(&runner.coordinators).push(task);
+    let error = tokio::time::timeout(WAIT, async {
+        loop {
+            match runner.try_hold_for_update() {
+                Err(error) => return error,
+                Ok(None) => tokio::task::yield_now().await,
+                Ok(Some(_)) => panic!("unconfirmed finalization granted an update hold"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(error.to_string().contains("child publication unconfirmed"));
+    assert!(runner.try_hold_for_update().is_err());
+    assert!(!runner.closed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn renewal_crossing_entry_and_failed_renewal_do_not_publish_heartbeat() {
     let signals = LiveTaskSignals::default();
     let (acknowledge, acknowledged) = oneshot::channel();
