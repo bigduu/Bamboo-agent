@@ -62,6 +62,9 @@ pub(super) async fn pause_before_model_round(
     let Some(message) = session.messages.last() else {
         return Ok(false);
     };
+    let Ok(transcript_sha256) = ParkedUpdateRoot::hash_transcript(&session.messages) else {
+        return Ok(false);
+    };
     let parked = ParkedUpdateRoot {
         update_id: update,
         session_id: session.id.clone(),
@@ -69,6 +72,7 @@ pub(super) async fn pause_before_model_round(
         run_id: writer.fence.run_id.clone(),
         lease_epoch: writer.fence.lease_epoch,
         conversation_reset_sha256,
+        transcript_sha256,
         root_tool_authority_revision: session.root_tool_authority_revision,
         project_id: session.project_id_meta(),
         workspace_path: session.workspace_path_meta(),
@@ -113,6 +117,8 @@ pub(crate) fn matches_checkpoint(root: &ParkedUpdateRoot, session: &Session) -> 
             .messages
             .last()
             .is_some_and(|message| message.id == root.message_id)
+        && ParkedUpdateRoot::hash_transcript(&session.messages)
+            .is_ok_and(|hash| hash == root.transcript_sha256)
         && session_effective_model_ref(session)
             .is_some_and(|model| model.to_pair() == root.model.to_pair())
 }

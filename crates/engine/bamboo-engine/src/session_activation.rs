@@ -553,12 +553,21 @@ pub struct ParkedUpdateRoot {
     pub run_id: String,
     pub lease_epoch: u64,
     pub conversation_reset_sha256: Option<String>,
+    pub transcript_sha256: String,
     pub root_tool_authority_revision: u64,
     pub project_id: Option<String>,
     pub workspace_path: Option<String>,
     pub message_id: String,
     pub message_count: usize,
     pub model: bamboo_domain::ProviderModelRef,
+}
+
+impl ParkedUpdateRoot {
+    pub fn hash_transcript(messages: &[bamboo_domain::Message]) -> serde_json::Result<String> {
+        let value = serde_json::to_value(messages)?;
+        let bytes = bamboo_domain::session::inbox::canonical_json_bytes(&value);
+        Ok(bamboo_domain::session::model_context::sha256_hex(&bytes))
+    }
 }
 
 impl SessionUpdateAdmission {
