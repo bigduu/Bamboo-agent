@@ -185,16 +185,16 @@ async fn create_child_action_inner(
                 "named_profile_requires_fresh_local_child".into(),
             ));
         }
-        input.read_only |=
-            bamboo_domain::PermissionAuditSnapshot::from_metadata(&input.parent_session.metadata)
-                .is_some_and(|audit| {
-                    audit.resolution.effective == bamboo_domain::PermissionMode::Plan
-                })
-                || input
-                    .parent_session
-                    .agent_runtime_state
-                    .as_ref()
-                    .is_some_and(|r| r.read_only || r.plan_mode.is_some());
+        input.read_only |= profile.read_only()
+            || bamboo_domain::PermissionAuditSnapshot::from_metadata(
+                &input.parent_session.metadata,
+            )
+            .is_some_and(|audit| audit.resolution.effective == bamboo_domain::PermissionMode::Plan)
+            || input
+                .parent_session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|r| r.read_only || r.plan_mode.is_some());
         if let Some(model) = profile.model().filter(|_| {
             !input
                 .runtime_metadata

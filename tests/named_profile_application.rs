@@ -232,7 +232,10 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     }
                     assert_eq!(binding["name"], role(probe.case));
                     assert_eq!(selected.model, child_model(probe.case));
-                    assert!(!selected.agent_runtime_state.as_ref().unwrap().read_only);
+                    assert_eq!(
+                        selected.agent_runtime_state.as_ref().unwrap().read_only,
+                        probe.case == Case::RoleDeniesShell
+                    );
                     if !builtin(probe.case) {
                         assert!(selected.messages[0].content.contains("PROJECT_ROLE_V1"));
                     }

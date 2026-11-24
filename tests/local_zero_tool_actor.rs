@@ -1455,6 +1455,9 @@ async fn fixture_with_followups(
         binding["tools"],
         if glob { json!(["Glob"]) } else { json!([]) }
     );
+    if glob {
+        assert!(before.agent_runtime_state.as_ref().unwrap().read_only);
+    }
     let mut recovery_prefix = None;
     if recovery {
         let inbox = bamboo_storage::FileSessionInbox::new(

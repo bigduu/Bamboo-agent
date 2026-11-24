@@ -161,10 +161,13 @@ impl ResolvedChildProfile {
         self.inspection_role
     }
 
-    /// Role classification for callers that request read-only execution.
-    #[deprecated(note = "use is_inspection_role for role classification")]
+    /// Inspection profiles with reader-only grants use read-only execution.
     pub fn read_only(&self) -> bool {
-        self.is_inspection_role()
+        self.inspection_role
+            && self
+                .tools
+                .iter()
+                .all(|tool| matches!(tool.as_str(), "Read" | "Glob"))
     }
 
     pub(super) fn append_prompt(&self, base: &str) -> String {
@@ -376,6 +379,10 @@ mod tests {
             child.set_project_id_meta(project);
         }
         child.model_ref = profile.model.clone();
+        child
+            .agent_runtime_state
+            .get_or_insert_with(Default::default)
+            .read_only = profile.read_only();
         let prompt = profile.append_prompt("GLOBAL_CUSTOM_BASE");
         child
             .metadata

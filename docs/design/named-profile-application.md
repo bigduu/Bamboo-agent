@@ -33,10 +33,11 @@ the grant with its native ceiling, tool disables, inherited restrictions,
 permission mode and workspace/Project validation.
 
 Explorer, reviewer and independent-reviewer limit their direct file tools to
-Read and Glob, including Project overrides. Use typed readOnly or Plan to
-enforce read-only execution. Workflow steps with the read capability request
-typed readOnly. A Child uses write_stdin with the handle returned by its own
-exec_command for input, incremental output or exit status.
+Read and Glob, including Project overrides. Inspection profiles with only
+reader tools use read-only execution. Typed readOnly, Plan and Workflow
+steps with the read capability also enforce read-only execution. A Child
+uses write_stdin with the handle returned by its own exec_command for input,
+incremental output or exit status.
 
 The existing Child metadata stores safe selection identity/revision plus the
 frozen model, tools, readOnly, lifetime/Project and composed-prompt digest.
