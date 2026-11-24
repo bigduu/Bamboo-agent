@@ -864,6 +864,13 @@ pub struct SubagentsConfig {
     /// bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
+    /// Total time limit in seconds for a local Child run. Defaults to 3600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_secs: Option<std::num::NonZeroU32>,
+    /// Time without recognized activity before cancelling a local Child run.
+    /// Defaults to 900 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_idle_secs: Option<std::num::NonZeroU32>,
     /// Expert: custom worker binary. Default: the current bamboo executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_bin: Option<String>,

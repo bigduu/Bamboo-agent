@@ -584,13 +584,14 @@ minimal-cost deployment.
 
 ## Sub-agents + external CLI executors
 
-Key `subagents` (`SubagentsConfig`). Sub-agents always run as independent
-actor subprocesses (crash isolation + real parallelism) — there is no
-in-process runtime toggle.
+Key `subagents` (`SubagentsConfig`). The built-in local runtime runs Child
+sessions in the Host, with separate executors for the external actor backends.
 
 | Field | Purpose |
 |---|---|
 | `max_concurrent` | Cap on simultaneously running sub-agents (default: 200). |
+| `max_total_secs` | Total time limit for a built-in local Child run in seconds (default: 3600). |
+| `max_idle_secs` | Time without recognized activity before cancelling a built-in local Child run, in seconds (default: 900). |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
 | `fabric_dir` | Where the actor fabric's mailbox/state files live. |
 | `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` \| `"codex"`. |
@@ -612,6 +613,11 @@ in-process runtime toggle.
 | `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
+
+Set the time limits in System Settings under Sub-agent or send a config patch
+such as `{"subagents":{"max_total_secs":10800}}`. Both fields take positive
+integer seconds. Clear an override with `null`. The next local Child run reads
+the saved limits at launch, with Host-owned per-session overrides taking precedence.
 
 ```json
 {
