@@ -45,7 +45,10 @@ fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<Ro
             .unwrap_or_else(|| format!("{:x}", Sha256::digest(b"bamboo.root-runtime.no-reset.v1"))),
     })
 }
-fn matches_observation(session: &Session, fence: &ActorActivationFence) -> io::Result<bool> {
+pub(super) fn matches_observation(
+    session: &Session,
+    fence: &ActorActivationFence,
+) -> io::Result<bool> {
     let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else {
         return Ok(false);
     };
@@ -150,6 +153,14 @@ fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
     }
 }
 impl SessionStoreV2 {
+    /// Verify that the persisted Root runtime was written under this Actor.
+    pub fn root_runtime_matches_activation(
+        session: &Session,
+        fence: &ActorActivationFence,
+    ) -> io::Result<bool> {
+        matches_observation(session, fence)
+    }
+
     /// Attribute the provider diagnostic to an already authorized failed run.
     /// The saved writer observation binds the pipeline state to the Root Actor.
     pub(crate) async fn managed_root_failure_diagnostic(

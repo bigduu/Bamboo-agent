@@ -493,13 +493,13 @@ pub trait ActorDirectoryPort: Send + Sync {
         self.claim_root_activation_observed_after(claim, expected, None)
             .await
     }
-    /// Check the completed predecessor inside the successor's claim transaction
-    /// when a planned update supplies its recorded lease epoch.
+    /// Check the recorded terminal predecessor inside the successor's claim
+    /// transaction when the Host has prepared a planned update.
     async fn claim_root_activation_observed_after(
         &self,
         _claim: &ActorActivationClaim,
         _expected: &super::Session,
-        _finished_epoch: Option<u64>,
+        _predecessor: Option<&ActorActivationFence>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         Err(ActorDirectoryError::InvalidTransition)
     }

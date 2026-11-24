@@ -69,8 +69,7 @@ pub(super) async fn pause_before_model_round(
         update_id: update,
         session_id: session.id.clone(),
         created_at: session.created_at,
-        run_id: writer.fence.run_id.clone(),
-        lease_epoch: writer.fence.lease_epoch,
+        fence: writer.fence.clone(),
         conversation_reset_sha256,
         transcript_sha256,
         root_tool_authority_revision: session.root_tool_authority_revision,
@@ -105,7 +104,6 @@ pub(crate) fn matches_checkpoint(root: &ParkedUpdateRoot, session: &Session) -> 
         && !crate::ticket_runtime::is_managed_work_root(session)
         && session.id == root.session_id
         && session.created_at == root.created_at
-        && session.host_run_id() == Some(root.run_id.as_str())
         && session.root_tool_authority_revision == root.root_tool_authority_revision
         && session.project_id_meta() == root.project_id
         && session.workspace_path_meta() == root.workspace_path
@@ -179,7 +177,6 @@ mod tests {
         let router = crate::session_activation::SessionActivationRouter::new();
         let mut session = Session::new("update-fixture", "local-model");
         session.set_provider_name("local-provider");
-        session.set_host_run_id("owned-root");
         session.add_message(Message::user("Read the fixture."));
         session.set_last_run_status("running");
         store.save_session(&session).await.unwrap();
@@ -263,7 +260,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(parked.run_id, "owned-root");
+        assert_eq!(parked.fence.run_id, "owned-root");
         let saved = store
             .load_session(&parked.session_id)
             .await

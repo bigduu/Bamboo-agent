@@ -37,7 +37,8 @@ impl UpdateHandoff {
             || self.roots.iter().any(|root| {
                 root.update_id.is_nil()
                     || Some(root.update_id) != prepared_batch
-                    || root.lease_epoch == 0
+                    || root.fence.actor_id.as_str() != root.session_id
+                    || root.fence.lease_epoch == 0
                     || !targets.insert(&root.session_id)
             })
         {
@@ -158,14 +159,18 @@ pub(super) async fn resume(
                 .activation
                 .filter(|_| actor.actor.session_created_at == root.created_at)
             {
-                if owner.lease_epoch > root.lease_epoch
+                if owner.lease_epoch > root.fence.lease_epoch
                     && state
                         .session_store
                         .load_session(&root.session_id)
                         .await
                         .is_ok_and(|saved| {
                             saved.is_some_and(|session| {
-                                session.host_run_id() == Some(owner.run_id.as_str())
+                                bamboo_storage::SessionStoreV2::root_runtime_matches_activation(
+                                    &session,
+                                    &owner.fence(),
+                                )
+                                .unwrap_or(false)
                                     && session
                                         .metadata
                                         .get("runtime.suspend_reason")
@@ -177,10 +182,7 @@ pub(super) async fn resume(
                     report.advanced += 1;
                     continue;
                 }
-                if owner.run_id == root.run_id
-                    && owner.lease_epoch == root.lease_epoch
-                    && owner.status == ActorActivationStatus::Succeeded
-                {
+                if owner.fence() == root.fence && owner.status == ActorActivationStatus::Succeeded {
                     match state
                         .child_completion_coordinator
                         .resume_planned_update_root(root)
