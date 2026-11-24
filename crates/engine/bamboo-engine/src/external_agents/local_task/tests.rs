@@ -272,6 +272,7 @@ struct Harness {
     messenger: Arc<crate::SessionMessenger>,
     runner: Arc<LocalTaskChildRunner>,
     ctx: crate::execution::SpawnContext,
+    config: Arc<RwLock<Config>>,
     parent_events: broadcast::Receiver<AgentEvent>,
     coordinator: Arc<crate::ChildCompletionCoordinator>,
     _scheduler: Arc<crate::execution::SpawnScheduler>,
@@ -414,7 +415,7 @@ impl Harness {
             ctx.agent_runners.clone(),
             ctx.session_event_senders.clone(),
             agent,
-            config,
+            config.clone(),
             registry,
             provider_router,
             home.to_path_buf(),
@@ -433,6 +434,7 @@ impl Harness {
             messenger,
             runner,
             ctx,
+            config,
             parent_events,
             coordinator,
             _scheduler: scheduler,
@@ -543,7 +545,7 @@ impl Harness {
         let expected = match status {
             "completed" => ActorActivationStatus::Succeeded,
             "cancelled" => ActorActivationStatus::Cancelled,
-            "error" => ActorActivationStatus::Failed,
+            "error" | "timeout" => ActorActivationStatus::Failed,
             other => panic!("unsupported expected terminal {other}"),
         };
         assert_eq!(activation.status, expected);
@@ -555,7 +557,7 @@ impl Harness {
         );
         assert_eq!(
             actor.actor.state,
-            if status == "error" {
+            if expected == ActorActivationStatus::Failed {
                 ActorLogicalState::Failed
             } else {
                 ActorLogicalState::Cold
@@ -1160,6 +1162,88 @@ async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_heal
         .await
         .unwrap_err()
         .contains("unconfirmed"));
+}
+
+#[tokio::test]
+async fn local_child_time_limits_take_effect_at_launch_and_keep_session_overrides() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    harness.config.write().await.subagents_mut().max_total_secs = std::num::NonZeroU32::new(10800);
+
+    let first = harness.child("first", "start a long task").await;
+    harness.launch(&first).await.unwrap();
+    let first_call = control.next().await;
+    let first_policy = harness.ctx.agent_runners.read().await[&first.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(first_policy.max_total_secs, 10800);
+    assert_eq!(first_policy.max_idle_secs, 900);
+    assert!(!first_policy.total_timeout_reached(10800, 0, true));
+
+    {
+        let mut config = harness.config.write().await;
+        config.subagents_mut().max_total_secs = std::num::NonZeroU32::new(7200);
+        config.subagents_mut().max_idle_secs = std::num::NonZeroU32::new(1200);
+    }
+    let running_policy = harness.ctx.agent_runners.read().await[&first.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(running_policy.max_total_secs, 10800);
+    assert_eq!(running_policy.max_idle_secs, 900);
+    first_call.complete("first finished");
+    assert_eq!(harness.completion().await.1, "completed");
+
+    let mut next = harness.child("next", "start the next task").await;
+    next.metadata
+        .insert("child_watchdog.max_idle_secs".into(), "1800".into());
+    harness.store.save_session(&next).await.unwrap();
+    harness.launch(&next).await.unwrap();
+    let next_call = control.next().await;
+    let next_policy = harness.ctx.agent_runners.read().await[&next.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(next_policy.max_total_secs, 7200);
+    assert_eq!(next_policy.max_idle_secs, 1800);
+    next_call.complete("second finished");
+    assert_eq!(harness.completion().await.1, "completed");
+    harness.runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_short_limits_timeout_local_children_without_interval_overrides() {
+    for (idle, expected) in [(false, "max_total_secs=1"), (true, "max_idle_secs=1")] {
+        let home = tempfile::tempdir().unwrap();
+        let control = ProviderControl::new();
+        let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+        let limit = std::num::NonZeroU32::new(1);
+        {
+            let mut config = harness.config.write().await;
+            if idle {
+                config.subagents_mut().max_idle_secs = limit;
+            } else {
+                config.subagents_mut().max_total_secs = limit;
+            }
+        }
+        let child = harness
+            .child("held-provider", "Wait for the model response")
+            .await;
+        harness.launch(&child).await.unwrap();
+        let (id, status, error) =
+            tokio::time::timeout(Duration::from_secs(10), harness.completion())
+                .await
+                .expect("a one-second limit must expire before the default 15-second interval");
+        assert_eq!(id, child.id);
+        assert_eq!(status, "timeout");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected)),
+            "{error:?}"
+        );
+        harness.assert_terminal(&child, "timeout").await;
+        harness.runner.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

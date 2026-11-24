@@ -58,16 +58,29 @@ pub struct InitialHttpRetry {
     pub delay: Duration,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InitialHttpRetryObserver {
     last: Mutex<Option<InitialHttpRetry>>,
     budget_managed: AtomicBool,
     active_request_policies: AtomicU32,
     terminal_diagnostic: Mutex<Option<bamboo_domain::LlmRequestDiagnostic>>,
     live_offer: Mutex<Option<tokio::sync::oneshot::Sender<LiveBootstrapOffer>>>,
+    progress: std::sync::OnceLock<Box<dyn Fn(InitialHttpRetry) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for InitialHttpRetryObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialHttpRetryObserver")
+            .finish_non_exhaustive()
+    }
 }
 
 impl InitialHttpRetryObserver {
+    /// Install a best-effort progress listener for this request bootstrap.
+    pub fn report_progress(&self, listener: impl Fn(InitialHttpRetry) + Send + Sync + 'static) {
+        let _ = self.progress.set(Box::new(listener));
+    }
+
     /// The engine creates this once for an execution with a bound Host. Only
     /// the actual Anthropic request can fill its one-shot receiver.
     pub fn with_live_bootstrap() -> (
@@ -119,13 +132,17 @@ impl InitialHttpRetryObserver {
     }
 
     fn record(&self, status: StatusCode, delay: Duration) {
+        let retry = InitialHttpRetry {
+            status: status.as_u16(),
+            delay,
+        };
         *self
             .last
             .lock()
-            .expect("initial HTTP retry observer poisoned") = Some(InitialHttpRetry {
-            status: status.as_u16(),
-            delay,
-        });
+            .expect("initial HTTP retry observer poisoned") = Some(retry);
+        if let Some(listener) = self.progress.get() {
+            listener(retry);
+        }
     }
 }
 

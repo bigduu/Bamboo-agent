@@ -1368,6 +1368,14 @@ impl Agent {
         &self.runtime.storage
     }
 
+    pub(crate) async fn local_child_watchdog_policy(
+        &self,
+        session: &bamboo_agent_core::Session,
+    ) -> crate::execution::spawn::ChildWatchdogPolicy {
+        let config = self.runtime.config.read().await;
+        crate::execution::spawn::watchdog_policy_for_session(session, Some(config.subagents()))
+    }
+
     /// Access the runtime persistence adapter for non-authoritative saves.
     pub fn persistence(&self) -> &Arc<dyn RuntimeSessionPersistence> {
         &self.runtime.persistence

@@ -37,6 +37,14 @@ pub(crate) mod test_support {
     };
     use serde_json::Value;
 
+    pub fn write_work_disabled_profile(data_dir: &std::path::Path) {
+        std::fs::write(
+            data_dir.join("config.json"),
+            r#"{"features":{"ticket_mutation":false,"ticket_dispatch":false}}"#,
+        )
+        .unwrap();
+    }
+
     /// Test-native owner consent is installed in the trusted service factory,
     /// never translated from an HTTP header, bearer or caller JSON claim.
     pub struct ApprovedHostIntent;

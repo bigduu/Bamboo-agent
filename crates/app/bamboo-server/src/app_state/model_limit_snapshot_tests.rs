@@ -417,7 +417,7 @@ async fn hosted_restart_loads_legacy_raw_model_limits_and_retains_them_until_rep
 
 #[actix_web::test]
 async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_watcher() {
-    use bamboo_compression::limits::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS};
+    use bamboo_compression::limits::{DEFAULT_MAX_CONTEXT_TOKENS, UNKNOWN_MODEL_OUTPUT_TOKENS};
 
     let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
     let dir = tempfile::tempdir().unwrap();
@@ -613,7 +613,7 @@ async fn compatibility_model_limit_writes_and_clear_reach_hosted_rounds_without_
             Some(4_000),
             Some(8_000),
             Some(48_000),
-            Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            Some(UNKNOWN_MODEL_OUTPUT_TOKENS),
             Some(12_000),
             Some(12_000),
             Some(20_000),

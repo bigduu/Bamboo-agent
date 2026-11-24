@@ -802,3 +802,7 @@ mod tests {
 #[cfg(test)]
 #[path = "goal_restart_tests.rs"]
 mod goal_restart_tests;
+
+#[cfg(test)]
+#[path = "planned_update_tests.rs"]
+mod planned_update_tests;
