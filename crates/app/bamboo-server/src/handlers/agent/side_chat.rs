@@ -163,6 +163,7 @@ struct ActiveTurn {
 pub(crate) struct SideChatRuntime {
     active: Mutex<HashMap<String, ActiveTurn>>,
     updates: broadcast::Sender<(String, Update)>,
+    pub(crate) update_admission: crate::app_state::update_admission::UntrackedUpdateAdmission,
 }
 
 impl Default for SideChatRuntime {
@@ -170,6 +171,7 @@ impl Default for SideChatRuntime {
         Self {
             active: Mutex::default(),
             updates: broadcast::channel(128).0,
+            update_admission: Default::default(),
         }
     }
 }
@@ -428,6 +430,12 @@ async fn start(
         ));
     };
 
+    state
+        .side_chats
+        .update_admission
+        .record_dispatch()
+        .await
+        .map_err(|error| request_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()))?;
     let config = state.config.read().await.clone();
     let mut limits =
         ModelLimitsRegistry::with_config_path(state.app_data_dir.join("model_limits.json"));
