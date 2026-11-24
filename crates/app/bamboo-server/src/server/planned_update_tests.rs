@@ -347,6 +347,8 @@ async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
 
     let request = uuid::Uuid::new_v4();
     planned_update_handoff::publish(&workspace, request, std::slice::from_ref(&checkpoint))
+        .unwrap()
+        .authorize()
         .unwrap();
 
     let probe = Arc::new(ProviderProbe::default());
@@ -409,7 +411,13 @@ async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
         .listen(listener)
         .unwrap()
         .run();
-    let managed = actix_web::rt::spawn(managed.run(server, Some(state.clone())));
+    let managed_state = state.clone();
+    let managed = actix_web::rt::spawn(async move {
+        let mut committed = None;
+        managed
+            .run(server, Some(managed_state), &mut committed)
+            .await
+    });
     let read_marker = |name: &str| {
         let path = control.path().join(name);
         async move {
@@ -428,18 +436,27 @@ async fn planned_update_desktop_protocol_resumes_only_the_recorded_run_once() {
         }
     };
     assert!(read_marker("ready").await.is_empty());
+    assert!(read_marker("planned-update-v1").await.is_empty());
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
     let mut marker = tempfile::NamedTempFile::new_in(control.path()).unwrap();
-    write!(marker, "{request}").unwrap();
+    write!(
+        marker,
+        "{}",
+        serde_json::json!({"version":1,"request_id":request,"sequence":1,"command":"resume"})
+    )
+    .unwrap();
     marker
-        .persist(control.path().join("resume-update"))
+        .persist(control.path().join("planned-update-command.json"))
         .unwrap();
     let result: serde_json::Value =
-        serde_json::from_slice(&read_marker("resume-update-result.json").await).unwrap();
+        serde_json::from_slice(&read_marker("planned-update-result.json").await).unwrap();
     assert_eq!(
         result,
         serde_json::json!({
-            "request": request,
+            "version": 1,
+            "request_id": request,
+            "sequence": 1,
+            "status": "resumed",
             "report": {"resumed": 1, "advanced": 0, "pending_sessions": []}
         })
     );

@@ -1,5 +1,6 @@
 //! Durable handoff between two desktop-owned Bamboo processes.
 
+use bamboo_domain::session::model_context::sha256_hex;
 use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, Storage};
 use bamboo_engine::session_activation::ParkedUpdateRoot;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: u8 = 1;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
+const AUTHORIZATION_BYTES: u64 = 64;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +20,31 @@ pub(super) struct UpdateHandoff {
     schema_version: u8,
     request: Uuid,
     pub(super) roots: Vec<ParkedUpdateRoot>,
+}
+
+/// Proof of the exact intent written before parked executions are retired.
+/// Only the original Host keeps this until it has verified final closure.
+pub(super) struct PublishedHandoff {
+    directory: PathBuf,
+    request: Uuid,
+    digest: String,
+}
+
+impl PublishedHandoff {
+    pub(super) fn authorize(&self) -> io::Result<()> {
+        let bytes = read_bounded(&record_path(&self.directory, self.request), MAX_BYTES)?;
+        if sha256_hex(&bytes) != self.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Planned update intent changed before authorization",
+            ));
+        }
+        persist_immutable(
+            &self.directory,
+            &authorization_path(&self.directory, self.request),
+            self.digest.as_bytes(),
+        )
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -75,6 +102,10 @@ fn record_path(directory: &Path, request: Uuid) -> PathBuf {
     directory.join(format!("{request}.json"))
 }
 
+fn authorization_path(directory: &Path, request: Uuid) -> PathBuf {
+    directory.join(format!("{request}.ready"))
+}
+
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
@@ -85,7 +116,11 @@ fn sync_directory(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn publish(profile: &Path, request: Uuid, roots: &[ParkedUpdateRoot]) -> io::Result<()> {
+pub(super) fn publish(
+    profile: &Path,
+    request: Uuid,
+    roots: &[ParkedUpdateRoot],
+) -> io::Result<PublishedHandoff> {
     let handoff = UpdateHandoff {
         schema_version: SCHEMA_VERSION,
         request,
@@ -100,26 +135,33 @@ pub(super) fn publish(profile: &Path, request: Uuid, roots: &[ParkedUpdateRoot])
         ));
     }
     let directory = directory(profile, true)?;
-    let path = record_path(&directory, request);
-    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-    file.write_all(&bytes)?;
+    persist_immutable(&directory, &record_path(&directory, request), &bytes)?;
+    Ok(PublishedHandoff {
+        directory,
+        request,
+        digest: sha256_hex(&bytes),
+    })
+}
+
+fn persist_immutable(directory: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(bytes)?;
     file.as_file().sync_all()?;
-    match file.persist_noclobber(&path) {
+    match file.persist_noclobber(path) {
         Ok(_) => (),
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            if read(profile, request)? != handoff {
+            if read_bounded(path, bytes.len() as u64)?.as_slice() != bytes {
                 return Err(error.error);
             }
         }
         Err(error) => return Err(error.error),
     }
-    sync_directory(&directory)
+    sync_directory(directory)
 }
 
-pub(super) fn read(profile: &Path, request: Uuid) -> io::Result<UpdateHandoff> {
-    let path = record_path(&directory(profile, false)?, request);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid planned update record",
@@ -127,16 +169,32 @@ pub(super) fn read(profile: &Path, request: Uuid) -> io::Result<UpdateHandoff> {
     }
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(MAX_BYTES + 1)
+        .take(max_bytes + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Planned update handoff is too large",
         ));
     }
+    Ok(bytes)
+}
+
+fn read(profile: &Path, request: Uuid) -> io::Result<UpdateHandoff> {
+    let directory = directory(profile, false)?;
+    let bytes = read_bounded(&record_path(&directory, request), MAX_BYTES)?;
     let handoff: UpdateHandoff = serde_json::from_slice(&bytes)?;
     handoff.validate(request)?;
+    let authorization = read_bounded(
+        &authorization_path(&directory, request),
+        AUTHORIZATION_BYTES,
+    )?;
+    if sha256_hex(&bytes).as_bytes() != authorization.as_slice() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Planned update authorization does not match its intent",
+        ));
+    }
     Ok(handoff)
 }
 
@@ -214,14 +272,33 @@ mod tests {
         let profile = tempfile::TempDir::new().unwrap();
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
-        publish(profile.path(), first, &[]).unwrap();
-        publish(profile.path(), first, &[]).unwrap();
+        let intent = publish(profile.path(), first, &[]).unwrap();
+        assert_eq!(
+            read(profile.path(), first).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        intent.authorize().unwrap();
+        let repeated = publish(profile.path(), first, &[]).unwrap();
+        repeated.authorize().unwrap();
         assert!(read(profile.path(), first).unwrap().roots.is_empty());
         assert!(read(profile.path(), second).is_err());
         let folder = directory(profile.path(), false).unwrap();
         fs::copy(record_path(&folder, first), record_path(&folder, second)).unwrap();
         assert_eq!(
             read(profile.path(), second).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut changed = File::options()
+            .append(true)
+            .open(record_path(&folder, first))
+            .unwrap();
+        changed.write_all(b"\n").unwrap();
+        assert_eq!(
+            read(profile.path(), first).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            intent.authorize().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }

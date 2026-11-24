@@ -385,10 +385,13 @@ async fn run_with_static_options(
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, static_dir)?;
 
-    let app_state = AppState::new(bamboo_home_dir.clone())
-        .await
-        .map_err(|e| format!("Failed to initialize app state: {e}"))?
-        .into_http_data();
+    let app_state = if shutdown.is_some() {
+        AppState::new_for_managed_update(bamboo_home_dir.clone()).await
+    } else {
+        AppState::new(bamboo_home_dir.clone()).await
+    }
+    .map_err(|e| format!("Failed to initialize app state: {e}"))?
+    .into_http_data();
     // Retained for graceful shutdown after the server stops — the `move` factory
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();
@@ -483,10 +486,15 @@ async fn run_with_static_options(
     let reconcile = tailscale
         .as_ref()
         .map(|access| TailscaleAccess::reconcile(access.clone(), app_state_for_shutdown.clone()));
+    let mut committed_update = None;
     let result = match shutdown {
         Some(shutdown) => {
             shutdown
-                .run(server, Some(app_state_for_shutdown.clone()))
+                .run(
+                    server,
+                    Some(app_state_for_shutdown.clone()),
+                    &mut committed_update,
+                )
                 .await
         }
         None => server.await,
@@ -511,7 +519,11 @@ async fn run_with_static_options(
         error!("Server error: {}", e);
         return Err(format!("Server error: {e}"));
     }
-
+    if let Some(committed) = committed_update {
+        committed.finalize().map_err(|error| {
+            format!("Cannot authorize the planned update after shutdown: {error}")
+        })?;
+    }
     Ok(())
 }
 
