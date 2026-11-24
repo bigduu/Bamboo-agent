@@ -78,13 +78,14 @@ The application attribute allowlist is:
 - `bamboo.perf.grep.*` includes worker queue and scan durations (microseconds),
   scanned files/bytes, matches and files scanned with the literal matcher.
 - `bamboo.perf.token_cache.process_hits`, `process_misses` and `process_entries`
-  are process-wide snapshots taken before provider dispatch. Use successive
-  samples from the same process for hit-rate calculations.
+  are process-wide snapshots taken before provider dispatch and available
+  through OTel export. Use successive samples from the same process for
+  hit-rate calculations.
 - `bamboo.perf.model.first_text_us` measures dispatch to the first non-empty
   upstream text chunk, including on silent streams.
 - `bamboo.perf.gemini.typed_text_frames` and `full_json_frames` count decode
-  paths used by a Gemini stream. The local trace detail returns the available
-  numeric fields under `performance`.
+  paths used by a Gemini stream. The local trace detail returns available
+  operation-level measurements under `performance`.
 
 Identifiers must be 1–128 ASCII letters, digits, underscores, hyphens or periods;
 other values are omitted, and span names fall back to the operation alone. The

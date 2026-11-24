@@ -27,9 +27,6 @@ pub(super) const LOCAL_FIELDS: &[(&str, &str)] = &[
     (GREP_BYTES, "grep_bytes_scanned"),
     (GREP_MATCHES, "grep_matches"),
     (RIPGREP_FILES, "grep_ripgrep_files"),
-    (CACHE_HITS, "token_cache_process_hits"),
-    (CACHE_MISSES, "token_cache_process_misses"),
-    (CACHE_ENTRIES, "token_cache_process_entries"),
     (FIRST_TEXT, "model_first_text_us"),
     (GEMINI_TYPED, "gemini_typed_text_frames"),
     (GEMINI_JSON, "gemini_full_json_frames"),
@@ -90,7 +87,7 @@ impl Observation {
         );
     }
 
-    /// These snapshots are process-wide, including calls in concurrent sessions.
+    /// These process-wide snapshots are available to OTel exporters.
     pub fn token_cache_snapshot(&self, hits: u64, misses: u64, entries: usize) {
         record(
             &self.context,
