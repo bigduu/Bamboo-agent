@@ -298,6 +298,7 @@ impl TicketApplication {
             .try_into()
             .map_err(|_| Error::AuthorityUnavailable("Work Review clock unavailable".into()))?;
         let evidence = serde_json::to_value(&prepared.evidence)?;
+        self.record_update_dispatch().await?;
         let result = self
             .work_reviews
             .execute(service, prepared, now, host)

@@ -644,6 +644,7 @@ pub use observer_subscriptions::ObserverSubscriptionStart;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;
+pub(crate) mod update_admission;
 pub mod watchers;
 
 #[cfg(test)]

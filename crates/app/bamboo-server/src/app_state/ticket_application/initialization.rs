@@ -32,7 +32,7 @@ impl ScopeInitializationError {
 }
 
 /// Observation only. Unknown files, partial stores and symlinks are never empty.
-fn scope_is_empty(root: &Path) -> io::Result<bool> {
+pub(super) fn scope_is_empty(root: &Path) -> io::Result<bool> {
     if let Some(parent) = root.parent() {
         match std::fs::symlink_metadata(parent) {
             Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
@@ -250,7 +250,7 @@ impl TicketApplication {
                 "verified owner access required",
             ));
         }
-        let _serial = self.initializing.lock().await;
+        let serial = self.initializing.clone().lock_owned().await;
         let supervisor = self
             .storage
             .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -344,6 +344,9 @@ impl TicketApplication {
         let created = Arc::new(AtomicBool::new(false));
         let created_job = created.clone();
         let operation = Box::new(move || {
+            // Storage can finish the physical journal operation after the
+            // HTTP caller disappears. Keep the same lock until it returns.
+            let _serial = serial;
             let _config = config;
             if let Some(service) = service_slot.get() {
                 return if service
