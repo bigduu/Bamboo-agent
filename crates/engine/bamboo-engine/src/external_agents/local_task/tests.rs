@@ -75,6 +75,35 @@ async fn planned_update_refuses_a_child_finalizer_with_unconfirmed_completion() 
 }
 
 #[tokio::test]
+async fn planned_update_refuses_an_unconfirmed_child_preparation_rollback() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let setup_error = "child writer setup failed";
+    assert_eq!(
+        runner.record_preparation_failure(setup_error.into(), Ok(())),
+        setup_error
+    );
+    assert!(runner.try_hold_for_update().unwrap().is_some());
+
+    let preparation = runner.preparations.try_acquire().unwrap();
+    let error = runner.record_preparation_failure(
+        setup_error.into(),
+        Err(ActorDirectoryError::Storage("rollback write failed".into())),
+    );
+    drop(preparation);
+
+    assert!(error.contains("exact claim rollback unconfirmed"));
+    assert!(lock(&runner.executions).is_empty());
+    assert!(lock(&runner.coordinators).is_empty());
+    for _ in 0..2 {
+        let Err(reason) = runner.try_hold_for_update() else {
+            panic!("unconfirmed preparation rollback granted an update hold");
+        };
+        assert_eq!(reason.to_string(), error);
+    }
+    assert_eq!(runner.shutdown().await.unwrap_err(), error);
+}
+
+#[tokio::test]
 async fn renewal_crossing_entry_and_failed_renewal_do_not_publish_heartbeat() {
     let signals = LiveTaskSignals::default();
     let (acknowledge, acknowledged) = oneshot::channel();
@@ -627,6 +656,7 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
         running.activation.unwrap().status,
         ActorActivationStatus::Running
     );
+    assert!(harness.runner.try_hold_for_update().unwrap().is_none());
     call.complete("native result");
     tokio::time::timeout(WAIT, async {
         let mut complete = false;

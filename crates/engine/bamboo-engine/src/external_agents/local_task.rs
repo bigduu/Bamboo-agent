@@ -349,6 +349,23 @@ impl LocalTaskChildRunner {
         }
     }
 
+    fn record_preparation_failure(
+        &self,
+        setup_error: String,
+        rollback: Result<(), ActorDirectoryError>,
+    ) -> String {
+        match rollback {
+            Ok(()) => setup_error,
+            Err(rollback) => {
+                let error = format!("{setup_error}; exact claim rollback unconfirmed: {rollback}");
+                // The preparation permit is about to be released and there is
+                // no execution record to keep this unresolved claim visible.
+                self.retain_shutdown_error(error.clone());
+                error
+            }
+        }
+    }
+
     fn reap_coordinators(&self, handles: &mut Vec<CoordinatorHandle>) {
         handles.retain_mut(|handle| {
             if !handle.is_finished() {
@@ -366,8 +383,9 @@ impl LocalTaskChildRunner {
 
     /// Keep native launches closed once every admitted preparation and
     /// execution has settled and its real finalizer has been joined. A still
-    /// running Child keeps its existing lifetime. This scope covers only this
-    /// runner, and the Host releases it before entering terminal shutdown.
+    /// running Child keeps its existing lifetime. The Host closes logical
+    /// Child admission before probing this runner and drops the hold before
+    /// entering terminal shutdown.
     pub fn try_hold_for_update(&self) -> io::Result<Option<NativeChildUpdateHold>> {
         let preparations = match self
             .preparations
@@ -839,19 +857,15 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let (owner, persistence) = match setup {
             Ok(bound) => bound,
             Err(error) => {
-                return match store
-                    .finish_activation(
+                let rollback = store
+                    .finish_activation_observed(
                         &claimed.fence(),
                         chrono::Utc::now(),
                         ActorActivationFinish::Failed,
                     )
                     .await
-                {
-                    Ok(_) => Err(error),
-                    Err(rollback) => Err(format!(
-                        "{error}; exact claim rollback unconfirmed: {rollback}"
-                    )),
-                };
+                    .map(drop);
+                return Err(self.record_preparation_failure(error, rollback));
             }
         };
         let signals = Arc::new(LiveTaskSignals::default());
