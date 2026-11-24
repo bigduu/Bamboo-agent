@@ -829,21 +829,46 @@ mod data_root_tests {
     }
 }
 
-/// Run Jiandu's deterministic lexical shortlist without exposing the composed
-/// store to Bamboo callers.
+/// Apply Bamboo's prompt scope policy before ranking or model reranking.
 pub async fn shortlist_relevant_memories(
     store: &MemoryStore,
     project_key: Option<&str>,
     query: &str,
     options: &MemoryRecallOptions,
 ) -> io::Result<Vec<MemoryRecallCandidate>> {
-    jiandu_memory::memory_store::shortlist_relevant_memories(
-        &store.store,
-        project_key,
+    use jiandu_memory::memory_store as jiandu;
+
+    let project_options = MemoryRecallOptions {
+        include_global_fallback: false,
+        ..options.clone()
+    };
+    let project =
+        jiandu::shortlist_relevant_memories(&store.store, project_key, query, &project_options)
+            .await?;
+    if !project.is_empty() || !options.include_global_fallback || query.trim().is_empty() {
+        return Ok(project);
+    }
+
+    let Some(mut index) = store
+        .store
+        .read_lexical_index(MemoryScope::Global, None)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    // Old versions could store Project facts in Global. Filter before they
+    // can displace valid Global candidates or reach the background model.
+    index.items.retain(|item| {
+        item.scope == MemoryScope::Global
+            && item.project_key.is_none()
+            && item.section_id.is_none()
+            && item.r#type != DurableMemoryType::Project
+    });
+    Ok(jiandu::recall_candidates_from_lexical_index(
+        &index,
         query,
-        options,
-    )
-    .await
+        options.shortlist_limit.max(1),
+    ))
 }
 
 #[cfg(test)]
@@ -879,6 +904,57 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_recall_keeps_global_reference_and_excludes_legacy_project_fact() {
+        use jiandu_memory::memory_store::LEXICAL_INDEX_FILE;
+
+        let directory = tempdir().unwrap();
+        let store = MemoryStore::new(directory.path());
+        let scope = MemoryScope::Global;
+        let legacy = write_durable(
+            &store,
+            scope,
+            None,
+            "Cedar rollout",
+            "A project-specific rollout.",
+        )
+        .await;
+        let reference = write_durable(
+            &store,
+            scope,
+            None,
+            "Cedar conventions",
+            "A shared reference.",
+        )
+        .await;
+        // Reproduce the lexical index of a Global store written by an older host.
+        let mut index = store
+            .store
+            .read_lexical_index(scope, None)
+            .await
+            .unwrap()
+            .unwrap();
+        index
+            .items
+            .iter_mut()
+            .find(|item| item.id == legacy.frontmatter.id)
+            .unwrap()
+            .r#type = DurableMemoryType::Project;
+        let index_path = store
+            .store
+            .resolver()
+            .indexes_dir(scope, None)
+            .join(LEXICAL_INDEX_FILE);
+        std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+        let recall =
+            shortlist_relevant_memories(&store, None, "cedar", &MemoryRecallOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(recall.len(), 1);
+        assert_eq!(recall[0].id, reference.frontmatter.id);
     }
 
     async fn write_durable(

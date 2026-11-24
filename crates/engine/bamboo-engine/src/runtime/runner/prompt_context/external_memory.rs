@@ -42,8 +42,8 @@ const RELEVANT_MEMORY_RESULT_LIMIT: usize = 3;
 const RELEVANT_MEMORY_TOTAL_MAX_CHARS: usize = 1_600;
 /// Max chars used by each fully rendered relevant-memory item.
 const RELEVANT_MEMORY_PER_ITEM_MAX_CHARS: usize = 220;
-/// Max chars injected from the global Dream notebook fallback.
-const GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
+/// Max chars injected from the authorized Project Dream notebook.
+const PROJECT_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
 /// Max chars for the ledger agenda section.
 const LEDGER_AGENDA_PROMPT_MAX_CHARS: usize = 1_200;
 /// Max items rendered per agenda bucket (overdue/today/upcoming/undated).
@@ -60,13 +60,6 @@ const CONTEXT_PRESSURE_WARNING_THRESHOLD: f64 = 70.0;
 #[derive(Debug, Clone)]
 struct TopicSnippet {
     name: String,
-    content: String,
-    truncated: bool,
-    full_len: usize,
-}
-
-#[derive(Debug, Clone)]
-struct LoadedSnippet {
     content: String,
     truncated: bool,
     full_len: usize,
@@ -194,7 +187,6 @@ struct ExternalMemoryRenderParts {
     rendered_relevant_memories: Vec<RelevantMemorySnippet>,
     project_memory_index_section: String,
     project_dream_section: String,
-    global_dream_fallback_section: String,
     context_pressure_warning: String,
     full_section: String,
 }
@@ -384,15 +376,6 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
     } else {
         None
     };
-    let global_dream_fallback = if prompt_memory_flags.project_first_dream {
-        if project_dream.is_none() && project_memory_index.is_none() {
-            load_global_dream_fallback_snippet(memory, session_id.as_str()).await
-        } else {
-            None
-        }
-    } else {
-        load_global_dream_fallback_snippet(memory, session_id.as_str()).await
-    };
 
     let latest_user_query_present = latest_user_query_text(session).is_some();
     let render_parts = build_external_memory_render_parts(
@@ -402,7 +385,6 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         project_memory_index.as_ref(),
         &relevant_memory_snippets,
         project_dream.as_ref(),
-        global_dream_fallback.as_ref(),
     );
     let all_compact_exposed_count = render_parts.rendered_relevant_memories.len() as u32;
     let project_items = render_parts
@@ -449,7 +431,6 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         &relevant_memory_snippets,
         relevant_memory_result.strategy,
         project_dream.as_ref(),
-        global_dream_fallback.as_ref(),
         &render_parts,
     );
 
@@ -465,7 +446,7 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
     persist_prompt_memory_observability(session, &observability);
 
     tracing::info!(
-        "[{}] External memory injected: project_key_resolved={}, project_index_loaded={}, project_index_chars={}, relevant_query_present={}, relevant_count={}, project_dream_loaded={}, project_dream_chars={}, global_dream_fallback_used={}, global_dream_chars={}, session_topics={}, session_note_chars={}, truncated_topics={}, dream_source={}, external_memory_section_chars={}",
+        "[{}] External memory injected: project_key_resolved={}, project_index_loaded={}, project_index_chars={}, relevant_query_present={}, relevant_count={}, project_dream_loaded={}, project_dream_chars={}, session_topics={}, session_note_chars={}, truncated_topics={}, dream_source={}, external_memory_section_chars={}",
         session_id,
         resolved_project_key.as_deref().unwrap_or(""),
         project_memory_index.is_some(),
@@ -477,11 +458,6 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         relevant_memory_snippets.len(),
         project_dream.is_some(),
         project_dream
-            .as_ref()
-            .map(|snippet| count_chars(&snippet.content))
-            .unwrap_or(0),
-        global_dream_fallback.is_some(),
-        global_dream_fallback
             .as_ref()
             .map(|snippet| count_chars(&snippet.content))
             .unwrap_or(0),
@@ -839,37 +815,9 @@ async fn load_project_dream_snippet(
     let content = read.snapshot?.content;
 
     let full_len = count_chars(&content);
-    let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
+    let (snippet, truncated) = truncate_chars(&content, PROJECT_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
     Some(ProjectDreamSnippet {
         project_key: project_key.to_string(),
-        content: snippet,
-        truncated,
-        full_len,
-    })
-}
-
-async fn load_global_dream_fallback_snippet(
-    memory: &MemoryStore,
-    session_id: &str,
-) -> Option<LoadedSnippet> {
-    let read = match memory.read_dream_snapshot(MemoryScope::Global, None).await {
-        Ok(read) => read,
-        Err(error) => {
-            tracing::warn!("[{}] Failed to read Dream notebook: {}", session_id, error);
-            return None;
-        }
-    };
-    if read.stale {
-        tracing::debug!(
-            "[{}] Using stale global Dream snapshot for orientation",
-            session_id
-        );
-    }
-    let content = read.snapshot?.content;
-
-    let full_len = count_chars(&content);
-    let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
-    Some(LoadedSnippet {
         content: snippet,
         truncated,
         full_len,
@@ -895,7 +843,6 @@ fn build_external_memory_render_parts(
     project_memory_index: Option<&ProjectMemoryIndexSnippet>,
     relevant_memory_snippets: &[RelevantMemorySnippet],
     project_dream: Option<&ProjectDreamSnippet>,
-    global_dream_fallback: Option<&LoadedSnippet>,
 ) -> ExternalMemoryRenderParts {
     let session_note_section = render_session_note_section(session_note_snippets);
     let ledger_agenda_section = ledger_agenda
@@ -916,9 +863,6 @@ fn build_external_memory_render_parts(
     let project_dream_section = project_dream
         .map(render_project_dream_section)
         .unwrap_or_default();
-    let global_dream_fallback_section = global_dream_fallback
-        .map(render_global_dream_fallback_section)
-        .unwrap_or_default();
     let context_pressure_warning = render_context_pressure_warning(session).unwrap_or_default();
 
     let memory_sections = [
@@ -927,7 +871,6 @@ fn build_external_memory_render_parts(
         &relevant_memory_section,
         &project_memory_index_section,
         &project_dream_section,
-        &global_dream_fallback_section,
     ];
     let mut section = String::new();
     if memory_sections.iter().any(|part| !part.is_empty()) {
@@ -946,7 +889,6 @@ fn build_external_memory_render_parts(
         rendered_relevant_memories: relevant_memory_render.kept_snippets,
         project_memory_index_section,
         project_dream_section,
-        global_dream_fallback_section,
         context_pressure_warning,
         full_section: section,
     }
@@ -962,7 +904,6 @@ fn build_prompt_memory_observability(
     relevant_memory_snippets: &[RelevantMemorySnippet],
     relevant_memory_strategy: MemoryRecallStrategy,
     project_dream: Option<&ProjectDreamSnippet>,
-    global_dream_fallback: Option<&LoadedSnippet>,
     render_parts: &ExternalMemoryRenderParts,
 ) -> PromptMemoryObservability {
     let session_notes_status = if session_note_snippets.is_empty() {
@@ -1010,31 +951,8 @@ fn build_prompt_memory_observability(
     } else {
         "no_project_key"
     };
-    let global_dream_fallback_status = if !prompt_memory_flags.project_first_dream {
-        if let Some(snippet) = global_dream_fallback {
-            if snippet.truncated {
-                "forced_loaded_truncated"
-            } else {
-                "forced_loaded"
-            }
-        } else {
-            "forced_missing"
-        }
-    } else if project_dream.is_some() || project_memory_index.is_some() {
-        "skipped_project_memory_or_dream_present"
-    } else if let Some(snippet) = global_dream_fallback {
-        if snippet.truncated {
-            "fallback_loaded_truncated"
-        } else {
-            "fallback_loaded"
-        }
-    } else {
-        "fallback_missing"
-    };
     let dream_source = if project_dream.is_some() {
         "project"
-    } else if global_dream_fallback.is_some() {
-        "global_fallback"
     } else {
         "none"
     };
@@ -1050,7 +968,7 @@ fn build_prompt_memory_observability(
         project_memory_index_status: project_memory_index_status.to_string(),
         relevant_memory_status: relevant_memory_status.to_string(),
         project_dream_status: project_dream_status.to_string(),
-        global_dream_fallback_status: global_dream_fallback_status.to_string(),
+        global_dream_fallback_status: "disabled".to_string(),
         dream_source: dream_source.to_string(),
         session_topic_count: session_note_snippets.len(),
         truncated_session_topic_count: session_note_snippets
@@ -1062,9 +980,7 @@ fn build_prompt_memory_observability(
         project_memory_index_section_chars: count_chars(&render_parts.project_memory_index_section),
         relevant_memory_section_chars: count_chars(&render_parts.relevant_memory_section),
         project_dream_section_chars: count_chars(&render_parts.project_dream_section),
-        global_dream_fallback_section_chars: count_chars(
-            &render_parts.global_dream_fallback_section,
-        ),
+        global_dream_fallback_section_chars: 0,
         context_pressure_warning_chars: count_chars(&render_parts.context_pressure_warning),
         external_memory_section_chars: count_chars(&render_parts.full_section),
     }
@@ -1314,28 +1230,6 @@ fn render_project_dream_section(snippet: &ProjectDreamSnippet) -> String {
     if snippet.truncated {
         section.push_str(&format!(
             "_(showing {} of {} chars from the project Dream notebook)_\n",
-            count_chars(&snippet.content),
-            snippet.full_len,
-        ));
-    }
-    section.push_str(
-        "Verify against current tools/files before relying on Dream content for repository state or project-specific claims.\n\n",
-    );
-    section
-}
-
-fn render_global_dream_fallback_section(snippet: &LoadedSnippet) -> String {
-    let mut section = String::new();
-    section.push_str("### Global Dream Summary (fallback)\n");
-    section.push_str(
-        "Synthesized auxiliary orientation only. This may be broader than the current project and is not authoritative current truth.\n",
-    );
-    section.push_str("````md\n");
-    section.push_str(&snippet.content);
-    section.push_str("\n````\n");
-    if snippet.truncated {
-        section.push_str(&format!(
-            "_(showing {} of {} chars from the global Dream notebook fallback)_\n",
             count_chars(&snippet.content),
             snippet.full_len,
         ));
