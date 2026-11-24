@@ -286,6 +286,8 @@ impl SessionRepository {
             run_id: run_id.to_string(),
             lease_owner: if for_compaction {
                 bamboo_domain::new_root_compaction_lease_owner()
+            } else if let Some(predecessor) = predecessor {
+                bamboo_domain::new_root_planned_update_lease_owner(predecessor)
             } else {
                 format!("root-execution-{}", uuid::Uuid::new_v4())
             },

@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_domain::{
-    ActorActivation, ActorActivationClaim, ActorActivationFence, ActorActivationFinish,
-    ActorActivationStatus, ActorAncestorObservation, ActorControlPlaneBinding, ActorDirectoryEntry,
-    ActorDirectoryError, ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
+    is_root_planned_update_attempt, root_planned_update_prior_projection_sha256, ActorActivation,
+    ActorActivationClaim, ActorActivationFence, ActorActivationFinish, ActorActivationStatus,
+    ActorAncestorObservation, ActorControlPlaneBinding, ActorDirectoryEntry, ActorDirectoryError,
+    ActorDirectoryPort, ActorLogicalState, ActorSession, ProjectId, Session,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1060,6 +1061,12 @@ impl ActorDirectoryPort for SessionStoreV2 {
         {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
+        // Only the update path may claim a parked Root with its exact
+        // completed predecessor. Fence stale ordinary callers under the
+        // same lock that commits the next Actor epoch.
+        if current.is_parked_for_planned_update() && predecessor.is_none() {
+            return Err(ActorDirectoryError::Busy);
+        }
         if bamboo_domain::is_root_compaction_lease_owner(&claim.lease_owner)
             && (matches!(
                 current.last_run_status().as_deref(),
@@ -1073,18 +1080,64 @@ impl ActorDirectoryPort for SessionStoreV2 {
         let mut entry = self
             .read_or_create_actor_entry(&claim.actor_id, &rel, &path, &guards)
             .await?;
-        if let Some(predecessor) = predecessor {
-            let finished = entry.activation.as_ref().is_some_and(|activation| {
-                activation.matches_fence(predecessor)
-                    && activation.status == ActorActivationStatus::Succeeded
-            });
-            if !finished
-                || !Self::root_runtime_matches_activation(&current, predecessor).map_err(storage)?
+        let prior_projection = if let Some(predecessor) = predecessor {
+            if !is_root_planned_update_attempt(&claim.lease_owner, predecessor)
+                || root_planned_update_prior_projection_sha256(&claim.lease_owner).is_some()
             {
                 return Err(ActorDirectoryError::StaleFence);
             }
-        }
-        let Mutation { value, changed, .. } = claim_entry(&mut entry, claim)?;
+            let activation = entry
+                .activation
+                .as_ref()
+                .ok_or(ActorDirectoryError::StaleFence)?;
+            let parked = current.is_parked_for_planned_update()
+                && current.last_run_status().as_deref() == Some("suspended")
+                && Self::root_runtime_matches_activation(&current, predecessor).map_err(storage)?;
+            let original = parked
+                && activation.matches_fence(predecessor)
+                && activation.status == ActorActivationStatus::Succeeded;
+            let same_scope = activation.lease_epoch > predecessor.lease_epoch
+                && activation.checkpoint_revision == 0
+                && is_root_planned_update_attempt(&activation.lease_owner, predecessor);
+            let projection = if same_scope && !parked {
+                Self::root_unstarted_planned_update_projection_sha256(&current, activation)
+                    .map_err(storage)?
+            } else {
+                None
+            };
+            let same_unstarted_attempt = same_scope && (parked || projection.is_some());
+            if !original
+                && (!same_unstarted_attempt
+                    || activation.status == ActorActivationStatus::Succeeded)
+            {
+                return Err(ActorDirectoryError::StaleFence);
+            }
+            if same_unstarted_attempt
+                && activation.status.is_live()
+                && activation.lease_expires_at > claim.now
+            {
+                return Err(ActorDirectoryError::Busy);
+            }
+            projection
+        } else {
+            if let Some(activation) = &entry.activation {
+                if Self::root_has_unstarted_planned_update_projection(&current, activation)
+                    .map_err(storage)?
+                {
+                    return Err(ActorDirectoryError::Busy);
+                }
+            }
+            None
+        };
+        // Replacing the Actor may also be interrupted before it can save. The
+        // persisted owner carries the exact, independently checked projection
+        // so a later claim can still recover the same unused execution.
+        let carried = prior_projection.map(|projection| ActorActivationClaim {
+            lease_owner: format!("{}:{projection}", claim.lease_owner),
+            ..claim.clone()
+        });
+        let Mutation { value, changed, .. } =
+            claim_entry(&mut entry, carried.as_ref().unwrap_or(claim))?;
         if changed {
             entry.revision = checked_next(entry.revision)?;
             self.write_actor_entry(&path, &entry, &guards).await?;

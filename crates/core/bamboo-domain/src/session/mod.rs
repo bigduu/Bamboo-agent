@@ -4,6 +4,8 @@
 pub const PACED_LOOP_METADATA_KEY: &str = "runtime.paced_loop";
 /// Last checkpointed outcome of a specific scheduled Session execution.
 pub const PACED_LOOP_OUTCOME_METADATA_KEY: &str = "runtime.paced_loop_outcome";
+/// Durable suspension owned by the desktop managed-update handoff.
+pub const PLANNED_UPDATE_SUSPEND_REASON: &str = "planned_update";
 
 pub mod actor;
 pub mod actor_snapshot;
