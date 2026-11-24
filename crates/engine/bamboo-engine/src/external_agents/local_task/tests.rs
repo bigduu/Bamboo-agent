@@ -21,6 +21,89 @@ mod owned_bash_publication;
 mod writer_lifecycle;
 
 #[tokio::test]
+async fn planned_update_waits_for_child_preparation_and_actual_finalization() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let preparing = runner.preparations.try_acquire().unwrap();
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    drop(preparing);
+
+    let (finish, finished) = oneshot::channel();
+    let finalizer = tokio::spawn(async move {
+        finished.await.unwrap();
+        Ok(())
+    });
+    lock(&runner.coordinators).push(finalizer);
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    assert!(!runner.closed.load(Ordering::Acquire));
+    finish.send(()).unwrap();
+    let hold = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(hold) = runner.try_hold_for_update().unwrap() {
+                return hold;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(lock(&runner.coordinators).is_empty());
+    assert!(runner.preparations.try_acquire().is_err());
+    drop(hold);
+    assert!(runner.preparations.try_acquire().is_ok());
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn planned_update_refuses_a_child_finalizer_with_unconfirmed_completion() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let task = tokio::spawn(async { Err("child publication unconfirmed".to_string()) });
+    lock(&runner.coordinators).push(task);
+    let error = tokio::time::timeout(WAIT, async {
+        loop {
+            match runner.try_hold_for_update() {
+                Err(error) => return error,
+                Ok(None) => tokio::task::yield_now().await,
+                Ok(Some(_)) => panic!("unconfirmed finalization granted an update hold"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(error.to_string().contains("child publication unconfirmed"));
+    assert!(runner.try_hold_for_update().is_err());
+    assert!(!runner.closed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn planned_update_refuses_an_unconfirmed_child_preparation_rollback() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let setup_error = "child writer setup failed";
+    assert_eq!(
+        runner.record_preparation_failure(setup_error.into(), Ok(())),
+        setup_error
+    );
+    assert!(runner.try_hold_for_update().unwrap().is_some());
+
+    let preparation = runner.preparations.try_acquire().unwrap();
+    let error = runner.record_preparation_failure(
+        setup_error.into(),
+        Err(ActorDirectoryError::Storage("rollback write failed".into())),
+    );
+    drop(preparation);
+
+    assert!(error.contains("exact claim rollback unconfirmed"));
+    assert!(lock(&runner.executions).is_empty());
+    assert!(lock(&runner.coordinators).is_empty());
+    for _ in 0..2 {
+        let Err(reason) = runner.try_hold_for_update() else {
+            panic!("unconfirmed preparation rollback granted an update hold");
+        };
+        assert_eq!(reason.to_string(), error);
+    }
+    assert_eq!(runner.shutdown().await.unwrap_err(), error);
+}
+
+#[tokio::test]
 async fn renewal_crossing_entry_and_failed_renewal_do_not_publish_heartbeat() {
     let signals = LiveTaskSignals::default();
     let (acknowledge, acknowledged) = oneshot::channel();
@@ -575,6 +658,7 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
         running.activation.unwrap().status,
         ActorActivationStatus::Running
     );
+    assert!(harness.runner.try_hold_for_update().unwrap().is_none());
     call.complete("native result");
     tokio::time::timeout(WAIT, async {
         let mut complete = false;
