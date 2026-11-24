@@ -157,6 +157,22 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         .resume_planned_update_root(&stale)
         .await
         .unwrap());
+    let mut stale_actor = checkpoint.clone();
+    stale_actor.lease_epoch += 1;
+    assert!(state
+        .child_completion_coordinator
+        .resume_planned_update_root(&stale_actor)
+        .await
+        .is_err());
+    let still_previous = state
+        .session_store
+        .inspect_actor(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        still_previous.activation.unwrap().lease_epoch,
+        checkpoint.lease_epoch
+    );
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
     assert!(state
         .child_completion_coordinator
