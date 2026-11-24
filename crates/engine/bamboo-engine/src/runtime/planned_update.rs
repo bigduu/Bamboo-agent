@@ -83,6 +83,7 @@ pub(super) async fn pause_before_model_round(
     if !crate::session_app::truncation::unresolved_tool_call_ids(&session.messages).is_empty() {
         return Ok(false);
     }
+    session.record_host_run_identity(&writer.fence.run_id);
     if let Err(error) = persistence.checkpoint_runtime_session(session).await {
         tracing::warn!(
             session_id = %session.id,
@@ -179,7 +180,6 @@ mod tests {
         let router = crate::session_activation::SessionActivationRouter::new();
         let mut session = Session::new("update-fixture", "local-model");
         session.set_provider_name("local-provider");
-        session.set_host_run_id("owned-root");
         session.add_message(Message::user("Read the fixture."));
         session.set_last_run_status("running");
         store.save_session(&session).await.unwrap();

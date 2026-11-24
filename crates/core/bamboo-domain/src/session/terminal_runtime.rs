@@ -11,12 +11,18 @@ impl Session {
         self.metadata.get(HOST_RUN_ID).map(String::as_str)
     }
 
-    pub fn set_host_run_id(&mut self, run_id: &str) {
+    /// Record the identity of the fenced Host run without resetting its
+    /// runtime state. A planned update can checkpoint mid-run through its writer.
+    pub fn record_host_run_identity(&mut self, run_id: &str) {
         self.metadata.insert(HOST_RUN_ID.into(), run_id.into());
         self.metadata.insert(
             "runtime.host_launch_generation".into(),
             self.child_launch_generation().to_string(),
         );
+    }
+
+    pub fn set_host_run_id(&mut self, run_id: &str) {
+        self.record_host_run_identity(run_id);
         // Materialize the new Host runtime before its completion source can
         // bind the pipeline identity. Keep durable waits and accounting.
         if self.agent_runtime_state.is_none() {
