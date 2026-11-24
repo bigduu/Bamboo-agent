@@ -3093,6 +3093,7 @@ pub enum TemplateExprSpec {
     /// Generate a runtime value.
     Generated { generator: GeneratedValue },
     /// Format string with placeholders (`{env:NAME}`, `{uuid}`, `{unix_ms}`).
+    /// Provider headers can also use `{session_affinity}`.
     Format { template: String },
 }
 

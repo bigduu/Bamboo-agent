@@ -201,6 +201,32 @@ flags. Authentication, connection, body framing, browser security and Bamboo
 control headers belong to their respective HTTP boundaries. A cross-origin
 redirect ends an upstream request carrying forwarded client headers.
 
+A Provider can use `{session_affinity}` in a structured `format` header
+override. The value is a domain-separated hash of the Bamboo session ID. It is
+stable across turns and retries, and distinct for different sessions. Bamboo
+omits the configured value on calls that have no session, including model
+discovery. Other header overrides keep their normal precedence.
+
+In the Provider's **Advanced Request Overrides (JSON)** editor, merge this
+example into the existing overrides. In file configuration, use the same
+object as the Provider's `request_overrides` value.
+
+```json
+{
+  "endpoints": {
+    "messages": {
+      "headers": {
+        "X-Session-Id": { "type": "format", "template": "{session_affinity}" }
+      }
+    }
+  }
+}
+```
+
+Choose the header name accepted by your gateway. Use `common.headers` for all
+generation endpoints or an endpoint or model rule for a narrower scope. This
+sends a routing hint the gateway can use for cache affinity.
+
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
 The [model limits](#model-limits-model_limitsjson) determine the output cap for
