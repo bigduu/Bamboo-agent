@@ -106,6 +106,7 @@ impl TicketApplication {
         }
         let (service, authority) = self.message_authority(message_id).await?;
         let prior = service.message_resolution(&authority, message_id)?;
+        self.record_update_dispatch().await?;
         if prior.proposal.is_some() {
             // Reuse the core's frozen identity check before mutable Host facts
             // can mask an altered retry. A saved proposal does not republish.

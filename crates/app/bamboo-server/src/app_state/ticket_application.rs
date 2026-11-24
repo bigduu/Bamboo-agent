@@ -2,6 +2,7 @@
 //! Authority always comes from Host storage; client JSON never selects a role.
 use std::{
     collections::BTreeSet,
+    io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -13,13 +14,32 @@ use bamboo_engine::{session_app::child_session::ChildSessionPort, ticket_runtime
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
+use super::update_admission::{DispatchHold, UntrackedUpdateAdmission};
 use crate::tools::{ticket_dispatch_adapter::TicketDispatchPolicy, ChildSessionAdapter};
+
+/// A reversible hold on the exact Ticket owner's dispatch and scope creation.
+#[must_use = "dropping a precommit hold reopens Ticket admission"]
+pub struct TicketUpdatePreparation {
+    dispatch: Option<DispatchHold>,
+    _initialization: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl TicketUpdatePreparation {
+    /// Commit once the managed Host has published its durable handoff.
+    /// Retain the hold until the old Host has drained HTTP and shut down.
+    pub fn commit(&mut self) {
+        if let Some(dispatch) = self.dispatch.take() {
+            dispatch.close();
+        }
+    }
+}
 
 pub struct TicketApplication {
     storage: Arc<dyn Storage>,
     config: Arc<RwLock<Config>>,
     service: Arc<OnceLock<Arc<TicketService>>>,
-    initializing: tokio::sync::Mutex<()>,
+    initializing: Arc<tokio::sync::Mutex<()>>,
+    update_admission: UntrackedUpdateAdmission,
     service_publisher: Arc<OnceLock<Arc<dyn Fn(Arc<TicketService>) + Send + Sync>>>,
     root: PathBuf,
     unavailable: Option<String>,
@@ -92,7 +112,8 @@ impl TicketApplication {
             storage,
             config,
             service: Arc::new(service.map(OnceLock::from).unwrap_or_default()),
-            initializing: tokio::sync::Mutex::new(()),
+            initializing: Arc::default(),
+            update_admission: Default::default(),
             service_publisher: Arc::new(OnceLock::new()),
             root: root.to_path_buf(),
             unavailable,
@@ -136,6 +157,84 @@ impl TicketApplication {
                 config.features.work_execution.max_parallel,
             )
         })
+    }
+
+    /// Freeze new Ticket runtime admission and prove the current scope idle.
+    /// A busy gate can be retried. Unconfirmed execution refuses replacement.
+    pub fn try_hold_for_planned_update(&self) -> io::Result<TicketUpdatePreparation> {
+        let dispatch = self.update_admission.try_hold(
+            "Waiting for Ticket dispatch admission",
+            "This Host has admitted Ticket activity without an update checkpoint",
+        )?;
+        let initialization = self.initializing.clone().try_lock_owned().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Waiting for Ticket scope initialization",
+            )
+        })?;
+        self.confirm_idle_for_planned_update()?;
+        Ok(TicketUpdatePreparation {
+            dispatch: Some(dispatch),
+            _initialization: initialization,
+        })
+    }
+
+    // Called under both the actual dispatch gate and the scope initialization
+    // lock. A durable business status alone cannot prove that Work stopped.
+    fn confirm_idle_for_planned_update(&self) -> io::Result<()> {
+        if !self.cancellation_tasks.lock().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Waiting for Ticket cancellation tasks",
+            ));
+        }
+        let policy_active = self.ready_scheduler.policy_is_active().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Waiting for Ready Work policy inspection",
+            )
+        })?;
+        if policy_active || self.patrol_calls.needs_accounting() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Active Ready Work or Patrol state prevents a planned update",
+            ));
+        }
+        let Some(service) = self.service.get() else {
+            if initialization::scope_is_empty(&self.root.join("tickets"))? {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The persisted Ticket scope could not prove that Work stopped",
+            ));
+        };
+        let (_, snapshot) = service.published().map_err(io::Error::other)?;
+        let pending_accounting = snapshot.execution_budget.as_ref().is_some_and(|budget| {
+            budget
+                .reservations
+                .values()
+                .any(|entry| entry.usage.is_none())
+        });
+        if snapshot
+            .assignments
+            .values()
+            .any(|work| !work.process_stopped)
+            || pending_accounting
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Managed Work termination or provider accounting is unconfirmed",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn record_update_dispatch(&self) -> Result<()> {
+        self.update_admission
+            .record_dispatch()
+            .await
+            .map_err(|error| Error::ResourceBlocked(error.to_string()))
     }
 
     pub(in crate::app_state) fn close_cancellation_tasks(&self) {
@@ -482,6 +581,7 @@ impl TicketApplication {
         }
         let (service, authority) = self.authority(principal.clone()).await?;
         self.validate_project_operations(&service, command)?;
+        self.record_update_dispatch().await?;
         let receipt = service.work_update(&authority, command)?;
         self.wake_ready_work();
         self.cancel_after_commit(&service, command);
@@ -614,6 +714,7 @@ impl TicketApplication {
         if let Some(fence) = fence {
             fence.check()?;
         }
+        self.record_update_dispatch().await?;
         let receipt = service.work_dispatch(&authority, command)?;
         self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds, fence)
             .await
@@ -880,6 +981,7 @@ impl TicketApplication {
         fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
+        self.record_update_dispatch().await?;
         if spec.managed_root.is_some() {
             if max_rounds.is_some() || fence.is_some() {
                 return Err(Error::ScopeDenied(

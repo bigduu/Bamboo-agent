@@ -23,6 +23,99 @@ fn contract() -> Contract {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn planned_update_rejects_preexisting_ticket_assignment_without_stop_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let config = config(true);
+    config.write().await.features.ticket_dispatch = true;
+    let app = TicketApplication::open(root.path(), storage, config).await;
+    let (service, authority) = app
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let create = service
+        .prepare_command(
+            &authority,
+            "update-proof-create",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::Ready {
+                    work_id: "work".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let work = service.work_update(&authority, &create).unwrap().ids["work"].clone();
+    drop(app.try_hold_for_planned_update().unwrap());
+    let dispatch = service
+        .prepare_command(
+            &authority,
+            "update-proof-dispatch",
+            vec![Operation::Start {
+                work_id: work,
+                temp_id: "assignment".into(),
+                workspace: None,
+            }],
+        )
+        .unwrap();
+    service.work_dispatch(&authority, &dispatch).unwrap();
+    assert!(matches!(
+        app.try_hold_for_planned_update(),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported
+    ));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn planned_update_seals_actual_ticket_admission_on_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
+    let config = config(true);
+    config.write().await.features.ticket_dispatch = true;
+    let app = TicketApplication::open(root.path(), storage, config).await;
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, authority) = app.authority(principal.clone()).await.unwrap();
+    let command = service
+        .prepare_command(
+            &authority,
+            "update-proof-gate",
+            vec![Operation::Create {
+                temp_id: "work".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: contract(),
+                depends_on: BTreeSet::new(),
+            }],
+        )
+        .unwrap();
+    let before = service.published().unwrap().0;
+    drop(app.try_hold_for_planned_update().unwrap());
+    let mut hold = app.try_hold_for_planned_update().unwrap();
+    hold.commit();
+    assert!(matches!(
+        app.update(principal, &command).await,
+        Err(Error::ResourceBlocked(message)) if message.contains("dispatch is closed")
+    ));
+    assert_eq!(service.published().unwrap().0, before);
+    drop(hold);
+    assert!(matches!(
+        app.try_hold_for_planned_update(),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported
+    ));
+}
+
 fn fixture_git(path: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
