@@ -9,7 +9,8 @@ ledger. Set `BAMBOO_LOCAL_TRACES_ENABLED=false` to disable and clear it. Library
 hosts retain control of their own telemetry initialization.
 
 Only fixed operation names, validated identifiers, timestamps, fixed outcome
-categories and provider-reported token counts are projected. No prompts,
+categories, provider-reported token counts, and operation-level performance
+timings and counters are projected. No prompts,
 responses, tool arguments/results, paths, credentials, span events or raw error
 messages are stored. As with the existing OTel mapping, operators must not place
 secrets in syntactically valid session, model or tool identifiers. For a session
@@ -126,6 +127,10 @@ is the provider's total input; cache read/creation are input subsets, cache
 write is separate provider metadata, and reasoning is an output subset. Do not
 add subsets to the totals. A cache-read ratio is meaningful only when both
 input and read are known, input is positive, and read does not exceed input.
+An optional `performance` object contains numeric measurements for the
+operation: Grep queue and scan time and counts, time to the first upstream text
+chunk, or Gemini frame counts. The process-wide token cache totals are available
+through OpenTelemetry export.
 
 ## Read-only hook event
 
