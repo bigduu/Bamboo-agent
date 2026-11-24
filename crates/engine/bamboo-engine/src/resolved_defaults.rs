@@ -182,11 +182,14 @@ pub async fn probe_model(provider: &dyn LLMProvider, model: &str) -> ModelProbeS
 
     let probe = async {
         let messages = [Message::user("Reply with OK.")];
+        // Legacy Claude thinking needs more than 1,024 output tokens.
+        // Stop as soon as the provider generates text or reasoning.
         let mut stream = provider
-            .chat_stream(&messages, &[], Some(64), model)
+            .chat_stream(&messages, &[], Some(2_048), model)
             .await?;
         while let Some(chunk) = stream.next().await {
-            if matches!(chunk?, LLMChunk::Token(text) if !text.trim().is_empty()) {
+            if matches!(chunk?, LLMChunk::Token(text) | LLMChunk::ReasoningToken(text) if !text.trim().is_empty())
+            {
                 return Ok::<_, LLMError>(true);
             }
         }
@@ -266,7 +269,7 @@ mod tests {
             ) -> Result<LLMStream, LLMError> {
                 assert_eq!(messages.len(), 1);
                 assert!(tools.is_empty());
-                assert_eq!(max_output_tokens, Some(64));
+                assert_eq!(max_output_tokens, Some(2_048));
                 if model == "catalog-only" {
                     return Err(LLMError::Api("HTTP 401 Unauthorized".into()));
                 }
@@ -284,6 +287,47 @@ mod tests {
             probe_model(&ModelProbeFixture, "catalog-only").await,
             ModelProbeStatus::AuthenticationFailed,
         );
+    }
+
+    #[tokio::test]
+    async fn model_probe_sends_a_legacy_claude_thinking_request() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        let server = MockServer::start().await;
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Check\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = bamboo_llm::AnthropicProvider::new("fixture-key")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_litellm_messages()
+            .with_reasoning_effort(Some(ReasoningEffort::High));
+
+        assert_eq!(
+            probe_model(&provider, "claude-sonnet-4-5").await,
+            ModelProbeStatus::Ready
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        let thinking_tokens = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(thinking_tokens >= 1_024);
+        assert!(thinking_tokens < body["max_tokens"].as_u64().unwrap());
+        assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
     }
 
     fn test_registry() -> Arc<ProviderRegistry> {
