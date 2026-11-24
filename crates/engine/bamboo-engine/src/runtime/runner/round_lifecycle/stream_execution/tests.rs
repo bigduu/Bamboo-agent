@@ -3824,14 +3824,19 @@ fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
     assert!(wire
         .iter()
         .any(|message| message.content == "Check its progress."));
-    assert_eq!(
-        wire.iter()
-            .filter(|message| message
-                .content
-                .contains("Supervisor delegation-first policy"))
-            .count(),
-        1
-    );
+    let mut policies = wire.iter().filter(|message| {
+        message
+            .content
+            .contains("Supervisor delegation-first policy")
+    });
+    let policy = policies.next().expect("refreshed Supervisor policy");
+    assert!(policies.next().is_none());
+    assert!(policy
+        .content
+        .contains("Do not poll the same assignment across tool rounds or turns"));
+    assert!(policy
+        .content
+        .contains("end the turn quietly without recapping unchanged progress"));
     let anthropic = bamboo_llm::providers::anthropic::build_anthropic_request_with_cache(
         &wire,
         &[],
