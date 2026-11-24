@@ -63,7 +63,7 @@ impl Default for ActorSnapshotLimits {
             directory_entries: 4096,
             file_reads: 2048,
             file_bytes: 512 * 1024,
-            aggregate_read_bytes: 8 * 1024 * 1024,
+            aggregate_read_bytes: 16 * 1024 * 1024,
             response_bytes: 256 * 1024,
         }
     }
