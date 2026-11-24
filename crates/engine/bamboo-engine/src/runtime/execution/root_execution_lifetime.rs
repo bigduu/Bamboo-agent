@@ -1,8 +1,9 @@
 //! Host-local outer-task ownership. Logical terminal status is never idleness.
 //!
 //! This module owns real JoinHandles, not a serialized idle assertion. It does
-//! not yet issue physical closure: ordinary Root tools have no complete resource
-//! domain. A reset admission reservation is therefore not a reset write grant.
+//! only issues an outer join. The managed update router must also prove the
+//! exact ordinary Root resource domain before using the join for replacement.
+//! A reset admission reservation is therefore not a reset write grant.
 use std::{
     collections::HashMap,
     fmt, io,
@@ -462,6 +463,7 @@ impl RootRunAdmission {
         Ok(RootOuterTask {
             lifetime: Arc::downgrade(&self.lifetime),
             epoch: self.epoch,
+            update_join: None,
         })
     }
 }
@@ -470,8 +472,15 @@ impl RootRunAdmission {
 pub(super) struct RootOuterTask {
     lifetime: Weak<RootExecutionLifetime>,
     epoch: u64,
+    update_join: Option<watch::Sender<Option<Result<(), String>>>>,
 }
 impl RootOuterTask {
+    pub(super) fn observe_update_join(&mut self) -> crate::session_activation::OrdinaryRootJoin {
+        let (tx, rx) = watch::channel(None);
+        self.update_join = Some(tx);
+        rx
+    }
+
     pub(super) fn unconfirmed(&self, reason: impl Into<String>) {
         self.update(|task| {
             task.failure.get_or_insert(reason.into());
@@ -535,6 +544,9 @@ impl RootOuterTask {
         };
         let weak = self.lifetime.clone();
         let epoch = self.epoch;
+        let update_join = self.update_join;
+        // Managed update must retain this owner even after idle Runner eviction.
+        let retained_owner = update_join.as_ref().map(|_| lifetime.clone());
         // Register the coordinator before it can remove the pending task.
         // Shutdown cannot snapshot an empty set between those two events.
         let mut state = match lifetime.state.lock() {
@@ -549,7 +561,7 @@ impl RootOuterTask {
         };
         let join = tokio::spawn(async move {
             let joined = task.await;
-            let Some(lifetime) = weak.upgrade() else {
+            let Some(lifetime) = retained_owner.or_else(|| weak.upgrade()) else {
                 return;
             };
             let confirmed = {
@@ -570,6 +582,9 @@ impl RootOuterTask {
                         (!task.tail_completed).then(|| "Root outer tail did not complete".into())
                     });
                 if let Some(error) = failure {
+                    if let Some(update_join) = &update_join {
+                        update_join.send_replace(Some(Err(error.clone())));
+                    }
                     state.failure.get_or_insert(error);
                     false
                 } else {
@@ -586,6 +601,17 @@ impl RootOuterTask {
             lifetime.changed.notify_waiters();
             if confirmed {
                 complete().await;
+            }
+            if let Some(update_join) = update_join {
+                let pending = update_join.borrow().is_none();
+                if pending {
+                    let result = if confirmed {
+                        Ok(())
+                    } else {
+                        Err("Root Actor closure is unconfirmed".into())
+                    };
+                    update_join.send_replace(Some(result));
+                }
             }
         });
         state.joins.push(join);

@@ -201,6 +201,18 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         self.runners.len() == 1 && self.runners[0].supports_native_ticket_budget()
     }
 
+    fn try_hold_native_children_for_update(
+        &self,
+    ) -> std::io::Result<Option<super::local_task::NativeChildUpdateHold>> {
+        let [runner] = self.runners.as_slice() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Planned updates require one native Child backend",
+            ));
+        };
+        runner.try_hold_native_children_for_update()
+    }
+
     fn set_local_child_skill_factory(
         &self,
         factory: Option<Arc<dyn super::local_task::LocalChildSkillFactory>>,

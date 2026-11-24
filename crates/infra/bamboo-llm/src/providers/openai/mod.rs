@@ -190,18 +190,24 @@ impl OpenAIProvider {
         self
     }
 
-    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+    fn build_headers(
+        &self,
+        endpoint: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", self.api_key))
                 .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
         );
-        request_overrides::apply_overrides_to_header_map(
+        request_overrides::apply_overrides_to_session_headers(
             &mut headers,
             self.request_overrides.as_ref(),
             endpoint,
             model,
+            session_id,
         );
         Ok(headers)
     }
@@ -346,9 +352,10 @@ impl OpenAIProvider {
         required_tool: Option<&str>,
         reasoning_source: &str,
         request_purpose: &str,
-        session_log_id: &str,
+        session_id: Option<&str>,
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
+        let session_log_id = session_id.unwrap_or("unknown-session");
         let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let mut effective_responses_options = responses_options.cloned();
         if let Some(options) = effective_responses_options.as_mut() {
@@ -434,7 +441,11 @@ impl OpenAIProvider {
             log_identity(request_purpose)
         );
 
-        let headers = self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
+            session_id,
+        )?;
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
         let responses_url = format!("{}/responses", self.base_url);
@@ -518,8 +529,11 @@ impl OpenAIProvider {
                     Some(&fallback_options),
                     session_log_id,
                 );
-                let fallback_headers =
-                    self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
+                let fallback_headers = self.build_headers(
+                    request_overrides::ENDPOINT_RESPONSES,
+                    Some(model),
+                    session_id,
+                )?;
                 let fallback =
                     crate::retry::send_provider_request(&crate::retry::global(), "OpenAI", || {
                         self.client
@@ -745,10 +759,7 @@ impl LLMProvider for OpenAIProvider {
                 .request_purpose
                 .as_deref()
                 .unwrap_or("unknown"),
-            effective_options
-                .session_id
-                .as_deref()
-                .unwrap_or("unknown-session"),
+            effective_options.session_id.as_deref(),
             capability_loading_mode,
         )
         .await
@@ -774,9 +785,8 @@ impl LLMProvider for OpenAIProvider {
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
-        let session_log_id = options
-            .and_then(|o| o.session_id.as_deref())
-            .unwrap_or("unknown-session");
+        let session_id = options.and_then(|options| options.session_id.as_deref());
+        let session_log_id = session_id.unwrap_or("unknown-session");
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -799,7 +809,7 @@ impl LLMProvider for OpenAIProvider {
                     required_tool,
                     reasoning_source,
                     request_purpose,
-                    session_log_id,
+                    session_id,
                     CapabilityLoadingMode::LegacyFullCatalog,
                 )
                 .await;
@@ -855,8 +865,11 @@ impl LLMProvider for OpenAIProvider {
             log_identity(request_purpose)
         );
 
-        let headers =
-            self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
+        let headers = self.build_headers(
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(model),
+            session_id,
+        )?;
         let chat_url = format!("{}/chat/completions", self.base_url);
         let correction = match (request_purpose, request_reasoning_effort) {
             ("compression", Some(ReasoningEffort::Disabled)) if !self.is_official_base_url() => {
@@ -917,7 +930,7 @@ impl LLMProvider for OpenAIProvider {
                         required_tool,
                         reasoning_source,
                         request_purpose,
-                        session_log_id,
+                        session_id,
                         CapabilityLoadingMode::LegacyFullCatalog,
                     )
                     .await;
@@ -995,13 +1008,13 @@ impl LLMProvider for OpenAIProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         model_fetcher::fetch_model_list(&self.client, &url, headers, "OpenAI").await
     }
 
     async fn list_model_info(&self) -> Result<Vec<crate::provider::ProviderModelInfo>> {
-        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None, None)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let models = self
             .model_info_cache

@@ -68,6 +68,7 @@ pub struct WorkflowRunAccess {
     agents: Arc<WorkflowAgentAdapter>,
     project_scope: Option<project_scope::WorkflowProjectScope>,
     scope_admissions: Arc<Mutex<BTreeMap<String, usize>>>,
+    update_admission: crate::app_state::update_admission::UntrackedUpdateAdmission,
 }
 
 struct WorkflowScopeSources {
@@ -229,6 +230,7 @@ impl WorkflowRunAccess {
             agents,
             project_scope: None,
             scope_admissions: Arc::default(),
+            update_admission: Default::default(),
         })
     }
 
@@ -252,6 +254,10 @@ impl WorkflowRunAccess {
             + Send
             + 'static,
     {
+        self.update_admission
+            .record_dispatch()
+            .await
+            .map_err(|error| WorkflowRunError::Storage(error.to_string()))?;
         *self
             .scope_admissions
             .lock()
@@ -271,6 +277,12 @@ impl WorkflowRunAccess {
         })
         .await
         .map_err(|_| WorkflowRunError::Storage("workflow admission task failed".into()))?
+    }
+
+    pub(crate) fn update_admission(
+        &self,
+    ) -> &crate::app_state::update_admission::UntrackedUpdateAdmission {
+        &self.update_admission
     }
 
     pub(crate) fn bind_child_adapter(

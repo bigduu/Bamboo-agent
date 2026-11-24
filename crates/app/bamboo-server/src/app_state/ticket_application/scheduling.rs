@@ -4,6 +4,7 @@ use bamboo_orchestration::{ReadyDispatch, ReadyWorkHost};
 
 impl TicketApplication {
     pub async fn install_ready_work_policy(&self, policy: ReadyWorkPolicy) -> Result<()> {
+        self.record_update_dispatch().await?;
         self.ready_scheduler.install(self, policy).await
     }
 

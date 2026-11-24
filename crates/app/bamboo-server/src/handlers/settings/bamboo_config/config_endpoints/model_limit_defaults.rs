@@ -68,9 +68,9 @@ mod tests {
 
         let default = &payload.model_limits[0];
         assert_eq!(default.model_pattern, "default");
-        assert_eq!(default.max_context_tokens, 1_000_000);
-        assert_eq!(default.max_output_tokens, 64_000);
-        // Safety margin scales with context window: max(1_000_000 / 100, 1_000).
-        assert_eq!(default.safety_margin, 10_000);
+        assert_eq!(default.max_context_tokens, 32_768);
+        assert_eq!(default.max_output_tokens, 4_096);
+        // Safety margin scales with context window: max(32_768 / 100, 1_000).
+        assert_eq!(default.safety_margin, 1_000);
     }
 }

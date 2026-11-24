@@ -18,6 +18,11 @@ use bamboo_domain::{
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
+mod ordinary_root_update;
+pub(crate) use ordinary_root_update::OrdinaryRootJoin;
+use ordinary_root_update::OrdinaryRootRegistry;
+pub use ordinary_root_update::OrdinaryRootUpdateResources;
+
 type AsyncRollback =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
 
@@ -216,7 +221,7 @@ struct ActiveOwner {
     session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
-    parked_update: Option<ParkedUpdateRoot>,
+    parked_update: Option<ParkedRootOwner>,
     /// Scheduling boundary for this owner, not durable queue/authority state.
     /// Keep wait/Guardian outcomes together until this exact Run leaves.
     child_completions_need_successor: bool,
@@ -225,6 +230,12 @@ struct ActiveOwner {
     /// canonical FileSessionInbox and forwards the claimed typed envelope.
     delivery_sink: Option<mpsc::UnboundedSender<u64>>,
     scoped_loop: Option<SupervisorLoopGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct ParkedRootOwner {
+    checkpoint: ParkedUpdateRoot,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +528,7 @@ pub struct SessionActivationRouter {
     runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
     update_hold: watch::Sender<UpdateHold>,
+    ordinary_root_resources: Option<Arc<OrdinaryRootRegistry>>,
     /// Live operations for one logical target share a fence. Weak entries are
     /// pruned on access; idle/deleted targets retain no separate lock state.
     publication_fences: TargetPublicationFences,
@@ -600,7 +612,8 @@ impl SessionUpdateAdmission {
         owner
             .parked_update
             .as_ref()
-            .filter(|root| root.update_id == self.id)
+            .filter(|root| root.checkpoint.update_id == self.id && !root.cancel.is_cancelled())
+            .map(|root| &root.checkpoint)
     }
 
     /// After checking physical work on the host, publish a durable handoff
@@ -612,32 +625,85 @@ impl SessionUpdateAdmission {
         &self,
         publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()> + Send,
     ) -> std::io::Result<()> {
+        if self.router.ordinary_root_resources.is_some() {
+            return Err(std::io::Error::other(
+                "managed updates require ordinary Root resource proof",
+            ));
+        }
         let states = self.router.states.lock().await;
-        let busy = || {
-            std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "Session update preparation is incomplete",
-            )
+        let parked = self.complete_parked_inventory(&states)?;
+        self.publish_parked_roots(&parked, publish)
+    }
+
+    /// Acquire a reversible hold on the canonical resource domains. A busy
+    /// owner can finish naturally without giving up its current execution.
+    pub async fn try_hold_ordinary_root_resources(
+        &self,
+    ) -> std::io::Result<Option<OrdinaryRootUpdateResources>> {
+        let states = self.router.states.lock().await;
+        let parked = match self.complete_parked_inventory(&states) {
+            Ok(parked) => parked,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
         };
+        self.router
+            .ordinary_root_resources
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ordinary Root resource tracking is unavailable"))?
+            .try_hold(self, parked)
+    }
+
+    /// Recheck the exact resource and checkpoint inventory at the publication
+    /// boundary. The publisher must not call back into the activation router.
+    pub async fn commit_parked_roots_with_resources(
+        &self,
+        resources: &OrdinaryRootUpdateResources,
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()> + Send,
+    ) -> std::io::Result<()> {
+        let states = self.router.states.lock().await;
+        let parked = self.complete_parked_inventory(&states)?;
+        resources.validate_for(self, &parked)?;
+        self.publish_parked_roots(&parked, publish)
+    }
+
+    fn complete_parked_inventory(
+        &self,
+        states: &HashMap<String, TargetActivationState>,
+    ) -> std::io::Result<Vec<ParkedUpdateRoot>> {
         if self.router.preparing_update() != Some(self.id) {
-            return Err(busy());
+            return Err(update_busy());
         }
         let mut parked = Vec::new();
         for state in states.values() {
             if state.activation_reserved {
-                return Err(busy());
+                return Err(update_busy());
             }
             if state.owner.is_some() {
-                parked.push(self.parked_root(state).ok_or_else(busy)?.clone());
+                parked.push(self.parked_root(state).ok_or_else(update_busy)?.clone());
             }
         }
         parked.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
-        publish(&parked)?;
+        Ok(parked)
+    }
+
+    fn publish_parked_roots(
+        &self,
+        parked: &[ParkedUpdateRoot],
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        publish(parked)?;
         self.router
             .update_hold
             .send_replace(UpdateHold::Committed(self.id));
         Ok(())
     }
+}
+
+fn update_busy() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "Session update preparation is incomplete",
+    )
 }
 
 impl Drop for SessionUpdateAdmission {
@@ -1093,6 +1159,74 @@ impl SessionActivationRouter {
         Arc::new(Self::default())
     }
 
+    /// Install before the managed Host starts accepting any executions.
+    pub fn new_for_managed_update() -> Arc<Self> {
+        Arc::new(Self {
+            ordinary_root_resources: Some(Arc::new(OrdinaryRootRegistry::default())),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn tracks_ordinary_root_update(&self) -> bool {
+        self.ordinary_root_resources.is_some()
+    }
+
+    pub(crate) fn owns_ordinary_root_resources(
+        &self,
+        resources: Option<&bamboo_tools::LocalTaskResources>,
+        writer: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> bool {
+        match (&self.ordinary_root_resources, resources, writer) {
+            (Some(registry), Some(resources), Some(writer)) => registry.owns(resources, writer),
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn enroll_ordinary_root_resources(
+        self: &Arc<Self>,
+        session: &bamboo_domain::Session,
+        writer: bamboo_domain::RootActorRuntimeWrite,
+        ownership: &SessionRunOwnership,
+        joined: OrdinaryRootJoin,
+    ) -> std::io::Result<bamboo_tools::LocalTaskResources> {
+        let states = self.states.lock().await;
+        let registry = self.ordinary_root_resources.as_ref().ok_or_else(|| {
+            std::io::Error::other("ordinary Root resource tracking is unavailable")
+        })?;
+        let owner = states
+            .get(&session.id)
+            .and_then(|state| state.owner.as_ref());
+        if !ownership.matches_router(self)
+            || ownership.target_session_id != session.id
+            || ownership.run_id != writer.fence.run_id
+            || !owner.is_some_and(|owner| {
+                Arc::ptr_eq(&owner.instance, &ownership.instance)
+                    && owner.run_id == ownership.run_id
+                    && owner.session_created_at == Some(session.created_at)
+                    && owner.registrations > 0
+                    && !owner.finalizing
+            })
+        {
+            let reason = "ordinary Root resource owner lost its exact activation";
+            registry.unconfirmed(reason)?;
+            return Err(std::io::Error::other(reason));
+        }
+        registry.enroll(session, writer, joined)
+    }
+
+    /// Legacy/direct ordinary execution may continue while the Host is open.
+    /// It invalidates managed replacement proof when no physical owner exists.
+    pub(crate) async fn observe_unowned_ordinary_root(&self) -> std::io::Result<()> {
+        let Some(registry) = &self.ordinary_root_resources else {
+            return Ok(());
+        };
+        let _states = self.states.lock().await;
+        if self.admissions_held() {
+            return Err(update_busy());
+        }
+        registry.unconfirmed("ordinary Root execution has no managed resource owner")
+    }
+
     /// Hold new admissions for a planned update. The state lock orders this
     /// with registration and Inbox reservation, including in-flight launches.
     pub async fn hold_admissions_for_update(&self) -> Option<SessionUpdateAdmission> {
@@ -1150,7 +1284,10 @@ impl SessionActivationRouter {
             else {
                 return Ok(false);
             };
-            owner.parked_update = Some(root);
+            owner.parked_update = Some(ParkedRootOwner {
+                checkpoint: root,
+                cancel: cancel.clone(),
+            });
         }
         let result = tokio::select! {
             biased;
@@ -1168,12 +1305,19 @@ impl SessionActivationRouter {
                     && owner
                         .parked_update
                         .as_ref()
-                        .is_some_and(|root| root.update_id == update)
+                        .is_some_and(|root| root.checkpoint.update_id == update)
             })
         {
             owner.parked_update = None;
         }
-        result
+        // A cancellation may wake the parked task during the publisher's
+        // atomic write. Read the outcome under the same lock as publication.
+        let committed = *hold.borrow() == UpdateHold::Committed(update);
+        if committed {
+            Ok(true)
+        } else {
+            result
+        }
     }
 
     /// Late-bind the real server/SDK reservation adapter after its dependency

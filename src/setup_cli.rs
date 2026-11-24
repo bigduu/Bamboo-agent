@@ -247,7 +247,7 @@ pub fn run_init(args: InitArgs) -> Result<()> {
     println!("  api_key  = {} (stored encrypted)", mask_secret(&api_key));
     println!();
     println!("Next steps:");
-    println!("  bamboo doctor        # verify the setup");
+    println!("  bamboo doctor --probe # verify that the model can answer");
     println!("  bamboo -p \"hello\"    # run a one-shot agent");
     println!("  bamboo serve         # start the HTTP server");
     Ok(())
@@ -256,6 +256,12 @@ pub fn run_init(args: InitArgs) -> Result<()> {
 /// `bamboo doctor` — diagnose the local install. Returns `Ok(true)` when healthy,
 /// `Ok(false)` when a blocking problem was found (caller should exit non-zero).
 pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
+    run_doctor_with_probe(data_dir, false).await
+}
+
+pub async fn run_doctor_with_probe(data_dir: Option<PathBuf>, probe: bool) -> Result<bool> {
+    use bamboo_engine::resolved_defaults::{default_chat_model_ref, ModelProbeStatus};
+
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
     let config_path = data_dir.join("config.json");
     let mut errors = 0u32;
@@ -313,11 +319,8 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
                 warns += 1;
             }
         }
-        match config
-            .get_model()
-            .filter(|model| !model.trim().is_empty() && model != "unknown")
-        {
-            Some(model) => info(&format!("default model = {model}")),
+        match default_chat_model_ref(&config) {
+            Some(target) => info(&format!("default model = {}", target.model)),
             None => {
                 err("no default model configured — set a provider model in settings or with its environment variable");
                 errors += 1;
@@ -341,6 +344,38 @@ pub async fn run_doctor(data_dir: Option<PathBuf>) -> Result<bool> {
         info(&format!(
             "server not running on {host}:{port} (start it with `bamboo serve`)"
         ));
+    }
+
+    if probe && errors == 0 {
+        let registry =
+            match bamboo_llm::ProviderRegistry::from_config(&config, data_dir.clone()).await {
+                Ok(registry) => Some(std::sync::Arc::new(registry)),
+                Err(_) => None,
+            };
+        let result = if let Some(registry) = registry {
+            let selected =
+                bamboo_engine::resolved_defaults::resolve_default_run_config(&config, &registry);
+            bamboo_engine::resolved_defaults::probe_chat_model(&selected).await
+        } else {
+            ModelProbeStatus::ModelUnavailable
+        };
+        let failure = match result {
+            ModelProbeStatus::Ready => None,
+            ModelProbeStatus::AuthenticationFailed => Some("check the API key and model access"),
+            ModelProbeStatus::ModelUnavailable => {
+                Some("check the provider, model ID, and base URL")
+            }
+            ModelProbeStatus::TimedOut => Some("check the network and base URL"),
+            ModelProbeStatus::RequestFailed => Some("check the provider and model settings"),
+        };
+        if let Some(hint) = failure {
+            err(&format!("model inference verification failed — {hint}"));
+            errors += 1;
+        } else {
+            ok("model responded to a verification request");
+        }
+    } else if !probe && errors == 0 {
+        info("inference check is available with bamboo doctor --probe");
     }
 
     println!();

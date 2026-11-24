@@ -150,12 +150,23 @@ struct BrowserLifecycle {
     ephemeral_clean: bool,
     stopping: AtomicBool,
     reset_epoch: AtomicU64,
-    opens: tokio::sync::RwLock<()>,
+    opens: Arc<tokio::sync::RwLock<()>>,
     owners: Mutex<Vec<Arc<BrowserCleanup>>>,
     unconfirmed_writers: Arc<AtomicBool>,
     // Serializes only synchronous child creation with the irreversible fence.
     // Never hold this across a host probe, filesystem I/O or an async wait.
     writer_admission: Arc<Mutex<()>>,
+}
+
+pub(crate) struct BrowserUpdateHold {
+    lifecycle: Arc<BrowserLifecycle>,
+    _opens: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl BrowserUpdateHold {
+    pub(crate) fn commit(self) {
+        self.lifecycle.stopping.store(true, Ordering::Release);
+    }
 }
 
 impl BrowserLifecycle {
@@ -2518,6 +2529,26 @@ mod tests {
 }
 
 impl BrowserManager {
+    pub(crate) fn try_hold_for_planned_update(&self) -> std::io::Result<Option<BrowserUpdateHold>> {
+        let Ok(opens) = self.lifecycle.opens.clone().try_write_owned() else {
+            return Ok(None);
+        };
+        if self.lifecycle.stopping.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("Browser manager is shutting down"));
+        }
+        self.lifecycle
+            .ensure_writer_admission()
+            .map_err(std::io::Error::other)?;
+        let owners = self.lifecycle.owners.lock().unwrap();
+        if owners.iter().any(|owner| !*owner.done.borrow()) {
+            return Ok(None);
+        }
+        Ok(Some(BrowserUpdateHold {
+            lifecycle: self.lifecycle.clone(),
+            _opens: opens,
+        }))
+    }
+
     /// Production supplies a data-directory-owned root. Default managers used
     /// by isolated protocol tests retain their explicitly ephemeral behavior.
     pub fn with_profile_root(root: PathBuf) -> Self {

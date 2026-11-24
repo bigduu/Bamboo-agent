@@ -577,6 +577,21 @@ async fn run_child_spawn_inner(
             .map_err(|error| error.to_string())?;
     }
 
+    let watchdog_policy = if local_backend {
+        ctx.agent.local_child_watchdog_policy(&session).await
+    } else {
+        watchdog_policy_for_session(&session, None)
+    };
+    if let Some(runner) = ctx
+        .agent_runners
+        .write()
+        .await
+        .get_mut(&session.id)
+        .filter(|runner| runner.run_id == run_id)
+    {
+        runner.child_watchdog_policy = Some(watchdog_policy);
+    }
+
     let mut host_bound = false;
     let publish_running = async {
         // Backend refusal has not started this Run. Bind only after successful
@@ -753,7 +768,6 @@ async fn run_child_spawn_inner(
     // Child liveness is owned by the child runner. The parent wait state can
     // have a longer lease, but it should not poll or terminate children.
     let timeout_reason = Arc::new(RwLock::new(None::<String>));
-    let watchdog_policy = watchdog_policy_for_session(&session);
     let watchdog_handle = tokio::spawn(watch_child_liveness(
         crate::execution::spawn::ChildWatchdogTarget {
             parent_session_id: job.parent_session_id.clone(),

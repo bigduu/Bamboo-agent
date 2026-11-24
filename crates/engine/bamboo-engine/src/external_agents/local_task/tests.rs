@@ -21,6 +21,89 @@ mod owned_bash_publication;
 mod writer_lifecycle;
 
 #[tokio::test]
+async fn planned_update_waits_for_child_preparation_and_actual_finalization() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let preparing = runner.preparations.try_acquire().unwrap();
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    drop(preparing);
+
+    let (finish, finished) = oneshot::channel();
+    let finalizer = tokio::spawn(async move {
+        finished.await.unwrap();
+        Ok(())
+    });
+    lock(&runner.coordinators).push(finalizer);
+    assert!(runner.try_hold_for_update().unwrap().is_none());
+    assert!(!runner.closed.load(Ordering::Acquire));
+    finish.send(()).unwrap();
+    let hold = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(hold) = runner.try_hold_for_update().unwrap() {
+                return hold;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(lock(&runner.coordinators).is_empty());
+    assert!(runner.preparations.try_acquire().is_err());
+    drop(hold);
+    assert!(runner.preparations.try_acquire().is_ok());
+    runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn planned_update_refuses_a_child_finalizer_with_unconfirmed_completion() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let task = tokio::spawn(async { Err("child publication unconfirmed".to_string()) });
+    lock(&runner.coordinators).push(task);
+    let error = tokio::time::timeout(WAIT, async {
+        loop {
+            match runner.try_hold_for_update() {
+                Err(error) => return error,
+                Ok(None) => tokio::task::yield_now().await,
+                Ok(Some(_)) => panic!("unconfirmed finalization granted an update hold"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(error.to_string().contains("child publication unconfirmed"));
+    assert!(runner.try_hold_for_update().is_err());
+    assert!(!runner.closed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn planned_update_refuses_an_unconfirmed_child_preparation_rollback() {
+    let runner = LocalTaskChildRunner::new(&Config::default(), None, None);
+    let setup_error = "child writer setup failed";
+    assert_eq!(
+        runner.record_preparation_failure(setup_error.into(), Ok(())),
+        setup_error
+    );
+    assert!(runner.try_hold_for_update().unwrap().is_some());
+
+    let preparation = runner.preparations.try_acquire().unwrap();
+    let error = runner.record_preparation_failure(
+        setup_error.into(),
+        Err(ActorDirectoryError::Storage("rollback write failed".into())),
+    );
+    drop(preparation);
+
+    assert!(error.contains("exact claim rollback unconfirmed"));
+    assert!(lock(&runner.executions).is_empty());
+    assert!(lock(&runner.coordinators).is_empty());
+    for _ in 0..2 {
+        let Err(reason) = runner.try_hold_for_update() else {
+            panic!("unconfirmed preparation rollback granted an update hold");
+        };
+        assert_eq!(reason.to_string(), error);
+    }
+    assert_eq!(runner.shutdown().await.unwrap_err(), error);
+}
+
+#[tokio::test]
 async fn renewal_crossing_entry_and_failed_renewal_do_not_publish_heartbeat() {
     let signals = LiveTaskSignals::default();
     let (acknowledge, acknowledged) = oneshot::channel();
@@ -189,6 +272,7 @@ struct Harness {
     messenger: Arc<crate::SessionMessenger>,
     runner: Arc<LocalTaskChildRunner>,
     ctx: crate::execution::SpawnContext,
+    config: Arc<RwLock<Config>>,
     parent_events: broadcast::Receiver<AgentEvent>,
     coordinator: Arc<crate::ChildCompletionCoordinator>,
     _scheduler: Arc<crate::execution::SpawnScheduler>,
@@ -331,7 +415,7 @@ impl Harness {
             ctx.agent_runners.clone(),
             ctx.session_event_senders.clone(),
             agent,
-            config,
+            config.clone(),
             registry,
             provider_router,
             home.to_path_buf(),
@@ -350,6 +434,7 @@ impl Harness {
             messenger,
             runner,
             ctx,
+            config,
             parent_events,
             coordinator,
             _scheduler: scheduler,
@@ -460,7 +545,7 @@ impl Harness {
         let expected = match status {
             "completed" => ActorActivationStatus::Succeeded,
             "cancelled" => ActorActivationStatus::Cancelled,
-            "error" => ActorActivationStatus::Failed,
+            "error" | "timeout" => ActorActivationStatus::Failed,
             other => panic!("unsupported expected terminal {other}"),
         };
         assert_eq!(activation.status, expected);
@@ -472,7 +557,7 @@ impl Harness {
         );
         assert_eq!(
             actor.actor.state,
-            if status == "error" {
+            if expected == ActorActivationStatus::Failed {
                 ActorLogicalState::Failed
             } else {
                 ActorLogicalState::Cold
@@ -573,6 +658,7 @@ async fn production_local_task_completes_in_host_and_commits_history_before_pare
         running.activation.unwrap().status,
         ActorActivationStatus::Running
     );
+    assert!(harness.runner.try_hold_for_update().unwrap().is_none());
     call.complete("native result");
     tokio::time::timeout(WAIT, async {
         let mut complete = false;
@@ -1076,6 +1162,88 @@ async fn production_local_task_panic_quarantines_unknown_stop_and_preserves_heal
         .await
         .unwrap_err()
         .contains("unconfirmed"));
+}
+
+#[tokio::test]
+async fn local_child_time_limits_take_effect_at_launch_and_keep_session_overrides() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    harness.config.write().await.subagents_mut().max_total_secs = std::num::NonZeroU32::new(10800);
+
+    let first = harness.child("first", "start a long task").await;
+    harness.launch(&first).await.unwrap();
+    let first_call = control.next().await;
+    let first_policy = harness.ctx.agent_runners.read().await[&first.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(first_policy.max_total_secs, 10800);
+    assert_eq!(first_policy.max_idle_secs, 900);
+    assert!(!first_policy.total_timeout_reached(10800, 0, true));
+
+    {
+        let mut config = harness.config.write().await;
+        config.subagents_mut().max_total_secs = std::num::NonZeroU32::new(7200);
+        config.subagents_mut().max_idle_secs = std::num::NonZeroU32::new(1200);
+    }
+    let running_policy = harness.ctx.agent_runners.read().await[&first.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(running_policy.max_total_secs, 10800);
+    assert_eq!(running_policy.max_idle_secs, 900);
+    first_call.complete("first finished");
+    assert_eq!(harness.completion().await.1, "completed");
+
+    let mut next = harness.child("next", "start the next task").await;
+    next.metadata
+        .insert("child_watchdog.max_idle_secs".into(), "1800".into());
+    harness.store.save_session(&next).await.unwrap();
+    harness.launch(&next).await.unwrap();
+    let next_call = control.next().await;
+    let next_policy = harness.ctx.agent_runners.read().await[&next.id]
+        .child_watchdog_policy
+        .unwrap();
+    assert_eq!(next_policy.max_total_secs, 7200);
+    assert_eq!(next_policy.max_idle_secs, 1800);
+    next_call.complete("second finished");
+    assert_eq!(harness.completion().await.1, "completed");
+    harness.runner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_short_limits_timeout_local_children_without_interval_overrides() {
+    for (idle, expected) in [(false, "max_total_secs=1"), (true, "max_idle_secs=1")] {
+        let home = tempfile::tempdir().unwrap();
+        let control = ProviderControl::new();
+        let mut harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+        let limit = std::num::NonZeroU32::new(1);
+        {
+            let mut config = harness.config.write().await;
+            if idle {
+                config.subagents_mut().max_idle_secs = limit;
+            } else {
+                config.subagents_mut().max_total_secs = limit;
+            }
+        }
+        let child = harness
+            .child("held-provider", "Wait for the model response")
+            .await;
+        harness.launch(&child).await.unwrap();
+        let (id, status, error) =
+            tokio::time::timeout(Duration::from_secs(10), harness.completion())
+                .await
+                .expect("a one-second limit must expire before the default 15-second interval");
+        assert_eq!(id, child.id);
+        assert_eq!(status, "timeout");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected)),
+            "{error:?}"
+        );
+        harness.assert_terminal(&child, "timeout").await;
+        harness.runner.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

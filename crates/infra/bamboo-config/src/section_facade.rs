@@ -3644,6 +3644,17 @@ fn load_strict_planning_input_with_overrides(
     overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<StrictPlanningInput> {
     let (mut config, root_raw) = load_strict_root(data_dir, overrides)?;
+    // Use the same captured configuration sources that the initial split
+    // publishes, including when a bootstrap credential migration wrote a
+    // document after the preflight. Explicit legacy feature settings win.
+    if read_planning_source(data_dir, "config.json", overrides)?.is_none()
+        && read_planning_source(data_dir, "providers.json", overrides)?.is_none()
+        && !data_dir.join("sessions").exists()
+        && !data_dir.join("tickets").exists()
+        && !data_dir.join("config.json.bak").exists()
+    {
+        config.apply_first_install_work_defaults();
+    }
     let mut authoritative_sidecars = BTreeSet::new();
 
     if let Some((memory, _)) =

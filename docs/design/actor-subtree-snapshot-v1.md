@@ -90,7 +90,7 @@ must not treat this identity as a stream coordinate.
 
 Default ceilings: 256 source nodes, 4096 accumulated directory entries, 2048
 attempted file reads (including absent optional files), 512 KiB per source file,
-8 MiB aggregate actual reads, and 256 KiB final serialized payload. Root proof and
+16 MiB aggregate actual reads, and 256 KiB final serialized payload. Root proof and
 initialization/revocation evidence additionally use 4 KiB ceilings; Supervisor
 proof uses 256 KiB. Internal callers may tighten ceilings, never raise them.
 Ancillary fd reads are capped and use one counted overflow byte to detect

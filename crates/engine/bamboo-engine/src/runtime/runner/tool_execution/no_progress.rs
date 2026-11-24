@@ -20,7 +20,8 @@ pub(super) fn quiet_exec_wait_scope(session: &Session, config: &AgentLoopConfig)
         && session.pending_question.is_none()
         && !crate::runtime::loop_control::suspension::active(config)
         // Ending an owned local task must not inadvertently stop its command.
-        && bamboo_tools::LocalTaskResources::current().is_none()
+        && bamboo_tools::LocalTaskResources::current()
+            .is_none_or(|scope| scope.is_ordinary_root_update_scope())
 }
 
 #[cfg(test)]

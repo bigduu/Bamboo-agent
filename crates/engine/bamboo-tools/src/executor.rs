@@ -562,8 +562,9 @@ impl BuiltinToolExecutor {
         // their awaiter is cancelled. Tokio filesystem work cannot be aborted
         // safely merely by dropping its future. Custom/plugin tools stay inline:
         // their private task-local capability scopes must not be lost.
-        let owned_resources = crate::LocalTaskResources::current().filter(|_| {
-            matches!(execution_name, "Write" | "Edit" | "exec_command")
+        let owned_resources = crate::LocalTaskResources::current().filter(|resources| {
+            (matches!(execution_name, "Write" | "Edit" | "exec_command")
+                || (execution_name == "Read" && resources.is_ordinary_root_update_scope()))
                 && self.is_framework_builtin_instance(execution_name, &tool)
         });
         let outcome = if let Some(resources) = owned_resources {
@@ -610,6 +611,13 @@ impl BuiltinToolExecutor {
                 .spawn_owned(invoke)
                 .map_err(|error| ToolError::Execution(error.to_string()))?;
             crate::local_task_resources::mark_current_invocation_owned();
+            if execution_name == "Read" {
+                crate::local_task_resources::mark_ordinary_root_tool_owned(
+                    &resources,
+                    execution_name,
+                    &call.id,
+                );
+            }
             registered.await.map_err(|_| {
                 ToolError::Execution(
                     "owned tool invocation panicked; stop remains unconfirmed".into(),
@@ -2219,6 +2227,62 @@ mod tests {
         let result = executor.execute(&namespaced).await.unwrap();
         assert!(result.success);
         assert!(result.result.contains("canonical read content"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_root_update_accepts_owned_read_and_rejects_same_named_custom_tool() {
+        use crate::local_task_resources::observe_ordinary_root_tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-read.txt");
+        fs::write(&path, "ordinary Root fixture").await.unwrap();
+        let call = make_tool_call("Read", json!({"file_path": path}));
+        let built_in = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Read")
+            .unwrap()
+            .build();
+        let custom = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "Read",
+                label: "custom Read",
+                args_sensitive: false,
+            })
+            .unwrap()
+            .build();
+
+        for (executor, output, known) in [
+            (built_in, "ordinary Root fixture", true),
+            (custom, "custom Read", false),
+        ] {
+            let scope =
+                crate::LocalTaskResources::new_for_ordinary_root("test", "run", chrono::Utc::now());
+            let outcome = scope
+                .scope(observe_ordinary_root_tool(
+                    "Read",
+                    &call.id,
+                    executor.execute(&call),
+                ))
+                .await
+                .unwrap();
+            assert!(outcome.result.contains(output));
+            if known {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(hold) = scope.try_hold_for_update().unwrap() {
+                            hold.ensure_current().unwrap();
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                assert!(scope
+                    .try_hold_for_update()
+                    .is_err_and(|error| error.to_string().contains("tool Read")));
+            }
+        }
     }
 
     #[tokio::test]

@@ -4760,12 +4760,13 @@ impl ChildCompletionCoordinator {
                         .unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                    let policy = match &control_plane {
-                        Some(child) => {
-                            crate::runtime::execution::spawn::watchdog_policy_for_session(child)
-                        }
-                        None => Default::default(),
-                    };
+                    let policy = runner.child_watchdog_policy.unwrap_or_else(|| {
+                        control_plane
+                            .as_ref()
+                            .map_or_else(Default::default, |child| {
+                                crate::execution::spawn::watchdog_policy_for_session(child, None)
+                            })
+                    });
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
                     let current_native_work =
                         if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {
