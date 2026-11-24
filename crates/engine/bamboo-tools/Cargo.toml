@@ -30,6 +30,9 @@ tracing = "0.1"
 thiserror = "2"
 anyhow = "1"
 regex = "1"
+grep-regex = "0.1.15"
+grep-searcher = "0.1.18"
+tokio-util = "0.7"
 dashmap = "6"
 sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
