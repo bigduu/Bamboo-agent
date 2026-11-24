@@ -5,6 +5,7 @@ use bamboo_domain::{Session, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSIO
 use serde_json::Value;
 use tempfile::tempdir;
 
+use crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile;
 use crate::{app_state::AppState, routes::configure_routes};
 
 fn open_request() -> test::TestRequest {
@@ -16,6 +17,7 @@ fn open_request() -> test::TestRequest {
 #[actix_web::test]
 async fn default_supervisor_opens_once_without_tickets_and_survives_restart_with_history() {
     let directory = tempdir().unwrap();
+    write_work_disabled_profile(directory.path());
     let state = web::Data::new(AppState::new(directory.path().into()).await.unwrap());
     assert!(!state.config.read().await.features.ticket_mutation);
     assert!(!state.config.read().await.features.ticket_dispatch);

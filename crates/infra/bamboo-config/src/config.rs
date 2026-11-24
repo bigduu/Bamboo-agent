@@ -3857,6 +3857,12 @@ impl Config {
         config
     }
 
+    pub(crate) fn apply_first_install_work_defaults(&mut self) {
+        self.features.ticket_mutation = true;
+        self.features.ticket_dispatch = true;
+        self.features.work_execution.max_parallel = Some(std::num::NonZeroU32::MIN);
+    }
+
     /// Load configuration from a specific data directory.
     ///
     /// Use [`Config::from_data_dir`] (publishes env vars to the global cache, for
@@ -3870,6 +3876,12 @@ impl Config {
         let data_dir = data_dir
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
+        // Detect a new profile before credential recovery or layout migration
+        // creates files. Existing profiles keep their stored Work switches.
+        let fresh_profile = match std::fs::read_dir(&data_dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
 
         match crate::modular_authority_boundary_present(&data_dir) {
             Ok(true) => return Self::from_completed_facade(&data_dir, publish, apply_env),
@@ -3977,6 +3989,10 @@ impl Config {
         } else {
             Self::create_default()
         };
+
+        if fresh_profile {
+            config.apply_first_install_work_defaults();
+        }
 
         // Phase-1 registrar migration: an existing sidecar is authoritative;
         // when absent, retain the legacy inline value loaded from config.json.
@@ -7142,6 +7158,49 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("https://internal.example"))
         }));
+    }
+
+    #[test]
+    fn new_install_enables_manual_work_and_existing_disabled_flags_are_preserved() {
+        let data = tempfile::tempdir().unwrap();
+        let fresh = Config::from_data_dir_without_env(Some(data.path().into()));
+        assert!(fresh.features.ticket_mutation);
+        assert!(fresh.features.ticket_dispatch);
+        assert_eq!(
+            fresh
+                .features
+                .work_execution
+                .max_parallel
+                .map(|cap| cap.get()),
+            Some(1)
+        );
+        assert_eq!(fresh.run_budget.max_rounds, None);
+
+        let opened = tempfile::tempdir().unwrap();
+        let facade = crate::ConfigFacade::open_or_migrate(opened.path()).unwrap();
+        let configured = facade.effective_config();
+        assert!(configured.features.ticket_mutation);
+        assert!(configured.features.ticket_dispatch);
+        assert_eq!(
+            configured
+                .features
+                .work_execution
+                .max_parallel
+                .map(|cap| cap.get()),
+            Some(1)
+        );
+        assert_eq!(configured.run_budget.max_rounds, None);
+
+        let existing = tempfile::tempdir().unwrap();
+        std::fs::write(
+            existing.path().join("config.json"),
+            r#"{"features":{"ticket_mutation":false,"ticket_dispatch":false}}"#,
+        )
+        .unwrap();
+        let upgraded = Config::from_data_dir_without_env(Some(existing.path().into()));
+        assert!(!upgraded.features.ticket_mutation);
+        assert!(!upgraded.features.ticket_dispatch);
+        assert_eq!(upgraded.features.work_execution.max_parallel, None);
     }
 
     #[test]
