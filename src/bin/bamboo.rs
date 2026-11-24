@@ -1641,7 +1641,21 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             // v2-P1 (#181): honor `server.tls` for in-process TLS termination
             // (fail-fast on bad/missing certs); absent → unchanged plaintext.
             let tls = config.server.tls.clone();
-            let result = if supervisor_scope_native_confirmation {
+            let shutdown_directory = parent_pid.and_then(|_| {
+                std::env::var_os(bamboo_agent::server::MANAGED_SHUTDOWN_DIR_ENV).map(PathBuf::from)
+            });
+            let result = if let Some(directory) = shutdown_directory {
+                bamboo_agent::server::run_with_managed_shutdown(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                    config.server.static_dir.clone(),
+                    tls,
+                    supervisor_scope_native_confirmation,
+                    directory,
+                )
+                .await
+            } else if supervisor_scope_native_confirmation {
                 bamboo_agent::server::run_with_native_scope_confirmation(
                     bamboo_home_dir,
                     config.server.port,
