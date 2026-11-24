@@ -131,12 +131,12 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Continue the process identified by exec_command's session_id. Empty chars waits for output and exit status. Silence and exit_observed are advisory. Use terminal status and exit code to verify completion. After three empty polls, reassess the command. A sole empty poll with closed stdin can wait longer. Nonempty chars sends exact bytes to the interactive pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the process."
+        "Continue a process started by this session's exec_command using its returned session_id. Empty chars waits for output and exit status. Silence and exit_observed are advisory. Use terminal status and exit code to verify completion. After three empty polls, reassess the command. A sole empty poll with closed stdin can wait longer. Nonempty chars sends exact bytes to the interactive pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the process."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{
-            "session_id":{"type":"string","description":"Running handle returned by exec_command"},
+            "session_id":{"type":"string","description":"Handle returned by exec_command in this same session"},
             "chars":{"type":"string","description":"Exact stdin bytes; empty or omitted waits/polls. A lone Ctrl-C stops the process"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding again, in milliseconds. Default 10000. An unattended empty poll can wait longer than 30000 within the runner's tool deadline."},
             "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000, capped at 8192; four JSON-encoded bytes per token including quotes and escapes. Status/session/exit metadata is additional"},

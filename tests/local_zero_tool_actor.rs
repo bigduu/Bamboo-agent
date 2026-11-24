@@ -1334,7 +1334,7 @@ async fn fixture_with_followups(
         std::fs::write(workspace.join("owned-marker.txt"), "actual read-only file").unwrap();
     }
     std::fs::write(agents.join(if glob {"explorer.md"} else {"plain-reply.md"}), if glob {
-        "---\nschema_version: 1\nname: explorer\ndescription: Verify one assigned file\nmodel_hint: openai:plain-child\ntools:\n  allow: [Glob]\n---\nUse Glob exactly once for the assigned file, then return one plain answer.\n"
+        "---\nschema_version: 1\nname: explorer\ndescription: Verify one assigned file\nmodel_hint: openai:plain-child\ntools:\n  allow: [Glob]\n  deny: [Bash]\n---\nUse Glob exactly once for the assigned file, then return one plain answer.\n"
     } else {
         "---\nschema_version: 1\nname: plain-reply\ndescription: One bounded plain reply\nmodel_hint: openai:plain-child\ntools:\n  deny: [Bash, Read, Glob, Edit, Write]\n---\nDo not use tools; return one plain answer and stop.\n"
     }).unwrap();
@@ -1455,9 +1455,6 @@ async fn fixture_with_followups(
         binding["tools"],
         if glob { json!(["Glob"]) } else { json!([]) }
     );
-    if glob {
-        assert!(before.agent_runtime_state.as_ref().unwrap().read_only);
-    }
     let mut recovery_prefix = None;
     if recovery {
         let inbox = bamboo_storage::FileSessionInbox::new(
@@ -1639,8 +1636,7 @@ async fn fixture_with_followups(
             tool["function"]["parameters"]["properties"]["role"]["description"].as_str()
         })
         .expect("the actual parent receives the SubAgent role description");
-    assert!(role_description
-        .contains("For commands, tests, or edits, choose a role that can perform them"));
+    assert!(role_description.contains("Roles can use shell tools when permitted by the runtime"));
     let child_wire = requests
         .iter()
         .find(|body| body["model"] == "plain-child")

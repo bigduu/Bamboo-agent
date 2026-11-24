@@ -7622,9 +7622,13 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
             .any(|m| m.role == Role::User && m.content.contains(&visible_assignment)));
         if index == 1 {
             assert_eq!(child.subagent_type().as_deref(), Some("explorer"));
-            assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
-            assert!(child_session::named_profile::has_named_profile(&child));
-            child_session::named_profile::validate_named_profile(&child).unwrap();
+            assert!(!child.agent_runtime_state.as_ref().unwrap().read_only);
+            assert_eq!(
+                child_session::named_profile::named_profile_tool_names(&child)
+                    .unwrap()
+                    .unwrap(),
+                ["exec_command", "write_stdin", "Glob", "Read"]
+            );
         }
         if index == 2 {
             assert_eq!(child.model, "private/custom-child");

@@ -37,7 +37,7 @@ pub struct ResolvedChildProfile {
     prompt: String,
     model: Option<ProviderModelRef>,
     tools: Vec<String>,
-    read_only: bool,
+    inspection_role: bool,
     parent_id: String,
     parent_created_at: chrono::DateTime<chrono::Utc>,
     parent_project: crate::project_context::SessionProjectIdentity,
@@ -117,29 +117,34 @@ impl ResolvedChildProfile {
                 })
             })
             .transpose()?;
-        let read_only = matches!(
+        let inspection_role = matches!(
             identity.name.as_str(),
             "explorer" | "reviewer" | "independent-reviewer"
         );
-        let foreground_denied = definition.tool_deny().iter().any(|name| name == "bash");
+        let allowed = definition.tool_allow();
+        let denied = definition.tool_deny();
+        let foreground_denied = denied.iter().any(|name| name == "bash");
         let tools = NATIVE_NAMES
             .iter()
-            .filter(|name| {
-                (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
-                    && !matches!(**name, "Bash" | "bash")
-                    && !declares_tool(definition.tool_deny(), name)
-                    && !(foreground_denied
-                        && matches!(**name, "Bash" | "exec_command" | "write_stdin"))
-                    && (!read_only || matches!(**name, "Read" | "Glob"))
+            .copied()
+            .filter(|&name| {
+                let shell = matches!(name, "exec_command" | "write_stdin");
+                // Explicit denies and the Host's runtime ceiling still narrow
+                // the role's baseline shell access.
+                (shell || allowed.is_empty() || declares_tool(allowed, name))
+                    && !matches!(name, "Bash" | "bash")
+                    && !declares_tool(denied, name)
+                    && !(foreground_denied && shell)
+                    && (!inspection_role || shell || matches!(name, "Read" | "Glob"))
             })
-            .map(|name| (*name).to_owned())
+            .map(str::to_owned)
             .collect();
         Ok(Self {
             identity,
             prompt: definition.system_prompt().to_owned(),
             model,
             tools,
-            read_only,
+            inspection_role,
             parent_id: parent.id.clone(),
             parent_created_at: parent.created_at,
             parent_project:
@@ -151,8 +156,15 @@ impl ResolvedChildProfile {
         self.model.as_ref()
     }
 
+    /// Whether this role can be selected for an explicitly read-only Workflow.
+    pub fn is_inspection_role(&self) -> bool {
+        self.inspection_role
+    }
+
+    /// Role classification for callers that request read-only execution.
+    #[deprecated(note = "use is_inspection_role for role classification")]
     pub fn read_only(&self) -> bool {
-        self.read_only
+        self.is_inspection_role()
     }
 
     pub(super) fn append_prompt(&self, base: &str) -> String {
@@ -364,10 +376,6 @@ mod tests {
             child.set_project_id_meta(project);
         }
         child.model_ref = profile.model.clone();
-        child
-            .agent_runtime_state
-            .get_or_insert_with(Default::default)
-            .read_only = profile.read_only;
         let prompt = profile.append_prompt("GLOBAL_CUSTOM_BASE");
         child
             .metadata
@@ -400,7 +408,7 @@ mod tests {
         assert_eq!(child.model_ref.as_ref().unwrap().model, "role-model");
         assert_eq!(
             named_profile_tool_names(&child).unwrap().unwrap(),
-            ["Read", "Write"]
+            ["exec_command", "write_stdin", "Read", "Write"]
         );
         let binding = child.metadata[NAMED_PROFILE_BINDING_KEY].clone();
         assert!(!binding.contains("PRIVATE_ROLE_BODY"));
@@ -409,11 +417,14 @@ mod tests {
         assert_eq!(child.metadata[NAMED_PROFILE_BINDING_KEY], binding);
         let later = bound(selected(&home, "implementer", &parent), &parent);
         assert_ne!(later.metadata[NAMED_PROFILE_BINDING_KEY], binding);
-        assert_eq!(named_profile_tool_names(&later).unwrap().unwrap(), ["Read"]);
+        assert_eq!(
+            named_profile_tool_names(&later).unwrap().unwrap(),
+            ["exec_command", "write_stdin", "Read"]
+        );
     }
 
     #[test]
-    fn readonly_roles_only_narrow_and_binding_changes_fail_closed() {
+    fn inspection_roles_allow_shell_and_binding_changes_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         std::fs::create_dir(home.join("agents")).unwrap();
@@ -428,17 +439,22 @@ mod tests {
             )
             .unwrap();
             let child = bound(selected(&home, name, &parent), &parent);
-            assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
+            assert!(!read_binding(&child).unwrap().unwrap().read_only);
             assert_eq!(
                 named_profile_tool_names(&child).unwrap().unwrap(),
-                ["Glob", "Read"]
+                ["exec_command", "write_stdin", "Glob", "Read"]
             );
             for case in 0..4 {
                 let mut changed = child.clone();
                 match case {
                     0 => changed.model = "other-model".into(),
                     1 => changed.created_at += chrono::Duration::nanoseconds(1),
-                    2 => changed.agent_runtime_state.as_mut().unwrap().read_only = false,
+                    2 => {
+                        changed
+                            .agent_runtime_state
+                            .get_or_insert_with(Default::default)
+                            .read_only = true;
+                    }
                     _ => changed.messages[0].content = "role removed".into(),
                 }
                 assert!(validate_named_profile(&changed).is_err());
@@ -657,7 +673,7 @@ mod tests {
             binding.scope_project_id.as_deref(),
             Some("assigned-project")
         );
-        assert!(binding.read_only);
+        assert!(!binding.read_only);
         let mut source_project = child.clone();
         let mut value: serde_json::Value =
             serde_json::from_str(&source_project.metadata[NAMED_PROFILE_BINDING_KEY]).unwrap();

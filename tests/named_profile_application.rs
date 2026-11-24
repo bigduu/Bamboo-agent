@@ -22,6 +22,8 @@ enum Case {
     Implementer,
     Explorer,
     Reviewer,
+    IndependentReviewer,
+    RoleDeniesShell,
     Narrow,
     Unknown,
     ExplicitModel,
@@ -45,8 +47,9 @@ struct Probe {
 }
 fn role(case: Case) -> &'static str {
     match case {
-        Case::Explorer | Case::BuiltinExplorer => "explorer",
+        Case::Explorer | Case::BuiltinExplorer | Case::RoleDeniesShell => "explorer",
         Case::Reviewer | Case::BuiltinReviewer => "reviewer",
+        Case::IndependentReviewer => "independent-reviewer",
         Case::Unknown => "unknown-label",
         _ => "implementer",
     }
@@ -57,11 +60,19 @@ fn builtin(case: Case) -> bool {
         Case::BuiltinImplementer | Case::BuiltinExplorer | Case::BuiltinReviewer
     )
 }
-fn read_only(case: Case) -> bool {
+fn inspection_role(case: Case) -> bool {
     matches!(
         case,
-        Case::Explorer | Case::Reviewer | Case::BuiltinExplorer | Case::BuiltinReviewer
+        Case::Explorer
+            | Case::Reviewer
+            | Case::IndependentReviewer
+            | Case::RoleDeniesShell
+            | Case::BuiltinExplorer
+            | Case::BuiltinReviewer
     )
+}
+fn shell_allowed(case: Case) -> bool {
+    !matches!(case, Case::Narrow | Case::RoleDeniesShell)
 }
 fn child_model(case: Case) -> &'static str {
     if case == Case::ExplicitModel {
@@ -118,6 +129,43 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             ),
             2 => discover("Glob"),
             3 => call("Glob", json!({"pattern":"*.txt","path":probe.workspace})),
+            4 => call(
+                "exec_command",
+                json!({
+                    "cmd": "IFS= read -r line && printf 'child received: %s\\n' \"$line\"",
+                    "workdir": probe.workspace,
+                    "interactive": true,
+                    "yield_time_ms": 250
+                }),
+            ),
+            5 => {
+                let exec = handoff_tool(&body, "call-exec_command");
+                if shell_allowed(probe.case) {
+                    let exec: Value = serde_json::from_str(exec).expect("Child shell must start");
+                    assert_eq!(exec["status"], "running");
+                    let handle = exec["session_id"].as_str().expect("running command handle");
+                    call(
+                        "write_stdin",
+                        json!({"session_id":handle, "chars":"ACTUAL_CHILD_STDIN\n", "eof":true}),
+                    )
+                } else {
+                    assert!(exec.contains("not callable"), "{exec}");
+                    call("write_stdin", json!({"session_id":"unavailable"}))
+                }
+            }
+            6 => {
+                let result = handoff_tool(&body, "call-write_stdin");
+                if shell_allowed(probe.case) {
+                    let result: Value =
+                        serde_json::from_str(result).expect("Child stdin must succeed");
+                    assert_eq!(result["status"], "completed");
+                    assert_eq!(result["exit_code"], 0);
+                    assert_eq!(result["output"], "child received: ACTUAL_CHILD_STDIN\n");
+                } else {
+                    assert!(result.contains("not callable"), "{result}");
+                }
+                (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop")
+            }
             _ => (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop"),
         }
     } else if body["model"] == "native-root" && body["tools"].to_string().contains("SubAgent") {
@@ -184,10 +232,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     }
                     assert_eq!(binding["name"], role(probe.case));
                     assert_eq!(selected.model, child_model(probe.case));
-                    assert_eq!(
-                        selected.agent_runtime_state.as_ref().unwrap().read_only,
-                        read_only(probe.case)
-                    );
+                    assert!(!selected.agent_runtime_state.as_ref().unwrap().read_only);
                     if !builtin(probe.case) {
                         assert!(selected.messages[0].content.contains("PROJECT_ROLE_V1"));
                     }
@@ -269,7 +314,15 @@ async fn fixture(case: Case) {
             ),
         )
         .unwrap();
-        std::fs::write(&profile_path, definition(role(case), "PROJECT_ROLE_V1: Keep the custom base and report concrete evidence; stop at the assigned boundary.", "native-child")).unwrap();
+        let mut project_role = definition(
+            role(case),
+            "PROJECT_ROLE_V1: Keep the custom base and report concrete evidence; stop at the assigned boundary.",
+            "native-child",
+        );
+        if case == Case::RoleDeniesShell {
+            project_role = project_role.replace("deny: [Edit]", "deny: [Edit, Bash]");
+        }
+        std::fs::write(&profile_path, project_role).unwrap();
         if case == Case::Duplicate {
             std::fs::copy(&profile_path, local.join("second.md")).unwrap();
         } else if case == Case::Invalid {
@@ -331,7 +384,7 @@ async fn fixture(case: Case) {
     config["providers"]["openai"]["runtime_models"] =
         json!(["native-root", "native-child", "explicit-child"]);
     if case == Case::Narrow {
-        config["tools"] = json!({"disabled":["Bash","Edit","Write"]});
+        config["tools"] = json!({"disabled":["Bash","write_stdin","Edit","Write"]});
     }
     std::fs::write(
         data.join("config.json"),
@@ -463,7 +516,7 @@ async fn fixture(case: Case) {
             handle.stop(true).await;
             return;
         }
-        assert!(child.len() >= 5);
+        assert!(child.len() >= 7);
         if case != Case::Unknown {
             for request in &child {
                 let text = request["messages"].to_string();
@@ -522,11 +575,14 @@ async fn fixture(case: Case) {
                 );
             }
         }
-        if case == Case::Narrow || read_only(case) {
+        for name in ["exec_command", "write_stdin"] {
             assert_eq!(
-                names,
-                BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"])
+                names.contains(name),
+                shell_allowed(case),
+                "{case:?}: {name}"
             );
+        }
+        if case == Case::Narrow || inspection_role(case) {
             assert!(!workspace.join("child-write.txt").exists());
             let history = child.last().unwrap()["messages"].to_string();
             assert!(history.contains("ACTUAL_READ_EVIDENCE"));
@@ -536,29 +592,24 @@ async fn fixture(case: Case) {
                 std::fs::read_to_string(workspace.join("child-write.txt")).unwrap(),
                 "real native child"
             );
-            if matches!(case, Case::Implementer | Case::ExplicitModel) {
-                assert_eq!(
-                    names,
-                    BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read", "Write"])
-                );
-            } else if case == Case::BuiltinImplementer {
-                assert_eq!(
-                    names,
-                    BTreeSet::from([
-                        "exec_command",
-                        "write_stdin",
-                        "Edit",
-                        DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
-                        "Read",
-                        "Write",
-                    ])
-                );
-            } else {
-                assert!(
-                    names.contains("Grep"),
-                    "the default role retains the resident Grep tool"
-                );
+        }
+        if case == Case::Unknown {
+            assert!(names.contains("Grep"), "the default role retains Grep");
+        } else {
+            let mut expected = BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"]);
+            if shell_allowed(case) {
+                expected.extend(["exec_command", "write_stdin"]);
             }
+            if matches!(
+                case,
+                Case::Implementer | Case::ExplicitModel | Case::BuiltinImplementer
+            ) {
+                expected.insert("Write");
+            }
+            if case == Case::BuiltinImplementer {
+                expected.insert("Edit");
+            }
+            assert_eq!(names, expected);
         }
         assert!(parent
             .agent_runtime_state
@@ -574,6 +625,8 @@ async fn actual_named_profiles_reach_provider_and_native_dispatch() {
         Case::Implementer,
         Case::Explorer,
         Case::Reviewer,
+        Case::IndependentReviewer,
+        Case::RoleDeniesShell,
         Case::Narrow,
         Case::Unknown,
         Case::ExplicitModel,
@@ -695,10 +748,7 @@ async fn handoff_freeze(probe: &HandoffProbe, child: &str, role: &str) {
     assert_eq!(selected.parent_session_id.as_deref(), Some(HANDOFF_ROOT));
     assert_eq!(selected.project_id_meta(), Some(probe.project_id.clone()));
     assert_eq!(selected.model, format!("handoff-{role}"));
-    assert_eq!(
-        selected.agent_runtime_state.as_ref().unwrap().read_only,
-        role == "reviewer"
-    );
+    assert!(!selected.agent_runtime_state.as_ref().unwrap().read_only);
     let raw = selected.metadata["child.named_profile.v1"].clone();
     let binding: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(binding["source"], "project");
@@ -1315,10 +1365,7 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
             "catalog reload cannot rebind a created Child"
         );
         assert_eq!(child.last_run_status().as_deref(), Some("completed"));
-        assert_eq!(
-            child.agent_runtime_state.as_ref().unwrap().read_only,
-            id == reviewer
-        );
+        assert!(!child.agent_runtime_state.as_ref().unwrap().read_only);
         if id == implementer {
             assert!(child
                 .messages
@@ -1372,7 +1419,12 @@ async fn actual_implementer_reviewer_bounded_handoff_and_correction() {
             assert!(text.contains(&format!("HANDOFF_{}_V1", role.to_uppercase())));
             assert!(!text.contains("HANDOFF_RELOADED_MUST_NOT_APPLY"));
             assert!(!text.contains("HANDOFF_GLOBAL_MUST_NOT_APPLY"));
-            let mut expected = BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"]);
+            let mut expected = BTreeSet::from([
+                DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                "Read",
+                "exec_command",
+                "write_stdin",
+            ]);
             if role == "implementer" {
                 expected.insert("Write");
             } else if index > 0 {

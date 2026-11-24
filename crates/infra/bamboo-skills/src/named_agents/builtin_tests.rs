@@ -44,11 +44,11 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
             );
             assert!(definition.tool_deny().is_empty());
         } else {
-            assert_eq!(definition.tool_allow(), ["Read", "Glob"]);
             assert_eq!(
-                definition.tool_deny(),
-                ["Bash", "exec_command", "write_stdin", "Edit", "Write"]
+                definition.tool_allow(),
+                ["Read", "Glob", "exec_command", "write_stdin"]
             );
+            assert_eq!(definition.tool_deny(), ["Edit", "Write"]);
         }
         assert!(!format!("{definition:?}").contains("Builtin role package"));
     }

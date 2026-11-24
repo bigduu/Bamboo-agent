@@ -25,15 +25,18 @@ optional history and no invented user decisions or constraints. A supplied
 packet keeps its complete required fields. Existing fit/capability checks
 reject before persistence; no remote/custom-worker support is claimed.
 
-Only the five native names Read/Glob/Bash/Edit/Write are supported declarations
-in this first application slice. Other/composition names reject. Profile
-allow/deny narrows the actual Host-owned #1361 ceiling, configured disables,
-inherited Child denies, permission checks, workspace/Project validation and
-typed readOnly. Project manifests have no additional tool-name policy field;
-this does not invent network/secret grants. Explorer/reviewer names impose an
-additional read-only restriction, even for a Project override; the name never
-attests builtin provenance or grants authority. Root's direct orchestration
-tool fence is separate from its configured delegation authority.
+Named profiles support Read, Glob, Edit, Write, exec_command and write_stdin.
+Legacy Bash declarations still resolve to the shell pair. Shell tools are
+part of the default role grant, including when a profile lists other allowed
+tools. Explicit profile denies can remove shell tools. The Host intersects
+the grant with its native ceiling, tool disables, inherited restrictions,
+permission mode and workspace/Project validation.
+
+Explorer, reviewer and independent-reviewer limit their direct file tools to
+Read and Glob, including Project overrides. Use typed readOnly or Plan to
+enforce read-only execution. Workflow steps with the read capability request
+typed readOnly. A Child uses write_stdin with the handle returned by its own
+exec_command for input, incremental output or exit status.
 
 The existing Child metadata stores safe selection identity/revision plus the
 frozen model, tools, readOnly, lifetime/Project and composed-prompt digest.

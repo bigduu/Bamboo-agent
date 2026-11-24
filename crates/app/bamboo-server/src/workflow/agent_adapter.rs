@@ -269,7 +269,7 @@ impl AgentStepPort for WorkflowAgentAdapter {
             .await
             .map_err(|_| "workflow Agent named profile unavailable")?;
         Ok(profile
-            .filter(|profile| profile.read_only())
+            .filter(|profile| profile.is_inspection_role())
             .map(|profile| NamedAgentSpec {
                 name: name.into(),
                 allowed_capabilities: BTreeSet::from(["read".into()]),
@@ -297,7 +297,7 @@ impl AgentStepPort for WorkflowAgentAdapter {
         let profile = spec
             .profile
             .as_ref()
-            .filter(|profile| profile.read_only())
+            .filter(|profile| profile.is_inspection_role())
             .ok_or("workflow Agent pinned profile unavailable")?
             .as_ref()
             .clone();
