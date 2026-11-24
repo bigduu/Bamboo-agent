@@ -667,6 +667,10 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         true
     }
 
+    fn try_hold_native_children_for_update(&self) -> io::Result<Option<NativeChildUpdateHold>> {
+        self.try_hold_for_update()
+    }
+
     fn set_local_child_skill_factory(&self, factory: Option<Arc<dyn LocalChildSkillFactory>>) {
         lock(&self.bindings).skills = factory;
     }

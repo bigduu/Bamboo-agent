@@ -283,6 +283,17 @@ pub trait ExternalChildRunner: Send + Sync {
         false
     }
 
+    /// Hold this assembled native backend's actual Child preparation and
+    /// execution lifetime. Unknown backends cannot certify that they are idle.
+    fn try_hold_native_children_for_update(
+        &self,
+    ) -> std::io::Result<Option<crate::external_agents::local_task::NativeChildUpdateHold>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Planned updates require the native Child runtime",
+        ))
+    }
+
     /// App catalog/read services for the owned local backend only.
     /// Process and remote adapters deliberately retain the default no-op.
     fn set_local_child_skill_factory(

@@ -83,6 +83,11 @@ impl TicketApplication {
             .await
             .map_err(|error| Error::ScopeDenied(error.to_string()))?;
         if snapshot.receipts.contains_key(&command.operation_id) {
+            self.record_update_dispatch().await?;
+            host.creator
+                .check_original_caller(caller)
+                .await
+                .map_err(|error| Error::ScopeDenied(error.to_string()))?;
             let receipt = service.work_dispatch(&authority, command)?;
             return self.enqueue_receipt(&service, command, receipt).await;
         }
@@ -134,6 +139,7 @@ impl TicketApplication {
             projects.insert(workspace.worktree.clone(), project.id);
         }
         self.validate_project_operations(&service, command)?;
+        self.record_update_dispatch().await?;
         host.creator
             .check_original_caller(caller)
             .await

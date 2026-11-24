@@ -104,6 +104,12 @@ impl TicketApplication {
                 "Ticket mutation feature is disabled".into(),
             ));
         }
+        let mut admission = Some(
+            self.update_admission
+                .enter()
+                .await
+                .map_err(|error| Error::ResourceBlocked(error.to_string()))?,
+        );
         let (service, authority) = self.message_authority(message_id).await?;
         let prior = service.message_resolution(&authority, message_id)?;
         if prior.proposal.is_some() {
@@ -173,13 +179,19 @@ impl TicketApplication {
                             && w.active_assignment.as_ref() == Some(&a.id)
                     })
             });
+            let dispatches = may_enqueue || self.cancel_after_commit(&service, &command);
+            if dispatches {
+                // A pending runtime receipt or a registered cancellation now
+                // owns work. Release the permit before ensure tries admission.
+                if let Some(mut permit) = admission.take() {
+                    permit.record_dispatch();
+                }
+            }
             if may_enqueue {
                 dispatch.push(
                     self.enqueue_receipt(&service, &command, receipt.clone())
                         .await?,
                 );
-            } else {
-                self.cancel_after_commit(&service, &command);
             }
         }
         Ok(json!({"status":"resolved","resolution":resolution,"dispatch":dispatch}))

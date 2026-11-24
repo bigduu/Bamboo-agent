@@ -432,6 +432,20 @@ async fn run_distillation_pass(
 /// Spawn the recurring ledger gardener loop: one run at startup, then on the
 /// configured interval. Disabled config makes each run return immediately.
 pub fn spawn_ledger_gardener_task(ctx: LedgerGardenerContext) {
+    spawn_ledger_gardener_task_inner(ctx, None);
+}
+
+pub fn spawn_guarded_ledger_gardener_task(
+    ctx: LedgerGardenerContext,
+    admission: crate::auto_dream::MemoryMaintenanceAdmission,
+) {
+    spawn_ledger_gardener_task_inner(ctx, Some(admission));
+}
+
+fn spawn_ledger_gardener_task_inner(
+    ctx: LedgerGardenerContext,
+    admission: Option<crate::auto_dream::MemoryMaintenanceAdmission>,
+) {
     tokio::spawn(async move {
         let interval_secs = {
             let guard = ctx.dream.config.read().await;
@@ -458,6 +472,13 @@ pub fn spawn_ledger_gardener_task(ctx: LedgerGardenerContext) {
             if !due {
                 continue;
             }
+            let _permit = match &admission {
+                Some(admission) => match admission.enter().await {
+                    Some(permit) => Some(permit),
+                    None => break,
+                },
+                None => None,
+            };
             if let Err(error) = run_ledger_gardener_once(&ctx).await {
                 tracing::warn!(
                     target: LEDGER_GARDENER_TRACING_TARGET,
