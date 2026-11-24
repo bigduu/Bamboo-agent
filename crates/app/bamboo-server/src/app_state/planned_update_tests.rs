@@ -114,6 +114,8 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         lease_epoch: owner.lease_epoch,
         conversation_reset_sha256: session.conversation_reset_sha256().unwrap(),
         root_tool_authority_revision: session.root_tool_authority_revision,
+        project_id: session.project_id_meta(),
+        workspace_path: session.workspace_path_meta(),
         message_id: session.messages.last().unwrap().id.clone(),
         message_count: session.messages.len(),
         model: ProviderModelRef::new(PROVIDER, MODEL),
@@ -137,6 +139,14 @@ async fn planned_update_resume_uses_the_saved_tool_result_under_a_new_owner_once
         HashMap::from([(PROVIDER.into(), probe.clone() as Arc<dyn LLMProvider>)]),
         PROVIDER.into(),
     ));
+    let before = state
+        .session_store
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.last_run_status().as_deref(), Some("suspended"));
+    assert_eq!(before.host_run_id(), Some(checkpoint.run_id.as_str()));
     let mut stale = checkpoint.clone();
     stale.message_id = "changed-tail".into();
     assert!(!state

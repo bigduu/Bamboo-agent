@@ -70,6 +70,8 @@ pub(super) async fn pause_before_model_round(
         lease_epoch: writer.fence.lease_epoch,
         conversation_reset_sha256,
         root_tool_authority_revision: session.root_tool_authority_revision,
+        project_id: session.project_id_meta(),
+        workspace_path: session.workspace_path_meta(),
         message_id: message.id.clone(),
         message_count: session.messages.len(),
         model,
@@ -101,6 +103,8 @@ pub(crate) fn matches_checkpoint(root: &ParkedUpdateRoot, session: &Session) -> 
         && session.created_at == root.created_at
         && session.host_run_id() == Some(root.run_id.as_str())
         && session.root_tool_authority_revision == root.root_tool_authority_revision
+        && session.project_id_meta() == root.project_id
+        && session.workspace_path_meta() == root.workspace_path
         && session
             .conversation_reset_sha256()
             .is_ok_and(|hash| hash == root.conversation_reset_sha256)

@@ -1229,13 +1229,32 @@ impl ChildCompletionCoordinator {
             return Ok(false);
         };
         let guard = self.persistence.acquire_lock(&root.session_id).await;
-        let Some(saved) = self.storage.load_session(&root.session_id).await? else {
-            return Ok(false);
-        };
-        let Some(resumed) = crate::runtime::planned_update::prepare_resuming_session(root, &saved)
+        let Some((saved, resumed)) =
+            self.storage
+                .load_session(&root.session_id)
+                .await?
+                .and_then(|saved| {
+                    let resumed =
+                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                    Some((saved, resumed))
+                })
         else {
+            drop(guard);
+            reservation.abandon().await;
             return Ok(false);
         };
+        let config = self.config.read().await.clone();
+        let provider =
+            resolve_provider_routing_key(&config, &root.model.provider, &self.provider_registry);
+        if !provider.is_ok_and(|provider| provider == root.model.provider)
+            || self.provider_router.route_with_origin(&root.model).is_err()
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(std::io::Error::other(
+                "The saved update model is unavailable",
+            ));
+        }
         self.prepare_paced_loop_turn(&mut reservation, &saved)
             .await?;
         let writer = reservation.root_actor_writer().ok_or_else(|| {
