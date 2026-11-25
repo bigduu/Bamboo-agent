@@ -45,6 +45,10 @@ server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
 
+The Linux and Windows ARM64 embedded frontend jobs upload their Cargo output and
+bounded Host failure diagnostics on failure. The `arm64-embedded-frontend` artifact
+name includes the target, workflow run and attempt.
+
 The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 `trusted-observer.yml` runs both Observer runtime selections in one feature job,
 reusing compatible compiled output and running the shared serde case once. The
