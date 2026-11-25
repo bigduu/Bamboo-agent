@@ -2,10 +2,10 @@
 use super::*;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_domain::{Message, ProviderModelRef, ReasoningEffort};
+use bamboo_domain::{ActorDirectoryPort, Message, ProviderModelRef, ReasoningEffort, SessionKind};
 use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderRegistry};
 use bamboo_server::AppState;
-use bamboo_tickets::{Command, ExecutionWorkspace, TicketService};
+use bamboo_tickets::{AssignmentState, Command, ExecutionWorkspace, TicketService};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 
@@ -441,44 +441,98 @@ async fn native_work_profile_override_does_not_borrow_discarded_role_effort() {
             .dispatch(owner(), &fixture.start)
             .await
             .unwrap();
-        assert_eq!(dispatched["errors"], json!([]));
+        assert_eq!(dispatched["runtime"], json!([]), "{dispatched}");
+        let errors = dispatched["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{dispatched}");
+        assert_eq!(errors[0]["status_code"], json!(403), "{dispatched}");
+        let reason = errors[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("Native Work requires Task"), "{reason}");
+        assert!(reason.contains("named worker profile"), "{reason}");
+
         let assignment_id = dispatched["receipt"]["ids"]["a"].as_str().unwrap();
-        // Named-profile grants predate this slice and do not contain native
-        // Work's required Task capability (#2628). Keep that existing refusal;
-        // verify the actual fresh Child before treating it as runnable.
-        let (stopped, child) = tokio::time::timeout(WAIT, async {
-            loop {
-                let snapshot = fixture.service.published().unwrap().1;
-                let assignment = &snapshot.assignments[assignment_id];
-                if assignment.process_stopped {
-                    let child_id = &assignment.runtime.as_ref().unwrap().session_id;
-                    let child = fixture
-                        .state
-                        .storage
-                        .load_session(child_id)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    if child.last_run_status().as_deref() == Some("error") {
-                        break (snapshot, child);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("incompatible profile must fail closed before provider execution");
+        let (commit, snapshot) = fixture.service.published().unwrap();
+        assert_eq!(snapshot.assignments.len(), 1);
+        let assignment = &snapshot.assignments[assignment_id];
+        assert_eq!(errors[0]["dispatch_key"], json!(assignment.dispatch_key));
+        assert_eq!(assignment.state, AssignmentState::DispatchPending);
+        assert!(assignment.runtime.is_none());
+        assert!(!assignment.process_stopped);
+        assert!(snapshot.submissions.is_empty());
+        let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+        let child = fixture
+            .state
+            .storage
+            .load_session(&child_id)
+            .await
+            .unwrap()
+            .expect("the exact named-profile Child is prepared");
+        assert_eq!(child.kind, SessionKind::Child);
         assert_eq!(child.model_ref.as_ref().unwrap().provider, account);
         assert_eq!(child.model_ref.as_ref().unwrap().model, model);
         assert_eq!(child.model_ref.as_ref().unwrap().reasoning_effort, None);
         assert_eq!(child.reasoning_effort, None);
-        assert_eq!(child.last_run_status().as_deref(), Some("error"));
-        assert!(child
-            .metadata
-            .get("last_run_error")
-            .is_some_and(|error| error.contains("unsupported Ticket native ceiling")));
+        let binding = ticket_runtime::read_dispatch(&child).unwrap().unwrap();
+        assert_eq!(binding.assignment_id, assignment_id);
+        assert_eq!(binding.dispatch_key, assignment.dispatch_key);
+        assert!(binding.receipt.is_none());
+        assert!(binding.receipt_created_at.is_none());
+        let assert_unlaunched = |child: &bamboo_domain::Session| {
+            assert_eq!(child.last_run_status().as_deref(), Some("pending"));
+            assert!(child
+                .runtime_metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.child_auto_run_launch_intent_generation.is_none()));
+        };
+        assert_unlaunched(&child);
         assert!(fixture.requests.try_recv().is_err());
-        assert!(stopped.submissions.is_empty());
+
+        let sessions_before_replay = fixture.state.session_store.list_index_entries().await.len();
+        let replay = fixture
+            .state
+            .tickets
+            .dispatch(owner(), &fixture.start)
+            .await
+            .unwrap();
+        assert_eq!(replay, dispatched);
+        assert_eq!(fixture.service.published().unwrap().0, commit);
+        let reloaded = fixture
+            .state
+            .storage
+            .load_session(&child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.created_at, child.created_at);
+        assert_eq!(
+            reloaded.child_launch_generation(),
+            child.child_launch_generation()
+        );
+        assert_eq!(reloaded.model_ref, child.model_ref);
+        assert_eq!(reloaded.reasoning_effort, child.reasoning_effort);
+        assert_eq!(
+            ticket_runtime::read_dispatch(&reloaded).unwrap(),
+            Some(binding)
+        );
+        assert_unlaunched(&reloaded);
+        assert_eq!(
+            fixture.state.session_store.list_index_entries().await.len(),
+            sessions_before_replay
+        );
+        assert!(fixture
+            .state
+            .session_activation_router
+            .current_run_id(&child_id)
+            .await
+            .is_none());
+        let actor = fixture
+            .state
+            .session_store
+            .inspect_actor(&child_id)
+            .await
+            .unwrap();
+        assert!(actor.activation.is_none());
+        assert_eq!(actor.actor.current_attempt, 0);
+        assert!(fixture.requests.try_recv().is_err());
     }
 }
 

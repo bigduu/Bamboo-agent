@@ -2,7 +2,9 @@
 //! no model, worker wait, or second placement policy runs in this adapter.
 use std::sync::Arc;
 
-use bamboo_engine::session_app::child_session::{create_ticket_child_action, CreateChildInput};
+use bamboo_engine::session_app::child_session::{
+    create_ticket_child_action, named_profile::named_profile_tool_names, CreateChildInput,
+};
 use bamboo_engine::ticket_runtime::{self, DispatchObservation, TICKET_DISPATCH_KEY};
 use bamboo_engine::ticket_worker_plan::tickets::{
     Authority, DispatchSpec, Error, Principal, Result, TicketService,
@@ -163,6 +165,25 @@ impl ChildSessionAdapter {
             .load_session(&child_id)
             .await?
             .ok_or_else(|| Error::AuthorityUnavailable("prepared Child missing".into()))?;
+        if self.scheduler.supports_native_child_startup(&child) {
+            // Check the frozen profile before reserving or enqueueing a native
+            // Run. The executor still applies the live ceiling at startup.
+            let profile_tools = named_profile_tool_names(&child).map_err(|_| {
+                Error::ScopeDenied("Invalid frozen named worker profile for native Work.".into())
+            })?;
+            if let Some(tools) = profile_tools {
+                let intersection = tools
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|tool| spec.contract.allowed_tools.contains(*tool));
+                bamboo_tickets::validate_native_tool_ceiling(intersection).map_err(|_| {
+                    Error::ScopeDenied(
+                        "Native Work requires Task. Configure the Work worker without this incompatible named worker profile."
+                            .into(),
+                    )
+                })?;
+            }
+        }
         // The scheduler obtains this same guard for its exact-generation
         // reservation. Release before enqueue and retain the durable generation.
         drop(guard);
