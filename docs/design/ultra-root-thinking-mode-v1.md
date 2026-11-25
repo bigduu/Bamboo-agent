@@ -1,12 +1,15 @@
 # Ultra Root thinking mode
 
 Ultra combines the primary model's highest reasoning effort with active
-parallel SubAgent delegation. The Root looks for useful independent work,
-dispatches as capacity permits, advances its own ready work, and verifies the
-results. An ordinary Ultra Root can write, edit and use `exec_command` under
-its workspace and permission checks. Use `SubAgent` with `intent=wait` for
+parallel SubAgent delegation. An ordinary Ultra Root identifies useful
+independent slices at the start, discovers SubAgent early when needed, and
+dispatches ready assignments as capacity permits. It advances its own ready
+work while children run and verifies their results. It can write, edit and use
+`exec_command` under its workspace and permission checks. Use `SubAgent` with `intent=wait` for
 non-interactive completion and `write_stdin` for input or unread output.
 Other reasoning selections use their chosen level and delegate when useful.
+A Supervisor in Ultra starts independent auxiliary planning, review and
+verification with SubAgents while coordinating Work or independent Sessions.
 
 At primary request dispatch Bamboo uses the highest supported native tier
 for known limits, such as `xhigh` on GPT-5.4 and `high` on Gemini 3. Routes
