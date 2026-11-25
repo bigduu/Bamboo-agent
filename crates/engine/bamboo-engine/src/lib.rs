@@ -52,9 +52,7 @@ pub use session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationRouter,
     SessionActivationSpawner, SessionRunRegistration, SessionRunRegistrationError,
 };
-pub use session_app::child_completion_coordinator::{
-    BackgroundExecStopOutcome, ChildCompletionCoordinator,
-};
+pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 pub use session_messaging::{
     SessionMessagingMetrics, SessionMessagingMetricsSnapshot, SessionMessenger,
     SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,

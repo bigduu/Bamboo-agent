@@ -81,7 +81,7 @@ pub async fn cancel_background_command_wait(
     body: web::Json<BackgroundCommandStopRequest>,
 ) -> HttpResponse {
     use actix_web::http::StatusCode;
-    use bamboo_engine::BackgroundExecStopOutcome;
+    use bamboo_engine::session_app::child_completion_coordinator::BackgroundExecStopOutcome;
 
     if let Err(error) = crate::handlers::agent::tickets::user(&state, &request).await {
         return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
