@@ -32,6 +32,9 @@ use super::runner_state::AgentRunner;
 /// reconstruct authority from a persisted job.
 pub type QueueAdmissionCheck = dyn Fn() -> Result<(), String> + Send + Sync;
 
+mod startup;
+pub(crate) use startup::ChildStartup;
+
 /// One in-memory queue slot, not an execution grant. Dropping it releases
 /// capacity without publishing a job or Start. The original cancellation gate
 /// stays bound to the reservation and cannot be replaced before commit.
@@ -39,9 +42,23 @@ pub struct QueueCapacityReservation<'a> {
     scheduler: &'a SpawnScheduler,
     gate: Option<&'a AdmissionGate>,
     permit: mpsc::Permit<'a, QueuedSpawnJob>,
+    startup: Option<ChildStartup>,
 }
 
 impl QueueCapacityReservation<'_> {
+    /// Observe an accepted ordinary native Child's exact launch generation.
+    pub fn with_child_startup(mut self, child: &Session) -> Self {
+        if self
+            .scheduler
+            .ctx
+            .external_child_runner
+            .supports_native_child_startup(child)
+        {
+            self.startup = ChildStartup::new(child);
+        }
+        self
+    }
+
     /// A terminal original gate needs no additional Host I/O. Commit repeats
     /// this arbitration atomically, including when preflight returned an error.
     pub fn terminal_state(&self) -> Option<AdmissionCommit<()>> {
@@ -71,6 +88,7 @@ impl QueueCapacityReservation<'_> {
             scheduler,
             gate,
             permit,
+            startup,
         } = self;
         let preparation_job = job.clone();
         let commit = send_reserved(
@@ -80,10 +98,23 @@ impl QueueCapacityReservation<'_> {
             gate,
             launch_generation,
             admission_check,
-            preflight,
+            preflight.map(|()| startup.clone()),
         )?;
+        if matches!(commit, AdmissionCommit::Committed(_)) {
+            if let Some(startup) = &startup {
+                startup
+                    .clone()
+                    .watch(scheduler.ctx.clone(), preparation_job.clone());
+            }
+        }
         scheduler
-            .finish_admission(preparation_job, title, launch_generation, commit)
+            .finish_admission(
+                preparation_job,
+                title,
+                launch_generation,
+                startup.as_ref(),
+                commit,
+            )
             .await
     }
 }
@@ -104,6 +135,7 @@ struct QueuedSpawnJob {
     launch_generation: Option<u64>,
     announcement_ready: oneshot::Receiver<()>,
     start_published: Arc<AtomicBool>,
+    startup: Option<ChildStartup>,
 }
 
 /// Serializes a queued launch's durable eligibility check and runner
@@ -155,6 +187,14 @@ impl ChildLaunchLocks {
 pub trait ChildRunLaunchHook: Send + Sync {
     fn before_child_launch(&self, job: &SpawnJob, child_events: broadcast::Sender<AgentEvent>);
 
+    fn on_child_startup_blocked(
+        &self,
+        _job: &SpawnJob,
+        _parent_events: broadcast::Sender<AgentEvent>,
+        _reason: &'static str,
+    ) {
+    }
+
     /// Optional queue boundary observer. The production notification hook is
     /// a no-op; deterministic scheduler tests can hold dequeue before the
     /// cancellation fence is acquired.
@@ -198,6 +238,13 @@ pub struct NativeTaskStart {
     pub run_id: String,
     pub instance_id: uuid::Uuid,
     pub entered_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeTaskStartup {
+    WaitingForCapacity,
+    Preparing,
+    Started,
 }
 
 impl NativeTaskStart {
@@ -250,6 +297,21 @@ pub trait ExternalChildRunner: Send + Sync {
         _child_birth: chrono::DateTime<chrono::Utc>,
     ) -> Option<NativeTaskStart> {
         None
+    }
+
+    /// Changes for the exact native task, including waits before Task entry.
+    fn native_task_startup(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: DateTime<Utc>,
+    ) -> Option<tokio::sync::watch::Receiver<NativeTaskStartup>> {
+        None
+    }
+
+    /// Whether the assembled backend will handle this Child as a native task.
+    fn supports_native_child_startup(&self, _session: &Session) -> bool {
+        false
     }
 
     /// Read the current native owner and its last acknowledged renewal.
@@ -603,15 +665,20 @@ impl SpawnScheduler {
                 launch_generation,
                 announcement_ready,
                 start_published,
+                startup,
             }) = rx.recv().await
             {
                 let job_ctx = worker_ctx.clone();
                 let job_for_panic = job.clone();
                 let job_launch_locks = worker_launch_locks.clone();
+                let startup_for_job = startup.clone();
                 let handle = tokio::spawn(async move {
                     // The producer publishes Start before returning to the
                     // tool. If it is aborted after queue admission, the worker
                     // publishes Start before any child execution/completion.
+                    if let Some(startup) = &startup_for_job {
+                        startup.preparing();
+                    }
                     let fallback_start =
                         needs_fallback_start(announcement_ready, &start_published).await;
                     if let Some(hook) = job_ctx.child_run_launch_hook.as_ref() {
@@ -619,9 +686,13 @@ impl SpawnScheduler {
                     }
                     let launch_guard = if let Some(generation) = launch_generation {
                         let guard = job_launch_locks.acquire(&job.child_session_id).await;
-                        if queued_launch_state(&job_ctx, &job, generation).await?
+                        if queued_launch_state(&job_ctx, &job, generation, startup_for_job.as_ref())
+                            .await?
                             != QueuedLaunchState::Eligible
                         {
+                            if let Some(startup) = &startup_for_job {
+                                startup.finish();
+                            }
                             return Ok(());
                         }
                         Some(guard)
@@ -645,8 +716,19 @@ impl SpawnScheduler {
                             )
                             .await;
                     }
-                    if let Err(err) = run_spawn_job(job_ctx, job, launch_guard).await {
+                    let report = startup_for_job
+                        .as_ref()
+                        .map(|startup| (startup.clone(), job_ctx.clone(), job.clone()));
+                    if let Err(err) =
+                        run_spawn_job(job_ctx, job, launch_guard, startup_for_job.clone()).await
+                    {
                         tracing::warn!("spawn job failed: {}", err);
+                        if let Some((startup, ctx, job)) = report {
+                            startup.finish();
+                            startup.report(ctx, job);
+                        }
+                    } else if let Some(startup) = &startup_for_job {
+                        startup.finish_unless_native();
                     }
                     Ok(())
                 });
@@ -655,6 +737,16 @@ impl SpawnScheduler {
                     Ok(Err(error)) => error,
                     Err(error) => format!("child spawn panicked: {error}"),
                 };
+                if let Some(startup) = startup {
+                    tracing::warn!(
+                        child_session_id = %job_for_panic.child_session_id,
+                        error = %failure,
+                        "could not confirm startup of the admitted Child"
+                    );
+                    startup.finish();
+                    startup.report(worker_ctx.clone(), job_for_panic);
+                    continue;
+                }
                 {
                     tracing::error!(
                         parent_session_id = %job_for_panic.parent_session_id,
@@ -754,7 +846,7 @@ impl SpawnScheduler {
             admission_check,
         )
         .await?;
-        self.finish_admission(preparation_job, title, launch_generation, commit)
+        self.finish_admission(preparation_job, title, launch_generation, None, commit)
             .await
     }
 
@@ -770,6 +862,7 @@ impl SpawnScheduler {
                     scheduler: self,
                     gate,
                     permit,
+                    startup: None,
                 })
             }
             AdmissionCommit::AlreadyCommitted => AdmissionCommit::AlreadyCommitted,
@@ -782,6 +875,7 @@ impl SpawnScheduler {
         preparation_job: SpawnJob,
         title: Option<String>,
         launch_generation: Option<u64>,
+        startup: Option<&ChildStartup>,
         commit: AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>,
     ) -> Result<AdmissionCommit<()>, String> {
         match commit {
@@ -797,7 +891,8 @@ impl SpawnScheduler {
                 };
                 let state = match launch_generation {
                     Some(generation) => {
-                        queued_launch_state(&self.ctx, &preparation_job, generation).await?
+                        queued_launch_state(&self.ctx, &preparation_job, generation, startup)
+                            .await?
                     }
                     None => QueuedLaunchState::Eligible,
                 };
@@ -944,7 +1039,7 @@ async fn reserve_and_send(
             gate,
             launch_generation,
             admission_check,
-            Ok(()),
+            Ok(None),
         ),
         AdmissionCommit::AlreadyCommitted => Ok(AdmissionCommit::AlreadyCommitted),
         AdmissionCommit::Cancelled => Ok(AdmissionCommit::Cancelled),
@@ -982,23 +1077,23 @@ fn send_reserved(
     gate: Option<&AdmissionGate>,
     launch_generation: Option<u64>,
     admission_check: Option<&QueueAdmissionCheck>,
-    preflight: Result<(), String>,
+    preflight: Result<Option<ChildStartup>, String>,
 ) -> Result<AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>, String> {
     let (announce_ready, announcement_ready) = oneshot::channel();
     let start_published = Arc::new(AtomicBool::new(false));
-    let queued = QueuedSpawnJob {
-        job,
-        title,
-        launch_generation,
-        announcement_ready,
-        start_published: start_published.clone(),
-    };
     let commit = || {
-        preflight?;
+        let startup = preflight?;
         if let Some(check) = admission_check {
             check()?;
         }
-        permit.send(queued);
+        permit.send(QueuedSpawnJob {
+            job,
+            title,
+            launch_generation,
+            announcement_ready,
+            start_published: start_published.clone(),
+            startup,
+        });
         Ok((announce_ready, start_published))
     };
     match gate {
@@ -1318,9 +1413,10 @@ async fn run_spawn_job(
     ctx: SpawnContext,
     job: SpawnJob,
     launch_guard: Option<ChildLaunchGuard>,
+    startup: Option<ChildStartup>,
 ) -> Result<(), String> {
     match launch_guard {
-        Some(guard) => crate::sdk::spawn::run_child_spawn_fenced(ctx, job, guard).await,
+        Some(guard) => crate::sdk::spawn::run_child_spawn_fenced(ctx, job, guard, startup).await,
         None => crate::sdk::spawn::run_child_spawn(ctx, job).await,
     }
 }
@@ -1336,19 +1432,23 @@ async fn queued_launch_state(
     ctx: &SpawnContext,
     job: &SpawnJob,
     generation: u64,
+    startup: Option<&ChildStartup>,
 ) -> Result<QueuedLaunchState, String> {
-    let child = ctx
-        .agent
-        .storage()
-        .load_session(&job.child_session_id)
-        .await
-        .map_err(|error| format!("load queued child launch fence: {error}"))?;
+    let storage = ctx.agent.storage();
+    let mut child = storage.load_session(&job.child_session_id).await;
+    if let Err(error) = &child {
+        if startup.is_some_and(|startup| startup.retry_io(job, "read launch generation", error)) {
+            child = storage.load_session(&job.child_session_id).await;
+        }
+    }
+    let child = child.map_err(|error| format!("load queued child launch fence: {error}"))?;
     let Some(child) = child else {
         return Ok(QueuedLaunchState::Stale);
     };
     if child.kind != bamboo_domain::SessionKind::Child
         || child.parent_session_id.as_deref() != Some(job.parent_session_id.as_str())
         || child.child_launch_generation() != generation
+        || startup.is_some_and(|startup| !startup.matches_child(&child))
         || child.is_child_launch_cancelled(generation)
     {
         return Ok(QueuedLaunchState::Stale);
@@ -1421,6 +1521,7 @@ mod launch_hook_tests {
             launch_generation: None,
             announcement_ready,
             start_published: Arc::new(AtomicBool::new(false)),
+            startup: None,
         })
         .await
         .unwrap();
@@ -1581,7 +1682,7 @@ mod launch_hook_tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
             assert!(matches!(
-                send_reserved(permit, job(), None, Some(&gate), Some(7), None, Ok(())).unwrap(),
+                send_reserved(permit, job(), None, Some(&gate), Some(7), None, Ok(None)).unwrap(),
                 AdmissionCommit::Committed(_)
             ));
             assert!(gate.is_committed());
@@ -1620,7 +1721,7 @@ mod launch_hook_tests {
             let late = reserve(&tx, &gate).await;
             let first = reserve(&tx, &gate).await;
             assert!(matches!(
-                send_reserved(first, job(), None, Some(&gate), Some(7), None, Ok(())).unwrap(),
+                send_reserved(first, job(), None, Some(&gate), Some(7), None, Ok(None)).unwrap(),
                 AdmissionCommit::Committed(_)
             ));
             let calls = Arc::new(AtomicUsize::new(0));
@@ -1690,7 +1791,7 @@ mod launch_hook_tests {
                 Some(&gate),
                 Some(7),
                 Some(&check),
-                Ok(()),
+                Ok(None),
             )
             .expect_err("the final synchronous fence remains authoritative");
             assert_eq!(error, "Ready policy expired during resource preflight");
