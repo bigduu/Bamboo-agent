@@ -488,7 +488,7 @@ jobs:
         run: |
           set -euo pipefail
           case_name=real_bamboo_binary_serves_the_required_embedded_frontend
-          cargo test --locked --target "$BAMBOO_TEST_TARGET" --test frontend_packaging -- --exact "$case_name" \
+          cargo test --locked --target "$BAMBOO_TEST_TARGET" --test frontend_packaging -- --exact "$case_name" 2>&1 \
             | tee "$RUNNER_TEMP/bamboo-arm64-frontend.log"
           tr -d '\r' < "$RUNNER_TEMP/bamboo-arm64-frontend.log" | grep -Fx "test $case_name ... ok"
           node - <<'NODE'
@@ -500,6 +500,14 @@ jobs:
           NODE
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve failed ARM64 frontend evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-embedded-frontend-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-arm64-frontend.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   browser-runtime-tests:
     name: Browser Runtime Unit and E2E (${{ matrix.shard }})

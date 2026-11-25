@@ -67,7 +67,7 @@ fn truncate_at_word_boundary(text: &str, max_chars: usize) -> &str {
 /// the banner title shares a line with the details label, the error body that
 /// follows belongs to the banner too, so it is skipped up to the next blank line.
 /// Nothing is removed unless the first non-blank line really starts a banner.
-fn strip_pasted_failure_banner(text: &str) -> String {
+pub(super) fn strip_pasted_failure_banner(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let Some(start) = lines.iter().position(|line| !line.trim().is_empty()) else {
         return String::new();
@@ -110,7 +110,7 @@ fn strip_pasted_failure_banner(text: &str) -> String {
     lines[index..].join("\n")
 }
 
-fn strip_code_fences(text: &str) -> String {
+pub(super) fn strip_code_fences(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut in_fence = false;
     for line in text.lines() {

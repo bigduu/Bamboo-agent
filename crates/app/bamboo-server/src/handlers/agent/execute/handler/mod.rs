@@ -77,7 +77,7 @@ pub async fn handler(
         if let Some(run_id) = continuation {
             continue_live_retry(&state, &session_id, &run_id).await
         } else {
-            handle_execute_inner(state, session_id, req, selected).await
+            handle_execute_inner(state, session_id, req, selected, ExecuteOrigin::Http).await
         }
     };
     match prepared {
@@ -179,7 +179,14 @@ pub async fn handle_execute(
     session_id: String,
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
-    handle_execute_inner(state, session_id, req, None).await
+    handle_execute_inner(state, session_id, req, None, ExecuteOrigin::InProcess).await
+}
+
+/// Identifies the genuine execute entrypoint without relying on client posture.
+#[derive(Clone, Copy)]
+pub(super) enum ExecuteOrigin {
+    Http,
+    InProcess,
 }
 
 struct RestoredFreshAdmission {
@@ -195,6 +202,7 @@ async fn handle_execute_inner(
     session_id: String,
     req: web::Json<ExecuteRequest>,
     selected: Option<receipt::Selection>,
+    origin: ExecuteOrigin,
 ) -> HttpResponse {
     match state.storage.load_session(&session_id).await {
         Ok(Some(session)) => {
@@ -280,6 +288,7 @@ async fn handle_execute_inner(
         &mut startup_guard,
         &mut admission_reservation,
         restored,
+        origin,
     )
     .await;
     // Await exact cleanup on every non-spawn return. The reservation's own
@@ -295,6 +304,7 @@ async fn handle_reserved_execute(
     startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
     admission_reservation: &mut Option<SessionExecutionReservation>,
     restored: Option<RestoredFreshAdmission>,
+    origin: ExecuteOrigin,
 ) -> HttpResponse {
     let restored_owner = restored.is_some();
     // A sync correction reuses this owner; preserve the opt-in selected on
@@ -645,6 +655,7 @@ async fn handle_reserved_execute(
                     untrusted_inputs,
                     native_main,
                     generate_title,
+                    origin,
                     effective_model,
                     effective_reasoning_effort,
                     model_source,

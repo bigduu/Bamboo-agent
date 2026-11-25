@@ -66,6 +66,10 @@ function assertRouting(source) {
   assert.match(arm64, /cargo test --locked --target "\$BAMBOO_TEST_TARGET" --test frontend_packaging -- --exact/);
   assert.match(arm64, /grep -Fx "test \$case_name \.\.\. ok"/);
   assert.match(arm64, /binaryArchitecture\(path.join/);
+  const arm64Evidence = arm64.split("      - name: Preserve failed ARM64 frontend evidence\n")[1];
+  assert.match(arm64Evidence, /^        if: failure\(\)\n        uses: actions\/upload-artifact@v7\n/m);
+  assert.match(arm64Evidence, /name: arm64-embedded-frontend-\$\{\{ matrix.target \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
+  assert.match(arm64Evidence, /path: \$\{\{ runner.temp \}\}\/bamboo-arm64-frontend.log/);
   assert.match(job(source, "msrv"), /cargo check --locked --workspace --all-targets --all-features/);
   assert.match(job(source, "lint"), /cargo clippy --all-features --/);
   assert.match(job(source, "security"), /cargo audit --deny warnings/);
@@ -93,6 +97,26 @@ test("feature CI owns tests and quality once; main has only read-only promotion"
     ["shard: [host, profile, shared, other]", "shard: [host, profile, shared]"],
     ["run: cargo fmt --all -- --check", "run: true"],
   ]) assert.throws(() => assertRouting(ci.replace(before, after)));
+});
+
+test("ARM64 frontend failure retains both output streams and fails the job", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-arm64-frontend-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const step = job(ci, "arm64-feature").split("      - name: Run the real Bamboo embedded frontend on ARM64\n")[1];
+  const fakeCargo = [
+    "cargo() {",
+    "  printf '%s\\n' 'frontend test output'",
+    "  printf '%s\\n' 'bounded Host failure evidence' >&2",
+    "  return 17",
+    "}",
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", `${fakeCargo}\n${script(step)}`], {
+    encoding: "utf8",
+    env: { ...process.env, RUNNER_TEMP: directory, BAMBOO_TEST_TARGET: "aarch64-unknown-linux-gnu" },
+  });
+  assert.equal(result.status, 17, result.stderr);
+  assert.equal(fs.readFileSync(path.join(directory, "bamboo-arm64-frontend.log"), "utf8"),
+    "frontend test output\nbounded Host failure evidence\n");
 });
 
 test("browser matrix executes a complete disjoint file selection and preserves child isolation", () => {

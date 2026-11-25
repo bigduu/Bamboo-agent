@@ -399,18 +399,31 @@ pub(crate) fn spawn_feed_forwarder(
         }
 
         // Phase B: live tail with overlap-dedupe and lagged re-seek.
+        let mut lagged_backlog = 0usize;
         loop {
             match receiver.recv().await {
                 Ok(ce) => {
+                    let fresh = lagged_backlog == 0 && ce.seq > latest_at_start;
+                    lagged_backlog = lagged_backlog.saturating_sub(1);
                     if ce.seq <= last_replayed {
                         continue; // dedupe the replay/live overlap
                     }
-                    if !send_env(&out, encoding, feed_envelope(&ce)).await {
+                    let envelope = feed_envelope(&ce);
+                    let envelope =
+                        if fresh && matches!(ce.event, AgentEvent::SessionTitleUpdated { .. }) {
+                            envelope.with_live_delivery()
+                        } else {
+                            envelope
+                        };
+                    if !send_env(&out, encoding, envelope).await {
                         return;
                     }
                     last_replayed = ce.seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // If the journal cannot recover the whole gap, the retained
+                    // broadcast backlog is still catch-up, with no live marker.
+                    lagged_backlog = receiver.len();
                     // Ring overran during a slow consumer; recover the gap from
                     // the durable journal (the backstop), then continue live.
                     if let Ok(events) = journal::read_since(&events_dir, last_replayed) {
@@ -1720,6 +1733,78 @@ mod tests {
         assert_eq!(v["event"]["seq"], 99);
         assert_eq!(v["event"]["session_id"], "s1");
         assert_eq!(v["event"]["event"]["type"], "token");
+        assert!(v.get("delivery").is_none());
+    }
+
+    #[tokio::test]
+    async fn feed_marks_live_title_updates_but_keeps_replay_and_lag_recovery_static() {
+        use bamboo_agent_core::agent::events::TitleSource;
+
+        async fn receive(out: &mut mpsc::Receiver<OutFrame>) -> serde_json::Value {
+            match tokio::time::timeout(Duration::from_secs(5), out.recv())
+                .await
+                .expect("feed frame before timeout")
+                .expect("feed stays open")
+            {
+                OutFrame::Text(value) => serde_json::from_str(&value).unwrap(),
+                OutFrame::Binary(value) => rmp_serde::from_slice(&value).unwrap(),
+            }
+        }
+
+        for encoding in [Encoding::Json, Encoding::Msgpack] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut journal, _) =
+                journal::EventJournal::open(directory.path().to_owned()).unwrap();
+            let title = |seq| ChangeEvent {
+                seq,
+                ts: chrono::Utc::now(),
+                session_id: Some("s1".into()),
+                event: AgentEvent::SessionTitleUpdated {
+                    session_id: "s1".into(),
+                    title: format!("Title {seq}"),
+                    title_version: seq,
+                    title_generated: true,
+                    source: TitleSource::Auto,
+                    updated_at: chrono::Utc::now(),
+                },
+            };
+            journal.append(&title(1)).unwrap();
+            let (bus, subscription) = broadcast::channel(1);
+            let (out, mut frames) = mpsc::channel(8);
+            let forwarder = spawn_feed_forwarder(
+                out,
+                encoding,
+                subscription,
+                directory.path().to_owned(),
+                0,
+                1,
+            );
+            let replayed = receive(&mut frames).await;
+            assert_eq!(replayed["seq"], 1);
+            assert!(replayed.get("delivery").is_none());
+
+            for seq in 2..=3 {
+                let change = title(seq);
+                journal.append(&change).unwrap();
+                bus.send(Arc::new(change)).unwrap();
+            }
+            for seq in 2..=3 {
+                let recovered = receive(&mut frames).await;
+                assert_eq!(recovered["seq"], seq);
+                assert!(recovered.get("delivery").is_none());
+            }
+
+            let change = title(4);
+            journal.append(&change).unwrap();
+            bus.send(Arc::new(change)).unwrap();
+            let live = receive(&mut frames).await;
+            assert_eq!(live["seq"], 4);
+            assert_eq!(live["delivery"], "live");
+            assert_eq!(live["event"]["event"]["title"], "Title 4");
+            assert!(live["event"].get("delivery").is_none());
+            drop(bus);
+            forwarder.await.unwrap();
+        }
     }
 
     // ── Broadcast-lag recovery (#543) ────────────────────────────────────────
