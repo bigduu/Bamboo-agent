@@ -27,7 +27,7 @@ use crate::runtime::execution::runner_lifecycle::{
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
     publish_child_completion, publish_child_completion_parts, watch_child_liveness,
-    watchdog_policy_for_session, ChildLaunchGuard, SpawnContext, SpawnJob,
+    watchdog_policy_for_session, ChildLaunchGuard, ChildStartup, SpawnContext, SpawnJob,
 };
 use crate::runtime::execution::SessionExecutionReservation;
 
@@ -125,7 +125,7 @@ fn reconcile_actor_host_wait(
 /// - Full real [`ExecuteRequest`] field set incl. split provider fields.
 /// - Terminal status strings `completed | cancelled | error | skipped | timeout`.
 pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
-    await_owned_child_setup(run_child_spawn_inner(ctx, job, None, None)).await
+    await_owned_child_setup(run_child_spawn_inner(ctx, job, None, None, None)).await
 }
 
 /// The scheduler holds the same child launch guard used by parent cancellation
@@ -134,8 +134,9 @@ pub(crate) async fn run_child_spawn_fenced(
     ctx: SpawnContext,
     job: SpawnJob,
     guard: ChildLaunchGuard,
+    startup: Option<ChildStartup>,
 ) -> Result<(), String> {
-    await_owned_child_setup(run_child_spawn_inner(ctx, job, None, Some(guard))).await
+    await_owned_child_setup(run_child_spawn_inner(ctx, job, None, Some(guard), startup)).await
 }
 
 /// Canonical child activation using a runner slot already reserved by the
@@ -145,7 +146,14 @@ pub(crate) async fn run_child_spawn_reserved(
     job: SpawnJob,
     reservation: SessionExecutionReservation,
 ) -> Result<(), String> {
-    await_owned_child_setup(run_child_spawn_inner(ctx, job, Some(reservation), None)).await
+    await_owned_child_setup(run_child_spawn_inner(
+        ctx,
+        job,
+        Some(reservation),
+        None,
+        None,
+    ))
+    .await
 }
 
 /// Setup owns reservations and may already have claimed the backend Actor.
@@ -205,14 +213,17 @@ fn publish_child_activation_blocked(
     child: &tokio::sync::broadcast::Sender<AgentEvent>,
     child_id: &str,
     reason: &str,
+    publish_legacy_error: bool,
 ) -> String {
     let message =
         format!("Child {child_id} activation blocked; execution outcome is unconfirmed: {reason}");
-    let event = AgentEvent::Error {
-        message: message.clone(),
-    };
-    let _ = child.send(event.clone());
-    let _ = parent.send(event);
+    if publish_legacy_error {
+        let event = AgentEvent::Error {
+            message: message.clone(),
+        };
+        let _ = child.send(event.clone());
+        let _ = parent.send(event);
+    }
     message
 }
 
@@ -247,6 +258,7 @@ async fn run_child_spawn_inner(
     job: SpawnJob,
     reserved: Option<SessionExecutionReservation>,
     launch_guard: Option<ChildLaunchGuard>,
+    startup: Option<ChildStartup>,
 ) -> Result<(), String> {
     // Ensure both session event streams exist.
     let parent_tx =
@@ -256,40 +268,55 @@ async fn run_child_spawn_inner(
         get_or_create_event_sender(&ctx.session_event_senders, &job.child_session_id).await;
 
     // Load child session.
-    let mut session = match ctx
-        .agent
-        .storage()
-        .load_session(&job.child_session_id)
-        .await
-    {
+    let storage = ctx.agent.storage();
+    let mut loaded = storage.load_session(&job.child_session_id).await;
+    if let Err(error) = &loaded {
+        if startup
+            .as_ref()
+            .is_some_and(|startup| startup.retry_io(&job, "load Child session", error))
+        {
+            loaded = storage.load_session(&job.child_session_id).await;
+        }
+    }
+    let mut session = match loaded {
         Ok(Some(s)) => s,
         Ok(None) => {
             let error = "child session not found".to_string();
-            publish_child_completion_parts(
-                &parent_event_publisher,
-                ctx.completion_handler.clone(),
-                job.parent_session_id.clone(),
-                job.child_session_id.clone(),
-                "error".to_string(),
-                Some(error.clone()),
-            )
-            .await;
+            if startup.is_none() {
+                publish_child_completion_parts(
+                    &parent_event_publisher,
+                    ctx.completion_handler.clone(),
+                    job.parent_session_id.clone(),
+                    job.child_session_id.clone(),
+                    "error".to_string(),
+                    Some(error.clone()),
+                )
+                .await;
+            }
             return Err(error);
         }
         Err(e) => {
             let error = format!("failed to load child session: {e}");
-            publish_child_completion_parts(
-                &parent_event_publisher,
-                ctx.completion_handler.clone(),
-                job.parent_session_id.clone(),
-                job.child_session_id.clone(),
-                "error".to_string(),
-                Some(error.clone()),
-            )
-            .await;
+            if startup.is_none() {
+                publish_child_completion_parts(
+                    &parent_event_publisher,
+                    ctx.completion_handler.clone(),
+                    job.parent_session_id.clone(),
+                    job.child_session_id.clone(),
+                    "error".to_string(),
+                    Some(error.clone()),
+                )
+                .await;
+            }
             return Err(error);
         }
     };
+    if startup
+        .as_ref()
+        .is_some_and(|startup| !startup.matches_child(&session))
+    {
+        return Ok(());
+    }
 
     // Backend preparation has not supplied an Actor writer yet. Refuse old
     // counted state read-only before skipped/running saves or tool preparation.
@@ -302,6 +329,7 @@ async fn run_child_spawn_inner(
             &child_tx,
             &session.id,
             &error.to_string(),
+            startup.is_none(),
         ));
     }
 
@@ -554,8 +582,13 @@ async fn run_child_spawn_inner(
             } else if let Some(router) = ctx.agent.activation_router() {
                 router.begin_finalization(&session.id, &run_id).await;
             }
-            let message =
-                publish_child_activation_blocked(&parent_tx, &child_tx, &session.id, &reason);
+            let message = publish_child_activation_blocked(
+                &parent_tx,
+                &child_tx,
+                &session.id,
+                &reason,
+                startup.is_none(),
+            );
             let failure = Err(bamboo_agent_core::AgentError::LLM(message.clone()));
             finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
             return Err(message);
@@ -593,11 +626,25 @@ async fn run_child_spawn_inner(
     }
 
     let mut host_bound = false;
+    let startup_cancel = execution_reservation.cancel_token().clone();
     let publish_running = async {
         // Backend refusal has not started this Run. Bind only after successful
         // preparation; a binding failure uses the existing exact pre-launch
         // cleanup path below instead of leaving an ownerless running marker.
-        if let Err(error) = ctx.agent.storage().begin_host_run(&session, &run_id).await {
+        let mut bound = ctx.agent.storage().begin_host_run(&session, &run_id).await;
+        if let Err(error) = &bound {
+            // This operation is idempotent for the exact Host run. Repeating
+            // it here preserves the Actor writer and cannot start a new task.
+            if local_backend
+                && !startup_cancel.is_cancelled()
+                && startup.as_ref().is_some_and(|startup| {
+                    startup.retry_io(&job, "write initial Host run checkpoint", error)
+                })
+            {
+                bound = ctx.agent.storage().begin_host_run(&session, &run_id).await;
+            }
+        }
+        if let Err(error) = bound {
             return (false, Err(error));
         }
         session.set_host_run_id(&run_id);
@@ -625,11 +672,25 @@ async fn run_child_spawn_inner(
                 &mut session,
                 &run_id,
             );
-        let saved = ctx
+        let mut saved = ctx
             .agent
             .persistence()
             .save_runtime_session(&mut session)
             .await;
+        if let Err(error) = &saved {
+            if local_backend
+                && !startup_cancel.is_cancelled()
+                && startup.as_ref().is_some_and(|startup| {
+                    startup.retry_io(&job, "save Child running checkpoint", error)
+                })
+            {
+                saved = ctx
+                    .agent
+                    .persistence()
+                    .save_runtime_session(&mut session)
+                    .await;
+            }
+        }
         (retired_pending, saved)
     };
     let (retired_pending, running_saved, setup_panicked) = if local_backend {
@@ -686,6 +747,9 @@ async fn run_child_spawn_inner(
                 finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
                 return Err(message);
             }
+            if let Some(startup) = &startup {
+                startup.record_startup_failure(&run_id);
+            }
             return Err(format!(
                 "Local Child running checkpoint failed before launch: {error}"
             ));
@@ -713,6 +777,14 @@ async fn run_child_spawn_inner(
         }
     }
     let (cancel_token, mut activation_registration) = execution_reservation.disarm_for_execution();
+    if let Some(startup) = startup {
+        if let Some(progress) =
+            ctx.external_child_runner
+                .native_task_startup(&session.id, &run_id, session.created_at)
+        {
+            startup.observe_native(progress, cancel_token.clone());
+        }
+    }
     if local_backend {
         if let Some(registration) = activation_registration.as_mut() {
             registration.quarantine_on_drop();
@@ -1619,7 +1691,7 @@ mod actor_host_wait_tests {
         let (parent, mut parent_rx) = tokio::sync::broadcast::channel(4);
         let (child, mut child_rx) = tokio::sync::broadcast::channel(4);
         let message =
-            publish_child_activation_blocked(&parent, &child, "child-id", "old stop unknown");
+            publish_child_activation_blocked(&parent, &child, "child-id", "old stop unknown", true);
         assert!(message.contains("child-id") && message.contains("old stop unknown"));
         for receiver in [&mut parent_rx, &mut child_rx] {
             assert!(
