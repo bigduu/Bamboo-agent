@@ -120,6 +120,15 @@ async fn invoke_json(
     )
 }
 
+fn mark_legacy_global_project(doc: &DurableMemoryDocument) {
+    // Simulate a stored record from before Jiandu validated scope on write.
+    assert_eq!(doc.frontmatter.scope, MemoryScope::Global);
+    let stored = std::fs::read_to_string(&doc.path).unwrap();
+    let legacy = stored.replacen("\ntype: reference\n", "\ntype: project\n", 1);
+    assert_ne!(legacy, stored);
+    std::fs::write(&doc.path, legacy).unwrap();
+}
+
 #[tokio::test]
 async fn memory_write_rejects_global_project_memory_and_preserves_valid_writes() {
     let dir = tempfile::tempdir().expect("memory dir");
@@ -161,7 +170,7 @@ async fn memory_write_rejects_global_project_memory_and_preserves_valid_writes()
         .write_memory(
             MemoryScope::Global,
             None,
-            bamboo_memory::memory_store::DurableMemoryType::Project,
+            DurableMemoryType::Reference,
             "Legacy Project entry",
             "A previously stored Project entry.",
             &[],
@@ -170,6 +179,11 @@ async fn memory_write_rejects_global_project_memory_and_preserves_valid_writes()
             false,
             None,
         )
+        .await
+        .unwrap();
+    mark_legacy_global_project(&legacy);
+    memory
+        .rebuild_scope(MemoryScope::Global, None)
         .await
         .unwrap();
     let legacy_id = legacy.frontmatter.id;
@@ -220,27 +234,30 @@ async fn memory_maintenance_rejects_global_project_type_before_writing() {
         (DurableMemoryType::Reference, "Cross-project note"),
         (DurableMemoryType::Project, "Historical Project record"),
     ] {
-        // Seed a historical Global record that the current write tool rejects.
-        ids.push(
-            store
-                .write_memory(
-                    MemoryScope::Global,
-                    None,
-                    memory_type,
-                    title,
-                    "Synthetic maintenance fixture.",
-                    &[],
-                    Some(session_id),
-                    "test",
-                    false,
-                    None,
-                )
-                .await
-                .unwrap()
-                .frontmatter
-                .id,
-        );
+        let doc = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                title,
+                "Synthetic maintenance fixture.",
+                &[],
+                Some(session_id),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        if memory_type == DurableMemoryType::Project {
+            mark_legacy_global_project(&doc);
+        }
+        ids.push(doc.frontmatter.id);
     }
+    store
+        .rebuild_scope(MemoryScope::Global, None)
+        .await
+        .unwrap();
     let split = |id: &str, piece: serde_json::Value| {
         json!({
             "action": "split",
