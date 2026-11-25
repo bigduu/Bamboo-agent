@@ -198,6 +198,9 @@ pub(crate) enum InboxAuthority {
         // than the other variants and would otherwise size every enum value.
         _guard: Box<crate::v2::host_session_scope::HostScopedDeliveryGuards>,
     },
+    ProjectPeer {
+        _guard: Box<crate::v2::ProjectPeerDeliveryGuard>,
+    },
     HostCreation {
         _guard: Box<crate::v2::host_root_create::HostCreatedRootDeliveryGuards>,
     },
@@ -832,6 +835,7 @@ impl FileSessionInbox {
             InboxAuthority::ObserverRootOutcomeRead { inbox_dir, .. } => Ok(inbox_dir.clone()),
             InboxAuthority::ObserverSupervisorReceipt { inbox_dir, .. } => Ok(inbox_dir.clone()),
             InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::ProjectPeer { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::CurrentSupervisor { _guard } => Ok(_guard.inbox_dir.clone()),

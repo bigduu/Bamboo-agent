@@ -13,6 +13,81 @@ fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }
 
+pub(crate) fn validate_host_peer_envelope(
+    caller: &SessionCallerReference,
+    target_created_at: chrono::DateTime<chrono::Utc>,
+    envelope: &bamboo_domain::SessionMessageEnvelope,
+    run_fenced: bool,
+) -> io::Result<bamboo_domain::HostSessionPeerIdentity> {
+    use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+    envelope
+        .validate()
+        .map_err(|error| denied(error.to_string()))?;
+    let operation = envelope
+        .correlation_id
+        .as_deref()
+        .ok_or_else(|| denied("host_session_send_operation_missing"))?;
+    bamboo_domain::SessionMessageId::parse(operation).map_err(|error| denied(error.to_string()))?;
+    let identity = if run_fenced {
+        bamboo_domain::HostSessionPeerIdentity::for_running_peer
+    } else {
+        bamboo_domain::HostSessionPeerIdentity::for_caller
+    }(
+        caller,
+        &envelope.target_session_id,
+        target_created_at,
+        operation,
+    );
+    let text = match &envelope.body {
+        SessionMessageBody::Content(content)
+            if content.parts.is_empty() && content.skill_request.is_none() =>
+        {
+            &content.text
+        }
+        _ => return Err(denied("host_session_send_requires_bounded_text")),
+    };
+    if envelope.source
+        != (SessionMessageSource::Session {
+            session_id: caller.session_id.clone(),
+        })
+        || envelope.kind != SessionMessageKind::PeerMessage
+        || envelope.id != identity.message_id
+        || envelope.thread_id != identity.thread_id
+        || envelope.in_reply_to.is_some()
+        || envelope.attempt.is_some()
+        || text.trim().is_empty()
+        || text.contains('\0')
+        || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+    {
+        return Err(denied("host_session_send_envelope_mismatch"));
+    }
+    Ok(identity)
+}
+
+pub(super) fn validate_project_root_peer_pair(
+    source: &Session,
+    target: &Session,
+) -> io::Result<()> {
+    for session in [source, target] {
+        if !SessionCallerReference::from(session).is_ordinary_root()
+            || session.root_session_id != session.id
+            || session
+                .metadata
+                .contains_key(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+        {
+            return Err(denied("native Project peers must be ordinary Roots"));
+        }
+    }
+    let project = source
+        .project_id_meta()
+        .and_then(|id| bamboo_domain::ProjectId::parse(id).ok())
+        .ok_or_else(|| denied("Project peer requires a current Project"))?;
+    if source.id == target.id || target.project_id_meta().as_deref() != Some(project.as_str()) {
+        return Err(denied("target is outside native Project peer authority"));
+    }
+    Ok(())
+}
+
 /// Publication → lifecycle → Task → canonical depth/ID Sessions → sorted trees.
 /// The same set is retained by any owned physical Inbox job using this scope.
 pub(crate) struct HostScopedSessionGuards {
@@ -523,11 +598,8 @@ impl SessionStoreV2 {
         token: &HostSessionScopeToken,
         caller: &SessionCallerReference,
         envelope: &bamboo_domain::SessionMessageEnvelope,
+        run_fenced: bool,
     ) -> io::Result<HostScopedDeliveryGuards> {
-        use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
-        envelope
-            .validate()
-            .map_err(|error| denied(error.to_string()))?;
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
         let target = binding
@@ -535,41 +607,8 @@ impl SessionStoreV2 {
             .map_err(|error| denied(error.to_string()))?
             .observation
             .clone();
-        let operation = envelope
-            .correlation_id
-            .as_deref()
-            .ok_or_else(|| denied("host_session_send_operation_missing"))?;
-        bamboo_domain::SessionMessageId::parse(operation)
-            .map_err(|error| denied(error.to_string()))?;
-        let identity = bamboo_domain::HostSessionPeerIdentity::for_caller(
-            caller,
-            &target.identity.session_id,
-            target.identity.created_at,
-            operation,
-        );
-        let text = match &envelope.body {
-            SessionMessageBody::Content(content)
-                if content.parts.is_empty() && content.skill_request.is_none() =>
-            {
-                &content.text
-            }
-            _ => return Err(denied("host_session_send_requires_bounded_text")),
-        };
-        if envelope.source
-            != (SessionMessageSource::Session {
-                session_id: caller.session_id.clone(),
-            })
-            || envelope.kind != SessionMessageKind::PeerMessage
-            || envelope.id != identity.message_id
-            || envelope.thread_id != identity.thread_id
-            || envelope.in_reply_to.is_some()
-            || envelope.attempt.is_some()
-            || text.trim().is_empty()
-            || text.contains('\0')
-            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
-        {
-            return Err(denied("host_session_send_envelope_mismatch"));
-        }
+        let identity =
+            validate_host_peer_envelope(caller, target.identity.created_at, envelope, run_fenced)?;
         let observations = [binding.caller.clone(), target.clone()];
         let guards = self
             .lock_host_scope_observations(&observations, Some(scope), &[])
@@ -579,6 +618,15 @@ impl SessionStoreV2 {
             .await?;
         if !caller.matches_session(&current) {
             return Err(denied("host_session_operation_caller_changed"));
+        }
+        if run_fenced && current.root_session_id != target.identity.root_session_id {
+            let current_target = self
+                .peer_delivery_control_session(
+                    &target.identity.session_id,
+                    &target.identity.root_session_id,
+                )
+                .await?;
+            validate_project_root_peer_pair(&current, &current_target)?;
         }
         let rel = if target.identity.session_id == target.identity.root_session_id {
             Self::root_rel_path(&target.identity.session_id)

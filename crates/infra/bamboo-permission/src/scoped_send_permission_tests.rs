@@ -240,3 +240,45 @@ fn invalid_or_changed_projection_never_reinterprets_another_owner_or_resource() 
     }
     assert_eq!(original, send());
 }
+
+#[test]
+fn run_coordination_uses_its_own_approval_identity_and_honors_peer_send_denials() {
+    let config = PermissionConfig::new();
+    config.set_ask_rules(["session_message(*)".into()]);
+    let mut input = send();
+    input.tool_name = "session_coordination".into();
+    input.resource = "session_coordination send".into();
+    input
+        .tool_args
+        .as_object_mut()
+        .unwrap()
+        .remove("delivery_intent");
+    input.tool_args["expected_run_id"] = json!("private-run");
+    let PermissionOutcome::Ask(request) =
+        config.evaluate_framework_scoped_session_send(input.clone())
+    else {
+        panic!("existing peer ask rule must narrow coordination");
+    };
+    assert_eq!(request.tool_name, "session_coordination");
+    assert_eq!(request.resource, "session_coordination send");
+    let wire = serde_json::to_string(&request).unwrap();
+    for private in [
+        "private-target",
+        "private-operation",
+        "private-message",
+        "private-run",
+    ] {
+        assert!(!wire.contains(private));
+    }
+    input.auto_approve_requested = true;
+    for resource in ["session_message send", "session_message steer"] {
+        let config = PermissionConfig::new();
+        config.deny_scoped_session_permission("sender", PermissionType::ExecuteCommand, resource);
+        assert!(
+            matches!(config.evaluate_framework_scoped_session_send(input.clone()), PermissionOutcome::Deny {
+        reason, ..
+    } if reason.code == PermissionReasonCode::ExplicitDeny),
+            "{resource}"
+        );
+    }
+}

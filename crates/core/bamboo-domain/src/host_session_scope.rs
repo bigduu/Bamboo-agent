@@ -50,6 +50,19 @@ pub struct HostSessionPeerIdentity {
 }
 
 impl HostSessionPeerIdentity {
+    /// Run-bound delivery is always attributed peer text, including when its
+    /// sender has Supervisor authority. Use the same operation address.
+    pub fn for_running_peer(
+        caller: &SessionCallerReference,
+        target_id: &str,
+        target_created_at: DateTime<Utc>,
+        operation_id: &str,
+    ) -> Self {
+        let mut identity = Self::for_caller(caller, target_id, target_created_at, operation_id);
+        identity.thread_id = Some(identity.message_id.to_string());
+        identity
+    }
+
     pub fn for_caller(
         caller: &SessionCallerReference,
         target_id: &str,

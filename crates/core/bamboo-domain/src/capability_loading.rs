@@ -80,7 +80,7 @@ pub const HOST_ONLY_TOOL_NAMES: [&str; 6] = [
 ];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
     "Glob",
     "GetFileInfo",
     "load_skill",
@@ -88,6 +88,7 @@ pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 7] = [
     "update_goal",
     "loop_control",
     "session_message",
+    crate::SESSION_COORDINATION_TOOL_NAME,
 ];
 
 /// Reserved provider-safe function name used only by Bamboo's compatibility

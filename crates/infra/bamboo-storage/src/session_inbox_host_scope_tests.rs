@@ -9,7 +9,7 @@ use bamboo_domain::{
 };
 use std::collections::BTreeMap;
 
-fn message(caller: &Session, target: &Session) -> SessionMessageEnvelope {
+pub(super) fn message(caller: &Session, target: &Session) -> SessionMessageEnvelope {
     let id = bamboo_domain::session_peer_message_id(
         &caller.id,
         caller.created_at,
@@ -41,7 +41,7 @@ fn ancestor(session: &Session) -> ActorAncestorObservation {
     }
 }
 
-async fn install(
+pub(super) async fn install(
     store: &SessionStoreV2,
     caller: &Session,
     caller_ancestors: Vec<ActorAncestorObservation>,

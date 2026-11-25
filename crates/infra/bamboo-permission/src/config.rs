@@ -1773,7 +1773,7 @@ impl PermissionConfig {
     /// grants are intentionally evaluated only after hard-dangerous and
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
-        self.evaluate_with_additional_restrictions(input, None, None, false)
+        self.evaluate_with_additional_restrictions(input, &[], &[], false)
     }
 
     /// The installed framework Root owner retains legacy create restrictions,
@@ -1783,8 +1783,8 @@ impl PermissionConfig {
         let legacy_args = serde_json::json!({"action":"create", "request": input.tool_args});
         self.evaluate_with_additional_restrictions(
             input,
-            Some(("session_control", &legacy_args)),
-            None,
+            &[("session_control", &legacy_args)],
+            &[],
             false,
         )
     }
@@ -1797,6 +1797,44 @@ impl PermissionConfig {
         &self,
         mut input: PermissionEvaluation,
     ) -> PermissionOutcome {
+        if input.tool_name == "session_coordination" {
+            if input.permission_type != PermissionType::ExecuteCommand
+                || input.resource != "session_coordination send"
+                || input
+                    .tool_args
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("send")
+            {
+                input.platform_hard_deny =
+                    Some("Session coordination send restriction unavailable".into());
+                return self.evaluate(input);
+            }
+            // Existing peer-send and active-run Deny/Ask rules narrow the tool.
+            // The actual request and any approval belong to session_coordination.
+            let mut steer = input.clone();
+            steer.tool_name = "session_message".into();
+            steer.resource = "session_message steer".into();
+            steer.tool_args["action"] = "steer".into();
+            steer.consume_once = false;
+            let mut send = steer.clone();
+            send.resource = "session_message send".into();
+            if let Some(args) = send.tool_args.as_object_mut() {
+                args.insert("action".into(), "send".into());
+                args.remove("expected_run_id");
+                args.insert("delivery_intent".into(), "queue_only".into());
+            }
+            let restrictions = [steer, send];
+            return self.evaluate_with_additional_restrictions(
+                input,
+                &[
+                    ("session_message", &restrictions[0].tool_args),
+                    ("session_message", &restrictions[1].tool_args),
+                ],
+                &restrictions,
+                false,
+            );
+        }
         let restriction =
             crate::tool_permissions::framework_scoped_session_send_restriction(&input.tool_args);
         if input.tool_name != "session_message"
@@ -1815,8 +1853,8 @@ impl PermissionConfig {
         restricting_input.consume_once = false;
         self.evaluate_with_additional_restrictions(
             input,
-            Some(("session_control", &legacy_args)),
-            Some(&restricting_input),
+            &[("session_control", &legacy_args)],
+            &[restricting_input],
             false,
         )
     }
@@ -1842,14 +1880,14 @@ impl PermissionConfig {
             input.platform_hard_deny = Some("current-session loop permission unavailable".into());
         }
         input.consume_once = false;
-        self.evaluate_with_additional_restrictions(input, None, None, true)
+        self.evaluate_with_additional_restrictions(input, &[], &[], true)
     }
 
     fn evaluate_with_additional_restrictions(
         &self,
         input: PermissionEvaluation,
-        additional_rule_context: Option<(&str, &serde_json::Value)>,
-        restricting_input: Option<&PermissionEvaluation>,
+        additional_rule_contexts: &[(&str, &serde_json::Value)],
+        restricting_inputs: &[PermissionEvaluation],
         current_session_loop: bool,
     ) -> PermissionOutcome {
         let configured_mode = self.mode();
@@ -1908,7 +1946,7 @@ impl PermissionConfig {
             );
         }
 
-        if restricting_input.is_some_and(|restriction| {
+        if restricting_inputs.iter().any(|restriction| {
             self.matching_durable_rule(restriction, PermissionRuleEffect::Deny)
                 .is_some()
                 || self.is_scoped_session_denied(
@@ -1922,7 +1960,12 @@ impl PermissionConfig {
             // Do not expose the private legacy resource in a new-tool error.
             return deny(
                 PermissionReasonCode::ExplicitDeny,
-                "scoped Session send denied by legacy followup policy".into(),
+                if input.tool_name == "session_coordination" {
+                    "Session coordination send denied by existing Session messaging policy"
+                } else {
+                    "scoped Session send denied by legacy followup policy"
+                }
+                .into(),
                 None,
             );
         }
@@ -1981,14 +2024,15 @@ impl PermissionConfig {
             .matching_durable_rule(&input, PermissionRuleEffect::AlwaysAsk)
             .map(|rule| PermissionRuleRef::from(&rule));
         let configured_always_ask = typed_always_ask.is_some()
-            || restricting_input.is_some_and(|restriction| {
+            || restricting_inputs.iter().any(|restriction| {
                 self.matching_durable_rule(restriction, PermissionRuleEffect::AlwaysAsk)
                     .is_some()
             })
             || self.ask_rules.read().recover_poison().iter().any(|rule| {
                 rule.matches_tool_call(&input.tool_name, &input.tool_args)
-                    || additional_rule_context
-                        .is_some_and(|(name, args)| rule.matches_tool_call(name, args))
+                    || additional_rule_contexts
+                        .iter()
+                        .any(|(name, args)| rule.matches_tool_call(name, args))
             });
         if hard_dangerous || configured_always_ask {
             let reason_code = if hard_dangerous {

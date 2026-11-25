@@ -640,6 +640,7 @@ pub mod session_events;
 mod session_loader;
 mod supervisor_observers;
 pub use observer_subscriptions::ObserverSubscriptionStart;
+mod running_session_directory;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;

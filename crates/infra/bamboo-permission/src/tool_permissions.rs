@@ -1445,6 +1445,17 @@ pub fn check_permissions(
                 description,
             )]))
         }
+        "session_coordination" => match required_string_arg(args, "action")? {
+            "list_running" => Ok(None),
+            "send" => Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                "session_coordination send",
+                "Send a peer message to an exact running Session",
+            )])),
+            _ => Err(PermissionError::CheckFailed(
+                "unsupported session_coordination action".into(),
+            )),
+        },
         // Read-only: session_inspector (list / get_meta / read_messages), the
         // legacy session_history viewer, and exact self-only current history
         // never mutate or spin up compute. #395.

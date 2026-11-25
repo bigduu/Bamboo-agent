@@ -55,7 +55,44 @@ pub fn assemble_framework_session_tools_with_message(
     root_creator: Option<Arc<dyn SessionRootCreatePort>>,
     message: Option<Arc<crate::SessionMessageTool>>,
 ) -> Arc<dyn ToolExecutor> {
+    assemble_framework_session_tools_with_messaging(
+        base,
+        permission_executor,
+        session_store,
+        storage,
+        config,
+        root_creator,
+        FrameworkMessagingTools {
+            message,
+            coordination: None,
+        },
+    )
+}
+
+pub struct FrameworkMessagingTools {
+    pub message: Option<Arc<crate::SessionMessageTool>>,
+    pub coordination: Option<Arc<crate::session_coordination::SessionCoordinationTool>>,
+}
+
+/// Install concrete messaging tools with the same restrictions and permission
+/// chain used by the application and ordinary native Child executors.
+pub fn assemble_framework_session_tools_with_messaging(
+    base: Arc<dyn ToolExecutor>,
+    permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
+    session_store: Arc<SessionStoreV2>,
+    storage: Arc<dyn Storage>,
+    config: Arc<RwLock<bamboo_llm::Config>>,
+    root_creator: Option<Arc<dyn SessionRootCreatePort>>,
+    FrameworkMessagingTools {
+        message,
+        coordination,
+    }: FrameworkMessagingTools,
+) -> Arc<dyn ToolExecutor> {
     let base: Arc<dyn ToolExecutor> = match &message {
+        Some(tool) => Arc::new(OverlayToolExecutor::new(base, tool.clone())),
+        None => base,
+    };
+    let base: Arc<dyn ToolExecutor> = match &coordination {
         Some(tool) => Arc::new(OverlayToolExecutor::new(base, tool.clone())),
         None => base,
     };
@@ -92,6 +129,9 @@ pub fn assemble_framework_session_tools_with_message(
     ];
     if let Some(message) = message {
         instances.push((Kind::Message, message));
+    }
+    if let Some(coordination) = coordination {
+        instances.push((Kind::Coordination, coordination));
     }
     let proofs = instances
         .into_iter()

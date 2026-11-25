@@ -18,13 +18,15 @@ pub enum FrameworkSessionToolKind {
     CurrentHistory,
     SpawnRoot,
     Message,
+    Coordination,
 }
 impl FrameworkSessionToolKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::History,
         Self::CurrentHistory,
         Self::SpawnRoot,
         Self::Message,
+        Self::Coordination,
     ];
     pub const fn execution_name(self) -> &'static str {
         match self {
@@ -32,6 +34,7 @@ impl FrameworkSessionToolKind {
             Self::CurrentHistory => "session_history_current",
             Self::SpawnRoot => "spawn_session",
             Self::Message => "session_message",
+            Self::Coordination => bamboo_domain::SESSION_COORDINATION_TOOL_NAME,
         }
     }
     pub fn from_execution_name(name: &str) -> Option<Self> {

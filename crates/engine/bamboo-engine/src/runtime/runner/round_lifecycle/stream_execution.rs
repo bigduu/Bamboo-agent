@@ -17,8 +17,9 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_instruction_overlay_context_block, build_memory_usage_context_block,
     build_plan_mode_context_block, build_plan_runtime_context_block,
     build_project_resources_context_block, build_root_orchestration_context_block,
-    build_session_identity_context_block, build_supervisor_route_observation,
-    build_task_list_context_block, build_workspace_context_block,
+    build_session_coordination_context_block, build_session_identity_context_block,
+    build_supervisor_route_observation, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -860,7 +861,8 @@ pub(super) async fn project_request_usage(
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
-    let effective_tool_schemas = select_request_tool_schemas(&shadow, tool_schemas, &selection)?;
+    let effective_tool_schemas =
+        select_request_tool_schemas(&shadow, tool_schemas, &selection, loading_mode)?;
     let wire_schemas = request_tool_schemas_for_loading_mode(
         &shadow,
         effective_tool_schemas.as_ref(),
@@ -1294,15 +1296,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let has_ledger_context = ledger_context.is_some();
     let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
     if !standalone_discovery {
+        let permission_mode = config.permission_mode.unwrap_or_default();
         current_context.extend(build_memory_usage_context_block(
             session,
             tool_schemas,
             wire_tool_schemas,
             loading_mode,
-            config.permission_mode.unwrap_or_default(),
+            permission_mode,
+        ));
+        current_context.extend(build_session_coordination_context_block(
+            session,
+            tool_schemas,
+            wire_tool_schemas,
+            loading_mode,
+            permission_mode,
         ));
     }
-    // The agenda and recall instructions are current context, outside the
+    // The agenda and tool guidance are current context, outside the
     // generated ledger. Present them before the user who owns this turn.
     let external_memory_message_id = if current_context.is_empty() {
         None
@@ -1333,7 +1343,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                 .into_iter()
                 .map(|block| block.render_runtime_context_message()),
         );
-        // Anthropic moves this ID to the live tail. The recall instructions
+        // Anthropic moves this ID to the live tail. The tool guidance
         // stay with the context that precedes the current user request.
         has_ledger_context.then(|| model_transcript[index].id.clone())
     };
@@ -1821,7 +1831,7 @@ pub(super) async fn execute_llm_stream(
             (required_tool, loading_mode, selection)
         };
         let effective_schemas =
-            select_request_tool_schemas(session, base_tool_schemas, &selection)?;
+            select_request_tool_schemas(session, base_tool_schemas, &selection, loading_mode)?;
         let tool_schemas = effective_schemas.as_ref();
         let wire_schemas = request_tool_schemas_for_loading_mode(
             session,

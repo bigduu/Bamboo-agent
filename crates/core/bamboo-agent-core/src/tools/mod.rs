@@ -218,6 +218,7 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             // This mixed-action tool checks Plan posture itself: target
             // discovery is read-only, while send/reply remain forbidden.
             "session_message",
+            "session_coordination",
             // Memory enforces Session-note-only operations in Plan posture.
             "memory",
         ]
