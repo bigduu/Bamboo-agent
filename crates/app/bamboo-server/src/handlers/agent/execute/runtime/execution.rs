@@ -146,7 +146,15 @@ impl SpawnAgentExecution {
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, None, Default::default(), false, false);
+        spawn_agent_execution_with_inputs(
+            self,
+            inputs,
+            None,
+            Default::default(),
+            false,
+            false,
+            true,
+        );
     }
 
     pub(crate) fn spawn_with_native_inputs(
@@ -161,6 +169,7 @@ impl SpawnAgentExecution {
             Default::default(),
             false,
             false,
+            true,
         );
     }
 
@@ -170,6 +179,7 @@ impl SpawnAgentExecution {
         native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
         live_bootstrap_resume: bool,
+        reconsider_title_after_reply: bool,
     ) {
         spawn_agent_execution_with_inputs(
             self,
@@ -178,6 +188,7 @@ impl SpawnAgentExecution {
             upstream_retry,
             live_bootstrap_resume,
             true,
+            reconsider_title_after_reply,
         );
     }
 }
@@ -189,6 +200,7 @@ fn spawn_agent_execution_with_inputs(
     upstream_retry: bamboo_llm::retry::UpstreamRetry,
     live_bootstrap_resume: bool,
     image_fallback_from_config: bool,
+    reconsider_title_after_reply: bool,
 ) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
@@ -319,7 +331,9 @@ fn spawn_agent_execution_with_inputs(
         },
         inputs,
         upstream_retry,
-        Some(args.state.into_inner()),
+        reconsider_title_after_reply.then(|| {
+            args.state.into_inner() as Arc<dyn bamboo_engine::app_context::AgentSessionContext>
+        }),
     );
 }
 
