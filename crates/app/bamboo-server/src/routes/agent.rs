@@ -526,6 +526,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::stop::handler_with_run),
         )
         .route(
+            "/sessions/{session_id}/background-command-wait/cancel",
+            web::post().to(agent::stop::cancel_background_command_wait),
+        )
+        .route(
             "/sessions/{session_id}/history",
             web::get().to(agent::history::handler),
         )

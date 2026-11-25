@@ -19,20 +19,174 @@ fn payload(outcome: ToolOutcome) -> Value {
 }
 
 async fn start(owner: &str, gate: &Path, suffix: &str) -> (ToolCtx, String) {
+    let gate = gate.to_string_lossy().replace('\'', "'\\''");
+    launch(
+        owner,
+        format!("while [ ! -f '{gate}' ]; do sleep 0.01; done; {suffix}"),
+    )
+    .await
+}
+
+async fn launch(owner: &str, command: String) -> (ToolCtx, String) {
     let mut ctx = ToolCtx::none("background-exec-test");
     ctx.session_id = Some(Arc::from(owner));
-    let gate = gate.to_string_lossy().replace('\'', "'\\''");
     let result = payload(
         ExecCommandTool::new()
-            .invoke(
-                json!({"cmd": format!("while [ ! -f '{gate}' ]; do sleep 0.01; done; {suffix}"), "yield_time_ms": 250}),
-                ctx.clone(),
-            )
+            .invoke(json!({"cmd": command, "yield_time_ms": 250}), ctx.clone())
             .await
             .unwrap(),
     );
     assert_eq!(result["status"], "running");
     (ctx, result["session_id"].as_str().unwrap().to_owned())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_exec_stop_reaps_noninteractive_command_group_and_leaves_other_handle_running() {
+    use BackgroundExecStopOutcome::{NotFound, Stopped};
+
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let pid_file = dir.path().join("descendant.pid");
+    let path = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+    let command = format!(
+        "(while [ ! -f '{}' ]; do sleep 0.01; done) & printf '%s\\n' \"$!\" > '{}'; wait",
+        path(&gate),
+        path(&pid_file),
+    );
+    let owner = "stop-background-owner";
+    let (_, handle) = launch(owner, command).await;
+    let (_, other) = start(owner, &gate, "printf neighboring-command-finished").await;
+    let descendant = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(descendant.trim().parse::<u32>().unwrap() > 1);
+    assert_eq!(exec_wait_target(owner, &handle).await, Some(true));
+    let job = reserve_background_job(owner, &handle).unwrap();
+    let other_job = reserve_background_job(owner, &other).unwrap();
+    assert!(!job.stop_confirmed().await);
+    assert_eq!(
+        stop_owned_background_exec("other-owner", &handle).await,
+        NotFound
+    );
+    assert_eq!(
+        stop_owned_background_exec(owner, "unknown-command").await,
+        NotFound
+    );
+    assert_eq!(
+        bash_runtime::get_shell(&handle).unwrap().status(),
+        "running"
+    );
+
+    let (first, retry) = tokio::join!(
+        stop_owned_background_exec(owner, &handle),
+        stop_owned_background_exec(owner, &handle),
+    );
+    assert_eq!((first, retry), (Stopped, Stopped));
+    assert_eq!(job.completion().await.status, "killed");
+    assert!(job.stop_confirmed().await);
+    let observed = std::process::Command::new("/bin/ps")
+        .args(["-o", "state=", "-p", descendant.trim()])
+        .output()
+        .unwrap();
+    let state = std::str::from_utf8(&observed.stdout).unwrap().trim();
+    assert!(
+        state.is_empty() || state.starts_with('Z'),
+        "descendant state: {state}"
+    );
+    assert_eq!(bash_runtime::get_shell(&other).unwrap().status(), "running");
+
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    let completion = timeout(Duration::from_secs(5), other_job.completion())
+        .await
+        .unwrap();
+    assert_eq!(completion.exit_code, Some(0));
+    assert!(other_job.stop_confirmed().await);
+    assert!(completion
+        .output_tail
+        .contains("neighboring-command-finished"));
+}
+
+#[tokio::test]
+async fn background_exec_stop_does_not_confirm_failed_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let owner = "unconfirmed-stop-owner";
+    let (_, handle) = start(owner, &gate, "exit 0").await;
+    let shell = bash_runtime::get_shell(&handle).unwrap();
+    let capture = shell.polled.as_ref().unwrap();
+    capture
+        .fail_cleanup_after_reap
+        .store(true, Ordering::Release);
+
+    assert_eq!(
+        stop_owned_background_exec(owner, &handle).await,
+        BackgroundExecStopOutcome::Unconfirmed,
+    );
+    assert!(capture.process_exited());
+    assert!(capture.is_complete().await);
+}
+
+#[tokio::test]
+async fn background_exec_stop_accepts_an_already_reaped_empty_command_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let owner = "naturally-finished-stop-owner";
+    let (_, handle) = start(owner, &gate, "exit 0").await;
+    let job = reserve_background_job(owner, &handle).unwrap();
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    let completion = timeout(Duration::from_secs(5), job.completion())
+        .await
+        .unwrap();
+    assert_eq!(completion.exit_code, Some(0));
+    assert!(job.stop_confirmed().await);
+    assert_eq!(
+        stop_owned_background_exec(owner, &handle).await,
+        BackgroundExecStopOutcome::Stopped,
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_exec_stop_does_not_signal_a_group_after_reaping_its_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("leader-release");
+    let descendant_gate = dir.path().join("descendant-release");
+    let descendant_finished = dir.path().join("descendant-finished");
+    let _release_leader = ReleaseGate(gate.clone());
+    let _release_descendant = ReleaseGate(descendant_gate.clone());
+    let path = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+    let command = format!(
+        "(while [ ! -f '{}' ]; do sleep 0.01; done; : > '{}') </dev/null >/dev/null 2>&1 & \
+         while [ ! -f '{}' ]; do sleep 0.01; done; exit 0",
+        path(&descendant_gate),
+        path(&descendant_finished),
+        path(&gate),
+    );
+    let owner = "reaped-leader-stop-owner";
+    let (_, handle) = launch(owner, command).await;
+    let job = reserve_background_job(owner, &handle).unwrap();
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    let completion = timeout(Duration::from_secs(5), job.completion())
+        .await
+        .unwrap();
+    assert_eq!(completion.exit_code, Some(0));
+    assert!(!job.stop_confirmed().await);
+    assert_eq!(
+        stop_owned_background_exec(owner, &handle).await,
+        BackgroundExecStopOutcome::Unconfirmed,
+    );
+    tokio::fs::write(&descendant_gate, b"release")
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !descendant_finished.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Stop must not signal a process group after its retained leader was reaped");
 }
 
 #[tokio::test]

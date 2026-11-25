@@ -179,10 +179,17 @@ impl InitialWindowsProcess {
             return Ok(());
         };
         release(job)?;
-        // Delivery closes our only job handle only after the close-kill flag
-        // was successfully cleared. On error the original job remains owned.
-        drop(self.job.take());
+        // Ordinary delivery preserves natural command behavior. Retain this
+        // exact job handle for an explicit later stop.
         Ok(())
+    }
+
+    pub(super) fn containment_is_empty(&self) -> io::Result<bool> {
+        let job = self
+            .job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("initial Windows job was already released"))?;
+        job.active_processes().map(|count| count == 0)
     }
 
     pub(super) async fn stop_and_reap(self) -> io::Result<ExitStatus> {

@@ -6,6 +6,7 @@ const COMMAND: &str = "start-managed-background-exec";
 const COMMAND_WAIT: &str = "wait-for-managed-background-exec";
 const OUTPUT: &str = "managed-background-exec-finished";
 const RELEASE_FILE: &str = "managed-exec-release";
+const PID_FILE: &str = "managed-exec-pid";
 const CRASH_STAGE: &str = "after-native-exec-final";
 const MARKER_ENV: &str = "BAMBOO_2662_MARKER";
 const TEST_NAME: &str = "app_state::supervised_root_run::tests::subscribed_background_exec_delivers_once_after_owned_host_restart";
@@ -73,15 +74,16 @@ pub(super) async fn stream(probe: &Probe, messages: &[Message]) -> Result<LLMStr
             json!({"intent":"wait","target":handle}),
         )])
     } else {
-        let gate = probe
-            .diagnostic_home
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .join(RELEASE_FILE);
-        let gate = gate.to_string_lossy().replace('\'', "'\\''");
-        let command = format!("while [ ! -f '{gate}' ]; do sleep 0.01; done; printf {OUTPUT}");
+        let home = probe.diagnostic_home.lock().unwrap();
+        let home = home.as_ref().unwrap();
+        let gate = home
+            .join(RELEASE_FILE)
+            .to_string_lossy()
+            .replace('\'', "'\\''");
+        let pid = home.join(PID_FILE).to_string_lossy().replace('\'', "'\\''");
+        let command = format!(
+            "printf '%s' \"$$\" > '{pid}'; while [ ! -f '{gate}' ]; do sleep 0.01; done; printf {OUTPUT}"
+        );
         LLMChunk::ToolCalls(vec![tool(
             COMMAND.into(),
             "exec_command",
@@ -96,9 +98,7 @@ pub(super) async fn stream(probe: &Probe, messages: &[Message]) -> Result<LLMStr
     ])))
 }
 
-async fn worker_before_delivery() {
-    let f = Fixture::new_with_native_source(true).await;
-    let gate = ReleaseGate(f.home.path().join(RELEASE_FILE));
+async fn park_background_command(f: &Fixture) -> (Value, String, String) {
     let mut source = load(&f.state, ROOT_A).await;
     source
         .agent_runtime_state
@@ -116,7 +116,7 @@ async fn worker_before_delivery() {
     assert_eq!(admitted["notify_on_material_event"], true);
 
     let deadline = std::time::Instant::now() + WAIT;
-    let (original_run, handle) = loop {
+    loop {
         let source = load(&f.state, ROOT_A).await;
         assert!(source.pending_question.is_none());
         if let Some(fact) = source
@@ -129,7 +129,8 @@ async fn worker_before_delivery() {
             let wait = source.messages.last().unwrap().metadata.as_ref().unwrap();
             assert_eq!(wait["runtime_kind"], "background_exec_wait");
             assert_eq!(wait["run_id"], fact.run_id);
-            break (
+            return (
+                admitted,
                 fact.run_id.clone(),
                 wait["exec_session_id"].as_str().unwrap().to_owned(),
             );
@@ -139,7 +140,90 @@ async fn worker_before_delivery() {
             "native background command did not park"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[actix_web::test]
+async fn exact_background_stop_reaps_the_command_and_does_not_resume_its_run() {
+    use actix_web::{http::StatusCode, test, App};
+
+    let f = Fixture::new_with_native_source(true).await;
+    let _gate = ReleaseGate(f.home.path().join(RELEASE_FILE));
+    let (_, _, handle) = park_background_command(&f).await;
+    let pid = std::fs::read_to_string(f.home.path().join(PID_FILE)).unwrap();
+    let pid = pid.trim().parse::<u32>().unwrap();
+    assert!(pid > 1);
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let stop = |session: &str, handle: &str, peer: &str| {
+        test::TestRequest::post()
+            .uri(&format!(
+                "/api/v1/sessions/{session}/background-command-wait/cancel"
+            ))
+            .peer_addr(peer.parse().unwrap())
+            .set_json(json!({"exec_session_id": handle}))
+            .to_request()
     };
+    let local = "127.0.0.1:8080";
+    let stale = uuid::Uuid::new_v4().to_string();
+    for (session, command) in [(ROOT_A, stale.as_str()), (ROOT_B, handle.as_str())] {
+        let response = test::call_service(&app, stop(session, command, local)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    let unauthorized = test::call_service(&app, stop(ROOT_A, &handle, "192.0.2.1:8080")).await;
+    assert!(matches!(
+        unauthorized.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    let process_exists = || {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(process_exists());
+    let expected = json!({"status":"cancelled", "exec_session_id": &handle});
+    for _ in 0..2 {
+        let response = test::call_service(&app, stop(ROOT_A, &handle, local)).await;
+        let status = response.status();
+        let body = test::read_body_json::<Value, _>(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, expected);
+    }
+    assert!(!process_exists(), "the receipt must follow process exit");
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{ROOT_A}"))
+            .peer_addr(local.parse().unwrap())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = test::read_body_json::<Value, _>(response).await;
+    assert_eq!(
+        session["session"]["last_run_status"], "cancelled",
+        "{session}"
+    );
+    settle_material_notices(&f).await;
+    let source = load(&f.state, ROOT_A).await;
+    assert!(source
+        .messages
+        .iter()
+        .all(|message| callback(message).is_none()));
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+}
+
+async fn worker_before_delivery() {
+    let f = Fixture::new_with_native_source(true).await;
+    let gate = ReleaseGate(f.home.path().join(RELEASE_FILE));
+    let (admitted, original_run, handle) = park_background_command(&f).await;
     assert_eq!(
         bamboo_tools::tools::bash_runtime::get_shell(&handle)
             .unwrap()

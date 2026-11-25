@@ -1,6 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder, ResponseError};
 
-use super::types::StopResponse;
+use super::{types::StopResponse, BackgroundCommandStopRequest};
 use crate::app_state::{AgentStatus, AppState};
 
 /// Stop a running agent execution.
@@ -70,6 +70,48 @@ pub async fn handler_with_run(
             actix_web::http::StatusCode::CONFLICT,
             "Requested run is not the current cancellable owner",
         )
+    }
+}
+
+/// Cancel the exact yielded shell command selected by the Host owner.
+pub async fn cancel_background_command_wait(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<BackgroundCommandStopRequest>,
+) -> HttpResponse {
+    use actix_web::http::StatusCode;
+    use bamboo_engine::BackgroundExecStopOutcome;
+
+    if let Err(error) = crate::handlers::agent::tickets::user(&state, &request).await {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
+    let session_id = path.into_inner();
+    let exec_session_id = body.into_inner().exec_session_id;
+    if !uuid::Uuid::parse_str(&exec_session_id).is_ok_and(|id| id.to_string() == exec_session_id) {
+        return crate::error::json_error(StatusCode::BAD_REQUEST, "Invalid command handle");
+    }
+    match state
+        .child_completion_coordinator
+        .stop_background_exec(&session_id, &exec_session_id)
+        .await
+    {
+        Ok(BackgroundExecStopOutcome::Stopped) => HttpResponse::Ok().json(serde_json::json!({
+            "status": "cancelled", "exec_session_id": exec_session_id
+        })),
+        Ok(BackgroundExecStopOutcome::NotCurrent) => crate::error::json_error(
+            StatusCode::CONFLICT,
+            "Requested command is not the current cancellable wait",
+        ),
+        result => {
+            if let Err(error) = result {
+                tracing::warn!(%session_id, %exec_session_id, %error, "Background command stop failed");
+            }
+            crate::error::json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Background command stop could not be confirmed",
+            )
+        }
     }
 }
 

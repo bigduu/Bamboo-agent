@@ -628,6 +628,13 @@ stdin, or stop the process with a lone Ctrl-C. Direct HTTP calls to either
 tool require the owning Bamboo `session_id` in the request. The `session_id`
 parameter of `write_stdin` is the handle returned by `exec_command`.
 
+To stop an exact monitored command in a suspended chat, the Host owner can
+send `POST /api/v1/sessions/{session_id}/background-command-wait/cancel` with
+`{"exec_session_id":"<command UUID>"}`. A confirmed stop returns `200` with
+`{"status":"cancelled","exec_session_id":"<command UUID>"}`. `409` means
+the selected command is no longer the cancellable wait. `503` means Bamboo
+could not confirm the stop. The exact wait can be retried when still visible.
+
 Callers of `Bash`, `bash`, and `execute_command` should use `exec_command`.
 Replace `BashInput`, `BashOutput`, and `KillShell` calls with `write_stdin`.
 

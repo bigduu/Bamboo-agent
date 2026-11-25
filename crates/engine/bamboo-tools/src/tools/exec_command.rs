@@ -17,6 +17,7 @@ const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_TOKENS: usize = 8192;
 const DEFAULT_OUTPUT_TOKENS: usize = 2000;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const BACKGROUND_EXEC_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIET_POLL_DIAGNOSIS_AFTER: Duration = Duration::from_secs(90);
 const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
 const QUIET_POLL_ADVISORY_POLLS: usize = 3;
@@ -27,6 +28,7 @@ struct CapturedOutput {
     bytes: Vec<u8>,
     omitted_bytes: usize,
     completion: Option<(&'static str, Option<i32>)>,
+    cleanup_confirmed: bool,
     error: Option<String>,
     started_at: Instant,
     last_output_at: Instant,
@@ -45,6 +47,7 @@ impl Default for CapturedOutput {
             bytes: Vec::new(),
             omitted_bytes: 0,
             completion: None,
+            cleanup_confirmed: false,
             error: None,
             started_at: now,
             last_output_at: now,
@@ -183,6 +186,7 @@ impl PolledShellState {
 
     pub(crate) async fn finish(&self, status: &'static str, exit_code: Option<i32>) {
         let mut output = self.output.lock().await;
+        output.cleanup_confirmed = status != "error";
         let status = if output.error.is_some() {
             "error"
         } else {
@@ -338,6 +342,38 @@ pub(super) fn owned_exec(owner: &str, handle: &str) -> Option<Arc<bash_runtime::
         .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundExecStopOutcome {
+    Stopped,
+    NotFound,
+    Unconfirmed,
+}
+
+/// Stop the exact command in the owner's registry and wait for its retained
+/// process owner to certify cleanup. This leaves the captured output unread.
+pub async fn stop_owned_background_exec(owner: &str, handle: &str) -> BackgroundExecStopOutcome {
+    use BackgroundExecStopOutcome::{NotFound, Stopped, Unconfirmed};
+
+    let Some(shell) = owned_exec(owner, handle) else {
+        return NotFound;
+    };
+    if !shell.request_owned_exec_stop() {
+        return Unconfirmed;
+    }
+    let state = shell.polled.as_ref().expect("validated exec capture");
+    let deadline = Instant::now() + BACKGROUND_EXEC_STOP_TIMEOUT;
+    let verified = timeout_at(deadline, async {
+        state.wait_until(deadline).await;
+        state.output.lock().await.cleanup_confirmed
+    })
+    .await;
+    if matches!(verified, Ok(true)) {
+        Stopped
+    } else {
+        Unconfirmed
+    }
+}
+
 /// None leaves non-exec targets to the caller's ordinary dispatch.
 pub async fn exec_wait_target(owner: &str, handle: &str) -> Option<bool> {
     let shell = owned_exec(owner, handle)?;
@@ -351,6 +387,18 @@ impl BackgroundExecJob {
 
     pub fn session_id(&self) -> &str {
         self.shell.session_id.as_deref().expect("validated owner")
+    }
+
+    /// Check terminal containment cleanup without signaling or reading output.
+    pub async fn stop_confirmed(&self) -> bool {
+        let state = self.shell.polled.as_ref().expect("validated exec capture");
+        let cleanup_confirmed = state.output.lock().await.cleanup_confirmed;
+        cleanup_confirmed
+            && self
+                .shell
+                .initial_handoff
+                .as_ref()
+                .is_none_or(|owner| owner.delivered_stop_confirmed())
     }
 
     /// Wait for the same fully drained terminal capture used by write_stdin.

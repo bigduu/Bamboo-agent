@@ -785,11 +785,30 @@ pub(crate) fn adopt_durable_tagged_child_wait(
     Some(registered_at)
 }
 
+/// Per-command stop receipts are owned by the background Stop transaction.
+pub const BACKGROUND_EXEC_STOP_RECEIPT_PREFIX: &str = "runtime.background_exec_stop.";
+
 /// The handoff notice and wait are committed together. Once that notice exists
 /// in durable history, the monitor owns later clears of that exact wait. A
 /// stale runner checkpoint cannot re-arm it or replace a newer shell wait.
 pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: &Session) {
     const EXEC_ID: &str = "runtime.background_exec_id";
+    if session.id != latest.id
+        || session.created_at != latest.created_at
+        || session.check_conversation_generation(latest).is_err()
+    {
+        return;
+    }
+    // Only the stop transaction creates receipts. Persist them through runtime
+    // checkpoints assembled before the user asked to stop the command.
+    session.metadata.extend(
+        latest
+            .metadata
+            .iter()
+            .filter(|(key, _)| key.starts_with(BACKGROUND_EXEC_STOP_RECEIPT_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    let same_host_run = session.host_run_id() == latest.host_run_id();
     let (Some(runtime), Some(durable)) = (
         session.agent_runtime_state.as_mut(),
         latest.agent_runtime_state.as_ref(),
@@ -803,9 +822,7 @@ pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: 
     else {
         return;
     };
-    if session.id != latest.id
-        || session.created_at != latest.created_at
-        || runtime.waiting_for_bash == durable.waiting_for_bash
+    if runtime.waiting_for_bash == durable.waiting_for_bash
         || !latest.messages.iter().rev().any(|message| {
             message.role == bamboo_domain::Role::Assistant
                 && message.metadata.as_ref().is_some_and(|metadata| {
@@ -817,6 +834,11 @@ pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: 
     {
         return;
     }
+    let stopped = same_host_run
+        && durable.status == bamboo_domain::AgentStatusState::Cancelled
+        && latest
+            .metadata
+            .contains_key(&format!("{BACKGROUND_EXEC_STOP_RECEIPT_PREFIX}{handle}"));
 
     runtime
         .waiting_for_bash
@@ -855,6 +877,10 @@ pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: 
         if let Ok(serialized) = serde_json::to_string(runtime) {
             *mirror = serialized;
         }
+    }
+    if stopped {
+        session.set_last_run_status("cancelled");
+        session.clear_last_run_error();
     }
 }
 

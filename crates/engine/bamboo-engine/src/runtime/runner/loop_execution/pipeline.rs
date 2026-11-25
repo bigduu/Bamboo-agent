@@ -1723,7 +1723,7 @@ async fn maybe_suspend_for_background_exec(
     persistence.save_runtime_session(&mut candidate).await?;
     *session = candidate;
     *runtime = waiting_runtime;
-    hook.arrange_exec_self_resume(job, session.created_at);
+    hook.arrange_bound_exec_self_resume(job, session);
     let _ = event_tx
         .send(AgentEvent::message_appended(&session.id, &notice))
         .await;
