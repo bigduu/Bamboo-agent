@@ -2178,6 +2178,33 @@ test('3053 requires its published prefix and permits a retry only from the retai
   assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
 })
 
+test('3078 binds the original failure and all five successful native transports', () => {
+  const recovery = require('./crate-release-2026-11-47-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const now = Date.parse('2026-11-25T13:00:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-28T12:04:41Z')
+  assert.equal(recovery.originalEvidence(read, now).id, 45610087197)
+  assert.deepEqual(TAIL, ['bamboo-server', 'bamboo-client-core', 'bamboo-tui', 'bamboo-agent'])
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts.at(-1).expired = true
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION' })
+})
+
+test('3078 reconciles the retained SDK and requires the original published prefix', () => {
+  const { TARGET, TAIL, verifyRegistryMetadata } = require('./crate-release-2026-11-47-recovery.cjs')
+  const checksum = 'a'.repeat(64)
+  const prefix = [...Array.from({ length: 25 }, (_, index) => 'published-' + index), 'bamboo-server-tools']
+  const receipt = { crates: [...prefix, 'bamboo-sdk', ...TAIL], packageChecksums: { 'bamboo-sdk': checksum } }
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-server-tools', TARGET.version, null), /published prefix disappeared/)
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, null), null)
+  const uploaded = { yanked: false, checksum }
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, uploaded), uploaded)
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, {
+    ...uploaded, checksum: 'b'.repeat(64),
+  }), /Registry checksum changed/)
+  assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
+})
+
 const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')
 test('2762 binds the failed attempt and all five original native transports', () => {
   const { TARGET, ATTEMPTS, ARTIFACTS } = recovery2762
