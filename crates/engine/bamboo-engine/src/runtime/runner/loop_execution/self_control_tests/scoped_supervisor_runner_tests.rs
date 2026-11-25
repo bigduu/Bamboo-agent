@@ -13,6 +13,9 @@ use bamboo_domain::{
     SessionInboxPort, SessionRunConflict, SessionRunDeliveryGuard, SupervisorReference,
 };
 use chrono::{DateTime, Utc};
+use std::ops::AsyncFnOnce;
+use std::time::Duration;
+use tokio::time::Instant;
 
 const TARGET_ID: &str = "public-scoped-loop-target";
 const TARGET_MODEL: &str = "synthetic-scoped-target";
@@ -507,32 +510,109 @@ fn actual_receipt(
     record
 }
 
+const NATIVE_ROOT_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct NativeRootFixtureProgress {
+    started: Instant,
+    phases: Vec<(Duration, &'static str)>,
+    run_id: Option<String>,
+    bound_owner: Option<bamboo_domain::ActorActivationFence>,
+    observed_lease_expires_at: Option<DateTime<Utc>>,
+}
+
+impl NativeRootFixtureProgress {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            phases: vec![(Duration::ZERO, "fixture setup")],
+            run_id: None,
+            bound_owner: None,
+            observed_lease_expires_at: None,
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        self.phases.push((self.started.elapsed(), phase));
+    }
+
+    fn describe(&self) -> String {
+        let elapsed = self.started.elapsed();
+        let (phase_start, phase) = self.phases.last().unwrap();
+        format!(
+            "elapsed={elapsed:?}, last_phase={phase:?}, phase_elapsed={:?}, phase_trace={:?}, run_id={:?}, bound_owner={:?}, observed_lease_expires_at={:?}, reported_at_utc={}",
+            elapsed.saturating_sub(*phase_start),
+            self.phases,
+            self.run_id,
+            self.bound_owner,
+            self.observed_lease_expires_at,
+            Utc::now(),
+        )
+    }
+}
+
+async fn run_native_root_with_deadline(
+    scenario: impl AsyncFnOnce(&mut NativeRootFixtureProgress),
+) -> Result<(), String> {
+    // The whole fixture starts before the repository issues any Root lease.
+    // Retain progress outside the timed future so cancellation preserves evidence.
+    let mut progress = NativeRootFixtureProgress::new();
+    let result = tokio::time::timeout(NATIVE_ROOT_FIXTURE_TIMEOUT, scenario(&mut progress)).await;
+    let evidence = progress.describe();
+    result
+        .map(|()| eprintln!("native Root fixture completed: {evidence}"))
+        .map_err(|_| {
+            format!("native Root fixture exceeded {NATIVE_ROOT_FIXTURE_TIMEOUT:?}: {evidence}")
+        })
+}
+
 #[tokio::test]
 async fn scoped_supervisor_public_direct_orders_start_update_stop_in_one_existing_owner() {
-    assert_scoped_public_start_update_stop(false).await;
+    assert_scoped_public_start_update_stop(false, &mut NativeRootFixtureProgress::new()).await;
 }
 
 #[tokio::test]
 async fn scoped_supervisor_native_root_direct_consumes_real_goals_with_owned_control_claims() {
-    // The real repository-issued lease lasts 15 seconds. Keep the whole
-    // fixture-local scenario below that bound; no renewal scheduler is added.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        assert_scoped_public_start_update_stop(true),
-    )
+    run_native_root_with_deadline(async |progress| {
+        assert_scoped_public_start_update_stop(true, progress).await;
+    })
     .await
-    .expect("native Root control and exact owner finish stay within the real lease");
+    .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
 }
 
-async fn assert_scoped_public_start_update_stop(native_root: bool) {
+#[tokio::test(start_paused = true)]
+async fn scoped_supervisor_native_root_fixture_deadline_reports_setup_before_binding() {
+    let diagnostic = run_native_root_with_deadline(async |_| std::future::pending::<()>().await)
+        .await
+        .expect_err("fixture setup is deliberately pending across the scenario deadline");
+
+    for evidence in [
+        "native Root fixture exceeded 10s",
+        "last_phase=\"fixture setup\"",
+        "run_id=None",
+        "bound_owner=None",
+        "observed_lease_expires_at=None",
+    ] {
+        assert!(diagnostic.contains(evidence), "{diagnostic}");
+    }
+    eprintln!("{diagnostic}");
+}
+
+async fn assert_scoped_public_start_update_stop(
+    native_root: bool,
+    progress: &mut NativeRootFixtureProgress,
+) {
     let mut f = ScopedPublicFixture::new_with_root_actor_directory(native_root).await;
     assert_ne!(f.supervisor.session_id, f.session.id);
     let birth = f.session.created_at;
     let (tx, mut rx) = mpsc::channel(1024);
     let request = f.request(tx);
     let (lease, mut root_binding) = if native_root {
+        progress.mark("register native Root execution");
         let lease = f.agent.begin_direct_execution(TARGET_ID).await.unwrap();
+        progress.mark("read registered run identity");
         let owner_run_id = f.router.current_run_id(TARGET_ID).await.unwrap();
+        progress.run_id = Some(owner_run_id.clone());
+        progress.mark("bind native Root activation");
         let binding = f
             .repository
             .bind_root_actor_execution(&f.session, &owner_run_id)
@@ -542,12 +622,14 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
         assert_eq!(binding.owner.fence.actor_id, TARGET_ID);
         assert_eq!(binding.owner.fence.run_id, owner_run_id);
         assert_eq!(binding.owner.created_at, birth);
+        progress.bound_owner = Some(binding.owner.fence.clone());
         let writer = binding
             .persistence
             .root_actor_writer()
             .expect("bound persistence retains the repository-issued writer");
         assert_eq!(writer.fence, binding.owner.fence);
         assert_eq!(writer.created_at, binding.owner.created_at);
+        progress.mark("inspect bound Root activation");
         let current = binding
             .directory
             .inspect_actor(TARGET_ID)
@@ -560,6 +642,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             current.status,
             bamboo_domain::ActorActivationStatus::Running
         );
+        progress.observed_lease_expires_at = Some(current.lease_expires_at);
         (Some(lease), Some(binding))
     } else {
         (None, None)
@@ -599,7 +682,18 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
         };
         tokio::pin!(run);
         let mut events = Vec::new();
+        let provider_phases = [
+            "wait for first provider call",
+            "wait for second provider call",
+            "wait for third provider call",
+        ];
+        let control_phases = [
+            "submit Supervisor Start",
+            "verify Start and submit Supervisor Update",
+            "verify Update and submit Supervisor Stop",
+        ];
         for stage in 0..3 {
+            progress.mark(provider_phases[stage]);
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
                     tokio::select! {
@@ -609,6 +703,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
                     }
                 }
             }).await.expect("bounded provider stage");
+            progress.mark(control_phases[stage]);
             let command = match stage {
                 0 => start.clone(),
                 1 => {
@@ -692,6 +787,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             assert_eq!(queued["objective_applied_actual"], false);
             provider.stages[stage].release.notify_one();
         }
+        progress.mark("wait for direct execution to finish");
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 tokio::select! {
@@ -707,6 +803,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
         }
         (result, events)
     };
+    progress.mark("verify durable Goal receipts");
     result.unwrap();
     assert_eq!(f.provider.calls.load(Ordering::SeqCst), 3);
     assert_eq!(f.provider.peak.load(Ordering::SeqCst), 1);
@@ -867,6 +964,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
     if let Some(binding) = root_binding.as_mut() {
         // The direct adapter released its real router owner, while the
         // independently issued physical Root lease stays ours until finish.
+        progress.mark("verify exact Root owner before finish");
         let current = binding
             .directory
             .inspect_actor(TARGET_ID)
@@ -879,6 +977,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             current.status,
             bamboo_domain::ActorActivationStatus::Running
         );
+        progress.observed_lease_expires_at = Some(current.lease_expires_at);
         assert_eq!(
             serde_json::to_value(
                 binding
@@ -892,6 +991,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             .unwrap(),
             serde_json::to_value(&durable.messages).unwrap()
         );
+        progress.mark("finish exact Root activation");
         binding
             .directory
             .finish_activation(
@@ -901,6 +1001,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             )
             .await
             .unwrap();
+        progress.mark("verify Root writer is closed");
         binding.disarm_abandonment();
         assert!(binding
             .persistence
@@ -908,6 +1009,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
             .await
             .is_err());
     }
+    progress.mark("verify terminal Supervisor control");
     assert!(f
         .messenger
         .supervisor_loop_control(
@@ -920,6 +1022,7 @@ async fn assert_scoped_public_start_update_stop(native_root: bool) {
         .await
         .is_err());
     f.assert_no_successor();
+    progress.mark("verified terminal control and ownership");
 }
 
 #[tokio::test]
