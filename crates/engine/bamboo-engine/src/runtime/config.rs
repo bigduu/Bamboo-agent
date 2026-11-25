@@ -302,6 +302,14 @@ pub trait BashResumeHook: Send + Sync {
         _session_created_at: chrono::DateTime<chrono::Utc>,
     ) {
     }
+
+    fn arrange_bound_exec_self_resume(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session: &bamboo_agent_core::Session,
+    ) {
+        self.arrange_exec_self_resume(job, session.created_at);
+    }
 }
 
 /// A child sub-agent's request to have a gated tool approved by its parent.

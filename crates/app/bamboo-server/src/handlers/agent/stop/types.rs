@@ -1,4 +1,9 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+pub struct BackgroundCommandStopRequest {
+    pub(super) exec_session_id: String,
+}
 
 /// Response for stop request.
 #[derive(Serialize)]

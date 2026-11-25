@@ -246,6 +246,11 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 }
                 let needs_runner_update = is_critical_event(&event)
                     || matches!(&event, AgentEvent::TokenBudgetUpdated { .. });
+                let tool_activity = match &event {
+                    AgentEvent::ToolStart { tool_name, .. } => Some((tool_name.clone(), "begin".into())),
+                    AgentEvent::ToolLifecycle { tool_name, phase, .. } => Some((tool_name.clone(), phase.clone())),
+                    _ => None,
+                };
                 let is_history_commit =
                     matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
                 let terminal_reason = visible_terminal_reason(&event);
@@ -258,7 +263,7 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 let publish_tx = session_tx.clone();
                 let result = match prepared {
                     Err(error) => Err(error),
-                    Ok(prepared) if needs_runner_update => {
+                    Ok(prepared) if needs_runner_update || tool_activity.is_some() => {
                         let mut runners = state.agent_runners.clone().write_owned().await;
                         if !runners.get(&session_id).is_some_and(|runner| runner.run_id == run_id) { return; }
                         let publish_session = session_id.clone();
@@ -266,8 +271,19 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                             let runner = runners.get_mut(&publish_session).expect("retained exact runner guard");
                             if is_critical_event(&event) { runner.push_critical_event(event.clone()); }
                             if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) { runner.last_budget_event = Some(event.clone()); }
-                            if let Some(account) = account { account.enqueue(); }
-                            let _ = publish_tx.send(event);
+                            let forward = || {
+                                if let Some(account) = account { account.enqueue(); }
+                                let _ = publish_tx.send(event);
+                            };
+                            if let Some((name, phase)) = tool_activity {
+                                let publication = runner.event_publication.clone();
+                                return publication.publish(|| {
+                                    runner.last_tool_name = Some(name);
+                                    runner.last_tool_phase = Some(phase);
+                                    forward();
+                                });
+                            }
+                            forward();
                             true
                         }).await
                     }
@@ -1195,6 +1211,21 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut visible = Vec::new();
+        for _ in 0..4 {
+            visible.push(
+                timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        {
+            let runners = state.agent_runners.read().await;
+            let runner = &runners[session_id];
+            assert_eq!(runner.last_tool_name.as_deref(), Some("browser"));
+            assert_eq!(runner.last_tool_phase.as_deref(), Some("error"));
+        }
         input
             .send(AgentEvent::ToolStart {
                 tool_call_id: "read-1".into(),
@@ -1223,8 +1254,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut visible = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..3 {
             visible.push(
                 timeout(Duration::from_secs(5), receiver.recv())
                     .await

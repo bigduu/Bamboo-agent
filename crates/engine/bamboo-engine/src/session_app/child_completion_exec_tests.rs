@@ -58,7 +58,7 @@ async fn background_exec_terminal_result_is_durable_wakes_once_and_remains_pulla
     let job =
         bamboo_tools::tools::exec_command::reserve_background_job(&session.id, &handle).unwrap();
     assert!(coordinator.supports_background_exec());
-    coordinator.arrange_exec_self_resume(job, session.created_at);
+    coordinator.arrange_bound_exec_self_resume(job, &session);
     tokio::fs::write(&gate, b"release").await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while inbox.inspect(&session.id).await.unwrap().pending == 0
@@ -182,6 +182,142 @@ fn background_exec_restart_or_wait_ceiling_never_claims_command_completion() {
         assert!(message.content.contains("unknown outcome"));
         assert!(!message.content.contains("have completed"));
     }
+}
+
+#[tokio::test]
+async fn background_exec_unconfirmed_stop_remains_retryable_and_blocks_its_wake() {
+    let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+    let mut session = Session::new("unconfirmed-background-stop", "model");
+    let handle = "b950aab2-3fcc-457c-9443-42d943ed1e49";
+    session.set_host_run_id("original-wait-run");
+    session.set_last_run_status("suspended");
+    let mut runtime = read_runtime_state(&session);
+    runtime.status = AgentStatusState::Suspended;
+    runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_bash".into(),
+        suspended_at: Utc::now(),
+        resumable: true,
+        hook_point: None,
+    });
+    runtime.waiting_for_bash = Some(bamboo_domain::WaitingForBashState::for_bash(
+        vec![handle.into()],
+        Utc::now(),
+    ));
+    write_runtime_state(&mut session, &runtime);
+    session
+        .metadata
+        .insert("runtime.background_exec_id".into(), handle.into());
+    session
+        .metadata
+        .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+    let mut notice = Message::assistant("Command moved to background monitoring.", None);
+    notice.metadata = Some(serde_json::json!({
+        "runtime_kind": "background_exec_wait",
+        "source": "runtime",
+        "exec_session_id": handle,
+    }));
+    session.add_message(notice);
+    store.save_session(&session).await.unwrap();
+
+    assert_eq!(
+        coordinator
+            .stop_background_exec(&session.id, "different-exec")
+            .await
+            .unwrap(),
+        BackgroundExecStopOutcome::NotCurrent
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            coordinator
+                .stop_background_exec(&session.id, handle)
+                .await
+                .unwrap(),
+            BackgroundExecStopOutcome::Unconfirmed
+        );
+    }
+    let pending = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(pending.last_run_status().as_deref(), Some("suspended"));
+    assert_eq!(
+        read_runtime_state(&pending).waiting_for_bash,
+        runtime.waiting_for_bash
+    );
+    assert!(has_background_exec_stop(&pending, handle));
+
+    // An in-flight writer assembled before Stop cannot discard the durable
+    // intent or reactivate the selected command as a follow-up.
+    coordinator
+        .persistence
+        .merge_save_runtime(&mut session)
+        .await
+        .unwrap();
+    coordinator
+        .deliver_shell_completion_for_lifetime(
+            BashCompletionInfo {
+                session_id: session.id.clone(),
+                bash_id: handle.into(),
+                command: String::new(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                output_tail: "late result".into(),
+            },
+            ShellCompletionKind::Exec,
+            Some(session.created_at),
+        )
+        .await;
+    let guard = session_resume_lock(&session.id);
+    let held = guard.lock().await;
+    coordinator
+        .perform_bash_resume(
+            &session.id,
+            exec_wait_resume_message(&[handle.into()], false),
+            &[handle.into()],
+        )
+        .await;
+    assert_eq!(inbox.inspect(&session.id).await.unwrap().pending, 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let pending = store.load_session(&session.id).await.unwrap().unwrap();
+    assert!(has_background_exec_stop(&pending, handle));
+    assert_eq!(
+        read_runtime_state(&pending).waiting_for_bash,
+        runtime.waiting_for_bash
+    );
+    drop(held);
+
+    coordinator
+        .deliver_shell_completion_with_proof(
+            BashCompletionInfo {
+                session_id: session.id.clone(),
+                bash_id: handle.into(),
+                command: String::new(),
+                status: "killed".into(),
+                exit_code: None,
+                output_tail: String::new(),
+            },
+            ShellCompletionKind::Exec,
+            Some(session.created_at),
+            Some(BackgroundExecConversation::capture(&session).unwrap()),
+            true,
+        )
+        .await;
+    let stopped = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(stopped.last_run_status().as_deref(), Some("cancelled"));
+    assert!(read_runtime_state(&stopped).waiting_for_bash.is_none());
+    coordinator
+        .persistence
+        .merge_save_runtime(&mut session)
+        .await
+        .unwrap();
+    assert_eq!(session.last_run_status().as_deref(), Some("cancelled"));
+    assert!(read_runtime_state(&session).waiting_for_bash.is_none());
+    assert_eq!(
+        coordinator
+            .stop_background_exec(&session.id, handle)
+            .await
+            .unwrap(),
+        BackgroundExecStopOutcome::Stopped
+    );
+    assert_eq!(inbox.inspect(&session.id).await.unwrap().pending, 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -71,6 +71,11 @@ const RUNTIME_RESUME_MESSAGE_KIND_KEY: &str = "runtime_kind";
 const CHILD_COMPLETION_INLINE_FIELD_BYTES: usize = 48 * 1024;
 const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
 
+#[path = "background_exec_stop.rs"]
+mod background_exec_stop;
+pub use background_exec_stop::BackgroundExecStopOutcome;
+use background_exec_stop::{has_background_exec_stop, BackgroundExecConversation};
+
 enum ResumeOrigin {
     Legacy,
     Configured,
@@ -3483,6 +3488,10 @@ impl ChildCompletionCoordinator {
                 // A newer Human turn may have installed a different wait.
                 return;
             }
+            if matches!(bash_ids.as_slice(), [handle] if has_background_exec_stop(&session, handle))
+            {
+                return;
+            }
 
             let still_running = bash_ids.iter().any(|id| {
                 bamboo_tools::tools::bash_runtime::get_shell(id).is_some_and(|shell| {
@@ -3568,6 +3577,7 @@ impl ChildCompletionCoordinator {
                 .waiting_for_bash
                 .as_ref()
                 .is_none_or(|wait| wait.bash_ids != expected_ids)
+                || matches!(expected_ids, [handle] if has_background_exec_stop(&session, handle))
             {
                 return;
             }
@@ -3665,17 +3675,43 @@ impl BashResumeHook for ChildCompletionCoordinator {
         job: bamboo_tools::tools::exec_command::BackgroundExecJob,
         session_created_at: chrono::DateTime<Utc>,
     ) {
+        self.start_exec_completion_monitor(job, session_created_at, None);
+    }
+
+    fn arrange_bound_exec_self_resume(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session: &Session,
+    ) {
+        let Ok(conversation) = BackgroundExecConversation::capture(session) else {
+            tracing::warn!(session_id = %session.id, "background exec has no valid conversation generation");
+            return;
+        };
+        self.start_exec_completion_monitor(job, session.created_at, Some(conversation));
+    }
+}
+
+impl ChildCompletionCoordinator {
+    fn start_exec_completion_monitor(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session_created_at: chrono::DateTime<Utc>,
+        expected_conversation: Option<BackgroundExecConversation>,
+    ) {
         let session_id = job.session_id().to_owned();
         let ids = vec![job.id().to_owned()];
         let coordinator = self.clone();
         tokio::spawn(async move {
             let info = job.completion().await;
+            let stop_confirmed = job.stop_confirmed().await;
             drop(job);
             coordinator
-                .deliver_shell_completion_for_lifetime(
+                .deliver_shell_completion_with_proof(
                     info,
                     ShellCompletionKind::Exec,
                     Some(session_created_at),
+                    expected_conversation,
+                    stop_confirmed,
                 )
                 .await;
         });
@@ -3920,9 +3956,21 @@ impl ChildCompletionCoordinator {
 
     async fn deliver_shell_completion_for_lifetime(
         &self,
+        info: BashCompletionInfo,
+        kind: ShellCompletionKind,
+        expected_birth: Option<chrono::DateTime<Utc>>,
+    ) {
+        self.deliver_shell_completion_with_proof(info, kind, expected_birth, None, false)
+            .await;
+    }
+
+    async fn deliver_shell_completion_with_proof(
+        &self,
         mut info: BashCompletionInfo,
         kind: ShellCompletionKind,
         expected_birth: Option<chrono::DateTime<Utc>>,
+        expected_conversation: Option<BackgroundExecConversation>,
+        stop_confirmed: bool,
     ) {
         // A background shell completes outside the originating tool call, so
         // fire its PostToolUse seam here before routing the completion into the
@@ -3959,6 +4007,20 @@ impl ChildCompletionCoordinator {
         if expected_birth.is_some_and(|birth| session.created_at != birth) {
             // A reused display id cannot redirect an old command's result into
             // a new Session lifetime.
+            return;
+        }
+        if expected_conversation.is_some_and(|expected| !expected.matches(&session)) {
+            return;
+        }
+        if kind == ShellCompletionKind::Exec && has_background_exec_stop(&session, &info.bash_id) {
+            if stop_confirmed {
+                if let Err(error) = self
+                    .finish_background_exec_stop_from_monitor(&session, &info.bash_id)
+                    .await
+                {
+                    tracing::warn!(session_id = %session.id, %error, "background exec stop confirmation could not be saved");
+                }
+            }
             return;
         }
         let runtime = read_runtime_state(&session);

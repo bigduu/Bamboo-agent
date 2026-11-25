@@ -150,6 +150,15 @@ impl ShellSession {
         Ok(())
     }
 
+    pub(super) fn request_owned_exec_stop(&self) -> bool {
+        if let Some(owner) = &self.initial_handoff {
+            return owner.request_delivered_stop();
+        }
+        // Scoped exec commands already retain containment in the completion task.
+        self.kill_notify.notify_one();
+        true
+    }
+
     pub(crate) fn cancel_initial(&self) {
         self.initial_cancelled.store(true, Ordering::Release);
         if let Some(owner) = &self.initial_handoff {

@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage};
 
+pub use super::root_execution_lifetime::RootConversationObservation;
+
 fn subagent_lifecycle_key(event: &AgentEvent) -> Option<(&str, &str)> {
     event
         .legacy_child_lifecycle_observation()
@@ -143,6 +145,11 @@ impl Default for AgentRunner {
 }
 
 impl AgentRunner {
+    /// Observe the exact attached Root conversation without granting write authority.
+    pub fn root_conversation_observation(&self) -> Option<RootConversationObservation> {
+        self.root_execution.conversation_observation(&self.run_id)
+    }
+
     /// Denial-only maintenance signal; never a claim that this run is idle.
     pub fn root_reset_admission_reserved(&self) -> bool {
         self.root_execution.reset_admission_reserved()
