@@ -613,6 +613,7 @@ sessions in the Host, with separate executors for the external actor backends.
 | Field | Purpose |
 |---|---|
 | `max_concurrent` | Cap on simultaneously running sub-agents (default: 200). |
+| `max_spawn_depth` | Maximum depth for new child sessions. Defaults to 4. A root is at depth 0, and 0 disables new children. |
 | `max_total_secs` | Total time limit for a built-in local Child run in seconds (default: 3600). |
 | `max_idle_secs` | Time without recognized activity before cancelling a built-in local Child run, in seconds (default: 900). |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
@@ -636,6 +637,11 @@ sessions in the Host, with separate executors for the external actor backends.
 | `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
+
+When the nesting cap changes, the host applies it to later child creation.
+Existing child sessions and their history stay available. The tool set of a
+worker stays fixed for that worker's lifetime. New workers receive the latest
+nesting capability. The host derives depth from the session's parent chain.
 
 Set the time limits in System Settings under Sub-agent or send a config patch
 such as `{"subagents":{"max_total_secs":10800}}`. Both fields take positive
@@ -710,10 +716,8 @@ as `sse`, MCP's newer single-endpoint transport). `reconnect` controls
 auto-reconnect backoff (`enabled`, `initial_backoff_ms`, `max_backoff_ms`,
 `max_attempts`, 0 = unlimited). `allowed_tools`/`denied_tools` filter which of
 the server's advertised tools are actually exposed (empty `allowed_tools` =
-all allowed). See the [`bamboo mcp` CLI verbs](../README.md#other-subcommands)
-for managing this without hand-editing JSON, or
-[`examples/mcp_client.rs`](../examples/mcp_client.rs) for wiring a server
-programmatically via the SDK.
+all allowed). Run `bamboo mcp --help` for the management commands.
+For SDK integration, see the [MCP client example](../examples/mcp_client.rs).
 
 ## Notifications
 
