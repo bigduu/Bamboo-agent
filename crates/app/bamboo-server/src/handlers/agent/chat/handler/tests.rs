@@ -1975,17 +1975,15 @@ mod optional_model_e2e {
             ..Default::default()
         });
 
-        let mut app_state = AppState::new_with_provider(data_dir, config, provider.clone())
+        let app_state = AppState::new_with_provider(data_dir, config, provider.clone())
             .await
             .expect("app state");
         let mut providers = HashMap::new();
         providers.insert("openai".to_string(), provider);
-        app_state.provider_registry =
-            Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
-        app_state.provider_router = Arc::new(ProviderModelRouter::new(
-            app_state.provider_registry.clone(),
-        ));
-        web::Data::new(app_state)
+        app_state
+            .provider_registry
+            .replace_with(ProviderRegistry::new(providers, "openai".to_string()));
+        app_state.into_http_data()
     }
 
     #[actix_web::test]
@@ -2233,11 +2231,23 @@ mod optional_model_e2e {
     }
 
     const TITLE_REPLY: &str = "这个链接描述了 Bamboo 会话收件箱在重连时回放旧游标的竞态。";
+    const TITLE_UNCERTAIN_REPLY: &str = "这个链接暂时缺少背景，我无法确定你想分析哪个主题。";
+    const TITLE_FOLLOWUP: &str = "我只知道这个问题在重连时出现，其他细节还在确认。";
+    const TITLE_FOLLOWUP_REPLY: &str = "我还需要知道你更关心哪一段重连行为。";
+    const TITLE_TOPIC: &str = "我确认问题是收件箱重复处理断线前的旧消息。";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TitleFixtureStage {
+        Initial,
+        UnclearFollowUp,
+        IdentifiedTopic,
+    }
 
     struct DeferredTitleProvider {
-        title_requests: tokio::sync::mpsc::UnboundedSender<bool>,
+        title_requests: tokio::sync::mpsc::UnboundedSender<TitleFixtureStage>,
         allow_reply: Semaphore,
         allow_deferred_outcome: Semaphore,
+        require_followup: bool,
     }
 
     #[async_trait]
@@ -2261,15 +2271,24 @@ mod optional_model_e2e {
             model: &str,
             options: Option<&LLMRequestOptions>,
         ) -> Result<LLMStream, LLMError> {
+            let has_text = |text: &str| {
+                messages
+                    .iter()
+                    .any(|message| message.content.contains(text))
+            };
             let output = if options.and_then(|options| options.request_purpose.as_deref())
                 == Some("title_generation")
             {
                 assert_eq!(model, "title-model");
-                let includes_reply = messages
-                    .iter()
-                    .any(|message| message.content.contains(TITLE_REPLY));
-                self.title_requests.send(includes_reply).unwrap();
-                if includes_reply {
+                let stage = if has_text(TITLE_REPLY) {
+                    TitleFixtureStage::IdentifiedTopic
+                } else if has_text(TITLE_FOLLOWUP_REPLY) {
+                    TitleFixtureStage::UnclearFollowUp
+                } else {
+                    TitleFixtureStage::Initial
+                };
+                self.title_requests.send(stage).unwrap();
+                if stage == TitleFixtureStage::IdentifiedTopic {
                     r#"{"title":"会话收件箱游标回放"}"#
                 } else {
                     self.allow_deferred_outcome
@@ -2281,7 +2300,13 @@ mod optional_model_e2e {
                 }
             } else {
                 let _allow_reply = self.allow_reply.acquire().await.unwrap();
-                TITLE_REPLY
+                if !self.require_followup || has_text(TITLE_TOPIC) {
+                    TITLE_REPLY
+                } else if has_text(TITLE_FOLLOWUP) {
+                    TITLE_FOLLOWUP_REPLY
+                } else {
+                    TITLE_UNCERTAIN_REPLY
+                }
             };
             Ok(Box::pin(futures::stream::iter(vec![
                 Ok(LLMChunk::Token(output.into())),
@@ -2298,6 +2323,7 @@ mod optional_model_e2e {
             title_requests,
             allow_reply: Semaphore::new(0),
             allow_deferred_outcome: Semaphore::new(0),
+            require_followup: false,
         });
         let state = title_test_state(provider.clone()).await;
         let mut session = Session::new(id, "chat-model");
@@ -2334,7 +2360,7 @@ mod optional_model_e2e {
         assert_eq!(execute.status(), StatusCode::ACCEPTED);
 
         tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
-            assert_eq!(requests.recv().await, Some(false));
+            assert_eq!(requests.recv().await, Some(TitleFixtureStage::Initial));
             provider.allow_reply.add_permits(1);
 
             loop {
@@ -2353,7 +2379,10 @@ mod optional_model_e2e {
             assert!(!pending.title_generated);
 
             provider.allow_deferred_outcome.add_permits(1);
-            assert_eq!(requests.recv().await, Some(true));
+            assert_eq!(
+                requests.recv().await,
+                Some(TitleFixtureStage::IdentifiedTopic)
+            );
             loop {
                 if let AgentEvent::SessionTitleUpdated {
                     title,
@@ -2371,6 +2400,119 @@ mod optional_model_e2e {
         })
         .await
         .expect("a committed visible answer prompts a fresh attempt at the pending title");
+    }
+
+    #[actix_web::test]
+    async fn pending_title_is_reconsidered_after_existing_root_inbox_turns() {
+        let (title_requests, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let state = title_test_state(Arc::new(DeferredTitleProvider {
+            title_requests,
+            allow_reply: Semaphore::new(1),
+            allow_deferred_outcome: Semaphore::new(4),
+            require_followup: true,
+        }))
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let chat = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "message": "https://example.test/issues/37",
+                    "model": "chat-model",
+                    "workspace_path": state.app_data_dir,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::CREATED);
+        let chat: Value = test::read_body_json(chat).await;
+        let id = chat["session_id"].as_str().unwrap();
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model": "chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            assert_eq!(requests.recv().await, Some(TitleFixtureStage::Initial));
+            let initial = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(initial
+                .messages
+                .iter()
+                .any(|m| m.content == TITLE_UNCERTAIN_REPLY));
+            assert_eq!(initial.title_version, 0);
+
+            for (input, expected_stage) in [
+                (TITLE_FOLLOWUP, TitleFixtureStage::UnclearFollowUp),
+                (TITLE_TOPIC, TitleFixtureStage::IdentifiedTopic),
+            ] {
+                // Existing Root Chat delivers to the Inbox and launches its own
+                // run. An explicit execute here would cover the other spawner.
+                let chat = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/api/v1/chat")
+                        .set_json(serde_json::json!({
+                            "session_id": id, "message": input, "model": "chat-model",
+                            "workspace_path": state.app_data_dir,
+                        }))
+                        .to_request(),
+                )
+                .await;
+                let status = chat.status();
+                let chat: Value = test::read_body_json(chat).await;
+                assert_eq!(status, StatusCode::CREATED, "{chat}");
+                assert!(
+                    chat["ingress_seq"].is_number(),
+                    "must use the Root Inbox: {chat}"
+                );
+                loop {
+                    let stage = requests.recv().await.unwrap();
+                    if stage == expected_stage {
+                        break;
+                    }
+                    assert_ne!(stage, TitleFixtureStage::IdentifiedTopic);
+                }
+
+                if expected_stage == TitleFixtureStage::UnclearFollowUp {
+                    let second = state.storage.load_session(id).await.unwrap().unwrap();
+                    assert!(second
+                        .messages
+                        .iter()
+                        .any(|m| m.content == TITLE_FOLLOWUP_REPLY));
+                    assert!(!second.title_generated);
+                    assert_eq!(second.title_version, 0);
+                }
+            }
+
+            loop {
+                if let AgentEvent::SessionTitleUpdated {
+                    title,
+                    title_version,
+                    source,
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(title, "会话收件箱游标回放");
+                    assert_eq!(title_version, 1);
+                    assert_eq!(source, bamboo_agent_core::TitleSource::Auto);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the Inbox run can defer and try again from a later durable reply");
     }
 
     #[actix_web::test]

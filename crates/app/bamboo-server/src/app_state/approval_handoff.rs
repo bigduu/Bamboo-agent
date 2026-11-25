@@ -17,6 +17,9 @@ impl AppState {
         let state = Arc::new(self);
         let weak = Arc::downgrade(&state);
         let _ = state.approval_runtime.set(weak.clone());
+        state
+            .child_completion_coordinator
+            .bind_root_title_context(weak.clone());
         if state.spawn_scheduler.supports_native_ticket_budget() {
             let shutdown = state.mcp_proxy_shutdown.clone();
             tokio::spawn(async move {
