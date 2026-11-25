@@ -33,7 +33,7 @@ fn schema(name: &str) -> ToolSchema {
 }
 
 fn record_discovery(session: &mut Session, definitions: &[ToolSchema]) {
-    session.add_message(Message::assistant(
+    let mut assistant = Message::assistant(
         "",
         Some(vec![ToolCall {
             id: "discovery".into(),
@@ -43,7 +43,13 @@ fn record_discovery(session: &mut Session, definitions: &[ToolSchema]) {
                 arguments: r#"{"query":"files"}"#.into(),
             },
         }]),
-    ));
+    );
+    assistant.never_compress = true;
+    assistant.metadata = Some(json!({
+        "runtime_kind":"sticky_capability_discovery",
+        "version":1,
+    }));
+    session.add_message(assistant);
     let mut result = Message::tool_result_with_status(
         "discovery",
         format!(
@@ -69,7 +75,7 @@ async fn run_round(
     session: &mut Session,
     provider: &Arc<dyn LLMProvider>,
     catalog: &[ToolSchema],
-    output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
+    output_limit_policy: Option<super::RoundRecoveryPolicy<'_>>,
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
     run_round_for_model(session, provider, catalog, output_limit_policy, MODEL, None).await
 }
@@ -78,7 +84,7 @@ async fn run_round_for_model(
     session: &mut Session,
     provider: &Arc<dyn LLMProvider>,
     catalog: &[ToolSchema],
-    output_limit_policy: Option<super::RoundOutputLimitPolicy<'_>>,
+    output_limit_policy: Option<super::RoundRecoveryPolicy<'_>>,
     model: &str,
     provider_type: Option<&str>,
 ) -> Result<super::RoundLlmExecutionOutput, super::AgentError> {
@@ -451,6 +457,382 @@ async fn roles_use_on_demand_declarations_on_every_compatibility_wire() {
     }
 }
 
+const OLD_SESSION_CONTROL_DESCRIPTION: &str = "An obsolete Session Control schema";
+const SESSION_CONTROL_QUERY: &str = r#"{"query":"session_control","limit":1}"#;
+
+struct SupervisorDiscoveryWireRun {
+    session: Session,
+    requests: Vec<Value>,
+    calls: Vec<ToolCall>,
+    outcome: crate::runtime::runner::Result<()>,
+}
+
+fn wire_tool_call(index: usize, id: &str, name: &str, arguments: &str) -> Value {
+    json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":arguments}})
+}
+
+fn scope_schema() -> ToolSchema {
+    let mut control = schema("session_control");
+    control.function.parameters = json!({
+        "type":"object", "properties":{"action":{"const":"scope"}}, "required":["action"],
+        "additionalProperties":false,
+    });
+    control
+}
+
+async fn run_supervisor_discovery_wire(
+    max_rounds: u32,
+    subsequent_replies: Vec<Value>,
+) -> SupervisorDiscoveryWireRun {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{ToolError, ToolExecutionContext, ToolExecutor, ToolResult};
+    use bamboo_compression::{
+        apply_compression_plan, build_message_summary_candidate_plan_with_fixed_tokens,
+        finalize_compression_candidate_plan, TokenBudget,
+    };
+    use bamboo_domain::{
+        AgentRuntimeState, CompressionEventKind, CompressionTriggerType, SessionPermissionMode,
+        SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID,
+    };
+    use wiremock::matchers::path;
+
+    struct RecordingExecutor {
+        catalog: Vec<ToolSchema>,
+        calls: Mutex<Vec<ToolCall>>,
+        supervisor: SupervisorReference,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for RecordingExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            self.calls.lock().unwrap().push(call.clone());
+            Ok(ToolResult::text(true, "Fixture tool completed."))
+        }
+
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            let observed = ctx
+                .to_tool_ctx()
+                .executing_supervisor_for(DEFAULT_SUPERVISOR_SESSION_ID)
+                .expect("tool must enter with the original Supervisor authority");
+            assert_eq!(observed.supervisor_reference(), self.supervisor);
+            self.execute(call).await
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.catalog.clone()
+        }
+    }
+
+    let mut old_control = scope_schema();
+    old_control.function.description = OLD_SESSION_CONTROL_DESCRIPTION.into();
+    let monitor = schema("supervisor_log_monitor");
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = bamboo_storage::SessionStoreV2::new(data_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let identity = store.get_or_create_default_supervisor(MODEL).await.unwrap();
+    let mut session = store
+        .load_session(&identity.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    session.model = MODEL.into();
+    session.set_root_orchestration_only(true).unwrap();
+    session
+        .agent_runtime_state
+        .get_or_insert_with(AgentRuntimeState::default)
+        .set_permission_mode(SessionPermissionMode::Default);
+    session.add_message(Message::user("Earlier request"));
+    let archived = session.messages.last().unwrap().id.clone();
+    record_discovery(&mut session, &[old_control, monitor.clone()]);
+    session.add_message(Message::assistant("Previous answer.", None));
+    session.add_message(Message::user("Keep this request active."));
+    let mut budget = TokenBudget::for_model(16_000);
+    budget.compression_target_percent = 40;
+    budget.working_reserve_tokens = 0;
+    let candidate = build_message_summary_candidate_plan_with_fixed_tokens(
+        &session,
+        MODEL,
+        Some(&budget),
+        0.20,
+        CompressionTriggerType::Auto,
+        0,
+    )
+    .unwrap();
+    let plan =
+        finalize_compression_candidate_plan(&session, candidate, "Earlier review.".into()).unwrap();
+    assert!(apply_compression_plan(&mut session, plan) > 0);
+    store.save_session(&session).await.unwrap();
+    drop(store);
+
+    let store = Arc::new(
+        bamboo_storage::SessionStoreV2::new(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut session = store
+        .load_session(&identity.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.supervisor_incarnation_id(),
+        Some(identity.incarnation_id)
+    );
+    assert!(session.root_orchestration_only_enabled());
+    assert_eq!(
+        session.compression_events.last().unwrap().kind,
+        CompressionEventKind::MessageSummary
+    );
+    assert!(session
+        .messages
+        .iter()
+        .any(|row| row.id == archived && row.compressed));
+    assert!(session.messages.iter().any(|row| {
+        row.tool_call_id.as_deref() == Some("discovery")
+            && !row.compressed
+            && row.content.contains(OLD_SESSION_CONTROL_DESCRIPTION)
+    }));
+
+    let mixed = json!({"tool_calls":[
+        wire_tool_call(0, "mixed-discovery", DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, SESSION_CONTROL_QUERY),
+        wire_tool_call(1, "mixed-task", "Task", r#"{"tasks":[]}"#),
+    ]});
+    let replies = std::iter::once(mixed)
+        .chain(subsequent_replies)
+        .collect::<Vec<_>>();
+    let expected_requests = replies.len() as u64;
+    let requests = AtomicUsize::new(0);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_: &wiremock::Request| {
+            let round = requests.fetch_add(1, Ordering::SeqCst);
+            let Some(delta) = replies.get(round) else {
+                return ResponseTemplate::new(400).set_body_string("unexpected fixture request");
+            };
+            let finish_reason = if delta.get("tool_calls").is_some() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            let chunk = json!({
+                "id":format!("discovery-wire-{round}"), "object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+            });
+            ResponseTemplate::new(200).set_body_raw(
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            )
+        })
+        .expect(expected_requests)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    let executor = Arc::new(RecordingExecutor {
+        catalog: vec![scope_schema(), schema("Task"), monitor],
+        calls: Mutex::new(Vec::new()),
+        supervisor: SupervisorReference::from(&identity),
+    });
+    let (events, _receiver) = tokio::sync::mpsc::channel(256);
+    let outcome = crate::runtime::runner::run_agent_loop_with_config(
+        &mut session,
+        "Read the scope and update the checklist.".into(),
+        events,
+        provider,
+        executor.clone(),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            storage: Some(store),
+            model_name: Some(MODEL.into()),
+            provider_type: Some("openai".into()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(max_rounds),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let requests = capture(&server).await;
+    let calls = std::mem::take(&mut *executor.calls.lock().unwrap());
+    SupervisorDiscoveryWireRun {
+        session,
+        requests,
+        calls,
+        outcome,
+    }
+}
+
+fn assert_discovery_correction_request(request: &Value) {
+    assert_eq!(tool_names(request), [DISCOVERY_CONTROL_FALLBACK_TOOL_NAME]);
+    assert_eq!(request["parallel_tool_calls"], false);
+    let wire = request.to_string();
+    assert!(wire.contains("This request is for tool discovery only."));
+    assert!(!wire.contains("Loaded tool definitions are in the tools for this request."));
+    assert!(!wire.contains("Current delegation route observation:"));
+}
+
+fn assert_discovery_wire_tool_result(session: &Session, id: &str, success: bool) {
+    let mut results = session
+        .messages
+        .iter()
+        .filter(|row| row.tool_call_id.as_deref() == Some(id));
+    assert_eq!(
+        results.next().and_then(|row| row.tool_success),
+        Some(success),
+        "missing result: {id}"
+    );
+    assert!(results.next().is_none(), "duplicate result: {id}");
+}
+
+#[tokio::test]
+async fn supervisor_resumes_live_session_control_and_recovers_parallel_discovery_on_wire() {
+    let SupervisorDiscoveryWireRun { session, requests, calls, outcome } = run_supervisor_discovery_wire(6, vec![
+        json!({"tool_calls":[
+            wire_tool_call(0, "lookup", DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, SESSION_CONTROL_QUERY),
+        ]}),
+        json!({"tool_calls":[
+            wire_tool_call(0, "scope", "session_control", r#"{"action":"scope"}"#),
+            wire_tool_call(1, "task", "Task", r#"{"tasks":[]}"#),
+        ]}),
+        json!({"content":"Checked the Session scope and updated the checklist."}),
+    ]).await;
+    outcome.unwrap();
+
+    assert_eq!(requests.len(), 4);
+    assert!(!tool_names(&requests[0]).contains(&"session_control"));
+    assert!(tool_names(&requests[0]).contains(&"supervisor_log_monitor"));
+    assert!(!requests[0]
+        .to_string()
+        .contains(OLD_SESSION_CONTROL_DESCRIPTION));
+    let old_discovery = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "discovery")
+        .and_then(|message| message["content"].as_str())
+        .expect("the reopened discovery result is retained on the wire");
+    assert!(old_discovery.contains("Call discover_capabilities by itself"));
+    assert!(old_discovery.contains(r#""query":"session_control""#));
+    assert_eq!(requests[0]["parallel_tool_calls"], true);
+    assert_discovery_correction_request(&requests[1]);
+    assert_eq!(
+        tool_names(&requests[2]),
+        [
+            "Task",
+            "session_control",
+            "supervisor_log_monitor",
+            DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+        ]
+    );
+    let current_control = requests[2]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "session_control")
+        .unwrap();
+    assert_eq!(
+        current_control["function"]["parameters"],
+        scope_schema().function.parameters
+    );
+    assert_eq!(requests[2]["parallel_tool_calls"], true);
+
+    for (id, success) in [
+        ("mixed-discovery", false),
+        ("mixed-task", false),
+        ("lookup", true),
+        ("scope", true),
+        ("task", true),
+    ] {
+        assert_discovery_wire_tool_result(&session, id, success);
+    }
+    assert_eq!(calls.len(), 2);
+    let scope = calls.iter().find(|call| call.id == "scope").unwrap();
+    assert_eq!(scope.function.name, "session_control");
+    assert_eq!(
+        serde_json::from_str::<Value>(&scope.function.arguments).unwrap(),
+        json!({"action":"scope"})
+    );
+    assert!(calls
+        .iter()
+        .any(|call| call.id == "task" && call.function.name == "Task"));
+}
+
+#[tokio::test]
+async fn supervisor_discovery_correction_stops_if_wire_returns_other_tools() {
+    for mixes_discovery in [false, true] {
+        let mut ignored_calls = vec![wire_tool_call(0, "ignored-task", "Task", r#"{"tasks":[]}"#)];
+        if mixes_discovery {
+            ignored_calls.push(wire_tool_call(
+                1,
+                "ignored-discovery",
+                DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                SESSION_CONTROL_QUERY,
+            ));
+        }
+        let run = run_supervisor_discovery_wire(6, vec![json!({"tool_calls":ignored_calls})]).await;
+        assert!(matches!(
+            run.outcome,
+            Err(super::AgentError::Tool(error)) if error.contains("correction round")
+        ));
+        assert_eq!(run.requests.len(), 2, "only one correction is allowed");
+        assert_discovery_correction_request(&run.requests[1]);
+        assert!(
+            run.calls.is_empty(),
+            "no tool from either batch may execute"
+        );
+        assert_discovery_wire_tool_result(&run.session, "mixed-task", false);
+        assert_discovery_wire_tool_result(&run.session, "ignored-task", false);
+        if mixes_discovery {
+            assert_discovery_wire_tool_result(&run.session, "ignored-discovery", false);
+        }
+    }
+}
+
+#[tokio::test]
+async fn supervisor_discovery_correction_does_not_replace_round_limit_summary() {
+    let summary = "Stopped at the round limit before checking Session scope.";
+    let run = run_supervisor_discovery_wire(1, vec![json!({"content":summary})]).await;
+    run.outcome.unwrap();
+    assert_eq!(run.requests.len(), 2);
+    let summary_request = &run.requests[1];
+    assert!(summary_request
+        .to_string()
+        .contains("summarize your progress"));
+    assert!(!summary_request
+        .to_string()
+        .contains("This request is for tool discovery only."));
+    assert!(tool_names(summary_request).contains(&"Task"));
+    assert_eq!(summary_request["parallel_tool_calls"], true);
+    assert_eq!(
+        run.session
+            .metadata
+            .get("runtime.completion_reason")
+            .map(String::as_str),
+        Some("max_rounds_reached")
+    );
+    assert!(run
+        .session
+        .messages
+        .iter()
+        .any(|row| row.content == summary));
+    assert!(run.calls.is_empty());
+    assert_discovery_wire_tool_result(&run.session, "mixed-task", false);
+}
+
 #[tokio::test]
 async fn child_tool_guidance_matches_current_request_and_stays_out_of_history() {
     let server = MockServer::start().await;
@@ -540,7 +922,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
             &mut session,
             provider,
             &catalog,
-            Some(super::RoundOutputLimitPolicy {
+            Some(super::RoundRecoveryPolicy {
                 retry: None,
                 remaining_run_tokens: None,
                 previous_prompt_tokens: 0,
@@ -548,6 +930,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
                     advisory: "Complete a smaller part of the request",
                     private_plan: false,
                 }),
+                standalone_discovery: false,
             }),
         )
         .await;

@@ -5808,6 +5808,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
+        false,
         None,
     );
     let before_wire = serde_json::to_string(&serde_json::json!({
@@ -5835,6 +5836,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::Progressive,
         None,
+        false,
         None,
     );
     let duplicate_wire = serde_json::to_vec(&serde_json::json!({
@@ -5849,6 +5851,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     );
     let after_messages = after.ir.flatten();
@@ -5889,6 +5892,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     );
     assert_eq!(
@@ -5910,6 +5914,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     );
     assert!(disabled
@@ -5930,6 +5935,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
         None,
+        false,
         None,
     );
     assert!(sticky
@@ -5953,6 +5959,7 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     );
     assert!(envelope
@@ -6004,6 +6011,7 @@ fn discovery_history_projection_omits_removed_tool_definitions() {
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     );
     let transcript = envelope.ir.flatten();

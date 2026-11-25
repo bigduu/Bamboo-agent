@@ -265,7 +265,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3027 keeps desktop recovery in the default Server, Storage and native
 // Root integration owners. The additive case selections are unchanged.
 // Scoped prompt recall retains the ordinary Engine, Memory, and Config cases.
-const FEATURE_SOURCE_SHA256 = "a69cede7572103287c1db54430cdd20bf0de003880779a5103b5262af904493e";
+// Supervisor discovery recovery and its wire regressions use the default Engine owner.
+const FEATURE_SOURCE_SHA256 = "a3f90587248c18c31c6a8c96141759cd36bf0a77846fef943616893ed5ce0ecb";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

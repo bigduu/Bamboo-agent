@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
-    PromptMemoryExposureFrame, RoundOutputLimitPolicy, RoundToolDispatch,
+    PromptMemoryExposureFrame, RoundRecoveryPolicy, RoundToolDispatch,
 };
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -64,7 +64,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
+    pub output_limit_recovery: Option<RoundRecoveryPolicy<'a>>,
     pub budget: &'a TokenBudget,
     pub provider_default_output: bool,
     pub observation_progress_hint: Option<&'a str>,
@@ -851,6 +851,7 @@ pub(super) async fn project_request_usage(
         model,
         loading_mode,
         native_transcript_protocol_for(llm, model),
+        false,
         None,
     );
     let tool_footprint = llm
@@ -882,6 +883,7 @@ fn build_request_envelope_reconciled(
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     )
 }
@@ -895,6 +897,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     model: &str,
     loading_mode: CapabilityLoadingMode,
     native_protocol: Option<ProviderProtocol>,
+    standalone_discovery: bool,
     request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
     let gemini_native = native_protocol == Some(ProviderProtocol::GeminiGenerateContentV1Beta);
@@ -1295,7 +1298,13 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
         model_transcript.push(block.render_runtime_context_message());
     }
-    if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
+    if standalone_discovery {
+        model_transcript.push(Message::user(
+            "This request is for tool discovery only. Call discover_capabilities once by itself. Continue the task using the returned definition in the next round.",
+        ));
+    } else if let Some(block) =
+        build_supervisor_route_observation(session, tool_schemas, loading_mode)
+    {
         model_transcript.push(block.render_runtime_context_message());
     }
     if let Some(deadline) = config.run_deadline {
@@ -1380,12 +1389,17 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         cache: cache_plan,
         continuation: None,
     };
+    let history_catalog = if standalone_discovery {
+        &[]
+    } else {
+        tool_schemas
+    };
     let wire_schemas =
-        request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode, true);
+        request_tool_schemas_for_loading_mode(session, history_catalog, loading_mode, true);
     let discovery_history =
         crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
             session,
-            tool_schemas,
+            history_catalog,
             wire_schemas.as_ref(),
             loading_mode,
         );
@@ -1657,6 +1671,16 @@ fn live_bootstrap_snapshot(session: &Session) -> Option<Session> {
     Some(session.clone())
 }
 
+fn discovery_correction_schemas(schemas: &[ToolSchema]) -> Result<&[ToolSchema], AgentError> {
+    schemas
+        .iter()
+        .find(|schema| schema.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+        .map(std::slice::from_ref)
+        .ok_or_else(|| {
+            AgentError::Tool("Tool discovery is no longer available for this request".into())
+        })
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1692,6 +1716,9 @@ pub(super) async fn execute_llm_stream(
     let task_split = frame
         .output_limit_recovery
         .and_then(|policy| policy.task_split);
+    let standalone_discovery = frame
+        .output_limit_recovery
+        .is_some_and(|policy| policy.standalone_discovery);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1724,6 +1751,17 @@ pub(super) async fn execute_llm_stream(
         let effective_schemas =
             select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
+        let wire_schemas = request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            task_split.is_none(),
+        );
+        let wire_schemas = if standalone_discovery {
+            discovery_correction_schemas(&wire_schemas)?
+        } else {
+            wire_schemas.as_ref()
+        };
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
         let previous_response_id = if continuation_enabled {
@@ -1741,6 +1779,7 @@ pub(super) async fn execute_llm_stream(
             model,
             loading_mode,
             native_transcript_protocol_for(llm, model),
+            standalone_discovery,
             observation_progress_hint
                 .into_iter()
                 .chain(convergence_hint),
@@ -1750,16 +1789,10 @@ pub(super) async fn execute_llm_stream(
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
-        let wire_schemas = request_tool_schemas_for_loading_mode(
-            session,
-            tool_schemas,
-            loading_mode,
-            task_split.is_none(),
-        );
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
-                wire_schemas.as_ref(),
+                wire_schemas,
                 model,
                 required_tool,
             )
@@ -1954,7 +1987,11 @@ pub(super) async fn execute_llm_stream(
         tool_dispatch.mode,
         task_split.is_none(),
     );
-    let tool_schemas = wire_schemas.as_ref();
+    let tool_schemas = if standalone_discovery {
+        discovery_correction_schemas(&wire_schemas)?
+    } else {
+        wire_schemas.as_ref()
+    };
     // Freeze the already-reconciled request's Session before the following
     // diagnostic-only mutations. The final IR, schemas and options below are
     // then retained by the very same pinned provider future; no retry may
@@ -2022,7 +2059,7 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         final_usage,
     );
-    if task_split.is_some() {
+    if task_split.is_some() || standalone_discovery {
         planned.request_options.parallel_tool_calls = Some(false);
     }
     if !continuation_enabled {
@@ -2569,7 +2606,11 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if !response_rejected && !incomplete_recovery && !private_plan {
+    if !response_rejected
+        && !incomplete_recovery
+        && !private_plan
+        && (!standalone_discovery || !stream_output.tool_calls.is_empty())
+    {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {
