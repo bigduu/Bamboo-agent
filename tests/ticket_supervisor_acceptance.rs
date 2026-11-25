@@ -91,7 +91,7 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
         );
     }
     assert_eq!(
-        prompt.contains("In Ultra, prefer parallel auxiliary planning and verification"),
+        prompt.contains("Launch ready auxiliary SubAgent assignments in parallel"),
         ultra
     );
     assert!(!prompt.contains("Ultra Root thinking mode"));

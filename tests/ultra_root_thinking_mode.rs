@@ -298,10 +298,13 @@ async fn run_ultra_fixture() {
     assert!(root_requests.len() >= 7);
     for request in root_requests {
         assert_eq!(request["reasoning_effort"], "max");
-        assert!(request.to_string().contains(REQUIRED));
-        assert!(request
-            .to_string()
-            .contains("Launch ready independent SubAgent assignments in parallel"));
+        let prompt = request.to_string();
+        assert!(prompt.contains(REQUIRED));
+        assert!(prompt.contains("At the start, identify useful independent slices"));
+        assert!(prompt.contains(
+            "Launch all ready SubAgent assignments that fit the available capacity and budget in parallel"
+        ));
+        assert!(prompt.contains("Advance your own independent work while children run"));
     }
     let child_requests: Vec<_> = requests
         .iter()

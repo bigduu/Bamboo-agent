@@ -170,10 +170,18 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's explorer role for investigation and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
-Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+At the start, identify useful independent slices. Discover SubAgent early if it is deferred. \
+Launch all ready SubAgent assignments that fit the available capacity and budget in parallel without waiting for a delegation request. \
+Advance your own independent work while children run and start newly ready slices as capacity opens. \
+Make authorized file edits directly when they are quicker or unblock the work.\n\
 Use exec_command for authorized shell commands. Prefer SubAgent intent=wait for non-interactive exit. Use write_stdin for input or unread output.\n\
-Use SubAgent's explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
+Use SubAgent's explorer role to resolve uncertainty. Wait only when a child result blocks further useful work. \
+Direct execution or one child can be enough for simple or sequential tasks.\n\
 Use the highest reasoning tier available on the primary model.";
+
+const SUPERVISOR_ULTRA_GUIDANCE: &str = "In Ultra, look for independent planning, review and verification at the start. \
+Discover SubAgent early if it is deferred. Launch ready auxiliary SubAgent assignments in parallel within the available capacity and budget. \
+Keep coordinating Work or independent Sessions while the children run. Wait only when a child result blocks further useful work.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
 Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized workers. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
@@ -187,16 +195,21 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
     if session.supervisor_incarnation_id().is_some() {
         let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
-        let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
+        let mut guidance = SUPERVISOR_DELEGATION_GUIDANCE.to_owned();
+        if session.root_orchestration_only_enabled() {
+            guidance.push_str("\n\n");
+            guidance.push_str(SUPERVISOR_ULTRA_GUIDANCE);
+        }
+        guidance.push_str("\n\n");
+        guidance.push_str(routing);
+        guidance.push_str("\n\n");
+        guidance.push_str(handoff);
         guidance.push_str(concat!(
             "\n\nIf the current task depends on a prior fact or decision, delegate the memory lookup. ",
             "Use an authorized Session in the verified Project for Project facts. ",
             "Ask the worker to discover memory if needed, run action=query with short keywords and the appropriate scope, then action=get for selected IDs. ",
             "Use Global scope for cross-project facts."
         ));
-        if session.root_orchestration_only_enabled() {
-            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification. Actively look for independent assignments.");
-        }
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
             ContextBlockPriority::Critical,
@@ -325,13 +338,13 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
         .content
         .contains("Prefer SubAgent intent=wait for non-interactive exit"));
     for concept in [
-        "Actively look for useful independent work",
-        "Launch ready independent SubAgent assignments in parallel",
-        "within the available capacity and budget",
-        "While children run, dispatch additional ready assignments and advance your own independent work",
+        "At the start, identify useful independent slices",
+        "Discover SubAgent early if it is deferred",
+        "Launch all ready SubAgent assignments that fit the available capacity and budget in parallel",
+        "without waiting for a delegation request",
+        "Advance your own independent work while children run and start newly ready slices as capacity opens",
         "Make authorized file edits directly",
-        "prerequisites only for the work that depends on them",
-        "Wait when a required child result blocks further useful work",
+        "Wait only when a child result blocks further useful work",
         "one child can be enough for simple or sequential tasks",
     ] {
         assert!(guidance.content.contains(concept), "missing {concept}");
@@ -367,12 +380,14 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
         assert_eq!(block.stability, ContextBlockStability::SessionStable);
-        assert_eq!(
-            block
-                .content
-                .contains("In Ultra, prefer parallel auxiliary"),
-            ultra
-        );
+        for concept in [
+            "look for independent planning, review and verification at the start",
+            "Discover SubAgent early if it is deferred",
+            "Launch ready auxiliary SubAgent assignments in parallel",
+            "Keep coordinating Work or independent Sessions while the children run",
+        ] {
+            assert_eq!(block.content.contains(concept), ultra, "{concept}");
+        }
         assert!(!block
             .content
             .contains("Make authorized file edits directly"));
