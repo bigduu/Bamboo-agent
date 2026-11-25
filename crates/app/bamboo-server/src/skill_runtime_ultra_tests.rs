@@ -124,6 +124,11 @@ async fn native_http_ultra_uses_finite_host_and_exact_registered_root_inventory(
         .map(|tool| tool.function.name)
         .filter(|name| bamboo_domain::orchestration_only_allows_execution_name(name))
         .collect::<BTreeSet<_>>();
+    // UltraProvider uses the legacy full catalog, which omits coordination
+    // because that capability requires a tool discovery route.
+    let coordination = bamboo_domain::SESSION_COORDINATION_TOOL_NAME;
+    let mut expected_wire = expected.clone();
+    assert!(expected_wire.remove(coordination));
     let mut root = Session::new("ultra-finite-inventory", "test-model");
     root.set_root_orchestration_only(true).unwrap();
     root.title_generated = true;
@@ -156,7 +161,8 @@ async fn native_http_ultra_uses_finite_host_and_exact_registered_root_inventory(
         .map(|tool| tool.function.name)
         .collect::<BTreeSet<_>>();
     assert_eq!(actual, expected);
-    assert_eq!(provider.requests.lock().unwrap()[0].1, expected);
+    assert!(executor.owns_exact_tool(coordination));
+    assert_eq!(provider.requests.lock().unwrap()[0].1, expected_wire);
     for name in ["Write", "Edit", "exec_command", "write_stdin"] {
         assert!(actual.contains(name));
         assert!(executor.owns_exact_tool(name));
@@ -197,7 +203,7 @@ async fn native_http_ultra_uses_finite_host_and_exact_registered_root_inventory(
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|(messages, schemas)| {
-        *schemas == expected
+        *schemas == expected_wire
             && messages.iter().all(|message| {
                 !message.content.contains("Using Skills")
                     && !message
