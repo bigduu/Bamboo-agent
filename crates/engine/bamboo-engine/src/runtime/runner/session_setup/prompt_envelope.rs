@@ -4,6 +4,8 @@ use bamboo_agent_core::{
 };
 use bamboo_domain::{CapabilityLoadingMode, SessionKind};
 
+use crate::runtime::runner::prompt_context::is_supervisor_created_session;
+
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
 /// engine reads these three runs straight into the canonical [`PromptIR`]; the
@@ -44,14 +46,26 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
     // whitespace or control characters remains inert data in the prompt.
     let encoded_session_id =
         serde_json::to_string(&session.id).expect("Session ID string is JSON serializable");
+    let mut content = format!(
+        "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
+    );
+    if is_supervisor_created_session(session) {
+        content.push_str(concat!(
+            "\n\nLook up memory when prior decisions or preferences matter. ",
+            "Use `discover_capabilities` to find `memory` if it is discoverable and not already callable. ",
+            "Call action=query with short keywords. Use scope=project when this Session has an assigned Project, ",
+            "scope=section when it has an assigned Section, and scope=global for cross-project facts. ",
+            "Use action=get for selected IDs and action=session_read for this Session's continuity notes. ",
+            "If this Session delegates tool execution, have an authorized worker in the same Project look up Project facts. ",
+            "Verify live state before relying on recalled facts."
+        ));
+    }
     ContextBlock::new(
         ContextBlockType::SessionIdentity,
         ContextBlockPriority::Critical,
         ContextBlockStability::SessionStable,
         "Current Session Identity",
-        format!(
-            "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
-        ),
+        content,
     )
 }
 
@@ -114,6 +128,12 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
         let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
         let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
+        guidance.push_str(concat!(
+            "\n\nWhen prior decisions or preferences matter, delegate the memory lookup. ",
+            "Use an authorized Session in the verified Project for Project facts. ",
+            "Ask the worker to discover memory if needed, run action=query with short keywords and the appropriate scope, then action=get for selected IDs. ",
+            "Use Global scope for cross-project facts."
+        ));
         if session.root_orchestration_only_enabled() {
             guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification. Actively look for independent assignments.");
         }
@@ -802,6 +822,27 @@ mod tests {
         assert!(block
             .content
             .contains("authorize the caller from trusted runtime context"));
+        assert!(!block.content.contains("action=query"));
+    }
+
+    #[test]
+    fn supervisor_created_session_identity_guides_on_demand_memory_lookup() {
+        let mut worker = Session::new("worker", "test-model");
+        worker.metadata.insert(
+            bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
+            "true".into(),
+        );
+
+        let guidance = build_session_identity_context_block(&worker).content;
+        for instruction in [
+            "discover_capabilities",
+            "action=query",
+            "scope=project",
+            "action=get",
+            "action=session_read",
+        ] {
+            assert!(guidance.contains(instruction));
+        }
     }
 
     #[test]
@@ -1064,13 +1105,16 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             "same verified assignment",
             "new independent Session for a separate assignment or requested context isolation",
             "intended Project and workspace",
-            "Project is optional",
-            "omit both project_id and workspace_path",
-            "the user identifies it for this assignment",
-            "Ask one focused question if a required workspace is unclear",
+            "Resolve the destination for the current assignment",
+            "use session_control scope to verify it",
+            "use session_control create with the verified project_id and workspace_path",
+            "ask one focused question",
+            "Leave both fields unset for this route",
             "session_history list",
             "bounded inspect",
             "to authorized independent Sessions",
+            "delegate the memory lookup",
+            "Use an authorized Session in the verified Project for Project facts",
             "auxiliary planning",
             "Use session_control followup",
             "current application user",

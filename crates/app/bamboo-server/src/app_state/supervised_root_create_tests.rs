@@ -15,6 +15,7 @@ use bamboo_domain::{
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
+use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope};
 use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::timeout};
@@ -243,10 +244,26 @@ impl Fixture {
         args: Value,
         observe_original_caller: bool,
     ) -> Result<ToolOutcome, ToolError> {
+        self.dispatch_session_tool(
+            &self.supervisor.session_id,
+            name,
+            args,
+            observe_original_caller,
+        )
+        .await
+    }
+
+    async fn dispatch_session_tool(
+        &self,
+        session_id: &str,
+        name: &str,
+        args: Value,
+        observe_original_caller: bool,
+    ) -> Result<ToolOutcome, ToolError> {
         let executing = self
             .state
             .storage
-            .load_root_authority(&self.supervisor.session_id)
+            .load_root_authority(session_id)
             .await
             .unwrap()
             .unwrap();
@@ -355,6 +372,98 @@ async fn assert_create_is_independent_and_exact_retry(ultra: bool) {
     assert_eq!(after.model, before.model);
     assert_eq!(after.root_orchestration_only_enabled(), ultra);
     assert!(f.home.path().is_dir());
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_created_project_root_can_query_its_own_project_memory() {
+    let f = Fixture::new(false).await;
+    let other = f.state.project_store.create("Other Project", None).unwrap();
+    let seed = async |project_id: &bamboo_domain::ProjectId, title, body| {
+        f.state
+            .memory_store
+            .for_project(project_id)
+            .write_memory(
+                MemoryScope::Project,
+                Some(project_id.as_str()),
+                DurableMemoryType::Project,
+                title,
+                body,
+                &[],
+                None,
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+            .frontmatter
+            .id
+    };
+    let own_memory = seed(
+        &f.project_id,
+        "Own deployment playbook",
+        "Use the blue deployment slot.",
+    )
+    .await;
+    let other_memory = seed(
+        &other.id,
+        "Other deployment playbook",
+        "Use the green deployment slot.",
+    )
+    .await;
+
+    let scope = f.invoke(json!({"action":"scope"})).await;
+    let project = scope["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["id"] == f.project_id.as_str())
+        .expect("current Host scope includes the assigned Project");
+    let mut request = f.request(uuid::Uuid::new_v4());
+    request["request"]["expected_state_revision"] = scope["state_revision"].clone();
+    request["request"]["project_id"] = project["id"].clone();
+    request["request"]["workspace_path"] = project["project_path"].clone();
+    let created = f.invoke(request).await;
+    assert_eq!(created["admitted"], true);
+    assert_eq!(created["project_id"], f.project_id.as_str());
+    let worker = created["target_session_id"].as_str().unwrap();
+    let persisted = f.state.storage.load_session(worker).await.unwrap().unwrap();
+    assert_eq!(
+        persisted.metadata[bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY],
+        "true"
+    );
+
+    let memory = |args| f.dispatch_session_tool(worker, "memory", args, true);
+    let query = json!({"action":"query", "scope":"project", "query":"deployment playbook"});
+    let result = memory(query.clone()).await.unwrap().into_tool_result();
+    assert!(result.success, "{}", result.result);
+    let result: Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result["data"]["returned_count"], 1);
+    assert_eq!(result["data"]["items"][0]["id"], json!(own_memory));
+    assert!(result["data"]["items"][0].get("body").is_none());
+
+    let get = memory(json!({"action":"get", "id":own_memory}))
+        .await
+        .unwrap()
+        .into_tool_result();
+    assert!(get.success, "{}", get.result);
+    let get: Value = serde_json::from_str(&get.result).unwrap();
+    assert_eq!(get["memory"]["body"], "Use the blue deployment slot.");
+
+    let error = memory(json!({"action":"get", "id":other_memory}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("memory not found"), "{error}");
+    let mut wrong_project = query;
+    wrong_project["project_key"] = json!(other.id);
+    let error = memory(wrong_project).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot override the session's assigned Project"),
+        "{error}"
+    );
     f.state.shutdown().await;
 }
 
@@ -991,6 +1100,21 @@ async fn supervisor_creates_and_continues_standalone_roots_without_inheriting_a_
         assert!(root.project_id_meta().is_none());
         assert!(root.parent_session_id.is_none());
         assert!(root.authority_identity.is_ordinary());
+        let error = f
+            .dispatch_session_tool(
+                id,
+                "memory",
+                json!({"action":"query", "scope":"project", "query":"installation"}),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Project memory requires an assigned Project"),
+            "{error}"
+        );
         assert_eq!(
             root.agent_runtime_state
                 .as_ref()

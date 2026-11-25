@@ -57,6 +57,38 @@ pub(crate) const PROMPT_MEMORY_OBSERVABILITY_KEY: &str = "runtime_prompt_memory_
 /// This should be below the budget system's compression trigger (~90%).
 const CONTEXT_PRESSURE_WARNING_THRESHOLD: f64 = 70.0;
 
+/// Creation provenance selects prompt behavior only. Finite Host creation
+/// shares the older origin label, so corroborate it with the first Inbox input.
+pub(crate) fn is_supervisor_created_session(session: &Session) -> bool {
+    if session.kind != bamboo_domain::SessionKind::Root || !session.authority_identity.is_ordinary()
+    {
+        return false;
+    }
+    if let Some(dispatch) = session
+        .metadata
+        .get(bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY)
+    {
+        return dispatch == "true";
+    }
+    session
+        .metadata
+        .get("session.origin.v1")
+        .map(String::as_str)
+        == Some("supervisor_created")
+        && session
+            .messages
+            .iter()
+            .find(|message| message.role == bamboo_agent_core::Role::User)
+            .and_then(|message| message.metadata.as_ref())
+            .and_then(|metadata| metadata.get("session_message"))
+            .is_some_and(|input| {
+                input["kind"] == "peer_message"
+                    && input["target_session_id"] == session.id.as_str()
+                    && input["source"]["type"] == "session"
+                    && input["source"]["session_id"] == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID
+            })
+}
+
 #[derive(Debug, Clone)]
 struct TopicSnippet {
     name: String,
@@ -301,7 +333,7 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
 async fn refresh_external_memory_context_with_store_resolver_and_ledger(
     session: &mut Session,
     memory: &MemoryStore,
-    prompt_memory_flags: PromptMemoryFlags,
+    mut prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
     ledger_data_dir: Option<&Path>,
@@ -310,6 +342,14 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
     // system message), so a per-round memory change never invalidates the cached
     // system prefix; the request assembler reads the field to build a volatile
     // block.
+    let on_demand_memory =
+        session.supervisor_incarnation_id().is_some() || is_supervisor_created_session(session);
+    if on_demand_memory {
+        prompt_memory_flags.project_prompt_injection = false;
+        prompt_memory_flags.relevant_recall = false;
+        prompt_memory_flags.relevant_recall_rerank = false;
+        prompt_memory_flags.project_first_dream = false;
+    }
     let session_id = session.id.clone();
     let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
     let resolved_project_scope = if let Some(resolver) = project_context_resolver {
@@ -335,7 +375,11 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         .unwrap_or_else(|| memory.clone());
     let memory = &scoped_memory;
     let resolved_project_key = resolved_project_scope.as_ref().map(ToString::to_string);
-    let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
+    let session_note_snippets = if on_demand_memory {
+        Vec::new()
+    } else {
+        load_session_note_snippets(memory, session_id.as_str()).await
+    };
     let ledger_agenda = if prompt_memory_flags.ledger_agenda {
         let data_dir = resolve_ledger_data_dir(ledger_data_dir);
         load_ledger_agenda_snippet(&data_dir, resolved_project_key.as_deref()).await
@@ -426,6 +470,7 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         prompt_memory_flags,
         resolved_project_key.clone(),
         latest_user_query_present,
+        on_demand_memory,
         &session_note_snippets,
         project_memory_index.as_ref(),
         &relevant_memory_snippets,
@@ -899,6 +944,7 @@ fn build_prompt_memory_observability(
     prompt_memory_flags: PromptMemoryFlags,
     resolved_project_key: Option<String>,
     latest_user_query_present: bool,
+    on_demand_memory: bool,
     session_note_snippets: &[TopicSnippet],
     project_memory_index: Option<&ProjectMemoryIndexSnippet>,
     relevant_memory_snippets: &[RelevantMemorySnippet],
@@ -906,7 +952,9 @@ fn build_prompt_memory_observability(
     project_dream: Option<&ProjectDreamSnippet>,
     render_parts: &ExternalMemoryRenderParts,
 ) -> PromptMemoryObservability {
-    let session_notes_status = if session_note_snippets.is_empty() {
+    let session_notes_status = if on_demand_memory {
+        "disabled"
+    } else if session_note_snippets.is_empty() {
         "empty"
     } else if session_note_snippets
         .iter()
@@ -1256,6 +1304,14 @@ fn render_context_pressure_warning(session: &Session) -> Option<String> {
         return None;
     }
 
+    if session.supervisor_incarnation_id().is_some()
+        || (is_supervisor_created_session(session)
+            && !session.allows_model_tool_execution(EXTERNAL_MEMORY_TOOL_NAME))
+    {
+        return Some(format!(
+            "\n> ⚠️ **Context window filling up (~{pct:.0}% used).** Older messages will soon be compressed and summarized. Keep key decisions and verified progress in the conversation for continuity.\n"
+        ));
+    }
     Some(format!(
         "\n> ⚠️ **Context window filling up (~{pct:.0}% used).** Older messages will soon be compressed and summarized. Save any important context (key decisions, file paths, architecture notes, progress state) to `{EXTERNAL_MEMORY_TOOL_NAME}` now so it persists across the compression boundary.\n"
     ))

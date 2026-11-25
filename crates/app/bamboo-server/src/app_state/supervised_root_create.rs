@@ -209,7 +209,7 @@ impl SupervisedRootCreator {
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. An observed dispatch starts the new Session in the Supervisor's current permission mode. After creation each worker owns its tool and approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects and Sessions in this application's current user domain in Standard and Ultra. For Project work, select the intended Project from projects and pass its id as project_id together with its registered project_path or an explicitly requested bound workspace as workspace_path. The Host validates both and persists the Project assignment used by the new Session's Project memory. For a standalone assignment, omit both fields on an observed creation call and the Host selects the Session's own workspace. An observed dispatch starts the Session in the Supervisor's current permission mode. After creation each worker owns its tool and approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
@@ -749,6 +749,10 @@ impl SupervisedRootCreator {
         candidate
             .metadata
             .insert("session.origin.v1".into(), "supervisor_created".into());
+        candidate.metadata.insert(
+            bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
+            matches!(authority, CreationAuthority::Supervisor { .. }).to_string(),
+        );
         Ok(candidate)
     }
 

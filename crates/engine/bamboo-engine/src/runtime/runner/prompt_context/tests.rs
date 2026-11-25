@@ -209,6 +209,177 @@ async fn external_memory_keeps_session_notes_without_global_dream_when_project_u
     assert!(system_prompt.contains("Treat Dream summaries as orientation."));
 }
 
+#[test]
+fn legacy_supervisor_origin_requires_the_first_input_from_supervisor() {
+    use bamboo_domain::{Session, DEFAULT_SUPERVISOR_SESSION_ID};
+
+    for (source, expected) in [
+        (DEFAULT_SUPERVISOR_SESSION_ID, true),
+        ("finite-host", false),
+    ] {
+        let mut worker = Session::new("legacy-worker", "test-model");
+        worker
+            .metadata
+            .insert("session.origin.v1".into(), "supervisor_created".into());
+        assert!(!super::is_supervisor_created_session(&worker));
+        let mut input = bamboo_domain::Message::user("Initial assignment");
+        input.metadata = Some(serde_json::json!({"session_message": {
+            "kind": "peer_message", "target_session_id": worker.id,
+            "source": {"type": "session", "session_id": source}
+        }}));
+        worker.add_message(input);
+        assert_eq!(super::is_supervisor_created_session(&worker), expected);
+    }
+}
+
+#[tokio::test]
+async fn supervisor_and_created_sessions_recall_memory_only_on_demand() {
+    use bamboo_agent_core::{PromptMemoryObservability, Session};
+    use bamboo_domain::ledger::{LedgerRecord, RecordKind};
+    use bamboo_domain::{ProjectId, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_memory::ledger_store::LedgerStore;
+    use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
+    use bamboo_metrics::types::PromptMemoryRecallOutcome;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let memory = MemoryStore::new(temp.path().join("jiandu"));
+    let ledger_root = temp.path().join("bamboo");
+    LedgerStore::new(&ledger_root)
+        .write_record(
+            LedgerRecord::new("rec_contract", RecordKind::Todo, "Pending ledger item"),
+            None,
+        )
+        .await
+        .expect("save agenda item");
+
+    let project_id = ProjectId::parse("on-demand-project").expect("Project ID");
+    let project_memory = memory.for_project(&project_id);
+    for (store, scope, project_key, memory_type, title) in [
+        (
+            &memory,
+            MemoryScope::Global,
+            None,
+            DurableMemoryType::Reference,
+            "Global compass rule",
+        ),
+        (
+            &project_memory,
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            DurableMemoryType::Project,
+            "Project compass rule",
+        ),
+    ] {
+        store
+            .write_memory(
+                scope,
+                project_key,
+                memory_type,
+                title,
+                "A prior compass rule applies here.",
+                &["compass".into()],
+                None,
+                "test-model",
+                false,
+                None,
+            )
+            .await
+            .expect("seed durable memory");
+    }
+    publish_project_dream(&project_memory, project_id.as_str(), "Project dream marker").await;
+
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let mut standalone = Session::new("standalone-worker", "test-model");
+    standalone.metadata.insert(
+        bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
+        "true".into(),
+    );
+    let mut project_worker = Session::new("project-worker", "test-model");
+    project_worker.set_project_id_meta(project_id.to_string());
+    project_worker.metadata.insert(
+        bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
+        "true".into(),
+    );
+    let mut manual = Session::new("manual-session", "test-model");
+    manual.set_project_id_meta(project_id.to_string());
+    let flags = crate::runtime::config::PromptMemoryFlags {
+        relevant_recall_rerank: true,
+        ..Default::default()
+    };
+
+    for (mut session, on_demand) in [
+        (supervisor, true),
+        (standalone, true),
+        (project_worker, true),
+        (manual, false),
+    ] {
+        memory
+            .write_session_topic(&session.id, "default", "Continuity note marker")
+            .await
+            .expect("save session note");
+        session.add_message(Message::user("compass rule"));
+        session.token_usage = Some(
+            serde_json::from_value(serde_json::json!({
+                "system_tokens": 0, "summary_tokens": 0, "window_tokens": 75,
+                "total_tokens": 75, "budget_limit": 100,
+                "truncation_occurred": false, "segments_removed": 0,
+            }))
+            .expect("set context pressure"),
+        );
+        session.metadata.insert(
+            super::EXTERNAL_MEMORY_RENDERED_KEY.into(),
+            "Legacy rendered memory marker".into(),
+        );
+        let observation = super::refresh_external_memory_context_with_stores(
+            &mut session,
+            &memory,
+            &ledger_root,
+            flags,
+            None,
+        )
+        .await
+        .observation("on-demand-round", &session.id, chrono::Utc::now());
+        let rendered = super::render_external_memory_section(&session).expect("render agenda");
+        assert!(rendered.contains("Pending ledger item"));
+        assert!(rendered.contains("Context window filling up (~75% used)"));
+        assert!(!rendered.contains("Legacy rendered memory marker"));
+        assert_eq!(observation.recall_enabled, !on_demand);
+
+        if on_demand {
+            if session.supervisor_incarnation_id().is_some() {
+                assert!(rendered.contains("Keep key decisions and verified progress"));
+            }
+            assert_eq!(
+                observation.recall_outcome,
+                PromptMemoryRecallOutcome::Disabled
+            );
+            assert_eq!(observation.all_compact_exposed_count, 0);
+            for text in [
+                "Continuity note marker",
+                "Project Durable Memory Index",
+                "Project compass rule",
+                "Global compass rule",
+                "Project dream marker",
+            ] {
+                assert!(!rendered.contains(text), "{} exposed {text}", session.id);
+            }
+            let observability: PromptMemoryObservability =
+                serde_json::from_str(&session.metadata[super::PROMPT_MEMORY_OBSERVABILITY_KEY])
+                    .expect("prompt memory observability");
+            assert_eq!(observability.session_notes_status, "disabled");
+        } else {
+            assert!(rendered.contains("Continuity note marker"));
+            assert!(rendered.contains("Project Durable Memory Index"));
+            assert!(rendered.contains("Project compass rule"));
+            assert!(rendered.contains("Project dream marker"));
+            assert!(observation.project_exposed_count > 0);
+        }
+    }
+}
+
 #[tokio::test]
 async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     let temp_dir = tempfile::tempdir().expect("temp dir");

@@ -8,9 +8,9 @@ mod plan_runtime;
 mod system_sections;
 mod task;
 
-pub(crate) use external_memory::EXTERNAL_MEMORY_RENDERED_KEY;
 pub(crate) use external_memory::{
-    PromptMemoryExposureProvenance, PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    is_supervisor_created_session, PromptMemoryExposureProvenance, PromptMemoryRuntimeContext,
+    EXTERNAL_MEMORY_RENDERED_KEY, PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 
 pub(crate) async fn refresh_external_memory_context(

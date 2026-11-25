@@ -6,6 +6,8 @@ pub const PACED_LOOP_METADATA_KEY: &str = "runtime.paced_loop";
 pub const PACED_LOOP_OUTCOME_METADATA_KEY: &str = "runtime.paced_loop_outcome";
 /// Durable suspension owned by the desktop managed-update handoff.
 pub const PLANNED_UPDATE_SUSPEND_REASON: &str = "planned_update";
+/// Birth-specific marker written when the Supervisor creates an independent Root.
+pub const SUPERVISOR_DISPATCH_METADATA_KEY: &str = "session.supervisor_dispatch.v1";
 
 pub mod actor;
 pub mod actor_snapshot;
