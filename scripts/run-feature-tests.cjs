@@ -276,7 +276,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // with the same additive contexts and case selections.
 // Post-reap Work diagnostics retain the default Ticket harness owner and its
 // existing feature-gated recovery case remains the sole additive selection for that harness.
-const FEATURE_SOURCE_SHA256 = "995b0de65a22f42c4a82e25704bd93a88002c9a3eef8904901ee79665711c253";
+// Running Session coordination extends the default Engine, Storage, Permission
+// and server-app-state owners. Its live Host case stays in the ordinary Root
+// Inbox lifecycle target. The existing five contexts and 23 additive cases
+// retain their current owners.
+const FEATURE_SOURCE_SHA256 = "79b4cc14f0d1b6e71eb9b7aca819fcd06ec95a2c0f181c1bf3f514b766a3e4b9";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
