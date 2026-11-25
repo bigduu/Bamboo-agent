@@ -10,6 +10,7 @@ use bamboo_llm::{LLMChunk, LLMStream};
 use super::chunk_handling::handle_chunk_result;
 use super::stream_state::StreamAccumulationState;
 use super::{StreamHandlingFailure, StreamHandlingOutput, StreamTimeoutContext};
+use crate::runtime::planned_update::StreamInterruption;
 
 fn timeout_duration(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
@@ -74,6 +75,7 @@ pub(super) async fn consume_llm_stream_internal(
         cancel_token,
         session_id,
         timeout_context,
+        None,
     )
     .await
     .map_err(|failure| failure.error)
@@ -85,6 +87,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
     cancel_token: &CancellationToken,
     session_id: &str,
     timeout_context: &StreamTimeoutContext,
+    update: Option<(&StreamInterruption<'_>, &[bamboo_agent_core::Message])>,
 ) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
     let mut state = StreamAccumulationState::new();
     let policy = timeout_context.policy;
@@ -94,6 +97,8 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
         .unwrap_or(stream_started_at);
     let mut last_transport_at = stream_started_at;
     let mut last_semantic_at = None;
+    let update = StreamInterruption::wait(update);
+    tokio::pin!(update);
 
     loop {
         let transport_timeout = timeout_duration(policy.transport_idle_timeout_secs);
@@ -113,11 +118,17 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
         let semantic_deadline = semantic_origin + semantic_timeout;
         let next_deadline = transport_deadline.min(semantic_deadline);
 
-        // Cancellation wins, then a simultaneously-ready provider frame, then
-        // the earliest independent watchdog deadline.
+        // User cancellation wins, then an explicit desktop update, a provider
+        // frame, and the independent watchdog deadline.
         let chunk_result = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
+                return Err(StreamHandlingFailure {
+                    error: AgentError::Cancelled,
+                    partial_output: Box::new(state.into_interrupted_output()),
+                });
+            },
+            _ = &mut update => {
                 return Err(StreamHandlingFailure {
                     error: AgentError::Cancelled,
                     partial_output: Box::new(state.into_interrupted_output()),
@@ -174,9 +185,12 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
             }
         }
 
-        if let Err(error) =
-            handle_chunk_result(chunk_result, &mut state, event_tx, session_id).await
-        {
+        let handled = tokio::select! {
+            biased;
+            _ = &mut update => Err(AgentError::Cancelled),
+            result = handle_chunk_result(chunk_result, &mut state, event_tx, session_id) => result,
+        };
+        if let Err(error) = handled {
             return Err(StreamHandlingFailure {
                 error,
                 partial_output: Box::new(state.into_interrupted_output()),

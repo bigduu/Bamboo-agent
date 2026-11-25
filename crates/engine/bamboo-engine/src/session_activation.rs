@@ -551,7 +551,10 @@ pub struct SessionUpdateAdmission {
 enum UpdateHold {
     #[default]
     Open,
-    Preparing(uuid::Uuid),
+    Preparing {
+        id: uuid::Uuid,
+        immediate: bool,
+    },
     Committed(uuid::Uuid),
 }
 
@@ -709,7 +712,7 @@ fn update_busy() -> std::io::Error {
 impl Drop for SessionUpdateAdmission {
     fn drop(&mut self) {
         self.router.update_hold.send_if_modified(|hold| {
-            if *hold == UpdateHold::Preparing(self.id) {
+            if matches!(*hold, UpdateHold::Preparing { id, .. } if id == self.id) {
                 *hold = UpdateHold::Open;
                 return true;
             }
@@ -1230,12 +1233,25 @@ impl SessionActivationRouter {
     /// Hold new admissions for a planned update. The state lock orders this
     /// with registration and Inbox reservation, including in-flight launches.
     pub async fn hold_admissions_for_update(&self) -> Option<SessionUpdateAdmission> {
+        self.hold_admissions_for_update_mode(false).await
+    }
+
+    /// Hold new admissions and let eligible provider streams park immediately.
+    pub async fn hold_admissions_for_immediate_update(&self) -> Option<SessionUpdateAdmission> {
+        self.hold_admissions_for_update_mode(true).await
+    }
+
+    async fn hold_admissions_for_update_mode(
+        &self,
+        immediate: bool,
+    ) -> Option<SessionUpdateAdmission> {
         let _states = self.states.lock().await;
         if self.admissions_held() {
             return None;
         }
         let id = uuid::Uuid::new_v4();
-        self.update_hold.send_replace(UpdateHold::Preparing(id));
+        self.update_hold
+            .send_replace(UpdateHold::Preparing { id, immediate });
         Some(SessionUpdateAdmission {
             router: self.clone(),
             id,
@@ -1244,8 +1260,25 @@ impl SessionActivationRouter {
 
     pub(crate) fn preparing_update(&self) -> Option<uuid::Uuid> {
         match *self.update_hold.borrow() {
-            UpdateHold::Preparing(id) => Some(id),
+            UpdateHold::Preparing { id, .. } => Some(id),
             _ => None,
+        }
+    }
+
+    pub(crate) async fn wait_for_immediate_update(
+        &self,
+        ignored: Option<uuid::Uuid>,
+    ) -> uuid::Uuid {
+        let mut hold = self.update_hold.subscribe();
+        let phase = hold.wait_for(|phase| {
+            matches!(*phase, UpdateHold::Preparing { id, immediate: true } if Some(id) != ignored)
+        });
+        let phase = *phase
+            .await
+            .expect("the activation router owns the update sender");
+        match phase {
+            UpdateHold::Preparing { id, .. } => id,
+            _ => unreachable!("the wait predicate requires an immediate update"),
         }
     }
 
@@ -1292,7 +1325,7 @@ impl SessionActivationRouter {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
-            phase = hold.wait_for(|phase| *phase != UpdateHold::Preparing(update)) => {
+            phase = hold.wait_for(|phase| !matches!(*phase, UpdateHold::Preparing { id, .. } if id == update)) => {
                 Ok(phase.is_ok_and(|phase| *phase == UpdateHold::Committed(update)))
             }
         };

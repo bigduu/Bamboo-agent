@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::planned_update::StreamInterruption;
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
@@ -2177,6 +2178,12 @@ pub(super) async fn execute_llm_stream(
     if cancel_token.is_cancelled() {
         return Err(AgentError::Cancelled);
     }
+    let update = frame
+        .output_limit_recovery
+        .and_then(|policy| policy.immediate_update)
+        .and_then(|policy| {
+            StreamInterruption::for_session(session, config, policy.ignored, policy.interrupted)
+        });
     // Start only at the actual dispatch boundary: failed prompt preflight is
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
@@ -2253,25 +2260,31 @@ pub(super) async fn execute_llm_stream(
         .with_provider_default_output(provider_default_output)
         .with_tools_disabled(round_cap_summary);
     let bootstrap_result = {
+        let provider = llm.chat_stream_ir(
+            &prepared_envelope.ir,
+            tool_schemas,
+            Some(window_limit.unwrap_or(budget.max_output_tokens)),
+            model,
+            Some(&planned.request_options),
+        );
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
-                bamboo_llm::provider::scope_completion_diagnostics(
-                    completion.clone(),
-                    llm.chat_stream_ir(
-                        &prepared_envelope.ir,
-                        tool_schemas,
-                        Some(window_limit.unwrap_or(budget.max_output_tokens)),
-                        model,
-                        Some(&planned.request_options),
-                    ),
-                ),
+                bamboo_llm::provider::scope_completion_diagnostics(completion.clone(), provider),
                 cancel_token,
                 session_id,
                 &timeout_context,
                 http_retry_observer.clone(),
             ),
         ));
+        let bootstrap = async {
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
+                _ = StreamInterruption::wait(update.as_ref().map(|stream| (stream, session.messages.as_slice()))) => Err(AgentError::Cancelled),
+                result = bootstrap => result,
+            }
+        };
         tokio::pin!(bootstrap);
         let mut live_guard: Option<Box<dyn Send>> = None;
         let result = match (live_bootstrap, live_offer) {
@@ -2448,31 +2461,23 @@ pub(super) async fn execute_llm_stream(
         );
     // The opt-in evidence check must publish only the final, checked answer.
     // A cap summary also stays private until its completion is validated.
+    let visible = !activation_pending
+        && !config.features_final_evidence_check
+        && !private_plan
+        && !round_cap_summary;
     let stream_output_result = observation
-        .scope(async {
-            if activation_pending
-                || config.features_final_evidence_check
-                || private_plan
-                || round_cap_summary
-            {
-                crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-                    stream,
-                    cancel_token,
-                    session_id,
-                    &timeout_context,
-                )
-                .await
-            } else {
-                crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-                    stream,
-                    event_tx,
-                    cancel_token,
-                    session_id,
-                    &timeout_context,
-                )
-                .await
-            }
-        })
+        .scope(
+            crate::runtime::stream::handler::consume_llm_stream_for_round(
+                stream,
+                visible.then_some(event_tx),
+                cancel_token,
+                session_id,
+                &timeout_context,
+                update
+                    .as_ref()
+                    .map(|stream| (stream, session.messages.as_slice())),
+            ),
+        )
         .await;
     if observation.is_recording() {
         if let Some((typed_text, full_json)) = completion.gemini_decode_counts() {
@@ -2481,6 +2486,23 @@ pub(super) async fn execute_llm_stream(
     }
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
+        Err(failure) if update.as_ref().is_some_and(StreamInterruption::interrupted) => {
+            usage_guard.finish(
+                usage_status(&failure.error),
+                failure.partial_output.provider_usage,
+            );
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(
+                &failure.error,
+            ));
+            if let Some(identity) = failure.partial_output.visible_message.filter(|_| visible) {
+                let _ = event_tx
+                    .send(AgentEvent::VisibleMessageDiscard {
+                        message_id: identity.message_id,
+                    })
+                    .await;
+            }
+            return Err(failure.error);
+        }
         Err(mut failure) => {
             // A generic SSE/body error is no safer to replay than a watchdog
             // expiry once text, reasoning or a tool-call delta was observed.

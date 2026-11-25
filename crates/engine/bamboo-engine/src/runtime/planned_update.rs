@@ -1,7 +1,11 @@
 //! Preparing a running local Root for a planned host update.
 
-use bamboo_agent_core::{AgentError, Session};
-use bamboo_domain::{AgentStatusState, SessionKind};
+use std::sync::OnceLock;
+
+use bamboo_agent_core::{AgentError, Message, Session};
+use bamboo_domain::{
+    AgentRuntimeState, AgentStatusState, ProviderModelRef, SessionKind, SuspensionState,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::config::AgentLoopConfig;
@@ -9,6 +13,76 @@ use crate::session_activation::ParkedUpdateRoot;
 use crate::session_app::provider_model::session_effective_model_ref;
 
 pub(crate) use bamboo_domain::PLANNED_UPDATE_SUSPEND_REASON as SUSPEND_REASON;
+
+pub(crate) struct StreamInterruption<'a> {
+    router: &'a crate::session_activation::SessionActivationRouter,
+    ignored: Option<uuid::Uuid>,
+    interrupted: &'a OnceLock<uuid::Uuid>,
+}
+
+impl<'a> StreamInterruption<'a> {
+    pub(crate) fn for_session(
+        session: &Session,
+        config: &'a AgentLoopConfig,
+        ignored: Option<uuid::Uuid>,
+        interrupted: &'a OnceLock<uuid::Uuid>,
+    ) -> Option<Self> {
+        let router = config.session_update_router.as_ref()?;
+        checkpoint_model(session, config)?;
+        Some(Self {
+            router,
+            ignored,
+            interrupted,
+        })
+    }
+
+    /// Record the update that interrupted this request before it unwinds through
+    /// the normal provider cancellation path. The runner's user token stays open.
+    pub(crate) async fn wait(interruption: Option<(&Self, &[Message])>) {
+        if let Some((stream, messages)) = interruption {
+            let update = stream
+                .router
+                .wait_for_immediate_update(stream.ignored)
+                .await;
+            if crate::session_app::truncation::unresolved_tool_call_ids(messages).is_empty() {
+                let _ = stream.interrupted.set(update);
+                return;
+            }
+        }
+        std::future::pending().await
+    }
+
+    pub(crate) fn interrupted(&self) -> bool {
+        self.interrupted.get().is_some()
+    }
+}
+
+fn checkpoint_model(session: &Session, config: &AgentLoopConfig) -> Option<ProviderModelRef> {
+    if session.kind != SessionKind::Root
+        || !session.authority_identity.is_ordinary()
+        || crate::ticket_runtime::is_managed_work_root(session)
+        || session.has_runtime_wait()
+        || config.run_budget != Default::default()
+        || config.run_deadline.is_some()
+        || config.effective_counted_loop().is_some()
+        || config.paced_loop_turn.is_some()
+    {
+        return None;
+    }
+    let writer = config.persistence.as_ref()?.root_actor_writer()?;
+    if writer.created_at != session.created_at
+        || writer.fence.actor_id.as_str() != session.id
+        || config.guidance_active_run_id.as_deref() != Some(&writer.fence.run_id)
+    {
+        return None;
+    }
+    let mut model = session_effective_model_ref(session).filter(|target| {
+        config.provider_name.as_deref() == Some(target.provider.as_str())
+            && config.model_name.as_deref() == Some(target.model.as_str())
+    })?;
+    model.reasoning_effort = config.reasoning_effort;
+    Some(model)
+}
 
 /// Called between complete rounds. Save through the old exact writer before
 /// reporting a parked round, then keep the original loop alive for an abort.
@@ -26,15 +100,10 @@ pub(super) async fn pause_before_model_round(
     if cancel.is_cancelled() {
         return Err(AgentError::Cancelled);
     }
-    if session.kind != SessionKind::Root
-        || !session.authority_identity.is_ordinary()
-        || crate::ticket_runtime::is_managed_work_root(session)
-        || session.has_runtime_wait()
-        || config.run_budget != Default::default()
-        || config.run_deadline.is_some()
-        || config.effective_counted_loop().is_some()
-        || config.paced_loop_turn.is_some()
-    {
+    let Some(model) = checkpoint_model(session, config) else {
+        return Ok(false);
+    };
+    if !crate::session_app::truncation::unresolved_tool_call_ids(&session.messages).is_empty() {
         return Ok(false);
     }
     let Some(persistence) = config.persistence.as_ref() else {
@@ -43,19 +112,6 @@ pub(super) async fn pause_before_model_round(
     let Some(writer) = persistence.root_actor_writer() else {
         return Ok(false);
     };
-    if writer.created_at != session.created_at
-        || writer.fence.actor_id.as_str() != session.id
-        || config.guidance_active_run_id.as_deref() != Some(&writer.fence.run_id)
-    {
-        return Ok(false);
-    }
-    let Some(mut model) = session_effective_model_ref(session).filter(|target| {
-        config.provider_name.as_deref() == Some(target.provider.as_str())
-            && config.model_name.as_deref() == Some(target.model.as_str())
-    }) else {
-        return Ok(false);
-    };
-    model.reasoning_effort = config.reasoning_effort;
     let Ok(conversation_reset_sha256) = session.conversation_reset_sha256() else {
         return Ok(false);
     };
@@ -79,9 +135,6 @@ pub(super) async fn pause_before_model_round(
         message_count: session.messages.len(),
         model,
     };
-    if !crate::session_app::truncation::unresolved_tool_call_ids(&session.messages).is_empty() {
-        return Ok(false);
-    }
     if let Err(error) = persistence.checkpoint_runtime_session(session).await {
         tracing::warn!(
             session_id = %session.id,
@@ -94,6 +147,20 @@ pub(super) async fn pause_before_model_round(
         return Ok(false);
     }
     router.park_root_for_update(parked, cancel).await
+}
+
+pub(crate) fn mark_suspended(session: &mut Session, runtime: &mut AgentRuntimeState) {
+    runtime.status = AgentStatusState::Suspended;
+    runtime.suspension = Some(SuspensionState {
+        reason: SUSPEND_REASON.into(),
+        suspended_at: chrono::Utc::now(),
+        resumable: true,
+        hook_point: None,
+    });
+    session
+        .metadata
+        .insert("runtime.suspend_reason".into(), SUSPEND_REASON.into());
+    super::runner::state_bridge::write_runtime_state(session, runtime);
 }
 
 /// Match the persisted history against the planned update controller's exact
