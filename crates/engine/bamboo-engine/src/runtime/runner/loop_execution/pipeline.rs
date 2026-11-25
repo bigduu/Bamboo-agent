@@ -4413,25 +4413,18 @@ async fn run_pipeline_inner(
             if max_rounds_summary_used {
                 // A provider may disregard the empty catalog. Don't persist
                 // its tool calls or native items as unpaired transcript actions.
-                let empty = stream_output.content.trim().is_empty();
-                let content = if empty {
-                    "The round limit was reached before the model returned a progress summary. \
+                let content = if llm_output.terminal_validation_error.is_some()
+                    || stream_output.content.trim().is_empty()
+                {
+                    "The round limit was reached before a complete progress summary was available. \
                      Work completed so far remains available.".into()
                 } else {
                     stream_output.content
                 };
-                let visible_message = stream_output.visible_message;
-                let publish = empty || visible_message.is_none() || config.features_final_evidence_check;
-                let message = assistant_with_visible_identity(
-                    Message::assistant(content, None),
-                    visible_message,
-                );
+                let message = Message::assistant(content, None);
                 let answer_id = message.id.clone();
-                let buffered = publish.then(|| message.clone());
+                publish_buffered_message(event_tx, &message).await;
                 session.add_message(message);
-                if let Some(message) = buffered.as_ref() {
-                    publish_buffered_message(event_tx, message).await;
-                }
                 record_root_final_message_candidate(session, config, &answer_id);
                 record_no_tool_calls_round_completed(
                     state.metrics_collector.as_ref(), &round_id, &state.session_id,

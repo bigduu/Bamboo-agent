@@ -484,6 +484,14 @@ pub(crate) async fn execute_llm_round(
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
+    let round_cap_summary = output_limit_recovery.is_some_and(|policy| policy.round_cap_summary);
+    if round_cap_summary {
+        // This request and any later resume must use the canonical transcript.
+        // Clear before context preflight as well as provider transport failures.
+        session
+            .metadata
+            .remove(stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    }
     // Resolve mutable host handles once for the whole request. The model
     // catalog, capability projection and provider send must use one route.
     let request_provider = bamboo_llm::provider::queued_snapshot_for(llm.clone())
@@ -574,7 +582,11 @@ pub(crate) async fn execute_llm_round(
         && !openai_client_search_boundary;
     let finish_reason = completion.finish_reason();
     let task_split = output_limit_recovery.is_some_and(|policy| policy.task_split.is_some());
-    let output_limited = rejected_output_limit(&stream_output, finish_reason, task_split);
+    let output_limited = rejected_output_limit(
+        &stream_output,
+        finish_reason,
+        task_split || round_cap_summary,
+    );
     let reasoning_repeated = finish_reason == REASONING_REPETITION_FINISH_REASON;
     let response_rejected = output_limited || reasoning_repeated;
     let reasoning_only = empty_answer
@@ -591,12 +603,15 @@ pub(crate) async fn execute_llm_round(
                     | ProviderTranscriptItemKind::AnthropicRedactedThinking
             )
         });
-    let terminal_validation_error = if stream_output
-        .tool_calls
-        .iter()
-        .any(|call| !tool_dispatch.selection.allows(&call.function.name))
-        || (openai_client_search_boundary
-            && tool_dispatch.mode != CapabilityLoadingMode::Progressive)
+    // The capped summary path independently discards all unexpected tool
+    // output. It can still keep a complete text response alongside it.
+    let terminal_validation_error = if !round_cap_summary
+        && (stream_output
+            .tool_calls
+            .iter()
+            .any(|call| !tool_dispatch.selection.allows(&call.function.name))
+            || (openai_client_search_boundary
+                && tool_dispatch.mode != CapabilityLoadingMode::Progressive))
     {
         Some(AgentError::LLMNonRetryable(
             "provider returned a tool call outside the current request's tool selection".into(),

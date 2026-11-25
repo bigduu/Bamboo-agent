@@ -2447,10 +2447,14 @@ pub(super) async fn execute_llm_stream(
             session,
         );
     // The opt-in evidence check must publish only the final, checked answer.
-    // Buffer this response until tool calls tell us whether it is a candidate.
+    // A cap summary also stays private until its completion is validated.
     let stream_output_result = observation
         .scope(async {
-            if activation_pending || config.features_final_evidence_check || private_plan {
+            if activation_pending
+                || config.features_final_evidence_check
+                || private_plan
+                || round_cap_summary
+            {
                 crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                     stream,
                     cancel_token,
@@ -2515,6 +2519,7 @@ pub(super) async fn execute_llm_stream(
                 &failure.error,
             ));
             let appended = !private_plan
+                && !round_cap_summary
                 && append_interrupted_assistant_output(
                     session,
                     *failure.partial_output,
@@ -2551,7 +2556,11 @@ pub(super) async fn execute_llm_stream(
     observation.finish(outcome);
 
     let response_rejected = finish_reason == REASONING_REPETITION_FINISH_REASON
-        || super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
+        || super::rejected_output_limit(
+            &stream_output,
+            finish_reason,
+            task_split.is_some() || round_cap_summary,
+        );
     if config.features_final_evidence_check
         && !activation_pending
         && !response_rejected
