@@ -1,18 +1,141 @@
 use std::{
+    fmt,
     io::{Read, Seek, SeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::Duration,
 };
+use tokio::time::Instant;
 
 const LOG_TAIL_BYTES: u64 = 16 * 1024;
 const DISCOVERY_READ_BYTES: u64 = 64 * 1024;
 const STARTUP_BUDGET: Duration = Duration::from_secs(30);
+const PROBE_INTERVAL: Duration = Duration::from_millis(30);
+const HTTP_BODY_BYTES: usize = 1024;
+const HTTP_HEADER_BYTES: usize = 256;
+const HTTP_ERROR_BYTES: usize = 512;
+
+#[derive(Default)]
+pub(super) struct HttpEvidence {
+    summary: String,
+    body: Vec<u8>,
+    body_read: String,
+}
+
+impl fmt::Display for HttpEvidence {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.summary.is_empty() {
+            return output.write_str("no HTTP result captured");
+        }
+        output.write_str(&self.summary)?;
+        if !self.body_read.is_empty() {
+            write!(
+                output,
+                " body={:?} body_read={}",
+                String::from_utf8_lossy(&self.body),
+                self.body_read
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn error_summary(error: &reqwest::Error) -> String {
+    let mut summary = format!("{error:?}");
+    if summary.len() > HTTP_ERROR_BYTES {
+        summary.truncate(summary.floor_char_boundary(HTTP_ERROR_BYTES));
+        summary.push_str(" (truncated)");
+    }
+    summary
+}
+
+pub(super) async fn observe_http(
+    response: Result<reqwest::Response, reqwest::Error>,
+    evidence: &mut HttpEvidence,
+) -> bool {
+    *evidence = HttpEvidence::default();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            evidence.summary = format!("transport_error={}", error_summary(&error));
+            return false;
+        }
+    };
+    let status = response.status();
+    let headers: Vec<_> = [
+        "content-type",
+        "content-length",
+        "retry-after",
+        "server",
+        "x-request-id",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let value = response.headers().get(name)?.as_bytes();
+        let prefix = String::from_utf8_lossy(&value[..value.len().min(HTTP_HEADER_BYTES)]);
+        let suffix = if value.len() > HTTP_HEADER_BYTES {
+            " (truncated)"
+        } else {
+            ""
+        };
+        Some(format!("{name}={prefix:?}{suffix}"))
+    })
+    .collect();
+    evidence.summary = format!(
+        "status={status} remote_addr={:?} headers=[{}]",
+        response.remote_addr(),
+        headers.join(", ")
+    );
+    if status.is_success() {
+        return true;
+    }
+
+    // Update the receipt as chunks arrive. Readiness may cancel the body read
+    // at the next polling instant while retaining the status and prefix.
+    evidence.body_read = "incomplete".into();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = HTTP_BODY_BYTES - evidence.body.len();
+                evidence
+                    .body
+                    .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if chunk.len() > remaining {
+                    evidence.body_read = format!("truncated at {HTTP_BODY_BYTES} bytes");
+                    break;
+                }
+            }
+            Ok(None) => {
+                evidence.body_read = "complete".into();
+                break;
+            }
+            Err(error) => {
+                evidence.body_read = format!("error: {}", error_summary(&error));
+                break;
+            }
+        }
+    }
+    false
+}
+
+async fn probe_health(client: &reqwest::Client, base: &str, evidence: &mut HttpEvidence) -> bool {
+    let response = client.get(format!("{base}/health")).send().await;
+    let next_probe = Instant::now() + PROBE_INTERVAL;
+    let healthy = tokio::time::timeout_at(next_probe, observe_http(response, evidence))
+        .await
+        .is_ok_and(|success| success);
+    if !healthy {
+        tokio::time::sleep_until(next_probe).await;
+    }
+    healthy
+}
 
 struct Launch {
     id: uuid::Uuid,
     generation: usize,
+    requested_port: u16,
+    address: Option<SocketAddr>,
     log: PathBuf,
     log_start: u64,
 }
@@ -33,6 +156,8 @@ fn start_on_port(data: &Path, generation: usize, port: u16) -> Host {
     let launch = Launch {
         id: uuid::Uuid::new_v4(),
         generation,
+        requested_port: port,
+        address: None,
         log: path,
         log_start: log.metadata().unwrap().len(),
     };
@@ -149,12 +274,17 @@ impl Host {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(error) => format!("current-launch log unavailable: {error}"),
         };
+        let endpoint = self.1.address.map_or_else(
+            || "unannounced".into(),
+            |address| format!("http://{address}/api/v1"),
+        );
         format!(
-            "{reason}: pid={} launch={} generation={} exit={} log={} start={}\nCurrent-launch log tail (at most {LOG_TAIL_BYTES} bytes):\n{tail}",
+            "{reason}: pid={} launch={} generation={} exit={} endpoint={endpoint} requested_port={} log={} start={}\nCurrent-launch log tail (at most {LOG_TAIL_BYTES} bytes):\n{tail}",
             self.0.id(),
             self.1.id,
             self.1.generation,
             exit,
+            self.1.requested_port,
             self.1.log.display(),
             self.1.log_start
         )
@@ -162,44 +292,39 @@ impl Host {
 
     pub async fn ready(&mut self, client: &reqwest::Client) -> Result<String, String> {
         let mut discovery = ListenerDiscovery::new(self.1.log_start);
+        let mut last_probe = HttpEvidence::default();
         let ready = tokio::time::timeout(STARTUP_BUDGET, async {
             loop {
                 match self.0.try_wait() {
                     Ok(None) => {}
-                    Ok(Some(_)) => return Err(self.diagnostics("Host exited before readiness")),
-                    Err(error) => {
-                        return Err(self.diagnostics(&format!("Host status failed: {error}")))
-                    }
+                    Ok(Some(_)) => return Err("Host exited before readiness".into()),
+                    Err(error) => return Err(format!("Host status failed: {error}")),
                 }
                 let address = discovery
                     .read(&self.1.log)
-                    .map_err(|error| self.diagnostics(&format!("Host log read failed: {error}")))?;
+                    .map_err(|error| format!("Host log read failed: {error}"))?;
                 if let Some(address) = address {
+                    self.1.address = Some(address);
                     let base = format!("http://{address}/api/v1");
-                    if client
-                        .get(format!("{base}/health"))
-                        .send()
-                        .await
-                        .is_ok_and(|response| response.status().is_success())
-                    {
-                        match self.0.try_wait() {
-                            Ok(None) => return Ok(base),
-                            Ok(Some(_)) => {
-                                return Err(self.diagnostics("Host exited during health probe"))
-                            }
-                            Err(error) => {
-                                return Err(
-                                    self.diagnostics(&format!("Host status failed: {error}"))
-                                )
-                            }
-                        }
+                    if probe_health(client, &base, &mut last_probe).await {
+                        return match self.0.try_wait() {
+                            Ok(None) => Ok(base),
+                            Ok(Some(_)) => Err("Host exited during health probe".into()),
+                            Err(error) => Err(format!("Host status failed: {error}")),
+                        };
                     }
+                } else {
+                    tokio::time::sleep(PROBE_INTERVAL).await;
                 }
-                tokio::time::sleep(Duration::from_millis(30)).await;
             }
         })
         .await;
-        ready.unwrap_or_else(|_| Err(self.diagnostics("Host readiness timed out")))
+        let reason = match ready {
+            Ok(Ok(base)) => return Ok(base),
+            Ok(Err(reason)) => reason,
+            Err(_) => "Host readiness timed out".into(),
+        };
+        Err(self.diagnostics(&format!("{reason}; last GET /api/v1/health: {last_probe}")))
     }
 }
 
@@ -239,6 +364,8 @@ mod tests {
     fn client() -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .pool_max_idle_per_host(0)
             .timeout(Duration::from_secs(2))
             .build()
@@ -266,6 +393,37 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn stalled_health_body_retains_evidence_within_the_next_probe_interval() {
+        let server = HttpServer::new(|| {
+            App::new().route(
+                "/api/v1/health",
+                web::get().to(|| async {
+                    HttpResponse::ServiceUnavailable()
+                        .insert_header(("retry-after", "1"))
+                        .streaming(futures::stream::pending::<
+                            Result<web::Bytes, actix_web::Error>,
+                        >())
+                }),
+            )
+        })
+        .workers(1)
+        .bind(("127.0.0.1", 0))
+        .unwrap();
+        let base = format!("http://{}/api/v1", server.addrs()[0]);
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let mut last_probe = HttpEvidence::default();
+        assert!(!probe_health(&client(), &base, &mut last_probe).await);
+        let evidence = last_probe.to_string();
+        assert!(evidence.contains("status=503"), "{evidence}");
+        assert!(evidence.contains("retry-after=\"1\""), "{evidence}");
+        assert!(evidence.contains("body_read=incomplete"), "{evidence}");
+        handle.stop(false).await;
+    }
+
+    #[actix_web::test]
     async fn ephemeral_hosts_publish_owned_addresses_and_restart() {
         let temp = tempfile::tempdir().unwrap();
         let first_data = temp.path().join("first");
@@ -283,6 +441,15 @@ mod tests {
         let second_base = second_base.unwrap();
         assert_ne!(first_base, second_base);
         assert_ne!(first_base, format!("http://{peer}/api/v1"));
+        let diagnostics = first.diagnostics("test");
+        assert!(
+            diagnostics.contains(&format!("endpoint={first_base}")),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(&format!("pid={}", first.0.id())),
+            "{diagnostics}"
+        );
         let first_launch = first.1.id;
         drop(first);
         std::fs::write(
@@ -322,6 +489,9 @@ mod tests {
             format!("launch={}", host.1.id),
             "generation=1".to_string(),
             "exit=exit status:".to_string(),
+            "endpoint=unannounced".to_string(),
+            format!("requested_port={}", peer.port()),
+            "last GET /api/v1/health: no HTTP result captured".to_string(),
             "host-1.log".to_string(),
             "Failed to bind listener".to_string(),
         ] {
