@@ -48,12 +48,7 @@ pub struct QueueCapacityReservation<'a> {
 impl QueueCapacityReservation<'_> {
     /// Observe an accepted ordinary native Child's exact launch generation.
     pub fn with_child_startup(mut self, child: &Session) -> Self {
-        if self
-            .scheduler
-            .ctx
-            .external_child_runner
-            .supports_native_child_startup(child)
-        {
+        if self.scheduler.supports_native_child_startup(child) {
             self.startup = ChildStartup::new(child);
         }
         self
@@ -613,6 +608,13 @@ impl SpawnScheduler {
         self.ctx
             .external_child_runner
             .native_task_liveness(session_id, run_id, child_birth)
+    }
+
+    /// Report whether the selected route uses the in-process native Child runner.
+    pub fn supports_native_child_startup(&self, child: &Session) -> bool {
+        self.ctx
+            .external_child_runner
+            .supports_native_child_startup(child)
     }
 
     pub fn supports_native_ticket_budget(&self) -> bool {
