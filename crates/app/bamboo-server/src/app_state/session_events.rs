@@ -53,6 +53,24 @@ impl bamboo_engine::execution::ChildRunLaunchHook for NotificationRelayLaunchHoo
     ) {
         ensure_notification_relay(&self.deps, &job.child_session_id, child_events);
     }
+
+    fn on_child_startup_blocked(
+        &self,
+        job: &bamboo_engine::execution::SpawnJob,
+        parent_events: broadcast::Sender<AgentEvent>,
+        reason: &'static str,
+    ) {
+        // A Child's startup problem must not end the parent's live stream.
+        let body = format!("SubAgent {}: {reason}", job.child_session_id);
+        if let Some(event) = self.deps.notification_service.mint_custom(
+            &job.parent_session_id,
+            "SubAgent startup blocked",
+            body,
+            bamboo_notification::NotificationPriority::Normal,
+        ) {
+            let _ = parent_events.send(event);
+        }
+    }
 }
 
 /// Ensure a notification relay task is running for `session_id`.
@@ -174,6 +192,7 @@ impl super::AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_engine::execution::{ChildRunLaunchHook, SpawnJob};
     use std::time::Duration;
 
     fn test_deps() -> (NotificationRelayDeps, tempfile::TempDir) {
@@ -188,6 +207,37 @@ mod tests {
             config: Arc::new(tokio::sync::RwLock::new(bamboo_llm::Config::default())),
         };
         (deps, dir)
+    }
+
+    #[test]
+    fn child_startup_notice_is_nonterminal_and_deduped_per_child() {
+        let (deps, _dir) = test_deps();
+        let hook = NotificationRelayLaunchHook::new(deps);
+        let (parent_events, mut events) = broadcast::channel(4);
+        let mut job = SpawnJob {
+            parent_session_id: "parent".into(),
+            child_session_id: "first-child".into(),
+            model: "model".into(),
+            disabled_tools: None,
+        };
+        let reason = "Prior execution could not be confirmed stopped";
+
+        hook.on_child_startup_blocked(&job, parent_events.clone(), reason);
+        hook.on_child_startup_blocked(&job, parent_events.clone(), reason);
+        job.child_session_id = "second-child".into();
+        hook.on_child_startup_blocked(&job, parent_events, reason);
+
+        for child_id in ["first-child", "second-child"] {
+            assert!(matches!(
+                events.try_recv(),
+                Ok(AgentEvent::Notification { session_id, body, .. })
+                    if session_id == "parent" && body == format!("SubAgent {child_id}: {reason}")
+            ));
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]

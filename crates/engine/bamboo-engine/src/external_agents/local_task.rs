@@ -2,7 +2,9 @@
 //! terminal publication still belong to the canonical Actor/Session stores.
 //! There is no broker, Worker IPC, or remote fallback in this backend.
 use super::runtime::NativeToolCeilingSource;
-use crate::execution::spawn::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
+use crate::execution::spawn::{
+    ExternalChildRunner, NativeTaskStartup, SessionInboxRuntimeBinding, SpawnJob,
+};
 use crate::runtime::{Agent, ExecuteRequestBuilder};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolExecutor;
@@ -24,7 +26,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -92,10 +94,20 @@ enum LaunchState {
     Stopped,
 }
 
-#[derive(Default)]
 struct LiveTaskSignals {
+    startup: watch::Sender<NativeTaskStartup>,
     entered_at: OnceLock<chrono::DateTime<chrono::Utc>>,
     renewal_started_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl Default for LiveTaskSignals {
+    fn default() -> Self {
+        Self {
+            startup: watch::channel(NativeTaskStartup::WaitingForCapacity).0,
+            entered_at: OnceLock::new(),
+            renewal_started_at: Mutex::new(None),
+        }
+    }
 }
 
 impl LiveTaskSignals {
@@ -528,7 +540,7 @@ impl LocalTaskChildRunner {
             .ok_or("Host local task runtime is unavailable".into())
     }
 
-    fn is_live_execution(
+    fn is_current_execution(
         &self,
         execution: &Execution,
         session_id: &str,
@@ -540,6 +552,16 @@ impl LocalTaskChildRunner {
             && execution.owner.created_at == child_birth
             && execution.owner.fence.actor_id == session_id
             && !execution.cancel.is_cancelled()
+    }
+
+    fn is_live_execution(
+        &self,
+        execution: &Execution,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.is_current_execution(execution, session_id, run_id, child_birth)
             && *lock(&execution.launch) == LaunchState::Running
             && lock(&execution.slot).is_some()
     }
@@ -619,6 +641,22 @@ impl ExternalChildRunner for LocalTaskChildRunner {
     ) -> Option<crate::execution::spawn::NativeTaskStart> {
         self.native_task_liveness(session_id, run_id, child_birth)
             .map(|live| live.start)
+    }
+
+    fn native_task_startup(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<watch::Receiver<NativeTaskStartup>> {
+        let execution = lock(&self.executions).get(session_id)?.clone();
+        let launch = lock(&execution.launch);
+        if !self.is_current_execution(&execution, session_id, run_id, child_birth)
+            || matches!(*launch, LaunchState::Stopping | LaunchState::Stopped)
+        {
+            return None;
+        }
+        Some(execution.signals.startup.subscribe())
     }
 
     fn native_task_liveness(
@@ -703,6 +741,10 @@ impl ExternalChildRunner for LocalTaskChildRunner {
     }
 
     async fn should_handle(&self, session: &Session) -> bool {
+        self.supports_native_child_startup(session)
+    }
+
+    fn supports_native_child_startup(&self, session: &Session) -> bool {
         session.kind == SessionKind::Child
             && session
                 .metadata
@@ -963,6 +1005,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let result = async {
         let slot = tokio::select! { biased; _ = cancel_token.cancelled() => return Err(AgentError::Cancelled), slot = self.concurrency.clone().acquire_owned() => slot.map_err(failure)? };
         *lock(&execution.slot) = Some(slot);
+        execution.signals.startup.send_replace(NativeTaskStartup::Preparing);
         crate::session_app::child_session::named_profile::validate_named_profile(session)
             .map_err(failure)?;
         if let (Some(policy), Some(workspace)) = (&self.permission, &session.workspace) {
@@ -1113,6 +1156,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                     // native slot and exact owner. Preparation/Actor start is
                     // earlier and cannot set this once-only, non-persisted fact.
                     let _ = signals.entered_at.set(chrono::Utc::now());
+                    signals.startup.send_replace(NativeTaskStartup::Started);
                     agent.execute(&mut owned_session, request.build()).await
                 })),
             )

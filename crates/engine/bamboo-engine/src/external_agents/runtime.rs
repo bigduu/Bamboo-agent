@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::runtime::execution::spawn::NativeTaskStartup;
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 use async_trait::async_trait;
 use bamboo_a2a::A2AJsonRpcClient;
 use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_llm::Config;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
@@ -147,6 +148,15 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn supports_native_child_startup(&self, session: &bamboo_domain::Session) -> bool {
+        // The production builder places the native route first unless the
+        // default Child uses the legacy Worker. A declined native route must
+        // keep the behavior of its selected process or remote backend.
+        self.runners
+            .first()
+            .is_some_and(|runner| runner.supports_native_child_startup(session))
+    }
+
     async fn owns_current_native_work(
         &self,
         session_id: &str,
@@ -181,6 +191,17 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
             return None;
         }
         self.runners[0].native_task_liveness(session_id, run_id, child_birth)
+    }
+
+    fn native_task_startup(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<watch::Receiver<NativeTaskStartup>> {
+        self.runners
+            .iter()
+            .find_map(|runner| runner.native_task_startup(session_id, run_id, child_birth))
     }
 
     fn shell_wait_activity_at(
@@ -1618,6 +1639,45 @@ mod placement_resolver_tests {
         DeployProfile, Node, NodePlacement, SshAuth, SshTarget, TrustLevel,
     };
     use bamboo_config::{RemoteActorPlacement, SchedulablePlacement};
+
+    #[test]
+    fn native_startup_observation_excludes_remote_roles_and_explicit_worker_profiles() {
+        use super::{CompositeExternalChildRunner, Config, ExternalChildRunner};
+        use crate::external_agents::local_task::LocalTaskChildRunner;
+        use bamboo_agent_core::Session;
+        use std::sync::Arc;
+
+        let mut config = Config::default();
+        config
+            .subagents_mut()
+            .remote_placements
+            .push(RemoteActorPlacement {
+                role: "remote-worker".into(),
+                endpoint: "ws://remote.invalid".into(),
+                token_env: None,
+                ca_cert_file: None,
+                broker_peer: None,
+                placement_requirements: None,
+            });
+        let runner = CompositeExternalChildRunner::new(vec![Arc::new(LocalTaskChildRunner::new(
+            &config, None, None,
+        ))]);
+        let mut child = Session::new_child("child", "root", "model", "Child");
+        assert!(runner.supports_native_child_startup(&child));
+        child
+            .metadata
+            .insert("subagent_type".into(), "remote-worker".into());
+        assert!(!runner.supports_native_child_startup(&child));
+
+        child.metadata.remove("subagent_type");
+        child
+            .metadata
+            .insert("external.agent_id".into(), "external-worker".into());
+        assert!(!runner.supports_native_child_startup(&child));
+        assert!(
+            !CompositeExternalChildRunner::new(Vec::new()).supports_native_child_startup(&child)
+        );
+    }
 
     #[test]
     fn explicit_broker_route_retains_unavailable_selection_and_redacted_debug() {
