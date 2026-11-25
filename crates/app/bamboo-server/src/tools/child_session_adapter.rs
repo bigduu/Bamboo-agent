@@ -169,6 +169,11 @@ impl ChildSessionAdapter {
             },
             None => preflight.await,
         };
+        let reservation = if admission_check.is_none() {
+            reservation.with_child_startup(&child)
+        } else {
+            reservation
+        };
         reservation
             .enqueue_announced_for_generation_revalidated(
                 Self::child_spawn_job(parent, &child)?,
@@ -683,11 +688,6 @@ impl ChildSessionAdapter {
                 tracing::warn!(child_id = %child.id, parent_id, "pending child launch has invalid parent authority");
                 continue;
             }
-            if let Err(error) = self.validate_child_model(&child).await {
-                tracing::warn!(child_id = %child.id, %error, "pending child model is not admitted");
-                first_error.get_or_insert(error);
-                continue;
-            }
             let already_enqueued = match self.recovered_launches.entry(child.id.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(slot) if *slot.get() == generation => true,
                 dashmap::mapref::entry::Entry::Occupied(mut slot) => {
@@ -702,24 +702,8 @@ impl ChildSessionAdapter {
             if already_enqueued {
                 continue;
             }
-            let job = match Self::child_spawn_job(&parent, &child) {
-                Ok(job) => job,
-                Err(error) => {
-                    self.recovered_launches
-                        .remove_if(&child.id, |_, value| *value == generation);
-                    tracing::warn!(child_id = %child.id, %error, "invalid pending child launch");
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
             let admission = self
-                .scheduler
-                .enqueue_announced_for_generation(
-                    job,
-                    Some(child.title.clone()),
-                    None,
-                    Some(generation),
-                )
+                .admit_child_run_checked(&parent, &child, None, None)
                 .await;
             match admission {
                 Ok(bamboo_domain::AdmissionCommit::Committed(())) => enqueued += 1,
@@ -729,7 +713,7 @@ impl ChildSessionAdapter {
                         .remove_if(&child.id, |_, value| *value == generation);
                     if let Err(error) = admission {
                         tracing::warn!(child_id = %child.id, %error, "failed to recover pending child launch");
-                        first_error.get_or_insert(ChildSessionError::Execution(error));
+                        first_error.get_or_insert(error);
                     }
                 }
             }
@@ -2063,17 +2047,9 @@ impl ChildSessionPort for ChildSessionAdapter {
         // step so the model can spawn several children without each one
         // suspending it — see `register_parent_wait_for_child` /
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
-        let child = self.ensure_child_launch_intent(child).await?;
         let admission = self
-            .scheduler
-            .enqueue_announced_for_generation(
-                Self::child_spawn_job(parent, &child)?,
-                Some(child.title.clone()),
-                None,
-                Some(child.child_launch_generation()),
-            )
-            .await
-            .map_err(ChildSessionError::Execution)?;
+            .admit_child_run_checked(parent, child, None, None)
+            .await?;
         match admission {
             bamboo_domain::AdmissionCommit::Cancelled => Err(ChildSessionError::Execution(
                 "child launch generation was cancelled before activation".into(),

@@ -5,12 +5,22 @@ three different ways (CLI, HTTP, in-process SDK), then where to go next.
 
 ## 1. Install
 
+Download the executable for your platform from the [latest release](https://github.com/bigduu/Bamboo-agent/releases/latest), or install the published crate.
+
 ```bash
-cargo install --path .        # from a checkout, or: cargo install bamboo-agent
+cargo install bamboo-agent --locked
 ```
 
-Or build/run straight from the workspace without installing:
-`cargo run --bin bamboo -- <subcommand>`.
+### Build from source
+
+Use Rust 1.97 or newer. Run these commands from the repository root to stage the locked Lotus Next frontend and install Bamboo.
+
+```bash
+node scripts/frontend-package.cjs stage
+cargo install --path . --locked
+```
+
+For an API-only build, set `BAMBOO_FRONTEND_BUILD_MODE=api-only` in your shell before running `cargo build --bin bamboo`. Use `$env:BAMBOO_FRONTEND_BUILD_MODE = "api-only"` in PowerShell. See the [frontend staging script](../../scripts/frontend-package.cjs) for other frontend options.
 
 ## 2. Configure a provider
 
@@ -71,10 +81,14 @@ an admitted model with `bamboo -p "Reply with OK." -m work:your-model-id`.
 bamboo -p "List the files here and tell me what this project does."
 ```
 
-Boots the full runtime (including sub-agent support), runs one turn, prints
-the result, exits. Add `-s <session-id>` on a later call to continue the same
-conversation. Plain mode reports the number of reasoning characters received
-on stderr.
+The command starts the agent runtime, runs one turn, prints the result, and
+exits. Answer tool or clarification prompts in the same terminal. The
+`bamboo respond` command applies to separate runs owned by `bamboo serve`.
+
+For a conversation with follow-up questions, use the web interface from a build
+with the frontend. Run `bamboo serve` and open [localhost:9562](http://127.0.0.1:9562).
+`bamboo -p "ping" --echo` checks the local transport using an echo executor.
+It makes no model calls.
 
 Use `--json` with the full headless command for one terminal `result` object on
 stdout.
@@ -96,7 +110,7 @@ started by this command. The counters include accounted retries and can use
 engine estimates if the provider omits usage. Child executions and background
 services have separate accounting.
 Known pre-execution failures report zero, and a missing execution snapshot
-reports `usage: null`. Each `-s` invocation reports its own execution.
+reports `usage: null`.
 
 ### b) HTTP server + curl
 
@@ -121,10 +135,10 @@ curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-`chat` only **persists** the turn; `execute` is what actually **runs** the
-loop; `events` streams it live. Subscribe before executing to avoid missing
-response tokens. See [`docs/guides/API.md`](../guides/API.md) for
-the full HTTP/SSE surface.
+`chat` admits the input. `execute` starts the agent loop and `events` streams
+the events. Subscribe before executing to receive the live response. See
+the [API reference](./API.md#create-chat-message) for the input receipt and
+transcript behavior.
 
 ### c) In-process Rust SDK (no server)
 
@@ -164,7 +178,7 @@ connecting an MCP server).
 | Drive Bamboo from Telegram/Feishu | [Connect / IM bridge how-to](./CONNECT.md) |
 | Install/trust a plugin (e.g. Nova) | [Plugins how-to](./PLUGINS.md) |
 | Run it as a long-lived server | [Deploy how-to](./DEPLOY.md) |
-| Embed the agent loop in your own Rust app | [`examples/`](../../examples/), the SDK section of the [README](../../README.md#use-it-as-a-rust-sdk-in-process) |
+| Embed the agent loop in your own Rust app | [`examples/`](../../examples/), the [README integration links](../../README.md#build-with-bamboo) |
 | See the full HTTP/SSE API | [`docs/guides/API.md`](./API.md) |
 | Upgrade across a breaking change | [`docs/guides/MIGRATION_GUIDE.md`](./MIGRATION_GUIDE.md) |
 | Understand the crate layout / architecture | [`docs/README.md`](../README.md) |

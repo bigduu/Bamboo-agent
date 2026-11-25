@@ -98,3 +98,10 @@ and any existing SVG asset is preserved.
 - Pixels: 1672 × 941 (RGB PNG)
 - Bytes: 2219576
 - SHA-256: `6a30f5406e6361be6fe17eed5d454661cf8e7f1f99bf2156310a1f64caf4e5f5`
+
+## Earlier README material
+
+- [Browser project setup recording](./demos/project-workspace.gif) · [Recording notes](./demos/README.md) · [Brand illustration](./assets/bamboo-nature-hero.png).
+- [Native chat and SDK integration notes](https://github.com/bigduu/Bamboo-agent/blob/24cc05a4f0269440e0d4f053fdf83aaedbdf7e4d/README.md#L130-L180).
+- [Tailscale setup and data boundaries](https://github.com/bigduu/Bamboo-agent/blob/24cc05a4f0269440e0d4f053fdf83aaedbdf7e4d/README.md#L182-L195).
+- [Skill implementation notes from the earlier README](https://github.com/bigduu/Bamboo-agent/blob/24cc05a4f0269440e0d4f053fdf83aaedbdf7e4d/README.md#L227-L482).
