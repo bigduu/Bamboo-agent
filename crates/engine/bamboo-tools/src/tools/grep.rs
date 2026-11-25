@@ -26,6 +26,13 @@ const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
 const RESULT_TOO_LARGE_ERROR: &str = "Result too large; refine query and retry.";
 
+#[derive(Debug, PartialEq, Eq)]
+enum SearchTextRead {
+    Complete,
+    TooLarge,
+    Unreadable,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
@@ -165,15 +172,25 @@ impl GrepTool {
         files
     }
 
-    fn read_search_text(reader: impl Read, content: &mut String) -> bool {
+    fn read_search_text(reader: impl Read, content: &mut String) -> SearchTextRead {
         // A file can grow after stat. Check one extra byte and skip the
         // entire file if it is oversized or contains invalid UTF-8.
         content.clear();
-        reader
-            .take(MAX_FILE_BYTES + 1)
-            .read_to_string(content)
-            .is_ok()
-            && content.len() as u64 <= MAX_FILE_BYTES
+        let mut reader = reader.take(MAX_FILE_BYTES + 1);
+        let result = reader.read_to_string(content);
+        if reader.limit() == 0 {
+            SearchTextRead::TooLarge
+        } else if result.is_ok() {
+            SearchTextRead::Complete
+        } else {
+            SearchTextRead::Unreadable
+        }
+    }
+
+    fn exact_file_size_limit_error() -> ToolError {
+        ToolError::Execution(format!(
+            "Grep did not search the specified file because it exceeds the per-file search limit of {MAX_FILE_BYTES} bytes."
+        ))
     }
 
     fn literal_matcher(
@@ -366,7 +383,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents using ripgrep-style regex parameters. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
+        "Search file contents using ripgrep-style regex parameters. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Directory searches skip oversized files; a search of one oversized file reports the size limit. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -455,7 +472,8 @@ impl GrepTool {
             .as_ref()
             .map(|_| SearcherBuilder::new().bom_sniffing(false).build());
 
-        let files = if root.is_file() {
+        let exact_file = root.is_file();
+        let files = if exact_file {
             vec![root.to_path_buf()]
         } else if root.is_dir() {
             Self::collect_files(
@@ -488,15 +506,25 @@ impl GrepTool {
             let Ok(metadata) = std::fs::metadata(&file) else {
                 continue;
             };
-            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            if !metadata.is_file() {
+                continue;
+            }
+            if metadata.len() > MAX_FILE_BYTES {
+                if exact_file {
+                    return Err(Self::exact_file_size_limit_error());
+                }
                 continue;
             }
 
             let Ok(reader) = std::fs::File::open(&file) else {
                 continue;
             };
-            if !Self::read_search_text(reader, &mut read_buffer) || read_buffer.contains('\0') {
-                continue;
+            match Self::read_search_text(reader, &mut read_buffer) {
+                SearchTextRead::Complete if !read_buffer.contains('\0') => {}
+                SearchTextRead::TooLarge if exact_file => {
+                    return Err(Self::exact_file_size_limit_error());
+                }
+                _ => continue,
             }
             let content = read_buffer.as_str();
             performance.files_scanned += 1;
@@ -1128,16 +1156,58 @@ mod tests {
         let bytes = vec![b'x'; MAX_FILE_BYTES as usize + 32];
         let at_limit = &bytes[..MAX_FILE_BYTES as usize];
         let mut buffer = String::new();
-        assert!(GrepTool::read_search_text(at_limit, &mut buffer));
+        assert_eq!(
+            GrepTool::read_search_text(at_limit, &mut buffer),
+            SearchTextRead::Complete
+        );
         assert_eq!(buffer.len() as u64, MAX_FILE_BYTES);
 
         let mut reader = std::io::Cursor::new(bytes);
-        assert!(!GrepTool::read_search_text(&mut reader, &mut buffer));
+        assert_eq!(
+            GrepTool::read_search_text(&mut reader, &mut buffer),
+            SearchTextRead::TooLarge
+        );
         assert_eq!(reader.position(), MAX_FILE_BYTES + 1);
-        assert!(!GrepTool::read_search_text(&[0xFF][..], &mut buffer));
-        assert!(GrepTool::read_search_text(&b"hello"[..], &mut buffer));
+        assert_eq!(
+            GrepTool::read_search_text(&[0xFF][..], &mut buffer),
+            SearchTextRead::Unreadable
+        );
+        assert_eq!(
+            GrepTool::read_search_text(&b"hello"[..], &mut buffer),
+            SearchTextRead::Complete
+        );
         assert_eq!(buffer, "hello");
         assert!(buffer.capacity() >= MAX_FILE_BYTES as usize);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_oversized_explicit_file_without_returning_a_no_match_result() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        bytes[..7].copy_from_slice(b"needle\n");
+        let tool = GrepTool::new();
+        let args = json!({"pattern": "needle", "path": file.path()});
+
+        tokio::fs::write(file.path(), &bytes[..MAX_FILE_BYTES as usize])
+            .await
+            .unwrap();
+        let at_limit = run(&tool, args.clone()).await.unwrap();
+        assert!(at_limit.success);
+        assert_eq!(result_lines(&at_limit).len(), 1);
+
+        tokio::fs::write(file.path(), &bytes).await.unwrap();
+        let error = run(&tool, args.clone())
+            .await
+            .expect_err("an oversized exact file was not searched");
+        assert!(matches!(error, ToolError::Execution(_)));
+        let message = error.to_string();
+        assert!(message.contains("did not search the specified file"));
+        assert!(message.contains(&MAX_FILE_BYTES.to_string()));
+
+        tokio::fs::write(file.path(), "unrelated\n").await.unwrap();
+        let no_match = run(&tool, args).await.unwrap();
+        assert!(no_match.success);
+        assert!(no_match.result.is_empty());
     }
 
     #[tokio::test]
