@@ -3,7 +3,8 @@
 mod handler;
 mod types;
 
-pub use handler::{handler, handler_with_run};
+pub use handler::{cancel_background_command_wait, handler, handler_with_run};
+pub use types::BackgroundCommandStopRequest;
 // Reused by the v2 WS multiplex `control` channel (`{"type":"stop"}`).
 pub(crate) use handler::cancel_session;
 

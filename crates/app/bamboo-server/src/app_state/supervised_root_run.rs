@@ -706,6 +706,12 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn exact_background_stop_reaps_the_command_and_does_not_resume_its_run() {
+        super::super::observer_subscriptions::tests::background_exec::exercise_exact_background_stop()
+            .await;
+    }
+
+    #[actix_web::test]
     async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
         super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
             PermissionDecisionKind::DenyOnce,
