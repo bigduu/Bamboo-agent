@@ -1,59 +1,83 @@
 //! Preparing a running local Root for a planned host update.
 
-use std::sync::OnceLock;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use bamboo_agent_core::{AgentError, Message, Session};
+use bamboo_agent_core::{AgentError, Session};
 use bamboo_domain::{
     AgentRuntimeState, AgentStatusState, ProviderModelRef, SessionKind, SuspensionState,
 };
+use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::config::AgentLoopConfig;
-use crate::session_activation::ParkedUpdateRoot;
+use crate::session_activation::{ParkedUpdateRoot, SessionActivationRouter};
 use crate::session_app::provider_model::session_effective_model_ref;
 
 pub(crate) use bamboo_domain::PLANNED_UPDATE_SUSPEND_REASON as SUSPEND_REASON;
 
 pub(crate) struct StreamInterruption<'a> {
-    router: &'a crate::session_activation::SessionActivationRouter,
-    ignored: Option<uuid::Uuid>,
-    interrupted: &'a OnceLock<uuid::Uuid>,
+    router: &'a SessionActivationRouter,
+    committed: &'a AtomicBool,
+}
+
+#[derive(Default)]
+pub(crate) struct StreamUpdateControl {
+    pub(crate) discard: CancellationToken,
+    pub(crate) paused: watch::Sender<Duration>,
 }
 
 impl<'a> StreamInterruption<'a> {
     pub(crate) fn for_session(
         session: &Session,
         config: &'a AgentLoopConfig,
-        ignored: Option<uuid::Uuid>,
-        interrupted: &'a OnceLock<uuid::Uuid>,
+        committed: &'a AtomicBool,
     ) -> Option<Self> {
         let router = config.session_update_router.as_ref()?;
         checkpoint_model(session, config)?;
-        Some(Self {
-            router,
-            ignored,
-            interrupted,
-        })
+        Some(Self { router, committed })
     }
 
-    /// Record the update that interrupted this request before it unwinds through
-    /// the normal provider cancellation path. The runner's user token stays open.
-    pub(crate) async fn wait(interruption: Option<(&Self, &[Message])>) {
-        if let Some((stream, messages)) = interruption {
-            let update = stream
-                .router
-                .wait_for_immediate_update(stream.ignored)
-                .await;
-            if crate::session_app::truncation::unresolved_tool_call_ids(messages).is_empty() {
-                let _ = stream.interrupted.set(update);
-                return;
+    /// Hold the original provider stream and its accumulated output while
+    /// preparation is reversible. Only a committed handoff discards the stream.
+    pub(crate) async fn drive<F: Future>(
+        &self,
+        stream: F,
+        session: &mut Session,
+        config: &AgentLoopConfig,
+        cancel: &CancellationToken,
+        control: &StreamUpdateControl,
+    ) -> Result<F::Output, AgentError> {
+        tokio::pin!(stream);
+        let mut ignored = None;
+        loop {
+            let update = tokio::select! {
+                biased;
+                update = self.router.wait_for_immediate_update(ignored), if !cancel.is_cancelled() => update,
+                result = &mut stream => return Ok(result),
+            };
+            let paused_at = Instant::now();
+            match checkpoint_for_update(self.router, update, session, config, cancel).await {
+                Ok(true) => {
+                    self.committed.store(true, Ordering::Relaxed);
+                    control.discard.cancel();
+                    return Ok(stream.await);
+                }
+                Ok(false) => {
+                    control.paused.send_modify(|total| {
+                        *total = total.saturating_add(paused_at.elapsed());
+                    });
+                    ignored = Some(update);
+                }
+                Err(AgentError::Cancelled) => return Ok(stream.await),
+                Err(error) => return Err(error),
             }
         }
-        std::future::pending().await
     }
 
-    pub(crate) fn interrupted(&self) -> bool {
-        self.interrupted.get().is_some()
+    pub(crate) fn committed(&self) -> bool {
+        self.committed.load(Ordering::Relaxed)
     }
 }
 
@@ -84,8 +108,8 @@ fn checkpoint_model(session: &Session, config: &AgentLoopConfig) -> Option<Provi
     Some(model)
 }
 
-/// Called between complete rounds. Save through the old exact writer before
-/// reporting a parked round, then keep the original loop alive for an abort.
+/// Save the complete transcript through the old exact writer before parking
+/// the Root, while the original loop remains available for an abort.
 pub(super) async fn pause_before_model_round(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -97,8 +121,21 @@ pub(super) async fn pause_before_model_round(
     let Some(update) = router.preparing_update() else {
         return Ok(false);
     };
+    checkpoint_for_update(router, update, session, config, cancel).await
+}
+
+async fn checkpoint_for_update(
+    router: &SessionActivationRouter,
+    update: uuid::Uuid,
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    cancel: &CancellationToken,
+) -> Result<bool, AgentError> {
     if cancel.is_cancelled() {
         return Err(AgentError::Cancelled);
+    }
+    if router.preparing_update() != Some(update) {
+        return Ok(false);
     }
     let Some(model) = checkpoint_model(session, config) else {
         return Ok(false);

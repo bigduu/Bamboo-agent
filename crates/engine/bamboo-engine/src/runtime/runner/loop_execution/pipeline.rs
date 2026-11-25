@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -23,8 +23,8 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::round_lifecycle::{
-    fallback_tool_is_resident, uses_sticky_fallback, ImmediateUpdatePolicy, RoundRecoveryPolicy,
-    RoundToolDispatch, TaskSplitPrompt,
+    fallback_tool_is_resident, uses_sticky_fallback, RoundRecoveryPolicy, RoundToolDispatch,
+    TaskSplitPrompt,
 };
 use crate::runtime::runner::session_setup::tool_schemas::{
     resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
@@ -3755,7 +3755,6 @@ async fn run_pipeline_inner(
     let mut no_tool_call_continuation_streak: u32 = 0;
     let mut split_recovery: Option<SplitRecovery> = None;
     let recovery_token_limit = config.run_budget.max_total_tokens;
-    let mut ignored_immediate_update = None;
 
     loop {
         let standalone_discovery = std::mem::take(&mut discovery_correction_pending);
@@ -4040,7 +4039,7 @@ async fn run_pipeline_inner(
         let mut round_had_tool_calls = false;
         let mut terminal_error: Option<AgentError> = None;
         let mut hook_suspension: Option<AgentError> = None;
-        let interrupted_for_update = OnceLock::new();
+        let interrupted_for_update = AtomicBool::new(false);
 
         // Canonical usage + activity for THIS round, shared by runtime budget
         // totals and durable metrics. Reset every round; accumulated across
@@ -4131,10 +4130,7 @@ async fn run_pipeline_inner(
                     && output_limit_recovery.is_none()
                     && !standalone_discovery
                     && !max_rounds_summary_used)
-                    .then_some(ImmediateUpdatePolicy {
-                        ignored: ignored_immediate_update,
-                        interrupted: &interrupted_for_update,
-                    }),
+                    .then_some(&interrupted_for_update),
             };
             let split_tools;
             let request_tools = match split_request.as_ref() {
@@ -4169,7 +4165,7 @@ async fn run_pipeline_inner(
             .await
             {
                 Ok(output) => output,
-                Err(AgentError::Cancelled) if interrupted_for_update.get().is_some() => break,
+                Err(AgentError::Cancelled) if interrupted_for_update.load(Ordering::Relaxed) => break,
                 Err(error) if output_limit_recovery.is_some() || standalone_discovery || max_rounds_summary_used => {
                     terminal_error = Some(error);
                     break;
@@ -5018,22 +5014,9 @@ async fn run_pipeline_inner(
         // usage that its durable round record receives below.
         round_activity.commit_to_runtime(&mut state.runtime_state);
 
-        if let Some(update) = interrupted_for_update.into_inner() {
-            state_bridge::write_runtime_state(session, &state.runtime_state);
-            if crate::runtime::planned_update::pause_before_model_round(
-                session,
-                config,
-                cancel_token,
-            )
-            .await?
-            {
-                crate::runtime::planned_update::mark_suspended(session, &mut state.runtime_state);
-                break;
-            }
-            // Abort resumes the same local run. If the checkpoint failed, let
-            // it finish naturally while this update still holds admission.
-            ignored_immediate_update = Some(update);
-            continue;
+        if interrupted_for_update.into_inner() {
+            crate::runtime::planned_update::mark_suspended(session, &mut state.runtime_state);
+            break;
         }
 
         if let Some(error) = hook_suspension {

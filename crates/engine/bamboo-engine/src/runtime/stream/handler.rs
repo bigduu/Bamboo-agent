@@ -8,9 +8,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::planned_update::StreamInterruption;
+use crate::runtime::planned_update::StreamUpdateControl;
 use bamboo_agent_core::tools::ToolCall;
-use bamboo_agent_core::{AgentError, AgentEvent, Message, StreamTimeoutError, StreamTimeoutPhase};
+use bamboo_agent_core::{AgentError, AgentEvent, StreamTimeoutError, StreamTimeoutPhase};
 use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::retry::{InitialHttpRetry, InitialHttpRetryObserver};
 use bamboo_llm::LLMStream;
@@ -402,7 +402,7 @@ pub(crate) async fn consume_llm_stream_for_round(
     cancel_token: &CancellationToken,
     session_id: &str,
     timeout_context: &StreamTimeoutContext,
-    update: Option<(&StreamInterruption<'_>, &[Message])>,
+    update: Option<&StreamUpdateControl>,
 ) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
     consume::consume_llm_stream_internal_with_partial(
         stream,
