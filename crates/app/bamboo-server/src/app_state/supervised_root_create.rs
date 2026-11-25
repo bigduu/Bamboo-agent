@@ -749,10 +749,6 @@ impl SupervisedRootCreator {
         candidate
             .metadata
             .insert("session.origin.v1".into(), "supervisor_created".into());
-        candidate.metadata.insert(
-            bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
-            matches!(authority, CreationAuthority::Supervisor { .. }).to_string(),
-        );
         Ok(candidate)
     }
 

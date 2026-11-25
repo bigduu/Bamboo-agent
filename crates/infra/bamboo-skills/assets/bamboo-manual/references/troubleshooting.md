@@ -32,13 +32,11 @@ or arbitrary error text into model context.
 
 ## Memory is missing or surprising
 
-Check current Project scope and injection/recall flags before reasoning about
-index quality. Lexical recall, optional model rerank, Dream freshness and
-prompt budgets are distinct. Counts can establish whether candidates or
-injected items existed without exposing their bodies. Never move Project facts
-to Global merely to bypass unavailable scope. Dream is derived context, not
-proof. Read `memory.md`; don't create a fallback memory file or run reindexing
-without a separate authorized need.
+Check that the current Session can call `memory`, confirm its assigned Project
+for Project queries, and inspect the lexical query result. Result counts help
+diagnose the search without exposing memory bodies. Keep Project facts within
+their assigned scope. Dream freshness applies to the background snapshot.
+Read `memory.md` for the on-demand lookup and scope contract.
 
 ## A hook did not run
 

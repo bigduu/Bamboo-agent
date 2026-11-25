@@ -15,13 +15,11 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_metrics::MetricsCollector;
 
 /// Default lifecycle manager that delegates to existing runner functions.
-pub struct DefaultLifecycleManager {
-    llm: Arc<dyn LLMProvider>,
-}
+pub struct DefaultLifecycleManager;
 
 impl DefaultLifecycleManager {
-    pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
-        Self { llm }
+    pub fn new(_llm: Arc<dyn LLMProvider>) -> Self {
+        Self
     }
 }
 
@@ -65,7 +63,6 @@ impl LifecycleManager for DefaultLifecycleManager {
             task_context,
             runtime_state,
             config,
-            self.llm.clone(),
             tools,
             &crate::runtime::runner::round_prelude::RoundPreludeFrame {
                 execution_id: &execution_id,
@@ -103,7 +100,6 @@ impl LifecycleManager for DefaultLifecycleManager {
             task_context,
             runtime_state,
             config,
-            self.llm.clone(),
             tools,
             &crate::runtime::runner::round_prelude::RoundPreludeFrame {
                 execution_id: &execution_id,
@@ -504,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_typed_inbox_input_drives_current_round_memory_recall() {
+    async fn adapter_admits_inbox_input_without_passive_memory_recall() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
@@ -519,24 +515,11 @@ mod tests {
             SessionInboxLimits::default(),
         ));
 
-        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path().join("jiandu"));
-        memory
-            .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Global,
-                None,
-                bamboo_memory::memory_store::DurableMemoryType::Reference,
-                "Adapter silver heron rule",
-                "The silver heron request must use the lifecycle memory boundary.",
-                &["silver".to_string(), "heron".to_string()],
-                Some("adapter-typed-inbox-recall"),
-                "model",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-
         let mut persisted = Session::new("adapter-typed-inbox-recall", "model");
+        persisted.metadata.insert(
+            "external_memory_rendered".into(),
+            "stale memory from a previous request".into(),
+        );
         persisted.add_message(Message::system("base prompt"));
         persisted.add_message(Message::user("unrelated earlier request"));
         storage.save_session(&persisted).await.unwrap();
@@ -558,7 +541,6 @@ mod tests {
             persistence: Some(persistence),
             session_inbox: Some(inbox),
             app_data_dir: Some(directory.path().join("bamboo")),
-            memory_store: memory,
             prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: true,
@@ -596,19 +578,16 @@ mod tests {
                 provider.as_ref(),
             )
             .await
-            .expect("typed inbox recall should prepare the current round");
+            .expect("typed inbox input should prepare the current round");
 
         assert!(running.messages.iter().any(|message| {
             message.id == envelope.id.as_str()
                 && message.role == bamboo_domain::Role::User
                 && message.content == query
         }));
-        let rendered =
-            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
-                .expect("current-round recall should render external memory");
-        assert!(rendered.contains("Adapter silver heron rule"));
         assert!(
-            rendered.contains("The silver heron request must use the lifecycle memory boundary.")
+            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
+                .is_none()
         );
 
         let observability: bamboo_agent_core::PromptMemoryObservability = serde_json::from_str(
@@ -619,7 +598,7 @@ mod tests {
         )
         .unwrap();
         assert!(observability.latest_user_query_present);
-        assert_eq!(observability.relevant_memory_status, "lexical");
-        assert_eq!(observability.relevant_memory_count, 1);
+        assert_eq!(observability.relevant_memory_status, "disabled");
+        assert_eq!(observability.relevant_memory_count, 0);
     }
 }

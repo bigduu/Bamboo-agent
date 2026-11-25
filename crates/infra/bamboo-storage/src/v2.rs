@@ -1926,6 +1926,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",
+    "runtime.ledger_and_usage_context.v1",
     "execute.startup_handoff_at",
     "execute.pending_turn_message_id",
     "goal.state",
@@ -1978,8 +1979,6 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     // user-created session and must not inherit the source's
     // supervisor_created origin mark (same reset discipline as id/created_at).
     copy.metadata.remove("session.origin.v1");
-    copy.metadata
-        .remove(bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY);
     copy.metadata.remove(SIDE_CHAT_CLEAR_EPOCH_KEY);
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;

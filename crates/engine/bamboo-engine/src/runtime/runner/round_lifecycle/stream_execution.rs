@@ -13,11 +13,11 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
-    build_instruction_overlay_context_block, build_plan_mode_context_block,
-    build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block, build_session_identity_context_block,
-    build_supervisor_route_observation, build_task_list_context_block,
-    build_workspace_context_block,
+    build_instruction_overlay_context_block, build_memory_usage_context_block,
+    build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_project_resources_context_block, build_root_orchestration_context_block,
+    build_session_identity_context_block, build_supervisor_route_observation,
+    build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -848,6 +848,7 @@ pub(super) async fn project_request_usage(
         prepared_context,
         config,
         effective_tool_schemas.as_ref(),
+        wire_schemas.as_ref(),
         model,
         loading_mode,
         native_transcript_protocol_for(llm, model),
@@ -880,6 +881,7 @@ fn build_request_envelope_reconciled(
         prepared_context,
         config,
         tool_schemas,
+        tool_schemas,
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
@@ -894,6 +896,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
+    wire_tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
     native_protocol: Option<ProviderProtocol>,
@@ -1249,11 +1252,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
-    // Recall, Dream, and agenda are current read models. Keeping them outside
-    // the generated ledger prevents old snapshots from reappearing after an
-    // edit, archive, or project reassignment.
-    let external_memory_message_id = build_external_memory_context_block(session).map(|block| {
-        // Place the current snapshot before the user who owns this turn.
+    let ledger_context = build_external_memory_context_block(session);
+    let has_ledger_context = ledger_context.is_some();
+    let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
+    if !standalone_discovery {
+        current_context.extend(build_memory_usage_context_block(
+            session,
+            tool_schemas,
+            wire_tool_schemas,
+            loading_mode,
+            config.permission_mode.unwrap_or_default(),
+        ));
+    }
+    // The agenda and recall instructions are current context, outside the
+    // generated ledger. Present them before the user who owns this turn.
+    let external_memory_message_id = if current_context.is_empty() {
+        None
+    } else {
         // Tool continuations then end with the same call/results as before.
         let anchor = real_transcript
             .iter()
@@ -1274,11 +1289,16 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                     .rposition(|message| message.id == anchor.id)
             })
             .unwrap_or(0);
-        let message = block.render_runtime_context_message();
-        let id = message.id.clone();
-        model_transcript.insert(index, message);
-        id
-    });
+        model_transcript.splice(
+            index..index,
+            current_context
+                .into_iter()
+                .map(|block| block.render_runtime_context_message()),
+        );
+        // Anthropic moves this ID to the live tail. The recall instructions
+        // stay with the context that precedes the current user request.
+        has_ledger_context.then(|| model_transcript[index].id.clone())
+    };
     cache_plan.anthropic_history = real_transcript.last().map(|newest| {
         let previous_message_id = ledger
             .prior_message_count
@@ -1776,6 +1796,7 @@ pub(super) async fn execute_llm_stream(
             &prepared_context,
             config,
             tool_schemas,
+            wire_schemas,
             model,
             loading_mode,
             native_transcript_protocol_for(llm, model),

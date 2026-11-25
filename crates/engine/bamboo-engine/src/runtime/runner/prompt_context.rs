@@ -2,96 +2,22 @@
 
 mod external_memory;
 mod goal;
-mod memory_rerank;
 mod plan_mode;
 mod plan_runtime;
 mod system_sections;
 mod task;
 
 pub(crate) use external_memory::{
-    is_supervisor_created_session, PromptMemoryExposureProvenance, PromptMemoryRuntimeContext,
-    EXTERNAL_MEMORY_RENDERED_KEY, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    refresh_external_memory_context, PromptMemoryExposureProvenance, EXTERNAL_MEMORY_RENDERED_KEY,
+    PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
-
-pub(crate) async fn refresh_external_memory_context(
-    session: &mut bamboo_agent_core::Session,
-    memory: &bamboo_memory::memory_store::MemoryStore,
-    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
-    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
-    app_data_dir: Option<&std::path::Path>,
-) -> PromptMemoryExposureProvenance {
-    external_memory::refresh_external_memory_context(
-        session,
-        memory,
-        prompt_memory_flags,
-        runtime_context,
-        project_context_resolver,
-        app_data_dir,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(super) async fn refresh_external_memory_context_with_store(
-    session: &mut bamboo_agent_core::Session,
-    memory: &bamboo_memory::memory_store::MemoryStore,
-    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
-) -> PromptMemoryExposureProvenance {
-    external_memory::refresh_external_memory_context_with_store(
-        session,
-        memory,
-        prompt_memory_flags,
-        runtime_context,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(super) async fn refresh_external_memory_context_with_stores(
-    session: &mut bamboo_agent_core::Session,
-    memory: &bamboo_memory::memory_store::MemoryStore,
-    ledger_data_dir: &std::path::Path,
-    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
-) -> PromptMemoryExposureProvenance {
-    external_memory::refresh_external_memory_context_with_stores(
-        session,
-        memory,
-        ledger_data_dir,
-        prompt_memory_flags,
-        runtime_context,
-    )
-    .await
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
-    session: &mut bamboo_agent_core::Session,
-    memory: &bamboo_memory::memory_store::MemoryStore,
-    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
-    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
-) -> PromptMemoryExposureProvenance {
-    external_memory::refresh_external_memory_context_with_store_and_resolver(
-        session,
-        memory,
-        prompt_memory_flags,
-        runtime_context,
-        project_context_resolver,
-    )
-    .await
-}
 
 pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     external_memory::strip_existing_external_memory(prompt)
 }
 
-/// The rendered external-memory section for this round, read from the session
-/// field the async refresh populates (`None` when there is none). Built into a
-/// volatile `ExternalMemory` block by the request assembler.
+/// The ledger agenda and context usage for this round, carried by the
+/// existing volatile `ExternalMemory` block.
 pub(crate) fn render_external_memory_section(
     session: &bamboo_agent_core::Session,
 ) -> Option<String> {

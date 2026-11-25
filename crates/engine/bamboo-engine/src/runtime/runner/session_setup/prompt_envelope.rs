@@ -1,10 +1,10 @@
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
-use bamboo_domain::{CapabilityLoadingMode, SessionKind};
-
-use crate::runtime::runner::prompt_context::is_supervisor_created_session;
+use bamboo_domain::{
+    CapabilityLoadingMode, PermissionMode, SessionKind, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+};
 
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
@@ -46,27 +46,85 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
     // whitespace or control characters remains inert data in the prompt.
     let encoded_session_id =
         serde_json::to_string(&session.id).expect("Session ID string is JSON serializable");
-    let mut content = format!(
-        "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
-    );
-    if is_supervisor_created_session(session) {
-        content.push_str(concat!(
-            "\n\nLook up memory when prior decisions or preferences matter. ",
-            "Use `discover_capabilities` to find `memory` if it is discoverable and not already callable. ",
-            "Call action=query with short keywords. Use scope=project when this Session has an assigned Project, ",
-            "scope=section when it has an assigned Section, and scope=global for cross-project facts. ",
-            "Use action=get for selected IDs and action=session_read for this Session's continuity notes. ",
-            "If this Session delegates tool execution, have an authorized worker in the same Project look up Project facts. ",
-            "Verify live state before relying on recalled facts."
-        ));
-    }
     ContextBlock::new(
         ContextBlockType::SessionIdentity,
         ContextBlockPriority::Critical,
         ContextBlockStability::SessionStable,
         "Current Session Identity",
-        content,
+        format!(
+            "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
+        ),
     )
+}
+
+/// Guidance follows the current request's capability exposure and never
+/// survives as a historical invitation after the tool becomes unavailable.
+pub(crate) fn build_memory_usage_context_block(
+    session: &Session,
+    eligible_schemas: &[ToolSchema],
+    wire_schemas: &[ToolSchema],
+    loading_mode: CapabilityLoadingMode,
+    configured_permission_mode: PermissionMode,
+) -> Option<ContextBlock> {
+    if !session.allows_model_tool_execution("memory") {
+        return None;
+    }
+    let schema = eligible_schemas
+        .iter()
+        .find(|schema| schema.function.name == "memory")?;
+    let wire_has = |name| wire_schemas.iter().any(|tool| tool.function.name == name);
+    let discovery = if wire_has("memory") {
+        match loading_mode {
+            CapabilityLoadingMode::Progressive => {
+                "Use tool discovery to load `memory` if it is deferred. "
+            }
+            _ => "",
+        }
+    } else if wire_has(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+        "Call `discover_capabilities` by itself to load `memory`, then use it in a later round. "
+    } else {
+        return None;
+    };
+
+    let properties = schema.function.parameters.get("properties")?;
+    let actions = properties.pointer("/action/enum")?.as_array()?;
+    let supports = |action| actions.iter().any(|entry| entry.as_str() == Some(action));
+    let session_read = supports("session_read");
+    let plan_read_only = ToolExecutionSessionFlags::from_session_and_configured_mode(
+        session,
+        configured_permission_mode,
+    )
+    .plan_read_only;
+    let durable_read = !plan_read_only
+        && supports("query")
+        && supports("get")
+        && properties.get("scope").is_some();
+    if !session_read && !durable_read {
+        return None;
+    }
+
+    let mut content = String::from(
+        "Look up memory only when the current task depends on a prior fact or decision. ",
+    );
+    content.push_str(discovery);
+    if durable_read {
+        content.push_str(concat!(
+            "Use `memory` action=query with short keywords and action=get for selected IDs. ",
+            "Choose scope=section for facts in the assigned Section, scope=project for the assigned Project, ",
+            "or scope=global for cross-project facts. "
+        ));
+    }
+    if session_read {
+        content.push_str("Use `memory` action=session_read for this Session's continuity notes. ");
+    }
+    content.push_str("Follow current instructions and verify recalled facts against live state.");
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "On-demand memory",
+        content,
+    ))
 }
 
 /// The request-selected catalog already accounts for role, Host, and provider
@@ -129,7 +187,7 @@ pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Optio
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
         let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
         guidance.push_str(concat!(
-            "\n\nWhen prior decisions or preferences matter, delegate the memory lookup. ",
+            "\n\nIf the current task depends on a prior fact or decision, delegate the memory lookup. ",
             "Use an authorized Session in the verified Project for Project facts. ",
             "Ask the worker to discover memory if needed, run action=query with short keywords and the appropriate scope, then action=get for selected IDs. ",
             "Use Global scope for cross-project facts."
@@ -662,7 +720,7 @@ pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<C
         ContextBlockType::ExternalMemory,
         ContextBlockPriority::Medium,
         ContextBlockStability::RoundDynamic,
-        "External Memory (Persistent)",
+        "Ledger and Context Usage",
         trimmed,
     ))
 }
@@ -826,22 +884,94 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_created_session_identity_guides_on_demand_memory_lookup() {
-        let mut worker = Session::new("worker", "test-model");
-        worker.metadata.insert(
-            bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY.into(),
-            "true".into(),
-        );
+    fn memory_guidance_uses_the_current_tool_schema_and_discovery_route() {
+        use bamboo_agent_core::tools::Tool;
 
-        let guidance = build_session_identity_context_block(&worker).content;
+        let session = Session::new("ordinary", "test-model");
+        let session_only = bamboo_tools::tools::memory::SessionMemoryTool::new().to_schema();
+        let mut durable = session_only.clone();
+        let properties = &mut durable.function.parameters["properties"];
+        properties["scope"] = serde_json::json!({
+            "enum": ["global", "project", "section"],
+        });
+        properties["action"]["enum"] = serde_json::json!(["query", "get", "session_read"]);
+        let gateway = bamboo_domain::discovery_control_fallback_schema();
+        let tools = std::slice::from_ref(&durable);
+
+        let guidance = build_memory_usage_context_block(
+            &session,
+            tools,
+            std::slice::from_ref(&gateway),
+            CapabilityLoadingMode::StickyFallback,
+            PermissionMode::Default,
+        )
+        .expect("deferred Host memory is eligible");
+        assert_eq!(guidance.stability, ContextBlockStability::RoundDynamic);
         for instruction in [
             "discover_capabilities",
             "action=query",
             "scope=project",
+            "scope=section",
+            "scope=global",
             "action=get",
             "action=session_read",
         ] {
-            assert!(guidance.contains(instruction));
+            assert!(guidance.content.contains(instruction));
+        }
+
+        let sdk_tools = std::slice::from_ref(&session_only);
+        let guidance = build_memory_usage_context_block(
+            &session,
+            sdk_tools,
+            sdk_tools,
+            CapabilityLoadingMode::Progressive,
+            PermissionMode::Default,
+        )
+        .expect("SDK session notes are eligible");
+        assert!(guidance.content.contains("tool discovery"));
+        assert!(guidance.content.contains("action=session_read"));
+        assert!(!guidance.content.contains("action=query"));
+        assert!(!guidance.content.contains("scope=project"));
+
+        let guidance = build_memory_usage_context_block(
+            &session,
+            tools,
+            tools,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            PermissionMode::Plan,
+        )
+        .expect("Plan retains Session note access");
+        assert!(guidance.content.contains("action=session_read"));
+        assert!(!guidance.content.contains("action=query"));
+        assert!(!guidance.content.contains("discovery"));
+
+        for (eligible, wire) in [(tools, &[][..]), (&[][..], std::slice::from_ref(&gateway))] {
+            assert!(build_memory_usage_context_block(
+                &session,
+                eligible,
+                wire,
+                CapabilityLoadingMode::StickyFallback,
+                PermissionMode::Default,
+            )
+            .is_none());
+        }
+
+        let mut ultra = session.clone();
+        ultra.set_root_orchestration_only(true).unwrap();
+        let mut supervisor =
+            Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+        supervisor.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for session in [&ultra, &supervisor] {
+            assert!(build_memory_usage_context_block(
+                session,
+                tools,
+                tools,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                PermissionMode::Default,
+            )
+            .is_none());
         }
     }
 

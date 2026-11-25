@@ -17,7 +17,7 @@ workflow files for the current implementation and rollout status.
 - Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.
 - Never store secrets or tokens. Do not add embeddings, vectors, or a duplicate Bamboo persistence/index layer.
 
-Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
+Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, and the model and cadence used to refresh Dream. Retrieve saved memories through the `memory` tool when an assignment needs them.
 
 ## Parallel Development
 

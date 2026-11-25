@@ -251,10 +251,10 @@
       "aliases": [
         "memory.memory_project_first_dream"
       ],
-      "default": true,
-      "example": false,
+      "default": false,
+      "example": true,
       "key": "memory.project_first_dream",
-      "meaning": "Include the authorized Project Dream in model prompts.",
+      "meaning": "Deprecated compatibility input, ignored: Dream refresh uses separate background settings.",
       "section": "memory",
       "type": "bool"
     },
@@ -262,10 +262,10 @@
       "aliases": [
         "memory.memory_project_prompt_injection"
       ],
-      "default": true,
-      "example": false,
+      "default": false,
+      "example": true,
       "key": "memory.project_prompt_injection",
-      "meaning": "Inject the project durable-memory index into the main prompt.",
+      "meaning": "Deprecated compatibility input, ignored: retrieve Project memories through the memory tool.",
       "section": "memory",
       "type": "bool"
     },
@@ -273,10 +273,10 @@
       "aliases": [
         "memory.memory_relevant_recall"
       ],
-      "default": true,
-      "example": false,
+      "default": false,
+      "example": true,
       "key": "memory.relevant_recall",
-      "meaning": "Enable automatic relevant durable-memory recall.",
+      "meaning": "Deprecated compatibility input, ignored: retrieve durable memories through the memory tool.",
       "section": "memory",
       "type": "bool"
     },
@@ -287,7 +287,7 @@
       "default": false,
       "example": true,
       "key": "memory.relevant_recall_rerank",
-      "meaning": "Optional model reranking of lexical candidates; fallback remains lexical.",
+      "meaning": "Deprecated compatibility input, ignored: on-demand memory queries use lexical retrieval.",
       "section": "memory",
       "type": "bool"
     },

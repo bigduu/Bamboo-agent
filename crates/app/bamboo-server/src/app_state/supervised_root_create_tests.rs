@@ -428,12 +428,6 @@ async fn supervisor_created_project_root_can_query_its_own_project_memory() {
     assert_eq!(created["admitted"], true);
     assert_eq!(created["project_id"], f.project_id.as_str());
     let worker = created["target_session_id"].as_str().unwrap();
-    let persisted = f.state.storage.load_session(worker).await.unwrap().unwrap();
-    assert_eq!(
-        persisted.metadata[bamboo_domain::SUPERVISOR_DISPATCH_METADATA_KEY],
-        "true"
-    );
-
     let memory = |args| f.dispatch_session_tool(worker, "memory", args, true);
     let query = json!({"action":"query", "scope":"project", "query":"deployment playbook"});
     let result = memory(query.clone()).await.unwrap().into_tool_result();
