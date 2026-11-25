@@ -1709,7 +1709,7 @@ impl AppState {
             provider_registry,
             provider_router,
             model_catalog,
-            title_gen_in_flight: Arc::new(dashmap::DashSet::new()),
+            title_gen_in_flight: Default::default(),
             pairing_codes: Arc::new(dashmap::DashMap::new()),
             pairing_code_guard: Arc::new(crate::handlers::settings::PairingCodeGuard::default()),
             root_password_guard: Arc::new(crate::handlers::settings::RootPasswordGuard::default()),

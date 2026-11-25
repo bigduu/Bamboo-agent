@@ -13,11 +13,11 @@ use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
-use super::build_sync_info_from_session;
 use super::response::{
     already_running_response, bad_request_error_response, internal_server_error_response,
     started_response,
 };
+use super::{build_sync_info_from_session, ExecuteOrigin};
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
     reserve_runner, spawn_event_forwarder_with_root_actor, RunnerReservation, SpawnAgentExecution,
@@ -41,6 +41,7 @@ pub(super) struct ReadyExecution<'a> {
     pub startup_turn_id: Option<String>,
     pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     pub generate_title: bool,
+    pub origin: ExecuteOrigin,
     pub native_main: bool,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
@@ -572,6 +573,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         native_binding,
         ready.upstream_retry,
         ready.live_bootstrap_resume,
+        matches!(ready.origin, ExecuteOrigin::Http),
     );
 
     started_response(session_id, sync_info, run_id)

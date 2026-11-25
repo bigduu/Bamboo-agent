@@ -110,4 +110,10 @@ pub trait AgentSessionContext: Send + Sync {
 
     /// Release the title-generation slot for `session_id`. Idempotent.
     fn title_gen_release(&self, session_id: &str);
+
+    /// Host-local title attempt state for deduplicating evidence and coalescing
+    /// new transcript commits that arrive during an in-flight request.
+    fn title_generation_tracker(&self) -> Option<&crate::title_gen::TitleGenerationTracker> {
+        None
+    }
 }
