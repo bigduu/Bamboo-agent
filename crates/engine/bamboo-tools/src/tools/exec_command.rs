@@ -526,6 +526,23 @@ pub async fn exec_wait_target(owner: &str, handle: &str) -> Option<bool> {
     Some(!shell.stdin_is_open().await)
 }
 
+/// Recommend a wait only while an owned command is still running. Unread
+/// terminal output remains available through the normal pull-session cursor.
+pub fn exec_wait_target_is_ready(owner: &str, handle: &str) -> bool {
+    owned_exec(owner, handle).is_some_and(|shell| {
+        shell.status() == "running"
+            && shell.stdin_is_known_closed()
+            && shell.polled.as_ref().is_some_and(|capture| {
+                !capture.process_exited()
+                    && !capture.background_monitor.load(Ordering::Acquire)
+                    && capture
+                        .output
+                        .try_lock()
+                        .is_ok_and(|output| output.completion.is_none())
+            })
+    })
+}
+
 impl BackgroundExecJob {
     pub fn id(&self) -> &str {
         &self.shell.id

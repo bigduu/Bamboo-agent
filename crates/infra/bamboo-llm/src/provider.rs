@@ -246,6 +246,7 @@ pub struct CompletionDiagnostics {
     recovery: Option<OutputLimitRecovery>,
     model_window_limit: Option<u32>,
     provider_default_output: bool,
+    tools_disabled: bool,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
@@ -381,6 +382,15 @@ impl CompletionDiagnostics {
     pub fn with_provider_default_output(mut self, enabled: bool) -> Self {
         self.provider_default_output = enabled;
         self
+    }
+
+    pub fn with_tools_disabled(mut self, disabled: bool) -> Self {
+        self.tools_disabled = disabled;
+        self
+    }
+
+    pub(crate) fn tools_disabled(&self) -> bool {
+        self.tools_disabled
     }
 
     pub(crate) fn allows_provider_default_output(&self) -> bool {
