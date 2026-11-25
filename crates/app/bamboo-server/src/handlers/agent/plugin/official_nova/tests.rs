@@ -1129,7 +1129,23 @@ async fn chunked_download_cannot_evade_the_size_limit() {
     let sender = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0u8; 1024];
-        stream.read(&mut request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut filled = 0;
+            while !request[..filled].windows(4).any(|part| part == b"\r\n\r\n") {
+                assert!(
+                    filled < request.len(),
+                    "fixture request headers exceed the buffer"
+                );
+                let received = stream.read(&mut request[filled..]).await.unwrap();
+                assert!(
+                    received > 0,
+                    "fixture connection closed before the header delimiter"
+                );
+                filled += received;
+            }
+        })
+        .await
+        .expect("fixture should receive complete request headers");
         stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nabcdefgh\r\n8\r\nijklmnop\r\n0\r\n\r\n").await.unwrap();
     });
     let response = reqwest::get(format!("http://{address}")).await.unwrap();
