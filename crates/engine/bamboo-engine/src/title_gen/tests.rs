@@ -746,6 +746,23 @@ fn title_evidence_fingerprint_ignores_repeated_turns_and_acknowledgements() {
 }
 
 #[test]
+fn title_model_rejects_a_copied_cjk_request_without_question_marks() {
+    for input in [
+        "你好，能麻烦你帮我看一下在两个工作目录间来回切换的时候，侧边栏为何会保留旧标签吗",
+        "切换工作目录会保留旧标签吗",
+        "请问切换目录后侧边栏还是保留了旧标签",
+    ] {
+        let mut session = Session::new("implicit-question", "model");
+        session.add_message(Message::user(input));
+        let context = TitleContext::from_session(&session).unwrap();
+        assert_eq!(
+            context.parse(&serde_json::json!({"title": input}).to_string()),
+            ModelTitle::Invalid("input_echo")
+        );
+    }
+}
+
+#[test]
 fn title_model_accepts_only_clear_json_decisions() {
     let mut session = Session::new("title-quality", "model");
     session.add_message(Message::user(

@@ -298,7 +298,10 @@ fn concise_label(text: &str) -> bool {
     text.chars().count() <= 42
         && text.split_whitespace().count() <= 8
         && !text.contains(['?', '？', '!', '！', '。'])
+        && !text.ends_with(['吗', '么', '呢'])
         && ![
+            "hi,",
+            "hello,",
             "please ",
             "can you ",
             "could you ",
@@ -308,10 +311,18 @@ fn concise_label(text: &str) -> bool {
             "what ",
             "why ",
             "how ",
+            "你好，",
+            "您好，",
             "帮我",
             "麻烦",
+            "请问",
+            "请帮",
             "请你",
+            "可以帮",
+            "能帮",
+            "能麻烦",
             "能不能",
+            "能否",
             "我想",
             "我需要",
             "为什么",
