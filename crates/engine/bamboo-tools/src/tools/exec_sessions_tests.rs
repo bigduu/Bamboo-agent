@@ -48,6 +48,26 @@ async fn capture_and_response_limits_report_omissions_and_advance_cursor() {
 }
 
 #[tokio::test]
+async fn retained_log_reports_evicted_offsets_and_preserves_utf8_page_boundaries() {
+    let state = PolledShellState::with_retained_output(true).unwrap();
+    let text = "界".repeat(MAX_CAPTURE_BYTES / 3 + 20);
+    state.push(text.as_bytes()).await;
+    let preview = state.take("log-handle", Some(2)).await;
+    let available = preview.output_log.unwrap();
+    assert_eq!(available.end_offset, text.len() as u64);
+    assert!(available.start_offset > 0);
+    assert!(available.end_offset - available.start_offset <= MAX_CAPTURE_BYTES as u64);
+
+    let captured = state.output.lock().await;
+    let log = captured.retained_log.as_ref().unwrap();
+    assert!(log.read(0, None).is_err());
+    assert!(log.read(available.start_offset + 1, None).is_err());
+    assert!(log.read(available.start_offset, Some(1)).is_err());
+    assert_eq!(log.read(available.start_offset, Some(2)).unwrap(), "界界");
+    assert_eq!(log.read(available.end_offset, None).unwrap(), "");
+}
+
+#[tokio::test]
 async fn response_budget_accounts_for_json_escaping_and_utf8_without_miscounting_omissions() {
     let text = "\0\"\\汉🙂\n\r\t\u{8}\u{c}\u{1f}/\u{7f}\u{2028}\u{2029}".repeat(40);
     for tokens in 1..=64 {
@@ -396,6 +416,78 @@ mod process_tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn completed_process_log_pages_are_replayable_and_owner_scoped() {
+        let _environment = environment();
+        let owner = "test-retained-process-log";
+        let text = "alpha\nbravo\ncharlie\n";
+        let preview = payload(
+            ExecCommandTool::new()
+                .invoke(
+                    json!({
+                        "cmd":"printf 'alpha\\nbravo\\ncharlie\\n'",
+                        "retain_output":true,
+                        "max_output_tokens":3,
+                        "yield_time_ms":2000,
+                    }),
+                    context(owner),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(preview["status"], "completed");
+        assert_eq!(preview["exit_code"], 0);
+        assert!(preview.get("session_id").is_none());
+        assert!(preview["output_omitted_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(preview["output_log"]["end_offset"], text.len());
+        let handle = preview["output_log"]["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(handle).expect("collected log remains available");
+        let state = shell.polled.as_ref().unwrap();
+        assert!(state.exec_permit.lock().unwrap().is_none());
+        assert!(state._log_permit.is_some());
+        assert!(!bash_runtime::uncollected_polled_shells_for_session(owner)
+            .contains(&handle.to_owned()));
+        let read =
+            |offset| json!({"session_id":handle,"output_offset":offset,"max_output_tokens":3});
+        let tool = WriteStdinTool::new();
+        assert!(tool
+            .invoke(read(0), context("different-owner"))
+            .await
+            .is_err());
+        assert!(tool
+            .invoke(json!({"session_id":handle}), context(owner))
+            .await
+            .is_err());
+        assert!(tool
+            .invoke(
+                json!({"session_id":handle,"output_offset":0,"chars":"x"}),
+                context(owner)
+            )
+            .await
+            .is_err());
+        let first = payload(tool.invoke(read(0), context(owner)).await.unwrap());
+        assert_eq!(
+            first,
+            payload(tool.invoke(read(0), context(owner)).await.unwrap())
+        );
+        let mut assembled = String::new();
+        let mut next = 0;
+        for _ in 0..10 {
+            let page = payload(tool.invoke(read(next), context(owner)).await.unwrap());
+            assert_eq!(page["status"], "completed");
+            assert_eq!(page["exit_code"], 0);
+            assert!(page.get("output_omitted_bytes").is_none());
+            assembled.push_str(page["output"].as_str().unwrap());
+            next = page["output_log"]["next_offset"].as_u64().unwrap();
+            assert_eq!(next, assembled.len() as u64);
+            if next == text.len() as u64 {
+                break;
+            }
+        }
+        assert_eq!(assembled, text);
+        bash_runtime::remove_shell(handle);
     }
 
     // Initial lifecycle fixture loops also stop on directory removal and
