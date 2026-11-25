@@ -102,4 +102,10 @@ impl AgentSessionContext for AppState {
     fn title_gen_release(&self, session_id: &str) {
         AppState::title_gen_release(self, session_id)
     }
+
+    fn title_generation_tracker(
+        &self,
+    ) -> Option<&bamboo_engine::title_gen::TitleGenerationTracker> {
+        Some(self.title_gen_in_flight.as_ref())
+    }
 }

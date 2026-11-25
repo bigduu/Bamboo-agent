@@ -10,9 +10,13 @@ async fn routing_contract_title_uses_saved_global_fast_and_live_replacement_for_
         let context: Arc<dyn AgentSessionContext> = state.clone();
         let session = RoutingContext::session();
         assert_eq!(
-            try_llm_title(&context, &session, "Synthetic title request")
-                .await
-                .unwrap(),
+            try_llm_title(
+                &context,
+                &session,
+                build_title_messages("Synthetic title request")
+            )
+            .await
+            .unwrap(),
             "Synthetic routing title"
         );
         assert_eq!(
@@ -23,9 +27,13 @@ async fn routing_contract_title_uses_saved_global_fast_and_live_replacement_for_
         state.config.write().await.defaults.as_mut().unwrap().fast = Some(
             bamboo_domain::ProviderModelRef::new("memory-c", "background-c"),
         );
-        try_llm_title(&context, &session, "Synthetic replacement request")
-            .await
-            .unwrap();
+        try_llm_title(
+            &context,
+            &session,
+            build_title_messages("Synthetic replacement request"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             state.requests("memory-c"),
             vec![("background-c".into(), "title_generation".into())]
@@ -54,7 +62,7 @@ async fn routing_contract_title_invalid_explicit_fast_never_dispatches_a_fallbac
         assert!(try_llm_title(
             &context,
             &RoutingContext::session(),
-            "Synthetic invalid route"
+            build_title_messages("Synthetic invalid route")
         )
         .await
         .is_err());
@@ -93,7 +101,7 @@ async fn routing_contract_title_embedder_owned_removed_fast_keeps_sdk_route() {
         let result = try_llm_title(
             &context,
             &RoutingContext::session(),
-            "Synthetic removed-account request",
+            build_title_messages("Synthetic removed-account request"),
         )
         .await;
         // This provider map belongs to the embedding application, not Config.
@@ -152,7 +160,7 @@ async fn routing_contract_title_accepts_an_embedder_owned_registry() {
                 try_llm_title(
                     &context,
                     &RoutingContext::session(),
-                    "Synthetic embedded request",
+                    build_title_messages("Synthetic embedded request"),
                 )
                 .await
                 .unwrap(),
@@ -208,7 +216,7 @@ async fn routing_contract_title_accepts_an_enabled_synthesized_legacy_provider()
             try_llm_title(
                 &context,
                 &RoutingContext::session(),
-                "Synthetic legacy request",
+                build_title_messages("Synthetic legacy request"),
             )
             .await
             .unwrap(),
@@ -285,9 +293,13 @@ async fn routing_contract_title_config_managed_removed_instance_never_dispatches
         // Positive control proves that the selected managed provider really
         // reaches the Fast endpoint and that its stream is consumable.
         assert_eq!(
-            try_llm_title(&context, &session, "Synthetic managed title")
-                .await
-                .unwrap(),
+            try_llm_title(
+                &context,
+                &session,
+                build_title_messages("Synthetic managed title")
+            )
+            .await
+            .unwrap(),
             "Synthetic routing title"
         );
         let requests = fast.received_requests().await.unwrap();
@@ -317,9 +329,13 @@ async fn routing_contract_title_config_managed_removed_instance_never_dispatches
             &old_handle,
             &state.registry.get("fast-b").unwrap()
         ));
-        let rejected = try_llm_title(&context, &session, "Synthetic stale managed title")
-            .await
-            .is_err();
+        let rejected = try_llm_title(
+            &context,
+            &session,
+            build_title_messages("Synthetic stale managed title"),
+        )
+        .await
+        .is_err();
         observations.push((
             flag,
             rejected,
@@ -412,9 +428,13 @@ async fn routing_contract_title_config_managed_same_id_legacy_requires_new_regis
         let session = RoutingContext::session();
 
         assert_eq!(
-            try_llm_title(&context, &session, "Synthetic instance title")
-                .await
-                .unwrap(),
+            try_llm_title(
+                &context,
+                &session,
+                build_title_messages("Synthetic instance title")
+            )
+            .await
+            .unwrap(),
             "Synthetic routing title"
         );
         assert_eq!(managed_title_request_count(&instance_endpoint).await, 1);
@@ -436,9 +456,13 @@ async fn routing_contract_title_config_managed_same_id_legacy_requires_new_regis
             &old_handle,
             &state.registry.get("openai").unwrap()
         ));
-        let rejected = try_llm_title(&context, &session, "Synthetic stale instance title")
-            .await
-            .is_err();
+        let rejected = try_llm_title(
+            &context,
+            &session,
+            build_title_messages("Synthetic stale instance title"),
+        )
+        .await
+        .is_err();
         let old_after_stale = managed_title_request_count(&instance_endpoint).await;
         let new_after_stale = managed_title_request_count(&legacy_endpoint).await;
         let other_after_stale = managed_title_request_count(&other_endpoint).await;
@@ -454,9 +478,13 @@ async fn routing_contract_title_config_managed_same_id_legacy_requires_new_regis
         assert!(refreshed.get("openai").is_some());
         state.registry.replace_with(refreshed);
         assert_eq!(
-            try_llm_title(&context, &session, "Synthetic legacy title")
-                .await
-                .unwrap(),
+            try_llm_title(
+                &context,
+                &session,
+                build_title_messages("Synthetic legacy title")
+            )
+            .await
+            .unwrap(),
             "Synthetic routing title"
         );
         assert_eq!(
@@ -642,23 +670,6 @@ fn test_heuristic_title_leaves_ordinary_messages_untouched() {
 }
 
 #[test]
-fn test_sanitize_strips_quotes_and_caps() {
-    assert_eq!(sanitize("\"Hello world.\""), "Hello world");
-    assert_eq!(sanitize("  'A quoted title'  "), "A quoted title");
-    assert_eq!(sanitize("First line\nSecond line"), "First line");
-
-    let long = "x".repeat(120);
-    let s = sanitize(&long);
-    assert!(s.chars().count() <= MAX_TITLE_LEN);
-}
-
-#[test]
-fn test_sanitize_empty_input() {
-    assert_eq!(sanitize(""), "");
-    assert_eq!(sanitize("   \n  "), "");
-}
-
-#[test]
 fn test_build_title_messages_truncates_to_2000_chars() {
     let huge: String = "z".repeat(5000);
     let msgs = build_title_messages(&huge);
@@ -678,24 +689,204 @@ fn test_build_title_messages_short_input_passthrough() {
 }
 
 #[test]
-fn first_user_text_skips_textless_turn_so_a_later_message_can_retry() {
-    let mut session = Session::new("retry-title", "model");
-    session.add_message(Message::user("   "));
-    session.add_message(Message::assistant("Image acknowledged", None));
-    session.add_message(Message::user("Use this later text for the title"));
+fn title_context_waits_for_evidence_and_excludes_runtime_records() {
+    use bamboo_agent_core::MessagePhase;
 
+    let mut session = Session::new("retry-title", "model");
+    session.add_message(Message::user("https://example.test/37 看一下"));
+    session.add_message(Message::assistant("收到", None));
+    let mut hidden = Message::user("Private runtime instructions");
+    hidden.metadata = Some(serde_json::json!({"hidden_from_ui": true}));
+    session.add_message(hidden);
+    let mut interrupted = Message::assistant("Private interrupted answer", None);
+    interrupted.metadata =
+        Some(serde_json::json!({"runtime_kind": "interrupted_assistant_output"}));
+    session.add_message(interrupted);
+    let mut commentary = Message::assistant("Provider commentary", None);
+    commentary.phase = Some(MessagePhase::Commentary);
+    session.add_message(commentary);
+    session.add_message(Message::system("Private system prompt"));
+    session.add_message(Message::tool_result("call-1", "Raw tool output"));
+    assert!(TitleContext::from_session(&session).is_none());
+
+    let mut answer = Message::assistant("这是 Lotus 的会话标题回退问题。", None);
+    answer.phase = Some(MessagePhase::FinalAnswer);
+    session.add_message(answer);
+    let context = TitleContext::from_session(&session).expect("substantive reply");
+    let messages = context.messages();
+    let evidence: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
     assert_eq!(
-        first_user_text(&session).as_deref(),
-        Some("Use this later text for the title")
+        evidence["conversation_excerpts"],
+        serde_json::json!([{"role": "assistant", "text": "这是 Lotus 的会话标题回退问题。"}])
+    );
+    assert_eq!(
+        context.parse(r#"{"title":"Lotus 会话标题回退"}"#),
+        ModelTitle::Title("Lotus 会话标题回退".into())
     );
 }
 
 #[test]
-fn first_user_text_stays_empty_until_a_text_turn_exists() {
-    let mut session = Session::new("pending-title", "model");
-    session.add_message(Message::user("\n\t"));
+fn peer_inbox_followup_cannot_enable_title_generation_from_an_older_human_turn() {
+    use bamboo_domain::{SessionMessageEnvelope, SessionMessageKind, SessionMessageSource};
 
-    assert!(first_user_text(&session).is_none());
+    let mut session = Session::new("title-peer-origin", "chat");
+    session.add_message(Message::user(
+        "Investigate the workspace reconnect behavior.",
+    ));
+    assert!(latest_title_input_is_human(&session));
+
+    let mut peer = SessionMessageEnvelope::user_input(&session.id, "Peer-only verifier dispatch");
+    peer.source = SessionMessageSource::Session {
+        session_id: bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+    };
+    peer.kind = SessionMessageKind::PeerMessage;
+    session.add_message(peer.to_provider_message().unwrap());
+    session.add_message(Message::assistant(
+        "Independent verification completed.",
+        None,
+    ));
+    assert!(!latest_title_input_is_human(&session));
+    assert!(!TitleContext::from_session(&session).unwrap().messages()[1]
+        .content
+        .contains("Peer-only verifier dispatch"));
+
+    let human = SessionMessageEnvelope::user_input(
+        &session.id,
+        "The issue is that reconnection replays the earlier unread cursor.",
+    )
+    .with_root_chat_prompt("Workspace instructions".into())
+    .unwrap();
+    session.add_message(human.to_provider_message().unwrap());
+    assert!(latest_title_input_is_human(&session));
+}
+
+#[test]
+fn title_evidence_fingerprint_ignores_repeated_turns_and_acknowledgements() {
+    let mut session = Session::new("pending-title", "model");
+    session.add_message(Message::user("我想了解这里的背景"));
+    let first = TitleContext::from_session(&session).unwrap().fingerprint();
+    session.add_message(Message::user("我想了解这里的背景。"));
+    session.add_message(Message::assistant("好的", None));
+    let repeated = TitleContext::from_session(&session).unwrap().fingerprint();
+    assert_eq!(first, repeated);
+
+    session.add_message(Message::assistant("主题是 Bamboo 的版本升级失败。", None));
+    let clarified = TitleContext::from_session(&session).unwrap().fingerprint();
+    assert_ne!(clarified, first);
+    session.add_message(Message::user("我想了解这里的背景。"));
+    assert_eq!(
+        TitleContext::from_session(&session).unwrap().fingerprint(),
+        clarified
+    );
+}
+
+#[test]
+fn title_model_rejects_a_copied_cjk_request_without_question_marks() {
+    for input in [
+        "你好，能麻烦你帮我看一下在两个工作目录间来回切换的时候，侧边栏为何会保留旧标签吗",
+        "切换工作目录会保留旧标签吗",
+        "请问切换目录后侧边栏还是保留了旧标签",
+    ] {
+        let mut session = Session::new("implicit-question", "model");
+        session.add_message(Message::user(input));
+        let context = TitleContext::from_session(&session).unwrap();
+        assert_eq!(
+            context.parse(&serde_json::json!({"title": input}).to_string()),
+            ModelTitle::Invalid("input_echo")
+        );
+    }
+}
+
+#[test]
+fn title_model_accepts_only_clear_json_decisions() {
+    let mut session = Session::new("title-quality", "model");
+    session.add_message(Message::user(
+        "请你研究一下这个标题功能为什么经常复述用户的原话并且把回退方案写出来",
+    ));
+    let context = TitleContext::from_session(&session).unwrap();
+    assert!(context.messages()[0].content.contains(r#"{"title":null}"#));
+    assert_eq!(
+        context.parse(r#"{"title":null}"#),
+        ModelTitle::InsufficientContext
+    );
+    assert_eq!(
+        context.parse(r#"{"title":"会话标题回退优化"}"#),
+        ModelTitle::Title("会话标题回退优化".into())
+    );
+    for invalid in [
+        "",
+        "会话标题回退优化",
+        "{}",
+        r#"{"title":9}"#,
+        r#"{"title":" "}"#,
+        r#"{"title":"——"}"#,
+        r#"{"title":"新会话"}"#,
+        r#"{"title":"Title: Session titles"}"#,
+        r#"{"title":"Topic\nAnother line"}"#,
+        r#"{"title":"https://example.test"}"#,
+        r#"{"title":"请你研究一下这个标题功能"}"#,
+        r#"{"title":"请你研究一下这个标题功能为什么经常复述用户的原话并且把回退方案写出来"}"#,
+        r#"{"title":null,"reason":"unknown"}"#,
+    ] {
+        assert!(
+            matches!(context.parse(invalid), ModelTitle::Invalid(_)),
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn title_model_can_reuse_a_good_short_label() {
+    let mut session = Session::new("named-topic", "model");
+    session.add_message(Message::user("Bamboo Session Titles"));
+    let context = TitleContext::from_session(&session).unwrap();
+    assert_eq!(
+        context.parse(r#"{"title":"Bamboo Session Titles"}"#),
+        ModelTitle::Title("Bamboo Session Titles".into())
+    );
+}
+
+#[test]
+fn title_labels_keep_language_identifiers_and_issue_references() {
+    let mut session = Session::new("language-title", "model");
+    session.add_message(Message::user("C++"));
+    let cpp = TitleContext::from_session(&session).unwrap();
+    assert_eq!(
+        cpp.parse(r#"{"title":"C++"}"#),
+        ModelTitle::Title("C++".into())
+    );
+    session.messages.clear();
+    session.add_message(Message::user("C#"));
+    let csharp = TitleContext::from_session(&session).unwrap();
+    assert_ne!(cpp.fingerprint(), csharp.fingerprint());
+    assert_eq!(
+        csharp.parse(r##"{"title":"#123 C# SDK"}"##),
+        ModelTitle::Title("#123 C# SDK".into())
+    );
+}
+
+#[test]
+fn title_tracker_coalesces_new_evidence_while_preserving_the_active_slot() {
+    let tracker = TitleGenerationTracker::default();
+    let mut session = Session::new("s1", "model");
+    assert!(tracker.acquire("s1", true));
+    assert!(tracker.record_attempt(&session, 10));
+    assert!(!tracker.acquire("s1", false));
+    assert!(!tracker.acquire("s1", true));
+    assert!(!tracker.acquire("s1", true));
+    assert!(tracker.finish("s1"));
+    assert!(!tracker.record_attempt(&session, 10));
+    assert!(tracker.record_attempt(&session, 20));
+    assert!(!tracker.finish("s1"));
+    assert!(tracker.acquire("s1", false));
+    assert!(!tracker.record_attempt(&session, 20));
+    session.metadata.insert(
+        bamboo_storage::v2::SIDE_CHAT_CLEAR_EPOCH_KEY.into(),
+        "after-clear".into(),
+    );
+    assert!(tracker.record_attempt(&session, 20));
+    tracker.release("s1");
+    assert!(tracker.acquire("s1", true));
 }
 
 #[test]

@@ -86,9 +86,9 @@ pub(crate) fn pong_frame(encoding: Encoding) -> Option<OutFrame> {
 /// { "ch": "agent.sess_abc", "seq": 43, "control": { "type": "terminal", "reason": "complete" } }
 /// ```
 ///
-/// The `event` / `control` keys are mutually exclusive and flattened in, so the
-/// wire object is exactly `{ch, seq, event}` or `{ch, seq, control}` — no extra
-/// nesting.
+/// The `event` / `control` keys are mutually exclusive and flattened in. A
+/// live title update can additionally carry `delivery: "live"`; this is a
+/// transport annotation and never part of the durable change event.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct ServerEnvelope {
     /// Channel id: `feed` or `agent.{session_id}`.
@@ -105,6 +105,8 @@ pub(crate) struct ServerEnvelope {
     /// honored as a lossless cursor and this counter is for ordering/dedup within
     /// one subscription only.
     pub seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<&'static str>,
     /// The carried payload: either a journaled/agent `event` or a transport
     /// `control` signal.
     #[serde(flatten)]
@@ -137,6 +139,7 @@ impl ServerEnvelope {
         Self {
             ch: ch.into(),
             seq,
+            delivery: None,
             body: EnvelopeBody::Event { event },
         }
     }
@@ -146,8 +149,14 @@ impl ServerEnvelope {
         Self {
             ch: ch.into(),
             seq,
+            delivery: None,
             body: EnvelopeBody::Control { control },
         }
+    }
+
+    pub(crate) fn with_live_delivery(mut self) -> Self {
+        self.delivery = Some("live");
+        self
     }
 
     /// Serialize to a JSON text frame.
