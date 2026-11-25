@@ -128,6 +128,50 @@ impl VisibleMessageStream {
         let _ = self.sender.send(event);
     }
 
+    /// Copy only the recent visible text still awaiting durable history.
+    pub fn pending_text_tail(
+        &self,
+        mut max_bytes: usize,
+        max_messages: usize,
+    ) -> (Vec<VisibleAssistantMessage>, bool) {
+        let state = self.lock();
+        let mut messages = Vec::new();
+        let mut truncated = false;
+        for message in state
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| !message.committed && !message.content.is_empty())
+        {
+            if messages.len() == max_messages {
+                truncated = true;
+                break;
+            }
+            let from = message
+                .content
+                .ceil_char_boundary(message.content.len().saturating_sub(max_bytes));
+            let tail = &message.content[from..];
+            if tail.is_empty() {
+                truncated = true;
+                break;
+            }
+            max_bytes -= tail.len();
+            messages.push(VisibleAssistantMessage {
+                id: message.id.clone(),
+                content: tail.to_owned(),
+                created_at: message.created_at,
+                round_count: message.round_count,
+                committed: false,
+            });
+            if from > 0 {
+                truncated = true;
+                break;
+            }
+        }
+        messages.reverse();
+        (messages, truncated)
+    }
+
     /// Subscribe before taking the snapshot. Concurrent events are either in the
     /// snapshot or queued with a greater version, never neither.
     pub fn subscribe_with_snapshot(
@@ -364,6 +408,29 @@ impl VisibleMessageStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_text_tail_is_bounded_and_reports_omissions() {
+        let stream = VisibleMessageStream::new();
+        stream.start("first".into(), Utc::now());
+        stream.append("earlier text".into());
+        stream.start("second".into(), Utc::now());
+        stream.append("前中后".into());
+
+        let (messages, truncated) = stream.pending_text_tail(7, 4);
+        assert!(truncated);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "second");
+        assert_eq!(messages[0].content, "中后");
+
+        let (messages, truncated) = stream.pending_text_tail(64, 1);
+        assert!(truncated);
+        assert_eq!(messages[0].content, "前中后");
+        assert!(!stream.pending_text_tail(64, 4).1);
+
+        stream.history_committed();
+        assert_eq!(stream.pending_text_tail(64, 4), (Vec::new(), false));
+    }
 
     #[test]
     fn subscribe_snapshot_and_live_tail_have_no_overlap_after_version_filter() {

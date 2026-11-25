@@ -13,6 +13,36 @@ fn session() -> Session {
     session
 }
 
+#[test]
+fn conversation_observation_excludes_replacement_and_cleared_sources() {
+    let session = session();
+    let lifetime = Arc::new(RootExecutionLifetime::default());
+    let admission = lifetime.admit("original-run").unwrap();
+    assert!(lifetime.conversation_observation("original-run").is_none());
+    let _outer = admission.attach(&session).unwrap();
+    let observation = lifetime.conversation_observation("original-run").unwrap();
+    assert!(observation.matches(&session));
+
+    let mut cleared = session.clone();
+    cleared
+        .metadata
+        .insert(SIDE_CHAT_CLEAR_EPOCH_KEY.into(), Uuid::new_v4().to_string());
+    assert!(!observation.matches(&cleared));
+
+    let mut moved = session.clone();
+    moved.set_project_id_meta("other-project");
+    assert!(!observation.matches(&moved));
+
+    let successor = lifetime.admit("successor").unwrap();
+    let _successor_outer = successor.attach(&session).unwrap();
+    assert!(lifetime.conversation_observation("original-run").is_none());
+    assert!(!observation.matches(&session));
+    assert!(lifetime
+        .conversation_observation("successor")
+        .unwrap()
+        .matches(&session));
+}
+
 async fn settled(lifetime: &RootExecutionLifetime) -> RootOuterClosure {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
