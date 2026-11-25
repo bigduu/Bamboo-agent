@@ -8,6 +8,11 @@ on:
         required: false
         default: ''
         type: string
+      windows_project_sha:
+        description: Exact source SHA for Windows Project read-only acceptance
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -156,6 +161,23 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind Windows Project acceptance to the exact clean source
+        if: inputs.windows_project_sha != ''
+        env:
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.windows_project_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Windows Project acceptance source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -168,3 +190,37 @@ jobs:
 
       - name: Verify unsupported file operations fail closed
         run: cargo test --locked -p bamboo-tickets --lib workspace_files::physical::tests::unsupported_platform_file_operations_fail_closed_without_mutation -- --exact
+
+      - name: Verify the native read-only Project proof
+        if: inputs.windows_project_sha != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ARCH" = X64
+          compiler=$(rustc -vV | tr -d '\r')
+          printf '%s\n' "$compiler"
+          grep -Fxq 'host: x86_64-pc-windows-msvc' <<< "$compiler"
+          cargo -V
+          log="$RUNNER_TEMP/windows-project-proof.log"
+          cargo test --locked -p bamboo-projects --lib read_only::windows::tests:: -- --test-threads=1 --color never \
+            | tr -d '\r' | tee "$log"
+          cases=(
+            current_project_proof_preserves_all_bytes
+            project_proof_respects_writer_lock_without_creating_it
+            project_proof_rejects_ancestor_junction
+            project_proof_rejects_replaced_or_hardlinked_primary
+            project_proof_rejects_missing_or_stale_floor
+          )
+          for name in "${cases[@]}"; do
+            test "$(grep -Fxc "test read_only::windows::tests::$name ... ok" "$log")" = 1
+          done
+
+      - name: Verify Windows Project acceptance left the exact source clean
+        if: always() && inputs.windows_project_sha != ''
+        env:
+          EXPECTED_SNAPSHOT_SHA: ${{ inputs.windows_project_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
