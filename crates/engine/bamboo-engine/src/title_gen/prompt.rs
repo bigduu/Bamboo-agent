@@ -4,6 +4,8 @@ use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 
 use bamboo_agent_core::{Message, MessagePart, MessagePhase, Role, Session};
+use bamboo_domain::SessionMessageEnvelope;
+use serde::Deserialize;
 
 use super::fallback::{strip_code_fences, strip_pasted_failure_banner};
 
@@ -47,11 +49,7 @@ impl TitleContext {
     pub(super) fn from_session(session: &Session) -> Option<Self> {
         // A final answer can supply the topic for a bare link or attachment,
         // but only if this session has an actual visible user turn.
-        if !session
-            .messages
-            .iter()
-            .any(|message| message.role == Role::User && visible(message))
-        {
+        if !session.messages.iter().any(is_human_title_input) {
             return None;
         }
 
@@ -155,13 +153,41 @@ fn visible(message: &Message) -> bool {
             .is_none_or(|metadata| metadata.get("runtime_kind").is_none())
 }
 
+pub(crate) fn is_human_title_input(message: &Message) -> bool {
+    if message.role != Role::User || !visible(message) {
+        return false;
+    }
+    let Some(envelope) = message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("session_message"))
+    else {
+        // Older interactive and directly submitted User turns have no Inbox envelope.
+        return true;
+    };
+    SessionMessageEnvelope::deserialize(envelope).is_ok_and(|envelope| {
+        envelope.id.as_str() == message.id && envelope.is_human_interactive_input()
+    })
+}
+
+pub(crate) fn latest_title_input_is_human(session: &Session) -> bool {
+    // A peer follow-up can be the current User-role provider input in a Root
+    // with older human turns. It cannot borrow their origin for naming.
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && visible(message))
+        .is_some_and(is_human_title_input)
+}
+
 fn message_evidence(message: &Message) -> Option<TitleEvidence> {
     if !visible(message) || message.compressed {
         return None;
     }
 
     let role = match message.role {
-        Role::User => "user",
+        Role::User if is_human_title_input(message) => "user",
         Role::Assistant
             if message.phase != Some(MessagePhase::Commentary)
                 && message.tool_calls.as_ref().is_none_or(Vec::is_empty) =>

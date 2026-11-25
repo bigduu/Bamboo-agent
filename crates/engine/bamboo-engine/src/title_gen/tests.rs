@@ -726,6 +726,41 @@ fn title_context_waits_for_evidence_and_excludes_runtime_records() {
 }
 
 #[test]
+fn peer_inbox_followup_cannot_enable_title_generation_from_an_older_human_turn() {
+    use bamboo_domain::{SessionMessageEnvelope, SessionMessageKind, SessionMessageSource};
+
+    let mut session = Session::new("title-peer-origin", "chat");
+    session.add_message(Message::user(
+        "Investigate the workspace reconnect behavior.",
+    ));
+    assert!(latest_title_input_is_human(&session));
+
+    let mut peer = SessionMessageEnvelope::user_input(&session.id, "Peer-only verifier dispatch");
+    peer.source = SessionMessageSource::Session {
+        session_id: bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+    };
+    peer.kind = SessionMessageKind::PeerMessage;
+    session.add_message(peer.to_provider_message().unwrap());
+    session.add_message(Message::assistant(
+        "Independent verification completed.",
+        None,
+    ));
+    assert!(!latest_title_input_is_human(&session));
+    assert!(!TitleContext::from_session(&session).unwrap().messages()[1]
+        .content
+        .contains("Peer-only verifier dispatch"));
+
+    let human = SessionMessageEnvelope::user_input(
+        &session.id,
+        "The issue is that reconnection replays the earlier unread cursor.",
+    )
+    .with_root_chat_prompt("Workspace instructions".into())
+    .unwrap();
+    session.add_message(human.to_provider_message().unwrap());
+    assert!(latest_title_input_is_human(&session));
+}
+
+#[test]
 fn title_evidence_fingerprint_ignores_repeated_turns_and_acknowledgements() {
     let mut session = Session::new("pending-title", "model");
     session.add_message(Message::user("我想了解这里的背景"));

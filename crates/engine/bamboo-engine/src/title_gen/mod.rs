@@ -22,6 +22,7 @@ mod tracker;
 
 pub use fallback::heuristic_title;
 pub use prompt::build_title_messages;
+pub(crate) use prompt::{is_human_title_input, latest_title_input_is_human};
 pub use tracker::TitleGenerationTracker;
 
 use prompt::{ModelTitle, TitleContext};
@@ -185,6 +186,9 @@ async fn run_title_generation(
             return Superseded;
         }
         _ => {}
+    }
+    if request.is_automatic() && !latest_title_input_is_human(&session) {
+        return InsufficientContext;
     }
 
     let Some(context) = TitleContext::from_session(&session) else {

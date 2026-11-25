@@ -2113,6 +2113,7 @@ pub fn spawn_session_execution_with_title_generation(
                     && !managed_root
                     && session.authority_identity.is_ordinary()
                     && !session.title_generated
+                    && crate::title_gen::latest_title_input_is_human(&session)
                     && session
                         .messages
                         .iter()

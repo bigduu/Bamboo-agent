@@ -2842,10 +2842,7 @@ impl ChildCompletionCoordinator {
                 execution_reservation.abandon().await;
                 return;
             }
-            if message.role == Role::User
-                && !bamboo_domain::session::history::is_hidden_from_ui(&message)
-                && !bamboo_domain::session::is_system_resume_message(&message)
-            {
+            if crate::title_gen::is_human_title_input(&message) {
                 if let Some(context) = &title_context {
                     crate::title_gen::spawn_title_generation(context.clone(), session_id.clone());
                 }
