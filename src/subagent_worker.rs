@@ -538,8 +538,8 @@ impl BambooRuntimeExecutor {
         let strict_native = spec.capabilities.native_tool_ceiling_required;
         let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
         // Local actor processes inherit the managed launcher's environment.
-        // Resolve again at the worker boundary, then inject this single store
-        // into both prompt preparation and the worker's memory tool.
+        // Resolve the same Jiandu store at the worker boundary for explicit
+        // memory tool calls.
         let jiandu_selection =
             resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))?;
         let jiandu_mode = jiandu_selection.mode();

@@ -13,11 +13,11 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
-    build_instruction_overlay_context_block, build_plan_mode_context_block,
-    build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block, build_session_identity_context_block,
-    build_supervisor_route_observation, build_task_list_context_block,
-    build_workspace_context_block,
+    build_instruction_overlay_context_block, build_memory_usage_context_block,
+    build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_project_resources_context_block, build_root_orchestration_context_block,
+    build_session_identity_context_block, build_supervisor_route_observation,
+    build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -33,13 +33,13 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
-    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
+    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
-    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, RequestToolSelection,
+    ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -754,10 +754,13 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
-    configured_mode: PermissionMode,
+    config: &AgentLoopConfig,
+    loading_mode: CapabilityLoadingMode,
 ) -> Option<ContextBlock> {
-    let flags =
-        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+        session,
+        config.permission_mode.unwrap_or_default(),
+    );
     let schemas = effective_tool_schemas(session, tool_schemas);
     if flags.plan_read_only
         || !session.allows_model_tool_execution("write_stdin")
@@ -771,15 +774,49 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
-    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
-        && schemas
-            .iter()
-            .any(|schema| schema.function.name == "SubAgent")
+    let mut guidance =
+        "Use write_stdin with an exact session_id below for interactive input, unread output, or a short wait for an exit status you still need. Reuse terminal evidence already returned for that session_id."
+            .to_owned();
+    if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && session.allows_model_tool_execution("SubAgent")
+        && !crate::runtime::loop_control::suspension::active(config)
+        && bamboo_agent_core::tools::suspension_allowed()
+        && schemas.iter().any(|schema| {
+            schema.function.name == "SubAgent"
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/intent/enum")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|intents| intents.iter().any(|intent| intent == "wait"))
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/target/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("string")
+        })
+        && (loading_mode != CapabilityLoadingMode::Progressive
+            || crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                session,
+                &schemas,
+                loading_mode,
+            )
+            .contains_execution_name("SubAgent"))
     {
-        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
-    } else {
-        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
-    };
+        let wait_targets: Vec<_> = ids
+            .iter()
+            .filter(|id| {
+                bamboo_tools::tools::exec_command::exec_wait_target_is_ready(&session.id, id)
+            })
+            .collect();
+        if !wait_targets.is_empty() {
+            guidance = format!(
+                "{guidance} Advance independent work while commands run. When you need to wait for a non-interactive command to exit, use SubAgent with intent=wait and target set to its exact session_id from the exit-wait list.\nExit-wait session IDs: {}",
+                serde_json::to_string(&wait_targets).expect("shell session IDs are serializable"),
+            );
+        }
+    }
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
@@ -848,6 +885,7 @@ pub(super) async fn project_request_usage(
         prepared_context,
         config,
         effective_tool_schemas.as_ref(),
+        wire_schemas.as_ref(),
         model,
         loading_mode,
         native_transcript_protocol_for(llm, model),
@@ -880,6 +918,7 @@ fn build_request_envelope_reconciled(
         prepared_context,
         config,
         tool_schemas,
+        tool_schemas,
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
@@ -894,6 +933,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
+    wire_tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
     native_protocol: Option<ProviderProtocol>,
@@ -1249,11 +1289,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
-    // Recall, Dream, and agenda are current read models. Keeping them outside
-    // the generated ledger prevents old snapshots from reappearing after an
-    // edit, archive, or project reassignment.
-    let external_memory_message_id = build_external_memory_context_block(session).map(|block| {
-        // Place the current snapshot before the user who owns this turn.
+    let ledger_context = build_external_memory_context_block(session);
+    let has_ledger_context = ledger_context.is_some();
+    let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
+    if !standalone_discovery {
+        current_context.extend(build_memory_usage_context_block(
+            session,
+            tool_schemas,
+            wire_tool_schemas,
+            loading_mode,
+            config.permission_mode.unwrap_or_default(),
+        ));
+    }
+    // The agenda and recall instructions are current context, outside the
+    // generated ledger. Present them before the user who owns this turn.
+    let external_memory_message_id = if current_context.is_empty() {
+        None
+    } else {
         // Tool continuations then end with the same call/results as before.
         let anchor = real_transcript
             .iter()
@@ -1274,11 +1326,16 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                     .rposition(|message| message.id == anchor.id)
             })
             .unwrap_or(0);
-        let message = block.render_runtime_context_message();
-        let id = message.id.clone();
-        model_transcript.insert(index, message);
-        id
-    });
+        model_transcript.splice(
+            index..index,
+            current_context
+                .into_iter()
+                .map(|block| block.render_runtime_context_message()),
+        );
+        // Anthropic moves this ID to the live tail. The recall instructions
+        // stay with the context that precedes the current user request.
+        has_ledger_context.then(|| model_transcript[index].id.clone())
+    };
     cache_plan.anthropic_history = real_transcript.last().map(|newest| {
         let previous_message_id = ledger
             .prior_message_count
@@ -1323,8 +1380,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     }
     if let Some(block) = build_exec_session_continuation_context_block(
         session,
-        tool_schemas,
-        config.permission_mode.unwrap_or_default(),
+        wire_tool_schemas,
+        config,
+        loading_mode,
     ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
@@ -1719,6 +1777,9 @@ pub(super) async fn execute_llm_stream(
     let standalone_discovery = frame
         .output_limit_recovery
         .is_some_and(|policy| policy.standalone_discovery);
+    let round_cap_summary = frame
+        .output_limit_recovery
+        .is_some_and(|policy| policy.round_cap_summary);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1727,6 +1788,7 @@ pub(super) async fn execute_llm_stream(
         .map_err(|error| AgentError::Budget(error.to_string()))?
         .is_none()
         && task_split.is_none()
+        && !round_cap_summary
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
@@ -1745,9 +1807,18 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         tool_dispatch,
     ) = loop {
-        let required_tool = required_tool_for_session(session);
-        let (loading_mode, selection) =
-            request_tool_policy(llm.as_ref(), model, required_tool).await?;
+        let (required_tool, loading_mode, selection) = if round_cap_summary {
+            (
+                None,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                RequestToolSelection::Disabled,
+            )
+        } else {
+            let required_tool = required_tool_for_session(session);
+            let (loading_mode, selection) =
+                request_tool_policy(llm.as_ref(), model, required_tool).await?;
+            (required_tool, loading_mode, selection)
+        };
         let effective_schemas =
             select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
@@ -1776,6 +1847,7 @@ pub(super) async fn execute_llm_stream(
             &prepared_context,
             config,
             tool_schemas,
+            wire_schemas,
             model,
             loading_mode,
             native_transcript_protocol_for(llm, model),
@@ -2178,7 +2250,8 @@ pub(super) async fn execute_llm_stream(
             .is_none_or(|policy| policy.remaining_run_tokens.is_none());
     let completion = CompletionDiagnostics::for_agent_round(recovery)
         .with_model_window_limit(window_limit)
-        .with_provider_default_output(provider_default_output);
+        .with_provider_default_output(provider_default_output)
+        .with_tools_disabled(round_cap_summary);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -2374,10 +2447,14 @@ pub(super) async fn execute_llm_stream(
             session,
         );
     // The opt-in evidence check must publish only the final, checked answer.
-    // Buffer this response until tool calls tell us whether it is a candidate.
+    // A cap summary also stays private until its completion is validated.
     let stream_output_result = observation
         .scope(async {
-            if activation_pending || config.features_final_evidence_check || private_plan {
+            if activation_pending
+                || config.features_final_evidence_check
+                || private_plan
+                || round_cap_summary
+            {
                 crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                     stream,
                     cancel_token,
@@ -2442,6 +2519,7 @@ pub(super) async fn execute_llm_stream(
                 &failure.error,
             ));
             let appended = !private_plan
+                && !round_cap_summary
                 && append_interrupted_assistant_output(
                     session,
                     *failure.partial_output,
@@ -2478,10 +2556,15 @@ pub(super) async fn execute_llm_stream(
     observation.finish(outcome);
 
     let response_rejected = finish_reason == REASONING_REPETITION_FINISH_REASON
-        || super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
+        || super::rejected_output_limit(
+            &stream_output,
+            finish_reason,
+            task_split.is_some() || round_cap_summary,
+        );
     if config.features_final_evidence_check
         && !activation_pending
         && !response_rejected
+        && !round_cap_summary
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {

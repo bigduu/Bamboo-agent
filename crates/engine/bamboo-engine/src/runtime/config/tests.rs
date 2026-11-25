@@ -74,20 +74,22 @@ fn model_must_come_from_config_not_session() {
 }
 
 #[test]
-fn prompt_memory_flags_map_from_memory_config() {
+fn prompt_memory_flags_ignore_legacy_injection_settings() {
     let memory = MemoryConfig {
-        project_prompt_injection: false,
-        relevant_recall: false,
+        project_prompt_injection: true,
+        relevant_recall: true,
         relevant_recall_rerank: true,
-        project_first_dream: false,
+        project_first_dream: true,
+        ledger_agenda_injection: false,
         ..MemoryConfig::default()
     };
 
     let flags = PromptMemoryFlags::from(&memory);
     assert!(!flags.project_prompt_injection);
     assert!(!flags.relevant_recall);
-    assert!(flags.relevant_recall_rerank);
+    assert!(!flags.relevant_recall_rerank);
     assert!(!flags.project_first_dream);
+    assert!(!flags.ledger_agenda);
 }
 
 #[test]

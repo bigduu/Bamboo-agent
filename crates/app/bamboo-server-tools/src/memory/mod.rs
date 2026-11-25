@@ -338,7 +338,7 @@ impl Tool for MemoryTool {
                                 "type": "string",
                                 "enum": ["day", "week", "month", "quarter", "year"]
                             },
-                            "description": "Restrict results to these temporal granularities: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). This is a hard filter (unlike the passive recall-into-prompt ordering): a memory whose granularity doesn't appear in this list is excluded entirely, and a memory with no granularity never matches a non-empty filter here. Omit for no granularity filtering."
+                            "description": "Restrict results to these temporal granularities: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). This is a hard filter: a memory whose granularity doesn't appear in this list is excluded entirely, and a memory with no granularity never matches a non-empty filter here. Omit for no granularity filtering."
                         }
                     }
                 },

@@ -1926,6 +1926,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",
+    "runtime.ledger_and_usage_context.v1",
     "execute.startup_handoff_at",
     "execute.pending_turn_message_id",
     "goal.state",

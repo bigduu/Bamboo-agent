@@ -22,7 +22,6 @@ use crate::runtime::guardian_state::{
 use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
-use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::round_lifecycle::{
     fallback_tool_is_resident, uses_sticky_fallback, RoundRecoveryPolicy, RoundToolDispatch,
     TaskSplitPrompt,
@@ -2974,6 +2973,34 @@ async fn handle_no_tool_calls_with_native(
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
     }
+    record_root_final_message_candidate(session, config, &answer_id);
+    let usage = to_event_token_usage(
+        complete_usage.prompt_tokens,
+        complete_usage.completion_tokens,
+    );
+    // Counted publication belongs to the outer runner, after AfterRound,
+    // normal finalization and the terminal LoopState checkpoint all succeed.
+    if !super::defers_terminal_complete(config) {
+        let _ = event_tx.send(AgentEvent::Complete { usage }).await;
+    }
+    record_no_tool_calls_round_completed(
+        metrics_collector,
+        round_id,
+        session_id,
+        session,
+        round_usage,
+    );
+    Ok(TurnOutcome {
+        should_break: true,
+        sent_complete: !super::defers_terminal_complete(config),
+    })
+}
+
+fn record_root_final_message_candidate(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    answer_id: &str,
+) {
     if let Some(owner) = config
         .persistence
         .as_ref()
@@ -2997,26 +3024,6 @@ async fn handle_no_tool_calls_with_native(
                 })
             });
     }
-    let usage = to_event_token_usage(
-        complete_usage.prompt_tokens,
-        complete_usage.completion_tokens,
-    );
-    // Counted publication belongs to the outer runner, after AfterRound,
-    // normal finalization and the terminal LoopState checkpoint all succeed.
-    if !super::defers_terminal_complete(config) {
-        let _ = event_tx.send(AgentEvent::Complete { usage }).await;
-    }
-    record_no_tool_calls_round_completed(
-        metrics_collector,
-        round_id,
-        session_id,
-        session,
-        round_usage,
-    );
-    Ok(TurnOutcome {
-        should_break: true,
-        sent_complete: !super::defers_terminal_complete(config),
-    })
 }
 
 fn reset_final_answer_context(session: &mut Session) {
@@ -3902,17 +3909,8 @@ async fn run_pipeline_inner(
         }
 
         // --- Turn-boundary refresh, cancellation, and prompt context ---
-        // Admit durable input before deriving this round's memory query. The
-        // shared prelude also checks cancellation before Project/external-memory
-        // work and again before provider dispatch.
-        let runtime_context = PromptMemoryRuntimeContext {
-            llm: state
-                .auxiliary_models
-                .background_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
-            background_model_name: state.auxiliary_models.background_model_name.clone(),
-        };
+        // Admit durable input and refresh the current Project and ledger before
+        // provider dispatch. The shared prelude checks cancellation first.
         let (prompt_memory_exposure, observation, admitted_messages) =
             crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
@@ -3921,7 +3919,6 @@ async fn run_pipeline_inner(
                 Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
-                split_request.is_none().then_some(&runtime_context),
                 &state.execution_id,
             )
             .await?;
@@ -3973,12 +3970,14 @@ async fn run_pipeline_inner(
             }
         }
         // Evaluate feedback after the real tool batch and any newly admitted
-        // Human input. Quiet command recovery retains its existing handoff.
-        let quiet_poll_active = crate::runtime::runner::tool_execution::quiet_poll_guard_active(
-            session,
-            &state.runtime_state,
-            config,
-        );
+        // Human input. A capped summary cannot start another background wait.
+        // Existing waits are reconciled when the run exits.
+        let quiet_poll_active = !max_rounds_summary_used
+            && crate::runtime::runner::tool_execution::quiet_poll_guard_active(
+                session,
+                &state.runtime_state,
+                config,
+            );
         if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
                 if maybe_suspend_for_background_exec(
@@ -4095,7 +4094,7 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        let attempt_limit = if split_request.is_some() || standalone_discovery {
+        let attempt_limit = if split_request.is_some() || standalone_discovery || max_rounds_summary_used {
             1
         } else {
             MAX_LLM_TURN_ATTEMPTS + extra_attempts
@@ -4135,6 +4134,7 @@ async fn run_pipeline_inner(
                     private_plan: *stage == SplitStage::Plan,
                 }),
                 standalone_discovery,
+                round_cap_summary: max_rounds_summary_used,
             };
             let split_tools;
             let request_tools = match split_request.as_ref() {
@@ -4169,7 +4169,7 @@ async fn run_pipeline_inner(
             .await
             {
                 Ok(output) => output,
-                Err(error) if output_limit_recovery.is_some() || standalone_discovery => {
+                Err(error) if output_limit_recovery.is_some() || standalone_discovery || max_rounds_summary_used => {
                     terminal_error = Some(error);
                     break;
                 }
@@ -4412,6 +4412,29 @@ async fn run_pipeline_inner(
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
+            if max_rounds_summary_used {
+                // A provider may disregard the empty catalog. Don't persist
+                // its tool calls or native items as unpaired transcript actions.
+                let content = if llm_output.terminal_validation_error.is_some()
+                    || stream_output.content.trim().is_empty()
+                {
+                    "The round limit was reached before a complete progress summary was available. \
+                     Work completed so far remains available.".into()
+                } else {
+                    stream_output.content
+                };
+                let message = Message::assistant(content, None);
+                let answer_id = message.id.clone();
+                publish_buffered_message(event_tx, &message).await;
+                session.add_message(message);
+                record_root_final_message_candidate(session, config, &answer_id);
+                record_no_tool_calls_round_completed(
+                    state.metrics_collector.as_ref(), &round_id, &state.session_id,
+                    session, round_activity.token_usage(),
+                );
+                turn_outcome = Some(TurnOutcome { should_break: true, sent_complete: false });
+                break;
+            }
             if let Some(split) = split_recovery.as_mut() {
                 split.prompt_floor = split.prompt_floor.max(llm_output.attempt_usage.prompt_tokens);
             }
@@ -5416,13 +5439,8 @@ async fn run_pipeline_inner(
         //   2. log a tracing::warn!;
         //   3. inject a VISIBLE user-facing notification explaining the stop.
         //
-        // We also grant the model EXACTLY ONE final turn to summarize. The
-        // local `max_rounds_summary_used` sentinel makes this strictly
-        // one-shot: the first guard hit injects the summary prompt and continues
-        // for a single extra round; the next time this guard fires we break
-        // unconditionally — regardless of what that turn did (including ignoring
-        // the instruction and emitting more tool calls). It can therefore never
-        // recurse or extend the loop indefinitely.
+        // Grant one final text-only summary request. The local sentinel selects
+        // a tool-free wire request and the terminal response path above.
         if let Some(max_rounds) = config.run_budget.max_rounds {
             if (config.effective_counted_loop().is_some() || config.loop_control.is_some())
                 && turn_counter >= max_rounds
@@ -5431,42 +5449,32 @@ async fn run_pipeline_inner(
                 break;
             }
             if turn_counter >= max_rounds {
-                if !max_rounds_summary_used {
-                    tracing::warn!(
-                        "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
-                        state.session_id,
-                        max_rounds
-                    );
-                    session.metadata.insert(
-                        "runtime.completion_reason".to_string(),
-                        "max_rounds_reached".to_string(),
-                    );
-                    // Single visible user turn that both notifies the user WHY the
-                    // run stopped and prompts the model to summarize. It MUST be one
-                    // message: two consecutive user messages would violate strict
-                    // role alternation (Anthropic 400s on it), breaking the summary
-                    // turn and the next resume. One user turn keeps alternation valid
-                    // (a preceding Tool message is merged into it by the serializer).
-                    let mut summary = Message::user(format!(
-                        "Reached the maximum of {0} rounds; the task was stopped before \
-                         completion. Stop working now and summarize your progress so far \
-                         and what remains.",
-                        max_rounds
-                    ));
-                    summary.metadata =
-                        Some(serde_json::json!({"runtime_kind": "max_rounds_summary"}));
-                    session.add_message(summary);
-                    max_rounds_summary_used = true;
-                    discovery_correction_pending = false;
-                    continue;
-                }
-
                 tracing::warn!(
-                    "[{}] Reached max rounds ({}) — stopping the run before completion.",
+                    "[{}] Reached max rounds ({}) — granting one summary turn before stopping.",
                     state.session_id,
                     max_rounds
                 );
-                break;
+                session.metadata.insert(
+                    "runtime.completion_reason".to_string(),
+                    "max_rounds_reached".to_string(),
+                );
+                // Single visible user turn that both notifies the user WHY the
+                // run stopped and prompts the model to summarize. It MUST be one
+                // message: two consecutive user messages would violate strict
+                // role alternation (Anthropic 400s on it), breaking the summary
+                // turn and the next resume. One user turn keeps alternation valid
+                // (a preceding Tool message is merged into it by the serializer).
+                let mut summary = Message::user(format!(
+                    "Reached the maximum of {0} rounds; the task was stopped before \
+                     completion. Summarize the progress, verified outputs, and remaining \
+                     work in text only. Do not call tools or claim unfinished work is complete.",
+                    max_rounds
+                ));
+                summary.metadata = Some(serde_json::json!({"runtime_kind": "max_rounds_summary"}));
+                session.add_message(summary);
+                max_rounds_summary_used = true;
+                discovery_correction_pending = false;
+                continue;
             }
         }
     }
@@ -12704,7 +12712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_typed_inbox_input_drives_current_round_memory_recall() {
+    async fn pipeline_admits_inbox_input_without_passive_memory_recall() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
@@ -12719,24 +12727,11 @@ mod tests {
             SessionInboxLimits::default(),
         ));
 
-        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path().join("jiandu"));
-        memory
-            .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Global,
-                None,
-                bamboo_memory::memory_store::DurableMemoryType::Reference,
-                "Pipeline cobalt orchid rule",
-                "The cobalt orchid request must use the pipeline memory boundary.",
-                &["cobalt".to_string(), "orchid".to_string()],
-                Some("pipeline-typed-inbox-recall"),
-                "model",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-
         let mut persisted = Session::new("pipeline-typed-inbox-recall", "model");
+        persisted.metadata.insert(
+            "external_memory_rendered".into(),
+            "stale memory from a previous request".into(),
+        );
         persisted.add_message(Message::system("base prompt"));
         persisted.add_message(Message::user("unrelated earlier request"));
         storage.save_session(&persisted).await.unwrap();
@@ -12759,7 +12754,6 @@ mod tests {
             persistence: Some(persistence),
             session_inbox: Some(inbox),
             app_data_dir: Some(directory.path().join("bamboo")),
-            memory_store: memory,
             prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: true,
@@ -12795,12 +12789,9 @@ mod tests {
                 && message.role == bamboo_domain::Role::User
                 && message.content == query
         }));
-        let rendered =
-            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
-                .expect("current-round recall should render external memory");
-        assert!(rendered.contains("Pipeline cobalt orchid rule"));
         assert!(
-            rendered.contains("The cobalt orchid request must use the pipeline memory boundary.")
+            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
+                .is_none()
         );
 
         let observability: bamboo_agent_core::PromptMemoryObservability = serde_json::from_str(
@@ -12811,8 +12802,8 @@ mod tests {
         )
         .unwrap();
         assert!(observability.latest_user_query_present);
-        assert_eq!(observability.relevant_memory_status, "lexical");
-        assert_eq!(observability.relevant_memory_count, 1);
+        assert_eq!(observability.relevant_memory_status, "disabled");
+        assert_eq!(observability.relevant_memory_count, 0);
         assert!(
             std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| {
                 matches!(

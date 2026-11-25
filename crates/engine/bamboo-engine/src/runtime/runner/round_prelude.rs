@@ -1,8 +1,6 @@
 //! Shared round prelude for the lifecycle adapter and main pipeline.
 //! Durable input admission and cancellation checks happen before prompt context.
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -11,11 +9,10 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::AgentRuntimeState;
-use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    refresh_external_memory_context, PromptMemoryExposureProvenance, PromptMemoryRuntimeContext,
+    refresh_external_memory_context, PromptMemoryExposureProvenance,
     PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
@@ -44,18 +41,14 @@ const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
 
 pub(crate) async fn refresh_round_prompt_context(
     session: &mut Session,
-    memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
     app_data_dir: Option<&std::path::Path>,
 ) -> Result<PromptMemoryExposureProvenance, AgentError> {
     refresh_project_context(session, project_context_resolver).await?;
     let prompt_memory_exposure = refresh_external_memory_context(
         session,
-        memory,
         prompt_memory_flags,
-        runtime_context,
         project_context_resolver,
         app_data_dir,
     )
@@ -94,9 +87,8 @@ async fn refresh_project_context(
 
 /// Refresh the durable turn boundary before deriving any prompt context.
 ///
-/// Both the main pipeline and the lifecycle adapter use this exact sequence so
-/// external-memory recall always sees messages admitted for the current round,
-/// while a cancelled run never starts Project or memory context work.
+/// The main pipeline and lifecycle adapter admit current input before rebuilding
+/// Project, ledger and context-usage information for the next request.
 pub(crate) async fn refresh_round_boundary_and_prompt_context(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
@@ -104,7 +96,6 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) -> Result<PromptMemoryExposureProvenance, AgentError> {
     refresh_round_boundary_inner(
         session,
@@ -113,7 +104,6 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         event_tx,
         cancel_token,
         metrics_collector,
-        runtime_context,
         None,
     )
     .await
@@ -127,7 +117,6 @@ pub(crate) async fn refresh_round_boundary_with_observation(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
     execution_id: &str,
 ) -> Result<
     (
@@ -144,7 +133,6 @@ pub(crate) async fn refresh_round_boundary_with_observation(
         event_tx,
         cancel_token,
         metrics_collector,
-        runtime_context,
         Some(execution_id),
     )
     .await
@@ -157,7 +145,6 @@ async fn refresh_round_boundary_inner(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
-    runtime_context: Option<&PromptMemoryRuntimeContext>,
     execution_id: Option<&str>,
 ) -> Result<
     (
@@ -282,9 +269,7 @@ async fn refresh_round_boundary_inner(
 
     let prompt_memory_exposure = refresh_round_prompt_context(
         session,
-        &config.memory_store,
         config.prompt_memory_flags,
-        runtime_context,
         config.project_context_resolver.as_deref(),
         config.app_data_dir.as_deref(),
     )
@@ -505,7 +490,6 @@ pub(crate) async fn prepare_round(
     task_context: &mut Option<TaskLoopContext>,
     runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
-    llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
     frame: &RoundPreludeFrame<'_>,
 ) -> Result<String, AgentError> {
@@ -514,7 +498,6 @@ pub(crate) async fn prepare_round(
         task_context,
         runtime_state,
         config,
-        llm,
         _tools,
         frame,
         false,
@@ -528,7 +511,6 @@ pub(crate) async fn prepare_round_with_observation(
     task_context: &mut Option<TaskLoopContext>,
     runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
-    llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
     frame: &RoundPreludeFrame<'_>,
 ) -> Result<crate::runtime::managers::lifecycle::ObservedRoundPreparation, AgentError> {
@@ -537,7 +519,6 @@ pub(crate) async fn prepare_round_with_observation(
         task_context,
         runtime_state,
         config,
-        llm,
         _tools,
         frame,
         true,
@@ -550,7 +531,6 @@ async fn prepare_round_inner(
     task_context: &mut Option<TaskLoopContext>,
     runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
-    llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
     frame: &RoundPreludeFrame<'_>,
     capture: bool,
@@ -564,11 +544,6 @@ async fn prepare_round_inner(
     let model_name = frame.model_name;
     let debug_enabled = frame.debug_enabled;
 
-    let auxiliary = config.resolve_auxiliary_models();
-    let runtime_context = PromptMemoryRuntimeContext {
-        llm: auxiliary.background_model_provider.unwrap_or(llm),
-        background_model_name: auxiliary.background_model_name,
-    };
     let (_, observation, _) = refresh_round_boundary_inner(
         session,
         runtime_state,
@@ -576,7 +551,6 @@ async fn prepare_round_inner(
         None,
         cancel_token,
         metrics_collector,
-        Some(&runtime_context),
         capture.then_some(frame.execution_id),
     )
     .await?;
@@ -717,7 +691,6 @@ mod project_prompt_tests {
         session.set_workspace_path_meta(second.to_string_lossy().to_string());
         super::refresh_round_prompt_context(
             &mut session,
-            &memory,
             crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,
@@ -725,7 +698,6 @@ mod project_prompt_tests {
                 project_first_dream: false,
                 ledger_agenda: false,
             },
-            None,
             Some(&resolver),
             Some(directory.path()),
         )
@@ -759,14 +731,8 @@ mod project_prompt_tests {
             snapshot.project_context.as_deref(),
             Some(project_context.as_str())
         );
-        assert!(snapshot
-            .session_memory_note
-            .as_deref()
-            .is_some_and(|note| note.contains("memory refresh marker")));
-        assert!(snapshot
-            .external_memory
-            .as_deref()
-            .is_some_and(|memory| memory.contains("memory refresh marker")));
+        assert!(snapshot.session_memory_note.is_none());
+        assert!(snapshot.external_memory.is_none());
         assert_eq!(snapshot.effective_system_prompt.as_bytes(), b"Base");
         assert!(session.messages.iter().all(|message| {
             !message

@@ -29,8 +29,8 @@ runtime settings. The section facade and the consuming runtime are separate
 observations. A persisted revision is not proof that a consumer has applied it.
 
 Examples of implemented controls include `BAMBOO_PROVIDER`, provider-specific
-`BAMBOO_<PROVIDER>_API_KEY`, `BAMBOO_MEMORY_RELEVANT_RECALL_RERANK`, and
-`bamboo serve --port ...`. Never infer a general `BAMBOO_<DOTTED_KEY>` mechanism.
+`BAMBOO_<PROVIDER>_API_KEY`, and `bamboo serve --port ...`. Never infer a general
+`BAMBOO_<DOTTED_KEY>` mechanism.
 Environment credential overrides are in-memory inputs; don't write them into a
 configuration example or tell a user they have been persisted.
 
@@ -47,7 +47,9 @@ in one of those DTOs, even an omitted Option, makes the generator fail to compil
 until its documentation or explicit dynamic-map exclusion is updated. Both TLS child
 paths are required when `server.tls` is present and have no input defaults;
 omitting either fails deserialization. The optional parent defaults to absent.
-The deprecated `memory.dream_refine_mode` remains accepted but is ignored.
+Deprecated memory fields remain accepted for configuration compatibility. The
+runtime ignores `memory.dream_refine_mode` and the four automatic prompt fields
+listed in `memory.md`, along with the old environment variables for those fields.
 
 `root_coverage` inventories ConfigValues ownership plus memory, reporting
 uncovered roots explicitly. It is not an exhaustive list of sidecars,
@@ -73,8 +75,8 @@ section file, a write request, or evidence about the running instance:
 ```json
 {
   "memory": {
-    "relevant_recall": true,
-    "relevant_recall_rerank": false
+    "auto_dream_interval_secs": 3600,
+    "gardener_interval_secs": 86400
   },
   "skills": {
     "disabled": []

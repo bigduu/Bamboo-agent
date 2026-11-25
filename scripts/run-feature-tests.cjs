@@ -266,7 +266,15 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Root integration owners. The additive case selections are unchanged.
 // Scoped prompt recall retains the ordinary Engine, Memory, and Config cases.
 // Supervisor discovery recovery and its wire regressions use the default Engine owner.
-const FEATURE_SOURCE_SHA256 = "a3f90587248c18c31c6a8c96141759cd36bf0a77846fef943616893ed5ce0ecb";
+// #3068 keeps on-demand memory regressions with Engine/packages-3,
+// Config and Server Tools/packages-4, and server-app-state. Transient Session
+// metadata remains with Storage/packages-0. The Stream, Config and Storage
+// source records change while all five contexts and 23 additive cases retain
+// their existing owners.
+// Shell wait projection and text-only round-cap summaries retain the default
+// Engine and LLM test owners. Their feature-sensitive source records change
+// with the same additive contexts and case selections.
+const FEATURE_SOURCE_SHA256 = "3511c191028ad746b673d9673a51439cc074fb5f2265363a8167a2a8dcc1ed8e";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

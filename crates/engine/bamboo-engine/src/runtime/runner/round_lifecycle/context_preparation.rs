@@ -2132,7 +2132,10 @@ async fn maybe_apply_summary_context_compression_with_budget(
             super::stream_execution::build_exec_session_continuation_context_block(
                 session,
                 tool_schemas,
-                config.permission_mode.unwrap_or_default(),
+                config,
+                // Reserve for a full catalog; deferred loading can only
+                // make the continuation snapshot shorter.
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
             )
             .map(|block| counter.count_message(&block.render_runtime_context_message()))
             .unwrap_or(0),

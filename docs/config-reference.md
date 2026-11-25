@@ -565,9 +565,8 @@ processes.
 
 ## Memory / auto-dream / gardener
 
-Key `memory` (`Option<MemoryConfig>` — absent means every default below
-applies). All the dream/gardener toggles default **on**; the values below are
-the shipped defaults, so an empty `{}` is already reasonable:
+Key `memory` is optional. Omitted fields use the defaults below. Background
+Dream and gardener toggles default **on**.
 
 | Field | Default | What it does |
 |---|---|---|
@@ -576,10 +575,6 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
-| `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
-| `relevant_recall` | `true` | Retrieve relevant durable memories for the current turn. |
-| `relevant_recall_rerank` | `false` | Rerank recalled memories (extra model call) before injecting. |
-| `project_first_dream` | `true` | Include the authorized Project Dream in model prompts. |
 | `ledger_agenda_injection` / `ledger_gardener_enabled` / `ledger_distillation_enabled` | `true` | Personal-assistant ledger subsystem toggles. |
 | `ledger_gardener_interval_secs` | `21600` (6h) | Ledger gardener cadence. |
 | `gardener_enabled` | `true` | Background job that splits "multi-topic blob" memories; **calls no LLM when its deterministic pre-screen finds no candidates.** |
@@ -599,10 +594,12 @@ request. Large terminal results are reduced into bounded multipart sections;
 the persisted summary keeps one overall source-derived budget, capped by the
 space remaining under the shared context target after mandatory content.
 
-`project_prompt_injection` / `relevant_recall` / `relevant_recall_rerank` /
-`project_first_dream` can also be flipped via env vars — see
-[Environment variables](#environment-variables) — which is handy for a
-one-off container run without touching `config.json`.
+Agents look up saved memory on demand with `memory`. Start with a short
+lexical `query` in the appropriate scope, then use `get` for selected results.
+Use `session_read` when the task needs continuity notes from the current Session.
+`project_prompt_injection`, `relevant_recall`, `relevant_recall_rerank`, and
+`project_first_dream` are deprecated compatibility fields. They default to
+`false`, and the runtime ignores saved values and legacy aliases.
 
 `auto_dream_enabled`/`gardener_enabled` intentionally consume model tokens
 when on; turn them off (`{"memory": {"auto_dream_enabled": false}}`) for a
@@ -947,7 +944,7 @@ optional; file config plus built-in defaults cover a fresh install.
 and `BAMBOO_GEMINI` prefixes with the `_API_KEY`, `_BASE_URL`, and `_MODEL`
 suffixes. [Provider variables and account scope](#choosing-a-provider-and-model).
 
-**Memory toggles** (override the matching `memory.*` config field):
+**Deprecated memory variables** (ignored):
 `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`, `BAMBOO_MEMORY_RELEVANT_RECALL`,
 `BAMBOO_MEMORY_RELEVANT_RECALL_RERANK`, `BAMBOO_MEMORY_PROJECT_FIRST_DREAM`.
 

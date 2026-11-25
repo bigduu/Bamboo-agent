@@ -805,18 +805,23 @@ async fn supervisor_discovery_correction_stops_if_wire_returns_other_tools() {
 #[tokio::test]
 async fn supervisor_discovery_correction_does_not_replace_round_limit_summary() {
     let summary = "Stopped at the round limit before checking Session scope.";
-    let run = run_supervisor_discovery_wire(1, vec![json!({"content":summary})]).await;
+    let unexpected = wire_tool_call(0, "summary-tool", "Task", r#"{"tasks":[]}"#);
+    let run = run_supervisor_discovery_wire(
+        1,
+        vec![json!({"content":summary,"tool_calls":[unexpected]})],
+    )
+    .await;
     run.outcome.unwrap();
     assert_eq!(run.requests.len(), 2);
     let summary_request = &run.requests[1];
     assert!(summary_request
         .to_string()
-        .contains("summarize your progress"));
+        .contains("Summarize the progress, verified outputs, and remaining work in text only"));
     assert!(!summary_request
         .to_string()
         .contains("This request is for tool discovery only."));
-    assert!(tool_names(summary_request).contains(&"Task"));
-    assert_eq!(summary_request["parallel_tool_calls"], true);
+    assert!(tool_names(summary_request).is_empty());
+    assert!(summary_request.get("parallel_tool_calls").is_none());
     assert_eq!(
         run.session
             .metadata
@@ -831,6 +836,234 @@ async fn supervisor_discovery_correction_does_not_replace_round_limit_summary() 
         .any(|row| row.content == summary));
     assert!(run.calls.is_empty());
     assert_discovery_wire_tool_result(&run.session, "mixed-task", false);
+    assert!(run.session.messages.iter().all(|message| {
+        message.tool_call_id.as_deref() != Some("summary-tool")
+            && message
+                .tool_calls
+                .as_ref()
+                .is_none_or(|calls| calls.iter().all(|call| call.id != "summary-tool"))
+    }));
+}
+
+#[tokio::test]
+async fn explicit_round_cap_summary_has_no_tools_even_with_a_forced_provider_choice() {
+    let summary = "Saved the partial artifact; verification remains.";
+    check_round_cap_summary_wire("tool_calls", summary).await;
+}
+
+#[tokio::test]
+async fn explicit_round_cap_summary_publishes_only_host_fallback_for_truncated_text() {
+    let fallback = "The round limit was reached before a complete progress summary was available. \
+                    Work completed so far remains available.";
+    check_round_cap_summary_wire("length", fallback).await;
+}
+
+async fn check_round_cap_summary_wire(summary_finish_reason: &'static str, expected_summary: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bamboo_agent_core::tools::{ToolError, ToolExecutor, ToolResult};
+    use wiremock::matchers::path;
+
+    struct Writer(std::path::PathBuf);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for Writer {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            std::fs::write(&self.0, &call.id).unwrap();
+            Ok(ToolResult::text(true, "Partial artifact saved."))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![schema("Write")]
+        }
+    }
+
+    let summary = "Saved the partial artifact; verification remains.";
+    let data = tempfile::tempdir().unwrap();
+    let artifact = data.path().join("partial.txt");
+    let write_arguments = json!({"file_path":artifact,"content":"fixture"}).to_string();
+    let requests = AtomicUsize::new(0);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_: &wiremock::Request| {
+            let round = requests.fetch_add(1, Ordering::SeqCst);
+            let delta = match round {
+                0 => json!({"tool_calls":[wire_tool_call(0, "work-write", "Write", &write_arguments)]}),
+                1 => json!({
+                    "content":summary,
+                    "tool_calls":[wire_tool_call(0, "over-cap-write", "Write", &write_arguments)],
+                }),
+                _ => return ResponseTemplate::new(400),
+            };
+            let finish_reason = if round == 0 {
+                "tool_calls"
+            } else {
+                summary_finish_reason
+            };
+            let chunk = json!({
+                "id":format!("round-cap-{round}"), "object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+            });
+            ResponseTemplate::new(200).set_body_raw(
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            )
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_request_overrides(Some(body_override(
+                "tool_choice",
+                json!({"type":"function","function":{"name":"Write"}}),
+            ))),
+    );
+    let mut session = Session::new("round-cap", MODEL);
+    let (events, mut receiver) = tokio::sync::mpsc::channel(128);
+    crate::runtime::runner::run_agent_loop_with_config(
+        &mut session,
+        "Write the artifact and verify it.".into(),
+        events,
+        provider,
+        Arc::new(Writer(artifact.clone())),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            model_name: Some(MODEL.into()),
+            provider_type: Some("openai".into()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = capture(&server).await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(tool_names(&requests[0]), ["Write"]);
+    assert_eq!(requests[0]["tool_choice"]["function"]["name"], "Write");
+    assert!(tool_names(&requests[1]).is_empty());
+    assert!(requests[1].get("tool_choice").is_none());
+    assert!(requests[1].to_string().contains("Partial artifact saved."));
+    assert_eq!(std::fs::read_to_string(artifact).unwrap(), "work-write");
+    assert_eq!(
+        session.metadata["runtime.completion_reason"],
+        "max_rounds_reached"
+    );
+    let answer = session.messages.last().unwrap();
+    assert_eq!(answer.role, bamboo_domain::Role::Assistant);
+    assert_eq!(answer.content, expected_summary);
+    assert!(answer.tool_calls.is_none());
+    let transcript = serde_json::to_string(&session.messages).unwrap();
+    assert!(!transcript.contains("over-cap-write"));
+    if summary_finish_reason == "length" {
+        assert!(!transcript.contains(summary));
+        let mut visible_text = String::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let bamboo_agent_core::AgentEvent::Token { content } = event {
+                visible_text.push_str(&content);
+            }
+        }
+        assert!(visible_text.contains(expected_summary));
+        assert!(!visible_text.contains(summary));
+    }
+}
+
+#[tokio::test]
+async fn rejected_round_cap_summary_clears_responses_id_before_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let requests = AtomicUsize::new(0);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            let round = requests.fetch_add(1, Ordering::SeqCst);
+            let frames = match round {
+                0 => vec![
+                    json!({"type":"response.output_text.delta","item_id":"msg_summary","delta":"Discard this partial summary."}),
+                    json!({"type":"response.incomplete","response":{
+                        "id":"resp_rejected","status":"incomplete","output":[],
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }}),
+                ],
+                1 => vec![
+                    json!({"type":"response.output_text.delta","item_id":"msg_resumed","delta":"Resumed."}),
+                    json!({"type":"response.completed","response":{
+                        "id":"resp_resumed","status":"completed","output":[]
+                    }}),
+                ],
+                _ => return ResponseTemplate::new(400),
+            };
+            let mut body = String::new();
+            for event in frames {
+                let kind = event["type"].as_str().unwrap();
+                body.push_str(&format!("event: {kind}\ndata: {event}\n\n"));
+            }
+            ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_responses_only_models(vec![MODEL.into()]),
+    );
+    let mut session = Session::new("round-cap-resume", MODEL);
+    session.add_message(Message::user("Prior request"));
+    session.add_message(Message::assistant("Work performed before the cap.", None));
+    session.add_message(Message::user("Summarize progress"));
+    let key = super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY;
+    session.metadata.insert(key.into(), "resp_old_work".into());
+
+    let catalog = [schema("Read")];
+    let summary = run_round(
+        &mut session,
+        &provider,
+        &catalog,
+        Some(super::RoundRecoveryPolicy {
+            retry: None,
+            remaining_run_tokens: None,
+            previous_prompt_tokens: 0,
+            task_split: None,
+            standalone_discovery: false,
+            round_cap_summary: true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        summary.terminal_validation_error,
+        Some(super::AgentError::OutputTokenLimit { .. })
+    ));
+    assert!(!session.metadata.contains_key(key));
+
+    session.add_message(Message::assistant(
+        "A complete summary was not available.",
+        None,
+    ));
+    session.add_message(Message::user("Resume from saved work."));
+    let resumed = run_round(&mut session, &provider, &catalog, None)
+        .await
+        .unwrap();
+    assert_eq!(resumed.stream_output.content, "Resumed.");
+    let bodies = capture(&server).await;
+    assert!(bodies
+        .iter()
+        .all(|body| body.get("previous_response_id").is_none()));
+    let resumed_input = bodies[1]["input"].to_string();
+    assert!(resumed_input.contains("Work performed before the cap."));
+    assert!(resumed_input.contains("Resume from saved work."));
+    assert!(!resumed_input.contains("Discard this partial summary."));
 }
 
 #[tokio::test]
@@ -930,6 +1163,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
                     advisory: "Complete a smaller part of the request",
                     private_plan: false,
                 }),
+                round_cap_summary: false,
                 standalone_discovery: false,
             }),
         )

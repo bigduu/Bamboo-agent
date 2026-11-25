@@ -178,7 +178,8 @@ pub struct AgentRuntime {
     /// Reloadable LLM provider handle (delegates to the latest provider).
     pub provider: Arc<dyn LLMProvider>,
 
-    /// Concrete Jiandu store shared by every run from this runtime.
+    /// Concrete Jiandu store supplied by the embedding. Memory tools own their
+    /// scope and store binding independently of model-request assembly.
     pub memory_store: bamboo_memory::memory_store::MemoryStore,
 
     /// Default tool executor (root tools with full surface).
@@ -1317,7 +1318,6 @@ impl AgentRuntime {
                 ),
             ),
             app_data_dir,
-            memory_store: self.memory_store.clone(),
             prompt_memory_flags: config
                 .memory()
                 .as_ref()

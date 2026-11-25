@@ -231,8 +231,10 @@ The trusted default Supervisor uses its own delegation policy in both
 Standard and Ultra. It can use Work tools with current Work authority and
 scoped Session management through the installed Host ports. Its independent-Root followup
 requires an explicitly attached target in current authorized Project/lifetime
-scope. Main execution first lists and inspects suitable managed independent
-Sessions; bounded Child agents assist with planning, review and verification.
+scope. The Supervisor prefers eligible Work for deliverables that need durable
+tracking or acceptance. For assignments routed to independent Sessions, it lists
+and inspects suitable targets. Bounded Child agents assist with planning, review
+and verification.
 The owner-facing `GET /api/v1/supervisor/default/sessions` observes these links,
 and explicit `PUT /api/v1/supervisor/default/sessions/{target_id}` attaches or
 detaches an existing Root with the current incarnation and management revision.

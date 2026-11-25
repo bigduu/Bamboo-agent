@@ -74,7 +74,6 @@ impl Request {
     }
 
     fn loop_task(self, round: u32) {
-        assert!(self.tools.iter().any(|tool| tool.function.name == "Task"));
         self.reply
             .send(Reply::LoopTask(round))
             .expect("live bounded-loop provider gate");
@@ -1877,8 +1876,21 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
                 round == MAX_ROUNDS,
                 "exactly one summary grace turn follows the retained Host cap"
             );
-            // Even the summary ignores the stop request and emits another Task.
-            // Unique tool call IDs keep this a real loop, rather than receipt replay.
+            if summary {
+                assert!(
+                    request.tools.is_empty(),
+                    "the capped summary must have an empty tool catalog"
+                );
+            } else {
+                assert!(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.function.name == "Task"),
+                    "each normal round exposes the authority-backed Task tool"
+                );
+            }
+            // Return a fresh Task even on the summary to verify the runner discards it.
             request.loop_task(round);
         }
         let stopped = tokio::select! {
@@ -1897,15 +1909,31 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
                 .max_rounds,
             Some(MAX_ROUNDS)
         );
+        let stopped_round = &stopped.agent_runtime_state.as_ref().unwrap().round;
         assert_eq!(
-            stopped
-                .agent_runtime_state
-                .as_ref()
-                .unwrap()
-                .round
-                .max_rounds,
+            stopped_round.max_rounds,
             Some(MAX_ROUNDS),
             "runtime uses the canonical Host cap instead of the relaxed global value"
+        );
+        let last_work_call = format!("ready-work-loop-{}", MAX_ROUNDS - 1);
+        let summary_call = format!("ready-work-loop-{MAX_ROUNDS}");
+        assert!(
+            stopped
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_ref() == Some(&last_work_call)),
+            "the last normal Task has a durable tool result"
+        );
+        assert!(
+            !stopped.messages.iter().any(|message| {
+                message.tool_call_id.as_ref() == Some(&summary_call)
+                    || message
+                        .tool_calls
+                        .iter()
+                        .flatten()
+                        .any(|call| call.id == summary_call)
+            }),
+            "the provider's extra Task has no durable call or result"
         );
         assert_eq!(
             stopped

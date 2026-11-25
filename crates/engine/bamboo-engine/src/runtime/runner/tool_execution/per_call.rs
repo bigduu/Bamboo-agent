@@ -280,6 +280,15 @@ pub(super) fn shell_accounting_outcome(
         return ShellAccountingOutcome::Pending;
     }
     let envelope = serde_json::from_str::<serde_json::Value>(&result.result).ok();
+    if execution_name == Some("write_stdin")
+        && envelope
+            .as_ref()
+            .is_some_and(|value| value["output_log"]["next_offset"].is_u64())
+    {
+        // A page reports the observed exit for reference. Only the command's
+        // terminal delivery should count its success or failure.
+        return ShellAccountingOutcome::Ordinary;
+    }
     let status = envelope.as_ref().and_then(|value| value["status"].as_str());
     if status == Some("running") {
         return ShellAccountingOutcome::Pending;
@@ -1902,6 +1911,34 @@ mod task_progress_tests {
                     .all(|evidence| evidence.success == Some(successful)));
             }
         }
+    }
+
+    #[test]
+    fn retained_log_page_counts_as_a_read_of_an_existing_shell_result() {
+        let outcome = ToolExecutionOutcome {
+            output_cap: None,
+            portable_tool: Some(PortableToolExecution {
+                name: "write_stdin".into(),
+                input: serde_json::json!({"session_id":"log", "output_offset":0}),
+            }),
+            permission_replay_origin: None,
+            result: Ok(ToolResult::text(
+                true,
+                serde_json::json!({
+                    "status":"completed", "exit_code":7, "output":"details",
+                    "output_log":{"session_id":"log","start_offset":0,"end_offset":7,"next_offset":7},
+                })
+                .to_string(),
+            )),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        assert!(matches!(
+            shell_accounting_outcome(&outcome, None),
+            ShellAccountingOutcome::Ordinary
+        ));
     }
 
     async fn real_shell_permission_ack_is_neutral(cap: u32) {

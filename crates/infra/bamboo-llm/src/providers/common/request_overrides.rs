@@ -390,6 +390,21 @@ pub(crate) fn mask_and_prepare_agent_request(
     let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
         return Ok(());
     };
+    if diagnostics.tools_disabled() {
+        if let Some(body) = body.as_object_mut() {
+            // A summary is text-only even when an operator selects a tool
+            // for other generation requests on this provider.
+            for field in [
+                "tools",
+                "tool_choice",
+                "toolConfig",
+                "tool_config",
+                "parallel_tool_calls",
+            ] {
+                body.remove(field);
+            }
+        }
+    }
     if parse_tool_selection(body, endpoint)?
         .names()
         .iter()

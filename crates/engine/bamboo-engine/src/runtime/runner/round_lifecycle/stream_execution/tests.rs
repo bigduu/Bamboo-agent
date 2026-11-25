@@ -3847,6 +3847,9 @@ fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
         None,
         Some(&refreshed.ir.cache),
     );
+    assert!(anthropic["messages"]
+        .to_string()
+        .contains("Prefer Work for authorized deliverables"));
     let user = anthropic["messages"].as_array().unwrap().last().unwrap();
     let blocks = user["content"].as_array().unwrap();
     let last = blocks.last().unwrap();
@@ -5787,6 +5790,67 @@ fn browser_history_prepared(session: &Session) -> PreparedContext {
 }
 
 #[test]
+fn on_demand_memory_guidance_follows_round_exposure_without_replaying() {
+    use bamboo_agent_core::tools::Tool;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("memory-guidance", "test-model");
+    session.add_message(Message::user("Verify the earlier decision."));
+    let config = test_config("system");
+    let prepared = browser_history_prepared(&session);
+    let eligible = [bamboo_tools::tools::memory::SessionMemoryTool::new().to_schema()];
+    let wire = [bamboo_domain::discovery_control_fallback_schema()];
+    let mode = bamboo_domain::CapabilityLoadingMode::StickyFallback;
+
+    for (tools, wire, expected) in [
+        (&eligible[..], &wire[..], true),
+        (&[][..], &wire[..], false),
+        (&eligible[..], &[][..], false),
+    ] {
+        let envelope = super::build_request_envelope_reconciled_for_loading_mode(
+            &mut session,
+            &prepared,
+            &config,
+            tools,
+            wire,
+            "test-model",
+            mode,
+            None,
+            false,
+            None,
+        );
+        let messages = envelope.ir.flatten();
+        let guidance = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.content.contains("On-demand memory"))
+            .collect::<Vec<_>>();
+        if expected {
+            let [(guide_index, guide)] = guidance.as_slice() else {
+                panic!("expected one current memory guide");
+            };
+            assert!(guide.content.contains("discover_capabilities"));
+            assert!(guide.content.contains("action=session_read"));
+            let request_index = messages
+                .iter()
+                .position(|message| message.content == "Verify the earlier decision.")
+                .expect("current user request");
+            assert!(*guide_index < request_index);
+            assert!(envelope
+                .ir
+                .cache
+                .anthropic_history
+                .as_ref()
+                .unwrap()
+                .external_memory_message_id
+                .is_none());
+        } else {
+            assert!(guidance.is_empty());
+        }
+    }
+}
+
+#[test]
 fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let (mut session, browser, full_result) = browser_history_fixture();
@@ -5804,6 +5868,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &mut before_session,
         &before_prepared,
         &config,
+        before_tools.as_ref(),
         before_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
@@ -5833,6 +5898,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &prepared,
         &config,
         loaded_tools.as_ref(),
+        loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::Progressive,
         None,
@@ -5847,6 +5913,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &mut session,
         &prepared,
         &config,
+        loaded_tools.as_ref(),
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
@@ -5889,6 +5956,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &resumed_prepared,
         &config,
         loaded_tools.as_ref(),
+        loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
@@ -5911,6 +5979,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &resumed_prepared,
         &config,
         &[],
+        &[],
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
@@ -5931,6 +6000,7 @@ fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
         &mut resumed,
         &resumed_prepared,
         &config,
+        loaded_tools.as_ref(),
         loaded_tools.as_ref(),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::StickyFallback,
@@ -5955,7 +6025,8 @@ fn legacy_browser_history_projection_requires_a_canonical_result() {
         &mut session,
         &prepared,
         &test_config("system"),
-        &[browser],
+        std::slice::from_ref(&browser),
+        std::slice::from_ref(&browser),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,
@@ -6007,7 +6078,8 @@ fn discovery_history_projection_omits_removed_tool_definitions() {
         &mut session,
         &prepared,
         &test_config("system"),
-        &[browser],
+        std::slice::from_ref(&browser),
+        std::slice::from_ref(&browser),
         "test-model",
         bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         None,

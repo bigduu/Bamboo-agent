@@ -2,8 +2,7 @@
 //!
 //! Canonical tool name: `memory`.
 //!
-//! This tool lets the model store (and later retrieve) per-session notes that
-//! are loaded into the system prompt at the start of each round.
+//! This tool lets the model store per-session notes and retrieve them on demand.
 //!
 //! Supports multiple **topics** per session so the model can track separate
 //! workstreams without clobbering each other.

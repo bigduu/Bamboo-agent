@@ -78,6 +78,9 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
     for required in [
         "Supervisor delegation-first policy",
         "Delegate execution",
+        "Prefer Work for authorized deliverables",
+        "use work_update to create a Work",
+        "use work_dispatch to start ready Work in the current turn",
         "assigned acceptance criteria",
         "reject the exact current submission",
         "wait for explicit User acceptance of the exact current submission",
