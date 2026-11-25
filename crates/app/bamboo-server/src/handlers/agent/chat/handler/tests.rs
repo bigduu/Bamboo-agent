@@ -1953,13 +1953,15 @@ mod optional_model_e2e {
                 .expect("release semaphore stays open");
 
             Ok(Box::pin(futures::stream::iter(vec![
-                Ok(LLMChunk::Token("Generated Immediately".to_string())),
+                Ok(LLMChunk::Token(
+                    r#"{"title":"Generated Immediately"}"#.to_string(),
+                )),
                 Ok(LLMChunk::Done),
             ])))
         }
     }
 
-    async fn title_test_state(provider: Arc<BlockingTitleProvider>) -> web::Data<AppState> {
+    async fn title_test_state(provider: Arc<dyn LLMProvider>) -> web::Data<AppState> {
         let data_dir = tempdir().expect("tempdir").keep();
         crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile(
             &data_dir,
@@ -1973,18 +1975,15 @@ mod optional_model_e2e {
             ..Default::default()
         });
 
-        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-        let mut app_state = AppState::new_with_provider(data_dir, config, provider_trait)
+        let app_state = AppState::new_with_provider(data_dir, config, provider.clone())
             .await
             .expect("app state");
         let mut providers = HashMap::new();
-        providers.insert("openai".to_string(), provider as Arc<dyn LLMProvider>);
-        app_state.provider_registry =
-            Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
-        app_state.provider_router = Arc::new(ProviderModelRouter::new(
-            app_state.provider_registry.clone(),
-        ));
-        web::Data::new(app_state)
+        providers.insert("openai".to_string(), provider);
+        app_state
+            .provider_registry
+            .replace_with(ProviderRegistry::new(providers, "openai".to_string()));
+        app_state.into_http_data()
     }
 
     #[actix_web::test]
@@ -2229,6 +2228,352 @@ mod optional_model_e2e {
             .is_err(),
             "deduplicated title work must not emit a second metadata event"
         );
+    }
+
+    const TITLE_REPLY: &str = "这个链接描述了 Bamboo 会话收件箱在重连时回放旧游标的竞态。";
+    const TITLE_UNCERTAIN_REPLY: &str = "这个链接暂时缺少背景，我无法确定你想分析哪个主题。";
+    const TITLE_FOLLOWUP: &str = "我只知道这个问题在重连时出现，其他细节还在确认。";
+    const TITLE_FOLLOWUP_REPLY: &str = "我还需要知道你更关心哪一段重连行为。";
+    const TITLE_TOPIC: &str = "我确认问题是收件箱重复处理断线前的旧消息。";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TitleFixtureStage {
+        Initial,
+        UnclearFollowUp,
+        IdentifiedTopic,
+    }
+
+    struct DeferredTitleProvider {
+        title_requests: tokio::sync::mpsc::UnboundedSender<TitleFixtureStage>,
+        allow_reply: Semaphore,
+        allow_deferred_outcome: Semaphore,
+        require_followup: bool,
+    }
+
+    #[async_trait]
+    impl LLMProvider for DeferredTitleProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            tools: &[bamboo_agent_core::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
+                .await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let has_text = |text: &str| {
+                messages
+                    .iter()
+                    .any(|message| message.content.contains(text))
+            };
+            let output = if options.and_then(|options| options.request_purpose.as_deref())
+                == Some("title_generation")
+            {
+                assert_eq!(model, "title-model");
+                let stage = if has_text(TITLE_REPLY) {
+                    TitleFixtureStage::IdentifiedTopic
+                } else if has_text(TITLE_FOLLOWUP_REPLY) {
+                    TitleFixtureStage::UnclearFollowUp
+                } else {
+                    TitleFixtureStage::Initial
+                };
+                self.title_requests.send(stage).unwrap();
+                if stage == TitleFixtureStage::IdentifiedTopic {
+                    r#"{"title":"会话收件箱游标回放"}"#
+                } else {
+                    self.allow_deferred_outcome
+                        .acquire()
+                        .await
+                        .unwrap()
+                        .forget();
+                    r#"{"title":null}"#
+                }
+            } else {
+                let _allow_reply = self.allow_reply.acquire().await.unwrap();
+                if !self.require_followup || has_text(TITLE_TOPIC) {
+                    TITLE_REPLY
+                } else if has_text(TITLE_FOLLOWUP) {
+                    TITLE_FOLLOWUP_REPLY
+                } else {
+                    TITLE_UNCERTAIN_REPLY
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token(output.into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[actix_web::test]
+    async fn native_title_reconsiders_an_ambiguous_link_after_a_durable_assistant_answer() {
+        let id = "chat-title-from-durable-reply";
+        let (title_requests, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let provider = Arc::new(DeferredTitleProvider {
+            title_requests,
+            allow_reply: Semaphore::new(0),
+            allow_deferred_outcome: Semaphore::new(0),
+            require_followup: false,
+        });
+        let state = title_test_state(provider.clone()).await;
+        let mut session = Session::new(id, "chat-model");
+        state.save_and_cache_session(&mut session).await;
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let chat = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "https://example.test/issues/37 我想了解这里的背景",
+                    "model": "chat-model",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::CREATED);
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model": "chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            assert_eq!(requests.recv().await, Some(TitleFixtureStage::Initial));
+            provider.allow_reply.add_permits(1);
+
+            loop {
+                let event = events.recv().await.unwrap();
+                assert!(!matches!(event, AgentEvent::SessionTitleUpdated { .. }));
+                if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                    break;
+                }
+            }
+            let pending = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(pending
+                .messages
+                .iter()
+                .any(|message| message.content == TITLE_REPLY));
+            assert_eq!(pending.title_version, 0);
+            assert!(!pending.title_generated);
+
+            provider.allow_deferred_outcome.add_permits(1);
+            assert_eq!(
+                requests.recv().await,
+                Some(TitleFixtureStage::IdentifiedTopic)
+            );
+            loop {
+                if let AgentEvent::SessionTitleUpdated {
+                    title,
+                    title_version,
+                    source,
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(title, "会话收件箱游标回放");
+                    assert_eq!(title_version, 1);
+                    assert_eq!(source, bamboo_agent_core::TitleSource::Auto);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a committed visible answer prompts a fresh attempt at the pending title");
+    }
+
+    #[actix_web::test]
+    async fn pending_title_is_reconsidered_after_existing_root_inbox_turns() {
+        let (title_requests, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let state = title_test_state(Arc::new(DeferredTitleProvider {
+            title_requests,
+            allow_reply: Semaphore::new(1),
+            allow_deferred_outcome: Semaphore::new(4),
+            require_followup: true,
+        }))
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let chat = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "message": "https://example.test/issues/37",
+                    "model": "chat-model",
+                    "workspace_path": state.app_data_dir,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::CREATED);
+        let chat: Value = test::read_body_json(chat).await;
+        let id = chat["session_id"].as_str().unwrap();
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model": "chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            assert_eq!(requests.recv().await, Some(TitleFixtureStage::Initial));
+            let initial = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(initial
+                .messages
+                .iter()
+                .any(|m| m.content == TITLE_UNCERTAIN_REPLY));
+            assert_eq!(initial.title_version, 0);
+
+            for (input, expected_stage) in [
+                (TITLE_FOLLOWUP, TitleFixtureStage::UnclearFollowUp),
+                (TITLE_TOPIC, TitleFixtureStage::IdentifiedTopic),
+            ] {
+                // Existing Root Chat delivers to the Inbox and launches its own
+                // run. An explicit execute here would cover the other spawner.
+                let chat = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/api/v1/chat")
+                        .set_json(serde_json::json!({
+                            "session_id": id, "message": input, "model": "chat-model",
+                            "workspace_path": state.app_data_dir,
+                        }))
+                        .to_request(),
+                )
+                .await;
+                let status = chat.status();
+                let chat: Value = test::read_body_json(chat).await;
+                assert_eq!(status, StatusCode::CREATED, "{chat}");
+                assert!(
+                    chat["ingress_seq"].is_number(),
+                    "must use the Root Inbox: {chat}"
+                );
+                loop {
+                    let stage = requests.recv().await.unwrap();
+                    if stage == expected_stage {
+                        break;
+                    }
+                    assert_ne!(stage, TitleFixtureStage::IdentifiedTopic);
+                }
+
+                if expected_stage == TitleFixtureStage::UnclearFollowUp {
+                    let second = state.storage.load_session(id).await.unwrap().unwrap();
+                    assert!(second
+                        .messages
+                        .iter()
+                        .any(|m| m.content == TITLE_FOLLOWUP_REPLY));
+                    assert!(!second.title_generated);
+                    assert_eq!(second.title_version, 0);
+                }
+            }
+
+            loop {
+                if let AgentEvent::SessionTitleUpdated {
+                    title,
+                    title_version,
+                    source,
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(title, "会话收件箱游标回放");
+                    assert_eq!(title_version, 1);
+                    assert_eq!(source, bamboo_agent_core::TitleSource::Auto);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the Inbox run can defer and try again from a later durable reply");
+    }
+
+    #[actix_web::test]
+    async fn wait_for_generated_title_reports_superseded_if_the_user_renames() {
+        let id = "chat-title-wait-rename";
+        let provider = BlockingTitleProvider::new();
+        let state = title_test_state(provider.clone()).await;
+        let mut session = Session::new(id, "chat-model");
+        session.title = "Previous title".into();
+        session.title_generated = true;
+        session.add_message(bamboo_agent_core::Message::user(
+            "Please investigate why rendering stalls after a transport reconnect.",
+        ));
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let regenerate = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{id}/regenerate-title?wait=true"))
+                .to_request(),
+        );
+        tokio::pin!(regenerate);
+        tokio::select! {
+            response = &mut regenerate => {
+                panic!("regeneration completed before the model responded: {}", response.status());
+            }
+            started = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, provider.started.acquire()) => {
+                started.expect("title provider was dispatched").unwrap().forget();
+            }
+        }
+
+        let rename = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({ "title": "User's chosen title" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rename.status(), StatusCode::OK);
+
+        provider.release.add_permits(1);
+        let response = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, regenerate)
+            .await
+            .expect("regeneration returns after the model responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome: Value = test::read_body_json(response).await;
+        assert_eq!(
+            outcome,
+            serde_json::json!({ "status": "superseded", "session_id": id })
+        );
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(persisted.title, "User's chosen title");
+        assert_eq!(persisted.title_version, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     /// #480: omitting `model` on `POST /chat` falls back to the server's

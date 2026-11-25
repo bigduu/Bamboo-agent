@@ -17,11 +17,13 @@ use bamboo_domain::{
     SessionMessageKind, SessionMessageSource, SessionProviderMessage,
 };
 
+use crate::app_context::AgentSessionContext;
+use crate::execution::agent_spawn::spawn_session_execution_with_title_generation;
 use crate::execution::{
-    reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
-    AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
-    SessionCompletionHook, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    reserve_runner_core, reserve_session_execution, AgentRunner, AgentStatus, ChildCompletion,
+    ChildCompletionHandler, ChildCompletionSource, ReserveOutcome, SessionCompletionHook,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{
     BashResumeHook, GuardianSpawner, RunDeadline, BASH_COMPLETION_RESUME_KIND,
@@ -930,6 +932,7 @@ pub struct ChildCompletionCoordinator {
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
+    root_title_context: Arc<OnceLock<Weak<dyn AgentSessionContext>>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
     reserved_root_adapter: Arc<StdRwLock<Option<ReservedRootExecutionAdapter>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
@@ -976,6 +979,7 @@ impl ChildCompletionCoordinator {
             app_data_dir,
             account_feed_inbox,
             root_account_sink: None,
+            root_title_context: Arc::default(),
             root_tools: Arc::new(RwLock::new(None)),
             reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
@@ -1006,6 +1010,11 @@ impl ChildCompletionCoordinator {
             .upgrade()
             .filter(|binding| binding.session_id == session_id)
             .map(|binding| binding.deadline)
+    }
+
+    /// Bind the HTTP host without retaining its lifetime through the activation router.
+    pub fn bind_root_title_context(&self, context: Weak<dyn AgentSessionContext>) {
+        let _ = self.root_title_context.set(context);
     }
 
     /// Register a host producer at the existing genuine reserved Root seam.
@@ -2808,6 +2817,15 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
                 root_publication,
             );
+        let title_context = if session.kind == SessionKind::Root
+            && session.authority_identity.is_ordinary()
+            && !session.title_generated
+            && !crate::ticket_runtime::is_managed_work_root(&session)
+        {
+            self.root_title_context.get().and_then(Weak::upgrade)
+        } else {
+            None
+        };
         if let Some(message) = startup_message {
             // The Message and its ACK are durable, so the round prelude
             // cannot rediscover it. Confirm publication before model startup.
@@ -2823,6 +2841,11 @@ impl ChildCompletionCoordinator {
                 tracing::warn!(%session_id, "Root Runtime input publication was not confirmed");
                 execution_reservation.abandon().await;
                 return;
+            }
+            if crate::title_gen::is_human_title_input(&message) {
+                if let Some(context) = &title_context {
+                    crate::title_gen::spawn_title_generation(context.clone(), session_id.clone());
+                }
             }
         }
 
@@ -2856,7 +2879,7 @@ impl ChildCompletionCoordinator {
 
         consume_pending_clarification_resume(&mut session);
         execution_reservation.set_run_deadline(self.headless_run_deadline_for(&session_id));
-        spawn_session_execution(SessionExecutionArgs {
+        let execution = SessionExecutionArgs {
             agent,
             session_id,
             session,
@@ -2901,7 +2924,13 @@ impl ChildCompletionCoordinator {
             // must publish its terminal completion so ITS parent is woken
             // in turn (issue #546).
             child_completion_handler: Some(Arc::new(self.clone())),
-        });
+        };
+        spawn_session_execution_with_title_generation(
+            execution,
+            None,
+            Default::default(),
+            title_context,
+        );
     }
 }
 
