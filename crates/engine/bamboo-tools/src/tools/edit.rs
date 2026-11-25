@@ -351,9 +351,9 @@ impl EditTool {
     }
 
     fn parse_patch_blocks(patch: &str) -> Result<Vec<(String, String)>, ToolError> {
-        const SEARCH: &str = "<<<<<<< SEARCH\n";
-        const SEP: &str = "\n=======\n";
-        const REPLACE: &str = "\n>>>>>>> REPLACE";
+        const SEARCH: &str = "<<<<<<< SEARCH";
+        const SEP: &str = "=======";
+        const REPLACE: &str = ">>>>>>> REPLACE";
 
         let normalized = patch.replace("\r\n", "\n");
         if normalized.trim().is_empty() {
@@ -368,30 +368,40 @@ impl EditTool {
             )));
         }
 
-        let mut cursor = 0usize;
+        let mut lines = normalized.split('\n');
         let mut blocks = Vec::new();
-        while let Some(start_rel) = normalized[cursor..].find(SEARCH) {
+        while let Some(opening) = lines.by_ref().find(|line| !line.trim().is_empty()) {
+            let block_number = blocks.len() + 1;
+            if opening != SEARCH {
+                return Err(ToolError::InvalidArguments(format!(
+                    "Malformed patch block {block_number}: expected {SEARCH}"
+                )));
+            }
             if blocks.len() >= MAX_PATCH_BLOCKS {
                 return Err(ToolError::InvalidArguments(format!(
                     "patch exceeds max block count of {}",
                     MAX_PATCH_BLOCKS
                 )));
             }
-            let search_start = cursor + start_rel + SEARCH.len();
-            let sep_rel = normalized[search_start..].find(SEP).ok_or_else(|| {
-                ToolError::InvalidArguments("Malformed patch block: missing =======".to_string())
-            })?;
-            let sep_idx = search_start + sep_rel;
-            let replace_start = sep_idx + SEP.len();
-            let replace_rel = normalized[replace_start..].find(REPLACE).ok_or_else(|| {
-                ToolError::InvalidArguments(
-                    "Malformed patch block: missing >>>>>>> REPLACE".to_string(),
-                )
-            })?;
-            let replace_idx = replace_start + replace_rel;
-
-            let old_block = normalized[search_start..sep_idx].to_string();
-            let new_block = normalized[replace_start..replace_idx].to_string();
+            let mut read_part = |delimiter| {
+                let mut content = String::new();
+                for line in lines.by_ref() {
+                    if line == delimiter {
+                        content.pop();
+                        return Ok(content);
+                    }
+                    if line == SEARCH || line == REPLACE {
+                        break;
+                    }
+                    content.push_str(line);
+                    content.push('\n');
+                }
+                Err(ToolError::InvalidArguments(format!(
+                    "Malformed patch block {block_number}: missing {delimiter}"
+                )))
+            };
+            let old_block = read_part(SEP)?;
+            let new_block = read_part(REPLACE)?;
             if old_block.is_empty() {
                 return Err(ToolError::InvalidArguments(
                     "Patch SEARCH block must be non-empty".to_string(),
@@ -404,17 +414,6 @@ impl EditTool {
                 )));
             }
             blocks.push((old_block, new_block));
-
-            cursor = replace_idx + REPLACE.len();
-            if normalized[cursor..].starts_with('\n') {
-                cursor += 1;
-            }
-        }
-
-        if blocks.is_empty() {
-            return Err(ToolError::InvalidArguments(
-                "patch must contain at least one SEARCH/REPLACE block".to_string(),
-            ));
         }
 
         Ok(blocks)
@@ -1324,6 +1323,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_patch_mode_accepts_crlf_blocks_with_marker_like_content_and_deletion() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let original = "prefix <<<<<<< SEARCH\r\n======= comment\r\nremove this too\r\n";
+        tokio::fs::write(file.path(), original).await.unwrap();
+
+        let result = run(
+            &EditTool::new(),
+            json!({
+                "file_path": file.path(),
+                "patch": concat!(
+                    " \r\n<<<<<<< SEARCH\r\nprefix <<<<<<< SEARCH\r\n======= comment\r\n",
+                    "=======\r\nupdated\r\n>>>>>>> REPLACE details\r\n>>>>>>> REPLACE\r\n",
+                    "\r\n<<<<<<< SEARCH\r\nremove this too\r\n=======\r\n\r\n>>>>>>> REPLACE\r\n\t"
+                )
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "updated\r\n>>>>>>> REPLACE details\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_patch_mode_line_number_disambiguates_duplicates() {
         let file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(file.path(), "x = 1;\nx = 1;\n")
@@ -1390,6 +1415,38 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::Execution(msg)) if msg.contains("matched 2 times"))
         );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_rejects_malformed_suffix_before_writing_any_block() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let original = b"first\nsecond\nthird\n";
+        tokio::fs::write(file.path(), original).await.unwrap();
+
+        let first_block = "<<<<<<< SEARCH\nfirst\n=======\nchanged\n>>>>>>> REPLACE";
+        for suffix in [
+            "\n<<<<<<< SEARCH",
+            "\n<<<<<<< SEARCH\nsecond\n=======\nupdated",
+            "\n<<<<<<< SEARCH\nsecond\n<<<<<<< SEARCH\nthird\n=======\nupdated\n>>>>>>> REPLACE",
+            " trailing text",
+            "\ntrailing text",
+            "\ninterleaved text\n<<<<<<< SEARCH\nsecond\n=======\nupdated\n>>>>>>> REPLACE",
+        ] {
+            let result = run(
+                &EditTool::new(),
+                json!({
+                    "file_path": file.path(),
+                    "patch": format!("{first_block}{suffix}")
+                }),
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(ToolError::InvalidArguments(_))),
+                "accepted a malformed patch suffix {suffix:?}: {result:?}"
+            );
+            assert_eq!(tokio::fs::read(file.path()).await.unwrap(), original);
+        }
     }
 
     #[tokio::test]

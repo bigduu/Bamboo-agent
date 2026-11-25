@@ -322,6 +322,7 @@ pub struct AppState {
     /// Owning Child runtime handle, retained so graceful shutdown cancels and
     /// joins same-process child tasks before their shared MCP tools are stopped.
     pub(crate) external_child_runner: Arc<dyn bamboo_engine::execution::ExternalChildRunner>,
+    managed_update_runtime: Option<planned_update::ManagedUpdateRuntime>,
 
     /// One Host-owned Ticket authority; records survive disabling dispatch.
     pub tickets: Arc<ticket_application::TicketApplication>,
@@ -475,6 +476,7 @@ pub struct AppState {
     /// terminal status) across every session are sequenced, journaled to disk,
     /// and broadcast here for resumable multi-client sync.
     pub account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    pub(crate) side_chats: crate::handlers::agent::side_chat::SideChatRuntime,
 
     /// Registry for tracking external processes.
     pub process_registry: Arc<ProcessRegistry>,
@@ -623,6 +625,7 @@ mod parent_permission_request;
 mod parent_question_outcome;
 mod parent_question_reconcile;
 mod persistence;
+pub(crate) mod planned_update;
 mod project_watcher;
 mod provider_api;
 pub mod resume_adapter;
@@ -643,6 +646,7 @@ pub use observer_subscriptions::ObserverSubscriptionStart;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;
+pub(crate) mod update_admission;
 pub mod watchers;
 
 #[cfg(test)]

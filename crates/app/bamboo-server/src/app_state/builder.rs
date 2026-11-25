@@ -26,6 +26,28 @@ async fn init_account_event_sink(
 #[path = "account_journal_tests.rs"]
 mod account_journal_tests;
 
+#[derive(Clone, Copy)]
+enum HostStartup {
+    Normal,
+    ManagedUpdate,
+    #[cfg(test)]
+    LegacyIngress,
+}
+
+impl HostStartup {
+    fn start_inbox_reconciler(self) -> bool {
+        match self {
+            Self::Normal | Self::ManagedUpdate => true,
+            #[cfg(test)]
+            Self::LegacyIngress => false,
+        }
+    }
+
+    fn manages_updates(self) -> bool {
+        matches!(self, Self::ManagedUpdate)
+    }
+}
+
 fn default_app_state_memory_store(
     bamboo_home_dir: &std::path::Path,
 ) -> Result<bamboo_memory::memory_store::MemoryStore, AppError> {
@@ -104,13 +126,24 @@ impl AppState {
         Self::new_with_memory_store(bamboo_home_dir, memory_store).await
     }
 
+    pub(crate) async fn new_for_managed_update(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_memory_store_and_startup(
+            bamboo_home_dir,
+            memory_store,
+            HostStartup::ManagedUpdate,
+        )
+        .await
+    }
+
     /// Create a server state with one explicit Jiandu store shared by the tool,
     /// prompt, Dream, gardener, metrics, and maintenance paths.
     pub async fn new_with_memory_store(
         bamboo_home_dir: PathBuf,
         memory_store: bamboo_memory::memory_store::MemoryStore,
     ) -> Result<Self, AppError> {
-        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, true).await
+        Self::new_with_memory_store_and_startup(bamboo_home_dir, memory_store, HostStartup::Normal)
+            .await
     }
 
     /// Isolate the synchronous legacy Inbox consumer from background recovery.
@@ -120,13 +153,18 @@ impl AppState {
         bamboo_home_dir: PathBuf,
     ) -> Result<Self, AppError> {
         let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
-        Self::new_with_memory_store_and_inbox_recovery(bamboo_home_dir, memory_store, false).await
+        Self::new_with_memory_store_and_startup(
+            bamboo_home_dir,
+            memory_store,
+            HostStartup::LegacyIngress,
+        )
+        .await
     }
 
-    async fn new_with_memory_store_and_inbox_recovery(
+    async fn new_with_memory_store_and_startup(
         bamboo_home_dir: PathBuf,
         memory_store: bamboo_memory::memory_store::MemoryStore,
-        start_inbox_reconciler: bool,
+        startup: HostStartup,
     ) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
@@ -225,7 +263,7 @@ impl AppState {
             config_facade,
             Arc::new(NoopToolEventPublisher),
             memory_store,
-            start_inbox_reconciler,
+            startup,
         )
         .await
     }
@@ -272,7 +310,7 @@ impl AppState {
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
-            false,
+            HostStartup::LegacyIngress,
         )
         .await
     }
@@ -293,7 +331,7 @@ impl AppState {
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
-            true,
+            HostStartup::Normal,
         )
         .await
     }
@@ -316,7 +354,7 @@ impl AppState {
             None,
             tool_event_publisher,
             memory_store,
-            true,
+            HostStartup::Normal,
         )
         .await
     }
@@ -330,7 +368,7 @@ impl AppState {
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
         memory_store: bamboo_memory::memory_store::MemoryStore,
-        start_inbox_reconciler: bool,
+        startup: HostStartup,
     ) -> Result<Self, AppError> {
         let boot_application_inputs =
             super::config_application::ApplicationInputs::boot(&config, config_facade.as_deref());
@@ -374,7 +412,11 @@ impl AppState {
             bamboo_domain::SessionInboxLimits::default(),
         ));
         let session_inbox: Arc<dyn bamboo_domain::SessionInboxPort> = file_session_inbox.clone();
-        let session_activation_router = bamboo_engine::SessionActivationRouter::new();
+        let session_activation_router = if startup.manages_updates() {
+            bamboo_engine::SessionActivationRouter::new_for_managed_update()
+        } else {
+            bamboo_engine::SessionActivationRouter::new()
+        };
         let session_messenger = Arc::new(bamboo_engine::SessionMessenger::new(
             storage.clone(),
             session_inbox.clone(),
@@ -473,7 +515,12 @@ impl AppState {
         let notification_service = Arc::new(bamboo_notification::NotificationService::new(
             bamboo_home_dir.join("notification_preferences.json"),
         ));
-        let session_watchers = super::watchers::SessionWatchers::new();
+        let managed_lifecycle_hooks = startup
+            .manages_updates()
+            .then(super::update_admission::UntrackedUpdateAdmission::default);
+        let session_watchers = super::watchers::SessionWatchers::with_lifecycle_hook_admission(
+            managed_lifecycle_hooks.clone(),
+        );
         let (mcp_manager, _legacy_mcp_bootstrap) =
             init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
@@ -848,6 +895,15 @@ impl AppState {
 
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
+        let memory_maintenance_admission =
+            bamboo_engine::auto_dream::MemoryMaintenanceAdmission::default();
+        let managed_update_runtime = managed_lifecycle_hooks.map(|lifecycle_hooks| {
+            super::planned_update::ManagedUpdateRuntime {
+                boot_refusal: super::planned_update::unsupported_host_routes(&config_snapshot),
+                memory: memory_maintenance_admission.clone(),
+                lifecycle_hooks,
+            }
+        });
 
         // When a broker is configured, run the MCP proxy service under a
         // supervisor (issue #47): deployed workers forward their (host-bound)
@@ -1114,7 +1170,7 @@ impl AppState {
             workflow_runs.clone(),
         );
 
-        bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
+        bamboo_engine::auto_dream::spawn_guarded_auto_dream_task(
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
@@ -1124,12 +1180,13 @@ impl AppState {
                 provider_registry: provider_registry.clone(),
             },
             project_context_resolver.as_ref().clone(),
+            memory_maintenance_admission.clone(),
         );
 
         // Background memory "gardener": opt-in blob remediation + near-duplicate
         // consolidation. No-op cost unless `memory.gardener_enabled` /
         // `memory.dedup_gardener_enabled` is set; an empty prefilter makes zero LLM calls.
-        bamboo_engine::gardener::spawn_gardener_task_with_project_resolver(
+        bamboo_engine::gardener::spawn_guarded_gardener_task(
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
@@ -1139,12 +1196,13 @@ impl AppState {
                 provider_registry: provider_registry.clone(),
             },
             project_context_resolver.clone(),
+            memory_maintenance_admission.clone(),
         );
 
         // Background ledger gardener: expiry + record↔schedule reconciliation
         // are deterministic and free; distillation uses the background model
         // and no-ops without one. The bridge handle is already bound above.
-        bamboo_engine::ledger_gardener::spawn_ledger_gardener_task(
+        bamboo_engine::ledger_gardener::spawn_guarded_ledger_gardener_task(
             bamboo_engine::ledger_gardener::LedgerGardenerContext {
                 dream: bamboo_engine::auto_dream::AutoDreamContext {
                     session_store: session_store.clone(),
@@ -1156,6 +1214,7 @@ impl AppState {
                 },
                 schedule_bridge: Some(ledger_schedule_bridge.clone()),
             },
+            memory_maintenance_admission,
         );
 
         let config_for_resolver = config.clone();
@@ -1398,7 +1457,7 @@ impl AppState {
                 spawn_scheduler.supports_native_ticket_budget(),
             ),
         );
-        if start_inbox_reconciler {
+        if startup.start_inbox_reconciler() {
             observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
@@ -1610,6 +1669,7 @@ impl AppState {
             session_messenger,
             spawn_scheduler,
             external_child_runner: external_runner,
+            managed_update_runtime,
             tickets,
             child_completion_coordinator,
             paced_loops,
@@ -1642,6 +1702,7 @@ impl AppState {
             session_event_senders,
             actor_event_hub,
             account_sink,
+            side_chats: Default::default(),
             process_registry,
             metrics_bus: None, // Will be set by server if needed
             agent,
@@ -2220,7 +2281,7 @@ mod boot_gold_identity_tests {
             None,
             Arc::new(NoopToolEventPublisher),
             bamboo_memory::memory_store::MemoryStore::new(dir.path().join("jiandu")),
-            false,
+            HostStartup::LegacyIngress,
         )
         .await
         .unwrap();

@@ -63,3 +63,9 @@ ceiling is an unknown outcome; the recovery notice requests a real status check
 with `write_stdin` and does not authorize replaying the command. Host restart does
 not reconstruct an OS process. Unread terminal output retains its existing
 five-minute expiry; the completion envelope remains in the durable inbox.
+
+The Host owner can stop the exact command selected from a suspended Root's
+monitoring notice. Bamboo records the stop intent before terminating the owned
+process group and suppresses that command's automatic resume. The original
+wait stays retryable until process exit is confirmed. An independently queued
+user message keeps its existing scheduling behavior.

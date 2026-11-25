@@ -19,9 +19,8 @@ pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
 
 pub const SUPERVISOR_STANDALONE_SPAWN_GUIDANCE: &str = concat!(
-    "Start one independent execution Session in its own workspace, with no Project. ",
-    "Use this default for new standalone tasks such as researching or installing a local utility. ",
-    "For a task that needs a specific Project, use session_control create with the verified Project and its bound workspace. ",
+    "Start an independent Session for a standalone assignment. It has its own workspace and no Project memory. ",
+    "For work in a registered Project, first use session_control scope, then session_control create with the verified Project and its bound workspace. ",
     "Use the current scope revision and a stable operation UUID. Subscribe to material notifications when available. ",
     "Retry an uncertain dispatch with the exact same request and operation UUID. Admission alone does not establish completion."
 );
@@ -38,7 +37,7 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
         return Err(concat!(
             "standalone_spawn_requires_unassigned: This spawn_session route creates a Session in its own workspace. ",
             "For a standalone task, retry the same operation UUID and instruction with both project_id and workspace_path omitted. ",
-            "Only if this assignment needs a verified Project and its bound workspace, use session_control create. ",
+            "For Project work, keep the intended destination and use session_control scope and create with the verified Project and its bound workspace. ",
             "A Project from another task or conversation history cannot be used. ",
             "For an exact retry of an existing Project-bound operation, send the unchanged request through session_control create."
         ));
@@ -48,14 +47,17 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
 
 /// Placement and dispatch policy in the Supervisor's role context.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
-    "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
-    "Use session_control create for a verified Project and its bound workspace, or its standalone form if spawn_session is unavailable. ",
-    "Bind a Project only when the user identifies it for this assignment or the named workspace or repository matches a canonical Host record. ",
-    "Ask one focused question if a required workspace is unclear. ",
+    "For an assignment routed to an independent Session, resolve its destination before creating the Session. ",
+    "When the user identifies a Project, workspace or repository for this assignment, use session_control scope to verify it against the current Host Project catalog. ",
+    "For Project work, use session_control create with the verified project_id and workspace_path. Use the verified primary project_path when the assignment names only the Project. A saved Project assignment gives the new Session its Project memory scope. ",
+    "If the Project or required workspace cannot be resolved unambiguously, ask one focused question or report the create-route blocker. Keep the intended Project on dispatch and retry. ",
+    "For standalone work with no Project destination, use spawn_session, or standalone session_control create when spawn_session is unavailable. Leave both fields unset for this route. Use only the current assignment to choose the destination. ",
     "Start a new independent Session for a separate assignment or requested context isolation. Workers are Ordinary Roots. ",
     "Set thinking_mode to ultra on explicit request. Use Standard by default.\n",
     "Reuse a Session only for the same verified assignment in the intended Project and workspace, or at the user's explicit direction. ",
     "Use session_control followup or an authorized session_message send, preserving the target's context and permissions. ",
+    "Use session_control observe_run with the original input receipt to verify its admission and actual Worker startup. ",
+    "For authorized recurring log checks, discover supervisor_log_monitor, use the registered Project and relative log path, and keep the returned monitor ID for stopping or resuming it. ",
     "Act only on requested assignments and their own fresh Host notifications."
 );
 

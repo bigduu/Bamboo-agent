@@ -1,11 +1,17 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_infrastructure::telemetry::{record_grep_performance, GrepPerformance};
 use globset::{GlobBuilder, GlobSet};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::time::Instant;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::{parameter_schema, search_traversal, workspace_state};
 
@@ -14,10 +20,68 @@ const MAX_RESULT_BYTES: usize = 256 * 1024;
 const MAX_MATCHES: usize = 2_000;
 const MAX_SCANNED_FILES: usize = 50_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+static GREP_WORKERS: Semaphore = Semaphore::const_new(4);
 const SEARCH_SCOPE_TOO_BROAD_ERROR: &str =
     "Search scope too broad. Add path/glob/type or reduce pattern.";
 const MULTILINE_REQUIRES_NARROWED_PATH_ERROR: &str = "Multiline grep requires narrowed path.";
 const RESULT_TOO_LARGE_ERROR: &str = "Result too large; refine query and retry.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SearchTextRead {
+    Complete,
+    TooLarge,
+    Unreadable,
+}
+
+#[derive(Default)]
+struct SearchCoverage {
+    scan_limited: bool,
+    traversal_errors: usize,
+    oversized_files: usize,
+    unreadable_files: usize,
+    non_text_files: usize,
+}
+
+impl SearchCoverage {
+    fn notice(&self, scan_limit: usize) -> Option<String> {
+        let mut reasons = Vec::new();
+        if self.scan_limited {
+            reasons.push(format!(
+                "directory discovery stopped at {scan_limit} candidate files"
+            ));
+        }
+        if self.traversal_errors != 0 {
+            reasons.push(format!(
+                "{} directory traversal error(s)",
+                self.traversal_errors
+            ));
+        }
+        if self.oversized_files != 0 {
+            reasons.push(format!(
+                "{} file(s) exceeded the {MAX_FILE_BYTES}-byte per-file limit",
+                self.oversized_files
+            ));
+        }
+        if self.unreadable_files != 0 {
+            reasons.push(format!(
+                "{} unreadable or invalid UTF-8 file(s) skipped",
+                self.unreadable_files
+            ));
+        }
+        if self.non_text_files != 0 {
+            reasons.push(format!(
+                "{} file(s) containing NUL bytes skipped",
+                self.non_text_files
+            ));
+        }
+        (!reasons.is_empty()).then(|| {
+            format!(
+                "[PARTIAL] Search coverage is incomplete: {}. Narrow path/glob/type or check skipped files separately.",
+                reasons.join("; ")
+            )
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +143,7 @@ struct GrepArgs {
     #[serde(default)]
     #[schemars(with = "String", skip_serializing_if = "Option::is_none")]
     r#type: Option<String>,
-    /// Limit output entries. Keep this small for broad queries.
+    /// Limit output entries. Reaching the limit may stop the search before remaining files are checked.
     #[serde(default)]
     #[schemars(
         schema_with = "parameter_schema::number",
@@ -123,6 +187,9 @@ impl GrepTool {
         base: &Path,
         type_filter: Option<&str>,
         include_ignored: bool,
+        cancel: &CancellationToken,
+        scan_limit: usize,
+        coverage: &mut SearchCoverage,
     ) -> Vec<PathBuf> {
         #[cfg(test)]
         tests::pause_directory_discovery(base);
@@ -131,12 +198,20 @@ impl GrepTool {
         let allowed_ext = type_filter.and_then(|name| ext_map.get(name).copied());
 
         let mut files = Vec::new();
-        for entry in search_traversal::walk(base, include_ignored).filter_map(|entry| entry.ok()) {
+        for entry in search_traversal::walk(base, include_ignored) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if files.len() >= scan_limit {
+                coverage.scan_limited = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                coverage.traversal_errors += 1;
+                continue;
+            };
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
-            }
-            if files.len() >= MAX_SCANNED_FILES {
-                break;
             }
             let path = entry.path();
 
@@ -156,16 +231,46 @@ impl GrepTool {
         files
     }
 
-    async fn read_search_text(reader: impl AsyncRead + Unpin) -> Option<String> {
-        // Some virtual files report zero length, and files can grow after stat.
-        // Read one extra byte so an oversized file is skipped as a whole.
-        let mut content = String::new();
-        reader
-            .take(MAX_FILE_BYTES + 1)
-            .read_to_string(&mut content)
-            .await
-            .ok()?;
-        (content.len() as u64 <= MAX_FILE_BYTES).then_some(content)
+    fn read_search_text(reader: impl Read, content: &mut String) -> SearchTextRead {
+        // A file can grow after stat. Check one extra byte and skip the
+        // entire file if it is oversized or contains invalid UTF-8.
+        content.clear();
+        let mut reader = reader.take(MAX_FILE_BYTES + 1);
+        let result = reader.read_to_string(content);
+        if reader.limit() == 0 {
+            SearchTextRead::TooLarge
+        } else if result.is_ok() {
+            SearchTextRead::Complete
+        } else {
+            SearchTextRead::Unreadable
+        }
+    }
+
+    fn exact_file_size_limit_error() -> ToolError {
+        ToolError::Execution(format!(
+            "Grep did not search the specified file because it exceeds the per-file search limit of {MAX_FILE_BYTES} bytes."
+        ))
+    }
+
+    fn literal_matcher(
+        pattern: &str,
+        case_insensitive: bool,
+        multiline: bool,
+    ) -> Option<RegexMatcher> {
+        // Only accelerate patterns whose per-line match semantics are
+        // identical. The original regex handles anchors, escapes and flags.
+        if case_insensitive
+            || multiline
+            || pattern.is_empty()
+            || pattern.contains(['\r', '\n'])
+            || regex::escape(pattern) != pattern
+        {
+            return None;
+        }
+        RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(pattern)
+            .ok()
     }
 
     fn compile_glob(glob: Option<&str>) -> Result<Option<GlobSet>, ToolError> {
@@ -337,7 +442,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents using ripgrep-style regex parameters. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
+        "Search file contents using ripgrep-style regex parameters. Directory searches respect repository .gitignore rules, including parent rules up to the Git root; non-repository searches do not apply ignore rules. Hidden files remain visible; global Git ignores, .ignore and .git/info/exclude are not applied. Directory results flag incomplete coverage from skipped files or the scan limit separately from output limits. Searching one oversized file reports the per-file limit. Start with files_with_matches or a narrowed path/glob/type before using content or multiline mode."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -359,141 +464,231 @@ impl Tool for GrepTool {
         let cwd = workspace_state::workspace_or_process_cwd(ctx.session_id());
         let root = Self::resolve_search_root(parsed.path.as_deref(), &cwd);
 
+        let multiline = parsed.multiline.unwrap_or(false);
+        let case_insensitive = parsed.case_insensitive.unwrap_or(false);
+        Self::validate_scope(
+            &parsed,
+            parsed.output_mode.unwrap_or_default(),
+            multiline,
+            &cwd,
+        )?;
+        let regex = Self::compile_regex(&parsed.pattern, case_insensitive, multiline)?;
+        let glob_filter = Self::compile_glob(parsed.glob.as_deref())?;
+
+        let queued_at = Instant::now();
+        let permit = GREP_WORKERS.acquire().await.expect("static Grep semaphore");
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        // Keep both filesystem and matching work off the Actix worker. One
+        // search uses one worker and reuses its read buffer between files.
+        let (result, performance) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let started_at = Instant::now();
+            let mut performance = GrepPerformance {
+                queue_time: started_at.duration_since(queued_at),
+                ..GrepPerformance::default()
+            };
+            let result = Self::search(
+                &parsed,
+                &root,
+                &regex,
+                glob_filter.as_ref(),
+                &cancel,
+                &mut performance,
+                MAX_SCANNED_FILES,
+            );
+            performance.scan_time = started_at.elapsed();
+            (result, performance)
+        })
+        .await
+        .map_err(|error| ToolError::Execution(format!("Grep worker failed: {error}")))?;
+        record_grep_performance(&performance);
+        result
+    }
+}
+
+impl GrepTool {
+    fn search(
+        parsed: &GrepArgs,
+        root: &Path,
+        regex: &Regex,
+        glob_filter: Option<&GlobSet>,
+        cancel: &CancellationToken,
+        performance: &mut GrepPerformance,
+        scan_limit: usize,
+    ) -> Result<ToolOutcome, ToolError> {
         let output_mode = parsed.output_mode.unwrap_or_default();
         let context = parsed.context.unwrap_or(0);
         let before = parsed.before.unwrap_or(context);
         let after = parsed.after.unwrap_or(context);
         let line_numbers = parsed.line_numbers.unwrap_or(false);
-        let case_insensitive = parsed.case_insensitive.unwrap_or(false);
         let multiline = parsed.multiline.unwrap_or(false);
         let head_limit = parsed.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
+        let literal = Self::literal_matcher(
+            &parsed.pattern,
+            parsed.case_insensitive.unwrap_or(false),
+            multiline,
+        );
+        let mut searcher = literal
+            .as_ref()
+            .map(|_| SearcherBuilder::new().bom_sniffing(false).build());
 
-        Self::validate_scope(&parsed, output_mode, multiline, &cwd)?;
+        let mut coverage = SearchCoverage::default();
+        let exact_file = root.is_file();
+        let files = if exact_file {
+            vec![root.to_path_buf()]
+        } else if root.is_dir() {
+            Self::collect_files(
+                root,
+                parsed.r#type.as_deref(),
+                parsed.include_ignored,
+                cancel,
+                scan_limit,
+                &mut coverage,
+            )
+        } else {
+            return Err(ToolError::Execution(format!(
+                "Path does not exist: {}",
+                root.display()
+            )));
+        };
+        let mut read_buffer = String::new();
+        let mut result_lines = Vec::new();
+        let mut output_limit = None;
+        let mut files = files.into_iter();
 
-        let regex = Self::compile_regex(&parsed.pattern, case_insensitive, multiline)?;
-        let glob_filter = Self::compile_glob(parsed.glob.as_deref())?;
-
-        let discovery_root = root.clone();
-        let type_filter = parsed.r#type.clone();
-        let include_ignored = parsed.include_ignored;
-        // Path inspection and ignore::Walk perform synchronous directory IO.
-        // Keep discovery off the runtime so a slow filesystem cannot delay
-        // lease renewal or other tasks on an Actix current-thread worker.
-        let files = tokio::task::spawn_blocking(move || {
-            if discovery_root.is_file() {
-                Ok(vec![discovery_root])
-            } else if discovery_root.is_dir() {
-                Ok(Self::collect_files(
-                    &discovery_root,
-                    type_filter.as_deref(),
-                    include_ignored,
-                ))
-            } else {
-                Err(ToolError::Execution(format!(
-                    "Path does not exist: {}",
-                    discovery_root.display()
-                )))
+        while let Some(file) = files.next() {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Execution("Grep cancelled".to_owned()));
             }
-        })
-        .await
-        .map_err(|error| {
-            ToolError::Execution(format!("Failed to discover search files: {}", error))
-        })??;
-
-        let mut matched_files = Vec::new();
-        let mut count_rows = Vec::new();
-        let mut content_rows = Vec::new();
-        let mut total_matches = 0usize;
-        let mut partial = false;
-
-        for file in files {
-            if let Some(filter) = &glob_filter {
-                let relative = file.strip_prefix(&root).unwrap_or(&file);
+            if let Some(filter) = glob_filter {
+                let relative = file.strip_prefix(root).unwrap_or(&file);
                 if !filter.is_match(relative) && !filter.is_match(&file) {
                     continue;
                 }
             }
 
-            let Ok(metadata) = tokio::fs::metadata(&file).await else {
+            let Ok(metadata) = std::fs::metadata(&file) else {
+                coverage.unreadable_files += 1;
                 continue;
             };
-            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            if !metadata.is_file() {
+                coverage.unreadable_files += 1;
+                continue;
+            }
+            if metadata.len() > MAX_FILE_BYTES {
+                if exact_file {
+                    return Err(Self::exact_file_size_limit_error());
+                }
+                coverage.oversized_files += 1;
                 continue;
             }
 
-            let Ok(reader) = tokio::fs::File::open(&file).await else {
+            let Ok(reader) = std::fs::File::open(&file) else {
+                coverage.unreadable_files += 1;
                 continue;
             };
-            let Some(content) = Self::read_search_text(reader).await else {
-                continue;
-            };
-
-            if content.contains('\0') {
-                continue;
+            match Self::read_search_text(reader, &mut read_buffer) {
+                SearchTextRead::Complete if !read_buffer.contains('\0') => {}
+                SearchTextRead::TooLarge if exact_file => {
+                    return Err(Self::exact_file_size_limit_error());
+                }
+                SearchTextRead::TooLarge => {
+                    coverage.oversized_files += 1;
+                    continue;
+                }
+                SearchTextRead::Unreadable => {
+                    coverage.unreadable_files += 1;
+                    continue;
+                }
+                SearchTextRead::Complete => {
+                    coverage.non_text_files += 1;
+                    continue;
+                }
             }
+            let content = read_buffer.as_str();
+            performance.files_scanned += 1;
+            performance.bytes_scanned += content.len() as u64;
 
-            let match_count = if multiline {
-                regex.find_iter(&content).count()
-            } else {
-                content.lines().filter(|line| regex.is_match(line)).count()
-            };
-
+            let fast_count =
+                searcher
+                    .as_mut()
+                    .zip(literal.as_ref())
+                    .and_then(|(searcher, matcher)| {
+                        let mut count = 0;
+                        searcher
+                            .search_slice(
+                                matcher,
+                                content.as_bytes(),
+                                UTF8(|_, _| {
+                                    count += 1;
+                                    Ok(true)
+                                }),
+                            )
+                            .ok()?;
+                        performance.ripgrep_files += 1;
+                        Some(count)
+                    });
+            let match_count = fast_count.unwrap_or_else(|| {
+                if multiline {
+                    regex.find_iter(content).count()
+                } else {
+                    content.lines().filter(|line| regex.is_match(line)).count()
+                }
+            });
             if match_count == 0 {
                 continue;
             }
 
-            total_matches = total_matches.saturating_add(match_count);
-            if total_matches > MAX_MATCHES {
+            performance.matches += match_count as u64;
+            if performance.matches > MAX_MATCHES as u64 {
                 return Err(ToolError::Execution(RESULT_TOO_LARGE_ERROR.to_string()));
             }
 
-            matched_files.push(bamboo_config::paths::path_to_display_string(&file));
-            count_rows.push(format!(
-                "{}:{}",
-                bamboo_config::paths::path_to_display_string(&file),
-                match_count
-            ));
-
-            if matches!(output_mode, OutputMode::Content) {
-                content_rows.extend(Self::format_content_hits(
-                    &file,
-                    &content,
-                    &regex,
-                    multiline,
-                    before,
-                    after,
-                    line_numbers,
-                ));
-                if content_rows.len() >= head_limit {
-                    content_rows.truncate(head_limit);
-                    partial = true;
-                    break;
+            match output_mode {
+                OutputMode::FilesWithMatches => {
+                    result_lines.push(bamboo_config::paths::path_to_display_string(&file));
+                }
+                OutputMode::Count => {
+                    let path = bamboo_config::paths::path_to_display_string(&file);
+                    result_lines.push(format!("{path}:{match_count}"));
+                }
+                OutputMode::Content => {
+                    result_lines.extend(Self::format_content_hits(
+                        &file,
+                        content,
+                        regex,
+                        multiline,
+                        before,
+                        after,
+                        line_numbers,
+                    ));
                 }
             }
-
-            if matches!(
-                output_mode,
-                OutputMode::FilesWithMatches | OutputMode::Count
-            ) && matched_files.len() >= head_limit
-            {
-                partial = true;
+            if result_lines.len() >= head_limit {
+                output_limit = match (
+                    result_lines.len() > head_limit,
+                    !files.as_slice().is_empty(),
+                ) {
+                    (true, true) => Some(
+                        "Entries were truncated and remaining candidate files were not searched.",
+                    ),
+                    (true, false) => Some("Entries were truncated."),
+                    (false, true) => Some("Remaining candidate files were not searched."),
+                    (false, false) => None,
+                };
                 break;
             }
         }
 
-        let mut result_lines = match output_mode {
-            OutputMode::FilesWithMatches => matched_files,
-            OutputMode::Count => count_rows,
-            OutputMode::Content => content_rows,
-        };
-
-        if result_lines.len() > head_limit {
-            result_lines.truncate(head_limit);
-            partial = true;
+        result_lines.truncate(head_limit);
+        if let Some(detail) = output_limit {
+            result_lines.insert(0, format!(
+                "[PARTIAL] Output limited by head_limit={head_limit}. {detail} Narrow path/pattern or raise head_limit."
+            ));
         }
-        if partial {
-            result_lines
-                .push("[PARTIAL] Output was truncated. Narrow path/pattern and retry.".to_string());
+        if let Some(notice) = coverage.notice(scan_limit) {
+            result_lines.insert(0, notice);
         }
 
         let result = result_lines.join("\n");
@@ -760,6 +955,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_distinguishes_complete_no_match_from_skipped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let query = json!({"pattern": "needle", "path": dir.path()});
+        let tool = GrepTool::new();
+        tokio::fs::write(dir.path().join("searched.txt"), "other\n")
+            .await
+            .unwrap();
+        let complete = run(&tool, query.clone()).await.unwrap();
+        assert!(complete.success);
+        assert!(complete.result.is_empty());
+
+        let mut oversized = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        oversized[..7].copy_from_slice(b"needle\n");
+        tokio::fs::write(dir.path().join("too-large.txt"), oversized)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("invalid.txt"), [0xff])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("binary.txt"), [0])
+            .await
+            .unwrap();
+
+        let incomplete = run(&tool, query).await.unwrap();
+        assert!(incomplete.success);
+        assert!(non_partial_lines(&incomplete).is_empty());
+        assert!(incomplete
+            .result
+            .starts_with("[PARTIAL] Search coverage is incomplete"));
+        assert!(incomplete
+            .result
+            .contains("1 file(s) exceeded the 2097152-byte per-file limit"));
+        assert!(incomplete
+            .result
+            .contains("1 unreadable or invalid UTF-8 file(s) skipped"));
+        assert!(incomplete
+            .result
+            .contains("1 file(s) containing NUL bytes skipped"));
+        assert!(!incomplete.result.contains("Output limited"));
+    }
+
+    #[test]
+    fn grep_reports_a_directory_scan_limit_only_when_traversal_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["first.txt", "second.txt"] {
+            std::fs::write(dir.path().join(file), "other\n").unwrap();
+        }
+        let args: GrepArgs = serde_json::from_value(json!({"pattern": "needle"})).unwrap();
+        let regex = Regex::new(&args.pattern).unwrap();
+        let search = |scan_limit| {
+            let ToolOutcome::Completed(result) = GrepTool::search(
+                &args,
+                dir.path(),
+                &regex,
+                None,
+                &CancellationToken::new(),
+                &mut GrepPerformance::default(),
+                scan_limit,
+            )
+            .unwrap() else {
+                panic!("expected Complete");
+            };
+            assert!(result.success);
+            result.result
+        };
+        assert!(search(2).is_empty());
+        let partial = search(1);
+        assert!(partial.starts_with("[PARTIAL] Search coverage is incomplete"));
+        assert!(partial.contains("directory discovery stopped at 1 candidate files"));
+        assert!(!partial.contains("Output limited"));
+    }
+
+    #[tokio::test]
+    async fn grep_output_limit_does_not_imply_skipped_file_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("matches.txt");
+        tokio::fs::write(&file, "needle\nneedle\n").await.unwrap();
+        let tool = GrepTool::new();
+        let query = |limit| {
+            json!({
+                "pattern": "needle",
+                "path": &file,
+                "output_mode": "content",
+                "head_limit": limit
+            })
+        };
+        let partial = run(&tool, query(1)).await.unwrap();
+        assert_eq!(non_partial_lines(&partial).len(), 1);
+        assert!(partial
+            .result
+            .contains("[PARTIAL] Output limited by head_limit=1"));
+        assert!(partial.result.contains("Entries were truncated."));
+        assert!(!partial.result.contains("Search coverage is incomplete"));
+        let exact = run(&tool, query(2)).await.unwrap();
+        assert_eq!(result_lines(&exact).len(), 2);
+        assert!(!exact.result.contains("[PARTIAL]"));
+    }
+
+    #[tokio::test]
     async fn grep_defaults_to_files_with_matches() {
         let dir = tempfile::tempdir().unwrap();
         let file_hit = dir.path().join("match.rs");
@@ -786,6 +1080,25 @@ mod tests {
         let lines = result_lines(&result);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("match.rs"));
+    }
+
+    #[tokio::test]
+    async fn literal_search_preserves_unicode_crlf_and_counts_lines_not_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mixed.txt");
+        std::fs::write(&file, "\u{feff}中文\r\nnone\r\n中文 中文\n中文").unwrap();
+
+        for pattern in ["中文", "\u{feff}中文"] {
+            assert!(GrepTool::literal_matcher(pattern, false, false).is_some());
+            let result = run(
+                &GrepTool::new(),
+                json!({"pattern": pattern, "path": file, "output_mode": "count"}),
+            )
+            .await
+            .unwrap();
+            let expected = if pattern == "中文" { ":3" } else { ":1" };
+            assert!(result.result.ends_with(expected), "{}", result.result);
+        }
     }
 
     #[tokio::test]
@@ -1028,16 +1341,63 @@ mod tests {
         assert!(error.to_string().contains(RESULT_TOO_LARGE_ERROR));
     }
 
-    #[tokio::test]
-    async fn grep_bounds_reads_independently_of_file_metadata() {
+    #[test]
+    fn grep_bounds_reads_independently_of_file_metadata() {
         let bytes = vec![b'x'; MAX_FILE_BYTES as usize + 32];
         let at_limit = &bytes[..MAX_FILE_BYTES as usize];
-        let content = GrepTool::read_search_text(at_limit).await.unwrap();
-        assert_eq!(content.len() as u64, MAX_FILE_BYTES);
+        let mut buffer = String::new();
+        assert_eq!(
+            GrepTool::read_search_text(at_limit, &mut buffer),
+            SearchTextRead::Complete
+        );
+        assert_eq!(buffer.len() as u64, MAX_FILE_BYTES);
 
         let mut reader = std::io::Cursor::new(bytes);
-        assert!(GrepTool::read_search_text(&mut reader).await.is_none());
+        assert_eq!(
+            GrepTool::read_search_text(&mut reader, &mut buffer),
+            SearchTextRead::TooLarge
+        );
         assert_eq!(reader.position(), MAX_FILE_BYTES + 1);
+        assert_eq!(
+            GrepTool::read_search_text(&[0xFF][..], &mut buffer),
+            SearchTextRead::Unreadable
+        );
+        assert_eq!(
+            GrepTool::read_search_text(&b"hello"[..], &mut buffer),
+            SearchTextRead::Complete
+        );
+        assert_eq!(buffer, "hello");
+        assert!(buffer.capacity() >= MAX_FILE_BYTES as usize);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_oversized_explicit_file_without_returning_a_no_match_result() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        bytes[..7].copy_from_slice(b"needle\n");
+        let tool = GrepTool::new();
+        let args = json!({"pattern": "needle", "path": file.path()});
+
+        tokio::fs::write(file.path(), &bytes[..MAX_FILE_BYTES as usize])
+            .await
+            .unwrap();
+        let at_limit = run(&tool, args.clone()).await.unwrap();
+        assert!(at_limit.success);
+        assert_eq!(result_lines(&at_limit).len(), 1);
+
+        tokio::fs::write(file.path(), &bytes).await.unwrap();
+        let error = run(&tool, args.clone())
+            .await
+            .expect_err("an oversized exact file was not searched");
+        assert!(matches!(error, ToolError::Execution(_)));
+        let message = error.to_string();
+        assert!(message.contains("did not search the specified file"));
+        assert!(message.contains(&MAX_FILE_BYTES.to_string()));
+
+        tokio::fs::write(file.path(), "unrelated\n").await.unwrap();
+        let no_match = run(&tool, args).await.unwrap();
+        assert!(no_match.success);
+        assert!(no_match.result.is_empty());
     }
 
     #[tokio::test]
@@ -1074,8 +1434,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let lines = result_lines(&result);
+        let lines = non_partial_lines(&result);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("small.rs"));
+        assert!(result.result.contains("1 file(s) exceeded"));
     }
 }

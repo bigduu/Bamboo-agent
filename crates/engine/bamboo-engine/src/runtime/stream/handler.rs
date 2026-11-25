@@ -334,6 +334,7 @@ pub(crate) struct InterruptedStreamOutput {
     pub content: String,
     pub reasoning_content: String,
     pub partial_tool_calls: Vec<PartialToolCallSnapshot>,
+    pub plain_text_only: bool,
     pub provider_usage: Option<ProviderUsageSnapshot>,
     pub input_tokens: u64,
     pub output_tokens: u64,

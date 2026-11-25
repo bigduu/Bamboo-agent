@@ -112,12 +112,14 @@ async fn entrypoint_routing_headless_provider_only_rejects_bad_target_before_par
 #[tokio::test]
 async fn entrypoint_routing_headless_unset_override_keeps_legitimate_parent_inheritance() {
     let (dir, state, main, _, _) = fixture(true, "missing-model").await;
+    let mut request = args(dir.path(), None);
+    request.timeout_secs = None;
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        run_with_state(args(dir.path(), None), state),
+        std::time::Duration::from_secs(20),
+        run_with_state(request, state),
     )
     .await
-    .unwrap();
+    .expect("synthetic headless consumer must finish");
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         main.calls

@@ -74,7 +74,7 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
+| `features` | `FeatureFlags` | Runtime feature settings. New profiles enable manual Work recording and dispatch with one concurrent Work. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
 | `context_management` | `ContextManagementConfig` | Selects conversation summary, prose-only message summary, or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
@@ -85,6 +85,9 @@ default. The full field list of `Config`:
 | `connect` | `ConnectConfig` | **Not actually stored here** — see [connect](#connect--the-im-bridge). |
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
+
+Manually dispatched Work uses the configured run budget. Automatic dispatch
+requires a separate owner policy.
 
 Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
 `revision` is the env-domain CAS revision stored in the credential envelope;
@@ -184,6 +187,45 @@ forward-compat fields. `AnthropicConfig` adds `max_tokens` and
 `thinking_replay_always` (needed by some Anthropic-compatible upstreams, e.g.
 GLM's `/anthropic` endpoint). Existing Bodhi gateway configurations use
 `target_provider` to select `openai`, `anthropic` or `gemini`.
+
+The Anthropic, OpenAI and Gemini compatible inference endpoints forward
+end-to-end HTTP headers in both directions for JSON and streaming calls.
+Custom fields such as `Provider-Route` and `X-LiteLLM-Session-ID` work with
+any header prefix, including repeated values. Supported browser origins can
+read the forwarded response headers. A retry replaces the headers from its
+previous attempt.
+
+Provider-configured request fields and Bamboo-owned response fields take
+precedence on a name collision. `Anthropic-Beta` combines provider and caller
+flags. Authentication, connection, body framing, browser security and Bamboo
+control headers belong to their respective HTTP boundaries. A cross-origin
+redirect ends an upstream request carrying forwarded client headers.
+
+A Provider can use `{session_affinity}` in a structured `format` header
+override. The value is a domain-separated hash of the Bamboo session ID. It is
+stable across turns and retries, and distinct for different sessions. Bamboo
+omits the configured value on calls that have no session, including model
+discovery. Other header overrides keep their normal precedence.
+
+In the Provider's **Advanced Request Overrides (JSON)** editor, merge this
+example into the existing overrides. In file configuration, use the same
+object as the Provider's `request_overrides` value.
+
+```json
+{
+  "endpoints": {
+    "messages": {
+      "headers": {
+        "X-Session-Id": { "type": "format", "template": "{session_affinity}" }
+      }
+    }
+  }
+}
+```
+
+Choose the header name accepted by your gateway. Use `common.headers` for all
+generation endpoints or an endpoint or model rule for a narrower scope. This
+sends a routing hint the gateway can use for cache affinity.
 
 The agent can close a reasoning-only stream when its text repeats in a sustained
 cycle. This uses the normalized reasoning stream across providers.
@@ -428,7 +470,7 @@ batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
 
-For the compatibility defaults, a 1M window with 64K output and 10K safety
+For a reported or configured 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations
 can trigger earlier. Fixed prompts, current user requests and protected content
 are feasibility constraints: if they cannot fit the calculated target, Bamboo
@@ -523,9 +565,8 @@ processes.
 
 ## Memory / auto-dream / gardener
 
-Key `memory` (`Option<MemoryConfig>` — absent means every default below
-applies). All the dream/gardener toggles default **on**; the values below are
-the shipped defaults, so an empty `{}` is already reasonable:
+Key `memory` is optional. Omitted fields use the defaults below. Background
+Dream and gardener toggles default **on**.
 
 | Field | Default | What it does |
 |---|---|---|
@@ -534,10 +575,6 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
-| `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
-| `relevant_recall` | `true` | Retrieve relevant durable memories for the current turn. |
-| `relevant_recall_rerank` | `false` | Rerank recalled memories (extra model call) before injecting. |
-| `project_first_dream` | `true` | Prefer project-scoped memory on a session's first dream pass. |
 | `ledger_agenda_injection` / `ledger_gardener_enabled` / `ledger_distillation_enabled` | `true` | Personal-assistant ledger subsystem toggles. |
 | `ledger_gardener_interval_secs` | `21600` (6h) | Ledger gardener cadence. |
 | `gardener_enabled` | `true` | Background job that splits "multi-topic blob" memories; **calls no LLM when its deterministic pre-screen finds no candidates.** |
@@ -557,10 +594,12 @@ request. Large terminal results are reduced into bounded multipart sections;
 the persisted summary keeps one overall source-derived budget, capped by the
 space remaining under the shared context target after mandatory content.
 
-`project_prompt_injection` / `relevant_recall` / `relevant_recall_rerank` /
-`project_first_dream` can also be flipped via env vars — see
-[Environment variables](#environment-variables) — which is handy for a
-one-off container run without touching `config.json`.
+Agents look up saved memory on demand with `memory`. Start with a short
+lexical `query` in the appropriate scope, then use `get` for selected results.
+Use `session_read` when the task needs continuity notes from the current Session.
+`project_prompt_injection`, `relevant_recall`, `relevant_recall_rerank`, and
+`project_first_dream` are deprecated compatibility fields. They default to
+`false`, and the runtime ignores saved values and legacy aliases.
 
 `auto_dream_enabled`/`gardener_enabled` intentionally consume model tokens
 when on; turn them off (`{"memory": {"auto_dream_enabled": false}}`) for a
@@ -568,13 +607,14 @@ minimal-cost deployment.
 
 ## Sub-agents + external CLI executors
 
-Key `subagents` (`SubagentsConfig`). Sub-agents always run as independent
-actor subprocesses (crash isolation + real parallelism) — there is no
-in-process runtime toggle.
+Key `subagents` (`SubagentsConfig`). The built-in local runtime runs Child
+sessions in the Host, with separate executors for the external actor backends.
 
 | Field | Purpose |
 |---|---|
 | `max_concurrent` | Cap on simultaneously running sub-agents (default: 200). |
+| `max_total_secs` | Total time limit for a built-in local Child run in seconds (default: 3600). |
+| `max_idle_secs` | Time without recognized activity before cancelling a built-in local Child run, in seconds (default: 900). |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
 | `fabric_dir` | Where the actor fabric's mailbox/state files live. |
 | `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` \| `"codex"`. |
@@ -596,6 +636,11 @@ in-process runtime toggle.
 | `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
+
+Set the time limits in System Settings under Sub-agent or send a config patch
+such as `{"subagents":{"max_total_secs":10800}}`. Both fields take positive
+integer seconds. Clear an override with `null`. The next local Child run reads
+the saved limits at launch, with Host-owned per-session overrides taking precedence.
 
 ```json
 {
@@ -848,9 +893,10 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 The file stores explicit overrides. With no matching user or provider limit,
-the runtime and the defaults API use 1,000,000 total context tokens and 64,000
-output tokens. When the window is known and the output ceiling is absent,
-the fallback output is one quarter of the window, up to 64,000. Set
+ordinary Agent turns and the defaults API use 32,768 total context tokens and
+4,096 output tokens. If only the provider's input or combined window is known,
+Bamboo uses at most 4,096 output tokens. For a user-configured window with no
+output ceiling, the fallback is one quarter of the window, up to 64,000. Set
 `unlimited_output` to `true` and omit `max_output_tokens` to let ordinary Agent
 turns use the selected route's output ceiling and the available joint window.
 When the route does not report an output ceiling, Bamboo leaves the optional
@@ -898,7 +944,7 @@ optional; file config plus built-in defaults cover a fresh install.
 and `BAMBOO_GEMINI` prefixes with the `_API_KEY`, `_BASE_URL`, and `_MODEL`
 suffixes. [Provider variables and account scope](#choosing-a-provider-and-model).
 
-**Memory toggles** (override the matching `memory.*` config field):
+**Deprecated memory variables** (ignored):
 `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`, `BAMBOO_MEMORY_RELEVANT_RECALL`,
 `BAMBOO_MEMORY_RELEVANT_RECALL_RERANK`, `BAMBOO_MEMORY_PROJECT_FIRST_DREAM`.
 

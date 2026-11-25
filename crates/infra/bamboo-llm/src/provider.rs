@@ -246,6 +246,7 @@ pub struct CompletionDiagnostics {
     recovery: Option<OutputLimitRecovery>,
     model_window_limit: Option<u32>,
     provider_default_output: bool,
+    tools_disabled: bool,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
@@ -323,6 +324,7 @@ impl OutputLimitRecovery {
 
 #[derive(Debug, Default)]
 struct CompletionDiagnosticState {
+    gemini_decode_counts: Option<(u64, u64)>,
     finish_reason: Option<&'static str>,
     messages_stopped: bool,
     provider_tool_seen: bool,
@@ -380,6 +382,15 @@ impl CompletionDiagnostics {
     pub fn with_provider_default_output(mut self, enabled: bool) -> Self {
         self.provider_default_output = enabled;
         self
+    }
+
+    pub fn with_tools_disabled(mut self, disabled: bool) -> Self {
+        self.tools_disabled = disabled;
+        self
+    }
+
+    pub(crate) fn tools_disabled(&self) -> bool {
+        self.tools_disabled
     }
 
     pub(crate) fn allows_provider_default_output(&self) -> bool {
@@ -656,6 +667,21 @@ impl CompletionDiagnostics {
                 .unwrap_or_else(|e| e.into_inner())
                 .finish_reason = Some(safe);
         }
+    }
+
+    /// Gemini frame counts from the stream decoder when it finishes or is dropped.
+    pub fn gemini_decode_counts(&self) -> Option<(u64, u64)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .gemini_decode_counts
+    }
+
+    pub(crate) fn record_gemini_decode_counts(&self, text_frames: u64, json_frames: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let counts = state.gemini_decode_counts.get_or_insert((0, 0));
+        counts.0 = counts.0.saturating_add(text_frames);
+        counts.1 = counts.1.saturating_add(json_frames);
     }
 
     pub(crate) fn observe_sse(&self, event: &str, data: &str) {

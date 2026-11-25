@@ -16,6 +16,21 @@ fn flat(session: &Session) -> Vec<u8> {
 fn encoded(session: &Session) -> Vec<u8> {
     compact_main::serialize_main(session).unwrap()
 }
+#[test]
+fn compact_main_writes_the_previous_pretty_json_bytes_in_place() {
+    let mut session = Session::new("main-body", "model");
+    for index in 0..128 {
+        session.messages.push(Message::user(format!(
+            "{index}: {}",
+            "中文, 日本語, \"quote\"\r\n".repeat(32)
+        )));
+    }
+    let raw = encoded(&session);
+    let body_offset = compact_main::section_length(&raw[..compact_main::HEADER_BYTES]).unwrap();
+    assert_eq!(&raw[body_offset..], &flat(&session)[1..]);
+    compact_main::validate_full_main(&raw).unwrap();
+}
+
 fn section(raw: &[u8]) -> &[u8] {
     let text = std::str::from_utf8(raw).unwrap();
     let fields: BTreeMap<String, &RawValue> = serde_json::from_str(text).unwrap();

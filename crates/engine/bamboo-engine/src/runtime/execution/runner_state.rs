@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage};
 
+pub use super::root_execution_lifetime::RootConversationObservation;
+
 fn subagent_lifecycle_key(event: &AgentEvent) -> Option<(&str, &str)> {
     event
         .legacy_child_lifecycle_observation()
@@ -90,6 +92,8 @@ pub struct AgentRunner {
     // an unqualified finalizer cannot prove which run it finalized.
     pub(super) execution_finalized: CancellationToken,
     pub(super) terminal_usage: Arc<OnceLock<TokenUsage>>,
+    /// Launch-time limits shared by the Child watchdog and parent wait recovery.
+    pub(crate) child_watchdog_policy: Option<super::spawn::ChildWatchdogPolicy>,
     child_completion_publication: Option<(DateTime<Utc>, Weak<()>)>,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
@@ -141,6 +145,11 @@ impl Default for AgentRunner {
 }
 
 impl AgentRunner {
+    /// Observe the exact attached Root conversation without granting write authority.
+    pub fn root_conversation_observation(&self) -> Option<RootConversationObservation> {
+        self.root_execution.conversation_observation(&self.run_id)
+    }
+
     /// Denial-only maintenance signal; never a claim that this run is idle.
     pub fn root_reset_admission_reserved(&self) -> bool {
         self.root_execution.reset_admission_reserved()
@@ -294,6 +303,7 @@ impl AgentRunner {
             completed_at: None,
             execution_finalized: CancellationToken::new(),
             terminal_usage: Arc::default(),
+            child_watchdog_policy: None,
             child_completion_publication: None,
             supervisor_run_target: None,
             supervisor_run_workspace: None,

@@ -150,6 +150,15 @@ impl ShellSession {
         Ok(())
     }
 
+    pub(super) fn request_owned_exec_stop(&self) -> bool {
+        if let Some(owner) = &self.initial_handoff {
+            return owner.request_delivered_stop();
+        }
+        // Scoped exec commands already retain containment in the completion task.
+        self.kill_notify.notify_one();
+        true
+    }
+
     pub(crate) fn cancel_initial(&self) {
         self.initial_cancelled.store(true, Ordering::Release);
         if let Some(owner) = &self.initial_handoff {
@@ -226,6 +235,10 @@ impl ShellSession {
 
     pub(super) async fn stdin_is_open(&self) -> bool {
         self.stdin.lock().await.is_some()
+    }
+
+    pub(super) fn stdin_is_known_closed(&self) -> bool {
+        self.stdin.try_lock().is_ok_and(|stdin| stdin.is_none())
     }
 }
 
@@ -859,15 +872,21 @@ pub fn remove_shell(id: &str) -> Option<Arc<ShellSession>> {
 
 /// Current pull-session handles whose terminal result has not been consumed.
 ///
-/// Include exited sessions: only a terminal `poll_result` removes their handle
-/// (apart from the existing cache TTL). The exec-session capacity bounds this
+/// Include exited sessions until their terminal result is collected, even if
+/// a retained log keeps the handle readable. The exec-session capacity bounds this
 /// snapshot; do not truncate it or infer process state from registry presence.
 /// This observes the existing registry without reading output or advancing a
 /// cursor, and intentionally excludes legacy Bash sessions.
 pub fn uncollected_polled_shells_for_session(session_id: &str) -> Vec<String> {
     let mut ids = sessions()
         .iter()
-        .filter(|entry| entry.polled.is_some() && entry.session_id.as_deref() == Some(session_id))
+        .filter(|entry| {
+            entry.session_id.as_deref() == Some(session_id)
+                && entry
+                    .polled
+                    .as_ref()
+                    .is_some_and(|state| !state.terminal_collected())
+        })
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     ids.sort_unstable();

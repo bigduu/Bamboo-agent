@@ -1,15 +1,16 @@
 #![allow(clippy::await_holding_lock)]
 
 use super::super::super::stream_execution::{
-    build_exec_session_continuation_context_block, execute_llm_stream, project_request_usage,
-    LlmStreamFrame,
+    execute_llm_stream, project_request_usage, LlmStreamFrame,
 };
 use super::super::maybe_apply_summary_context_compression_with_budget;
 use super::*;
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
 use bamboo_agent_core::{BashCompletionInfo, BashCompletionSink};
 use bamboo_domain::PermissionMode;
-use bamboo_tools::tools::{bash_runtime, ExecCommandTool, WriteStdinTool};
+use bamboo_tools::tools::{
+    bash_runtime, exec_command::reserve_background_job, ExecCommandTool, WriteStdinTool,
+};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +79,38 @@ fn shell_schemas() -> Vec<ToolSchema> {
         ExecCommandTool::new().to_schema(),
         WriteStdinTool::new().to_schema(),
     ]
+}
+
+fn shell_schemas_with_wait() -> Vec<ToolSchema> {
+    let mut schemas = shell_schemas();
+    schemas.push(ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_agent_core::tools::FunctionSchema {
+            name: "SubAgent".into(),
+            description: "Wait for an owned non-interactive command.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string", "enum": ["chat", "inspect", "wait"]},
+                    "target": {"type": "string"}
+                }
+            }),
+        },
+    });
+    schemas
+}
+
+fn shell_snapshot(
+    session: &Session,
+    schemas: &[ToolSchema],
+    config: &AgentLoopConfig,
+) -> Option<bamboo_agent_core::ContextBlock> {
+    super::super::super::stream_execution::build_exec_session_continuation_context_block(
+        session,
+        schemas,
+        config,
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    )
 }
 
 fn shell_history(owner: &str, args: &Value, result: &Value) -> Session {
@@ -195,7 +228,7 @@ async fn dispatch_and_pull_from_context(
     .unwrap();
     let (tx, _rx) = mpsc::channel(128);
     let block_tokens = TiktokenTokenCounter::default().count_message(
-        &build_exec_session_continuation_context_block(session, schemas, PermissionMode::Default)
+        &shell_snapshot(session, schemas, config)
             .unwrap()
             .render_runtime_context_message(),
     );
@@ -276,12 +309,7 @@ async fn dispatch_and_pull_from_context(
         .unwrap()
         .contains("terminal-output"));
     assert!(bash_runtime::uncollected_polled_shells_for_session(&owner).is_empty());
-    assert!(build_exec_session_continuation_context_block(
-        session,
-        schemas,
-        PermissionMode::Default
-    )
-    .is_none());
+    assert!(shell_snapshot(session, schemas, config).is_none());
     assert!(
         session
             .model_context_state
@@ -369,13 +397,9 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
             }
             let schemas = shell_schemas();
             let block_tokens = TiktokenTokenCounter::default().count_message(
-                &build_exec_session_continuation_context_block(
-                    &session,
-                    &schemas,
-                    PermissionMode::Default,
-                )
-                .unwrap()
-                .render_runtime_context_message(),
+                &shell_snapshot(&session, &schemas, &AgentLoopConfig::default())
+                    .unwrap()
+                    .render_runtime_context_message(),
             );
             let (summary_llm, summary_requests) = prompt_capture_llm();
             let mut config = bounded_compression_config(summary_llm);
@@ -480,6 +504,126 @@ async fn exec_handles_survive_hard_history_trimming_without_summary() {
 }
 
 #[tokio::test]
+async fn first_provider_request_after_exec_yields_identifies_waitable_and_interactive_handles() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("release");
+    let _release = ReleaseGate(gate.clone());
+    let owner = "first-exec-wait-guidance";
+    let completion = Arc::new(CompletionRecorder::default());
+    let (waitable, args, result) = start_gated_shell(owner, &gate, completion.clone()).await;
+    let quoted_gate = gate.to_string_lossy().replace('\'', "'\\''");
+    let interactive = tool_payload(
+        ExecCommandTool::new()
+            .invoke(
+                json!({
+                    "cmd": format!("while [ ! -f '{quoted_gate}' ]; do sleep 0.01; done; exit 9"),
+                    "interactive": true,
+                    "yield_time_ms": 250
+                }),
+                tool_context(owner, completion.clone()),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(interactive["status"], "running");
+    let interactive = interactive["session_id"].as_str().unwrap();
+    let mut session = shell_history(owner, &args, &result);
+    let schemas = shell_schemas_with_wait();
+    let config = AgentLoopConfig::default();
+    let (llm, requests) = prompt_capture_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        owner,
+        &schemas,
+        &llm,
+        None,
+    )
+    .await
+    .unwrap();
+    let budget = session.token_budget.clone().unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm,
+        &prepared.prepared_context,
+        &schemas,
+        &LlmStreamFrame {
+            event_tx: &tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: owner,
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            output_limit_recovery: None,
+            budget: &budget,
+            provider_default_output: false,
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let snapshot = requests[0]
+            .iter()
+            .find(|message| {
+                message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["bamboo_context_block"]["title"] == "Shell session handles"
+                })
+            })
+            .unwrap();
+        assert!(snapshot
+            .content
+            .contains("SubAgent with intent=wait and target set to its exact session_id"));
+        assert!(snapshot
+            .content
+            .contains("Use write_stdin with an exact session_id"));
+        assert!(snapshot
+            .content
+            .contains("interactive input, unread output, or a short wait"));
+        assert!(snapshot
+            .content
+            .contains(&format!("Exit-wait session IDs: [\"{waitable}\"]")));
+        let ids: Vec<String> = serde_json::from_str(
+            snapshot
+                .content
+                .lines()
+                .find_map(|line| line.strip_prefix("Session IDs: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ids.iter().any(|id| id == interactive));
+        assert!(ids.contains(&waitable));
+    }
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| { !message.content.contains("Exit-wait session IDs:") }));
+    assert_eq!(result["status"], "running");
+    assert!(result.get("exit_code").is_none());
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    for (handle, eof, expected_exit) in [(&*waitable, false, 7), (interactive, true, 9)] {
+        let terminal = tool_payload(
+            WriteStdinTool::new()
+                .invoke(
+                    json!({"session_id": handle, "eof": eof, "yield_time_ms": 5000}),
+                    tool_context(owner, completion.clone()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(terminal["exit_code"], expected_exit);
+    }
+}
+
+#[tokio::test]
 async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
@@ -488,14 +632,6 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
     let completion = Arc::new(CompletionRecorder::default());
     let (handle, _, _) = start_gated_shell(owner, &gate, completion.clone()).await;
     let shell = bash_runtime::get_shell(&handle).unwrap();
-    tokio::fs::write(&gate, b"release").await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while shell.status() == "running" {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
     assert_eq!(
         bash_runtime::uncollected_polled_shells_for_session(owner),
         vec![handle.clone()]
@@ -516,47 +652,64 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
     bash_runtime::remove_shell(&legacy.id);
     bash_runtime::remove_shell(&unowned.id);
     let mut session = Session::new(owner, "test-model");
+    let config = AgentLoopConfig::default();
     let schemas = shell_schemas();
-    let snapshot =
-        build_exec_session_continuation_context_block(&session, &schemas, PermissionMode::Default)
-            .unwrap();
+    let snapshot = shell_snapshot(&session, &schemas, &config).unwrap();
     assert!(snapshot.content.contains(&handle));
     assert!(snapshot.content.contains("Use write_stdin"));
     assert!(!snapshot.content.contains("SubAgent"));
-    let mut with_wait = schemas.to_vec();
-    let mut subagent = schemas[0].clone();
-    subagent.function.name = "SubAgent".into();
-    with_wait.push(subagent);
+    let with_wait = shell_schemas_with_wait();
     for ultra in [false, true] {
         session.set_root_orchestration_only(ultra).unwrap();
-        let snapshot = build_exec_session_continuation_context_block(
-            &session,
-            &with_wait,
-            PermissionMode::Default,
-        )
-        .unwrap();
-        assert!(snapshot.content.contains("If you still need"));
+        let snapshot = shell_snapshot(&session, &with_wait, &config).unwrap();
         assert!(snapshot
             .content
             .contains("SubAgent with intent=wait and target"));
         assert!(snapshot.content.contains(&handle));
     }
-    assert!(build_exec_session_continuation_context_block(
+    let mut non_wait_schema = with_wait.clone();
+    non_wait_schema.last_mut().unwrap().function.parameters["properties"]["intent"]["enum"] =
+        json!(["chat", "inspect"]);
+    assert!(!shell_snapshot(&session, &non_wait_schema, &config)
+        .unwrap()
+        .content
+        .contains("SubAgent"));
+    let deferred =
+        super::super::super::stream_execution::build_exec_session_continuation_context_block(
+            &session,
+            &with_wait,
+            &config,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        )
+        .unwrap();
+    assert!(!deferred.content.contains("SubAgent"));
+    bamboo_agent_core::tools::with_suspension_disabled(async {
+        assert!(!shell_snapshot(&session, &with_wait, &config)
+            .unwrap()
+            .content
+            .contains("SubAgent"));
+    })
+    .await;
+    let monitor = reserve_background_job(owner, &handle).unwrap();
+    let monitored = shell_snapshot(&session, &with_wait, &config).unwrap();
+    assert!(monitored.content.contains(&handle));
+    assert!(!monitored.content.contains("Exit-wait session IDs:"));
+    drop(monitor);
+    assert!(shell_snapshot(
         &session,
         &with_wait,
-        PermissionMode::Plan,
+        &AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        },
     )
     .is_none());
     let parent = Session::new("shell-parent", "test-model");
     let child = Session::new_child_of(owner, &parent, "test-model", "worker");
-    assert!(!build_exec_session_continuation_context_block(
-        &child,
-        &with_wait,
-        PermissionMode::Default
-    )
-    .unwrap()
-    .content
-    .contains("SubAgent"));
+    assert!(!shell_snapshot(&child, &with_wait, &config)
+        .unwrap()
+        .content
+        .contains("SubAgent"));
     session.set_root_orchestration_only(false).unwrap();
     for name in [
         "vendor::write_stdin",
@@ -567,19 +720,11 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
         let mut foreign = schemas[1].clone();
         foreign.function.name = name.into();
         assert!(
-            build_exec_session_continuation_context_block(
-                &session,
-                &[foreign],
-                PermissionMode::Default
-            )
-            .is_none(),
+            shell_snapshot(&session, &[foreign], &config).is_none(),
             "{name}"
         );
     }
-    assert!(
-        build_exec_session_continuation_context_block(&session, &[], PermissionMode::Default)
-            .is_none()
-    );
+    assert!(shell_snapshot(&session, &[], &config).is_none());
     // An explicit load_skill-only request must not inherit continuation guidance
     // from a broader pre-projection schema list.
     let mut required = session.clone();
@@ -591,21 +736,26 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
         bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
         "[\"review\"]".into(),
     );
-    assert!(build_exec_session_continuation_context_block(
-        &required,
-        &schemas,
-        PermissionMode::Default
-    )
-    .is_none());
+    assert!(shell_snapshot(&required, &schemas, &config).is_none());
     session.set_root_orchestration_only(true).unwrap();
-    assert!(build_exec_session_continuation_context_block(
-        &session,
-        &schemas,
-        PermissionMode::Default
-    )
-    .unwrap()
-    .content
-    .contains(&handle));
+    assert!(shell_snapshot(&session, &schemas, &config)
+        .unwrap()
+        .content
+        .contains(&handle));
+    tokio::fs::write(&gate, b"release").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while shell.status() == "running" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let completed = shell_snapshot(&session, &with_wait, &config).unwrap();
+    assert!(completed.content.contains(&handle));
+    assert!(completed.content.contains("Use write_stdin"));
+    assert!(completed.content.contains("Reuse terminal evidence"));
+    assert!(!completed.content.contains("Exit-wait session IDs:"));
+    assert!(!completed.content.contains("SubAgent"));
     let terminal = tool_payload(
         WriteStdinTool::new()
             .invoke(
@@ -616,11 +766,10 @@ async fn exec_snapshot_retains_unread_terminal_and_respects_owner_and_exact_cata
             .unwrap(),
     );
     assert_eq!(terminal["exit_code"], 7);
-    assert!(build_exec_session_continuation_context_block(
-        &session,
-        &schemas,
-        PermissionMode::Default
-    )
-    .is_none());
+    assert!(terminal["output"]
+        .as_str()
+        .unwrap()
+        .contains("terminal-output"));
+    assert!(shell_snapshot(&session, &schemas, &config).is_none());
     assert_eq!(completion.0.load(Ordering::SeqCst), 0);
 }

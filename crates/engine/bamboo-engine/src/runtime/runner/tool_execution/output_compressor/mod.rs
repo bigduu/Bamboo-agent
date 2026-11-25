@@ -384,11 +384,26 @@ pub(super) fn truncate_exec_session_output(
         .get("output_omitted_bytes")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    object.insert("output".into(), serde_json::json!(""));
-    object.insert(
-        "output_omitted_bytes".into(),
-        serde_json::json!(prior_omitted.saturating_add(output.len() as u64)),
-    );
+    let page_offset = object
+        .get("output_log")
+        .and_then(|log| log.get("next_offset"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|next| next.checked_sub(output.len() as u64));
+    let set_output = |object: &mut serde_json::Map<String, serde_json::Value>, end: usize| {
+        object.insert("output".into(), serde_json::json!(&output[..end]));
+        if let Some(offset) = page_offset {
+            // Offset reads do not consume the log. Move the continuation only
+            // past bytes that the model actually receives, not the raw page.
+            object.get_mut("output_log").expect("validated output log")["next_offset"] =
+                serde_json::json!(offset + end as u64);
+        } else {
+            object.insert(
+                "output_omitted_bytes".into(),
+                serde_json::json!(prior_omitted.saturating_add((output.len() - end) as u64)),
+            );
+        }
+    };
+    set_output(object, 0);
     let mut kept = serde_json::to_string(object).expect("terminal result is serializable");
     if counter.count_text(&kept) > max_tokens {
         // Hook context is optional; it cannot acquire the required terminal
@@ -422,11 +437,7 @@ pub(super) fn truncate_exec_session_output(
         return Some(kept);
     }
     let mut render = |end: usize| {
-        object.insert("output".into(), serde_json::json!(&output[..end]));
-        object.insert(
-            "output_omitted_bytes".into(),
-            serde_json::json!(prior_omitted.saturating_add((output.len() - end) as u64)),
-        );
+        set_output(object, end);
         serde_json::to_string(object).expect("terminal result is serializable")
     };
     let mut low = 0;
@@ -929,6 +940,37 @@ mod tests {
                 assert!(received.get("polling").is_none());
             } else if cap == 512 {
                 assert_eq!(received["polling"], polling);
+                assert!(counter.count_text(&compressed) <= cap);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_log_page_continues_at_the_received_byte_boundary_after_compression() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let counter = TiktokenTokenCounter::default();
+        let text = "captured output 界🦀 ".repeat(500);
+        let offset = 77;
+        let end_offset = offset + text.len();
+        let payload = serde_json::json!({
+            "status":"completed", "exit_code":0, "output":text,
+            "output_log":{"session_id":"retained-log","start_offset":12,
+                          "end_offset":end_offset,"next_offset":end_offset},
+        });
+        for cap in [1, 128] {
+            let compressed =
+                truncate_exec_session_output(&payload.to_string(), cap, &counter).unwrap();
+            let received: serde_json::Value = serde_json::from_str(&compressed).unwrap();
+            let kept = received["output"].as_str().unwrap();
+            assert!(text.starts_with(kept));
+            assert_eq!(received["output_log"]["end_offset"], end_offset);
+            assert_eq!(received["output_log"]["next_offset"], offset + kept.len());
+            assert!(received.get("output_omitted_bytes").is_none());
+            if cap == 1 {
+                assert!(kept.is_empty());
+            } else {
+                assert!(!kept.is_empty());
                 assert!(counter.count_text(&compressed) <= cap);
             }
         }

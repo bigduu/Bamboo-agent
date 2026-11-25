@@ -9,6 +9,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+use super::log_monitor::LogMonitor;
 use super::trigger_engine::{default_trigger_engine, TriggerEngine};
 use bamboo_domain::{
     MisFirePolicy, OverlapPolicy, ProjectId, ScheduleRunConfig, ScheduleRunRecord,
@@ -79,6 +80,8 @@ pub struct ScheduleEntry {
     pub state: ScheduleState,
     #[serde(default)]
     pub run_config: ScheduleRunConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) log_monitor: Option<LogMonitor>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +118,8 @@ struct ScheduleEntryCompat {
     pub running_run_count: u32,
     #[serde(default)]
     pub run_config: ScheduleRunConfig,
+    #[serde(default)]
+    log_monitor: Option<LogMonitor>,
 }
 
 impl ScheduleEntry {
@@ -172,7 +177,14 @@ impl ScheduleEntry {
             updated_at: raw.updated_at,
             state,
             run_config: raw.run_config,
+            log_monitor: raw.log_monitor,
         })
+    }
+
+    fn dispatch_enabled(&self) -> bool {
+        self.log_monitor
+            .as_ref()
+            .map_or(self.enabled, |monitor| monitor.active)
     }
 
     pub fn derived_anchor_at(&self) -> Option<DateTime<Utc>> {
@@ -383,6 +395,26 @@ fn normalize_loaded_index(mut index: SchedulesIndex) -> (SchedulesIndex, bool) {
     }
     for entry in index.schedules.values_mut() {
         changed |= normalize_loaded_schedule_entry(entry);
+        if entry.log_monitor.is_some()
+            && (entry.state.queued_run_count != 0 || entry.state.running_run_count != 0)
+        {
+            entry.state.queued_run_count = 0;
+            entry.state.running_run_count = 0;
+            changed = true;
+        }
+    }
+    for record in index.run_records.values_mut() {
+        if !record.status.is_terminal()
+            && index
+                .schedules
+                .get(&record.schedule_id)
+                .is_some_and(|entry| entry.log_monitor.is_some())
+        {
+            record.status = ScheduleRunStatus::Cancelled;
+            record.completed_at = Some(Utc::now());
+            record.outcome_reason = Some("Log monitor Host restarted during this check".into());
+            changed = true;
+        }
     }
     if changed {
         index.updated_at = Utc::now();
@@ -687,6 +719,7 @@ pub struct ScheduleStore {
     index_path: PathBuf,
     index: RwLock<SchedulesIndex>,
     write_lock: Mutex<()>,
+    pub(super) log_monitor_gate: Mutex<()>,
 }
 
 impl ScheduleStore {
@@ -748,6 +781,7 @@ impl ScheduleStore {
             index_path,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
+            log_monitor_gate: Mutex::new(()),
         })
     }
 
@@ -773,14 +807,124 @@ impl ScheduleStore {
 
     pub async fn list_schedules(&self) -> Vec<ScheduleEntry> {
         let index = self.index.read().await;
-        let mut items: Vec<_> = index.schedules.values().cloned().collect();
+        let mut items: Vec<_> = index
+            .schedules
+            .values()
+            .filter(|entry| entry.log_monitor.is_none())
+            .cloned()
+            .collect();
         items.sort_by_key(|e| Reverse(e.updated_at));
         items
     }
 
     pub async fn get_schedule(&self, id: &str) -> Option<ScheduleEntry> {
         let index = self.index.read().await;
-        index.schedules.get(id).cloned()
+        index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+            .cloned()
+    }
+
+    pub(super) async fn log_monitor(&self, id: &str) -> Option<ScheduleEntry> {
+        self.index
+            .read()
+            .await
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_some())
+            .cloned()
+    }
+
+    pub(super) async fn log_monitors(&self) -> Vec<ScheduleEntry> {
+        self.index
+            .read()
+            .await
+            .schedules
+            .values()
+            .filter(|entry| entry.log_monitor.is_some())
+            .cloned()
+            .collect()
+    }
+
+    // Cursor and pending delivery become visible to the scheduler only after
+    // the existing schedule index has been written successfully.
+    async fn update_monitor_index<T>(
+        &self,
+        update: impl FnOnce(&mut SchedulesIndex) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _writer = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let mut next = index.clone();
+        let result = update(&mut next)?;
+        next.updated_at = Utc::now();
+        atomic_write_json(&self.index_path, serde_json::to_vec_pretty(&next)?).await?;
+        *index = next;
+        Ok(result)
+    }
+
+    pub(super) async fn insert_log_monitor(
+        &self,
+        id: String,
+        monitor: LogMonitor,
+        every_seconds: u64,
+    ) -> io::Result<ScheduleEntry> {
+        let now = Utc::now();
+        self.update_monitor_index(|index| {
+            if index.schedules.contains_key(&id) {
+                return Err(other_io_error("log monitor operation ID is already in use"));
+            }
+            let entry = ScheduleEntry {
+                id: id.clone(),
+                name: format!("Log monitor for {}", monitor.spec.relative_path),
+                // Older Hosts treat this schedule as disabled. Only the typed
+                // monitor configuration enables checks on the current Host.
+                enabled: false,
+                trigger: ScheduleTrigger::legacy_interval(every_seconds, Some(now)),
+                timezone: None,
+                start_at: None,
+                end_at: None,
+                misfire_policy: MisFirePolicy::RunOnce,
+                overlap_policy: OverlapPolicy::QueueOne,
+                created_at: now,
+                updated_at: now,
+                state: ScheduleState {
+                    next_fire_at: Some(now + Duration::seconds(every_seconds as i64)),
+                    ..Default::default()
+                },
+                run_config: ScheduleRunConfig {
+                    project_id: Some(monitor.spec.project_id.clone()),
+                    ..Default::default()
+                },
+                log_monitor: Some(monitor),
+            };
+            index.schedules.insert(id, entry.clone());
+            Ok(entry)
+        })
+        .await
+    }
+
+    pub(super) async fn save_log_monitor(
+        &self,
+        id: &str,
+        monitor: LogMonitor,
+    ) -> io::Result<ScheduleEntry> {
+        self.update_monitor_index(|index| {
+            let entry = index
+                .schedules
+                .get_mut(id)
+                .filter(|entry| entry.log_monitor.is_some())
+                .ok_or_else(|| other_io_error("log monitor is unavailable"))?;
+            if monitor.active && entry.log_monitor.as_ref().is_some_and(|old| !old.active) {
+                let every = interval_seconds_from_trigger(&entry.trigger)
+                    .ok_or_else(|| other_io_error("log monitor trigger changed"))?;
+                entry.state.next_fire_at = Some(Utc::now() + Duration::seconds(every as i64));
+            }
+            entry.log_monitor = Some(monitor);
+            entry.updated_at = Utc::now();
+            Ok(entry.clone())
+        })
+        .await
     }
 
     pub async fn get_run_record(&self, run_id: &str) -> Option<ScheduleRunRecord> {
@@ -855,6 +999,7 @@ impl ScheduleStore {
                 ..Default::default()
             },
             run_config,
+            log_monitor: None,
         };
 
         self.update_index(|index| {
@@ -930,7 +1075,11 @@ impl ScheduleStore {
         expected_project_id: Option<Option<ProjectId>>,
     ) -> io::Result<Option<ScheduleEntry>> {
         self.update_index(|index| {
-            let Some(existing) = index.schedules.get_mut(id) else {
+            let Some(existing) = index
+                .schedules
+                .get_mut(id)
+                .filter(|entry| entry.log_monitor.is_none())
+            else {
                 return Ok(None);
             };
             if expected_project_id.as_ref().is_some_and(|expected| {
@@ -1011,6 +1160,13 @@ impl ScheduleStore {
         expected_project_id: Option<Option<ProjectId>>,
     ) -> io::Result<bool> {
         self.update_index(|index| {
+            if index
+                .schedules
+                .get(id)
+                .is_some_and(|entry| entry.log_monitor.is_some())
+            {
+                return Ok(false);
+            }
             if expected_project_id.as_ref().is_some_and(|expected| {
                 index
                     .schedules
@@ -1050,7 +1206,8 @@ impl ScheduleStore {
         {
             let index = self.index.read().await;
             let any_due = index.schedules.values().any(|entry| {
-                entry.enabled && current_due_at(entry).is_some_and(|due_at| due_at <= now)
+                entry.dispatch_enabled()
+                    && current_due_at(entry).is_some_and(|due_at| due_at <= now)
             });
             if !any_due {
                 return Ok(Vec::new());
@@ -1061,7 +1218,7 @@ impl ScheduleStore {
             let mut out = Vec::new();
             let (schedules, run_records) = (&mut index.schedules, &mut index.run_records);
             for entry in schedules.values_mut() {
-                if !entry.enabled {
+                if !entry.dispatch_enabled() {
                     continue;
                 }
                 let Some(due_at) = current_due_at(entry) else {
@@ -1379,7 +1536,12 @@ impl ScheduleStore {
         expected_run_config: Option<ScheduleRunConfig>,
     ) -> io::Result<Option<ClaimedScheduleRun>> {
         self.update_index(|index| {
-            let Some(entry) = index.schedules.get(id).cloned() else {
+            let Some(entry) = index
+                .schedules
+                .get(id)
+                .filter(|entry| entry.log_monitor.is_none())
+                .cloned()
+            else {
                 return Ok(None);
             };
             if expected_project_id

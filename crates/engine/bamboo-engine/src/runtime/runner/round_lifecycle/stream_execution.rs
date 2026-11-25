@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -12,11 +13,11 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_history_boundary_context_block,
-    build_instruction_overlay_context_block, build_plan_mode_context_block,
-    build_plan_runtime_context_block, build_project_resources_context_block,
-    build_root_orchestration_context_block, build_session_identity_context_block,
-    build_supervisor_route_observation, build_task_list_context_block,
-    build_workspace_context_block,
+    build_instruction_overlay_context_block, build_memory_usage_context_block,
+    build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_project_resources_context_block, build_root_orchestration_context_block,
+    build_session_identity_context_block, build_supervisor_route_observation,
+    build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -32,13 +33,13 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
-    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
+    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
-    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, RequestToolSelection,
+    ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -49,7 +50,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
-    PromptMemoryExposureFrame, RoundOutputLimitPolicy, RoundToolDispatch,
+    PromptMemoryExposureFrame, RoundRecoveryPolicy, RoundToolDispatch,
 };
 
 /// LLM-stream frame bundling per-request identification, observability, and
@@ -63,7 +64,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub output_limit_recovery: Option<RoundOutputLimitPolicy<'a>>,
+    pub output_limit_recovery: Option<RoundRecoveryPolicy<'a>>,
     pub budget: &'a TokenBudget,
     pub provider_default_output: bool,
     pub observation_progress_hint: Option<&'a str>,
@@ -226,6 +227,7 @@ fn append_interrupted_assistant_output(
     let partial_tool_calls = (!partial.partial_tool_calls.is_empty()).then(|| {
         serde_json::to_value(&partial.partial_tool_calls).unwrap_or(serde_json::Value::Null)
     });
+    let plain_text_only = partial.plain_text_only;
     let mut message = Message::assistant_with_reasoning(
         partial.content,
         None,
@@ -241,9 +243,74 @@ fn append_interrupted_assistant_output(
         "interrupted": true,
         "interruption_kind": interruption_kind(error),
         "partial_tool_calls": partial_tool_calls,
+        "plain_text_only": plain_text_only,
     }));
     session.add_message(message);
     true
+}
+
+/// Consider only the fragment produced by this attempt. The original input
+/// and all completed tool results stay on the same run.
+pub(crate) fn worker_timeout_usage(
+    session: &Session,
+    config: &AgentLoopConfig,
+    previous_tail: Option<&str>,
+    error: &AgentError,
+) -> Option<bamboo_metrics::TokenUsage> {
+    let AgentError::StreamTimeout(timeout) = error else {
+        return None;
+    };
+    if !timeout.semantic_output_started()
+        || !matches!(
+            timeout.phase(),
+            bamboo_agent_core::StreamTimeoutPhase::TransportIdle
+                | bamboo_agent_core::StreamTimeoutPhase::SemanticIdle
+        )
+        || !session.messages.last().is_some_and(|message| {
+            Some(message.id.as_str()) != previous_tail
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == INTERRUPTED_ASSISTANT_OUTPUT_KIND
+                        && metadata["plain_text_only"] == true
+                })
+        })
+    {
+        return None;
+    }
+    let owner = config
+        .persistence
+        .as_ref()
+        .and_then(|port| port.root_actor_writer())?;
+    if owner.created_at != session.created_at
+        || owner.fence.actor_id.as_str() != session.id
+        || config.guidance_active_run_id.as_deref() != Some(owner.fence.run_id.as_str())
+    {
+        return None;
+    }
+    let is_work =
+        crate::ticket_runtime::is_managed_work_root(session) && config.ticket_worker_plan.is_some();
+    let is_subscribed = session
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        .is_some_and(|outcomes| {
+            outcomes.facts.last().is_some_and(|fact| {
+                fact.run_id == owner.fence.run_id
+                    && fact.result.is_none()
+                    && outcomes.material_inputs(fact).next().is_some()
+            })
+        });
+    if !is_work && !is_subscribed {
+        return None;
+    }
+    let (prompt_tokens, completion_tokens) = timeout.interrupted_attempt_tokens()?;
+    Some(
+        bamboo_metrics::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+        .clamped_for_durable_metrics(),
+    )
 }
 
 /// Remove the transient partial record before a retry.  A terminal attempt
@@ -687,10 +754,13 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
-    configured_mode: PermissionMode,
+    config: &AgentLoopConfig,
+    loading_mode: CapabilityLoadingMode,
 ) -> Option<ContextBlock> {
-    let flags =
-        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+        session,
+        config.permission_mode.unwrap_or_default(),
+    );
     let schemas = effective_tool_schemas(session, tool_schemas);
     if flags.plan_read_only
         || !session.allows_model_tool_execution("write_stdin")
@@ -704,15 +774,49 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
-    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
-        && schemas
-            .iter()
-            .any(|schema| schema.function.name == "SubAgent")
+    let mut guidance =
+        "Use write_stdin with an exact session_id below for interactive input, unread output, or a short wait for an exit status you still need. Reuse terminal evidence already returned for that session_id."
+            .to_owned();
+    if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && session.allows_model_tool_execution("SubAgent")
+        && !crate::runtime::loop_control::suspension::active(config)
+        && bamboo_agent_core::tools::suspension_allowed()
+        && schemas.iter().any(|schema| {
+            schema.function.name == "SubAgent"
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/intent/enum")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|intents| intents.iter().any(|intent| intent == "wait"))
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/target/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("string")
+        })
+        && (loading_mode != CapabilityLoadingMode::Progressive
+            || crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                session,
+                &schemas,
+                loading_mode,
+            )
+            .contains_execution_name("SubAgent"))
     {
-        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
-    } else {
-        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
-    };
+        let wait_targets: Vec<_> = ids
+            .iter()
+            .filter(|id| {
+                bamboo_tools::tools::exec_command::exec_wait_target_is_ready(&session.id, id)
+            })
+            .collect();
+        if !wait_targets.is_empty() {
+            guidance = format!(
+                "{guidance} Advance independent work while commands run. When you need to wait for a non-interactive command to exit, use SubAgent with intent=wait and target set to its exact session_id from the exit-wait list.\nExit-wait session IDs: {}",
+                serde_json::to_string(&wait_targets).expect("shell session IDs are serializable"),
+            );
+        }
+    }
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
@@ -781,9 +885,11 @@ pub(super) async fn project_request_usage(
         prepared_context,
         config,
         effective_tool_schemas.as_ref(),
+        wire_schemas.as_ref(),
         model,
         loading_mode,
         native_transcript_protocol_for(llm, model),
+        false,
         None,
     );
     let tool_footprint = llm
@@ -812,9 +918,11 @@ fn build_request_envelope_reconciled(
         prepared_context,
         config,
         tool_schemas,
+        tool_schemas,
         model,
         CapabilityLoadingMode::LegacyFullCatalog,
         None,
+        false,
         None,
     )
 }
@@ -825,9 +933,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
+    wire_tool_schemas: &[ToolSchema],
     model: &str,
     loading_mode: CapabilityLoadingMode,
     native_protocol: Option<ProviderProtocol>,
+    standalone_discovery: bool,
     request_advisories: impl IntoIterator<Item = &'a str>,
 ) -> PreparedRequestEnvelope {
     let gemini_native = native_protocol == Some(ProviderProtocol::GeminiGenerateContentV1Beta);
@@ -891,10 +1001,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         .as_ref()
         .filter(|_| session.supervisor_incarnation_id().is_some())
         .map(bamboo_domain::model_context_block_sha256);
-    if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
-        session,
-        config.guidance_active_run_id.as_deref(),
-    ) {
+    // Work creation receipts cover the first input. Attach review guidance to
+    // the model context of the bound Worker without rewriting that input.
+    let handoff = if config.ticket_worker_plan.is_some() {
+        Some(ContextBlock::new(
+            ContextBlockType::RootOrchestration,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Work Delivery Evidence",
+            bamboo_orchestration::managed_work::WORK_HANDOFF_GUIDANCE,
+        ))
+    } else {
+        bamboo_orchestration::managed_session::worker_handoff_context(
+            session,
+            config.guidance_active_run_id.as_deref(),
+        )
+    };
+    if let Some(handoff) = handoff {
         if let Some(block) = orchestration.as_mut() {
             block.content.push_str("\n\n");
             block.content.push_str(&handoff.content);
@@ -1166,11 +1289,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
-    // Recall, Dream, and agenda are current read models. Keeping them outside
-    // the generated ledger prevents old snapshots from reappearing after an
-    // edit, archive, or project reassignment.
-    let external_memory_message_id = build_external_memory_context_block(session).map(|block| {
-        // Place the current snapshot before the user who owns this turn.
+    let ledger_context = build_external_memory_context_block(session);
+    let has_ledger_context = ledger_context.is_some();
+    let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
+    if !standalone_discovery {
+        current_context.extend(build_memory_usage_context_block(
+            session,
+            tool_schemas,
+            wire_tool_schemas,
+            loading_mode,
+            config.permission_mode.unwrap_or_default(),
+        ));
+    }
+    // The agenda and recall instructions are current context, outside the
+    // generated ledger. Present them before the user who owns this turn.
+    let external_memory_message_id = if current_context.is_empty() {
+        None
+    } else {
         // Tool continuations then end with the same call/results as before.
         let anchor = real_transcript
             .iter()
@@ -1191,11 +1326,16 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                     .rposition(|message| message.id == anchor.id)
             })
             .unwrap_or(0);
-        let message = block.render_runtime_context_message();
-        let id = message.id.clone();
-        model_transcript.insert(index, message);
-        id
-    });
+        model_transcript.splice(
+            index..index,
+            current_context
+                .into_iter()
+                .map(|block| block.render_runtime_context_message()),
+        );
+        // Anthropic moves this ID to the live tail. The recall instructions
+        // stay with the context that precedes the current user request.
+        has_ledger_context.then(|| model_transcript[index].id.clone())
+    };
     cache_plan.anthropic_history = real_transcript.last().map(|newest| {
         let previous_message_id = ledger
             .prior_message_count
@@ -1215,7 +1355,13 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     if let Some(block) = build_child_tool_guidance(session, tool_schemas) {
         model_transcript.push(block.render_runtime_context_message());
     }
-    if let Some(block) = build_supervisor_route_observation(session, tool_schemas, loading_mode) {
+    if standalone_discovery {
+        model_transcript.push(Message::user(
+            "This request is for tool discovery only. Call discover_capabilities once by itself. Continue the task using the returned definition in the next round.",
+        ));
+    } else if let Some(block) =
+        build_supervisor_route_observation(session, tool_schemas, loading_mode)
+    {
         model_transcript.push(block.render_runtime_context_message());
     }
     if let Some(deadline) = config.run_deadline {
@@ -1234,8 +1380,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     }
     if let Some(block) = build_exec_session_continuation_context_block(
         session,
-        tool_schemas,
-        config.permission_mode.unwrap_or_default(),
+        wire_tool_schemas,
+        config,
+        loading_mode,
     ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
@@ -1300,12 +1447,17 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
         cache: cache_plan,
         continuation: None,
     };
+    let history_catalog = if standalone_discovery {
+        &[]
+    } else {
+        tool_schemas
+    };
     let wire_schemas =
-        request_tool_schemas_for_loading_mode(session, tool_schemas, loading_mode, true);
+        request_tool_schemas_for_loading_mode(session, history_catalog, loading_mode, true);
     let discovery_history =
         crate::runtime::runner::loop_execution::projected_sticky_fallback_results(
             session,
-            tool_schemas,
+            history_catalog,
             wire_schemas.as_ref(),
             loading_mode,
         );
@@ -1577,6 +1729,16 @@ fn live_bootstrap_snapshot(session: &Session) -> Option<Session> {
     Some(session.clone())
 }
 
+fn discovery_correction_schemas(schemas: &[ToolSchema]) -> Result<&[ToolSchema], AgentError> {
+    schemas
+        .iter()
+        .find(|schema| schema.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+        .map(std::slice::from_ref)
+        .ok_or_else(|| {
+            AgentError::Tool("Tool discovery is no longer available for this request".into())
+        })
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1612,6 +1774,12 @@ pub(super) async fn execute_llm_stream(
     let task_split = frame
         .output_limit_recovery
         .and_then(|policy| policy.task_split);
+    let standalone_discovery = frame
+        .output_limit_recovery
+        .is_some_and(|policy| policy.standalone_discovery);
+    let round_cap_summary = frame
+        .output_limit_recovery
+        .is_some_and(|policy| policy.round_cap_summary);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1620,6 +1788,7 @@ pub(super) async fn execute_llm_stream(
         .map_err(|error| AgentError::Budget(error.to_string()))?
         .is_none()
         && task_split.is_none()
+        && !round_cap_summary
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
@@ -1638,12 +1807,32 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         tool_dispatch,
     ) = loop {
-        let required_tool = required_tool_for_session(session);
-        let (loading_mode, selection) =
-            request_tool_policy(llm.as_ref(), model, required_tool).await?;
+        let (required_tool, loading_mode, selection) = if round_cap_summary {
+            (
+                None,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                RequestToolSelection::Disabled,
+            )
+        } else {
+            let required_tool = required_tool_for_session(session);
+            let (loading_mode, selection) =
+                request_tool_policy(llm.as_ref(), model, required_tool).await?;
+            (required_tool, loading_mode, selection)
+        };
         let effective_schemas =
             select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
+        let wire_schemas = request_tool_schemas_for_loading_mode(
+            session,
+            tool_schemas,
+            loading_mode,
+            task_split.is_none(),
+        );
+        let wire_schemas = if standalone_discovery {
+            discovery_correction_schemas(&wire_schemas)?
+        } else {
+            wire_schemas.as_ref()
+        };
         // Owned (not borrowed) so the immutable borrow of `session` ends here and
         // the drift diagnostic below can take `&mut session`.
         let previous_response_id = if continuation_enabled {
@@ -1658,9 +1847,11 @@ pub(super) async fn execute_llm_stream(
             &prepared_context,
             config,
             tool_schemas,
+            wire_schemas,
             model,
             loading_mode,
             native_transcript_protocol_for(llm, model),
+            standalone_discovery,
             observation_progress_hint
                 .into_iter()
                 .chain(convergence_hint),
@@ -1670,16 +1861,10 @@ pub(super) async fn execute_llm_stream(
         // exact final IR again before checkpoint/provider dispatch. Failing closed
         // preserves the context-window contract without committing an unsendable
         // ledger candidate.
-        let wire_schemas = request_tool_schemas_for_loading_mode(
-            session,
-            tool_schemas,
-            loading_mode,
-            task_split.is_none(),
-        );
         let tool_footprint = match llm
             .provider_visible_tool_footprint(
                 &prepared_envelope.ir,
-                wire_schemas.as_ref(),
+                wire_schemas,
                 model,
                 required_tool,
             )
@@ -1874,7 +2059,11 @@ pub(super) async fn execute_llm_stream(
         tool_dispatch.mode,
         task_split.is_none(),
     );
-    let tool_schemas = wire_schemas.as_ref();
+    let tool_schemas = if standalone_discovery {
+        discovery_correction_schemas(&wire_schemas)?
+    } else {
+        wire_schemas.as_ref()
+    };
     // Freeze the already-reconciled request's Session before the following
     // diagnostic-only mutations. The final IR, schemas and options below are
     // then retained by the very same pinned provider future; no retry may
@@ -1942,7 +2131,7 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         final_usage,
     );
-    if task_split.is_some() {
+    if task_split.is_some() || standalone_discovery {
         planned.request_options.parallel_tool_calls = Some(false);
     }
     if !continuation_enabled {
@@ -1992,6 +2181,11 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let model_started = observation.is_recording().then(std::time::Instant::now);
+    if model_started.is_some() {
+        let cache = bamboo_compression::counter::token_count_cache_stats();
+        observation.token_cache_snapshot(cache.hits, cache.misses, cache.entries);
+    }
     let call_id = uuid::Uuid::new_v4().to_string();
     observation.model_call_id(&call_id);
     let trace_ids = observation.trace_ids();
@@ -2027,6 +2221,13 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let progress_events = event_tx.clone();
+    http_retry_observer.report_progress(move |retry| {
+        let _ = progress_events.try_send(AgentEvent::UpstreamRetryScheduled {
+            http_status: retry.status,
+            retry_delay_ms: retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    });
     let recovery = recovery.map(|retry| match window_limit {
         Some(limit) => retry.tighten_output_limit(limit),
         None => retry,
@@ -2049,7 +2250,8 @@ pub(super) async fn execute_llm_stream(
             .is_none_or(|policy| policy.remaining_run_tokens.is_none());
     let completion = CompletionDiagnostics::for_agent_round(recovery)
         .with_model_window_limit(window_limit)
-        .with_provider_default_output(provider_default_output);
+        .with_provider_default_output(provider_default_output)
+        .with_tools_disabled(round_cap_summary);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -2154,6 +2356,19 @@ pub(super) async fn execute_llm_stream(
             return Err(error);
         }
     };
+    let stream: bamboo_llm::LLMStream = if let Some(model_started) = model_started {
+        let mut started = Some(model_started);
+        Box::pin(stream.inspect(move |chunk| {
+            if let Some(start) = started {
+                if matches!(chunk, Ok(bamboo_llm::LLMChunk::Token(text)) if !text.is_empty()) {
+                    bamboo_infrastructure::telemetry::record_first_model_text(start.elapsed());
+                    started = None;
+                }
+            }
+        }))
+    } else {
+        stream
+    };
     let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
     if provider_manages_retry_budget {
         timeout_context.managed_response_established();
@@ -2232,10 +2447,14 @@ pub(super) async fn execute_llm_stream(
             session,
         );
     // The opt-in evidence check must publish only the final, checked answer.
-    // Buffer this response until tool calls tell us whether it is a candidate.
+    // A cap summary also stays private until its completion is validated.
     let stream_output_result = observation
         .scope(async {
-            if activation_pending || config.features_final_evidence_check || private_plan {
+            if activation_pending
+                || config.features_final_evidence_check
+                || private_plan
+                || round_cap_summary
+            {
                 crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                     stream,
                     cancel_token,
@@ -2255,6 +2474,11 @@ pub(super) async fn execute_llm_stream(
             }
         })
         .await;
+    if observation.is_recording() {
+        if let Some((typed_text, full_json)) = completion.gemini_decode_counts() {
+            observation.gemini_decode_counts(typed_text, full_json);
+        }
+    }
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
         Err(mut failure) => {
@@ -2268,6 +2492,22 @@ pub(super) async fn execute_llm_stream(
                 AgentError::LLM(message) if replay_unsafe => AgentError::LLMNonRetryable(message),
                 other => other,
             };
+            if failure.partial_output.plain_text_only {
+                if let AgentError::StreamTimeout(timeout) = &mut failure.error {
+                    let partial = &failure.partial_output;
+                    let usage = super::canonical_token_usage(
+                        partial.provider_usage,
+                        partial.input_tokens,
+                        partial.output_tokens,
+                        u64::from(final_usage.input_tokens),
+                        super::token_estimation::estimate_completion_tokens(&partial.content, &[]),
+                    );
+                    timeout.record_interrupted_attempt_tokens(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                }
+            }
             if let Some(usage) = failure.partial_output.provider_usage {
                 observation.model_usage(&token_usage(usage));
             }
@@ -2279,6 +2519,7 @@ pub(super) async fn execute_llm_stream(
                 &failure.error,
             ));
             let appended = !private_plan
+                && !round_cap_summary
                 && append_interrupted_assistant_output(
                     session,
                     *failure.partial_output,
@@ -2315,10 +2556,15 @@ pub(super) async fn execute_llm_stream(
     observation.finish(outcome);
 
     let response_rejected = finish_reason == REASONING_REPETITION_FINISH_REASON
-        || super::rejected_output_limit(&stream_output, finish_reason, task_split.is_some());
+        || super::rejected_output_limit(
+            &stream_output,
+            finish_reason,
+            task_split.is_some() || round_cap_summary,
+        );
     if config.features_final_evidence_check
         && !activation_pending
         && !response_rejected
+        && !round_cap_summary
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
@@ -2443,7 +2689,11 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if !response_rejected && !incomplete_recovery && !private_plan {
+    if !response_rejected
+        && !incomplete_recovery
+        && !private_plan
+        && (!standalone_discovery || !stream_output.tool_calls.is_empty())
+    {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {

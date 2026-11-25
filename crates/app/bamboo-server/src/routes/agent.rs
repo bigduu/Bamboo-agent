@@ -232,6 +232,8 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::browser::screenshot),
         )
         .route("/chat", web::post().to(agent::chat::handler))
+        .service(agent::draft_completion::resource())
+        .service(agent::side_chat::routes())
         .route(
             "/sessions/{session_id}/goal/resume",
             web::post().to(agent::chat::resume_goal),
@@ -522,6 +524,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}/stop",
             web::post().to(agent::stop::handler_with_run),
+        )
+        .route(
+            "/sessions/{session_id}/background-command-wait/cancel",
+            web::post().to(agent::stop::cancel_background_command_wait),
         )
         .route(
             "/sessions/{session_id}/history",

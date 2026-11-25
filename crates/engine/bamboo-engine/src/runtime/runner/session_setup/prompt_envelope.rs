@@ -1,8 +1,10 @@
-use bamboo_agent_core::tools::ToolSchema;
+use bamboo_agent_core::tools::{ToolExecutionSessionFlags, ToolSchema};
 use bamboo_agent_core::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Session,
 };
-use bamboo_domain::{CapabilityLoadingMode, SessionKind};
+use bamboo_domain::{
+    CapabilityLoadingMode, PermissionMode, SessionKind, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+};
 
 /// Structured request envelope separating the stable instructions, the
 /// session-stable prefix messages, and the per-round dynamic context blocks. The
@@ -55,6 +57,76 @@ pub(crate) fn build_session_identity_context_block(session: &Session) -> Context
     )
 }
 
+/// Guidance follows the current request's capability exposure and never
+/// survives as a historical invitation after the tool becomes unavailable.
+pub(crate) fn build_memory_usage_context_block(
+    session: &Session,
+    eligible_schemas: &[ToolSchema],
+    wire_schemas: &[ToolSchema],
+    loading_mode: CapabilityLoadingMode,
+    configured_permission_mode: PermissionMode,
+) -> Option<ContextBlock> {
+    if !session.allows_model_tool_execution("memory") {
+        return None;
+    }
+    let schema = eligible_schemas
+        .iter()
+        .find(|schema| schema.function.name == "memory")?;
+    let wire_has = |name| wire_schemas.iter().any(|tool| tool.function.name == name);
+    let discovery = if wire_has("memory") {
+        match loading_mode {
+            CapabilityLoadingMode::Progressive => {
+                "Use tool discovery to load `memory` if it is deferred. "
+            }
+            _ => "",
+        }
+    } else if wire_has(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+        "Call `discover_capabilities` by itself to load `memory`, then use it in a later round. "
+    } else {
+        return None;
+    };
+
+    let properties = schema.function.parameters.get("properties")?;
+    let actions = properties.pointer("/action/enum")?.as_array()?;
+    let supports = |action| actions.iter().any(|entry| entry.as_str() == Some(action));
+    let session_read = supports("session_read");
+    let plan_read_only = ToolExecutionSessionFlags::from_session_and_configured_mode(
+        session,
+        configured_permission_mode,
+    )
+    .plan_read_only;
+    let durable_read = !plan_read_only
+        && supports("query")
+        && supports("get")
+        && properties.get("scope").is_some();
+    if !session_read && !durable_read {
+        return None;
+    }
+
+    let mut content = String::from(
+        "Look up memory only when the current task depends on a prior fact or decision. ",
+    );
+    content.push_str(discovery);
+    if durable_read {
+        content.push_str(concat!(
+            "Use `memory` action=query with short keywords and action=get for selected IDs. ",
+            "Choose scope=section for facts in the assigned Section, scope=project for the assigned Project, ",
+            "or scope=global for cross-project facts. "
+        ));
+    }
+    if session_read {
+        content.push_str("Use `memory` action=session_read for this Session's continuity notes. ");
+    }
+    content.push_str("Follow current instructions and verify recalled facts against live state.");
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "On-demand memory",
+        content,
+    ))
+}
+
 /// The request-selected catalog already accounts for role, Host, and provider
 /// restrictions. The native shell entry point is Core and is never deferred.
 pub(crate) fn build_child_tool_guidance(
@@ -95,28 +167,49 @@ Inspect authoritative child progress and results when needed. Correct or revise 
 If a finding exceeds the assignment, pause that expansion and seek the user's approval or a separate focused task before proceeding. Never infer broader authority from a child report.\n\
 Verify child evidence, resolve conflicting results, and report completed work, remaining work, and risks with clear provenance.";
 
-const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's read-only explorer role and review its findings before assigning implementation.";
+const ROOT_PLANNING_GUIDANCE: &str = "For uncertain or multi-step work, use SubAgent's explorer role for investigation and review its findings before assigning implementation.";
 
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode.\n\
-Actively look for useful independent work. Launch ready independent SubAgent assignments in parallel within the available capacity and budget. While children run, dispatch additional ready assignments and advance your own independent work. Make authorized file edits directly when they are quicker or unblock the work.\n\
+At the start, identify useful independent slices. Discover SubAgent early if it is deferred. \
+Launch all ready SubAgent assignments that fit the available capacity and budget in parallel without waiting for a delegation request. \
+Advance your own independent work while children run and start newly ready slices as capacity opens. \
+Make authorized file edits directly when they are quicker or unblock the work.\n\
 Use exec_command for authorized shell commands. Prefer SubAgent intent=wait for non-interactive exit. Use write_stdin for input or unread output.\n\
-Use SubAgent's read-only explorer role to resolve uncertainty. Its findings are prerequisites only for the work that depends on them. Wait when a required child result blocks further useful work. Direct execution or one child can be enough for simple or sequential tasks.\n\
+Use SubAgent's explorer role to resolve uncertainty. Wait only when a child result blocks further useful work. \
+Direct execution or one child can be enough for simple or sequential tasks.\n\
 Use the highest reasoning tier available on the primary model.";
 
+const SUPERVISOR_ULTRA_GUIDANCE: &str = "In Ultra, look for independent planning, review and verification at the start. \
+Discover SubAgent early if it is deferred. Launch ready auxiliary SubAgent assignments in parallel within the available capacity and budget. \
+Keep coordinating Work or independent Sessions while the children run. Wait only when a child result blocks further useful work.";
+
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
-Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized independent Sessions. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
-Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. Track parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
-Use SubAgent only for auxiliary planning, review or verification. Select the read-only explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Use work_dispatch only for existing explicit Work. Keep the coordinating role with the Supervisor.\n\
+Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized workers. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
+\n\
+Prefer Work for authorized deliverables that benefit from durable tracking, dependencies, parallel ownership or explicit acceptance when Work is enabled and its admitted tools and workspace fit. The user can ask for the outcome without naming Work. Use bounded Work views to find matching Work and advance it from its current state. When the Work views establish no match, use work_update to create a Work with a concrete deliverable, constraints and observable acceptance criteria. Mark it ready when its prerequisites are met and use work_dispatch to start ready Work in the current turn as capacity permits. Honor plan-only and draft-only requests and preserve required User acceptance. Use authorized independent Sessions for one-off execution, an explicitly requested Session or when Work cannot support the assignment and the user's instructions permit a Session.\n\
+Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. When selecting a target, locate parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
+Use SubAgent only for auxiliary planning, review or verification. Select the explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Keep the coordinating role with the Supervisor.\n\
 Use discovery for a discoverable route. Tool exposure describes the catalog. Use Host admission to verify target scope and worker readiness. When no authorized route or worker fits, report the specific blocker. Inspect the existing assignment or receipt before retrying. Reuse the complete request and operation UUID on an uncertain response.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
     if session.supervisor_incarnation_id().is_some() {
         let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
         let handoff = bamboo_orchestration::managed_session::SUPERVISOR_HANDOFF_GUIDANCE;
-        let mut guidance = format!("{SUPERVISOR_DELEGATION_GUIDANCE}\n\n{routing}\n\n{handoff}");
+        let mut guidance = SUPERVISOR_DELEGATION_GUIDANCE.to_owned();
         if session.root_orchestration_only_enabled() {
-            guidance.push_str("\n\nIn Ultra, prefer parallel auxiliary planning and verification. Actively look for independent assignments.");
+            guidance.push_str("\n\n");
+            guidance.push_str(SUPERVISOR_ULTRA_GUIDANCE);
         }
+        guidance.push_str("\n\n");
+        guidance.push_str(routing);
+        guidance.push_str("\n\n");
+        guidance.push_str(handoff);
+        guidance.push_str(concat!(
+            "\n\nIf the current task depends on a prior fact or decision, delegate the memory lookup. ",
+            "Use an authorized Session in the verified Project for Project facts. ",
+            "Ask the worker to discover memory if needed, run action=query with short keywords and the appropriate scope, then action=get for selected IDs. ",
+            "Use Global scope for cross-project facts."
+        ));
         return Some(ContextBlock::new(
             ContextBlockType::RootOrchestration,
             ContextBlockPriority::Critical,
@@ -236,7 +329,7 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
     let guidance = build_root_orchestration_context_block(&restored)
         .expect("durable orchestration-only mode supplies delegation guidance");
     assert_eq!(guidance.block_type, ContextBlockType::RootOrchestration);
-    assert!(guidance.content.contains("read-only explorer role"));
+    assert!(guidance.content.contains("explorer role"));
     assert!(guidance.content.contains("Ultra Root thinking mode"));
     assert!(guidance
         .content
@@ -245,13 +338,13 @@ fn orchestration_only_root_receives_guidance_without_prompt_only_selection() {
         .content
         .contains("Prefer SubAgent intent=wait for non-interactive exit"));
     for concept in [
-        "Actively look for useful independent work",
-        "Launch ready independent SubAgent assignments in parallel",
-        "within the available capacity and budget",
-        "While children run, dispatch additional ready assignments and advance your own independent work",
+        "At the start, identify useful independent slices",
+        "Discover SubAgent early if it is deferred",
+        "Launch all ready SubAgent assignments that fit the available capacity and budget in parallel",
+        "without waiting for a delegation request",
+        "Advance your own independent work while children run and start newly ready slices as capacity opens",
         "Make authorized file edits directly",
-        "prerequisites only for the work that depends on them",
-        "Wait when a required child result blocks further useful work",
+        "Wait only when a child result blocks further useful work",
         "one child can be enough for simple or sequential tasks",
     ] {
         assert!(guidance.content.contains(concept), "missing {concept}");
@@ -287,12 +380,14 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
         let block = build_root_orchestration_context_block(&restored)
             .expect("trusted Supervisor always receives its delegation contract");
         assert_eq!(block.stability, ContextBlockStability::SessionStable);
-        assert_eq!(
-            block
-                .content
-                .contains("In Ultra, prefer parallel auxiliary"),
-            ultra
-        );
+        for concept in [
+            "look for independent planning, review and verification at the start",
+            "Discover SubAgent early if it is deferred",
+            "Launch ready auxiliary SubAgent assignments in parallel",
+            "Keep coordinating Work or independent Sessions while the children run",
+        ] {
+            assert_eq!(block.content.contains(concept), ultra, "{concept}");
+        }
         assert!(!block
             .content
             .contains("Make authorized file edits directly"));
@@ -308,13 +403,23 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
             "nested delegation",
             "end the turn",
             "Resume on Inbox delivery",
+            "use a supported bounded wait for the exact Run",
+            "Do not poll the same assignment across tool rounds or turns",
+            "repeating or alternating inspect, read_messages, observe_run, directory or status views, or wait calls",
+            "one bounded, targeted check to confirm initial startup, answer an explicit status request",
+            "specific verification or recovery gap backed by fresh Run evidence",
+            "stop checking until a new material event or explicit status request",
+            "Treat route observations, recalled memory, compressed history and replayed handoffs as background",
+            "Do not acknowledge them or use them to restart checks",
+            "end the turn quietly without recapping unchanged progress",
+            "Answer an explicit status request once",
+            "Report a fresh handoff once when it contains a verified result, an actual test failure, an actionable blocker or a decision the user needs to make",
             "assigned acceptance criteria",
             "reject the exact current submission",
             "Verify the corrected result",
             "wait for explicit User acceptance of the exact current submission",
             "Dispatch independent slices in parallel with disjoint writes",
-            "parallel workstreams",
-            "session_control directory",
+            "When selecting a target, locate parallel workstreams with session_control directory",
             "Follow up a user-engaged Session again only when the user asks",
             "Use authoritative Run evidence for completion",
         ] {
@@ -632,7 +737,7 @@ pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<C
         ContextBlockType::ExternalMemory,
         ContextBlockPriority::Medium,
         ContextBlockStability::RoundDynamic,
-        "External Memory (Persistent)",
+        "Ledger and Context Usage",
         trimmed,
     ))
 }
@@ -792,6 +897,99 @@ mod tests {
         assert!(block
             .content
             .contains("authorize the caller from trusted runtime context"));
+        assert!(!block.content.contains("action=query"));
+    }
+
+    #[test]
+    fn memory_guidance_uses_the_current_tool_schema_and_discovery_route() {
+        use bamboo_agent_core::tools::Tool;
+
+        let session = Session::new("ordinary", "test-model");
+        let session_only = bamboo_tools::tools::memory::SessionMemoryTool::new().to_schema();
+        let mut durable = session_only.clone();
+        let properties = &mut durable.function.parameters["properties"];
+        properties["scope"] = serde_json::json!({
+            "enum": ["global", "project", "section"],
+        });
+        properties["action"]["enum"] = serde_json::json!(["query", "get", "session_read"]);
+        let gateway = bamboo_domain::discovery_control_fallback_schema();
+        let tools = std::slice::from_ref(&durable);
+
+        let guidance = build_memory_usage_context_block(
+            &session,
+            tools,
+            std::slice::from_ref(&gateway),
+            CapabilityLoadingMode::StickyFallback,
+            PermissionMode::Default,
+        )
+        .expect("deferred Host memory is eligible");
+        assert_eq!(guidance.stability, ContextBlockStability::RoundDynamic);
+        for instruction in [
+            "discover_capabilities",
+            "action=query",
+            "scope=project",
+            "scope=section",
+            "scope=global",
+            "action=get",
+            "action=session_read",
+        ] {
+            assert!(guidance.content.contains(instruction));
+        }
+
+        let sdk_tools = std::slice::from_ref(&session_only);
+        let guidance = build_memory_usage_context_block(
+            &session,
+            sdk_tools,
+            sdk_tools,
+            CapabilityLoadingMode::Progressive,
+            PermissionMode::Default,
+        )
+        .expect("SDK session notes are eligible");
+        assert!(guidance.content.contains("tool discovery"));
+        assert!(guidance.content.contains("action=session_read"));
+        assert!(!guidance.content.contains("action=query"));
+        assert!(!guidance.content.contains("scope=project"));
+
+        let guidance = build_memory_usage_context_block(
+            &session,
+            tools,
+            tools,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            PermissionMode::Plan,
+        )
+        .expect("Plan retains Session note access");
+        assert!(guidance.content.contains("action=session_read"));
+        assert!(!guidance.content.contains("action=query"));
+        assert!(!guidance.content.contains("discovery"));
+
+        for (eligible, wire) in [(tools, &[][..]), (&[][..], std::slice::from_ref(&gateway))] {
+            assert!(build_memory_usage_context_block(
+                &session,
+                eligible,
+                wire,
+                CapabilityLoadingMode::StickyFallback,
+                PermissionMode::Default,
+            )
+            .is_none());
+        }
+
+        let mut ultra = session.clone();
+        ultra.set_root_orchestration_only(true).unwrap();
+        let mut supervisor =
+            Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+        supervisor.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for session in [&ultra, &supervisor] {
+            assert!(build_memory_usage_context_block(
+                session,
+                tools,
+                tools,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                PermissionMode::Default,
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -1054,13 +1252,23 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             "same verified assignment",
             "new independent Session for a separate assignment or requested context isolation",
             "intended Project and workspace",
-            "Project is optional",
-            "omit both project_id and workspace_path",
-            "the user identifies it for this assignment",
-            "Ask one focused question if a required workspace is unclear",
+            "For an assignment routed to an independent Session, resolve its destination before creating the Session",
+            "use session_control scope to verify it",
+            "use session_control create with the verified project_id and workspace_path",
+            "ask one focused question",
+            "Leave both fields unset for this route",
             "session_history list",
             "bounded inspect",
-            "to authorized independent Sessions",
+            "Prefer Work for authorized deliverables",
+            "when Work is enabled and its admitted tools and workspace fit",
+            "without naming Work",
+            "find matching Work and advance it from its current state",
+            "use work_update to create a Work",
+            "use work_dispatch to start ready Work in the current turn",
+            "Honor plan-only and draft-only requests and preserve required User acceptance",
+            "an explicitly requested Session",
+            "delegate the memory lookup",
+            "Use an authorized Session in the verified Project for Project facts",
             "auxiliary planning",
             "Use session_control followup",
             "current application user",
@@ -1069,6 +1277,14 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             assert!(guidance.contains(concept), "missing {concept}");
         }
         assert!(!guidance.contains("explicitly attach"));
+        assert!(
+            guidance
+                .find("Prefer Work for authorized deliverables")
+                .unwrap()
+                < guidance
+                    .find("For an assignment routed to an independent Session")
+                    .unwrap()
+        );
         assert!(
             guidance.find("session_history list").unwrap()
                 < guidance.find("auxiliary planning").unwrap()

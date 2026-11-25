@@ -17,7 +17,7 @@ workflow files for the current implementation and rollout status.
 - Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.
 - Never store secrets or tokens. Do not add embeddings, vectors, or a duplicate Bamboo persistence/index layer.
 
-Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
+Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, and the model and cadence used to refresh Dream. Retrieve saved memories through the `memory` tool when an assignment needs them.
 
 ## Parallel Development
 
@@ -194,6 +194,12 @@ The fixed `v2026.11.31` recovery in #2840 verifies the original failed registry
 read, 26 signed crate originals and all five successful native transports.
 The four unstarted crates use the same signed first-compilation checkpoint.
 Follow the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261131-crate-recovery).
+
+The fixed `v2026.11.43` recovery in #3053 resumes the failed upload of the
+retained `bamboo-projects` archive. It authenticates 25 crate originals, the
+sealed frontend and five original native transports. Only the six proven
+unstarted crates can receive a first verification compile. Follow the
+[fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261143-crate-recovery).
 
 The Bamboo npm workflow is a consumer of the completed v3 Release. Use its
 exact source, manifest and publisher attempt. The preparation job owns npm

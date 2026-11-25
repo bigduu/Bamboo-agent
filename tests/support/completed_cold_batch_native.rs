@@ -192,14 +192,12 @@ async fn cold_batch_wait_settled(
                 message.role == bamboo_domain::Role::Tool
                     && message.tool_call_id.as_deref() == Some(call_id.as_str())
             });
-            let rows: Value = client
-                .get(format!("{base}/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let rows = poll_sessions(client, base).await.unwrap_or_else(|error| {
+                panic!(
+                    "cold phase {phase}: {error}; {}",
+                    fixture_host_log_tail(&probe.data)
+                )
+            });
             let parent_idle = rows["sessions"]
                 .as_array()
                 .unwrap()

@@ -18,6 +18,12 @@ workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
 
+The four Linux `agent-tests-*` jobs run Bamboo Agent integration targets.
+`agent-tests-0` retains both default Ticket runtime targets and their additive
+feature context. The slower Actor and Broker targets have explicit owners in
+`agent-tests-1` through `agent-tests-3`. Other integration targets are assigned
+by name hash, and the routing test checks complete, disjoint ownership.
+
 The Linux `packages-1` shard owns the default LiteLLM wire-types suite. Its
 additive `schema` context runs the three schema-only cases with the same target
 directory and checks that the test names match the compiled catalog.
@@ -181,7 +187,36 @@ compilation, `receipt.completed=false` and `publisherRunId=44437436231`. Retry
 only the original run's failed jobs. The original pipeline publishes its
 retained v3 executables with the existing draft, source and tag.
 
+### Fixed v2026.11.43 crate recovery
+
+Issue #3053 binds draft 457147104 and source
+`d9a04783cc9eff82e406a78e291136537eff10c6` to [publisher 45451853467](https://github.com/bigduu/Bamboo-agent/actions/runs/45451853467).
+The first 24 crates were verified in the registry. The publisher retained and
+recorded the `bamboo-projects` archive before its upload returned HTTP 500.
+Recovery checks the registry before uploading that original again. It preserves
+the signed crate prefix, sealed frontend and all five original native transports.
+The six crates from `bamboo-server-tools` through `bamboo-agent` use the existing
+signed first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev.
+
+```bash
+gh workflow run recover-crate-2026-11-43.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Require authenticated remote readback with `recovery20261143.completed=true`,
+no pending compilation, `receipt.completed=false` and
+`publisherRunId=45451853467`. Retry the original failed jobs to finalize the
+same version with the retained native outputs.
+
 ## Main and consumers
+
+### Desktop browser runtime
+
+The desktop runtime consumer listens for the successful original `Publish Crate` workflow on protected Dev. A frozen v3 source with `browser-runtime/desktop.lock.json` opts into native desktop runtime packaging. The consumer authenticates the original executable manifest, packs the runtime for each of the five targets, and retains each archive before publication. The protected `bamboo-release` job verifies the original build outputs and uploads `bamboo-desktop-browser-runtimes-v1.json` after all five archives have been verified at the exact Bamboo release tag. The manifest binds the source and executable manifest SHA-256.
+
+Recover a publication failure by retrying the failed jobs of the same browser runtime workflow. Archives already verified by a successful pack step must be recovered from the original transport. This workflow uses the published executable release as its input and leaves its original asset digests and receipts intact.
 
 The frozen source selects the native executable contract. The five-target v3
 contract requires Linux ARM64 and Windows ARM64 feature evidence through the

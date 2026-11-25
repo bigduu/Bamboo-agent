@@ -97,8 +97,14 @@ workspace reads, file edits, shell commands, and Skill or Workflow execution.
 Catalog projection, final dispatch, approval replay and queued tool actions
 apply the same exact execution-name boundary.
 
-For main execution, first use `session_history` with `list`, then bounded
-`inspect`, to select a suitable managed independent Ordinary Root. Continue it
+When Work is enabled and can execute the assignment, the Supervisor prefers it
+for deliverables that benefit from durable tracking, dependencies, parallel
+ownership or explicit acceptance. It checks for a matching Work before creating
+one with a deliverable, constraints and acceptance criteria. It starts ready
+Work within the current authorization and honors requests to keep it in draft.
+
+For assignments routed to an independent Session, use `session_history` with
+`list` and bounded `inspect` to verify a suitable managed Ordinary Root. Continue it
 with `session_control` `followup` under its existing context. Explicit attach,
 current Project, lifetime and Supervisor checks remain required; discovery is
 an observation rather than a grant. If no suitable authorized Root exists,

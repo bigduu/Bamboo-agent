@@ -10,7 +10,9 @@ use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::app_state::supervisor_owner_authorization::test_support::ApprovedHostIntent;
+use crate::app_state::supervisor_owner_authorization::test_support::{
+    write_work_disabled_profile, ApprovedHostIntent,
+};
 use crate::{app_state::AppState, routes::configure_routes};
 
 const URI: &str = "/api/v1/supervisor/default/sessions";
@@ -23,6 +25,7 @@ struct Fixture {
 impl Fixture {
     async fn new(exact_authorizer: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
+        write_work_disabled_profile(home.path());
         let memory = bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu"));
         let mut state = Box::pin(AppState::new_with_memory_store(home.path().into(), memory))
             .await
@@ -783,7 +786,10 @@ async fn managed_history_binds_ordinary_child_and_its_ancestry() {
         .unwrap();
     let mut child = Session::new_child_of("child-a", &parent, "model", "Synthetic child");
     child.set_project_id_meta(f.project.to_string());
-    child.add_message(Message::user("synthetic child history"));
+    let mut older = Message::user("synthetic child history");
+    older.compressed = true;
+    child.add_message(older);
+    child.add_message(Message::assistant("newer child message", None));
     f.state.storage.save_session(&child).await.unwrap();
     let (_, directory) = f.call(Method::GET, None, None).await;
     let target = directory["sessions"]
@@ -796,12 +802,49 @@ async fn managed_history_binds_ordinary_child_and_its_ancestry() {
     assert_eq!(target["kind"], "child");
     assert_eq!(target["parent_session_id"], "target-a");
     let binding = json!({"supervisor": f.supervisor, "target": target});
+    let mut page_request = binding.clone();
+    page_request["query"] = json!({"limit": 1});
+    let (status, latest) = f
+        .call(
+            Method::POST,
+            Some("child-a/history"),
+            Some(page_request.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{latest}");
+    assert_eq!(latest["current_user_target"], target);
+    assert_eq!(latest["messages"][0]["content"], "newer child message");
+    assert_eq!(latest["total_message_count"], 2);
+
+    page_request["query"]["before_message_id"] = latest["next_before_message_id"].clone();
+    let (status, previous) = f
+        .call(
+            Method::POST,
+            Some("child-a/history"),
+            Some(page_request.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{previous}");
+    assert_eq!(previous["current_user_target"], target);
+    assert_eq!(
+        previous["messages"][0]["content"],
+        "synthetic child history"
+    );
+    assert_eq!(previous["messages"][0]["compressed"], true);
+    assert_eq!(previous["next_before_message_id"], Value::Null);
+
+    page_request["clear_readback"] = json!(true);
+    let (status, _) = f
+        .call(Method::POST, Some("child-a/history"), Some(page_request))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     let (status, history) = f
         .call(Method::POST, Some("child-a/history"), Some(binding))
         .await;
     assert_eq!(status, StatusCode::OK, "{history}");
-    assert_eq!(history["current_user_target"], target);
-    assert_eq!(history["messages"][0]["content"], "synthetic child history");
+    assert_eq!(history["messages"].as_array().unwrap().len(), 2);
+    assert!(history.get("next_before_message_id").is_none());
     f.state.shutdown().await;
 }
 

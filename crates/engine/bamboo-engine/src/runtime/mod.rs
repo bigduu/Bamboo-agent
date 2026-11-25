@@ -22,6 +22,7 @@ pub mod managers;
 pub mod model_roster;
 #[doc(hidden)]
 pub mod paced_loop_wakeup;
+pub(crate) mod planned_update;
 pub mod runner;
 #[allow(clippy::module_inception)]
 pub mod runtime;

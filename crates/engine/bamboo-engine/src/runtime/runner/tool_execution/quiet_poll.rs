@@ -272,6 +272,13 @@ mod tests {
                 Some("write_stdin")
             )
             .is_none());
+        let log_read = call(
+            "write_stdin",
+            serde_json::json!({"session_id":"handle", "output_offset":0}),
+        );
+        assert!(guard.suppress(&log_read, Some("write_stdin")).is_none());
+        guard.observe(&log_read, &outcome(5, ""), Some("write_stdin"));
+        assert!(guard.pending());
         assert!(guard
             .suppress(
                 &call("Read", serde_json::json!({"session_id":"handle"})),

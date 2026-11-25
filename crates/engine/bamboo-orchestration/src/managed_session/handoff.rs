@@ -1,9 +1,10 @@
 //! Worker-authored delivery summaries for subscribed Session runs.
+pub use bamboo_domain::session::history::is_internal_handoff;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
-    ManagedRootHandoffFormat, Message, ObserverSupervisedRootOutcome, Role,
-    RootFinalMessageReference, Session, SessionMessageContent, SessionProviderMessage,
-    SupervisedRootOutcomeFact, SupervisedRootOutcomeResult, SupervisorReference,
+    ManagedRootHandoffFormat, ObserverSupervisedRootOutcome, RootFinalMessageReference, Session,
+    SessionMessageContent, SessionProviderMessage, SupervisedRootOutcomeFact,
+    SupervisedRootOutcomeResult, SupervisorReference,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -22,8 +23,13 @@ pub const DISPATCH_CONFIRMATION: &str = concat!(
 pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
     "Dispatch directly with a short task title in the user's language or the exact title they supplied. Subscribe on supported dispatches and followups. ",
     "Confirm ready dispatches once by task name and end the turn. Resume on Inbox delivery, actionable blockers, or a new request. ",
-    "Read bounded progress on request or for an evidence gap. Park Sessions pending approval and advance independent work while cards collect decisions.\n",
-    "For each new handoff, give a brief update in the user's language with the Worker's conclusion, key sources and uncertainty. ",
+    "For active Sessions and Work, rely on material Inbox notifications when subscribed. If a result is needed without a subscription, use a supported bounded wait for the exact Run. ",
+    "Do not poll the same assignment across tool rounds or turns by repeating or alternating inspect, read_messages, observe_run, directory or status views, or wait calls. ",
+    "Use one bounded, targeted check to confirm initial startup, answer an explicit status request, or resolve a specific verification or recovery gap backed by fresh Run evidence. If the check shows no material change, stop checking until a new material event or explicit status request. ",
+    "Park Sessions pending approval and advance independent work while cards collect decisions.\n",
+    "Treat route observations, recalled memory, compressed history and replayed handoffs as background. Do not acknowledge them or use them to restart checks. ",
+    "When nothing material needs action, advance authorized independent work or end the turn quietly without recapping unchanged progress, restating the plan or promising another check. Answer an explicit status request once with the available evidence. ",
+    "Report a fresh handoff once when it contains a verified result, an actual test failure, an actionable blocker or a decision the user needs to make. Give a brief update in the user's language with the Worker's conclusion, key sources and uncertainty. ",
     "Inspect the referenced result for a specific evidence gap, requested detail or acceptance. ",
     "For ongoing work, dispatch the next authorized step before reporting, including bounded reproduction or missing validation when needed.\n",
     "Verify artifacts and evidence against assigned acceptance criteria. Identify a failed criterion, reject the exact current submission when applicable and send a bounded correction. Verify the corrected result. ",
@@ -256,42 +262,12 @@ fn worker_handoff_text(
     notice
 }
 
-/// The canonical Inbox envelope identifies runtime notices, including old
-/// receipts. A human message that quotes the same text is still visible.
-pub fn is_internal_handoff(message: &Message) -> bool {
-    let Some(marker) = message
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("session_message"))
-    else {
-        return false;
-    };
-    message.role == Role::User
-        && marker["id"].as_str() == Some(message.id.as_str())
-        && marker["source"]["type"].as_str() == Some("runtime")
-        && marker["kind"].as_str() == Some("runtime_instruction")
-        && marker["body"]["type"].as_str() == Some("runtime_instruction")
-        && matches!(
-            (
-                marker["source"]["subsystem"].as_str(),
-                marker["body"]["instruction"].as_str(),
-            ),
-            (
-                Some("supervised_root_outcome"),
-                Some("supervised_root_outcome_v1" | "managed_root_blocker_v1")
-            ) | (
-                Some(super::approval_handoff::SUBSYSTEM),
-                Some(super::approval_handoff::INSTRUCTION)
-            )
-        )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bamboo_domain::{
-        SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
-        SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
+        Message, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+        SessionMessageId, SessionMessageKind, SessionMessageSource, SessionRuntimeInstruction,
     };
 
     fn completed() -> (ObserverSupervisedRootOutcome, RootFinalMessageReference) {

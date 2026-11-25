@@ -231,8 +231,10 @@ The trusted default Supervisor uses its own delegation policy in both
 Standard and Ultra. It can use Work tools with current Work authority and
 scoped Session management through the installed Host ports. Its independent-Root followup
 requires an explicitly attached target in current authorized Project/lifetime
-scope. Main execution first lists and inspects suitable managed independent
-Sessions; bounded Child agents assist with planning, review and verification.
+scope. The Supervisor prefers eligible Work for deliverables that need durable
+tracking or acceptance. For assignments routed to independent Sessions, it lists
+and inspects suitable targets. Bounded Child agents assist with planning, review
+and verification.
 The owner-facing `GET /api/v1/supervisor/default/sessions` observes these links,
 and explicit `PUT /api/v1/supervisor/default/sessions/{target_id}` attaches or
 detaches an existing Root with the current incarnation and management revision.
@@ -627,6 +629,13 @@ use `write_stdin` to collect output and the exit status, send input, close
 stdin, or stop the process with a lone Ctrl-C. Direct HTTP calls to either
 tool require the owning Bamboo `session_id` in the request. The `session_id`
 parameter of `write_stdin` is the handle returned by `exec_command`.
+
+To stop an exact monitored command in a suspended chat, the Host owner can
+send `POST /api/v1/sessions/{session_id}/background-command-wait/cancel` with
+`{"exec_session_id":"<command UUID>"}`. A confirmed stop returns `200` with
+`{"status":"cancelled","exec_session_id":"<command UUID>"}`. `409` means
+the selected command is no longer the cancellable wait. `503` means Bamboo
+could not confirm the stop. The exact wait can be retried when still visible.
 
 Callers of `Bash`, `bash`, and `execute_command` should use `exec_command`.
 Replace `BashInput`, `BashOutput`, and `KillShell` calls with `write_stdin`.

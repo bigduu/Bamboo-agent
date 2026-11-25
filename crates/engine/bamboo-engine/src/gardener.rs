@@ -672,14 +672,22 @@ async fn run_gardener_passes(
 /// each pass reads config and returns immediately if its gardener is off, and the
 /// poll itself is just a cheap topic-file count.
 pub fn spawn_gardener_task(ctx: AutoDreamContext) {
-    spawn_gardener_task_inner(ctx, None);
+    spawn_gardener_task_inner(ctx, None, None);
 }
 
 pub fn spawn_gardener_task_with_project_resolver(
     ctx: AutoDreamContext,
     project_context_resolver: std::sync::Arc<crate::project_context::ProjectContextResolver>,
 ) {
-    spawn_gardener_task_inner(ctx, Some(project_context_resolver));
+    spawn_gardener_task_inner(ctx, Some(project_context_resolver), None);
+}
+
+pub fn spawn_guarded_gardener_task(
+    ctx: AutoDreamContext,
+    project_context_resolver: std::sync::Arc<crate::project_context::ProjectContextResolver>,
+    admission: crate::auto_dream::MemoryMaintenanceAdmission,
+) {
+    spawn_gardener_task_inner(ctx, Some(project_context_resolver), Some(admission));
 }
 
 fn spawn_gardener_task_inner(
@@ -687,6 +695,7 @@ fn spawn_gardener_task_inner(
     project_context_resolver: Option<
         std::sync::Arc<crate::project_context::ProjectContextResolver>,
     >,
+    admission: Option<crate::auto_dream::MemoryMaintenanceAdmission>,
 ) {
     tokio::spawn(async move {
         let (interval_secs, volume_trigger) = {
@@ -718,6 +727,13 @@ fn spawn_gardener_task_inner(
 
         loop {
             ticker.tick().await;
+            let _permit = match &admission {
+                Some(admission) => match admission.enter().await {
+                    Some(permit) => Some(permit),
+                    None => break,
+                },
+                None => None,
+            };
             let current_count =
                 count_gardener_memories(&memory, project_context_resolver.as_deref()).await;
             let elapsed_secs = last_run.elapsed().as_secs();
@@ -828,7 +844,7 @@ mod tests {
                         .write_memory(
                             MemoryScope::Global,
                             None,
-                            DurableMemoryType::Project,
+                            DurableMemoryType::Reference,
                             title,
                             body,
                             &[],
@@ -1091,7 +1107,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
-            "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"project\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
+            "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"reference\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(config_with_memory(
             bamboo_config::MemoryConfig {
@@ -1130,7 +1146,7 @@ mod tests {
                 .write_memory(
                     MemoryScope::Global,
                     None,
-                    DurableMemoryType::Project,
+                    DurableMemoryType::Reference,
                     title,
                     content,
                     &[],
@@ -1218,11 +1234,11 @@ mod tests {
             "Global fact c",
             "Global fact d",
         ] {
-            memory
+            let doc = memory
                 .write_memory(
                     MemoryScope::Global,
                     None,
-                    DurableMemoryType::Project,
+                    DurableMemoryType::Reference,
                     title,
                     "body content for the memory",
                     &[],
@@ -1233,7 +1249,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // Existing Project records in this synthetic Global store are evictable.
+            let stored = std::fs::read_to_string(&doc.path).unwrap();
+            let legacy = stored.replacen("\ntype: reference\n", "\ntype: project\n", 1);
+            assert_ne!(legacy, stored);
+            std::fs::write(&doc.path, legacy).unwrap();
         }
+        memory
+            .rebuild_scope(MemoryScope::Global, None)
+            .await
+            .unwrap();
 
         // Off by default (capacity == 0) → Ok(None), archives nothing.
         let off_config = Arc::new(RwLock::new(Config::default()));
@@ -1346,7 +1371,7 @@ mod tests {
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "Freshly written day note",
                 "Not yet old enough to expire.",
                 &[],

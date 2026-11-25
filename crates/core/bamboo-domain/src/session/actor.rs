@@ -15,6 +15,7 @@ pub const ACTOR_DIRECTORY_SCHEMA_VERSION: u32 = 2;
 // Keep the maintenance purpose in the persisted, exact lease identity so a
 // restart can distinguish it from chat without changing the Actor schema.
 const ROOT_COMPACTION_LEASE_OWNER_PREFIX: &str = "root-compaction-";
+const ROOT_PLANNED_UPDATE_LEASE_OWNER_PREFIX: &str = "root-planned-update-v1-";
 
 pub fn new_root_compaction_lease_owner() -> String {
     format!(
@@ -25,6 +26,62 @@ pub fn new_root_compaction_lease_owner() -> String {
 
 pub fn is_root_compaction_lease_owner(owner: &str) -> bool {
     owner.starts_with(ROOT_COMPACTION_LEASE_OWNER_PREFIX)
+}
+
+/// Identifies a fresh successor attempt without discarding the exact parked
+/// predecessor's identity if the process exits before publishing startup.
+pub fn new_root_planned_update_lease_owner(predecessor: &ActorActivationFence) -> String {
+    format!(
+        "{ROOT_PLANNED_UPDATE_LEASE_OWNER_PREFIX}{}-{}",
+        planned_update_fence_sha256(predecessor),
+        uuid::Uuid::new_v4()
+    )
+}
+
+pub fn is_root_planned_update_attempt(owner: &str, predecessor: &ActorActivationFence) -> bool {
+    root_planned_update_predecessor_sha256(owner)
+        .is_some_and(|digest| digest == planned_update_fence_sha256(predecessor))
+}
+
+/// Extracts the fence digest used by the original Root runtime observation.
+pub fn root_planned_update_predecessor_sha256(owner: &str) -> Option<&str> {
+    root_planned_update_lease_digests(owner).map(|(predecessor, _)| predecessor)
+}
+
+/// Identifies the retry projection the Storage claim inherited while holding
+/// the exact mutation guards, if the attempt has yet to replace it.
+pub fn root_planned_update_prior_projection_sha256(owner: &str) -> Option<&str> {
+    root_planned_update_lease_digests(owner).and_then(|(_, projection)| projection)
+}
+
+fn root_planned_update_lease_digests(owner: &str) -> Option<(&str, Option<&str>)> {
+    let (digest, nonce) = owner
+        .strip_prefix(ROOT_PLANNED_UPDATE_LEASE_OWNER_PREFIX)?
+        .split_once('-')?;
+    let (nonce, projection) = match nonce.split_once(':') {
+        Some((nonce, digest)) if is_fence_sha256(digest) => (nonce, Some(digest)),
+        Some(_) => return None,
+        None => (nonce, None),
+    };
+    if !is_fence_sha256(digest) || !uuid::Uuid::parse_str(nonce).is_ok_and(|nonce| !nonce.is_nil())
+    {
+        return None;
+    }
+    Some((digest, projection))
+}
+
+fn is_fence_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn planned_update_fence_sha256(predecessor: &ActorActivationFence) -> String {
+    super::model_context::sha256_hex(
+        &serde_json::to_vec(predecessor)
+            .expect("Actor activation fences serialize without failure"),
+    )
 }
 
 /// A stable logical address. It is always exactly Session.id.
@@ -487,8 +544,19 @@ pub trait ActorDirectoryPort: Send + Sync {
     /// fall back to the selector-only claim or refresh the caller observation.
     async fn claim_root_activation_observed(
         &self,
+        claim: &ActorActivationClaim,
+        expected: &super::Session,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        self.claim_root_activation_observed_after(claim, expected, None)
+            .await
+    }
+    /// Check the recorded terminal predecessor inside the successor's claim
+    /// transaction when the Host has prepared a planned update.
+    async fn claim_root_activation_observed_after(
+        &self,
         _claim: &ActorActivationClaim,
         _expected: &super::Session,
+        _predecessor: Option<&ActorActivationFence>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         Err(ActorDirectoryError::InvalidTransition)
     }

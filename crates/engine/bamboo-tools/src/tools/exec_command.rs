@@ -12,11 +12,13 @@ use tokio::time::{timeout_at, Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
 
-const MAX_RETAINED_SESSIONS: usize = 64;
+const MAX_EXEC_SESSIONS: usize = 64;
+const MAX_OUTPUT_LOGS: usize = 32;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_TOKENS: usize = 8192;
 const DEFAULT_OUTPUT_TOKENS: usize = 2000;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const BACKGROUND_EXEC_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIET_POLL_DIAGNOSIS_AFTER: Duration = Duration::from_secs(90);
 const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
 const QUIET_POLL_ADVISORY_POLLS: usize = 3;
@@ -26,7 +28,9 @@ const QUIET_POLL_ADVISORY: &str = "No new output after three consecutive empty p
 struct CapturedOutput {
     bytes: Vec<u8>,
     omitted_bytes: usize,
+    retained_log: Option<RetainedOutputLog>,
     completion: Option<(&'static str, Option<i32>)>,
+    cleanup_confirmed: bool,
     error: Option<String>,
     started_at: Instant,
     last_output_at: Instant,
@@ -44,7 +48,9 @@ impl Default for CapturedOutput {
         Self {
             bytes: Vec::new(),
             omitted_bytes: 0,
+            retained_log: None,
             completion: None,
+            cleanup_confirmed: false,
             error: None,
             started_at: now,
             last_output_at: now,
@@ -94,6 +100,61 @@ impl CapturedOutput {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct RetainedOutputLog {
+    first_offset: u64,
+    bytes: Vec<u8>,
+}
+
+impl RetainedOutputLog {
+    fn append(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        self.first_offset += trim_capture(&mut self.bytes) as u64;
+    }
+
+    fn range(&self, id: &str, next_offset: Option<u64>) -> OutputLogRange {
+        OutputLogRange {
+            session_id: id.to_owned(),
+            start_offset: self.first_offset,
+            end_offset: self.first_offset + self.bytes.len() as u64,
+            next_offset,
+        }
+    }
+
+    fn read(&self, offset: u64, max_output_tokens: Option<usize>) -> Result<&str, ToolError> {
+        let end_offset = self.first_offset + self.bytes.len() as u64;
+        let text = std::str::from_utf8(&self.bytes).expect("polled capture is normalized UTF-8");
+        let page = offset
+            .checked_sub(self.first_offset)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| text.get(index..))
+            .ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "output_offset must be a UTF-8 boundary within retained log offsets {}..={end_offset}",
+                    self.first_offset
+                ))
+            })?;
+        let end = json_output_prefix_end(page, encoded_output_budget(max_output_tokens));
+        if end == 0 && !page.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "max_output_tokens cannot fit the next log character; increase it and retry the same output_offset".into(),
+            ));
+        }
+        Ok(&page[..end])
+    }
+}
+
+fn trim_capture(bytes: &mut Vec<u8>) -> usize {
+    let mut excess = bytes.len().saturating_sub(MAX_CAPTURE_BYTES);
+    if excess > 0 {
+        while excess < bytes.len() && bytes[excess] & 0b1100_0000 == 0b1000_0000 {
+            excess += 1;
+        }
+        bytes.drain(..excess);
+    }
+    excess
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum EmptyPoll<'a> {
     Deliver,
@@ -107,6 +168,7 @@ pub(super) enum EmptyPoll<'a> {
 pub(crate) struct PolledShellState {
     output: Mutex<CapturedOutput>,
     completed: Notify,
+    terminal_delivery: OnceLock<(&'static str, Option<i32>)>,
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
@@ -115,27 +177,48 @@ pub(crate) struct PolledShellState {
     fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
     pub(crate) interaction: Mutex<()>,
-    _permit: OwnedSemaphorePermit,
+    exec_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    _log_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PolledShellState {
+    #[cfg(test)]
     fn new() -> Result<Arc<Self>, ToolError> {
-        static CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        let permit = CAPACITY
-            .get_or_init(|| Arc::new(Semaphore::new(MAX_RETAINED_SESSIONS)))
+        Self::with_retained_output(false)
+    }
+
+    fn with_retained_output(retain_output: bool) -> Result<Arc<Self>, ToolError> {
+        static EXEC_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        static LOG_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let permit = EXEC_CAPACITY
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_EXEC_SESSIONS)))
             .clone()
             .try_acquire_owned()
             .map_err(|_| ToolError::Execution("Exec session capacity exhausted; finish or stop an existing session before starting another command".into()))?;
+        let log_permit = retain_output
+            .then(|| {
+                LOG_CAPACITY
+                    .get_or_init(|| Arc::new(Semaphore::new(MAX_OUTPUT_LOGS)))
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| ToolError::Execution("Exec output log capacity exhausted; retry with retain_output=false or wait for a retained log to expire".into()))
+            })
+            .transpose()?;
         Ok(Arc::new(Self {
-            output: Mutex::new(CapturedOutput::default()),
+            output: Mutex::new(CapturedOutput {
+                retained_log: retain_output.then(RetainedOutputLog::default),
+                ..CapturedOutput::default()
+            }),
             completed: Notify::new(),
+            terminal_delivery: OnceLock::new(),
             process_exited: AtomicBool::new(false),
             background_monitor: AtomicBool::new(false),
             #[cfg(test)]
             fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
             interaction: Mutex::new(()),
-            _permit: permit,
+            exec_permit: std::sync::Mutex::new(Some(permit)),
+            _log_permit: log_permit,
         }))
     }
 
@@ -148,13 +231,29 @@ impl PolledShellState {
         output.consecutive_empty_readouts = 0;
         output.reset_poll_advisory();
         output.bytes.extend_from_slice(bytes);
-        let mut excess = output.bytes.len().saturating_sub(MAX_CAPTURE_BYTES);
-        if excess > 0 {
-            while excess < output.bytes.len() && output.bytes[excess] & 0b1100_0000 == 0b1000_0000 {
-                excess += 1;
-            }
-            output.bytes.drain(..excess);
-            output.omitted_bytes = output.omitted_bytes.saturating_add(excess);
+        let excess = trim_capture(&mut output.bytes);
+        output.omitted_bytes = output.omitted_bytes.saturating_add(excess);
+        if let Some(log) = output.retained_log.as_mut() {
+            log.append(bytes);
+        }
+    }
+
+    pub(super) fn terminal_collected(&self) -> bool {
+        self.terminal_delivery.get().is_some()
+    }
+
+    fn finish_delivery(&self, result: &ExecSessionResult, id: &str) {
+        if result.session_id.is_some() {
+            return;
+        }
+        let _ = self
+            .terminal_delivery
+            .set((result.status, result.exit_code));
+        if result.output_log.is_some() {
+            // A collected log uses only the independent log capacity.
+            self.exec_permit.lock().expect("exec permit lock").take();
+        } else {
+            bash_runtime::remove_shell(id);
         }
     }
 
@@ -183,6 +282,7 @@ impl PolledShellState {
 
     pub(crate) async fn finish(&self, status: &'static str, exit_code: Option<i32>) {
         let mut output = self.output.lock().await;
+        output.cleanup_confirmed = status != "error";
         let status = if output.error.is_some() {
             "error"
         } else {
@@ -304,11 +404,7 @@ impl PolledShellState {
         });
         let bytes = std::mem::take(&mut output.bytes);
         let decoded = String::from_utf8_lossy(&bytes);
-        let budget = max_output_tokens
-            .unwrap_or(DEFAULT_OUTPUT_TOKENS)
-            .clamp(1, MAX_OUTPUT_TOKENS)
-            .saturating_mul(4);
-        let end = json_output_prefix_end(&decoded, budget);
+        let end = json_output_prefix_end(&decoded, encoded_output_budget(max_output_tokens));
         let omitted = std::mem::take(&mut output.omitted_bytes)
             .saturating_add(decoded.len().saturating_sub(end));
         let (status, exit_code) = output.completion.unwrap_or(("running", None));
@@ -320,8 +416,20 @@ impl PolledShellState {
             output_omitted_bytes: omitted,
             error: output.error.clone(),
             polling,
+            output_log: output
+                .retained_log
+                .as_ref()
+                .filter(|log| !log.bytes.is_empty())
+                .map(|log| log.range(shell_id, None)),
         }
     }
+}
+
+fn encoded_output_budget(max_output_tokens: Option<usize>) -> usize {
+    max_output_tokens
+        .unwrap_or(DEFAULT_OUTPUT_TOKENS)
+        .clamp(1, MAX_OUTPUT_TOKENS)
+        * 4
 }
 
 /// A reserved, owner-checked observation of an existing exec command. It does
@@ -334,14 +442,105 @@ pub struct BackgroundExecJob {
 pub const WAIT_FOR_EXEC_DISPLAY: &str = "runtime_control:waiting_for_exec";
 
 pub(super) fn owned_exec(owner: &str, handle: &str) -> Option<Arc<bash_runtime::ShellSession>> {
+    owned_shell(owner, handle).filter(|shell| {
+        shell
+            .polled
+            .as_ref()
+            .is_some_and(|state| !state.terminal_collected())
+    })
+}
+
+fn owned_shell(owner: &str, handle: &str) -> Option<Arc<bash_runtime::ShellSession>> {
     bash_runtime::get_shell(handle)
         .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundExecStopOutcome {
+    Stopped,
+    NotFound,
+    Unconfirmed,
+}
+
+/// Stop the exact command in the owner's registry and wait for its retained
+/// process owner to certify cleanup. This leaves the captured output unread.
+pub async fn stop_owned_background_exec(owner: &str, handle: &str) -> BackgroundExecStopOutcome {
+    use BackgroundExecStopOutcome::{NotFound, Stopped, Unconfirmed};
+
+    let Some(shell) = owned_exec(owner, handle) else {
+        return NotFound;
+    };
+    if !shell.request_owned_exec_stop() {
+        return Unconfirmed;
+    }
+    let state = shell.polled.as_ref().expect("validated exec capture");
+    let deadline = Instant::now() + BACKGROUND_EXEC_STOP_TIMEOUT;
+    let verified = timeout_at(deadline, async {
+        state.wait_until(deadline).await;
+        state.output.lock().await.cleanup_confirmed
+    })
+    .await;
+    if matches!(verified, Ok(true)) {
+        Stopped
+    } else {
+        Unconfirmed
+    }
+}
+
+pub(super) async fn read_retained_output(
+    owner: &str,
+    id: &str,
+    offset: u64,
+    max_output_tokens: Option<usize>,
+) -> Result<ToolOutcome, ToolError> {
+    let shell = owned_shell(owner, id).ok_or_else(|| {
+        ToolError::Execution("Exec log not found or not owned by this session".into())
+    })?;
+    let state = shell.polled.as_ref().expect("validated exec session");
+    let output = state.output.lock().await;
+    let log = output.retained_log.as_ref().ok_or_else(|| {
+        ToolError::Execution("This command was not started with retain_output=true".into())
+    })?;
+    let page = log.read(offset, max_output_tokens)?;
+    // The initial handoff can deliver a reaped exit before the capture task
+    // records completion. An immediate log read must keep that terminal truth.
+    let (status, exit_code) = output
+        .completion
+        .or_else(|| state.terminal_delivery.get().copied())
+        .unwrap_or(("running", None));
+    Ok(result_outcome(&ExecSessionResult {
+        session_id: None,
+        status,
+        output: page.to_owned(),
+        exit_code,
+        output_omitted_bytes: 0,
+        error: output.error.clone(),
+        polling: None,
+        output_log: Some(log.range(id, Some(offset + page.len() as u64))),
+    }))
 }
 
 /// None leaves non-exec targets to the caller's ordinary dispatch.
 pub async fn exec_wait_target(owner: &str, handle: &str) -> Option<bool> {
     let shell = owned_exec(owner, handle)?;
     Some(!shell.stdin_is_open().await)
+}
+
+/// Recommend a wait only while an owned command is still running. Unread
+/// terminal output remains available through the normal pull-session cursor.
+pub fn exec_wait_target_is_ready(owner: &str, handle: &str) -> bool {
+    owned_exec(owner, handle).is_some_and(|shell| {
+        shell.status() == "running"
+            && shell.stdin_is_known_closed()
+            && shell.polled.as_ref().is_some_and(|capture| {
+                !capture.process_exited()
+                    && !capture.background_monitor.load(Ordering::Acquire)
+                    && capture
+                        .output
+                        .try_lock()
+                        .is_ok_and(|output| output.completion.is_none())
+            })
+    })
 }
 
 impl BackgroundExecJob {
@@ -351,6 +550,18 @@ impl BackgroundExecJob {
 
     pub fn session_id(&self) -> &str {
         self.shell.session_id.as_deref().expect("validated owner")
+    }
+
+    /// Check terminal containment cleanup without signaling or reading output.
+    pub async fn stop_confirmed(&self) -> bool {
+        let state = self.shell.polled.as_ref().expect("validated exec capture");
+        let cleanup_confirmed = state.output.lock().await.cleanup_confirmed;
+        cleanup_confirmed
+            && self
+                .shell
+                .initial_handoff
+                .as_ref()
+                .is_none_or(|owner| owner.delivered_stop_confirmed())
     }
 
     /// Wait for the same fully drained terminal capture used by write_stdin.
@@ -537,6 +748,17 @@ struct ExecSessionResult {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     polling: Option<ExecSessionProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_log: Option<OutputLogRange>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutputLogRange {
+    session_id: String,
+    start_offset: u64,
+    end_offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<u64>,
 }
 
 /// Capture observations, never a liveness probe or evidence of a hung process.
@@ -582,9 +804,7 @@ pub(super) async fn poll_result(
     let result = state
         .take_poll(&shell.id, max_output_tokens, empty_poll)
         .await;
-    if result.session_id.is_none() {
-        bash_runtime::remove_shell(&shell.id);
-    }
+    state.finish_delivery(&result, &shell.id);
     result_outcome(&result)
 }
 
@@ -634,9 +854,11 @@ async fn poll_initial_result(
         shell.wait_for_polled_output(yield_time_ms).await;
     }
     let result = take_initial_result(shell, max_output_tokens, &mut delivery, || {}).await?;
-    if result.session_id.is_none() {
-        bash_runtime::remove_shell(&shell.id);
-    }
+    shell
+        .polled
+        .as_ref()
+        .expect("validated initial exec")
+        .finish_delivery(&result, &shell.id);
     Ok(result_outcome(&result))
 }
 
@@ -693,6 +915,8 @@ struct ExecCommandArgs {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     interactive: bool,
+    #[serde(default)]
+    retain_output: bool,
 }
 
 fn resolve_cwd(owner: &str, workdir: Option<&str>) -> Result<PathBuf, ToolError> {
@@ -757,7 +981,7 @@ impl Tool for ExecCommandTool {
          Keep builds and tests you need to verify attached to this call. \
          A running command returns a session_id. An ordinary Root with SubAgent can wait for a non-interactive command using intent=wait and that exact session_id. Use write_stdin for interactive input or output and exit status when needed. \
          Preserve the command's own exit status when piping test output. \
-         interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
+         interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes. Set retain_output=true when you need to inspect a long log after the run."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -766,7 +990,8 @@ impl Tool for ExecCommandTool {
             "workdir":{"type":"string","description":"Working directory within the current session workspace, relative or absolute; paths and symlinks outside the workspace are rejected"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding a running session; default 10000, clamped to 250..30000 ms"},
             "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000 and capped at 8192; estimated as four JSON-encoded bytes per token, including string quotes and escapes. Status/session/exit metadata is additional"},
-            "interactive":{"type":"boolean","description":"Keep stdin open for write_stdin using a pipe. Default false sends EOF immediately."}
+            "interactive":{"type":"boolean","description":"Keep stdin open for write_stdin using a pipe. Default false sends EOF immediately."},
+            "retain_output":{"type":"boolean","description":"Keep the last 256 KiB of normalized output in memory for offset reads by write_stdin. The receipt reports the range in output_log. At most 32 retained logs per host, expiring five minutes after completion or when the host restarts. Default false."}
         },"required":["cmd"],"additionalProperties":false})
     }
 
@@ -785,7 +1010,7 @@ impl Tool for ExecCommandTool {
             ));
         }
         let cwd = resolve_cwd(owner, parsed.workdir.as_deref())?;
-        let state = PolledShellState::new()?;
+        let state = PolledShellState::with_retained_output(parsed.retain_output)?;
         let shell = bash_runtime::spawn_polled(
             &parsed.cmd,
             &cwd,

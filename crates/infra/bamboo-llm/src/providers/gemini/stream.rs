@@ -23,6 +23,10 @@ use crate::types::{LLMChunk, ProviderUsageInvalidFields, ProviderUsageReplacemen
 use bamboo_domain::{FunctionCall, ToolCall};
 use serde_json::Value;
 
+use crate::provider::CompletionDiagnostics;
+
+mod text_frame;
+
 /// Stateful parser for Gemini SSE streaming events.
 ///
 /// Tracks partial tool calls by index so we can accumulate arguments across chunks.
@@ -52,6 +56,22 @@ pub struct GeminiStreamState {
     provider_usage: GeminiProviderUsage,
     pending_replacement: Option<ProviderUsageReplacement>,
     emit_legacy_provider_usage: bool,
+    decode_observation: DecodeObservation,
+}
+
+#[derive(Default)]
+struct DecodeObservation {
+    diagnostics: Option<CompletionDiagnostics>,
+    text_frames: u64,
+    json_frames: u64,
+}
+
+impl Drop for DecodeObservation {
+    fn drop(&mut self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.record_gemini_decode_counts(self.text_frames, self.json_frames);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -186,6 +206,23 @@ impl GeminiProviderUsage {
 }
 
 impl GeminiStreamState {
+    pub(super) fn with_diagnostics(diagnostics: Option<CompletionDiagnostics>) -> Self {
+        Self {
+            decode_observation: DecodeObservation {
+                diagnostics,
+                ..DecodeObservation::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    fn captures_native_replay(&self) -> bool {
+        #[cfg(feature = "litellm-wire-types")]
+        return self.native_replay.is_some();
+        #[cfg(not(feature = "litellm-wire-types"))]
+        return false;
+    }
+
     #[cfg(feature = "litellm-wire-types")]
     pub(in crate::providers) fn enable_litellm_tool_ids(&mut self) {
         self.litellm_tool_ids = true;
@@ -334,13 +371,13 @@ pub(super) fn parse_with_provider_usage(
 /// ```
 pub fn parse_gemini_sse_event(
     state: &mut GeminiStreamState,
-    _event_type: &str,
-    data: &str,
+    event_type: &str,
+    raw_data: &str,
 ) -> Result<Vec<LLMChunk>> {
     state.pending_replacement = None;
     state.emit_legacy_provider_usage = false;
     // Trim whitespace
-    let data = data.trim();
+    let data = raw_data.trim();
 
     // Empty data or [DONE] signal
     if data.is_empty() {
@@ -351,10 +388,29 @@ pub fn parse_gemini_sse_event(
         return Ok(vec![LLMChunk::Done]);
     }
 
-    // Parse the JSON response
+    if matches!(event_type, "" | "message") && !state.captures_native_replay() {
+        // The strict subset has no usage/finish markers, tool calls, or
+        // replay effects. Plain text borrows from the frame until it is sent.
+        if let Some(text) = text_frame::decode(data) {
+            state.decode_observation.text_frames += 1;
+            return Ok(if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![LLMChunk::Token(text.into_owned())]
+            });
+        }
+    }
+    state.decode_observation.json_frames += 1;
     let value: Value = serde_json::from_str(data).map_err(|e| {
         LLMError::Stream(format!("Failed to parse Gemini SSE data: {}: {}", e, data))
     })?;
+    // Share the decode with request diagnostics. Keep their JSON whitespace
+    // acceptance distinct from the parser's existing Unicode trimming.
+    if let Some(diagnostics) = &state.decode_observation.diagnostics {
+        if raw_data.trim_matches([' ', '\t', '\r', '\n']) == data {
+            diagnostics.observe_event(event_type, &value);
+        }
+    }
     let chunks = parse_gemini_frame(state, &value, data)?;
     #[cfg(feature = "litellm-wire-types")]
     let chunks = {
@@ -550,6 +606,51 @@ fn parse_gemini_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_gemini_frames_preserve_legacy_semantics_and_report_decode_counts() {
+        let diagnostics = CompletionDiagnostics::default();
+        let mut state = GeminiStreamState::with_diagnostics(Some(diagnostics.clone()));
+        let plain = r#"{"candidates":[{"content":{"parts":[{"text":"中文"}]}}]}"#;
+        let parts = r#"{"candidates":[{"content":{"parts":[{"text":"think","thought":true},{"text":"old","text":"new"},{"functionCall":{"name":"read","args":{"key":"value"}}}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":3,"candidatesTokenCount":5}}"#;
+        assert!(matches!(
+            parse_with_provider_usage(&mut state, "message", plain).unwrap().as_slice(),
+            [LLMChunk::Token(text)] if text == "中文"
+        ));
+        let chunks = parse_with_provider_usage(&mut state, "message", parts).unwrap();
+        assert!(matches!(&chunks[0], LLMChunk::ReasoningToken(text) if text == "think"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "new"));
+        assert!(
+            matches!(&chunks[2], LLMChunk::ToolCalls(calls) if calls[0].function.arguments == r#"{"key":"value"}"#)
+        );
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ProviderUsageReplace(_))));
+        assert_eq!(diagnostics.finish_reason(), "MAX_TOKENS");
+        drop(state);
+        assert_eq!(diagnostics.gemini_decode_counts(), Some((1, 1)));
+    }
+
+    #[test]
+    fn positional_arrays_follow_the_full_gemini_decoder() {
+        let mut state = GeminiStreamState::default();
+        let root_array = r#"[[{"content":{"parts":[{"text":"x"}]}}],null,null]"#;
+        assert!(matches!(
+            parse_gemini_sse_event(&mut state, "message", root_array),
+            Err(LLMError::Stream(message)) if message.contains("Missing candidates")
+        ));
+
+        let nested_arrays = [
+            r#"{"candidates":[[{"parts":[{"text":"x"}]},0]]}"#,
+            r#"{"candidates":[{"content":[[{"text":"x"}],"model"]}]}"#,
+            r#"{"candidates":[{"content":{"parts":[["x"]]}}]}"#,
+        ];
+        for data in nested_arrays {
+            assert!(parse_gemini_sse_event(&mut state, "message", data)
+                .unwrap()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn repeated_usage_tracks_invalid_missing_zero_and_recovery() {

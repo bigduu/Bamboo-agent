@@ -569,6 +569,20 @@ impl SessionStoreV2 {
         let (Some(main), Some(side)) = (main, side) else {
             return Err(context_conflict());
         };
+        if side.is_initializing_planned_update_resume() {
+            let ObservedFile::Bytes(record) = &record else {
+                return Err(context_conflict());
+            };
+            let entry: ActorDirectoryEntry =
+                serde_json::from_slice(record).map_err(|_| context_conflict())?;
+            if let Some(activation) = &entry.activation {
+                if Self::root_has_unstarted_planned_update_projection(&side, activation)?
+                    && !Self::root_has_unstarted_planned_update_projection(incoming, activation)?
+                {
+                    return Err(context_conflict());
+                }
+            }
+        }
         // Incoming birth/Project/tool authority still pass the original final
         // guards below this classifier. Here compare the actual canonical pair.
         if main.id != incoming.id
@@ -787,6 +801,15 @@ impl SessionStoreV2 {
                     let _ = phase;
                     Ok(())
                 })?;
+            }
+            // Main already carries the new epoch. The previous side chat is
+            // unreachable even if a crash or cleanup error leaves its file.
+            if let Err(error) =
+                std::fs::remove_file(directory.join(super::side_chat::SIDE_CHAT_FILE))
+            {
+                if error.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "could not remove invalidated side chat record");
+                }
             }
             Ok(())
         })

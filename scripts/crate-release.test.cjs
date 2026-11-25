@@ -1858,6 +1858,37 @@ test('minimal frozen publisher never recompiles a successful or unverifiable nat
     () => { throw new Error('No metadata read for another publisher run') }, { receipt: { publisherRunId: '88' } }), /original publisher run 88/)
 })
 
+test('native retry admits a matrix that never expanded after the original preflight failed', () => {
+  const { assertNoNativeRebuild } = require('./sidecar-build.cjs')
+  const target = 'aarch64-apple-darwin'
+  const workflowRevision = 'a'.repeat(40)
+  const identity = { workflowRevision, runId: '77', runAttempt: 2, validation: { kind: 'bamboo-frozen-dev-release/v1' } }
+  const preparation = { receipt: { publisherRunId: '77' } }
+  const earlier = { run_id: 77, run_attempt: 1, head_sha: workflowRevision, status: 'completed' }
+  const preflight = { ...earlier, name: 'automatic', conclusion: 'failure' }
+  const placeholder = { ...earlier, name: 'Complete executable (${{ matrix.target }})', conclusion: 'skipped', steps: [] }
+  const guard = jobs => assertNoNativeRebuild(identity, target, route => {
+    assert.equal(route, 'actions/runs/77/attempts/1/jobs?per_page=100&page=1')
+    return { total_count: jobs.length, jobs }
+  }, preparation)
+
+  assert.doesNotThrow(() => guard([preflight, placeholder]))
+  for (const ambiguous of [
+    [preflight],
+    [placeholder],
+    [preflight, { ...placeholder, conclusion: 'cancelled' }],
+    [preflight, { ...placeholder, run_attempt: 2 }],
+    [preflight, { ...placeholder, head_sha: 'b'.repeat(40) }],
+    [preflight, { ...placeholder, steps: [{ name: 'Build', conclusion: 'success' }] }],
+    [{ ...preflight, conclusion: 'success' }, placeholder],
+    [{ ...preflight, run_id: 78 }, placeholder],
+    [preflight, placeholder, placeholder],
+    [preflight, placeholder, { ...placeholder, name: 'Complete executable (' + target + ')' }],
+  ]) {
+    assert.throws(() => guard(ambiguous), /Unknown previous native target history/)
+  }
+})
+
 test('minimal frozen publisher seals the original run and requires failed-job recovery until the native checkpoint exists', async () => {
   const { context } = fixture({ publisherRunId: '77' })
   const result = await plan(context)
@@ -2114,6 +2145,37 @@ test('2840 binds the failed execution, exact unstarted tail and retained native 
   const expected = artifact.digest
   artifact.digest = 'sha256:' + '0'.repeat(64)
   assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION', actual: artifact.digest, expected })
+})
+
+test('3053 binds the original publisher, six unstarted crates and five native transports', () => {
+  const recovery = require('./crate-release-2026-11-43-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const expires = '2026-11-27T18:06:59Z'
+  const now = Date.parse('2026-11-24T19:00:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, expires)
+  assert.equal(recovery.originalEvidence(read, now).id, 45451853467)
+  assert.deepEqual(TAIL, [
+    'bamboo-server-tools', 'bamboo-sdk', 'bamboo-server', 'bamboo-client-core', 'bamboo-tui', 'bamboo-agent',
+  ])
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  const artifacts = routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts
+  artifacts[1].digest = 'sha256:' + '0'.repeat(64)
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION' })
+})
+
+test('3053 requires its published prefix and permits a retry only from the retained upload', () => {
+  const { TARGET, TAIL, verifyRegistryMetadata } = require('./crate-release-2026-11-43-recovery.cjs')
+  const prefix = [...Array.from({ length: 23 }, (_, index) => 'published-' + index), 'bamboo-notification']
+  const checksum = 'a'.repeat(64)
+  const receipt = { crates: [...prefix, 'bamboo-projects', ...TAIL], packageChecksums: { 'bamboo-projects': checksum } }
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-notification', TARGET.version, null), /published prefix disappeared/)
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-projects', TARGET.version, null), null)
+  const uploaded = { yanked: false, checksum }
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-projects', TARGET.version, uploaded), uploaded)
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-projects', TARGET.version, {
+    ...uploaded, checksum: 'b'.repeat(64),
+  }), /Registry checksum changed/)
+  assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
 })
 
 const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')

@@ -22,7 +22,10 @@ pub(super) async fn handle_chunk_result(
             state.set_response_id(response_id);
             Ok(())
         }
-        Ok(LLMChunk::ResponsesEvent { .. }) => Ok(()),
+        Ok(LLMChunk::ResponsesEvent { event_type, data }) => {
+            state.observe_responses_event(&event_type, &data);
+            Ok(())
+        }
         Ok(LLMChunk::ProviderTranscriptItem(item)) => {
             state.push_provider_transcript_item(item);
             Ok(())

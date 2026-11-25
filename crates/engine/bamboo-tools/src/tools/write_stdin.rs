@@ -5,7 +5,9 @@ use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::exec_command::{owned_exec, owner_session, poll_result, yield_duration, EmptyPoll};
+use super::exec_command::{
+    owned_exec, owner_session, poll_result, read_retained_output, yield_duration, EmptyPoll,
+};
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 
@@ -26,6 +28,7 @@ struct WriteStdinArgs {
     chars: String,
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
+    output_offset: Option<u64>,
     #[serde(default)]
     eof: bool,
 }
@@ -49,7 +52,8 @@ pub async fn continue_empty_poll(
     ) else {
         return ToolOutcome::Completed(previous);
     };
-    if !args.chars.is_empty()
+    if args.output_offset.is_some()
+        || !args.chars.is_empty()
         || args.eof
         || result["session_id"].as_str() != Some(args.session_id.as_str())
         || result["status"] != "running"
@@ -131,16 +135,17 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Continue the process identified by exec_command's session_id. Empty chars waits for output and exit status. Silence and exit_observed are advisory. Use terminal status and exit code to verify completion. After three empty polls, reassess the command. A sole empty poll with closed stdin can wait longer. Nonempty chars sends exact bytes to the interactive pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the process."
+        "Continue a process started by this session's exec_command using its returned session_id. Empty chars waits for output and exit status. Silence and exit_observed are advisory. Use terminal status and exit code to verify completion. After three empty polls, reassess the command. A sole empty poll with closed stdin can wait longer. Nonempty chars sends exact bytes to the interactive pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the process. When exec_command returns output_log, use output_offset with its session_id to read the retained log without advancing the regular output cursor."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{
-            "session_id":{"type":"string","description":"Running handle returned by exec_command"},
+            "session_id":{"type":"string","description":"Handle returned by exec_command in this same session"},
             "chars":{"type":"string","description":"Exact stdin bytes; empty or omitted waits/polls. A lone Ctrl-C stops the process"},
             "yield_time_ms":{"type":"integer","description":"Wait before yielding again, in milliseconds. Default 10000. An unattended empty poll can wait longer than 30000 within the runner's tool deadline."},
             "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000, capped at 8192; four JSON-encoded bytes per token including quotes and escapes. Status/session/exit metadata is additional"},
-            "eof":{"type":"boolean","description":"Close the stdin pipe after sending chars"}
+            "eof":{"type":"boolean","description":"Close the stdin pipe after sending chars"},
+            "output_offset":{"type":"integer","minimum":0,"description":"Immediately read a retained log page at this normalized UTF-8 byte offset, starting at output_log.start_offset. Use output_log.next_offset for the next page while it is below output_log.end_offset. If a page cannot advance, increase the page or session output budget. Omit stdin, EOF and yield arguments for log reads."}
         },"required":["session_id"],"additionalProperties":false})
     }
 
@@ -153,6 +158,20 @@ impl Tool for WriteStdinTool {
             ToolError::InvalidArguments(format!("Invalid write_stdin args: {error}"))
         })?;
         let owner = owner_session(&ctx)?;
+        if let Some(offset) = parsed.output_offset {
+            if !parsed.chars.is_empty() || parsed.eof || parsed.yield_time_ms.is_some() {
+                return Err(ToolError::InvalidArguments(
+                    "output_offset cannot be combined with chars, eof, or yield_time_ms".into(),
+                ));
+            }
+            return read_retained_output(
+                owner,
+                &parsed.session_id,
+                offset,
+                parsed.max_output_tokens,
+            )
+            .await;
+        }
         let shell = owned_exec(owner, &parsed.session_id)
             .ok_or_else(|| {
                 ToolError::Execution("Exec session not found or not owned by this session (unread completed results expire after five minutes; handles do not survive Host restart)".into())

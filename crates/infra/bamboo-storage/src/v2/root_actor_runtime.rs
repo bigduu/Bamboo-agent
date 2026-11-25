@@ -466,11 +466,34 @@ impl SessionStoreV2 {
         };
         let observed = expected.clone();
         let proposed = session.clone();
+        let planned_update =
+            bamboo_domain::root_planned_update_predecessor_sha256(&owner.fence.lease_owner)
+                .is_some();
         Self::default_writer_job(&guards, move || {
             let current = proof.validate()?;
             observed
                 .check_conversation_generation(&current)
                 .map_err(conflict)?;
+            if planned_update {
+                let history = serde_json::to_value(&observed.messages)?;
+                let same_park = observed.is_parked_for_planned_update()
+                    && current.is_parked_for_planned_update();
+                let same_startup = observed.is_initializing_planned_update_resume()
+                    && current.is_initializing_planned_update_resume();
+                if !(same_park || same_startup)
+                    || !proposed.is_initializing_planned_update_resume()
+                    || !Self::same_root_runtime_observation(&observed, &current)
+                    || history != serde_json::to_value(&current.messages)?
+                    || history != serde_json::to_value(&proposed.messages)?
+                    || observed.root_tool_authority_revision != current.root_tool_authority_revision
+                    || observed.root_tool_authority_revision
+                        != proposed.root_tool_authority_revision
+                    || observed.workspace_path_meta() != current.workspace_path_meta()
+                    || observed.workspace_path_meta() != proposed.workspace_path_meta()
+                {
+                    return Err(conflict("planned update checkpoint changed before startup"));
+                }
+            }
             let schedule = observed.metadata.get("created_by_schedule_id");
             let connect = observed
                 .metadata

@@ -96,6 +96,7 @@ enum ScheduleRunLifecycleResult {
 #[derive(Clone)]
 pub struct ScheduleManager {
     tx: mpsc::Sender<ScheduleRunJob>,
+    update_admission: crate::app_state::update_admission::UntrackedUpdateAdmission,
     #[cfg(test)]
     guard_progress: ScheduleGuardObservers,
 }
@@ -226,6 +227,8 @@ fn guard_progress_for_received_job(
 impl ScheduleManager {
     pub fn new(ctx: ScheduleContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<ScheduleRunJob>(128);
+        let update_admission =
+            crate::app_state::update_admission::UntrackedUpdateAdmission::default();
         #[cfg(test)]
         let guard_progress = ScheduleGuardObservers::default();
 
@@ -345,10 +348,14 @@ impl ScheduleManager {
             let tx = tx.clone();
             let store = ctx.schedule_store.clone();
             let trigger_engine = ctx.trigger_engine.clone();
+            let update_admission = update_admission.clone();
             async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
+                    let Some(mut admission) = update_admission.try_enter() else {
+                        continue;
+                    };
                     let now = Utc::now();
                     let claimed: Vec<ClaimedScheduleRun> = match store
                         .claim_due_runs_with_engine(now, trigger_engine.as_ref())
@@ -360,6 +367,10 @@ impl ScheduleManager {
                             continue;
                         }
                     };
+                    if !claimed.is_empty() {
+                        admission.record_dispatch();
+                    }
+                    drop(admission);
                     for c in claimed {
                         let schedule_id = c.schedule_id.clone();
                         let run_id = c.run_id.clone();
@@ -391,12 +402,23 @@ impl ScheduleManager {
 
         Self {
             tx,
+            update_admission,
             #[cfg(test)]
             guard_progress,
         }
     }
 
+    pub(crate) fn update_admission(
+        &self,
+    ) -> &crate::app_state::update_admission::UntrackedUpdateAdmission {
+        &self.update_admission
+    }
+
     pub async fn enqueue_run_now(&self, job: ScheduleRunJob) -> Result<(), String> {
+        self.update_admission
+            .record_dispatch()
+            .await
+            .map_err(|error| error.to_string())?;
         #[cfg(test)]
         let progress = guard_progress_for_job(&self.guard_progress, &job);
         let result = self
@@ -502,7 +524,12 @@ async fn notify_schedule_run_outcome(
     if let Some(sink_notification) = sink_notification {
         let has_watcher = relay.session_watchers.has_watcher(session_id);
         let config_snapshot = relay.config.read().await.clone();
-        crate::AppState::dispatch_to_sinks(&config_snapshot, has_watcher, &sink_notification);
+        crate::notify_sinks::dispatch_with_hook_admission(
+            &config_snapshot,
+            has_watcher,
+            &sink_notification,
+            relay.session_watchers.lifecycle_hook_admission(),
+        );
     }
 }
 
@@ -511,6 +538,12 @@ async fn run_schedule_job(
     job: ScheduleRunJob,
     #[cfg(test)] progress: Option<Arc<ScheduleGuardProgress>>,
 ) -> Result<ScheduleRunLifecycleResult, String> {
+    if let Some(status) = super::log_monitor::run_log_monitor(&ctx, &job)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(ScheduleRunLifecycleResult::Terminal(status));
+    }
     #[cfg(test)]
     progress.at("session_preparation_pending");
     validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;
@@ -641,6 +674,7 @@ async fn run_schedule_job(
             ctx.app_data_dir.clone(),
             &mut session,
             &raw_prompt,
+            None,
         )
         .await
         {

@@ -64,6 +64,25 @@ fn normalize_model_unknown() {
     assert_eq!(normalize_model(Some("unknown")), None);
 }
 
+#[test]
+fn existing_model_less_root_recovers_from_saved_chat_default_for_the_same_provider() {
+    let session = make_session("unknown");
+    let input = make_input();
+    let mut config = make_config();
+    config.provider_name = "openai".into();
+    let selected = ProviderModelRef::new("openai", "my-chat-model");
+    config.default_model_ref = Some(selected.clone());
+    let (bound, model, source) = resolve_execution_model(&session, &input, &config).unwrap();
+    assert_eq!(bound, Some(selected));
+    assert_eq!(model.as_deref(), Some("my-chat-model"));
+    assert_eq!(source, "provider_default");
+
+    config.provider_name = "another-account".into();
+    let (bound, model, _) = resolve_execution_model(&session, &input, &config).unwrap();
+    assert!(bound.is_none());
+    assert!(model.is_none());
+}
+
 // ---- resolve_model_cascade (flag OFF) ----
 
 #[test]

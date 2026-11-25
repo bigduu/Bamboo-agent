@@ -71,6 +71,11 @@ const RUNTIME_RESUME_MESSAGE_KIND_KEY: &str = "runtime_kind";
 const CHILD_COMPLETION_INLINE_FIELD_BYTES: usize = 48 * 1024;
 const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
 
+#[path = "background_exec_stop.rs"]
+mod background_exec_stop;
+pub use background_exec_stop::BackgroundExecStopOutcome;
+use background_exec_stop::{has_background_exec_stop, BackgroundExecConversation};
+
 enum ResumeOrigin {
     Legacy,
     Configured,
@@ -127,7 +132,7 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// persistence lock that commits the generic suspension clear.
 ///
 /// The boolean is false while a human response is pending or has its own
-/// successor, or while a child/Bash wait is respected.
+/// successor, a child/Bash wait is respected, or a managed update owns resume.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -143,7 +148,8 @@ async fn prepare_session_inbox_activation(
             // has already advanced the prefix's interrupt watermark.
             if expected_birth.is_some_and(|birth| {
                 latest.created_at != birth || crate::ticket_runtime::is_managed_work_root(latest)
-            }) || latest.has_pending_question()
+            }) || latest.is_parked_for_planned_update()
+                || latest.has_pending_question()
                 || latest
                     .metadata
                     .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
@@ -1078,6 +1084,16 @@ impl ChildCompletionCoordinator {
         reservation: &mut SessionExecutionReservation,
         session: &Session,
     ) -> std::io::Result<()> {
+        self.prepare_root_continuation(reservation, session, None)
+            .await
+    }
+
+    async fn prepare_root_continuation(
+        &self,
+        reservation: &mut SessionExecutionReservation,
+        session: &Session,
+        predecessor: Option<&bamboo_domain::ActorActivationFence>,
+    ) -> std::io::Result<()> {
         if session.kind != SessionKind::Root
             || !session.authority_identity.is_ordinary()
             || crate::ticket_runtime::is_managed_work_root(session)
@@ -1091,7 +1107,14 @@ impl ChildCompletionCoordinator {
         reservation
             .bind_reserved_session_lifetime(&self.agent, session)
             .await?;
-        reservation.bind_root_actor(&self.agent, session).await
+        match predecessor {
+            Some(predecessor) => {
+                reservation
+                    .bind_root_actor_after_update(&self.agent, session, predecessor)
+                    .await
+            }
+            None => reservation.bind_root_actor(&self.agent, session).await,
+        }
     }
 
     /// Publish and hand off this exact reserved turn. Success records Inbox
@@ -1214,8 +1237,59 @@ impl ChildCompletionCoordinator {
         let expected = session.clone();
         crate::runtime::goal_restart::consume(&mut session, &checkpoint);
         drop(guard);
-        self.start_bound_goal_turn(session, &expected, reservation)
+        self.start_bound_root_continuation(session, &expected, reservation)
             .await
+    }
+
+    /// Resume a Root from the owning host's committed update handoff. The
+    /// caller verifies the predecessor process, update receipt and Actor
+    /// closure before proposing a member.
+    pub async fn resume_planned_update_root(
+        &self,
+        root: &crate::session_activation::ParkedUpdateRoot,
+    ) -> std::io::Result<bool> {
+        let Some(mut reservation) = self.reserve_paced_loop_turn(&root.session_id).await else {
+            return Ok(false);
+        };
+        let guard = self.persistence.acquire_lock(&root.session_id).await;
+        let Some((saved, resumed)) =
+            self.storage
+                .load_session(&root.session_id)
+                .await?
+                .and_then(|saved| {
+                    let resumed =
+                        crate::runtime::planned_update::prepare_resuming_session(root, &saved)?;
+                    Some((saved, resumed))
+                })
+        else {
+            drop(guard);
+            reservation.abandon().await;
+            return Ok(false);
+        };
+        let config = self.config.read().await.clone();
+        let provider =
+            resolve_provider_routing_key(&config, &root.model.provider, &self.provider_registry);
+        if !provider.is_ok_and(|provider| provider == root.model.provider)
+            || self.provider_router.route_with_origin(&root.model).is_err()
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(std::io::Error::other(
+                "The saved update model is unavailable",
+            ));
+        }
+        if let Err(error) = self
+            .prepare_root_continuation(&mut reservation, &saved, Some(&root.fence))
+            .await
+        {
+            drop(guard);
+            reservation.abandon().await;
+            return Err(error);
+        }
+        drop(guard);
+        self.dispatch_bound_root_continuation(resumed, reservation)
+            .await?;
+        Ok(true)
     }
 
     /// Admit the explicitly requested resume during this Root activation.
@@ -1285,19 +1359,19 @@ impl ChildCompletionCoordinator {
         resumed.set_last_run_status("running");
         resumed.clear_last_run_error();
         drop(guard);
-        self.start_bound_goal_turn(resumed, &current, reservation)
+        self.start_bound_root_continuation(resumed, &current, reservation)
             .await
     }
 
-    async fn start_bound_goal_turn(
+    async fn start_bound_root_continuation(
         &self,
         mut session: Session,
         expected: &Session,
         reservation: SessionExecutionReservation,
     ) -> std::io::Result<()> {
-        let persistence = reservation
-            .execution_persistence()
-            .ok_or_else(|| std::io::Error::other("Goal restart requires fenced persistence"))?;
+        let persistence = reservation.execution_persistence().ok_or_else(|| {
+            std::io::Error::other("Root continuation requires fenced persistence")
+        })?;
         if let Err(error) = persistence
             .save_bound_startup_session(&mut session, expected)
             .await
@@ -1306,6 +1380,15 @@ impl ChildCompletionCoordinator {
             return Err(error);
         }
 
+        self.dispatch_bound_root_continuation(session, reservation)
+            .await
+    }
+
+    async fn dispatch_bound_root_continuation(
+        &self,
+        session: Session,
+        reservation: SessionExecutionReservation,
+    ) -> std::io::Result<()> {
         let config_snapshot = self.config.read().await.clone();
         let config = self.build_resume_config(&session, &config_snapshot);
         let request = ResumeSpawnRequest {
@@ -1315,8 +1398,9 @@ impl ChildCompletionCoordinator {
             execution_reservation: reservation,
             config,
         };
-        ResumeExecutionPort::dispatch_configured_resume_execution(self, request)
-            .map_err(|_| std::io::Error::other("Goal restart owner did not accept the checkpoint"))
+        ResumeExecutionPort::dispatch_configured_resume_execution(self, request).map_err(|_| {
+            std::io::Error::other("Root continuation owner did not accept the checkpoint")
+        })
     }
 
     /// Drive a parent-resume and return the final [`ResumeOutcome`] so callers
@@ -1496,6 +1580,16 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
     }
 
     async fn on_child_completed(&self, completion: ChildCompletion) {
+        self.handle_child_completion(completion, None).await;
+    }
+}
+
+impl ChildCompletionCoordinator {
+    async fn handle_child_completion(
+        &self,
+        completion: ChildCompletion,
+        replay: Option<&mut ChildReplayCheck<'_>>,
+    ) {
         // Terminality guard: a child that reports a NON-terminal status (e.g.
         // "suspended" — awaiting parent approval, its own bash wait, or its own
         // grandchildren) is not done. It must never satisfy the parent's wait:
@@ -1837,6 +1931,24 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             // A permanent receipt suppresses another notification, but it does
             // not prove that the corresponding Guardian verdict was committed.
             if previously_admitted && !should_resume && !guardian_control_changed {
+                let replay = replay.filter(|replay| {
+                    parent.created_at == replay.registration.session_created_at
+                        && runtime_state.run_id == replay.registration.run_id
+                        && active_wait.as_ref() == Some(replay.wait)
+                });
+                let child = loaded_child
+                    .as_ref()
+                    .filter(|child| child.subagent_type().as_deref() != Some("guardian"));
+                if let (Some(replay), Some((envelope, true)), Some(child), Some(source)) =
+                    (replay, previous_delivery.as_ref(), child, completion.source)
+                {
+                    replay.acknowledged = Some(AcknowledgedChildReplay {
+                        parent_updated_at: parent.updated_at,
+                        observed: ChildReplayObservation::read(child, &completion.status),
+                        receipt_id: envelope.id.clone(),
+                        source,
+                    });
+                }
                 return;
             }
             let activation_policy = if should_resume || guardian_control_changed {
@@ -3376,6 +3488,10 @@ impl ChildCompletionCoordinator {
                 // A newer Human turn may have installed a different wait.
                 return;
             }
+            if matches!(bash_ids.as_slice(), [handle] if has_background_exec_stop(&session, handle))
+            {
+                return;
+            }
 
             let still_running = bash_ids.iter().any(|id| {
                 bamboo_tools::tools::bash_runtime::get_shell(id).is_some_and(|shell| {
@@ -3461,6 +3577,7 @@ impl ChildCompletionCoordinator {
                 .waiting_for_bash
                 .as_ref()
                 .is_none_or(|wait| wait.bash_ids != expected_ids)
+                || matches!(expected_ids, [handle] if has_background_exec_stop(&session, handle))
             {
                 return;
             }
@@ -3558,17 +3675,43 @@ impl BashResumeHook for ChildCompletionCoordinator {
         job: bamboo_tools::tools::exec_command::BackgroundExecJob,
         session_created_at: chrono::DateTime<Utc>,
     ) {
+        self.start_exec_completion_monitor(job, session_created_at, None);
+    }
+
+    fn arrange_bound_exec_self_resume(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session: &Session,
+    ) {
+        let Ok(conversation) = BackgroundExecConversation::capture(session) else {
+            tracing::warn!(session_id = %session.id, "background exec has no valid conversation generation");
+            return;
+        };
+        self.start_exec_completion_monitor(job, session.created_at, Some(conversation));
+    }
+}
+
+impl ChildCompletionCoordinator {
+    fn start_exec_completion_monitor(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session_created_at: chrono::DateTime<Utc>,
+        expected_conversation: Option<BackgroundExecConversation>,
+    ) {
         let session_id = job.session_id().to_owned();
         let ids = vec![job.id().to_owned()];
         let coordinator = self.clone();
         tokio::spawn(async move {
             let info = job.completion().await;
+            let stop_confirmed = job.stop_confirmed().await;
             drop(job);
             coordinator
-                .deliver_shell_completion_for_lifetime(
+                .deliver_shell_completion_with_proof(
                     info,
                     ShellCompletionKind::Exec,
                     Some(session_created_at),
+                    expected_conversation,
+                    stop_confirmed,
                 )
                 .await;
         });
@@ -3813,9 +3956,21 @@ impl ChildCompletionCoordinator {
 
     async fn deliver_shell_completion_for_lifetime(
         &self,
+        info: BashCompletionInfo,
+        kind: ShellCompletionKind,
+        expected_birth: Option<chrono::DateTime<Utc>>,
+    ) {
+        self.deliver_shell_completion_with_proof(info, kind, expected_birth, None, false)
+            .await;
+    }
+
+    async fn deliver_shell_completion_with_proof(
+        &self,
         mut info: BashCompletionInfo,
         kind: ShellCompletionKind,
         expected_birth: Option<chrono::DateTime<Utc>>,
+        expected_conversation: Option<BackgroundExecConversation>,
+        stop_confirmed: bool,
     ) {
         // A background shell completes outside the originating tool call, so
         // fire its PostToolUse seam here before routing the completion into the
@@ -3852,6 +4007,20 @@ impl ChildCompletionCoordinator {
         if expected_birth.is_some_and(|birth| session.created_at != birth) {
             // A reused display id cannot redirect an old command's result into
             // a new Session lifetime.
+            return;
+        }
+        if expected_conversation.is_some_and(|expected| !expected.matches(&session)) {
+            return;
+        }
+        if kind == ShellCompletionKind::Exec && has_background_exec_stop(&session, &info.bash_id) {
+            if stop_confirmed {
+                if let Err(error) = self
+                    .finish_background_exec_stop_from_monitor(&session, &info.bash_id)
+                    .await
+                {
+                    tracing::warn!(session_id = %session.id, %error, "background exec stop confirmation could not be saved");
+                }
+            }
             return;
         }
         let runtime = read_runtime_state(&session);
@@ -4155,11 +4324,44 @@ struct ChildWaitRegistration {
 
 struct ChildWaitWatchdogState {
     registration: ChildWaitRegistration,
+    wait: WaitingForChildrenState,
     force_resume_rejected: bool,
     replay_retries: HashMap<String, ChildReplayRetry>,
+    acknowledged_replays: HashMap<String, AcknowledgedChildReplay>,
+}
+
+impl ChildWaitWatchdogState {
+    fn new(registration: ChildWaitRegistration, wait: WaitingForChildrenState) -> Self {
+        Self {
+            registration,
+            wait,
+            force_resume_rejected: false,
+            replay_retries: HashMap::new(),
+            acknowledged_replays: HashMap::new(),
+        }
+    }
+}
+
+struct ChildReplayCheck<'a> {
+    registration: &'a ChildWaitRegistration,
+    wait: &'a WaitingForChildrenState,
+    acknowledged: Option<AcknowledgedChildReplay>,
+}
+
+struct AcknowledgedChildReplay {
+    parent_updated_at: chrono::DateTime<Utc>,
+    observed: ChildReplayObservation,
+    receipt_id: SessionMessageId,
+    source: ChildCompletionSource,
 }
 
 struct ChildReplayRetry {
+    observed: ChildReplayObservation,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(PartialEq, Eq)]
+struct ChildReplayObservation {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     launch_generation: u64,
@@ -4167,18 +4369,19 @@ struct ChildReplayRetry {
     indexed_status: String,
     saved_status: Option<String>,
     source_fingerprint: Option<[u8; 32]>,
-    retry_at: tokio::time::Instant,
 }
 
-impl ChildReplayRetry {
-    fn matches(&self, child: &Session, indexed_status: &str) -> bool {
-        self.created_at == child.created_at
-            && self.updated_at == child.updated_at
-            && self.launch_generation == child.child_launch_generation()
-            && self.host_run_id.as_deref() == child.host_run_id()
-            && self.indexed_status == indexed_status
-            && self.saved_status == child.last_run_status()
-            && self.source_fingerprint == ChildCompletionSource::replay_record_fingerprint(child)
+impl ChildReplayObservation {
+    fn read(child: &Session, indexed_status: &str) -> Self {
+        Self {
+            created_at: child.created_at,
+            updated_at: child.updated_at,
+            launch_generation: child.child_launch_generation(),
+            host_run_id: child.host_run_id().map(str::to_owned),
+            indexed_status: indexed_status.into(),
+            saved_status: child.last_run_status(),
+            source_fingerprint: ChildCompletionSource::replay_record_fingerprint(child),
+        }
     }
 }
 
@@ -4387,23 +4590,22 @@ impl ChildCompletionCoordinator {
                     run_id: runtime_state.run_id,
                     registered_at: wait.registered_at,
                 };
-                let mut state = previous
-                    .filter(|state| state.registration == registration)
-                    .unwrap_or_else(|| ChildWaitWatchdogState {
-                        registration,
-                        force_resume_rejected: false,
-                        replay_retries: HashMap::new(),
-                    });
-                let rejected_now = self
-                    .sweep_child_wait(
-                        session_id,
-                        wait,
-                        !state.force_resume_rejected,
-                        &mut state.replay_retries,
-                    )
-                    .await;
+                let mut state = match previous {
+                    Some(mut state) if state.registration == registration => {
+                        if state.wait != wait {
+                            state.acknowledged_replays.clear();
+                            state.wait = wait;
+                        }
+                        state
+                    }
+                    _ => ChildWaitWatchdogState::new(registration, wait),
+                };
+                let rejected_now = self.sweep_child_wait(&session, &mut state).await;
                 state.force_resume_rejected |= rejected_now;
-                (state.force_resume_rejected || !state.replay_retries.is_empty()).then_some(state)
+                (state.force_resume_rejected
+                    || !state.replay_retries.is_empty()
+                    || !state.acknowledged_replays.is_empty())
+                .then_some(state)
             }
             // Suspended with NO armed wait: either the coordinator cleared the
             // wait but its resume never spawned, or state is half-cleared.
@@ -4437,25 +4639,39 @@ impl ChildCompletionCoordinator {
         parent_session_id: &str,
         wait: WaitingForChildrenState,
     ) {
-        self.sweep_child_wait(parent_session_id, wait, true, &mut HashMap::new())
-            .await;
+        let Some(parent) = self.load_control_plane(parent_session_id).await else {
+            return;
+        };
+        let registration = ChildWaitRegistration {
+            session_created_at: parent.created_at,
+            run_id: read_runtime_state(&parent).run_id,
+            registered_at: wait.registered_at,
+        };
+        self.sweep_child_wait(
+            &parent,
+            &mut ChildWaitWatchdogState::new(registration, wait),
+        )
+        .await;
     }
 
     /// Report a deterministic rejection of the unfenced force-resume path.
-    async fn sweep_child_wait(
-        &self,
-        parent_session_id: &str,
-        wait: WaitingForChildrenState,
-        allow_force_resume: bool,
-        replay_retries: &mut HashMap<String, ChildReplayRetry>,
-    ) -> bool {
+    async fn sweep_child_wait(&self, parent: &Session, state: &mut ChildWaitWatchdogState) -> bool {
+        let parent_session_id = parent.id.as_str();
+        let root_session_id = if parent.kind == SessionKind::Root {
+            parent_session_id
+        } else {
+            parent.root_session_id.as_str()
+        };
+        let wait = &state.wait;
         let now = Utc::now();
-        replay_retries.retain(|child_id, _| wait.child_session_ids.contains(child_id));
+        state
+            .replay_retries
+            .retain(|child_id, _| wait.child_session_ids.contains(child_id));
 
         // The 6h lease (previously written but never read). Expiry does not
         // kill children — child runners own child liveness; the parent is
         // resumed with a verify-don't-assume note.
-        if allow_force_resume {
+        if !state.force_resume_rejected {
             let forced_resume = if wait.child_session_ids.is_empty() {
                 Some(empty_child_wait_message())
             } else if wait.timeout_at.is_some_and(|deadline| now >= deadline) {
@@ -4472,18 +4688,16 @@ impl ChildCompletionCoordinator {
                     .root_child_wait_requires_owned_expiry(&parent)
                     .await
                 {
-                    Ok(true) => {
-                        match self.expire_owned_root_child_wait(&parent, &wait, now).await {
-                            Ok(true) => return false,
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::debug!(%parent_session_id, %error, "owned child wait expiry remains pending");
-                            }
+                    Ok(true) => match self.expire_owned_root_child_wait(&parent, wait, now).await {
+                        Ok(true) => return false,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::debug!(%parent_session_id, %error, "owned child wait expiry remains pending");
                         }
-                    }
+                    },
                     Ok(false) => {
                         let Err(error) = self
-                            .force_resume_child_wait(parent_session_id, &wait, message)
+                            .force_resume_child_wait(parent_session_id, wait, message)
                             .await
                         else {
                             return false;
@@ -4532,6 +4746,7 @@ impl ChildCompletionCoordinator {
 
         let mut terminal: Vec<(String, String)> = Vec::new();
         let mut dead: Vec<DeadChild> = Vec::new();
+        let mut unfinished_child = false;
         for child_id in &wait.child_session_ids {
             let status = statuses.get(child_id).and_then(|status| status.as_deref());
             if let Some(status) = status {
@@ -4570,6 +4785,20 @@ impl ChildCompletionCoordinator {
                 continue;
             }
 
+            // A stale index can still say "running" after its Child commits.
+            // Acknowledgement can only skip a replay if fresh Child state still
+            // blocks this All wait.
+            if wait.wait_for == ChildWaitPolicy::All && !unfinished_child {
+                unfinished_child = control_plane.as_ref().is_some_and(|child| {
+                    child.kind == SessionKind::Child
+                        && child.root_session_id == root_session_id
+                        && matches!(
+                            child.last_run_status().as_deref(),
+                            Some("running" | "pending" | "suspended")
+                        )
+                });
+            }
+
             let runner = { self.agent_runners.read().await.get(child_id).cloned() };
             match runner {
                 Some(runner) if matches!(runner.status, AgentStatus::Running) => {
@@ -4595,12 +4824,13 @@ impl ChildCompletionCoordinator {
                         .unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
-                    let policy = match &control_plane {
-                        Some(child) => {
-                            crate::runtime::execution::spawn::watchdog_policy_for_session(child)
-                        }
-                        None => Default::default(),
-                    };
+                    let policy = runner.child_watchdog_policy.unwrap_or_else(|| {
+                        control_plane
+                            .as_ref()
+                            .map_or_else(Default::default, |child| {
+                                crate::execution::spawn::watchdog_policy_for_session(child, None)
+                            })
+                    });
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
                     let current_native_work =
                         if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {
@@ -4712,56 +4942,76 @@ impl ChildCompletionCoordinator {
                 completed_at: Utc::now(),
                 source: None,
             };
+            let mut acknowledged = false;
             // Lost callbacks replay the committed source, not a synthetic
             // latest answer. Check ownership before loading any transcript.
             if let Some(observed_child) = control_plane
                 .as_ref()
                 .filter(|child| child.parent_session_id.as_deref() == Some(parent_session_id))
             {
-                let retry = replay_retries
-                    .get_mut(&child_id)
-                    .filter(|retry| retry.matches(observed_child, &completion.status));
-                if retry
-                    .as_ref()
-                    .is_some_and(|retry| tokio::time::Instant::now() < retry.retry_at)
-                {
-                    continue;
-                }
-                let Ok(Some(child)) = self.storage.load_session(&child_id).await else {
-                    continue;
-                };
-                completion.source = ChildCompletionSource::from_committed_session(&child)
-                    .filter(|source| source.matches_completion(&completion));
-                if (ChildCompletionSource::has_source_record(&child)
-                    || repaired_child_requires_source(&child))
-                    && completion.source.is_none()
-                {
-                    let retry_at = tokio::time::Instant::now() + CHILD_REPLAY_RETRY_INTERVAL;
-                    if let Some(retry) = retry {
-                        retry.retry_at = retry_at;
-                    } else {
-                        tracing::warn!(%parent_session_id, %child_id,
-                            "unavailable committed replay source; leaving wait armed");
-                        replay_retries.insert(
-                            child_id,
-                            ChildReplayRetry {
-                                created_at: observed_child.created_at,
-                                updated_at: observed_child.updated_at,
-                                launch_generation: observed_child.child_launch_generation(),
-                                host_run_id: observed_child.host_run_id().map(str::to_owned),
-                                indexed_status: completion.status,
-                                saved_status: observed_child.last_run_status(),
-                                source_fingerprint:
-                                    ChildCompletionSource::replay_record_fingerprint(observed_child),
-                                retry_at,
-                            },
-                        );
+                let observed = ChildReplayObservation::read(observed_child, &completion.status);
+                let candidate = state.acknowledged_replays.get(&child_id).filter(|replay| {
+                    unfinished_child
+                        && replay.parent_updated_at == parent.updated_at
+                        && replay.observed == observed
+                        && observed_child.subagent_type().as_deref() != Some("guardian")
+                        && replay.source.matches_completion(&completion)
+                });
+                let acknowledged_replay = match (candidate, self.agent.session_inbox()) {
+                    (Some(replay), Some(inbox))
+                        if inbox
+                            .was_admitted(parent_session_id, &replay.receipt_id)
+                            .await
+                            .unwrap_or(false) =>
+                    {
+                        Some(replay)
                     }
-                    continue;
+                    _ => None,
+                };
+                if let Some(replay) = acknowledged_replay {
+                    // The parent already consumed this exact source. Retain its
+                    // independent event publication without re-entering Inbox or
+                    // reloading either transcript.
+                    completion.source = Some(replay.source.clone());
+                    completion.completed_at = replay.observed.updated_at;
+                    acknowledged = true;
+                } else {
+                    state.acknowledged_replays.remove(&child_id);
+                    let retry = state
+                        .replay_retries
+                        .get_mut(&child_id)
+                        .filter(|retry| retry.observed == observed);
+                    if retry
+                        .as_ref()
+                        .is_some_and(|retry| tokio::time::Instant::now() < retry.retry_at)
+                    {
+                        continue;
+                    }
+                    let Ok(Some(child)) = self.storage.load_session(&child_id).await else {
+                        continue;
+                    };
+                    completion.source = ChildCompletionSource::from_committed_session(&child)
+                        .filter(|source| source.matches_completion(&completion));
+                    if (ChildCompletionSource::has_source_record(&child)
+                        || repaired_child_requires_source(&child))
+                        && completion.source.is_none()
+                    {
+                        let retry_at = tokio::time::Instant::now() + CHILD_REPLAY_RETRY_INTERVAL;
+                        if let Some(retry) = retry {
+                            retry.retry_at = retry_at;
+                        } else {
+                            tracing::warn!(%parent_session_id, %child_id,
+                                "unavailable committed replay source; leaving wait armed");
+                            state
+                                .replay_retries
+                                .insert(child_id, ChildReplayRetry { observed, retry_at });
+                        }
+                        continue;
+                    }
+                    completion.completed_at = child.updated_at;
                 }
-                completion.completed_at = child.updated_at;
             }
-            replay_retries.remove(&child_id);
+            state.replay_retries.remove(&child_id);
             if let Some(source) = &completion.source {
                 if self
                     .agent_runners
@@ -4773,12 +5023,30 @@ impl ChildCompletionCoordinator {
                     continue;
                 }
             }
+            if acknowledged {
+                self.publish_completion(completion, |_| async {}).await;
+                continue;
+            }
             tracing::debug!(
                 %parent_session_id,
                 child_session_id = %child_id,
                 "child-wait watchdog: replaying terminal child outcome"
             );
-            self.publish_completion(completion).await;
+            let mut check = ChildReplayCheck {
+                registration: &state.registration,
+                wait,
+                acknowledged: None,
+            };
+            let replay = unfinished_child.then_some(&mut check);
+            self.publish_completion(completion, |completion| {
+                // Keep the full coordinator future out of the watchdog's
+                // polling stack, as on the ordinary boxed callback path.
+                Box::pin(self.handle_child_completion(completion, replay))
+            })
+            .await;
+            if let Some(acknowledged) = check.acknowledged {
+                state.acknowledged_replays.insert(child_id, acknowledged);
+            }
         }
         false
     }
@@ -4827,18 +5095,27 @@ impl ChildCompletionCoordinator {
         status: &str,
         error: Option<String>,
     ) {
-        self.publish_completion(ChildCompletion {
-            parent_session_id: parent_session_id.into(),
-            child_session_id: child_session_id.into(),
-            status: status.into(),
-            error,
-            completed_at: Utc::now(),
-            source: None,
-        })
+        self.publish_completion(
+            ChildCompletion {
+                parent_session_id: parent_session_id.into(),
+                child_session_id: child_session_id.into(),
+                status: status.into(),
+                error,
+                completed_at: Utc::now(),
+                source: None,
+            },
+            |completion| async move { self.on_child_completed(completion).await },
+        )
         .await;
     }
 
-    async fn publish_completion(&self, completion: ChildCompletion) {
+    async fn publish_completion<F>(
+        &self,
+        completion: ChildCompletion,
+        on_completion: impl FnOnce(ChildCompletion) -> F + Send,
+    ) where
+        F: std::future::Future<Output = ()> + Send,
+    {
         let publisher =
             crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
                 self.agent_runners.clone(),
@@ -4848,11 +5125,10 @@ impl ChildCompletionCoordinator {
                     self.root_account_sink.as_ref(),
                 ),
             );
-        let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
-        crate::runtime::execution::spawn::publish_child_completion(
+        crate::runtime::execution::spawn::publish_child_completion_with(
             &publisher,
-            Some(handler),
             completion,
+            on_completion,
         )
         .await;
     }
@@ -6879,6 +7155,184 @@ mod tests {
             read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
                 .waiting_for_children
                 .is_some()
+        );
+    }
+
+    struct CountingReplayStorage {
+        inner: Arc<bamboo_storage::SessionStoreV2>,
+        history_reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Storage for CountingReplayStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.history_reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+
+        async fn load_runtime_control_plane(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(id).await
+        }
+
+        async fn load_child_wait_session(
+            &self,
+            parent: &Session,
+            child_id: &str,
+            full: bool,
+        ) -> std::io::Result<Option<Session>> {
+            if full {
+                self.history_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner
+                .load_child_wait_session(parent, child_id, full)
+                .await
+        }
+
+        async fn list_child_run_statuses(
+            &self,
+            id: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            self.inner.list_child_run_statuses(id).await
+        }
+
+        async fn list_sessions_by_run_status(
+            &self,
+            status: &str,
+        ) -> std::io::Result<Vec<(String, Option<String>)>> {
+            self.inner.list_sessions_by_run_status(status).await
+        }
+    }
+
+    async fn acknowledge_replay_outcome(
+        store: &bamboo_storage::SessionStoreV2,
+        inbox: &dyn SessionInboxPort,
+        claim: &bamboo_domain::SessionInboxClaim,
+    ) {
+        let parent_id = &claim.envelope.target_session_id;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        parent.add_message(claim.envelope.to_provider_message().unwrap());
+        parent
+            .session_inbox_admission_mut()
+            .record(claim.envelope.id.clone(), claim.generation);
+        store.save_session(&parent).await.unwrap();
+        inbox.ack(parent_id, claim).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn watchdog_skips_acknowledged_history_and_recovers_a_later_child_with_a_stale_index() {
+        let (temp, store, inbox, mut coordinator, _, launches) = completion_inbox_fixture().await;
+        let storage = Arc::new(CountingReplayStorage {
+            inner: store.clone(),
+            history_reads: AtomicUsize::new(0),
+        });
+        Arc::get_mut(&mut coordinator).unwrap().storage = storage.clone();
+        let parent_id = "watchdog-incremental-parent";
+        let first_id = "watchdog-first";
+        let second_id = "watchdog-second";
+        save_waiting_test_parent(
+            &store,
+            parent_id,
+            vec![first_id.into(), second_id.into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let mut runtime = read_runtime_state(&parent);
+        let wait = runtime.waiting_for_children.as_mut().unwrap();
+        wait.registered_at -= chrono::Duration::minutes(2);
+        write_runtime_state(&mut parent, &runtime);
+        parent.set_last_run_status("suspended");
+        store.save_session(&parent).await.unwrap();
+        save_completion_test_child(&store, parent_id, first_id, "completed").await;
+        save_completion_test_child(&store, parent_id, second_id, "running").await;
+
+        let mut wait_states = HashMap::new();
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
+        let SessionMessageBody::ChildOutcome(outcome) = &claim.envelope.body else {
+            panic!("child outcome");
+        };
+        assert_eq!(outcome.child_session_id, first_id);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap()),
+            runtime
+        );
+
+        let first_receipt = claim.envelope.id.clone();
+        acknowledge_replay_outcome(&store, inbox.as_ref(), claim).await;
+        // Observe the permanent ACK once, as after a cold watchdog start.
+        wait_states.clear();
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        storage.history_reads.store(0, Ordering::SeqCst);
+        for _ in 0..3 {
+            coordinator.sweep_child_waits(&mut wait_states).await;
+        }
+        assert_eq!(storage.history_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().pending, 0);
+
+        // A successor seal must invalidate the recorded ACK even when the
+        // child's terminal status and update timestamp did not change.
+        let mut successor = store.load_session(first_id).await.unwrap().unwrap();
+        let old_updated_at = successor.updated_at;
+        successor.add_message(Message::assistant("successor result", None));
+        successor.updated_at = old_updated_at;
+        ChildCompletionSource::prepare(
+            &mut successor,
+            "watchdog-first-successor",
+            &Default::default(),
+        );
+        store.save_session(&successor).await.unwrap();
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
+        assert_ne!(claim.envelope.id, first_receipt);
+        let SessionMessageBody::ChildOutcome(outcome) = &claim.envelope.body else {
+            panic!("child outcome");
+        };
+        assert_eq!(outcome.child_session_id, first_id);
+        assert_eq!(outcome.result.as_deref(), Some("successor result"));
+        acknowledge_replay_outcome(&store, inbox.as_ref(), claim).await;
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        storage.history_reads.store(0, Ordering::SeqCst);
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        assert_eq!(storage.history_reads.load(Ordering::SeqCst), 0);
+
+        let other_store = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        save_completion_test_child(&other_store, parent_id, second_id, "completed").await;
+        assert!(
+            store
+                .list_child_run_statuses(parent_id)
+                .await
+                .unwrap()
+                .contains(&(second_id.into(), Some("running".into()))),
+            "only the second store observed the terminal index update"
+        );
+        coordinator.sweep_child_waits(&mut wait_states).await;
+        let claims = inbox.claim(parent_id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let SessionMessageBody::ChildOutcome(outcome) = &claims[0].envelope.body else {
+            panic!("child outcome");
+        };
+        assert_eq!(outcome.child_session_id, second_id);
+        assert!(
+            read_runtime_state(&store.load_session(parent_id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
         );
     }
 

@@ -21,6 +21,7 @@ enum Phase {
     Pending,
     Delivered,
     Cancelled,
+    StoppingDelivered,
 }
 
 struct State {
@@ -28,6 +29,12 @@ struct State {
     process: Option<Process>,
     capture_ready: bool,
     outcome: Option<Result<ExitStatus, String>>,
+}
+
+impl State {
+    fn finish(&mut self, outcome: &io::Result<ExitStatus>) {
+        self.outcome = Some(outcome.as_ref().copied().map_err(ToString::to_string));
+    }
 }
 
 pub(crate) struct InitialHandoff {
@@ -109,6 +116,47 @@ impl InitialHandoff {
                 .map_or(Ok(()), |p| p.child_mut().start_kill())
         } else {
             Ok(())
+        }
+    }
+
+    /// Transfer a delivered command's still-retained containment to the sole reaper.
+    pub(crate) fn request_delivered_stop(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.phase == Phase::StoppingDelivered {
+            return true;
+        }
+        if state.phase != Phase::Delivered || matches!(state.outcome, Some(Err(_))) {
+            return false;
+        }
+        let already_reaped = state.outcome.is_some();
+        let Some(process) = state.process.as_mut() else {
+            return false;
+        };
+        if already_reaped || process.child_mut().id().is_none() {
+            // Natural exit can win while Stop is being authorized. Check for
+            // live members without signaling a possibly reused group ID.
+            return process.containment_is_empty().unwrap_or(false);
+        }
+        #[cfg(unix)]
+        process.arm_delivered_stop();
+        state.phase = Phase::StoppingDelivered;
+        drop(state);
+        self.changed();
+        true
+    }
+
+    pub(crate) fn delivered_stop_confirmed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(state.outcome, Some(Ok(_))) {
+            return false;
+        }
+        match state.phase {
+            Phase::StoppingDelivered => true,
+            Phase::Delivered => state
+                .process
+                .as_ref()
+                .is_some_and(|process| process.containment_is_empty().unwrap_or(false)),
+            _ => false,
         }
     }
 
@@ -265,7 +313,7 @@ impl InitialHandoff {
                         .map_err(|_| io::Error::other("initial ownership signal disappeared"))?;
                     continue;
                 }
-                Phase::Cancelled => {
+                Phase::Cancelled | Phase::StoppingDelivered => {
                     let process = self
                         .state
                         .lock()
@@ -278,20 +326,37 @@ impl InitialHandoff {
                 Phase::Delivered => {
                     // Child::wait is cancellation safe. Only poll it while the
                     // short synchronous lock is held, never across an await.
-                    poll_fn(|cx| {
+                    let wait = poll_fn(|cx| {
                         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.phase != Phase::Delivered {
+                            return std::task::Poll::Ready(None);
+                        }
                         let process = state
                             .process
                             .as_mut()
                             .expect("delivered child remains owned");
                         let outcome = pin!(process.child_mut().wait()).poll(cx);
-                        outcome
-                    })
-                    .await
+                        outcome.map(|outcome| {
+                            // Reaping/error and publishing the outcome must share
+                            // the lock with an explicit stop's authority check.
+                            state.finish(&outcome);
+                            Some(outcome)
+                        })
+                    });
+                    tokio::select! {
+                        outcome = wait => if let Some(outcome) = outcome {
+                            self.changed();
+                            return outcome;
+                        },
+                        _ = changed.changed() => {},
+                    }
+                    continue;
                 }
             };
-            self.state.lock().unwrap_or_else(|e| e.into_inner()).outcome =
-                Some(outcome.as_ref().copied().map_err(ToString::to_string));
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish(&outcome);
             self.changed();
             return outcome;
         }
@@ -350,6 +415,12 @@ impl Process {
     fn disarm(&mut self) -> io::Result<()> {
         self.armed = false;
         Ok(())
+    }
+    fn arm_delivered_stop(&mut self) {
+        self.armed = true;
+    }
+    fn containment_is_empty(&self) -> io::Result<bool> {
+        super::group_has_running_members(self.pid).map(|running| !running)
     }
     async fn stop_and_reap(mut self) -> io::Result<ExitStatus> {
         if !self.armed {
@@ -410,6 +481,9 @@ impl Process {
         unreachable!("unsupported initial process cannot be spawned")
     }
     fn disarm(&mut self) -> io::Result<()> {
+        unreachable!("unsupported initial process cannot be spawned")
+    }
+    fn containment_is_empty(&self) -> io::Result<bool> {
         unreachable!("unsupported initial process cannot be spawned")
     }
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {

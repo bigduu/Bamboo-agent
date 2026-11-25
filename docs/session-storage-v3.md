@@ -23,3 +23,19 @@ SQLite connections are retained by the store. The API is synchronous for offline
 This slice implements the transactional store, revisioned reads/writes, and verified shadow import. It does not select runtime read/write authority. Attachments remain unchanged message payloads or existing references; referenced files are not copied into a new attachment store. Search indexing, fork/delete lifecycle, live catch-up and authority switching remain on the current V2 path. V3 has no destructive rollback command. Do not treat disabling a future selector as a rollback procedure.
 
 Tests cover V2 captured-tree equivalence, reopening, admission proof retention, per-row edits and truncation, revisioned pagination, concurrent CAS, Project/creation fences, and whole-tree rollback. Synthetic measurements must be reported with their history size and build mode; these tests establish consistency, not production performance.
+
+## Compare append and runtime writes
+
+Run the same synthetic conversation through V2 and the V3 shadow store:
+
+```sh
+cargo run --locked --release -p bamboo-storage --example v3_compare -- 4096 30
+```
+
+The command creates both stores in a disposable directory and verifies message
+pagination, history after reopening both stores, and the V3 revision. It reports
+append and runtime-only P95 times in microseconds. Main file size and WAL size
+describe the output of one append. The experiment checkpoints the WAL outside
+the timed operation, and its byte counts exclude V2 sidecar/index I/O and
+SQLite checkpoint I/O. Report the message count, samples and build profile with
+results.

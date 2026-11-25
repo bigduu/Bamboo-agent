@@ -18,6 +18,11 @@ use bamboo_domain::{
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
+mod ordinary_root_update;
+pub(crate) use ordinary_root_update::OrdinaryRootJoin;
+use ordinary_root_update::OrdinaryRootRegistry;
+pub use ordinary_root_update::OrdinaryRootUpdateResources;
+
 type AsyncRollback =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
 
@@ -216,6 +221,7 @@ struct ActiveOwner {
     session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
+    parked_update: Option<ParkedRootOwner>,
     /// Scheduling boundary for this owner, not durable queue/authority state.
     /// Keep wait/Guardian outcomes together until this exact Run leaves.
     child_completions_need_successor: bool,
@@ -224,6 +230,12 @@ struct ActiveOwner {
     /// canonical FileSessionInbox and forwards the claimed typed envelope.
     delivery_sink: Option<mpsc::UnboundedSender<u64>>,
     scoped_loop: Option<SupervisorLoopGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct ParkedRootOwner {
+    checkpoint: ParkedUpdateRoot,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +527,8 @@ impl ExpectedRunDeliveryGuard {
 pub struct SessionActivationRouter {
     runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    update_hold: watch::Sender<UpdateHold>,
+    ordinary_root_resources: Option<Arc<OrdinaryRootRegistry>>,
     /// Live operations for one logical target share a fence. Weak entries are
     /// pruned on access; idle/deleted targets retain no separate lock state.
     publication_fences: TargetPublicationFences,
@@ -522,6 +536,186 @@ pub struct SessionActivationRouter {
     inbox: Arc<StdRwLock<Option<Arc<dyn SessionInboxPort>>>>,
     #[cfg(test)]
     terminal_inspection_pause: Arc<Mutex<Option<TerminalInspectionPause>>>,
+}
+
+/// The owning host's temporary hold on new logical execution admissions.
+/// Existing reservations and live owners retain their normal completion paths.
+/// Dropping the hold reopens admission, including after an aborted update.
+#[must_use = "dropping the hold reopens session admissions"]
+pub struct SessionUpdateAdmission {
+    router: SessionActivationRouter,
+    id: uuid::Uuid,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UpdateHold {
+    #[default]
+    Open,
+    Preparing(uuid::Uuid),
+    Committed(uuid::Uuid),
+}
+
+/// An exact Root owner that reached and saved a model-round boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParkedUpdateRoot {
+    pub update_id: uuid::Uuid,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub fence: bamboo_domain::ActorActivationFence,
+    pub conversation_reset_sha256: Option<String>,
+    pub transcript_sha256: String,
+    pub root_tool_authority_revision: u64,
+    pub project_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub message_id: String,
+    pub message_count: usize,
+    pub model: bamboo_domain::ProviderModelRef,
+}
+
+impl ParkedUpdateRoot {
+    pub fn hash_transcript(messages: &[bamboo_domain::Message]) -> serde_json::Result<String> {
+        let value = serde_json::to_value(messages)?;
+        let bytes = bamboo_domain::session::inbox::canonical_json_bytes(&value);
+        Ok(bamboo_domain::session::model_context::sha256_hex(&bytes))
+    }
+}
+
+impl SessionUpdateAdmission {
+    /// Logical sessions whose activation or preparation was already admitted.
+    /// Physical work and durable checkpoint verification belong to the host.
+    pub async fn outstanding_sessions(&self) -> Vec<String> {
+        let states = self.router.states.lock().await;
+        let mut outstanding: Vec<_> = states
+            .iter()
+            .filter(|(_, state)| state.owner.is_some() || state.activation_reserved)
+            .map(|(target, _)| target.clone())
+            .collect();
+        outstanding.sort_unstable();
+        outstanding
+    }
+
+    /// Snapshot of prepared Root rounds. Other resource lifetimes and final
+    /// process-replacement readiness are separate host checks.
+    pub async fn parked_roots(&self) -> Vec<ParkedUpdateRoot> {
+        let states = self.router.states.lock().await;
+        let mut parked: Vec<_> = states
+            .values()
+            .filter_map(|state| self.parked_root(state).cloned())
+            .collect();
+        parked.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        parked
+    }
+
+    fn parked_root<'a>(&self, target: &'a TargetActivationState) -> Option<&'a ParkedUpdateRoot> {
+        let owner = target.owner.as_ref().filter(|owner| !owner.finalizing)?;
+        owner
+            .parked_update
+            .as_ref()
+            .filter(|root| root.checkpoint.update_id == self.id && !root.cancel.is_cancelled())
+            .map(|root| &root.checkpoint)
+    }
+
+    /// After checking physical work on the host, publish a durable handoff
+    /// under the same lock as the complete parked-owner inventory. The
+    /// publisher performs the bounded atomic write and must not call the
+    /// activation router. Failed writes keep the original runs parked and
+    /// abortable. Committed admission remains closed until process exit.
+    pub async fn commit_parked_roots(
+        &self,
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()> + Send,
+    ) -> std::io::Result<()> {
+        if self.router.ordinary_root_resources.is_some() {
+            return Err(std::io::Error::other(
+                "managed updates require ordinary Root resource proof",
+            ));
+        }
+        let states = self.router.states.lock().await;
+        let parked = self.complete_parked_inventory(&states)?;
+        self.publish_parked_roots(&parked, publish)
+    }
+
+    /// Acquire a reversible hold on the canonical resource domains. A busy
+    /// owner can finish naturally without giving up its current execution.
+    pub async fn try_hold_ordinary_root_resources(
+        &self,
+    ) -> std::io::Result<Option<OrdinaryRootUpdateResources>> {
+        let states = self.router.states.lock().await;
+        let parked = match self.complete_parked_inventory(&states) {
+            Ok(parked) => parked,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.router
+            .ordinary_root_resources
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ordinary Root resource tracking is unavailable"))?
+            .try_hold(self, parked)
+    }
+
+    /// Recheck the exact resource and checkpoint inventory at the publication
+    /// boundary. The publisher must not call back into the activation router.
+    pub async fn commit_parked_roots_with_resources(
+        &self,
+        resources: &OrdinaryRootUpdateResources,
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()> + Send,
+    ) -> std::io::Result<()> {
+        let states = self.router.states.lock().await;
+        let parked = self.complete_parked_inventory(&states)?;
+        resources.validate_for(self, &parked)?;
+        self.publish_parked_roots(&parked, publish)
+    }
+
+    fn complete_parked_inventory(
+        &self,
+        states: &HashMap<String, TargetActivationState>,
+    ) -> std::io::Result<Vec<ParkedUpdateRoot>> {
+        if self.router.preparing_update() != Some(self.id) {
+            return Err(update_busy());
+        }
+        let mut parked = Vec::new();
+        for state in states.values() {
+            if state.activation_reserved {
+                return Err(update_busy());
+            }
+            if state.owner.is_some() {
+                parked.push(self.parked_root(state).ok_or_else(update_busy)?.clone());
+            }
+        }
+        parked.sort_unstable_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(parked)
+    }
+
+    fn publish_parked_roots(
+        &self,
+        parked: &[ParkedUpdateRoot],
+        publish: impl FnOnce(&[ParkedUpdateRoot]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        publish(parked)?;
+        self.router
+            .update_hold
+            .send_replace(UpdateHold::Committed(self.id));
+        Ok(())
+    }
+}
+
+fn update_busy() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "Session update preparation is incomplete",
+    )
+}
+
+impl Drop for SessionUpdateAdmission {
+    fn drop(&mut self) {
+        self.router.update_hold.send_if_modified(|hold| {
+            if *hold == UpdateHold::Preparing(self.id) {
+                *hold = UpdateHold::Open;
+                return true;
+            }
+            false
+        });
+    }
 }
 
 type TargetPublicationFences = Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>;
@@ -965,6 +1159,167 @@ impl SessionActivationRouter {
         Arc::new(Self::default())
     }
 
+    /// Install before the managed Host starts accepting any executions.
+    pub fn new_for_managed_update() -> Arc<Self> {
+        Arc::new(Self {
+            ordinary_root_resources: Some(Arc::new(OrdinaryRootRegistry::default())),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn tracks_ordinary_root_update(&self) -> bool {
+        self.ordinary_root_resources.is_some()
+    }
+
+    pub(crate) fn owns_ordinary_root_resources(
+        &self,
+        resources: Option<&bamboo_tools::LocalTaskResources>,
+        writer: Option<&bamboo_domain::RootActorRuntimeWrite>,
+    ) -> bool {
+        match (&self.ordinary_root_resources, resources, writer) {
+            (Some(registry), Some(resources), Some(writer)) => registry.owns(resources, writer),
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn enroll_ordinary_root_resources(
+        self: &Arc<Self>,
+        session: &bamboo_domain::Session,
+        writer: bamboo_domain::RootActorRuntimeWrite,
+        ownership: &SessionRunOwnership,
+        joined: OrdinaryRootJoin,
+    ) -> std::io::Result<bamboo_tools::LocalTaskResources> {
+        let states = self.states.lock().await;
+        let registry = self.ordinary_root_resources.as_ref().ok_or_else(|| {
+            std::io::Error::other("ordinary Root resource tracking is unavailable")
+        })?;
+        let owner = states
+            .get(&session.id)
+            .and_then(|state| state.owner.as_ref());
+        if !ownership.matches_router(self)
+            || ownership.target_session_id != session.id
+            || ownership.run_id != writer.fence.run_id
+            || !owner.is_some_and(|owner| {
+                Arc::ptr_eq(&owner.instance, &ownership.instance)
+                    && owner.run_id == ownership.run_id
+                    && owner.session_created_at == Some(session.created_at)
+                    && owner.registrations > 0
+                    && !owner.finalizing
+            })
+        {
+            let reason = "ordinary Root resource owner lost its exact activation";
+            registry.unconfirmed(reason)?;
+            return Err(std::io::Error::other(reason));
+        }
+        registry.enroll(session, writer, joined)
+    }
+
+    /// Legacy/direct ordinary execution may continue while the Host is open.
+    /// It invalidates managed replacement proof when no physical owner exists.
+    pub(crate) async fn observe_unowned_ordinary_root(&self) -> std::io::Result<()> {
+        let Some(registry) = &self.ordinary_root_resources else {
+            return Ok(());
+        };
+        let _states = self.states.lock().await;
+        if self.admissions_held() {
+            return Err(update_busy());
+        }
+        registry.unconfirmed("ordinary Root execution has no managed resource owner")
+    }
+
+    /// Hold new admissions for a planned update. The state lock orders this
+    /// with registration and Inbox reservation, including in-flight launches.
+    pub async fn hold_admissions_for_update(&self) -> Option<SessionUpdateAdmission> {
+        let _states = self.states.lock().await;
+        if self.admissions_held() {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4();
+        self.update_hold.send_replace(UpdateHold::Preparing(id));
+        Some(SessionUpdateAdmission {
+            router: self.clone(),
+            id,
+        })
+    }
+
+    pub(crate) fn preparing_update(&self) -> Option<uuid::Uuid> {
+        match *self.update_hold.borrow() {
+            UpdateHold::Preparing(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn admissions_held(&self) -> bool {
+        *self.update_hold.borrow() != UpdateHold::Open
+    }
+
+    /// Wait between model rounds under the exact registered Root. An aborted
+    /// update releases the same loop, with its original execution budget.
+    pub(crate) async fn park_root_for_update(
+        &self,
+        root: ParkedUpdateRoot,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, bamboo_agent_core::AgentError> {
+        let update = root.update_id;
+        let session_id = root.session_id.clone();
+        let run_id = root.fence.run_id.clone();
+        let mut hold = self.update_hold.subscribe();
+        {
+            let mut states = self.states.lock().await;
+            if cancel.is_cancelled() {
+                return Err(bamboo_agent_core::AgentError::Cancelled);
+            }
+            if self.preparing_update() != Some(update) {
+                return Ok(false);
+            }
+            let Some(owner) = states
+                .get_mut(&session_id)
+                .and_then(|state| state.owner.as_mut())
+                .filter(|owner| {
+                    owner.run_id == run_id
+                        && owner.session_created_at == Some(root.created_at)
+                        && owner.registrations > 0
+                        && !owner.finalizing
+                })
+            else {
+                return Ok(false);
+            };
+            owner.parked_update = Some(ParkedRootOwner {
+                checkpoint: root,
+                cancel: cancel.clone(),
+            });
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(bamboo_agent_core::AgentError::Cancelled),
+            phase = hold.wait_for(|phase| *phase != UpdateHold::Preparing(update)) => {
+                Ok(phase.is_ok_and(|phase| *phase == UpdateHold::Committed(update)))
+            }
+        };
+        let mut states = self.states.lock().await;
+        if let Some(owner) = states
+            .get_mut(&session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                owner.run_id == run_id
+                    && owner
+                        .parked_update
+                        .as_ref()
+                        .is_some_and(|root| root.checkpoint.update_id == update)
+            })
+        {
+            owner.parked_update = None;
+        }
+        // A cancellation may wake the parked task during the publisher's
+        // atomic write. Read the outcome under the same lock as publication.
+        let committed = *hold.borrow() == UpdateHold::Committed(update);
+        if committed {
+            Ok(true)
+        } else {
+            result
+        }
+    }
+
     /// Late-bind the real server/SDK reservation adapter after its dependency
     /// graph has been assembled.
     pub async fn set_spawner(&self, spawner: Arc<dyn SessionActivationSpawner>) {
@@ -1122,6 +1477,12 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(candidate.generation);
+                if self.admissions_held() {
+                    return Ok(SessionWakeReconcileResult {
+                        disposition: None,
+                        next_due_at: Some(now + Duration::seconds(1)),
+                    });
+                }
                 if let Some(owner) = state.owner.as_mut() {
                     if !owner.finalizing {
                         state.notify.send_replace(candidate.generation);
@@ -1209,6 +1570,7 @@ impl SessionActivationRouter {
             session_created_at: None,
             finalizing: false,
             registrations: 0,
+            parked_update: None,
             child_completions_need_successor: false,
             delivery_sink: None,
             scoped_loop: None,
@@ -1384,8 +1746,19 @@ impl SessionActivationRouter {
     ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
         loop {
             let (notifications, reservation_wait) = {
-                let _publication = self.lock_publication(target_session_id).await;
+                let publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
+                if self.admissions_held()
+                    && states
+                        .get(target_session_id)
+                        .is_none_or(|state| state.owner.is_none())
+                {
+                    let mut update = self.update_hold.subscribe();
+                    drop(states);
+                    drop(publication);
+                    let _ = update.wait_for(|phase| *phase == UpdateHold::Open).await;
+                    continue;
+                }
                 let state = states.entry(target_session_id.to_string()).or_default();
                 match state.owner.as_mut() {
                     Some(owner)
@@ -1445,6 +1818,7 @@ impl SessionActivationRouter {
                             session_created_at: birth,
                             finalizing: false,
                             registrations: 1,
+                            parked_update: None,
                             child_completions_need_successor: false,
                             delivery_sink: None,
                             scoped_loop: None,
@@ -1557,6 +1931,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: true,
                     registrations: 0,
+                    parked_update: None,
                     child_completions_need_successor: false,
                     delivery_sink: None,
                     scoped_loop: None,
@@ -1681,6 +2056,7 @@ impl SessionActivationRouter {
             if (state.latest_generation > state.last_dispatched_generation
                 || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1787,6 +2163,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -1869,6 +2246,7 @@ impl SessionActivationRouter {
                 && (state.latest_generation > state.last_dispatched_generation
                     || released_prefix > state.last_dispatched_coordinator_generation)
                 && !state.activation_reserved
+                && !self.admissions_held()
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
@@ -2023,6 +2401,7 @@ impl SessionActivationRouter {
                         session_created_at: None,
                         finalizing: false,
                         registrations: 0,
+                        parked_update: None,
                         child_completions_need_successor: false,
                         delivery_sink: None,
                         scoped_loop: None,
@@ -2056,6 +2435,7 @@ impl SessionActivationRouter {
                     session_created_at: None,
                     finalizing: false,
                     registrations: 0,
+                    parked_update: None,
                     child_completions_need_successor: false,
                     delivery_sink: None,
                     scoped_loop: None,
@@ -2365,6 +2745,15 @@ impl SessionActivationRouter {
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 state.latest_generation = state.latest_generation.max(inbox_generation);
+                if self.admissions_held() {
+                    if let Some(startup) = runtime_startup
+                        .as_ref()
+                        .filter(|startup| startup.receipt.generation == state.latest_generation)
+                    {
+                        state.runtime_startup = Some(startup.clone());
+                    }
+                    return Ok(SessionActivationDisposition::ActivationCoalesced);
+                }
                 if let Some(owner) = state.owner.as_mut() {
                     if let Some(startup) = runtime_startup
                         .as_ref()
@@ -2976,6 +3365,123 @@ mod tests {
             entered: None,
             release: None,
         })
+    }
+
+    #[tokio::test]
+    async fn update_admission_defers_new_runs_and_preserves_the_durable_inbox() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        for id in ["active", "manual"] {
+            store
+                .save_session(&Session::new(id, "model"))
+                .await
+                .unwrap();
+        }
+        let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+        let router = SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut active = router.register_run("active", "previous").await.unwrap();
+
+        let update = router.hold_admissions_for_update().await.unwrap();
+        assert!(router.hold_admissions_for_update().await.is_none());
+        assert_eq!(update.outstanding_sessions().await, ["active"]);
+        assert!(router.owns_run("active", "previous").await);
+
+        let mut manual = {
+            let router = router.clone();
+            tokio::spawn(async move { router.register_run("manual", "fresh").await.unwrap() })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut manual)
+                .await
+                .is_err()
+        );
+        assert_eq!(update.outstanding_sessions().await, ["active"]);
+
+        let receipt = inbox
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input("active", "queued during update"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .request_activation("active", receipt.generation)
+                .await
+                .unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        active.begin_finalization().await;
+        assert_eq!(active.finish(0).await.unwrap(), None);
+        assert!(update.outstanding_sessions().await.is_empty());
+        let now = Utc::now();
+        let deferred = router.reconcile_wake("active", now).await.unwrap();
+        assert!(deferred.disposition.is_none() && deferred.next_due_at.is_some());
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+
+        drop(update);
+        let manual = tokio::time::timeout(std::time::Duration::from_secs(5), manual)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(router.owns_run("manual", "fresh").await);
+        assert_eq!(
+            router
+                .reconcile_wake("active", now)
+                .await
+                .unwrap()
+                .disposition,
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+        manual.abandon().await;
+    }
+
+    #[tokio::test]
+    async fn update_admission_keeps_a_preexisting_reservation_visible_until_finalization() {
+        let router = SessionActivationRouter::new();
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let spawner = Arc::new(RecordingSpawner {
+            reservations: AtomicUsize::new(0),
+            launches: Arc::new(AtomicUsize::new(0)),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        });
+        router.set_spawner(spawner.clone()).await;
+        let dispatch = {
+            let router = router.clone();
+            tokio::spawn(async move { router.request_activation("prior", 1).await.unwrap() })
+        };
+        entered.wait().await;
+
+        let update = router.hold_admissions_for_update().await.unwrap();
+        assert_eq!(update.outstanding_sessions().await, ["prior"]);
+        assert_eq!(
+            router.request_activation("later", 1).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        release.notify_one();
+        assert_eq!(
+            dispatch.await.unwrap(),
+            SessionActivationDisposition::ActivationReserved
+        );
+        let mut admitted = router.register_run("prior", "run-1").await.unwrap();
+        assert_eq!(update.outstanding_sessions().await, ["prior"]);
+        admitted.begin_finalization().await;
+        assert_eq!(admitted.finish(1).await.unwrap(), None);
+        assert!(update.outstanding_sessions().await.is_empty());
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
     }
 
     struct BlockingInspectInbox {
