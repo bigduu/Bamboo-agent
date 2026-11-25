@@ -280,7 +280,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // and server-app-state owners. Its live Host case stays in the ordinary Root
 // Inbox lifecycle target. The existing five contexts and 23 additive cases
 // retain their current owners.
-const FEATURE_SOURCE_SHA256 = "79b4cc14f0d1b6e71eb9b7aca819fcd06ec95a2c0f181c1bf3f514b766a3e4b9";
+// #3088 keeps provider-stream and planned-update regressions in the default
+// Engine and Server owners. The provider execution source records change;
+// all five additive contexts and 23 case selections retain their owners.
+const FEATURE_SOURCE_SHA256 = "5c82fe1ea5016293fa5f6068d9435d3c8eace4db18518b8ae2f753c4717fec4b";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

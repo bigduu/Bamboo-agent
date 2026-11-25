@@ -21,6 +21,7 @@ use super::planned_update_handoff::{self, PublishedHandoff, UpdateResumeReport};
 pub const MANAGED_SHUTDOWN_DIR_ENV: &str = "BAMBOO_MANAGED_SHUTDOWN_DIR";
 
 const UPDATE_CAPABILITY: &str = "planned-update-v1";
+const IMMEDIATE_UPDATE_CAPABILITY: &str = "immediate-update-v1";
 const UPDATE_COMMAND: &str = "planned-update-command.json";
 const UPDATE_RESULT: &str = "planned-update-result.json";
 const UPDATE_VERSION: u8 = 1;
@@ -67,6 +68,7 @@ impl ManagedShutdown {
             "ready",
             "stop",
             UPDATE_CAPABILITY,
+            IMMEDIATE_UPDATE_CAPABILITY,
             UPDATE_COMMAND,
             UPDATE_RESULT,
         ] {
@@ -92,6 +94,7 @@ impl ManagedShutdown {
     ) -> io::Result<()> {
         if state.is_some() {
             File::create_new(self.directory.join(UPDATE_CAPABILITY))?;
+            File::create_new(self.directory.join(IMMEDIATE_UPDATE_CAPABILITY))?;
         }
         File::create_new(self.directory.join("ready"))?;
         let handle = server.handle();
@@ -122,6 +125,7 @@ struct UpdateCommand {
 #[serde(rename_all = "snake_case")]
 enum UpdateCommandKind {
     Prepare,
+    PrepareImmediate,
     Abort,
     Commit,
     Resume,
@@ -179,6 +183,7 @@ enum UpdatePhase {
     Idle,
     Preparing {
         request: Uuid,
+        immediate: bool,
         host: HostUpdatePreparation,
         deadline: Instant,
     },
@@ -210,7 +215,8 @@ impl UpdateProtocol<'_> {
 
     async fn process(&mut self, request: Uuid, command: UpdateCommandKind) -> UpdateStatus {
         let result = match command {
-            UpdateCommandKind::Prepare => self.prepare(request).await,
+            UpdateCommandKind::Prepare => self.prepare(request, false).await,
+            UpdateCommandKind::PrepareImmediate => self.prepare(request, true).await,
             UpdateCommandKind::Abort => self.abort(request),
             UpdateCommandKind::Commit => self.commit(request).await,
             UpdateCommandKind::Resume => self.resume(request).await,
@@ -223,7 +229,7 @@ impl UpdateProtocol<'_> {
         }
     }
 
-    async fn prepare(&mut self, request: Uuid) -> io::Result<UpdateStatus> {
+    async fn prepare(&mut self, request: Uuid, immediate: bool) -> io::Result<UpdateStatus> {
         if self.revoked == Some(request) {
             return Ok(UpdateStatus::Revoked);
         }
@@ -234,7 +240,7 @@ impl UpdateProtocol<'_> {
                     "The running Host cannot prepare a planned update",
                 ));
             }
-            let host = match self.state.begin_planned_update().await {
+            let host = match self.state.begin_update(immediate).await {
                 Ok(host) => host,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     return Ok(UpdateStatus::busy(error.to_string()));
@@ -243,6 +249,7 @@ impl UpdateProtocol<'_> {
             };
             self.phase = UpdatePhase::Preparing {
                 request,
+                immediate,
                 host,
                 deadline: Instant::now() + PREPARE_LEASE,
             };
@@ -250,9 +257,15 @@ impl UpdateProtocol<'_> {
         match &mut self.phase {
             UpdatePhase::Preparing {
                 request: owner,
+                immediate: owned_mode,
                 host,
                 deadline,
             } if request == *owner => {
+                if *owned_mode != immediate {
+                    return Err(io::Error::other(
+                        "The update is preparing in a different mode",
+                    ));
+                }
                 *deadline = Instant::now() + PREPARE_LEASE;
                 match host.observe().await {
                     Ok(HostUpdateReadiness::Ready) => Ok(UpdateStatus::Ready),
@@ -519,6 +532,12 @@ mod tests {
         assert_eq!(accepted.request_id, request_id);
         assert_eq!(accepted.sequence, 1);
         assert!(matches!(accepted.command, UpdateCommandKind::Prepare));
+        command["command"] = serde_json::json!("prepare_immediate");
+        fs::write(&path, command.to_string()).unwrap();
+        assert!(matches!(
+            read_command(&path).unwrap().command,
+            UpdateCommandKind::PrepareImmediate
+        ));
 
         command["sequence"] = serde_json::json!(0);
         fs::write(&path, command.to_string()).unwrap();

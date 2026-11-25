@@ -1154,6 +1154,7 @@ async fn rejected_round_cap_summary_clears_responses_id_before_resume() {
             task_split: None,
             standalone_discovery: false,
             round_cap_summary: true,
+            immediate_update: None,
         }),
     )
     .await
@@ -1282,6 +1283,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
                 }),
                 round_cap_summary: false,
                 standalone_discovery: false,
+                immediate_update: None,
             }),
         )
         .await;
