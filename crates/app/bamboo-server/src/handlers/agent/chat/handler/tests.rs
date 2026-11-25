@@ -206,15 +206,12 @@ async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
             .count(),
         128
     );
-    assert_eq!(
-        state
-            .session_inbox
-            .inspect("partial-batch-root")
-            .await
-            .unwrap()
-            .pending,
-        1
-    );
+    let before_retry = state
+        .session_inbox
+        .inspect("partial-batch-root")
+        .await
+        .unwrap();
+    assert_eq!(before_retry.pending, 1);
     let mut seen = BTreeSet::new();
     for _ in 0..128 {
         let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
@@ -227,9 +224,47 @@ async fn partial_queued_ingress_emits_every_committed_message_before_retry() {
             panic!("expected committed MessageAppended event");
         }
     }
-    super::ingress::admit_for_execute(&state, "partial-batch-root")
-        .await
-        .unwrap();
+    if let Err(response) = super::ingress::admit_for_execute(&state, "partial-batch-root").await {
+        let status = response.status();
+        let body = actix_web::body::to_bytes_limited(response.into_body(), 1024)
+            .await
+            .map(|result| result.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()));
+        let tail = bamboo_domain::SessionMessageId::parse("partial-input-128").unwrap();
+        let marker = |snapshot: &Session| snapshot.metadata.get("chat.queued_ingress.v1").cloned();
+        eprintln!(
+            "queued ingress retry returned {status}: {body:?}; before={before_retry:?}, marker={:?}",
+            marker(&history)
+        );
+
+        let durable_evidence = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let backlog = state.session_inbox.inspect("partial-batch-root").await;
+            let snapshot = state
+                .storage
+                .load_session("partial-batch-root")
+                .await
+                .map(|loaded| {
+                    loaded.map(|snapshot| {
+                        (
+                            marker(&snapshot),
+                            snapshot
+                                .messages
+                                .iter()
+                                .any(|message| message.id == tail.as_str()),
+                        )
+                    })
+                });
+            let receipt = state
+                .session_inbox
+                .was_admitted("partial-batch-root", &tail)
+                .await;
+            (backlog, snapshot, receipt)
+        })
+        .await;
+        panic!(
+            "queued ingress retry failed; subsequent readback \
+             (backlog, (marker, tail ID present), admitted receipt)={durable_evidence:?}"
+        );
+    }
     let change = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
         .await
         .unwrap()
