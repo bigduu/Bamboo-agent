@@ -4923,6 +4923,7 @@ impl ChildCompletionCoordinator {
         }
 
         if !dead.is_empty() {
+            let mut published_synthetic_completion = false;
             for entry in dead {
                 tracing::warn!(
                     %parent_session_id,
@@ -4950,10 +4951,15 @@ impl ChildCompletionCoordinator {
                         Some(entry.reason),
                     )
                     .await;
+                    published_synthetic_completion = true;
                 }
             }
-            // The publishes above re-evaluate the wait policy themselves.
-            return false;
+            // Synthetic publications re-evaluate the wait themselves. Owned
+            // Child reconciliation does not publish an outcome, so it cannot
+            // replace replaying the terminal siblings observed in this sweep.
+            if published_synthetic_completion {
+                return false;
+            }
         }
 
         // A lost callback must not hide one ready result behind an unfinished
@@ -7185,6 +7191,83 @@ mod tests {
                 .waiting_for_children
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_replays_sealed_sibling_with_stale_owned_child() {
+        for policy in [
+            ChildWaitPolicy::All,
+            ChildWaitPolicy::Any,
+            ChildWaitPolicy::FirstError,
+        ] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "stale-sibling-parent";
+            let stale_id = "stale-owned-child";
+            let sealed_id = "sealed-sibling";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec![stale_id.into(), sealed_id.into()],
+                policy,
+            )
+            .await;
+            let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+            let mut runtime = read_runtime_state(&parent);
+            let wait = runtime.waiting_for_children.as_mut().unwrap();
+            wait.registered_at -= chrono::Duration::seconds(CHILD_WAIT_REGISTRATION_GRACE_SECS + 1);
+            let wait = wait.clone();
+            write_runtime_state(&mut parent, &runtime);
+            store.save_session(&parent).await.unwrap();
+
+            // An owned Child with no Actor activation or Host completion can
+            // remain stale across sweeps. The sibling's callback has been lost.
+            let mut stale = Session::new_child_of(stale_id, &parent, "model", "Child");
+            stale.set_last_run_status("running");
+            stale.updated_at -= chrono::Duration::seconds(DEAD_CHILD_GRACE_SECS + 1);
+            store.save_session(&stale).await.unwrap();
+            let stale = store
+                .load_runtime_control_plane(stale_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.parent_session_id.as_deref(), Some(parent_id));
+            assert!(
+                Utc::now()
+                    .signed_duration_since(stale.updated_at)
+                    .num_seconds()
+                    >= DEAD_CHILD_GRACE_SECS
+            );
+            assert!(stale.host_run_id().is_none());
+            assert!(!ChildCompletionSource::has_source_record(&stale));
+            let sealed = save_completion_test_child(&store, parent_id, sealed_id, "error").await;
+            assert!(sealed.source.is_some());
+
+            coordinator.sweep_child_wait_for_test(parent_id, wait).await;
+
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(
+                claims.len(),
+                1,
+                "sealed sibling must be delivered for {policy:?}"
+            );
+            assert!(matches!(
+                &claims[0].envelope.body,
+                SessionMessageBody::ChildOutcome(outcome)
+                    if outcome.child_session_id == sealed_id && outcome.status == "error"
+            ));
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            let parent = store.load_session(parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                read_runtime_state(&parent).waiting_for_children.is_some(),
+                policy == ChildWaitPolicy::All
+            );
+            let stale = store
+                .load_runtime_control_plane(stale_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.last_run_status().as_deref(), Some("running"));
+        }
     }
 
     struct CountingReplayStorage {
