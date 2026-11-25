@@ -408,6 +408,7 @@ pub(crate) struct RoundRecoveryPolicy<'a> {
     pub task_split: Option<TaskSplitPrompt<'a>>,
     pub standalone_discovery: bool,
     pub round_cap_summary: bool,
+    pub immediate_update: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable

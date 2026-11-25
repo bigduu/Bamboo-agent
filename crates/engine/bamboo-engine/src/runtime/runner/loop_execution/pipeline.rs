@@ -3767,18 +3767,7 @@ async fn run_pipeline_inner(
             )
             .await?
         {
-            let reason = crate::runtime::planned_update::SUSPEND_REASON;
-            state.runtime_state.status = AgentStatusState::Suspended;
-            state.runtime_state.suspension = Some(SuspensionState {
-                reason: reason.into(),
-                suspended_at: Utc::now(),
-                resumable: true,
-                hook_point: None,
-            });
-            session
-                .metadata
-                .insert("runtime.suspend_reason".into(), reason.into());
-            state_bridge::write_runtime_state(session, &state.runtime_state);
+            crate::runtime::planned_update::mark_suspended(session, &mut state.runtime_state);
             break;
         }
         if (split_recovery.is_some() || config.effective_counted_loop().is_some())
@@ -4050,6 +4039,7 @@ async fn run_pipeline_inner(
         let mut round_had_tool_calls = false;
         let mut terminal_error: Option<AgentError> = None;
         let mut hook_suspension: Option<AgentError> = None;
+        let interrupted_for_update = AtomicBool::new(false);
 
         // Canonical usage + activity for THIS round, shared by runtime budget
         // totals and durable metrics. Reset every round; accumulated across
@@ -4135,6 +4125,12 @@ async fn run_pipeline_inner(
                 }),
                 standalone_discovery,
                 round_cap_summary: max_rounds_summary_used,
+                immediate_update: (attempt == 1
+                    && split_recovery.is_none()
+                    && output_limit_recovery.is_none()
+                    && !standalone_discovery
+                    && !max_rounds_summary_used)
+                    .then_some(&interrupted_for_update),
             };
             let split_tools;
             let request_tools = match split_request.as_ref() {
@@ -4169,6 +4165,7 @@ async fn run_pipeline_inner(
             .await
             {
                 Ok(output) => output,
+                Err(AgentError::Cancelled) if interrupted_for_update.load(Ordering::Relaxed) => break,
                 Err(error) if output_limit_recovery.is_some() || standalone_discovery || max_rounds_summary_used => {
                     terminal_error = Some(error);
                     break;
@@ -5016,6 +5013,11 @@ async fn run_pipeline_inner(
         // terminal validation/post-LLM failure must retain the same accumulated
         // usage that its durable round record receives below.
         round_activity.commit_to_runtime(&mut state.runtime_state);
+
+        if interrupted_for_update.into_inner() {
+            crate::runtime::planned_update::mark_suspended(session, &mut state.runtime_state);
+            break;
+        }
 
         if let Some(error) = hook_suspension {
             return Err(error);
