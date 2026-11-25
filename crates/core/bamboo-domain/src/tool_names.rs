@@ -91,7 +91,7 @@ pub const SERVER_TOOL_NAMES: [&str; 12] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 30] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 31] = [
     "SubAgent",
     "Project",
     "archive_context",
@@ -113,6 +113,7 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 30] = [
     SESSION_LOOP_TOOL_NAME,
     PACED_LOOP_WAKEUP_TOOL_NAME,
     "session_message",
+    SESSION_COORDINATION_TOOL_NAME,
     "supervisor_log_monitor",
     "workflow_run",
     "work_overview",
@@ -126,6 +127,7 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 30] = [
 
 pub const SESSION_LOOP_TOOL_NAME: &str = "session_loop";
 pub const PACED_LOOP_WAKEUP_TOOL_NAME: &str = "schedule_loop_wakeup";
+pub const SESSION_COORDINATION_TOOL_NAME: &str = "session_coordination";
 
 /// Resolve any model- or host-facing tool reference to one canonical identity.
 ///

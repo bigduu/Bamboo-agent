@@ -12,7 +12,10 @@ use bamboo_agent_core::tools::{
     PENDING_TOOL_OPERATION_METADATA_KEY,
 };
 use bamboo_agent_core::{AgentError, PendingQuestionSource, Session};
-use bamboo_domain::{permission_request_generation, AgentRuntimeState, PermissionMode};
+use bamboo_domain::{
+    permission_request_generation, AgentRuntimeState, PermissionMode,
+    SESSION_COORDINATION_TOOL_NAME,
+};
 use bamboo_tools::permission::{
     PermissionConfig, PermissionDecision, PermissionDecisionKind, PermissionDecisionReceipt,
     PermissionRequest,
@@ -377,6 +380,14 @@ fn replay_framework_instance_available(
     retained: Option<&RetainedToolExecution>,
     executor: &dyn ToolExecutor,
 ) -> bool {
+    if name == SESSION_COORDINATION_TOOL_NAME {
+        return retained.is_some_and(|retained| {
+            retained.execution_name() == name
+                && retained.execution_contract()
+                    == Some(bamboo_tools::scoped_session_send_permission::SESSION_COORDINATION_EXECUTION_CONTRACT)
+                && retained.framework_instance_is_available(executor)
+        });
+    }
     let kind = bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(name);
     let root_semantics = retained.and_then(RetainedToolExecution::execution_contract)
         == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
@@ -1932,6 +1943,46 @@ mod tests {
     struct FrozenOwnerProbe {
         names: Vec<&'static str>,
         resolver_queries: std::sync::atomic::AtomicUsize,
+    }
+
+    #[test]
+    fn retained_coordination_replay_requires_its_frozen_contract_and_current_instance() {
+        use framework_fixture::{park, FixtureTools};
+        let name = SESSION_COORDINATION_TOOL_NAME;
+        let contract =
+            bamboo_tools::scoped_session_send_permission::SESSION_COORDINATION_EXECUTION_CONTRACT;
+        let host = FixtureTools::new(&[name]);
+        let call = ToolCall {
+            id: "parked-coordination".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: r#"{"action":"send"}"#.into(),
+            },
+        };
+        let mut unknown = Session::new("unknown-coordination-contract", "model");
+        let target = park(&mut unknown, &call, name, false, None);
+        assert!(
+            resolve_permission_replay_owner(&unknown, &target, host.as_ref())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut session = Session::new("known-coordination-contract", "model");
+        let target = park(&mut session, &call, name, true, Some(contract));
+        assert_eq!(
+            resolve_permission_replay_owner(&session, &target, host.as_ref())
+                .unwrap()
+                .as_deref(),
+            Some(name)
+        );
+        host.proofs_enabled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            resolve_permission_replay_owner(&session, &target, host.as_ref())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
