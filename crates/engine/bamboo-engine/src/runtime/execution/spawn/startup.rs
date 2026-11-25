@@ -19,7 +19,7 @@ const SETUP_FAILED: &str = "Startup failed before the task could enter execution
 #[derive(Clone)]
 enum Progress {
     Queued,
-    Preparing,
+    Preparing(Instant),
     Native {
         progress: watch::Receiver<NativeTaskStartup>,
         cancel: CancellationToken,
@@ -69,7 +69,9 @@ impl ChildStartup {
     }
 
     pub(super) fn preparing(&self) {
-        self.0.progress.send_replace(Progress::Preparing);
+        self.0
+            .progress
+            .send_replace(Progress::Preparing(Instant::now()));
     }
 
     pub(crate) fn observe_native(
@@ -137,30 +139,24 @@ impl ChildStartup {
     }
 
     pub(super) fn watch(self, ctx: SpawnContext, job: SpawnJob) {
-        let deadline = Instant::now() + STARTUP_CHECK_DELAY;
         tokio::spawn(async move {
-            if self.preparation_delayed(deadline).await {
+            if self.preparation_delayed().await {
                 self.notify(&ctx, &job, PREPARATION_DELAYED).await;
             }
         });
     }
 
-    async fn preparation_delayed(&self, deadline: Instant) -> bool {
+    async fn preparation_delayed(&self) -> bool {
         let mut progress = self.0.progress.subscribe();
-        let timer = tokio::time::sleep_until(deadline);
-        tokio::pin!(timer);
-        let mut queued_at_deadline = false;
         loop {
             let stage = progress.borrow_and_update().clone();
-            if let Progress::Native { progress, cancel } = stage {
-                return self.native_preparation_delayed(progress, cancel).await;
-            }
-            if queued_at_deadline && matches!(stage, Progress::Preparing) {
-                // Capacity/queue waits can be indefinite. The dequeue event
-                // starts a fresh finite preparation window without polling.
-                timer.as_mut().reset(Instant::now() + STARTUP_CHECK_DELAY);
-                queued_at_deadline = false;
-            }
+            let started_at = match stage {
+                Progress::Queued => None,
+                Progress::Preparing(started_at) => Some(started_at),
+                Progress::Native { progress, cancel } => {
+                    return self.native_preparation_delayed(progress, cancel).await;
+                }
+            };
             tokio::select! {
                 biased;
                 _ = self.0.finished.cancelled() => return false,
@@ -169,11 +165,15 @@ impl ChildStartup {
                         return false;
                     }
                 }
-                _ = &mut timer, if !queued_at_deadline => {
-                    if matches!(*progress.borrow(), Progress::Preparing) {
+                _ = async {
+                    match started_at {
+                        Some(started_at) => tokio::time::sleep_until(started_at + STARTUP_CHECK_DELAY).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if matches!(*progress.borrow(), Progress::Preparing(current) if Some(current) == started_at) {
                         return true;
                     }
-                    queued_at_deadline = true;
                 }
             }
         }
@@ -267,7 +267,7 @@ impl ChildStartup {
         !self.0.finished.is_cancelled()
             && match &*self.0.progress.borrow() {
                 Progress::Queued => false,
-                Progress::Preparing => true,
+                Progress::Preparing(_) => true,
                 Progress::Native { progress, cancel } => {
                     !cancel.is_cancelled() && *progress.borrow() == NativeTaskStartup::Preparing
                 }
@@ -308,7 +308,7 @@ mod tests {
     async fn queue_wait_does_not_report_and_dequeue_starts_a_finite_check() {
         let startup = startup();
         let started = Instant::now();
-        let check = startup.preparation_delayed(started + STARTUP_CHECK_DELAY);
+        let check = startup.preparation_delayed();
         tokio::pin!(check);
         assert!(futures::poll!(check.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -320,13 +320,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn late_dequeue_gets_a_full_preparation_window() {
+        let startup = startup();
+        let check = startup.preparation_delayed();
+        tokio::pin!(check);
+        assert!(futures::poll!(check.as_mut()).is_pending());
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        startup.preparing();
+        let prepared_at = Instant::now();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(check.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(58)).await;
+        assert!(futures::poll!(check.as_mut()).is_pending());
+        assert!(check.await);
+        assert!(prepared_at.elapsed() >= STARTUP_CHECK_DELAY);
+        assert!(prepared_at.elapsed() < STARTUP_CHECK_DELAY + Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn native_capacity_wait_sleeps_until_entry_or_cancellation() {
         for enter in [true, false] {
             let startup = startup();
             let (native, progress) = watch::channel(NativeTaskStartup::WaitingForCapacity);
             let cancel = CancellationToken::new();
             startup.observe_native(progress, cancel.clone());
-            let check = startup.preparation_delayed(Instant::now() + STARTUP_CHECK_DELAY);
+            let check = startup.preparation_delayed();
             tokio::pin!(check);
             assert!(futures::poll!(check.as_mut()).is_pending());
             tokio::time::advance(Duration::from_secs(120)).await;
