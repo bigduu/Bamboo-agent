@@ -1004,13 +1004,18 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
-    assert_eq!(canonical.len(), 15);
+    let coordination = bamboo_domain::SESSION_COORDINATION_TOOL_NAME;
+    assert_eq!(canonical.len(), 16);
+    assert!(canonical.contains(coordination));
     assert!(canonical.contains("Write") && canonical.contains("Edit"));
     assert!(canonical.contains("exec_command") && canonical.contains("write_stdin"));
     assert!(!canonical.contains("work_dispatch"));
     assert!(!canonical.contains("Plan"));
     assert!(canonical.contains("session_history"));
     let tools = agent.inner.default_tools();
+    assert!(tools
+        .framework_session_tool_for_exact(coordination)
+        .is_none());
     let history = tools
         .framework_session_tool_for_exact("session_history")
         .expect("defaults must install the actual common history instance");
@@ -1049,6 +1054,7 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
     let trace = provider.0.lock().unwrap();
     let actual = trace[0].1.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(actual, expected, "Ultra must preserve the exact actually registered subset of the canonical set; no fake SDK-only registrations");
+    assert!(!actual.contains(coordination));
     assert!(!actual.contains("skills_list") && !actual.contains("skills_read"));
     assert!(!trace[0]
         .0

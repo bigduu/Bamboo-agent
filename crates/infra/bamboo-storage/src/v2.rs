@@ -169,7 +169,7 @@ mod supervisor;
 mod supervisor_management;
 pub(crate) use supervisor_management::{
     subscriptions::{ObserverNoticeAuthority, ObserverRootOutcomeAuthority},
-    CurrentUserTargetGuard, SupervisorFollowupGuard,
+    CurrentUserTargetGuard, ProjectPeerDeliveryGuard, SupervisorFollowupGuard,
 };
 #[cfg(test)]
 mod session_directory_tests;
@@ -8558,6 +8558,17 @@ impl Storage for SessionStoreV2 {
         target_id: &str,
     ) -> io::Result<Session> {
         self.current_user_peer_session(caller, target_id).await
+    }
+
+    async fn load_same_project_root_peer(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        Ok(self
+            .lock_same_project_root_peer(caller, target_id)
+            .await?
+            .target)
     }
 
     async fn load_host_scoped_context_target(

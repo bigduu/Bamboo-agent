@@ -61,6 +61,23 @@ publication, as with other cancelled admission; it is not a message receipt.
 Steer does not broaden the strict zero-tool Child continuation boundary. A
 retired run's unconsumed steer cannot become a cold successor's input.
 
+## On-demand Session coordination
+
+Discover `session_coordination` when another running Session's work affects the
+current task. `list_running` returns a bounded, live snapshot of authorized
+sessions with a title, brief, observation time and run ID. The application Host
+scopes collaboration to the same task tree or native ordinary Roots in the
+same Project. Installed finite Host scopes retain separate list, brief and send
+rights. Plan mode can list eligible sessions.
+
+For `send`, copy `session_id` and `run_id` from one entry into
+`target_session_id` and `expected_run_id`, then add a stable `operation_id` and
+the peer message. The Inbox admits it only for the selected run and presents it
+at a normal input boundary with its source Session. A receipt confirms durable
+admission. On a run conflict, discover the target again. The tool uses the
+provider's deferred discovery path. Full-catalog-only requests continue to use
+the existing `session_message` surface.
+
 ## Receipt boundaries
 
 The tool retains `admitted`, `message_id`, `inbox_generation`, `activation` and

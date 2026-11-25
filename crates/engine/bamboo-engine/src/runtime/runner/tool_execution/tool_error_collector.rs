@@ -62,6 +62,7 @@ fn error_preview(tool_name: &str, value: &str) -> String {
     if canonical.eq_ignore_ascii_case("browser")
         || canonical.eq_ignore_ascii_case("browser_eval")
         || canonical.eq_ignore_ascii_case("session_message")
+        || canonical.eq_ignore_ascii_case(bamboo_domain::SESSION_COORDINATION_TOOL_NAME)
     {
         // Browser and peer arguments, results and failure text can contain
         // private content. Keep correlation metadata, not those payloads.
@@ -182,6 +183,7 @@ mod tests {
             ("default::session_message", "reply", false),
             ("default::SESSION_MESSAGE", "send", true),
             ("session_message", "reply", true),
+            (bamboo_domain::SESSION_COORDINATION_TOOL_NAME, "send", false),
         ];
         for (tool_name, action, malformed) in cases {
             let mut arguments = serde_json::json!({

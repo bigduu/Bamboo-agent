@@ -1859,6 +1859,179 @@ fn steer_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::P
 }
 
 #[tokio::test]
+async fn native_project_exact_run_peer_replays_without_retargeting() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (_temp, store, inbox) = fixture().await;
+    let mut sender = Session::new("project-sender", "model");
+    let mut target = Session::new("project-target", "model");
+    let mut foreign = Session::new("foreign-target", "model");
+    sender.set_project_id_meta("shared");
+    target.set_project_id_meta("shared");
+    foreign.set_project_id_meta("foreign");
+    for session in [&sender, &target, &foreign] {
+        store.save_session(session).await.unwrap();
+    }
+    let caller = bamboo_domain::SessionCallerReference::from(&sender);
+    let envelope = super::host_scope_tests::message(&sender, &target);
+    let foreign_envelope = super::host_scope_tests::message(&sender, &foreign);
+    let run = SteerRunPort::new(Some("run-a"));
+
+    assert!(store
+        .load_same_project_root_peer(&caller, &foreign.id)
+        .await
+        .is_err());
+    assert!(inbox
+        .deliver_project_root_peer_for_run(&caller, &foreign_envelope, "run-a", run.clone())
+        .await
+        .is_err());
+    assert_eq!(run.calls.load(SeqCst), 0);
+    assert!(matches!(
+        inbox
+            .deliver_project_root_peer_for_run(&caller, &envelope, "stale-run", run.clone())
+            .await,
+        Err(SessionInboxError::ExpectedRunConflict(_))
+    ));
+    assert_eq!(inbox.inspect(&target.id).await.unwrap().pending, 0);
+
+    let first = inbox
+        .deliver_project_root_peer_for_run(&caller, &envelope, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert!(!first.replayed && first.active_delivery_notified);
+    assert_eq!(run.notified.load(SeqCst), 1);
+    *run.current.lock().unwrap() = Some("run-b".into());
+    let retry = inbox
+        .deliver_project_root_peer_for_run(&caller, &envelope, "run-a", run.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry.delivery, first.delivery);
+    assert!(retry.replayed && !retry.active_delivery_notified);
+    assert_eq!(run.notified.load(SeqCst), 1);
+    assert!(inbox
+        .deliver_project_root_peer_for_run(&caller, &envelope, "run-b", run)
+        .await
+        .is_err());
+    assert!(inbox
+        .claim_for_turn(&target.id, 1, Some("run-b"))
+        .await
+        .unwrap()
+        .is_empty());
+    let mut claims = inbox
+        .claim_for_turn(&target.id, 1, Some("run-a"))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims.remove(0).envelope.id, envelope.id);
+    assert!(!inbox
+        .inspect(&target.id)
+        .await
+        .unwrap()
+        .activation_pending());
+}
+
+#[tokio::test]
+async fn finite_scope_exact_run_peer_respects_native_project_boundary_and_never_falls_through() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    for same_project in [false, true] {
+        let (_temp, store, inbox) = fixture().await;
+        let mut sender = Session::new("finite-sender", "model");
+        let mut target = Session::new("finite-target", "model");
+        sender.set_project_id_meta("project-a");
+        target.set_project_id_meta(if same_project {
+            "project-a"
+        } else {
+            "project-b"
+        });
+        for session in [&sender, &target] {
+            store.save_session(session).await.unwrap();
+        }
+        let caller = bamboo_domain::SessionCallerReference::from(&sender);
+        let envelope = super::host_scope_tests::message(&sender, &target);
+        let token =
+            super::host_scope_tests::install(&store, &sender, vec![], &target, vec![]).await;
+        let run = SteerRunPort::new(Some("run-a"));
+        assert!(inbox
+            .deliver_project_root_peer_for_run(&caller, &envelope, "run-a", run.clone())
+            .await
+            .is_err());
+        assert_eq!(run.calls.load(SeqCst), 0);
+        let exact = inbox
+            .deliver_host_scoped_peer_for_run(&token, &caller, &envelope, "run-a", run.clone())
+            .await;
+        if same_project {
+            let exact = exact.unwrap();
+            assert!(exact.active_delivery_notified && !exact.replayed);
+            assert_eq!(run.notified.load(SeqCst), 1);
+        } else {
+            assert!(exact.is_err());
+            assert_eq!(run.calls.load(SeqCst), 0);
+            assert_eq!(inbox.inspect(&target.id).await.unwrap().pending, 0);
+            // The separate, pre-existing scoped sender keeps broader grants.
+            let receipt = inbox
+                .deliver_host_scoped_peer_message(
+                    &token,
+                    &caller,
+                    &envelope,
+                    SessionMessageDeliveryIntent::QueueOnly,
+                )
+                .await
+                .unwrap();
+            assert!(receipt.pending);
+        }
+    }
+}
+
+#[tokio::test]
+async fn observed_same_tree_exact_run_peer_preserves_root_and_child_directions() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (_temp, store, inbox, child, root) = explicit_peer_fixture().await;
+    for (source, target) in [(&root, &child), (&child, &root)] {
+        let sender = store.load_session(&source.actor_id).await.unwrap().unwrap();
+        let peer = store.load_session(&target.actor_id).await.unwrap().unwrap();
+        let caller = bamboo_domain::SessionCallerReference::from(&sender);
+        let mut stale = caller.clone();
+        stale.created_at += chrono::Duration::seconds(1);
+        let envelope = super::host_scope_tests::message(&sender, &peer);
+        let run = SteerRunPort::new(Some("peer-run"));
+        assert!(inbox
+            .deliver_unscoped_peer_for_run(
+                &stale,
+                &envelope,
+                source,
+                target,
+                "peer-run",
+                run.clone()
+            )
+            .await
+            .is_err());
+        assert_eq!(run.calls.load(SeqCst), 0);
+        let accepted = inbox
+            .deliver_unscoped_peer_for_run(
+                &caller,
+                &envelope,
+                source,
+                target,
+                "peer-run",
+                run.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(accepted.active_delivery_notified);
+        assert_eq!(run.notified.load(SeqCst), 1);
+        assert!(inbox.claim(&peer.id, 1).await.unwrap().is_empty());
+        let mut claims = inbox
+            .claim_for_turn(&peer.id, 1, Some("peer-run"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims.remove(0).envelope.id, envelope.id);
+    }
+}
+
+#[tokio::test]
 async fn peer_steer_replays_exact_receipt_after_replacement_and_ack_without_retargeting() {
     use std::sync::atomic::Ordering::SeqCst;
     let (temp, store, inbox, source, target) = explicit_peer_fixture().await;

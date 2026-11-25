@@ -45,9 +45,15 @@ fn parse_warning_log_details<'a>(
     warning: &'a str,
 ) -> (String, &'a str) {
     let canonical = canonical_tool_name(execution_name);
-    if ["browser", "browser_eval", "session_message", "session_loop"]
-        .iter()
-        .any(|name| canonical.eq_ignore_ascii_case(name))
+    if [
+        "browser",
+        "browser_eval",
+        "session_message",
+        "session_coordination",
+        "session_loop",
+    ]
+    .iter()
+    .any(|name| canonical.eq_ignore_ascii_case(name))
     {
         // A repaired JSON warning embeds its own preview, so both strings
         // must be hidden for private browser input, peer text, or loop prompts.
@@ -92,7 +98,7 @@ fn approval_permission_description(
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
-    if ["session_message", "session_loop"]
+    if ["session_message", "session_coordination", "session_loop"]
         .iter()
         .any(|name| canonical_tool_name(tool_name).eq_ignore_ascii_case(name))
     {
@@ -676,12 +682,12 @@ impl BuiltinToolExecutor {
                 execution_name,
                 &args,
             );
-        let framework_scoped_send = tool_name == "session_message"
-            && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
-            && (self.local_execution_contract(execution_name)
-                == Some(
-                    crate::scoped_session_send_permission::SCOPED_SESSION_SEND_EXECUTION_CONTRACT,
-                )
+        let action = args.get("action").and_then(serde_json::Value::as_str);
+        let send_contract =
+            crate::scoped_session_send_permission::framework_session_send_contract(execution_name);
+        let framework_scoped_send = action == Some("send")
+            && send_contract.is_some()
+            && (self.local_execution_contract(execution_name) == send_contract
                 || crate::scoped_session_send_permission::selected_framework_scoped_session_send(
                     call,
                     execution_name,
@@ -695,9 +701,8 @@ impl BuiltinToolExecutor {
         }
         if ctx.plan_read_only
             && (!crate::orchestrator::plan_mode_allows_tool(&tool_name)
-                || (tool_name == "session_message"
-                    && args.get("action").and_then(serde_json::Value::as_str)
-                        != Some("list_targets")))
+                || (tool_name == "session_message" && action != Some("list_targets"))
+                || (tool_name == "session_coordination" && action != Some("list_running")))
         {
             return Err(ToolError::Execution(format!(
                 "Plan mode: {tool_name} operation blocked"
@@ -842,7 +847,7 @@ impl BuiltinToolExecutor {
                     } else if framework_root_spawn {
                         config.evaluate_framework_root_spawn(evaluation)
                     } else if framework_scoped_send {
-                        crate::scoped_session_send_permission::record_framework_scoped_session_send_evaluation(call, &args);
+                        crate::scoped_session_send_permission::record_framework_scoped_session_send_evaluation(call, execution_name, &args);
                         config.evaluate_framework_scoped_session_send(evaluation)
                     } else {
                         config.evaluate(evaluation)

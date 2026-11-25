@@ -107,7 +107,7 @@ async fn ordinary_child_uses_actual_host_ports_and_fresh_root_aliases_for_every_
         let mut child = f.child.clone();
         child.session_version = version;
         let tools = local(&f, &child, host.clone(), &[], &[]);
-        assert_eq!(tools.list_tools().len(), 4);
+        assert_eq!(tools.list_tools().len(), Kind::ALL.len());
         for name in ["spawn_session", "spawnSession", "default::spawn_session"] {
             let call = call(name);
             let original = call.clone();

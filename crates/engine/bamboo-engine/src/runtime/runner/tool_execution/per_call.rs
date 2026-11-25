@@ -13,7 +13,7 @@ use bamboo_agent_core::tools::{
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
-    HookToolOutcome, SessionCallerReference,
+    HookToolOutcome, SessionCallerReference, SESSION_COORDINATION_TOOL_NAME,
 };
 use bamboo_metrics::MetricsCollector;
 
@@ -45,6 +45,7 @@ fn parse_warning_log_details<'a>(
     if execution_name.eq_ignore_ascii_case("browser")
         || execution_name.eq_ignore_ascii_case("browser_eval")
         || execution_name.eq_ignore_ascii_case("session_message")
+        || execution_name.eq_ignore_ascii_case(SESSION_COORDINATION_TOOL_NAME)
         || [
             "session_loop",
             "spawn_session",
@@ -466,13 +467,16 @@ async fn execute_tool_call_only_with_execution_name_inner(
         || !ctx.root_session_id.is_empty() && ctx.root_session_id != ctx.session_id,
         |caller| caller.kind == bamboo_domain::SessionKind::Child,
     );
-    let framework_unavailable = (execution_name == "spawn_session"
-        || ((ctx.root_orchestration_only || executing_supervisor || executing_child)
+    let framework_unavailable =
+        (matches!(
+            execution_name,
+            "spawn_session" | SESSION_COORDINATION_TOOL_NAME
+        ) || ((ctx.root_orchestration_only || executing_supervisor || executing_child)
             && session_kind.is_some()))
-        && !ctx
-            .tools
-            .framework_session_tool_for_exact(execution_name)
-            .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
+            && !ctx
+                .tools
+                .framework_session_tool_for_exact(execution_name)
+                .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
     let work_unavailable =
         bamboo_domain::supervisor_work_tool(execution_name) && !executing_supervisor;
     if framework_unavailable
@@ -4981,6 +4985,10 @@ mod hook_tests {
                 r#"{"action":"reply","message":"private peer reply"#,
             ),
             (
+                SESSION_COORDINATION_TOOL_NAME,
+                r#"{"action":"send","message":"private coordination text"#,
+            ),
+            (
                 "session_loop",
                 r#"{"action":"start","prompt":"private loop prompt"#,
             ),
@@ -5542,6 +5550,29 @@ mod hook_tests {
                 assert_eq!(concrete.entered(), vec!["SubAgent"]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn coordination_rejects_an_unproven_owner_before_toolstart_even_after_discovery() {
+        let mut concrete = NameRecordingExecutor::new(&[SESSION_COORDINATION_TOOL_NAME]);
+        concrete.framework_proof = false;
+        let concrete = Arc::new(concrete);
+        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+        let callable = effective_callable_set(
+            &[SESSION_COORDINATION_TOOL_NAME],
+            CapabilityLoadingMode::StickyFallback,
+            &[SESSION_COORDINATION_TOOL_NAME],
+        );
+        let call = probe_call(SESSION_COORDINATION_TOOL_NAME);
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = execute_without_hooks(&callable, &tools, &call, &tx).await;
+        assert!(result
+            .result
+            .unwrap_err()
+            .contains("session_framework_port_unavailable"));
+        assert!(concrete.entered().is_empty());
+        assert!(std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
     }
 
     #[tokio::test]

@@ -48,7 +48,13 @@ impl Tool for Concrete {
         }
     }
     fn execution_contract(&self) -> Option<&'static str> {
-        (self.name == "spawn_session").then_some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        match self.name.as_str() {
+            "spawn_session" => Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+            bamboo_domain::SESSION_COORDINATION_TOOL_NAME => Some(
+                bamboo_tools::scoped_session_send_permission::SESSION_COORDINATION_EXECUTION_CONTRACT,
+            ),
+            _ => None,
+        }
     }
     fn classify(&self, _: &Value) -> ToolClass {
         if Kind::from_execution_name(&self.name).is_some_and(Kind::is_reader) {

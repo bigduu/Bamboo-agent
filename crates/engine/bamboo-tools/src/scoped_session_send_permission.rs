@@ -7,6 +7,15 @@ use bamboo_agent_core::{ToolCall, ToolError};
 use serde_json::Value;
 
 pub const SCOPED_SESSION_SEND_EXECUTION_CONTRACT: &str = "bamboo.session_message.scoped_send.v1";
+pub const SESSION_COORDINATION_EXECUTION_CONTRACT: &str = "bamboo.session_coordination.send.v1";
+
+pub fn framework_session_send_contract(execution_name: &str) -> Option<&'static str> {
+    match execution_name {
+        "session_message" => Some(SCOPED_SESSION_SEND_EXECUTION_CONTRACT),
+        "session_coordination" => Some(SESSION_COORDINATION_EXECUTION_CONTRACT),
+        _ => None,
+    }
+}
 
 struct SelectedSend {
     call: ToolCall,
@@ -33,17 +42,21 @@ pub async fn with_framework_scoped_session_send_restriction<F, T>(
 where
     F: Future<Output = Result<T, ToolError>>,
 {
-    if selected_contract != Some(SCOPED_SESSION_SEND_EXECUTION_CONTRACT) {
+    let Some(
+        contract @ (SCOPED_SESSION_SEND_EXECUTION_CONTRACT
+        | SESSION_COORDINATION_EXECUTION_CONTRACT),
+    ) = selected_contract
+    else {
         return Err(ToolError::Execution(
             "scoped_session_send_permission_owner_unavailable".into(),
         ));
-    }
+    };
     SELECTED_SEND
         .scope(
             SelectedSend {
                 call: call.clone(),
                 resolved_args: resolved_args.clone(),
-                contract: SCOPED_SESSION_SEND_EXECUTION_CONTRACT,
+                contract,
                 native_evaluated: AtomicBool::new(false),
             },
             async {
@@ -65,9 +78,10 @@ where
 
 pub(crate) fn record_framework_scoped_session_send_evaluation(
     call: &ToolCall,
+    execution_name: &str,
     resolved_args: &Value,
 ) {
-    if selected_framework_scoped_session_send(call, "session_message", resolved_args) {
+    if selected_framework_scoped_session_send(call, execution_name, resolved_args) {
         let _ = SELECTED_SEND.try_with(|selection| {
             selection.native_evaluated.store(true, Ordering::SeqCst);
         });
@@ -79,14 +93,15 @@ pub(crate) fn selected_framework_scoped_session_send(
     execution_name: &str,
     resolved_args: &Value,
 ) -> bool {
-    execution_name == "session_message"
-        && SELECTED_SEND
+    framework_session_send_contract(execution_name).is_some_and(|contract| {
+        SELECTED_SEND
             .try_with(|selection| {
-                selection.contract == SCOPED_SESSION_SEND_EXECUTION_CONTRACT
+                selection.contract == contract
                     && selection.call == *call
                     && selection.resolved_args == *resolved_args
             })
             .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -145,7 +160,11 @@ mod tests {
                     "session_message",
                     &changed
                 ));
-                record_framework_scoped_session_send_evaluation(&original, &args);
+                record_framework_scoped_session_send_evaluation(
+                    &original,
+                    "session_message",
+                    &args,
+                );
                 Ok(())
             },
         )
@@ -178,7 +197,11 @@ mod tests {
                     if nested {
                         let mut other = original.clone();
                         other.id = "nested-call".into();
-                        record_framework_scoped_session_send_evaluation(&other, &args);
+                        record_framework_scoped_session_send_evaluation(
+                            &other,
+                            "session_message",
+                            &args,
+                        );
                     }
                     Ok(())
                 },
