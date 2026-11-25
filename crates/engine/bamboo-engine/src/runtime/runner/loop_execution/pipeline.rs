@@ -24,7 +24,7 @@ use crate::runtime::runner::loop_execution::startup::{
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::round_lifecycle::{
-    fallback_tool_is_resident, uses_sticky_fallback, RoundOutputLimitPolicy, RoundToolDispatch,
+    fallback_tool_is_resident, uses_sticky_fallback, RoundRecoveryPolicy, RoundToolDispatch,
     TaskSplitPrompt,
 };
 use crate::runtime::runner::session_setup::tool_schemas::{
@@ -645,6 +645,17 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
     history
         .iter()
         .filter_map(|(message, definitions)| {
+            let refresh_control = uses_sticky_fallback(mode)
+                && session.supervisor_incarnation_id().is_some()
+                && !declared_definitions.contains_key("session_control")
+                && eligible_definitions
+                    .get("session_control")
+                    .is_some_and(|current| {
+                        definitions.iter().any(|stored| {
+                            sticky_definition_name(stored) == Some("session_control")
+                                && stored != current
+                        })
+                    });
             let mut duplicate = false;
             let remaining = definitions
                 .iter()
@@ -671,7 +682,7 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
             if remaining.len() == definitions.len() {
                 return None;
             }
-            let content = if remaining.is_empty() {
+            let mut content = if remaining.is_empty() {
                 if duplicate
                     && definitions.len() == 1
                     && sticky_definition_name(&definitions[0]) == Some("browser")
@@ -686,6 +697,14 @@ pub(in crate::runtime::runner) fn projected_sticky_fallback_results(
                 let result = serde_json::json!({"tools": remaining});
                 format!("{STICKY_DISCOVERY_RESULT_START}{result}{STICKY_DISCOVERY_RESULT_END}")
             };
+            if refresh_control {
+                content.push_str(concat!(
+                    "\nThe previously discovered session_control definition is outdated. ",
+                    "Call discover_capabilities by itself with ",
+                    r#"{"query":"session_control","kinds":["tool"],"limit":1}"#,
+                    " to load the current definition."
+                ));
+            }
             Some((message.id.clone(), (message.content.clone(), content)))
         })
         .collect()
@@ -789,7 +808,7 @@ async fn commit_sticky_fallback_discovery_round(
         && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
     let mut fingerprint = None;
     if !discovery_is_alone {
-        const ERROR: &str = "discovery must be called alone";
+        const ERROR: &str = "No calls in this batch ran. Call discover_capabilities by itself, then make other tool calls in a later round.";
         for call in &tool_calls {
             session.add_message(sticky_fallback_tool_result(
                 &call.id,
@@ -3697,6 +3716,8 @@ async fn run_pipeline_inner(
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     let mut worker_text_timeout_retried = false;
+    let mut discovery_correction_used = false;
+    let mut discovery_correction_pending = false;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
     // bottom of the loop). Cleared per-run. We also drop any stale
     // `runtime.completion_reason` carried over from a previous run on this
@@ -3729,6 +3750,7 @@ async fn run_pipeline_inner(
     let recovery_token_limit = config.run_budget.max_total_tokens;
 
     loop {
+        let standalone_discovery = std::mem::take(&mut discovery_correction_pending);
         crate::runtime::goal_restart::disarm_before_round(session, config).await?;
         if split_recovery.is_none()
             && crate::runtime::planned_update::pause_before_model_round(
@@ -4073,7 +4095,7 @@ async fn run_pipeline_inner(
         } else {
             0
         };
-        let attempt_limit = if split_request.is_some() {
+        let attempt_limit = if split_request.is_some() || standalone_discovery {
             1
         } else {
             MAX_LLM_TURN_ATTEMPTS + extra_attempts
@@ -4104,7 +4126,7 @@ async fn run_pipeline_inner(
                 round_activity.apply_to_round(&mut spent);
                 limit.saturating_sub(run_tokens_used(&spent))
             });
-            let output_limit_policy = RoundOutputLimitPolicy {
+            let recovery_policy = RoundRecoveryPolicy {
                 retry: output_limit_recovery,
                 remaining_run_tokens,
                 previous_prompt_tokens,
@@ -4112,6 +4134,7 @@ async fn run_pipeline_inner(
                     advisory,
                     private_plan: *stage == SplitStage::Plan,
                 }),
+                standalone_discovery,
             };
             let split_tools;
             let request_tools = match split_request.as_ref() {
@@ -4141,12 +4164,12 @@ async fn run_pipeline_inner(
                         provenance: &prompt_memory_exposure,
                     },
                 ),
-                Some(output_limit_policy),
+                Some(recovery_policy),
             )
             .await
             {
                 Ok(output) => output,
-                Err(error) if output_limit_recovery.is_some() => {
+                Err(error) if output_limit_recovery.is_some() || standalone_discovery => {
                     terminal_error = Some(error);
                     break;
                 }
@@ -4405,7 +4428,7 @@ async fn run_pipeline_inner(
                 let reasoning_repeated = matches!(error, AgentError::ReasoningRepetition { .. });
                 let response_rejected = reasoning_repeated
                     || matches!(error, AgentError::OutputTokenLimit { .. });
-                if output_limit_recovery.is_some() || response_rejected {
+                if output_limit_recovery.is_some() || response_rejected || standalone_discovery {
                     if let Some(visible) = stream_output.visible_message {
                         let _ = event_tx
                             .send(AgentEvent::VisibleMessageDiscard {
@@ -4413,6 +4436,10 @@ async fn run_pipeline_inner(
                             })
                             .await;
                     }
+                }
+                if standalone_discovery {
+                    terminal_error = Some(error);
+                    break;
                 }
                 if matches!(split_request.as_ref(), Some((SplitStage::Plan, _)))
                     && llm_output.can_resume_truncated_messages
@@ -4561,6 +4588,17 @@ async fn run_pipeline_inner(
                     turn_outcome = Some(TurnOutcome { should_break: false, sent_complete: false });
                     break;
                 }
+            }
+            if standalone_discovery && stream_output.tool_calls.is_empty() {
+                if let Some(visible) = stream_output.visible_message {
+                    let _ = event_tx.send(AgentEvent::VisibleMessageDiscard {
+                        message_id: visible.message_id,
+                    }).await;
+                }
+                terminal_error = Some(AgentError::Tool(
+                    "Supervisor tool discovery correction returned no tool call".into(),
+                ));
+                break;
             }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
@@ -4777,10 +4815,11 @@ async fn run_pipeline_inner(
             }
 
             if llm_output.tool_dispatch.fallback_discovery
-                && stream_output.tool_calls.iter().any(|call| {
+                && (standalone_discovery || stream_output.tool_calls.iter().any(|call| {
                     call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
-                })
+                }))
             {
+                let mixed_discovery = stream_output.tool_calls.len() > 1;
                 match commit_sticky_fallback_discovery_round(
                     stream_output,
                     session,
@@ -4790,6 +4829,26 @@ async fn run_pipeline_inner(
                 .await
                 {
                     Ok(fingerprint) => {
+                        if standalone_discovery
+                            && session.messages.last().and_then(|result| result.tool_success) != Some(true)
+                        {
+                            terminal_error = Some(AgentError::Tool(
+                                "Supervisor tool discovery did not complete in its correction round".into(),
+                            ));
+                            break;
+                        }
+                        if mixed_discovery && session.supervisor_incarnation_id().is_some()
+                            && !max_rounds_summary_used && !budget_summary_used
+                        {
+                            if discovery_correction_used {
+                                terminal_error = Some(AgentError::Tool(
+                                    "Supervisor tool discovery must run by itself; its correction was already used".into(),
+                                ));
+                                break;
+                            }
+                            discovery_correction_used = true;
+                            discovery_correction_pending = true;
+                        }
                         tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
                         tool_policy_guard.observe_repeated_call(
                             bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
@@ -5326,6 +5385,7 @@ async fn run_pipeline_inner(
                     })
                     .await;
                 budget_summary_used = true;
+                discovery_correction_pending = false;
                 continue;
             }
 
@@ -5397,6 +5457,7 @@ async fn run_pipeline_inner(
                         Some(serde_json::json!({"runtime_kind": "max_rounds_summary"}));
                     session.add_message(summary);
                     max_rounds_summary_used = true;
+                    discovery_correction_pending = false;
                     continue;
                 }
 

@@ -141,7 +141,7 @@ pub fn discovery_control_fallback_schema() -> ToolSchema {
         schema_type: "function".to_string(),
         function: FunctionSchema {
             name: DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
-            description: "Search eligible Deferred tools by name, description, and parameter metadata; load complete callable definitions into conversation history. Explicit kinds may request the legacy Skill/Workflow catalog.".to_string(),
+            description: "Call this tool by itself, then use any loaded tools in a later round. Search eligible Deferred tools by name, description, and parameter metadata to load their definitions. Explicit kinds may request the legacy Skill/Workflow catalog.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

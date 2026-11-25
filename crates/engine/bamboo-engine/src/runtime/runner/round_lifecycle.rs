@@ -401,11 +401,12 @@ pub(crate) struct TaskSplitPrompt<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RoundOutputLimitPolicy<'a> {
+pub(crate) struct RoundRecoveryPolicy<'a> {
     pub retry: Option<OutputLimitRecovery>,
     pub remaining_run_tokens: Option<u64>,
     pub previous_prompt_tokens: u64,
     pub task_split: Option<TaskSplitPrompt<'a>>,
+    pub standalone_discovery: bool,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable
@@ -478,7 +479,7 @@ pub(crate) async fn execute_llm_round(
     tool_schemas: &[ToolSchema],
     observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
-    output_limit_recovery: Option<RoundOutputLimitPolicy<'_>>,
+    output_limit_recovery: Option<RoundRecoveryPolicy<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
