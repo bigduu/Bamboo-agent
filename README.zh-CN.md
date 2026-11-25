@@ -1,198 +1,126 @@
-# Bamboo 🎋
+# Bamboo 班布 🎋
 
-![Bamboo 品牌插画：溪流旁的竹子，寓意韧性。](docs/assets/bamboo-nature-hero.png)
+我们想把班布做成最先进的开源 Agent Harness，用 Rust 把运行开销做低。同一套引擎可以在终端跑，通过 HTTP 调用，也能用 SDK 嵌进自己的应用。模型和工具按需要配置，会话保存在本地。
 
-*品牌插画，非软件截图。竹子象征韧性。*
+一个任务拆到多个会话后，来回切换、追进度、收结果都费时间。把目标交给 [Supervisor](#supervisor)，它会分派任务、跟进进度、收集结果。你可以查看各会话的执行记录，按需审批和验收。
 
-### 在终端或自己的应用里，让 AI agent 处理你的项目。
-
-Bamboo 是 [Zenith](https://github.com/bigduu/Zenith) 的本地 agent harness 核心。为它指定工作区并配置模型，就可以读取文件、调用工具、保存会话，并把同一套运行时接入浏览器、桌面外壳或 Rust 应用。
-
-[English](./README.md) · [crates.io](https://crates.io/crates/bamboo-agent) · [API](./docs/guides/API.md) · [MIT](./LICENSE)
-
-## 它能帮你做什么
-
-| 你的任务 | Bamboo 提供的能力 |
-|---|---|
-| 理解或处理一个代码仓库 | 针对工作区运行提示词、查看工具活动，之后继续同一会话。文件和 shell 操作遵循运行时权限策略。 |
-| 为自己的应用接入助手 | 使用 HTTP 和实时 WebSocket/SSE 事件，或嵌入 Rust SDK，复用现有 agent loop。 |
-| 保留有用的项目上下文 | 会话便签和 Jiandu 持久记忆可在轮次、会话之间保留选定事实。压缩管理上下文预算，但不保证永不遗忘。 |
-| 接入已有工具 | 按需添加 MCP 服务、技能、service plugin 和定时提示词。 |
-
-运行时和会话存储在本地。**配置的模型提供方、MCP 服务、网页工具和插件可能把数据发往机器之外。** 本地部署不等于离线模型，也不等于无需支付外部 API 费用。
-
-## 源码与发布包的区别
-
-本文描述 **开发源码检出**：最初产品审查基线为 `025641317c5703226052a4b94a52d1844615c352`，本次文档更新基于 `dev` 提交 `10ca51ccdf1f253ff6ec1e78f21b4c74835e1582`，不表示每个命令和能力都已进入最新 crates.io 发布版。比较版本时请查看已安装程序的 `bamboo --help` 和[版本/源码审查](./docs/readme-audit.md)。源码 manifest 有意使用 `0.0.0` 占位，发布流程另行写入发布版本。下方录屏保留其独立的较早源码来源说明。
-
-
-## Terminal-Bench 评测
-
-Bamboo `7efc6bbd0` 使用 DS Flash high 和 Auto 模式，在本地 Terminal-Bench 2.1 的 78 道题子集上通过 **60 道（76.92%）**。按相同 78 道题重算，参考排名为 **第 2 / 11**。Bamboo 每题一次有效尝试，公开榜数据每题三次。[逐题结果、运行配置和复跑命令](./docs/benchmarks/terminal-bench-2.1-2026-11-15/README.md)
-
-## 看界面准备项目上下文
-
-![Lotus Next 在真实 Bamboo 后端创建演示项目，并为新任务选择工作区。](docs/demos/project-workspace.gif)
-
-[静态图片](docs/demos/project-workspace.png) · [录制说明](docs/demos/README.md)
-
-真实源码检出的浏览器录屏，使用独立临时工作区和真实 Bamboo 后端。
-仅展示项目创建与选择，没有调用模型，也不代表 agent 已完成任务或已发布桌面版验证。
+[快速开始](#开始使用) · [接入应用](#接入应用) · [评测](#评测) · [架构](#架构) · [参与贡献](#参与贡献) · [English](./README.md)
 
 ## 开始使用
 
 ### 安装
 
-#### Bodhi 桌面版
+从[最新 GitHub 发布版](https://github.com/bigduu/Bamboo-agent/releases/latest)下载对应平台的可执行文件。
 
-Bodhi 内置 Bamboo 运行时。终端安装脚本支持运行 macOS 13.5 或更高版本的 Apple Silicon Mac，以及使用 APT 的 Linux x64 发行版。
+| 平台 | 预编译程序 |
+|---|---|
+| macOS | [Apple Silicon](https://github.com/bigduu/Bamboo-agent/releases/latest/download/bamboo-aarch64-apple-darwin) |
+| Linux | [x64](https://github.com/bigduu/Bamboo-agent/releases/latest/download/bamboo-x86_64-unknown-linux-gnu) · [ARM64](https://github.com/bigduu/Bamboo-agent/releases/latest/download/bamboo-aarch64-unknown-linux-gnu) |
+| Windows | [x64](https://github.com/bigduu/Bamboo-agent/releases/latest/download/bamboo-x86_64-pc-windows-msvc.exe) · [ARM64](https://github.com/bigduu/Bamboo-agent/releases/latest/download/bamboo-aarch64-pc-windows-msvc.exe) |
+
+将文件重命名为 `bamboo`（Windows 上用 `bamboo.exe`），放入 `PATH` 中的目录。在 macOS 或 Linux 上，用 `chmod +x bamboo` 赋予执行权限。
+
+已有 Rust 环境也可以用 Cargo 安装已发布的包。
+
+```bash
+cargo install bamboo-agent --locked
+```
+
+### 运行第一个任务
+
+首次使用时，在配置引导中选择提供方并填写 API 密钥。要指定账户可用的模型，可用 `bamboo init --model YOUR_MODEL_ID`。
+
+```bash
+bamboo init
+```
+
+进入一个在 `README.md` 中写明测试命令的项目，请班布读取这条命令。
+
+```bash
+cd "/path/to/sample-project"
+bamboo -p "读取 $PWD/README.md，原样告诉我运行本项目测试的命令。请勿修改文件。"
+```
+
+```text
+Read README.md
+Run the tests using the following command: `python3 -m unittest discover -s tests`
+```
+
+班布 CLI 输出摘录，模型回复保留原文。
+
+想在浏览器里对话，用带前端的版本运行 `bamboo serve`，再打开 [localhost:9562](http://127.0.0.1:9562)。[CLI 指南](./docs/guides/GETTING_STARTED.md#a-headless-one-shot-fastest-way-to-see-it-work) · [自定义模型配置](./docs/config-reference.md#choosing-a-provider-and-model)
+
+## 接入应用
+
+```mermaid
+flowchart TD
+    Client["终端 · HTTP · Rust SDK"] <-->|请求 / 回复和事件| Bamboo["班布 Agent 循环 · 本地会话"]
+    Bamboo <-->|上下文、文本和工具请求| Router["选择提供方和模型"]
+    Router <-->|请求和回复| Provider["大模型接口 · OpenAI 兼容（含本地） · Anthropic · Gemini"]
+    Bamboo <-->|检查权限 / 返回工具结果| Tools["项目工具和 MCP"]
+```
+
+[HTTP 示例](./docs/guides/GETTING_STARTED.md#b-http-server--curl) · [API 参考](./docs/guides/API.md) · [Rust SDK 示例](./examples/sdk_quickstart.rs) · [模型配置](./docs/config-reference.md#choosing-a-provider-and-model)
+
+## Supervisor
+
+```mermaid
+flowchart TD
+    User["用户"] <-->|任务 / 结果| Supervisor["Supervisor"]
+    Supervisor <-->|派发 / 执行证据| Work["Work · 目标和验收"]
+    Work <-->|任务分配 / 提交结果| Session["执行会话 · 隔离工作树 · 独立权限"]
+    Supervisor <-->|规划和复核| Child["子代理"]
+```
+
+[Supervisor 的职责](./docs/supervisor-identity.md#model-role-and-thinking-mode) · [Work 操作](./docs/guides/TICKET_CONTROLS.md) · [子代理配置](./docs/config-reference.md#sub-agents--external-cli-executors)
+
+## 菩提桌面应用
+
+菩提会自动准备和启动班布，让你在桌面窗口里处理任务。终端安装脚本支持 macOS 13.5 或更高版本的 Apple Silicon Mac，以及使用 APT 的 Linux x64 发行版。
 
 ```sh
 curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://bigduu.github.io/Pavilion/install.sh | sh
 ```
 
-[Bodhi 安装要求与下载](https://bigduu.github.io/Pavilion/download?lang=zh#terminal-install)
+[下载菩提](https://github.com/bigduu/Bodhi-AI/releases/latest)
 
-#### 独立安装 Bamboo
-
-安装已发布包：
-
-```bash
-cargo install bamboo-agent --locked
-bamboo --help
-```
-
-若要构建本文描述的源码，需要 **Rust 1.97+**，在本仓库运行：
-
-```bash
-node scripts/frontend-package.cjs stage
-cargo install --path . --locked
-```
-
-staging 命令验证仓库已提交的前端资源。常规构建需要固定的 **Lotus Next** 资源包，资源缺失或无效会导致构建失败，不会悄悄下载浮动的 `latest`。精确版本见 [frontend-package-lock.json](./scripts/frontend-package-lock.json)。
-
-有意只构建 API 服务时：
-
-```bash
-BAMBOO_FRONTEND_BUILD_MODE=api-only cargo build --bin bamboo
-```
-
-上面的环境变量赋值使用 POSIX shell 语法；Windows PowerShell 中先运行 `$env:BAMBOO_FRONTEND_BUILD_MODE = "api-only"`。API-only 构建不含内嵌浏览器界面。外部或本地前端路径见[部署指南](./docs/guides/DEPLOY.md)和[前端 staging 脚本](./scripts/frontend-package.cjs)。
-
-### 配置并打开本地界面
-
-```bash
-bamboo init
-bamboo serve
-```
-
-`init` 交互式配置 provider，并在 Bamboo 数据目录（通常为 `~/.bamboo/`）下加密保存密钥。`config.json` 保存配置元数据，不保存加密后的 provider 密钥。选择你的 provider/账号实际支持的模型。包含前端的构建可打开 **http://127.0.0.1:9562**。在另一个终端运行：
-
-```bash
-bamboo health
-bamboo doctor
-```
-
-健康检查端点是 `GET /api/v1/health`，`bamboo health` 需要可达的服务。`doctor` 检查配置与 provider 凭据，相关错误会使其失败；服务可达性探测仅提供信息，服务未启动本身不会让 `doctor` 失败。`serve --port`、`--bind`、`--data-dir`、`--static-dir` 和 `--workers` 可覆盖配置，完整参数见 `bamboo serve --help`。
-
-### 从终端处理任务
-
-```bash
-bamboo -p "总结这个工作区的 README。" --workspace /path/to/project
-bamboo sessions
-bamboo history <session-id>
-bamboo -p "接下来应该读哪些文件？" -s <session-id>
-```
-
-接入自定义网关时，按网关的 API 协议选 provider，再提供网关上的模型 ID。下面的命令使用 OpenAI 兼容协议，可从空数据目录运行。
-
-```bash
-BAMBOO_OPENAI_API_KEY="$GATEWAY_API_KEY" \
-BAMBOO_OPENAI_BASE_URL="https://gateway.example/v1" \
-BAMBOO_OPENAI_MODEL="your-model-id" \
-  bamboo -p "回复 OK。" --provider openai
-```
-
-Anthropic 和 Gemini 使用同样的变量名规则。长期使用可运行 `bamboo init --provider openai --base-url https://gateway.example/v1 --model your-model-id` 保存设置。[各 provider 的配置方式与优先级](./docs/config-reference.md#choosing-a-provider-and-model)。
-
-普通模式把推理进度写到 stderr。使用 `--stream-json` 时，stdout 输出 NDJSON 事件流。
-
-Headless 运行使用完整 agent 运行时和已配置的 provider。交互式 `bamboo -p` 因工具权限请求或提问暂停时，请在同一个终端回答提示。浏览器回应和 `bamboo respond <session-id> --pending` / `bamboo respond <session-id> "<answer>"` 面向独立运行的 `bamboo serve` 所拥有的任务，不能解除进程内 headless 任务的等待。不要仅为了跑通示例而关闭权限检查。
-
-还没有密钥？`bamboo -p "ping" --echo` **仅用于传输链路冒烟**：它使用 echo executor 而非 LLM，不证明模型推理或工具任务成功。
-
-### 接入自己的应用
-
-配置 provider 并启动服务后，legacy HTTP/SSE 调用顺序为 **chat → 订阅事件 → execute**。`chat` 保存消息，`execute` 才启动 agent loop。示例需要 `curl` 和 `jq`，请把模型名替换为账号支持的模型。在终端 A 创建会话并打开实时事件连接：
-
-```bash
-SID=$(curl -fsS http://127.0.0.1:9562/api/v1/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"你好。","model":"YOUR_MODEL_ID"}' | jq -r .session_id)
-printf 'Session: %s\n' "$SID"
-curl -iNfsS "http://127.0.0.1:9562/api/v1/events/$SID"
-```
-
-保持终端 A 打开。看到 HTTP 200 响应头后，将打印的会话 ID 复制到终端 B，再启动运行：
-
-```bash
-SID="<终端 A 打印的会话 ID>"
-curl -fsS -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
-  -H 'Content-Type: application/json' -d '{}'
-```
-
-在终端 A 查看实时事件；执行后才订阅可能丢失响应 token。浏览器使用共享的 `/v2/stream` WebSocket，legacy SSE 路由仍可用。
-
-### 作为进程内 Rust SDK 使用
-
-嵌入 SDK 时，`bamboo_sdk::agent::Agent` 通过 `run`、`run_stream`、`execute` 使用同一引擎；默认装配需要已配置的 provider，不会提供凭据。参见 [CLI / HTTP / SDK 入门示例](./docs/guides/GETTING_STARTED.md)、[API 参考](./docs/guides/API.md)及[发布包 rustdoc](https://docs.rs/bamboo-agent)。
-
-## 通过 Tailscale 访问 Bamboo 和 Lotus
-
-在运行 Bamboo 的电脑上安装 Tailscale 客户端和命令行工具。通过绑定回环地址的 Bamboo HTTP 服务打开本机 Lotus，进入 **系统设置 → 系统 → Tailscale 远程访问**。连接这台电脑，按提示登录 Tailscale，再设置 Bamboo 访问密码。组网启用 MagicDNS 和 HTTPS 证书后，开启远程访问并复制 HTTPS 地址。[Tailscale CLI 安装指南](https://tailscale.com/docs/reference/tailscale-cli)
-
-在组网内以用户身份登录 Tailscale 的设备上打开该地址，再用 Bamboo 访问密码登录。Bamboo 重启后会为保存的 Tailscale 设备和 HTTPS 端口恢复远程访问。点击 **关闭远程访问** 会停止分享并断开已有的实时连接。
-
-## 数据与运行边界
-
-- Bamboo 配置和会话默认在 `~/.bamboo`，可用 `BAMBOO_DATA_DIR` 或 `--data-dir` 覆盖。Jiandu 独立持有 `~/.jiandu` 下的规范记忆。隔离运行时，`BAMBOO_JIANDU_DATA_DIR` 必须是非空绝对路径；仅设置 `--data-dir` 不会迁移记忆目录。
-- Bamboo 负责提示词上下文选择和预算；Jiandu 负责记忆持久化、词法检索和 Dream 派生快照。Dream 是方向性参考，不是规范事实源。不需要第二套 Bamboo 记忆索引或 embedding 流水线。
-- 服务应保持回环绑定。新实例默认无鉴权；当前服务将私有局域网来源视为可信本地，即使设置密码也会跳过密码校验。远程访问应保留回环绑定/端口发布，在可信网络中通过有鉴权的反向代理接入。
-- [Docker Compose 配置](./docker/docker-compose.yml) 发布 `127.0.0.1:9562:9562`，使用非 root 用户和命名数据卷，并丢弃 capability。运行 `cd docker && docker compose up -d --build` 可构建此配置，仍需配置 provider。
-- 终端、服务端和浏览器界面本身不提供原生桌面控制。[Nova](https://github.com/bigduu/Nova) 是独立的 MCP 能力，有自己的平台和权限要求。本次文档审查不代表已验证 macOS/Windows 运行表现。
-
-## Bamboo 在套件中的位置
+## 评测
 
 ```mermaid
 flowchart LR
-  Bodhi["Bodhi · 桌面外壳"] --> Bamboo["Bamboo · 本地 agent 运行时"]
-  Lotus["Lotus Next · 浏览器 UI"] --> Bamboo
-  CLI["终端 / HTTP 客户端"] --> Bamboo
-  Bamboo --> Provider["已配置的模型提供方"]
-  Bamboo --> Jiandu["Jiandu · 规范记忆"]
-  Bamboo --> MCP["MCP 工具 · 如 Nova"]
+    Task["Terminal-Bench 2.1 · 本地子集"] --> Pass["通过 60 / 78 题 · 76.92%"]
+    Pass --> Detail["51 题正常退出 · 9 题超时后通过"]
+    Task --> Fail["18 题未通过"]
+    Grep["字面量 Grep P95 · 1,854 个 Rust 文件"] --> Before["优化前 · 2.07–2.35 秒"]
+    Before --> After["优化后 · 135–140 毫秒"]
 ```
 
-Bodhi 启动并健康检查自己管理的 Bamboo sidecar；只有显式选择旧版回滚路径时才复用外部服务。在此源码版本中，Bamboo 默认内嵌前端是 **Lotus Next**，不是旧 Lotus。可选的 [bodhi-server](https://github.com/bigduu/bodhi-server) 账号/provider 服务并非本地链路的必需组件。[Magpie](https://github.com/bigduu/Magpie) 连接消息渠道；[Pavilion](https://github.com/bigduu/Pavilion) 提供网站/文档。完整模块导航见 [Zenith](https://github.com/bigduu/Zenith)。
+[Terminal-Bench 结果和方法](./docs/benchmarks/terminal-bench-2.1-2026-11-15/README.md) · [Grep 实测](https://github.com/bigduu/Bamboo-agent/pull/3014)
 
-Cargo workspace 分为四层：`crates/core`（类型/接口）、`crates/infra`（存储、provider、记忆、MCP、权限等服务）、`crates/engine`（agent loop/工具）、`crates/app`（服务端、SDK、TUI、broker 和客户端）。根 `bamboo` 二进制组合这些模块；源码中的 actor/broker 命令是高级入口，不构成无限并发或发布成熟度承诺。
+## 架构
 
-## 开发与深入阅读
-
-```bash
-cargo fmt --check
-cargo test
-cargo clippy
+```mermaid
+flowchart LR
+    Bodhi["菩提桌面应用"] -->|打开| Lotus["Lotus Next 界面"]
+    Bodhi -->|管理进程| Bamboo["班布运行时"]
+    Lotus <-->|HTTP 和 WebSocket| Bamboo
+    Bamboo <-->|本地记忆| Jiandu["简牍"]
+    Bamboo -.->|可选 MCP| Nova["Nova 桌面工具"]
+    Magpie["Magpie 消息连接器"] -.->|可选接入| Bamboo
 ```
 
-裸 Cargo 命令使用 manifest 的 `default-members`，`cargo test` 不等于测试所有 workspace 成员。仅用于开发的 analytics crate 默认被排除；使用 `--workspace` 前请查看 [Cargo.toml](./Cargo.toml)。
+[班布架构详解](./docs/architecture.zh-CN.md)
 
-- [架构](./docs/design/architecture-overview.md) · [配置](./docs/config-reference.md)
-- [插件](./docs/guides/PLUGINS.md) · [迁移](./docs/guides/MIGRATION_GUIDE.md) · [文档目录](./docs/README.md)
-- [贡献](./CONTRIBUTING.md) · [变更日志](./CHANGELOG.md) · [安全](./SECURITY.md)
+## 文档
+
+[从源码构建](./docs/guides/GETTING_STARTED.md#build-from-source) · [配置](./docs/config-reference.md) · [部署](./docs/guides/DEPLOY.md)
+
+## 参与贡献
+
+欢迎一起做班布。你可以分享实际用法、反馈问题、讨论设计，也可以贡献代码、文档、示例或评测结果。
+
+[GitHub Issues](https://github.com/bigduu/Bamboo-agent/issues) · [贡献指南](./CONTRIBUTING.md)
 
 ## 许可证
 
-项目自有代码采用 [MIT 许可证](./LICENSE)。第三方材料保留各自的许可证和版权声明：
-
-- `builtin_skills/skill-creator` 保留其 [Apache-2.0 许可证](./builtin_skills/skill-creator/LICENSE.txt)。
+[MIT](./LICENSE) · [第三方声明](./THIRD_PARTY_NOTICES.md) · [Skill Creator (Apache-2.0)](./builtin_skills/skill-creator/LICENSE.txt)

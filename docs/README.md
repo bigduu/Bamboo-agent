@@ -1,8 +1,7 @@
 # Docs index
 
 New here? Start at [`guides/GETTING_STARTED.md`](guides/GETTING_STARTED.md).
-The top-level [`README.md`](../README.md) has the project overview, capability
-summary, and CLI command table.
+See how the pieces work together in [Bamboo architecture](architecture.md) or [班布架构](architecture.zh-CN.md).
 
 ## User guides
 
@@ -70,3 +69,5 @@ Adding a new design doc? Put it in `design/` from the start if it's a plan/RFC
 for work not yet shipped — promote genuinely user-facing outcomes into a guide
 above once the feature lands, rather than leaving the plan doc as the only
 documentation.
+
+[Earlier README source and media](./readme-audit.md#earlier-readme-material)
