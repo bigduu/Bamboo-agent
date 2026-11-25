@@ -410,28 +410,16 @@ impl SessionMessenger {
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         Self::validate_peer_session_id(target_session_id)?;
-        let unauthorized = || SessionMessengerError::Unauthorized {
-            source_session_id: caller.session_id.clone(),
-            target: target_session_id.into(),
-        };
-        if !token.binding().caller.identity.matches_caller(caller) {
-            return Err(unauthorized());
-        }
-        let target = &token
-            .binding()
-            .target(target_session_id, bamboo_domain::HostSessionRight::SendPeer)
-            .map_err(|_| unauthorized())?
-            .observation
-            .identity;
+        let target_birth = Self::host_scoped_peer_birth(token, caller, target_session_id)?;
         let identity = bamboo_domain::HostSessionPeerIdentity::for_caller(
             caller,
-            &target.session_id,
-            target.created_at,
+            target_session_id,
+            target_birth,
             operation_id,
         );
         let envelope = Self::peer_envelope_for_ids(
             &caller.session_id,
-            &target.session_id,
+            target_session_id,
             operation_id,
             message,
             identity.message_id,
@@ -450,6 +438,127 @@ impl SessionMessenger {
             })?;
         self.finish_peer_delivery(envelope, delivery, started, Some(intent))
             .await
+    }
+
+    fn host_scoped_peer_birth(
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+    ) -> Result<chrono::DateTime<chrono::Utc>, SessionMessengerError> {
+        let unauthorized = || SessionMessengerError::Unauthorized {
+            source_session_id: caller.session_id.clone(),
+            target: target_session_id.into(),
+        };
+        if !token.binding().caller.identity.matches_caller(caller) {
+            return Err(unauthorized());
+        }
+        Ok(token
+            .binding()
+            .target(target_session_id, bamboo_domain::HostSessionRight::SendPeer)
+            .map_err(|_| unauthorized())?
+            .observation
+            .identity
+            .created_at)
+    }
+
+    /// Deliver only to the selected run, using the installed finite SendPeer
+    /// grant. Independent Roots still require native Project peer authority.
+    /// This is collaboration text and never starts a turn.
+    pub async fn send_host_scoped_peer_for_run(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        Self::validate_run_peer_input(operation_id, message, expected_run_id)?;
+        Self::validate_peer_session_id(target_session_id)?;
+        let target_birth = Self::host_scoped_peer_birth(token, caller, target_session_id)?;
+        let envelope = Self::running_peer_envelope(
+            caller,
+            target_session_id,
+            target_birth,
+            operation_id,
+            message,
+        );
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_host_scoped_peer_for_run(
+                token,
+                caller,
+                &envelope,
+                expected_run_id,
+                self.activation.clone(),
+            )
+            .await;
+        self.record_run_peer_delivery(envelope, delivery, started)
+    }
+
+    /// Native Host route for independent ordinary Roots in the same existing
+    /// Project. Storage rechecks the exact pair and any scope changes at commit.
+    pub async fn send_same_project_root_peer_for_run(
+        &self,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        Self::validate_run_peer_input(operation_id, message, expected_run_id)?;
+        Self::validate_peer_session_id(target_session_id)?;
+        let target = self
+            .sessions
+            .load_same_project_root_peer(caller, target_session_id)
+            .await
+            .map_err(|_| SessionMessengerError::Unauthorized {
+                source_session_id: caller.session_id.clone(),
+                target: target_session_id.into(),
+            })?;
+        let envelope = Self::running_peer_envelope(
+            caller,
+            target_session_id,
+            target.created_at,
+            operation_id,
+            message,
+        );
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_project_root_peer_for_run(
+                caller,
+                &envelope,
+                expected_run_id,
+                self.activation.clone(),
+            )
+            .await;
+        self.record_run_peer_delivery(envelope, delivery, started)
+    }
+
+    fn running_peer_envelope(
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        target_birth: chrono::DateTime<chrono::Utc>,
+        operation_id: &str,
+        message: &str,
+    ) -> SessionMessageEnvelope {
+        let identity = bamboo_domain::HostSessionPeerIdentity::for_running_peer(
+            caller,
+            target_session_id,
+            target_birth,
+            operation_id,
+        );
+        Self::peer_envelope_for_ids(
+            &caller.session_id,
+            target_session_id,
+            operation_id,
+            message,
+            identity.message_id,
+            identity.thread_id,
+            None,
+        )
     }
 
     /// Admit the first input for one explicitly authorized Root creation. This
@@ -556,12 +665,47 @@ impl SessionMessenger {
         message: &str,
         expected_run_id: &str,
     ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
-        Self::validate_peer_input(operation_id, message)?;
-        if !bamboo_domain::valid_session_run_id(expected_run_id) {
-            return Err(SessionMessengerError::InvalidEnvelope(
-                "invalid expected run id".into(),
-            ));
-        }
+        self.steer_peer_delivery(
+            caller_session_id,
+            target_session_id,
+            operation_id,
+            message,
+            expected_run_id,
+            None,
+        )
+        .await
+    }
+
+    /// Run-bound collaboration from the original observed same-tree caller.
+    pub async fn steer_peer_observed(
+        &self,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        self.steer_peer_delivery(
+            &caller.session_id,
+            target_session_id,
+            operation_id,
+            message,
+            expected_run_id,
+            Some(caller),
+        )
+        .await
+    }
+
+    async fn steer_peer_delivery(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+        original_caller: Option<&SessionCallerReference>,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        Self::validate_run_peer_input(operation_id, message, expected_run_id)?;
         let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
         let id = Self::peer_message_id(&caller, &target, operation_id);
         let envelope = Self::peer_envelope(
@@ -578,21 +722,56 @@ impl SessionMessenger {
         let target = ActorSession::from_session(&target)
             .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
         let started = Instant::now();
-        let receipt = self
-            .inbox
-            .deliver_peer_steer(
-                &envelope,
-                &source,
-                &target,
-                expected_run_id,
-                self.activation.clone(),
-            )
-            .await
-            .map_err(|error| {
-                let error = SessionMessengerError::Inbox(error);
-                self.record_rejection(&error);
-                error
-            })?;
+        let delivery = if let Some(original) = original_caller {
+            self.inbox
+                .deliver_unscoped_peer_for_run(
+                    original,
+                    &envelope,
+                    &source,
+                    &target,
+                    expected_run_id,
+                    self.activation.clone(),
+                )
+                .await
+        } else {
+            self.inbox
+                .deliver_peer_steer(
+                    &envelope,
+                    &source,
+                    &target,
+                    expected_run_id,
+                    self.activation.clone(),
+                )
+                .await
+        };
+        self.record_run_peer_delivery(envelope, delivery, started)
+    }
+
+    fn validate_run_peer_input(
+        operation_id: &str,
+        message: &str,
+        expected_run_id: &str,
+    ) -> Result<(), SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        if !bamboo_domain::valid_session_run_id(expected_run_id) {
+            return Err(SessionMessengerError::InvalidEnvelope(
+                "invalid expected run id".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_run_peer_delivery(
+        &self,
+        envelope: SessionMessageEnvelope,
+        delivery: Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError>,
+        started: Instant,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionMessengerError> {
+        let receipt = delivery.map_err(|error| {
+            let error = SessionMessengerError::Inbox(error);
+            self.record_rejection(&error);
+            error
+        })?;
         self.record_admission(envelope, receipt.delivery.clone(), started);
         Ok(receipt)
     }

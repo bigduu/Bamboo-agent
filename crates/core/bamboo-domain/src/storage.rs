@@ -781,6 +781,19 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Read the control view of one independent ordinary Root in the original
+    /// caller's current Project under the native Host's pairwise authority.
+    async fn load_same_project_root_peer(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _target_id: &str,
+    ) -> std::io::Result<Session> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native Project peer reads are unsupported",
+        ))
+    }
+
     /// Strict metadata/runtime-only Root source for a bounded immutable view.
     /// Requires the independent installed ReadContextView right, never raw
     /// history or the older InspectBoundedProgress projection authority.

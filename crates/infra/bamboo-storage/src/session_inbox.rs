@@ -3397,6 +3397,39 @@ impl FileSessionInbox {
         .await
     }
 
+    async fn deliver_peer_for_run(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        target_created_at: chrono::DateTime<Utc>,
+        expected_run_id: &str,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+        authority: InboxAuthority,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        let intent = SessionInboxActivationIntent::for_expected_run(expected_run_id)?;
+        let state = self
+            .deliver_with_lifecycle_held_run(
+                envelope,
+                authority,
+                None,
+                Some(intent),
+                Some(ExpectedRunAdmission {
+                    target_session_id: envelope.target_session_id.clone(),
+                    target_created_at,
+                    expected_run_id: expected_run_id.into(),
+                    activation,
+                    scoped_loop: None,
+                    scoped_loop_stopped: false,
+                    native_census: None,
+                }),
+            )
+            .await?;
+        Ok(bamboo_domain::SessionInboxSteerReceipt {
+            delivery: state.receipt.delivery,
+            replayed: state.replayed,
+            active_delivery_notified: state.active_delivery_notified,
+        })
+    }
+
     async fn deliver_with_run_authority(
         &self,
         envelope: &SessionMessageEnvelope,
@@ -5011,34 +5044,44 @@ impl SessionInboxPort for FileSessionInbox {
         activation: Arc<dyn bamboo_domain::SessionActivationPort>,
     ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
         Self::validate_peer_route(envelope, source, target, None)?;
-        let intent = SessionInboxActivationIntent::for_expected_run(expected_run_id)?;
         let authority = self
             .sessions
             .lock_peer_delivery(source, target, None)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        let state = self
-            .deliver_with_lifecycle_held_run(
-                envelope,
-                InboxAuthority::Peer { _guard: authority },
-                None,
-                Some(intent),
-                Some(ExpectedRunAdmission {
-                    target_session_id: target.actor_id.clone(),
-                    target_created_at: target.session_created_at,
-                    expected_run_id: expected_run_id.into(),
-                    activation,
-                    scoped_loop: None,
-                    scoped_loop_stopped: false,
-                    native_census: None,
-                }),
-            )
-            .await?;
-        Ok(bamboo_domain::SessionInboxSteerReceipt {
-            delivery: state.receipt.delivery,
-            replayed: state.replayed,
-            active_delivery_notified: state.active_delivery_notified,
-        })
+        self.deliver_peer_for_run(
+            envelope,
+            target.session_created_at,
+            expected_run_id,
+            activation,
+            InboxAuthority::Peer { _guard: authority },
+        )
+        .await
+    }
+
+    async fn deliver_unscoped_peer_for_run(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        expected_run_id: &str,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        Self::validate_peer_route(envelope, source, target, None)?;
+        let authority = self
+            .sessions
+            .lock_unscoped_peer_delivery(caller, source, target)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_peer_for_run(
+            envelope,
+            target.session_created_at,
+            expected_run_id,
+            activation,
+            InboxAuthority::Unscoped { _guard: authority },
+        )
+        .await
     }
 
     async fn deliver_peer_message_with_intent(
@@ -5062,7 +5105,7 @@ impl SessionInboxPort for FileSessionInbox {
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         let authority = self
             .sessions
-            .lock_host_scoped_peer_delivery(token, caller, envelope)
+            .lock_host_scoped_peer_delivery(token, caller, envelope, false)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         let base = authority.identity.activation_intent(intent);
@@ -5095,6 +5138,62 @@ impl SessionInboxPort for FileSessionInbox {
             },
             None,
             Some(intent),
+        )
+        .await
+    }
+
+    async fn deliver_host_scoped_peer_for_run(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        envelope: &SessionMessageEnvelope,
+        expected_run_id: &str,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .lock_host_scoped_peer_delivery(token, caller, envelope, true)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_peer_for_run(
+            envelope,
+            authority.target.identity.created_at,
+            expected_run_id,
+            activation,
+            InboxAuthority::HostScoped {
+                _guard: Box::new(authority),
+            },
+        )
+        .await
+    }
+
+    async fn deliver_project_root_peer_for_run(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        envelope: &SessionMessageEnvelope,
+        expected_run_id: &str,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> Result<bamboo_domain::SessionInboxSteerReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .lock_same_project_root_peer(caller, &envelope.target_session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        crate::v2::host_session_scope::validate_host_peer_envelope(
+            caller,
+            authority.target.created_at,
+            envelope,
+            true,
+        )
+        .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_peer_for_run(
+            envelope,
+            authority.target.created_at,
+            expected_run_id,
+            activation,
+            InboxAuthority::ProjectPeer {
+                _guard: Box::new(authority),
+            },
         )
         .await
     }
