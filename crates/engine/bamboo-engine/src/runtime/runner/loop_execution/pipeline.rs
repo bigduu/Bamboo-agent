@@ -3970,12 +3970,14 @@ async fn run_pipeline_inner(
             }
         }
         // Evaluate feedback after the real tool batch and any newly admitted
-        // Human input. Quiet command recovery retains its existing handoff.
-        let quiet_poll_active = crate::runtime::runner::tool_execution::quiet_poll_guard_active(
-            session,
-            &state.runtime_state,
-            config,
-        );
+        // Human input. A capped summary cannot start another background wait.
+        // Existing waits are reconciled when the run exits.
+        let quiet_poll_active = !max_rounds_summary_used
+            && crate::runtime::runner::tool_execution::quiet_poll_guard_active(
+                session,
+                &state.runtime_state,
+                config,
+            );
         if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
                 if maybe_suspend_for_background_exec(

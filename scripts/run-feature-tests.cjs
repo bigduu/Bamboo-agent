@@ -274,7 +274,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Shell wait projection and text-only round-cap summaries retain the default
 // Engine and LLM test owners. Their feature-sensitive source records change
 // with the same additive contexts and case selections.
-const FEATURE_SOURCE_SHA256 = "8d5f5ca4179314491e51df3ecf6ecf5c4022bcd103794b6e910a8f5e7da80cbf";
+const FEATURE_SOURCE_SHA256 = "3511c191028ad746b673d9673a51439cc074fb5f2265363a8167a2a8dcc1ed8e";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
