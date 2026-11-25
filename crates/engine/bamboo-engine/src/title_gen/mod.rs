@@ -1,68 +1,123 @@
-//! Backend auto-title-generation service.
-//!
-//! Runs asynchronously as soon as the chat handler durably appends a user
-//! message, derives a concise title for the session via the configured fast
-//! model (with a heuristic fallback), persists it through the authoritative
-//! metadata writer, and emits [`AgentEvent::SessionTitleUpdated`].
-//!
-//! Public entry points:
-//! - [`spawn_title_generation`] - skips work when the session title lifecycle
-//!   has already been finalized.
-//! - [`spawn_title_generation_force`] - always regenerates (used by the
-//!   `POST /sessions/{id}/regenerate-title` endpoint).
-//!
-//! Both share an in-flight guard keyed by session id to prevent duplicate work
-//! when called repeatedly for the same session.
+//! Asynchronous session naming from durable conversation evidence.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bamboo_agent_core::{Message, Role, Session, TitleSource};
-use tokio::time::timeout;
+use bamboo_agent_core::{Message, Session, TitleSource};
+use serde::Serialize;
+use tokio::{sync::oneshot, time::timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::app_context::AgentSessionContext;
-use crate::session_app::metadata::SessionMetadataService;
+use crate::session_app::metadata::{
+    GeneratedTitleCommit, MetadataError, SessionMetadataService, TitleGenerationRevision,
+};
 
 mod fallback;
 mod prompt;
 #[cfg(test)]
 mod tests;
+mod tracker;
 
 pub use fallback::heuristic_title;
 pub use prompt::build_title_messages;
+pub use tracker::TitleGenerationTracker;
+
+use prompt::{ModelTitle, TitleContext};
 
 const TITLE_GEN_TIMEOUT_SECS: u64 = 30;
-const MAX_TITLE_LEN: usize = 80;
-const MAX_USER_TEXT_FOR_TITLE: usize = 2000;
 
-/// Spawn a background task that generates an auto-title for a pending session.
-/// Skips if the title lifecycle is already finalized.
+/// Result of an explicit title request. Only an updated result writes metadata
+/// and publishes `SessionTitleUpdated`.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TitleGenerationOutcome {
+    Updated { title: String, title_version: u64 },
+    InsufficientContext,
+    Unavailable,
+    Unchanged,
+    Superseded,
+    Busy,
+}
+
+enum Request {
+    Automatic,
+    Regenerate {
+        observed: Option<TitleGenerationRevision>,
+    },
+}
+
+impl Request {
+    fn is_automatic(&self) -> bool {
+        matches!(self, Self::Automatic)
+    }
+}
+
+/// Evaluate newly durable conversation evidence for a still-pending title.
 pub fn spawn_title_generation(state: Arc<dyn AgentSessionContext>, session_id: String) {
-    spawn_inner(state, session_id, false);
+    spawn_inner(state, session_id, Request::Automatic, None);
 }
 
-/// Same as [`spawn_title_generation`] but bypasses the finalized-lifecycle
-/// check. Used by `POST /sessions/{id}/regenerate-title`.
+/// Request a title even when a session already has a title.
 pub fn spawn_title_generation_force(state: Arc<dyn AgentSessionContext>, session_id: String) {
-    spawn_inner(state, session_id, true);
+    spawn_inner(
+        state,
+        session_id,
+        Request::Regenerate { observed: None },
+        None,
+    );
 }
 
-fn spawn_inner(state: Arc<dyn AgentSessionContext>, session_id: String, force: bool) {
-    if !state.title_gen_acquire(&session_id) {
-        info!(session_id = %session_id, "title-gen: already in-flight, skipping");
+/// Request a title against the revision the caller observed. Dropping the
+/// receiver leaves the background job running.
+pub fn spawn_title_regeneration(
+    state: Arc<dyn AgentSessionContext>,
+    observed: &Session,
+) -> oneshot::Receiver<TitleGenerationOutcome> {
+    let (sender, receiver) = oneshot::channel();
+    spawn_inner(
+        state,
+        observed.id.clone(),
+        Request::Regenerate {
+            observed: Some(TitleGenerationRevision::capture(observed)),
+        },
+        Some(sender),
+    );
+    receiver
+}
+
+fn spawn_inner(
+    state: Arc<dyn AgentSessionContext>,
+    session_id: String,
+    request: Request,
+    result: Option<oneshot::Sender<TitleGenerationOutcome>>,
+) {
+    let acquired = state.title_generation_tracker().map_or_else(
+        || state.title_gen_acquire(&session_id),
+        |tracker| tracker.acquire(&session_id, request.is_automatic()),
+    );
+    if !acquired {
+        if let Some(result) = result {
+            let _ = result.send(TitleGenerationOutcome::Busy);
+        }
         return;
     }
-    let state_for_task = state.clone();
-    let sid = session_id.clone();
+
+    let mut guard = TitleGenGuard {
+        state,
+        session_id,
+        armed: true,
+    };
     tokio::spawn(async move {
-        let _guard = TitleGenGuard {
-            state: state_for_task.clone(),
-            session_id: sid.clone(),
-        };
-        if let Err(e) = run_title_generation(&state_for_task, &sid, force).await {
-            warn!(session_id = %sid, "title-gen failed: {e}");
+        let outcome = run_title_generation(&guard.state, &guard.session_id, request).await;
+        let mut queued = guard.finish();
+        if let Some(result) = result {
+            let _ = result.send(outcome);
+        }
+        while queued {
+            run_title_generation(&guard.state, &guard.session_id, Request::Automatic).await;
+            queued = guard.finish();
         }
     });
 }
@@ -70,142 +125,132 @@ fn spawn_inner(state: Arc<dyn AgentSessionContext>, session_id: String, force: b
 struct TitleGenGuard {
     state: Arc<dyn AgentSessionContext>,
     session_id: String,
+    armed: bool,
+}
+
+impl TitleGenGuard {
+    fn finish(&mut self) -> bool {
+        if let Some(tracker) = self.state.title_generation_tracker() {
+            self.armed = tracker.finish(&self.session_id);
+            return self.armed;
+        }
+        false
+    }
 }
 
 impl Drop for TitleGenGuard {
     fn drop(&mut self) {
-        self.state.title_gen_release(&self.session_id);
+        if self.armed {
+            if let Some(tracker) = self.state.title_generation_tracker() {
+                tracker.release(&self.session_id);
+            } else {
+                self.state.title_gen_release(&self.session_id);
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TitleModelError {
+    RouteUnavailable,
+    Bootstrap,
+    Request,
+    Stream,
+    ReasoningOnly,
+    Timeout,
 }
 
 async fn run_title_generation(
     state: &Arc<dyn AgentSessionContext>,
     session_id: &str,
-    force: bool,
-) -> Result<(), String> {
-    // 1. Reload session.
-    let session = state
-        .storage()
-        .load_session(session_id)
-        .await
-        .map_err(|e| format!("load_session: {e}"))?
-        .ok_or_else(|| "session not found".to_string())?;
-
-    // 2. Skip if the lifecycle is already finalized (unless forced).
-    if !force && session.title_generated {
-        debug!(session_id = %session_id, "title-gen: title lifecycle already finalized, skipping");
-        return Ok(());
-    }
-
-    // 3. Find first user message text.
-    let first_user = match first_user_text(&session) {
-        Some(t) if !t.trim().is_empty() => t,
-        _ => {
-            debug!(session_id = %session_id, "title-gen: no user message text, skipping");
-            return Ok(());
-        }
-    };
-    let first_user_len = first_user.len();
-
-    // 4. Try LLM, then heuristic fallback.
-    let (raw_title, source) = match try_llm_title(state, &session, &first_user).await {
-        Ok(t) if !t.trim().is_empty() => {
-            info!(session_id = %session_id, prompt_len = first_user_len, "title-gen: LLM produced title");
-            (t, TitleSource::Auto)
-        }
-        Ok(_) => {
-            warn!(session_id = %session_id, "title-gen: LLM returned empty, using fallback");
-            (heuristic_title(&first_user), TitleSource::Fallback)
-        }
-        Err(e) => {
-            warn!(session_id = %session_id, "title-gen: LLM failed ({e}), using fallback");
-            (heuristic_title(&first_user), TitleSource::Fallback)
-        }
+    request: Request,
+) -> TitleGenerationOutcome {
+    use TitleGenerationOutcome::{
+        InsufficientContext, Superseded, Unavailable, Unchanged, Updated,
     };
 
-    let title = sanitize(&raw_title);
-    if title.is_empty() {
-        debug!(session_id = %session_id, "title-gen: sanitized title empty, skipping");
-        return Ok(());
+    let session = match state.storage().load_session(session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Superseded,
+        Err(_) => {
+            warn!(%session_id, "title-gen: session load failed");
+            return Unavailable;
+        }
+    };
+    match &request {
+        Request::Automatic if session.title_generated => return Superseded,
+        Request::Regenerate {
+            observed: Some(revision),
+        } if !revision.matches(&session) => {
+            return Superseded;
+        }
+        _ => {}
     }
 
-    // 5. Hand off to the authoritative metadata writer. It re-checks
-    //    title_generated (when force=false) inside a per-session lock so a
-    //    concurrent user PATCH wins, finalizes the lifecycle, bumps
-    //    title_version and metadata_version, refreshes the in-memory cache,
-    //    and emits SessionTitleUpdated through the replayable helper.
-    match SessionMetadataService::apply_generated_title(
+    let Some(context) = TitleContext::from_session(&session) else {
+        debug!(%session_id, "title-gen: no eligible conversation evidence");
+        return InsufficientContext;
+    };
+    let repeated_evidence = state
+        .title_generation_tracker()
+        .is_some_and(|tracker| !tracker.record_attempt(&session, context.fingerprint()));
+    if repeated_evidence && request.is_automatic() {
+        return Unchanged;
+    }
+
+    let started_at = Instant::now();
+    let output = match try_llm_title(state, &session, context.messages()).await {
+        Ok(output) => output,
+        Err(reason) => {
+            warn!(%session_id, ?reason, duration_ms = started_at.elapsed().as_millis(), "title-gen: model unavailable");
+            return Unavailable;
+        }
+    };
+    let title = match context.parse(&output) {
+        ModelTitle::Title(title) => title,
+        ModelTitle::InsufficientContext => {
+            info!(%session_id, duration_ms = started_at.elapsed().as_millis(), "title-gen: model deferred");
+            return InsufficientContext;
+        }
+        ModelTitle::Invalid(reason) => {
+            warn!(%session_id, reason, duration_ms = started_at.elapsed().as_millis(), "title-gen: rejected model output");
+            return Unavailable;
+        }
+    };
+
+    match SessionMetadataService::commit_generated_title(
         state.as_ref(),
         session_id,
         &title,
-        source,
-        force,
+        TitleSource::Auto,
+        !request.is_automatic(),
+        Some(&TitleGenerationRevision::capture(&session)),
     )
     .await
-    .map_err(|e| format!("apply_generated_title: {e}"))?
     {
-        Some((applied, title_version)) => {
-            info!(
-                session_id = %session_id,
-                title_len = applied.len(),
+        Ok(GeneratedTitleCommit::Updated(title, title_version)) => {
+            info!(%session_id, title_version, duration_ms = started_at.elapsed().as_millis(), "title-gen: applied model title");
+            Updated {
+                title,
                 title_version,
-                source = ?source,
-                "title-gen: applied generated title"
-            );
+            }
         }
-        None => {
-            debug!(
-                session_id = %session_id,
-                "title-gen: skipped (title lifecycle finalized or unchanged)"
-            );
+        Ok(GeneratedTitleCommit::Unchanged) => Unchanged,
+        Ok(GeneratedTitleCommit::Superseded) | Err(MetadataError::NotFound(_)) => Superseded,
+        Err(_) => {
+            warn!(%session_id, "title-gen: title commit failed");
+            Unavailable
         }
     }
-    Ok(())
 }
 
-/// Extract the first user message's text, preferring `Text` parts when
-/// `content_parts` is set. Truncates to `MAX_USER_TEXT_FOR_TITLE` characters.
-/// Skips hidden runtime resume messages so internal system messages don't
-/// pollute generated titles.
-fn first_user_text(session: &Session) -> Option<String> {
-    session
-        .messages
-        .iter()
-        .filter(|message| {
-            matches!(message.role, Role::User)
-                && !crate::session_app::execute::is_system_resume_message(message)
-        })
-        .find_map(|message| {
-            let raw = if let Some(parts) = message.content_parts.as_ref() {
-                let joined: String = parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        bamboo_agent_core::MessagePart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if joined.trim().is_empty() {
-                    message.content.clone()
-                } else {
-                    joined
-                }
-            } else {
-                message.content.clone()
-            };
-            let truncated: String = raw.chars().take(MAX_USER_TEXT_FOR_TITLE).collect();
-            (!truncated.trim().is_empty()).then_some(truncated)
-        })
-}
-
-/// Run the LLM call to produce a title. Wrapped in a 30s timeout; any error
-/// (resolve, stream, consume, timeout) propagates back so the caller can fall
-/// through to the heuristic.
+/// Consume the fast-model response without exposing conversation excerpts or
+/// upstream error content to the title diagnostic.
 async fn try_llm_title(
     state: &Arc<dyn AgentSessionContext>,
     session: &Session,
-    first_user_text: &str,
-) -> Result<String, String> {
+    messages: Vec<Message>,
+) -> Result<String, TitleModelError> {
     // Select the target and its handle while the same config is current.
     // Drop the guard before any provider request or stream await.
     let (provider_name, resolved, stream_timeout) = {
@@ -216,14 +261,22 @@ async fn try_llm_title(
             &provider_name,
             state.provider_registry(),
         )
-        .map_err(|error| format!("configured fast model unavailable: {error}"))?
-        .ok_or_else(|| "no fast model resolved".to_string())?;
-        (provider_name, resolved, config.stream_timeout)
+        .map_err(|_| TitleModelError::RouteUnavailable)?
+        .ok_or(TitleModelError::RouteUnavailable)?;
+        let actual_provider = config.defaults.as_ref().map_or(provider_name, |defaults| {
+            defaults
+                .fast
+                .as_ref()
+                .unwrap_or(&defaults.chat)
+                .provider
+                .clone()
+        });
+        (actual_provider, resolved, config.stream_timeout)
     };
 
-    let messages: Vec<Message> = build_title_messages(first_user_text);
     let model_name = resolved.model_name.clone();
     let provider = resolved.provider;
+    debug!(provider = %provider_name, model = %model_name, "title-gen: selected model");
     let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
         stream_timeout,
         Some(&provider_name),
@@ -241,7 +294,7 @@ async fn try_llm_title(
             provider.chat_stream_with_options(
                 &messages,
                 &[],
-                Some(64),
+                Some(128),
                 &model_name,
                 Some(&options),
             ),
@@ -250,8 +303,8 @@ async fn try_llm_title(
             &timeout_context,
         )
         .await
-        .map_err(|e| format!("chat_stream bootstrap: {e}"))?
-        .map_err(|e| format!("chat_stream: {e}"))?;
+        .map_err(|_| TitleModelError::Bootstrap)?
+        .map_err(|_| TitleModelError::Request)?;
         let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
             &cancel_token,
@@ -259,13 +312,18 @@ async fn try_llm_title(
             &timeout_context,
         )
         .await
-        .map_err(|e| format!("consume_llm_stream_silent: {e}"))?;
-        Ok::<String, String>(output.content)
+        .map_err(|_| TitleModelError::Stream)?;
+        if output.content.trim().is_empty()
+            && (!output.reasoning_content.trim().is_empty() || output.thinking_tokens > 0)
+        {
+            return Err(TitleModelError::ReasoningOnly);
+        }
+        Ok(output.content)
     };
 
     timeout(Duration::from_secs(TITLE_GEN_TIMEOUT_SECS), fut)
         .await
-        .map_err(|_| "title-gen LLM timeout".to_string())?
+        .map_err(|_| TitleModelError::Timeout)?
 }
 
 fn title_provider_name(config: &bamboo_config::Config, session: &Session) -> String {
@@ -276,18 +334,4 @@ fn title_provider_name(config: &bamboo_config::Config, session: &Session) -> Str
     } else {
         config.effective_default_provider().to_string()
     }
-}
-
-/// Trim, take first line, strip leading/trailing quotes/punctuation,
-/// cap at [`MAX_TITLE_LEN`] characters.
-fn sanitize(input: &str) -> String {
-    let first_line = input.lines().next().unwrap_or("").trim();
-    let trim_chars: &[char] = &['"', '\'', '`', '.', ',', ';', ':', ' ', '\t'];
-    let stripped = first_line.trim_matches(trim_chars).trim();
-    let limit = stripped
-        .char_indices()
-        .nth(MAX_TITLE_LEN)
-        .map(|(i, _)| i)
-        .unwrap_or(stripped.len());
-    stripped[..limit].trim().to_string()
 }

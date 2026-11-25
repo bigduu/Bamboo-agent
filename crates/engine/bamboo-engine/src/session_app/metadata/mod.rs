@@ -39,7 +39,8 @@
 
 use bamboo_agent_core::{AgentEvent, Session, TitleSource};
 use bamboo_domain::SessionPresentationMutation;
-use chrono::Utc;
+use bamboo_storage::v2::SIDE_CHAT_CLEAR_EPOCH_KEY;
+use chrono::{DateTime, Utc};
 
 use crate::app_context::AgentSessionContext;
 use crate::events::replayable::publish_reserved_session_mutation;
@@ -108,6 +109,38 @@ async fn commit_presentation_metadata(
 /// value, or a guard rejected the change). `Some(applied)` means the change
 /// was persisted and an event was published.
 pub type MetadataChange<T> = Option<T>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TitleGenerationRevision {
+    title_version: u64,
+    session_created_at: DateTime<Utc>,
+    conversation_revision: u64,
+    legacy_clear_epoch: Option<String>,
+}
+
+impl TitleGenerationRevision {
+    pub(crate) fn capture(session: &Session) -> Self {
+        Self {
+            title_version: session.title_version,
+            session_created_at: session.created_at,
+            conversation_revision: session.conversation_revision(),
+            legacy_clear_epoch: session.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY).cloned(),
+        }
+    }
+
+    pub(crate) fn matches(&self, session: &Session) -> bool {
+        self.title_version == session.title_version
+            && self.session_created_at == session.created_at
+            && self.conversation_revision == session.conversation_revision()
+            && self.legacy_clear_epoch.as_ref() == session.metadata.get(SIDE_CHAT_CLEAR_EPOCH_KEY)
+    }
+}
+
+pub(crate) enum GeneratedTitleCommit {
+    Updated(String, u64),
+    Unchanged,
+    Superseded,
+}
 
 pub struct SessionMetadataService;
 
@@ -181,22 +214,43 @@ impl SessionMetadataService {
         source: TitleSource,
         force: bool,
     ) -> Result<MetadataChange<(String, u64)>, MetadataError> {
+        Ok(
+            match Self::commit_generated_title(state, session_id, candidate, source, force, None)
+                .await?
+            {
+                GeneratedTitleCommit::Updated(title, version) => Some((title, version)),
+                GeneratedTitleCommit::Unchanged | GeneratedTitleCommit::Superseded => None,
+            },
+        )
+    }
+
+    /// Commit a candidate only against the title revision that the model read.
+    pub(crate) async fn commit_generated_title(
+        state: &dyn AgentSessionContext,
+        session_id: &str,
+        candidate: &str,
+        source: TitleSource,
+        force: bool,
+        requested_revision: Option<&TitleGenerationRevision>,
+    ) -> Result<GeneratedTitleCommit, MetadataError> {
         let trimmed = candidate.trim();
         if trimmed.is_empty() {
-            return Ok(None);
+            return Ok(GeneratedTitleCommit::Unchanged);
         }
 
         // Lock: serialise with any concurrent manual rename.
         let _guard = state.persistence().acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
-        if !force && session.title_generated {
+        if requested_revision.is_some_and(|revision| !revision.matches(&session))
+            || (!force && session.title_generated)
+        {
             validate_presentation_metadata(state, &session).await?;
-            return Ok(None);
+            return Ok(GeneratedTitleCommit::Superseded);
         }
         if session.title == trimmed && session.title_generated {
             validate_presentation_metadata(state, &session).await?;
-            return Ok(None);
+            return Ok(GeneratedTitleCommit::Unchanged);
         }
 
         session.title = trimmed.to_string();
@@ -226,7 +280,10 @@ impl SessionMetadataService {
         };
         publish_reserved_session_mutation(state, session_id, event, event_slot).await;
 
-        Ok(Some((session.title, session.title_version)))
+        Ok(GeneratedTitleCommit::Updated(
+            session.title,
+            session.title_version,
+        ))
     }
 
     /// Toggle the `pinned` flag. Returns `Ok(None)` if the requested value
