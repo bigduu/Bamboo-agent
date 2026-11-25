@@ -38,8 +38,8 @@ use bamboo_domain::{
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
-    native_transcript_protocol_for, CompletionDiagnostics, ResponsesRequestOptions,
-    OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
+    native_transcript_protocol_for, CompletionDiagnostics, RequestToolSelection,
+    ResponsesRequestOptions, OUTPUT_LIMIT_CONVERGENCE_HINT, REASONING_REPETITION_FINISH_REASON,
 };
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
@@ -1777,6 +1777,9 @@ pub(super) async fn execute_llm_stream(
     let standalone_discovery = frame
         .output_limit_recovery
         .is_some_and(|policy| policy.standalone_discovery);
+    let round_cap_summary = frame
+        .output_limit_recovery
+        .is_some_and(|policy| policy.round_cap_summary);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -1785,6 +1788,7 @@ pub(super) async fn execute_llm_stream(
         .map_err(|error| AgentError::Budget(error.to_string()))?
         .is_none()
         && task_split.is_none()
+        && !round_cap_summary
         && responses_continuation_enabled(&responses_policy, provider_type);
     let mut checkpoint_reprepares = 0usize;
     let mut observation_progress_hint = frame.observation_progress_hint;
@@ -1803,9 +1807,18 @@ pub(super) async fn execute_llm_stream(
         required_tool,
         tool_dispatch,
     ) = loop {
-        let required_tool = required_tool_for_session(session);
-        let (loading_mode, selection) =
-            request_tool_policy(llm.as_ref(), model, required_tool).await?;
+        let (required_tool, loading_mode, selection) = if round_cap_summary {
+            (
+                None,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                RequestToolSelection::Disabled,
+            )
+        } else {
+            let required_tool = required_tool_for_session(session);
+            let (loading_mode, selection) =
+                request_tool_policy(llm.as_ref(), model, required_tool).await?;
+            (required_tool, loading_mode, selection)
+        };
         let effective_schemas =
             select_request_tool_schemas(session, base_tool_schemas, &selection)?;
         let tool_schemas = effective_schemas.as_ref();
@@ -2237,7 +2250,8 @@ pub(super) async fn execute_llm_stream(
             .is_none_or(|policy| policy.remaining_run_tokens.is_none());
     let completion = CompletionDiagnostics::for_agent_round(recovery)
         .with_model_window_limit(window_limit)
-        .with_provider_default_output(provider_default_output);
+        .with_provider_default_output(provider_default_output)
+        .with_tools_disabled(round_cap_summary);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -2541,6 +2555,7 @@ pub(super) async fn execute_llm_stream(
     if config.features_final_evidence_check
         && !activation_pending
         && !response_rejected
+        && !round_cap_summary
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {

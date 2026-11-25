@@ -407,6 +407,7 @@ pub(crate) struct RoundRecoveryPolicy<'a> {
     pub previous_prompt_tokens: u64,
     pub task_split: Option<TaskSplitPrompt<'a>>,
     pub standalone_discovery: bool,
+    pub round_cap_summary: bool,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable

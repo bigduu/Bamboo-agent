@@ -805,18 +805,23 @@ async fn supervisor_discovery_correction_stops_if_wire_returns_other_tools() {
 #[tokio::test]
 async fn supervisor_discovery_correction_does_not_replace_round_limit_summary() {
     let summary = "Stopped at the round limit before checking Session scope.";
-    let run = run_supervisor_discovery_wire(1, vec![json!({"content":summary})]).await;
+    let unexpected = wire_tool_call(0, "summary-tool", "Task", r#"{"tasks":[]}"#);
+    let run = run_supervisor_discovery_wire(
+        1,
+        vec![json!({"content":summary,"tool_calls":[unexpected]})],
+    )
+    .await;
     run.outcome.unwrap();
     assert_eq!(run.requests.len(), 2);
     let summary_request = &run.requests[1];
     assert!(summary_request
         .to_string()
-        .contains("summarize your progress"));
+        .contains("Summarize the progress, verified outputs, and remaining work in text only"));
     assert!(!summary_request
         .to_string()
         .contains("This request is for tool discovery only."));
-    assert!(tool_names(summary_request).contains(&"Task"));
-    assert_eq!(summary_request["parallel_tool_calls"], true);
+    assert!(tool_names(summary_request).is_empty());
+    assert!(summary_request.get("parallel_tool_calls").is_none());
     assert_eq!(
         run.session
             .metadata
@@ -831,6 +836,117 @@ async fn supervisor_discovery_correction_does_not_replace_round_limit_summary() 
         .any(|row| row.content == summary));
     assert!(run.calls.is_empty());
     assert_discovery_wire_tool_result(&run.session, "mixed-task", false);
+    assert!(run.session.messages.iter().all(|message| {
+        message.tool_call_id.as_deref() != Some("summary-tool")
+            && message
+                .tool_calls
+                .as_ref()
+                .is_none_or(|calls| calls.iter().all(|call| call.id != "summary-tool"))
+    }));
+}
+
+#[tokio::test]
+async fn explicit_round_cap_summary_has_no_tools_even_with_a_forced_provider_choice() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bamboo_agent_core::tools::{ToolError, ToolExecutor, ToolResult};
+    use wiremock::matchers::path;
+
+    struct Writer(std::path::PathBuf);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for Writer {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            std::fs::write(&self.0, &call.id).unwrap();
+            Ok(ToolResult::text(true, "Partial artifact saved."))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![schema("Write")]
+        }
+    }
+
+    let summary = "Saved the partial artifact; verification remains.";
+    let data = tempfile::tempdir().unwrap();
+    let artifact = data.path().join("partial.txt");
+    let write_arguments = json!({"file_path":artifact,"content":"fixture"}).to_string();
+    let requests = AtomicUsize::new(0);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_: &wiremock::Request| {
+            let round = requests.fetch_add(1, Ordering::SeqCst);
+            let delta = match round {
+                0 => json!({"tool_calls":[wire_tool_call(0, "work-write", "Write", &write_arguments)]}),
+                1 => json!({
+                    "content":summary,
+                    "tool_calls":[wire_tool_call(0, "over-cap-write", "Write", &write_arguments)],
+                }),
+                _ => return ResponseTemplate::new(400),
+            };
+            let chunk = json!({
+                "id":format!("round-cap-{round}"), "object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":delta,"finish_reason":"tool_calls"}]
+            });
+            ResponseTemplate::new(200).set_body_raw(
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            )
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .with_request_overrides(Some(body_override(
+                "tool_choice",
+                json!({"type":"function","function":{"name":"Write"}}),
+            ))),
+    );
+    let mut session = Session::new("round-cap", MODEL);
+    let (events, _receiver) = tokio::sync::mpsc::channel(128);
+    crate::runtime::runner::run_agent_loop_with_config(
+        &mut session,
+        "Write the artifact and verify it.".into(),
+        events,
+        provider,
+        Arc::new(Writer(artifact.clone())),
+        CancellationToken::new(),
+        AgentLoopConfig {
+            model_name: Some(MODEL.into()),
+            provider_type: Some("openai".into()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = capture(&server).await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(tool_names(&requests[0]), ["Write"]);
+    assert_eq!(requests[0]["tool_choice"]["function"]["name"], "Write");
+    assert!(tool_names(&requests[1]).is_empty());
+    assert!(requests[1].get("tool_choice").is_none());
+    assert!(requests[1].to_string().contains("Partial artifact saved."));
+    assert_eq!(std::fs::read_to_string(artifact).unwrap(), "work-write");
+    assert_eq!(
+        session.metadata["runtime.completion_reason"],
+        "max_rounds_reached"
+    );
+    let answer = session.messages.last().unwrap();
+    assert_eq!(answer.role, bamboo_domain::Role::Assistant);
+    assert_eq!(answer.content, summary);
+    assert!(answer.tool_calls.is_none());
+    assert!(!serde_json::to_string(&session.messages)
+        .unwrap()
+        .contains("over-cap-write"));
 }
 
 #[tokio::test]
@@ -930,6 +1046,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
                     advisory: "Complete a smaller part of the request",
                     private_plan: false,
                 }),
+                round_cap_summary: false,
                 standalone_discovery: false,
             }),
         )
