@@ -10,7 +10,7 @@ to retrieve the bytes. Answer generation can still use a configured model.
 | Which binary version? Source SHA? Package hash? Offline? | `manifest.json` |
 | Configuration key, default, JSON, partition, precedence, environment, CLI | `references/configuration.md` |
 | Exact keys, aliases, defaults, typed groups, root coverage and unknown fields | `references/config-keys.json` |
-| Memory, Jiandu, Session/Project/Global, lexical, rerank, Dream, 记忆 | `references/memory.md` |
+| Memory, Jiandu, Session/Section/Project/Global, lexical query, Dream, 记忆 | `references/memory.md` |
 | Hook, lifecycle_hooks, command, script, timeout, portable plugin, 钩子 | `references/hooks.md` |
 | Provider, model, MCP, desired/applied revision, live-health | `references/providers-mcp.md` |
 | Supervisor Work, tickets, dispatch, pending messages, chat-only resolution | `references/work.md` |

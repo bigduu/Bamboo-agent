@@ -382,6 +382,8 @@ pub struct ImageFallbackConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptMemoryFlags {
+    // Legacy prompt-memory switches remain accepted by earlier SDK callers.
+    // Task requests retrieve Jiandu memory through tools.
     pub project_prompt_injection: bool,
     pub relevant_recall: bool,
     pub relevant_recall_rerank: bool,
@@ -392,10 +394,10 @@ pub struct PromptMemoryFlags {
 impl Default for PromptMemoryFlags {
     fn default() -> Self {
         Self {
-            project_prompt_injection: true,
-            relevant_recall: true,
+            project_prompt_injection: false,
+            relevant_recall: false,
             relevant_recall_rerank: false,
-            project_first_dream: true,
+            project_first_dream: false,
             ledger_agenda: true,
         }
     }
@@ -404,11 +406,8 @@ impl Default for PromptMemoryFlags {
 impl From<&MemoryConfig> for PromptMemoryFlags {
     fn from(value: &MemoryConfig) -> Self {
         Self {
-            project_prompt_injection: value.project_prompt_injection,
-            relevant_recall: value.relevant_recall,
-            relevant_recall_rerank: value.relevant_recall_rerank,
-            project_first_dream: value.project_first_dream,
             ledger_agenda: value.ledger_agenda_injection,
+            ..Self::default()
         }
     }
 }
@@ -1071,9 +1070,6 @@ pub struct AgentLoopConfig {
     /// Used by runtime features that persist auxiliary artifacts outside the
     /// session store, such as durable plan mode files under `~/.bamboo/plan`.
     pub(crate) app_data_dir: Option<PathBuf>,
-    /// Jiandu memory handle for this run. The default is the independent
-    /// `~/.jiandu` store; explicit construction is used by isolated tests.
-    pub(crate) memory_store: bamboo_memory::memory_store::MemoryStore,
     /// Tool names that should be excluded from schemas sent to the LLM.
     pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
@@ -1267,7 +1263,6 @@ impl Default for AgentLoopConfig {
             provider_type: None,
             reasoning_effort: None,
             app_data_dir: None,
-            memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             disabled_tools: BTreeSet::new(),
             token_budget: None,
             model_limits_section: None,

@@ -1970,7 +1970,6 @@ mod tests {
             None,
             &cancel,
             None,
-            None,
         )
         .await
         .unwrap();

@@ -1992,413 +1992,178 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
 }
 
 #[tokio::test]
-async fn provider_request_jiandu_recall_baseline() {
-    use bamboo_memory::memory_store::{
-        DurableMemoryStatus, DurableMemoryType, MemoryRetrievalInput, MemoryScope, MemoryStore,
-    };
+async fn provider_gets_jiandu_text_only_after_explicit_memory_call() {
+    use bamboo_agent_core::tools::ToolCall;
+    use bamboo_agent_core::Role;
+    use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
+    use bamboo_metrics::types::{PromptMemoryRecallOutcome, TokenUsage};
 
-    let (_metrics_root, collector, _storage) = create_runner_metrics().await;
-    let memory_root = tempfile::tempdir().unwrap();
-    let store = MemoryStore::new(memory_root.path());
-    let local = bamboo_domain::ProjectId::parse("coding-recall-orchid").unwrap();
-    let other = bamboo_domain::ProjectId::parse("coding-recall-ember").unwrap();
-    let mut ids = Vec::new();
-    for (project, title, body, keywords) in [
+    const NOTE: &str = "SESSION_NOTE_CANARY";
+    const LEGACY_STATE: &str = "LEGACY_RENDERED_MEMORY_CANARY";
+    const LEGACY_PROMPT: &str = "LEGACY_SYSTEM_PROMPT_MEMORY_CANARY";
+    const DREAM: &str = "PROJECT_DREAM_CANARY";
+    let session_id = "metrics-on-demand-memory";
+    let project_id = bamboo_domain::ProjectId::parse("on-demand-wire-project").unwrap();
+    let (_metrics_directory, collector, metrics) = create_runner_metrics().await;
+    let memory_directory = tempfile::tempdir().expect("memory tempdir");
+    let store = MemoryStore::new(memory_directory.path());
+    store
+        .write_session_topic(session_id, "default", NOTE)
+        .await
+        .unwrap();
+    let project_store = store.for_project(&project_id);
+    let mut durable_ids = Vec::new();
+    for (memory, scope, project_key, memory_type, title) in [
         (
-            &local,
-            "Bamboo sidecar readiness failure",
-            "BAMBOO_E_INIT means the sidecar did not reach the readiness probe.",
-            vec!["侧车探针", "启动失败"],
+            &store,
+            MemoryScope::Global,
+            None,
+            DurableMemoryType::Reference,
+            "Compass global rule",
         ),
         (
-            &local,
-            "Orchid release window",
-            "Previous decision: Friday. ORCHID_FRIDAY_OLD.",
-            vec!["Orchid release window"],
-        ),
-        (
-            &local,
-            "Orchid release window",
-            "Current decision: Thursday morning.",
-            vec!["Orchid release window"],
-        ),
-        (
-            &other,
-            "Orchid release window",
-            "Separate Project's decision: Sunday. EMBER_SUNDAY_PRIVATE.",
-            vec!["Orchid release window"],
+            &project_store,
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            DurableMemoryType::Project,
+            "Compass project rule",
         ),
     ] {
-        let record = store
-            .for_project(project)
-            .write_memory_with_retrieval(
-                MemoryScope::Project,
-                Some(project.as_str()),
-                DurableMemoryType::Project,
-                title,
-                body,
-                &[],
-                &MemoryRetrievalInput {
-                    keywords: keywords.into_iter().map(str::to_owned).collect(),
-                    entities: vec![],
-                },
-                None,
-                "recall-fixture",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        ids.push(record.frontmatter.id);
-    }
-    store
-        .for_project(&local)
-        .archive_memory(
-            &ids[1],
-            Some(local.as_str()),
-            DurableMemoryStatus::Superseded,
-            Some("Current decision adopted"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let cases = [
-        ("侧车探针启动失败", Some(ids[0].as_str())),
-        ("Orchid release window", Some(ids[2].as_str())),
-        ("EMBERSUNDAYPRIVATE", None),
-        ("TUNDRA934ZYX", None),
-    ];
-    let provider = Arc::new(MetricsQueueProvider {
-        queue: Mutex::new(
-            cases
-                .iter()
-                .map(|_| {
-                    vec![
-                        Ok(provider_usage(11, 2)),
-                        Ok(LLMChunk::Token("fixture reply".into())),
-                        Ok(LLMChunk::Done),
-                    ]
-                })
-                .collect(),
-        ),
-        requested_messages: Mutex::new(Vec::new()),
-    });
-    for (index, (query, _)) in cases.iter().enumerate() {
-        let mut session = Session::new(format!("coding-recall-{index}"), "test-model");
-        session.set_project_id_meta(local.to_string());
-        let mut config = runner_metrics_config(&collector);
-        config.memory_store = store.clone();
-        config.prompt_memory_flags.relevant_recall = true;
-        config.prompt_memory_flags.project_prompt_injection = true;
-        let (events, _receiver) = mpsc::channel(64);
-        super::run_agent_loop_with_config(
-            &mut session,
-            (*query).to_owned(),
-            events,
-            provider.clone(),
-            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
-            CancellationToken::new(),
-            config,
-        )
-        .await
-        .unwrap();
-    }
-    let requests = provider.requested_messages.lock().await;
-    assert_eq!(requests.len(), cases.len());
-    for (messages, (query, expected)) in requests.iter().zip(cases) {
-        let text = messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !text.contains(&ids[1]),
-            "{query}: superseded record entered the request"
-        );
-        assert!(
-            !text.contains(&ids[3]),
-            "{query}: another Project's record entered the request"
-        );
-        assert!(!text.contains("ORCHID_FRIDAY_OLD"));
-        assert!(!text.contains("EMBER_SUNDAY_PRIVATE"));
-        if let Some(expected) = expected {
-            let recall = text
-                .split_once("### Relevant Durable Memories")
-                .unwrap_or_else(|| panic!("no recall block for {query}"))
-                .1;
-            assert!(
-                recall.contains(&format!("action=get id={expected}")),
-                "{query}: expected evidence missing"
-            );
-        } else {
-            assert!(
-                !text.contains("### Relevant Durable Memories"),
-                "{query}: unmatched query received recall candidates"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn provider_bootstrap_persists_exact_project_ids_and_redacts_global_ids() {
-    let session_id = "metrics-prompt-memory-exposure";
-    let (_directory, collector, storage) = create_runner_metrics().await;
-    let memory_directory = tempfile::tempdir().expect("memory tempdir");
-    let memory_store = bamboo_memory::memory_store::MemoryStore::new(memory_directory.path());
-    let project_a =
-        bamboo_domain::ProjectId::parse("prompt-memory-project-a").expect("valid Project A id");
-    let project_b =
-        bamboo_domain::ProjectId::parse("prompt-memory-project-b").expect("valid Project B id");
-    let project_c = bamboo_domain::ProjectId::parse("prompt-memory-project-c").expect("Project C");
-    let project_a_store = memory_store.for_project(&project_a);
-    let project_b_store = memory_store.for_project(&project_b);
-    let query = "exposuretoken1077";
-    let first = project_a_store
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_a.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Exposuretoken1077 canonical Project A decision",
-            &format!(
-                "Project A compact summary. {} FULL_PRIVATE_BODY_A_MUST_NOT_RENDER",
-                "a".repeat(300)
-            ),
-            &[query.to_string()],
-            Some(session_id),
-            "test-model",
-            false,
-            Some(bamboo_memory::memory_store::TemporalGranularity::Year),
-        )
-        .await
-        .expect("write Project A memory");
-    let mut project_a_ids = vec![first.frontmatter.id];
-    for (index, granularity) in [
-        bamboo_memory::memory_store::TemporalGranularity::Day,
-        bamboo_memory::memory_store::TemporalGranularity::Quarter,
-        bamboo_memory::memory_store::TemporalGranularity::Week,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let written = project_a_store
+        let record = memory
             .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Project,
-                Some(project_a.as_str()),
-                bamboo_memory::memory_store::DurableMemoryType::Project,
-                &format!("Exposuretoken1077 Project A decision {}", index + 2),
-                &format!(
-                    "Project A compact summary {}. {} FULL_PRIVATE_BODY_A_MUST_NOT_RENDER",
-                    index + 2,
-                    "a".repeat(300)
-                ),
-                &[query.to_string()],
+                scope,
+                project_key,
+                memory_type,
+                title,
+                "Previously adopted Compass rule.",
+                &["compass".to_string()],
                 Some(session_id),
                 "test-model",
                 false,
-                Some(granularity),
+                None,
             )
             .await
-            .expect("write another Project A memory");
-        project_a_ids.push(written.frontmatter.id);
-        std::thread::sleep(std::time::Duration::from_millis(5));
+            .expect("write matching durable memory");
+        durable_ids.push(record.frontmatter.id);
     }
-    let excluded = project_b_store
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_b.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Exposuretoken1077 other Project decision",
-            &format!(
-                "Project B compact summary. {} FULL_PRIVATE_BODY_B_MUST_NOT_RENDER",
-                "b".repeat(300)
-            ),
-            &[query.to_string()],
-            Some("other-session"),
-            "test-model",
-            false,
-            Some(bamboo_memory::memory_store::TemporalGranularity::Day),
+    let generation = project_store
+        .current_scope_generation(MemoryScope::Project, Some(project_id.as_str()))
+        .await
+        .unwrap();
+    project_store
+        .publish_dream_snapshot(
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            &generation,
+            DREAM,
         )
         .await
-        .expect("write Project B memory");
-    let global = memory_store
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Global,
-            None,
-            bamboo_memory::memory_store::DurableMemoryType::Reference,
-            "Exposuretoken1077 global fallback",
-            &format!(
-                "Global compact summary. {} FULL_PRIVATE_GLOBAL_BODY_MUST_NOT_RENDER",
-                "g".repeat(300)
-            ),
-            &[query.to_string()],
-            Some("global-session"),
-            "test-model",
-            false,
-            None,
-        )
-        .await
-        .expect("write Global fallback memory");
+        .unwrap();
 
+    let tools = bamboo_tools::BuiltinToolExecutor::new();
+    assert!(tools.registry().unregister("memory"));
+    tools
+        .register_tool(bamboo_tools::tools::SessionMemoryTool::with_memory_store(
+            store,
+        ))
+        .unwrap();
+    let memory_call = ToolCall {
+        id: "explicit-note-read".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "memory".into(),
+            arguments: r#"{"action":"session_read"}"#.into(),
+        },
+    };
     let provider = Arc::new(MetricsQueueProvider {
         queue: Mutex::new(vec![
             vec![
                 Ok(provider_usage(17, 3)),
-                Ok(LLMChunk::Token("observed answer".to_string())),
+                Ok(LLMChunk::ToolCalls(vec![memory_call])),
                 Ok(LLMChunk::Done),
             ],
             vec![
                 Ok(provider_usage(5, 1)),
-                Ok(LLMChunk::Token("global answer".to_string())),
+                Ok(LLMChunk::Token("Completed the request.".into())),
                 Ok(LLMChunk::Done),
             ],
         ]),
         requested_messages: Mutex::new(Vec::new()),
     });
-    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
-        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
     let mut session = Session::new(session_id, "test-model");
-    session.set_project_id_meta(project_a.to_string());
-    session.metadata.insert(
-        "runtime_prompt_memory_observability".to_string(),
-        serde_json::json!({"relevant_memory_ids":["forged-metadata-id"]}).to_string(),
-    );
-    session.metadata.insert(
-        "external_memory_rendered".to_string(),
-        "If selected: `memory` action=get id=forged-rendered-id".to_string(),
-    );
+    session.set_project_id_meta(project_id.to_string());
+    session
+        .metadata
+        .insert("external_memory_rendered".into(), LEGACY_STATE.into());
     let mut config = runner_metrics_config(&collector);
-    config.memory_store = memory_store.clone();
+    config.system_prompt = Some(format!(
+        "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n{LEGACY_PROMPT}\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
+    ));
+    config.prompt_memory_flags.project_prompt_injection = true;
     config.prompt_memory_flags.relevant_recall = true;
+    config.prompt_memory_flags.relevant_recall_rerank = true;
+    config.prompt_memory_flags.project_first_dream = true;
 
-    let (event_tx, _event_rx) = mpsc::channel(64);
+    let (events, _receiver) = mpsc::channel(128);
     super::run_agent_loop_with_config(
         &mut session,
-        format!("recall {query}"),
-        event_tx,
+        "Check the previous Compass decision.".into(),
+        events,
         provider.clone(),
-        tools,
+        Arc::new(tools),
         CancellationToken::new(),
         config,
     )
     .await
     .expect("provider-backed execution");
 
-    let detail = wait_for_runner_metrics(
-        storage.as_ref(),
-        session_id,
-        1,
-        bamboo_metrics::types::TokenUsage {
-            prompt_tokens: 17,
-            completion_tokens: 3,
-            total_tokens: 20,
-        },
-    )
-    .await;
-    let observation = storage
-        .prompt_memory_exposure(&detail.rounds[0].round_id)
-        .await
-        .expect("query prompt-memory observation")
-        .expect("successful bootstrap persists an observation");
-    assert_eq!(observation.project_id.as_deref(), Some(project_a.as_str()));
-    assert_eq!(
-        observation.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
-    );
-    assert_eq!(observation.all_compact_exposed_count, 3);
-    assert_eq!(observation.project_exposed_count, 3);
-    assert!(!observation.out_of_project_only);
-    assert_eq!(observation.project_items.len(), 3);
-
     let requests = provider.requested_messages.lock().await;
-    assert_eq!(requests.len(), 1);
-    let provider_text = requests[0]
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        for message in request {
+            assert!(!message.content.contains(LEGACY_STATE));
+            assert!(!message.content.contains(LEGACY_PROMPT));
+            assert!(!message.content.contains(DREAM));
+            assert!(!message.content.contains("Previously adopted Compass rule."));
+            assert!(durable_ids.iter().all(|id| !message.content.contains(id)));
+        }
+    }
+    assert!(requests[0]
         .iter()
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut provider_ids = project_a_ids
+        .all(|message| !message.content.contains(NOTE)));
+    assert!(requests[1]
         .iter()
-        .filter(|id| provider_text.contains(id.as_str()))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    provider_ids.sort_by_key(|id| provider_text.find(*id).expect("provider-visible id"));
-    assert_eq!(
-        provider_ids.len(),
-        3,
-        "one of four candidates stays outside top-k"
-    );
-    assert_eq!(
-        observation
-            .project_items
-            .iter()
-            .map(|item| item.memory_id.as_str())
-            .collect::<Vec<_>>(),
-        provider_ids,
-        "persisted IDs and ranks must match final provider-visible order"
-    );
-    assert!(observation
-        .project_items
-        .iter()
-        .enumerate()
-        .all(|(index, item)| item.rank == index as u32 + 1));
-    assert!(!provider_text.contains(&excluded.frontmatter.id));
-    assert!(!provider_text.contains("forged-metadata-id"));
-    assert!(!provider_text.contains("forged-rendered-id"));
-    assert!(!provider_text.contains("FULL_PRIVATE_BODY_A_MUST_NOT_RENDER"));
-    assert!(!provider_text.contains("FULL_PRIVATE_BODY_B_MUST_NOT_RENDER"));
-    assert!(!provider_text.contains(&global.frontmatter.id));
+        .any(|message| message.role == Role::Tool && message.content.contains(NOTE)));
+    assert!(!session.metadata.contains_key("external_memory_rendered"));
     drop(requests);
 
-    let global_session_id = "metrics-prompt-memory-global-fallback";
-    let mut global_session = Session::new(global_session_id, "test-model");
-    global_session.set_project_id_meta(project_c.to_string());
-    let mut global_config = runner_metrics_config(&collector);
-    global_config.memory_store = memory_store;
-    global_config.prompt_memory_flags.relevant_recall = true;
-    let (global_tx, _global_rx) = mpsc::channel(64);
-    super::run_agent_loop_with_config(
-        &mut global_session,
-        format!("recall {query}"),
-        global_tx,
-        provider.clone(),
-        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
-        CancellationToken::new(),
-        global_config,
-    )
-    .await
-    .expect("Global-fallback provider execution");
-    let global_detail = wait_for_runner_metrics(
-        storage.as_ref(),
-        global_session_id,
-        1,
-        bamboo_metrics::types::TokenUsage {
-            prompt_tokens: 5,
-            completion_tokens: 1,
-            total_tokens: 6,
+    let detail = wait_for_runner_metrics(
+        metrics.as_ref(),
+        session_id,
+        2,
+        TokenUsage {
+            prompt_tokens: 22,
+            completion_tokens: 4,
+            total_tokens: 26,
         },
     )
     .await;
-    let global_observation = storage
-        .prompt_memory_exposure(&global_detail.rounds[0].round_id)
-        .await
-        .expect("query Global-only observation")
-        .expect("Global-only provider bootstrap persists a header");
-    assert_eq!(
-        global_observation.project_id.as_deref(),
-        Some(project_c.as_str())
-    );
-    assert_eq!(global_observation.all_compact_exposed_count, 1);
-    assert_eq!(global_observation.project_exposed_count, 0);
-    assert!(global_observation.out_of_project_only);
-    assert!(global_observation.project_items.is_empty());
-    let requests = provider.requested_messages.lock().await;
-    let global_text = requests[1]
-        .iter()
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(global_text.contains(&global.frontmatter.id));
-    assert!(!global_text.contains("FULL_PRIVATE_GLOBAL_BODY_MUST_NOT_RENDER"));
+    for round in detail.rounds {
+        let observation = metrics
+            .prompt_memory_exposure(&round.round_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.project_id.as_deref(), Some(project_id.as_str()));
+        assert!(observation.query_present);
+        assert!(!observation.recall_enabled);
+        assert_eq!(
+            observation.recall_outcome,
+            PromptMemoryRecallOutcome::Disabled
+        );
+        assert_eq!(observation.all_compact_exposed_count, 0);
+        assert!(observation.project_items.is_empty());
+    }
 }
 
 struct PauseForHumanTool;

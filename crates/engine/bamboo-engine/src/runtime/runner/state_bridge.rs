@@ -1631,7 +1631,6 @@ mod tests {
                         Some(&tx),
                         &cancel,
                         None,
-                        None,
                         "actual-parity-run",
                     )
                     .await
@@ -1648,7 +1647,6 @@ mod tests {
                     &config,
                     Some(&tx),
                     &cancel,
-                    None,
                     None,
                 )
                 .await

@@ -22,7 +22,6 @@ use crate::runtime::guardian_state::{
 use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
-use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::round_lifecycle::{
     fallback_tool_is_resident, uses_sticky_fallback, RoundRecoveryPolicy, RoundToolDispatch,
     TaskSplitPrompt,
@@ -3902,17 +3901,8 @@ async fn run_pipeline_inner(
         }
 
         // --- Turn-boundary refresh, cancellation, and prompt context ---
-        // Admit durable input before deriving this round's memory query. The
-        // shared prelude also checks cancellation before Project/external-memory
-        // work and again before provider dispatch.
-        let runtime_context = PromptMemoryRuntimeContext {
-            llm: state
-                .auxiliary_models
-                .background_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
-            background_model_name: state.auxiliary_models.background_model_name.clone(),
-        };
+        // Admit durable input and refresh the current Project and ledger before
+        // provider dispatch. The shared prelude checks cancellation first.
         let (prompt_memory_exposure, observation, admitted_messages) =
             crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
@@ -3921,7 +3911,6 @@ async fn run_pipeline_inner(
                 Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
-                split_request.is_none().then_some(&runtime_context),
                 &state.execution_id,
             )
             .await?;
@@ -12704,7 +12693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_typed_inbox_input_drives_current_round_memory_recall() {
+    async fn pipeline_admits_inbox_input_without_passive_memory_recall() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
@@ -12719,24 +12708,11 @@ mod tests {
             SessionInboxLimits::default(),
         ));
 
-        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path().join("jiandu"));
-        memory
-            .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Global,
-                None,
-                bamboo_memory::memory_store::DurableMemoryType::Reference,
-                "Pipeline cobalt orchid rule",
-                "The cobalt orchid request must use the pipeline memory boundary.",
-                &["cobalt".to_string(), "orchid".to_string()],
-                Some("pipeline-typed-inbox-recall"),
-                "model",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-
         let mut persisted = Session::new("pipeline-typed-inbox-recall", "model");
+        persisted.metadata.insert(
+            "external_memory_rendered".into(),
+            "stale memory from a previous request".into(),
+        );
         persisted.add_message(Message::system("base prompt"));
         persisted.add_message(Message::user("unrelated earlier request"));
         storage.save_session(&persisted).await.unwrap();
@@ -12759,7 +12735,6 @@ mod tests {
             persistence: Some(persistence),
             session_inbox: Some(inbox),
             app_data_dir: Some(directory.path().join("bamboo")),
-            memory_store: memory,
             prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: true,
@@ -12795,12 +12770,9 @@ mod tests {
                 && message.role == bamboo_domain::Role::User
                 && message.content == query
         }));
-        let rendered =
-            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
-                .expect("current-round recall should render external memory");
-        assert!(rendered.contains("Pipeline cobalt orchid rule"));
         assert!(
-            rendered.contains("The cobalt orchid request must use the pipeline memory boundary.")
+            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
+                .is_none()
         );
 
         let observability: bamboo_agent_core::PromptMemoryObservability = serde_json::from_str(
@@ -12811,8 +12783,8 @@ mod tests {
         )
         .unwrap();
         assert!(observability.latest_user_query_present);
-        assert_eq!(observability.relevant_memory_status, "lexical");
-        assert_eq!(observability.relevant_memory_count, 1);
+        assert_eq!(observability.relevant_memory_status, "disabled");
+        assert_eq!(observability.relevant_memory_count, 0);
         assert!(
             std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| {
                 matches!(

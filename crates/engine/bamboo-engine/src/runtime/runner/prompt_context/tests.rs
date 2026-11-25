@@ -1,63 +1,7 @@
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
-use futures::stream;
+use bamboo_agent_core::Message;
 
 use super::merge_system_prompt_with_contexts;
 use super::system_sections::{strip_existing_skill_context, strip_existing_tool_guide_context};
-use bamboo_agent_core::Message;
-use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
-
-#[derive(Clone)]
-struct StaticResponseProvider {
-    response: String,
-    requested_models: Arc<Mutex<Vec<String>>>,
-}
-
-impl StaticResponseProvider {
-    fn new(response: impl Into<String>) -> Self {
-        Self {
-            response: response.into(),
-            requested_models: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-}
-
-#[async_trait]
-impl LLMProvider for StaticResponseProvider {
-    async fn chat_stream(
-        &self,
-        _messages: &[Message],
-        _tools: &[bamboo_agent_core::tools::ToolSchema],
-        _max_output_tokens: Option<u32>,
-        model: &str,
-    ) -> Result<LLMStream, LLMError> {
-        self.requested_models
-            .lock()
-            .expect("lock poisoned")
-            .push(model.to_string());
-        Ok(Box::pin(stream::iter(vec![
-            Ok(LLMChunk::Token(self.response.clone())),
-            Ok(LLMChunk::Done),
-        ])))
-    }
-}
-
-async fn publish_global_dream(store: &bamboo_memory::memory_store::MemoryStore, content: &str) {
-    let generation = store
-        .current_scope_generation(bamboo_memory::memory_store::MemoryScope::Global, None)
-        .await
-        .expect("read global generation");
-    store
-        .publish_dream_snapshot(
-            bamboo_memory::memory_store::MemoryScope::Global,
-            None,
-            &generation,
-            content,
-        )
-        .await
-        .expect("publish global dream");
-}
 
 async fn publish_project_dream(
     store: &bamboo_memory::memory_store::MemoryStore,
@@ -99,7 +43,7 @@ fn latest_user_query_skips_hidden_and_runtime_resume_messages() {
     session.add_message(runtime_kind_only);
 
     assert_eq!(
-        super::external_memory::latest_user_query_text(&session).as_deref(),
+        super::external_memory::latest_user_query_text(&session),
         Some("real release question")
     );
 }
@@ -172,1518 +116,197 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
     assert_eq!(stripped, original);
 }
 
-#[tokio::test]
-async fn external_memory_keeps_session_notes_without_global_dream_when_project_unknown() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    publish_global_dream(
-        &store,
-        "# Bamboo Dream Notebook\n\nDurable cross-session insight",
-    )
-    .await;
-    store
-        .write_session_topic("session-dream-test", "default", "Session durable note")
-        .await
-        .expect("save session note");
-
-    let mut session = bamboo_agent_core::Session::new("session-dream-test", "test-model");
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(!system_prompt.contains("Global Dream Summary (fallback)"));
-    assert!(!system_prompt.contains("Durable cross-session insight"));
-    assert!(system_prompt.contains("Session Memory Note"));
-    assert!(system_prompt.contains("Session durable note"));
-    assert!(!system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("Verify workspace and runtime claims against current evidence."));
-    assert!(system_prompt.contains("Treat Dream summaries as orientation."));
+#[test]
+fn legacy_external_memory_is_stripped_from_the_system_prompt() {
+    let prompt = concat!(
+        "Base instructions\n\n",
+        "<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n",
+        "Previously injected Jiandu text.\n",
+        "<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
+    );
+    assert_eq!(
+        super::strip_existing_external_memory(prompt),
+        "Base instructions"
+    );
 }
 
 #[tokio::test]
-async fn external_memory_includes_ledger_agenda_when_records_are_open() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let jiandu_root = temp_dir.path().join("jiandu");
-    let bamboo_root = temp_dir.path().join("bamboo");
-    let store = bamboo_memory::memory_store::MemoryStore::new(&jiandu_root);
+async fn all_session_roles_keep_jiandu_memory_out_of_round_context() {
+    use crate::runtime::config::PromptMemoryFlags;
+    use bamboo_agent_core::{PromptMemoryObservability, Session};
+    use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordKind};
+    use bamboo_domain::{ProjectId, SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_memory::ledger_store::LedgerStore;
+    use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
+    use bamboo_metrics::types::PromptMemoryRecallOutcome;
 
-    // Bamboo's Ledger remains separate from Jiandu memory.
-    let ledger = bamboo_memory::ledger_store::LedgerStore::new(&bamboo_root);
-    let mut overdue = bamboo_domain::ledger::LedgerRecord::new(
-        "rec_overdue",
-        bamboo_domain::ledger::RecordKind::Todo,
-        "Send the quarterly report",
-    );
-    overdue.time.due_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    let temp = tempfile::tempdir().expect("temp dir");
+    let bamboo_root = temp.path().join("bamboo");
+    let jiandu_root = temp.path().join("jiandu");
+    let memory = MemoryStore::new(&jiandu_root);
+    let ledger = LedgerStore::new(&bamboo_root);
+    let project_id = ProjectId::parse("on-demand-project").expect("Project ID");
+    let project_memory = memory.for_project(&project_id);
+
+    let mut global_record =
+        LedgerRecord::new("rec_global", RecordKind::Todo, "Pending global item");
+    global_record.time.due_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
     ledger
-        .write_record(overdue, None)
+        .write_record(global_record, None)
         .await
-        .expect("write overdue record");
-    let undated = bamboo_domain::ledger::LedgerRecord::new(
-        "rec_open",
-        bamboo_domain::ledger::RecordKind::Todo,
-        "Clean the garage",
-    );
+        .expect("save global agenda item");
+    let mut project_record =
+        LedgerRecord::new("rec_project", RecordKind::Todo, "Pending Project item");
+    project_record.scope = LedgerScope::Project;
+    project_record.project_key = Some(project_id.to_string());
     ledger
-        .write_record(undated, None)
+        .write_record(project_record, None)
         .await
-        .expect("write undated record");
+        .expect("save Project agenda item");
 
-    let mut session = bamboo_agent_core::Session::new("session-ledger-test", "test-model");
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-
-    super::refresh_external_memory_context_with_stores(
-        &mut session,
-        &store,
-        &bamboo_root,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-    assert!(system_prompt.contains("### Ledger Agenda (prospective records)"));
-    assert!(system_prompt.contains("[OVERDUE] `rec_overdue`"));
-    assert!(system_prompt.contains("Send the quarterly report"));
-    assert!(system_prompt.contains("[OPEN] `rec_open`"));
-
-    // Flag off → the section disappears even with open records.
-    let flags = crate::runtime::config::PromptMemoryFlags {
-        ledger_agenda: false,
-        ..Default::default()
-    };
-    super::refresh_external_memory_context_with_stores(
-        &mut session,
-        &store,
-        &bamboo_root,
-        flags,
-        None,
-    )
-    .await;
-    assert!(super::render_external_memory_section(&session).is_none());
-    assert!(!jiandu_root.join("ledger").exists());
-}
-
-#[tokio::test]
-async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let jiandu_root = temp_dir.path().join("jiandu");
-    let bamboo_root = temp_dir.path().join("bamboo");
-    let store = bamboo_memory::memory_store::MemoryStore::new(&jiandu_root);
-    store
-        .write_session_topic("session-empty-ledger", "default", "note")
-        .await
-        .expect("save session note");
-
-    let mut session = bamboo_agent_core::Session::new("session-empty-ledger", "test-model");
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-
-    super::refresh_external_memory_context_with_stores(
-        &mut session,
-        &store,
-        &bamboo_root,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-    assert!(!system_prompt.contains("### Ledger Agenda"));
-    assert!(!jiandu_root.join("ledger").exists());
-}
-
-#[tokio::test]
-async fn external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-index").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-alpha");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Release freeze begins next week",
-            "Merge freeze begins on Tuesday for mobile release cut.",
-            &["release".to_string(), "freeze".to_string()],
-            Some("session-project-memory"),
-            "main-model",
-            false,
+    for (store, scope, project_key, memory_type, title) in [
+        (
+            &memory,
+            MemoryScope::Global,
             None,
-        )
-        .await
-        .expect("save project memory");
-    publish_global_dream(
-        &store,
-        "# Bamboo Dream Notebook\n\nGlobal fallback that should not appear",
-    )
-    .await;
-
-    let mut session = bamboo_agent_core::Session::new("session-project-memory", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("Release freeze begins next week"));
-    assert!(!system_prompt.contains("### Global Dream Summary (fallback)"));
-    assert!(!system_prompt.contains("Global fallback that should not appear"));
-    assert!(!system_prompt.contains("### Session Memory Note (markdown)"));
-}
-
-#[tokio::test]
-async fn external_memory_excludes_other_project_memory_index_content() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id_a = bamboo_domain::ProjectId::parse("project-prompt-a").expect("project id");
-    let project_id_b = bamboo_domain::ProjectId::parse("project-prompt-b").expect("project id");
-    let project_memory_a = store.for_project(&project_id_a);
-    let project_memory_b = store.for_project(&project_id_b);
-    let workspace_a = temp_dir.path().join("workspace-project-a");
-    let workspace_b = temp_dir.path().join("workspace-project-b");
-    std::fs::create_dir_all(&workspace_a).expect("workspace a dir");
-    std::fs::create_dir_all(&workspace_b).expect("workspace b dir");
-    let project_key_a = project_id_a.to_string();
-    let project_key_b = project_id_b.to_string();
-
-    project_memory_a
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key_a.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Project A release rule",
-            "Only Project A changes may ship this week.",
-            &["release".to_string(), "project-a".to_string()],
-            Some("session-project-a"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save project A memory");
-    project_memory_b
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key_b.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Project B deployment rule",
-            "Project B uses a separate deployment checklist.",
-            &["deploy".to_string(), "project-b".to_string()],
-            Some("session-project-b"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save project B memory");
-
-    let mut session = bamboo_agent_core::Session::new("session-project-a", "test-model");
-    session.set_project_id_meta(project_id_a.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace_a.to_string_lossy().to_string(),
-    );
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("Project A release rule"));
-    assert!(system_prompt.contains("Only Project A changes may ship this week."));
-    assert!(!system_prompt.contains("Project B deployment rule"));
-    assert!(!system_prompt.contains("Project B uses a separate deployment checklist."));
-}
-
-#[tokio::test]
-async fn external_memory_malformed_project_id_does_not_read_canonical_project_memory() {
-    struct EmptyProjectSource;
-
-    #[async_trait]
-    impl crate::project_context::ProjectContextSource for EmptyProjectSource {
-        async fn find_project(
-            &self,
-            _project_id: &bamboo_domain::ProjectId,
-        ) -> Result<
-            Option<crate::project_context::ProjectDescriptor>,
-            crate::project_context::ProjectContextError,
-        > {
-            Ok(None)
-        }
-    }
-
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-secret").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
+            DurableMemoryType::Reference,
+            "Global compass rule",
+        ),
+        (
+            &project_memory,
+            MemoryScope::Project,
             Some(project_id.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Legacy secret",
-            "MUST NOT ENTER PROMPT THROUGH MALFORMED PROJECT ID",
-            &[],
-            Some("malformed-prompt-memory"),
-            "test",
-            false,
-            None,
-        )
-        .await
-        .expect("seed canonical Project memory");
-    let mut session = bamboo_agent_core::Session::new("malformed-prompt-memory", "test-model");
-    session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
-    session.set_project_id_meta("../malformed".to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    let resolver =
-        crate::project_context::ProjectContextResolver::new(Arc::new(EmptyProjectSource));
-
-    super::refresh_external_memory_context_with_store_and_resolver(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-        Some(&resolver),
-    )
-    .await;
-
-    let rendered = super::render_external_memory_section(&session).unwrap_or_default();
-    assert!(!rendered.contains("Legacy secret"));
-    assert!(!rendered.contains("MUST NOT ENTER PROMPT THROUGH MALFORMED PROJECT ID"));
-}
-
-#[tokio::test]
-async fn external_memory_truncates_project_memory_index_without_path_access() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id =
-        bamboo_domain::ProjectId::parse("project-prompt-truncated").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-beta");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-    for index in 0..12 {
-        project_memory
+            DurableMemoryType::Project,
+            "Project compass rule",
+        ),
+    ] {
+        store
             .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Project,
-                Some(project_key.as_str()),
-                bamboo_memory::memory_store::DurableMemoryType::Project,
-                &format!("Architectural note {index}"),
-                &format!("Durable project context {index}: {}", "x".repeat(320)),
-                &["architecture".to_string()],
-                Some("session-project-memory-truncated"),
+                scope,
+                project_key,
+                memory_type,
+                title,
+                "A prior compass rule applies here.",
+                &["compass".into()],
+                None,
                 "test-model",
                 false,
                 None,
             )
             .await
-            .expect("write project memory");
+            .expect("seed durable memory");
     }
+    publish_project_dream(&project_memory, project_id.as_str(), "Project dream marker").await;
 
-    let mut session =
-        bamboo_agent_core::Session::new("session-project-memory-truncated", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "test-model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let mut worker = Session::new("project-worker", "test-model");
+    worker.set_project_id_meta(project_id.to_string());
+    worker
+        .metadata
+        .insert("session.origin.v1".into(), "supervisor_created".into());
+    let mut ultra = Session::new("ultra-root", "test-model");
+    ultra.set_root_orchestration_only(true).unwrap();
+    let mut child = Session::new_child_of("project-child", &worker, "test-model", "child");
+    child.set_project_id_meta(project_id.to_string());
+    let mut manual = Session::new("manual-project-root", "test-model");
+    manual.set_project_id_meta(project_id.to_string());
+    let flags = PromptMemoryFlags {
+        project_prompt_injection: true,
+        relevant_recall: true,
+        relevant_recall_rerank: true,
+        project_first_dream: true,
+        ledger_agenda: true,
+    };
 
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("showing "));
-    assert!(system_prompt.contains("Architectural note"));
-}
-
-#[test]
-fn memory_freshness_note_marks_old_index_entries() {
-    let note = bamboo_memory::memory_store::render_memory_freshness_note(
-        "2026-03-01T00:00:00Z",
-        bamboo_memory::memory_store::FreshnessKind::Index,
-    )
-    .expect("old memory index should carry a freshness warning");
-    assert!(note.contains("memory index entry"));
-    assert!(note.contains("verify"));
-}
-
-#[tokio::test]
-async fn external_memory_truncates_multi_topic_content_and_is_idempotent() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    store
-        .write_session_topic("session-memory-many", "alpha", &"a".repeat(5_000))
-        .await
-        .expect("save alpha");
-    store
-        .write_session_topic("session-memory-many", "beta", &"b".repeat(5_000))
-        .await
-        .expect("save beta");
-
-    let mut session = bamboo_agent_core::Session::new("session-memory-many", "test-model");
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert_eq!(
-        system_prompt
-            .matches("## External Memory (Persistent)")
-            .count(),
-        1
-    );
-    assert!(system_prompt.contains("### Session Memory Topic: `alpha`"));
-    assert!(system_prompt.contains("### Session Memory Topic: `beta`"));
-    assert!(system_prompt.contains("showing "));
-    assert!(system_prompt.contains("use action=session_read topic=alpha"));
-}
-
-#[tokio::test]
-async fn external_memory_renders_relevant_memory_section_for_project_hits() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-recall").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-recall-project");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    let body = format!(
-        "Keep responses concise and avoid unnecessary recap. {}FULL_BODY_SENTINEL_DO_NOT_INJECT",
-        "x".repeat(240)
-    );
-    let written = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "User prefers concise answers",
-            &body,
-            &["concise".to_string(), "style".to_string()],
-            Some("session-recall-project"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save relevant project memory");
-
-    let mut session = bamboo_agent_core::Session::new("session-recall-project", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user(
-        "请记住我更喜欢 concise answers 并减少 recap",
-    ));
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Relevant Durable Memories"));
-    assert!(system_prompt.contains("User prefers concise answers"));
-    assert!(system_prompt.contains("Summary: Keep responses concise"));
-    assert!(system_prompt.contains("[active][project]"));
-    assert!(system_prompt.contains(&written.frontmatter.id));
-    assert!(system_prompt.contains(&format!(
-        "If selected: `memory` action=get id={}",
-        written.frontmatter.id
-    )));
-    assert!(!system_prompt.contains("FULL_BODY_SENTINEL_DO_NOT_INJECT"));
+    for mut session in [supervisor, worker, ultra, child, manual] {
+        memory
+            .write_session_topic(&session.id, "default", "Continuity note marker")
+            .await
+            .expect("save session note");
+        session.add_message(Message::user("compass rule"));
+        session.token_usage = Some(
+            serde_json::from_value(serde_json::json!({
+                "system_tokens": 0, "summary_tokens": 0, "window_tokens": 75,
+                "total_tokens": 75, "budget_limit": 100,
+                "truncation_occurred": false, "segments_removed": 0,
+            }))
+            .expect("set context pressure"),
+        );
+        let legacy_key = super::external_memory::LEGACY_EXTERNAL_MEMORY_RENDERED_KEY;
+        session
+            .metadata
+            .insert(legacy_key.into(), "Legacy rendered memory marker".into());
+        assert!(super::render_external_memory_section(&session).is_none());
+        let observation =
+            super::refresh_external_memory_context(&mut session, flags, None, Some(&bamboo_root))
+                .await
+                .observation("on-demand-round", &session.id, chrono::Utc::now());
+        let rendered = super::render_external_memory_section(&session).expect("render agenda");
+        assert!(rendered.contains("[OVERDUE] `rec_global`"));
+        assert_eq!(
+            rendered.contains("Pending Project item"),
+            session.project_id_meta().is_some()
+        );
+        assert!(rendered.contains("Context window filling up (~75% used)"));
+        assert!(!session.metadata.contains_key(legacy_key));
+        for text in [
+            "Continuity note marker",
+            "Project compass rule",
+            "Global compass rule",
+            "Project dream marker",
+            "Legacy rendered memory marker",
+        ] {
+            assert!(!rendered.contains(text), "{} exposed {text}", session.id);
+        }
+        assert!(!observation.recall_enabled);
+        assert!(observation.query_present);
+        assert_eq!(
+            observation.recall_outcome,
+            PromptMemoryRecallOutcome::Disabled
+        );
+        assert_eq!(observation.all_compact_exposed_count, 0);
+        let observability: PromptMemoryObservability =
+            serde_json::from_str(&session.metadata[super::PROMPT_MEMORY_OBSERVABILITY_KEY])
+                .expect("prompt memory observability");
+        assert_eq!(observability.session_notes_status, "disabled");
+        assert_eq!(observability.project_memory_index_status, "disabled");
+        assert_eq!(observability.relevant_memory_status, "disabled");
+        assert_eq!(observability.project_dream_status, "disabled");
+    }
 }
 
 #[tokio::test]
-async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-stale").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-recall-stale");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
+async fn round_context_clears_when_ledger_is_disabled_or_empty() {
+    use crate::runtime::config::PromptMemoryFlags;
+    use bamboo_agent_core::Session;
+    use bamboo_domain::ledger::{LedgerRecord, RecordKind};
+    use bamboo_memory::ledger_store::LedgerStore;
 
-    let doc = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Release freeze policy",
-            "Mobile release freeze starts Tuesday and needs verification.",
-            &["release".to_string(), "freeze".to_string()],
-            Some("session-recall-stale"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save stale-eligible project memory");
-
-    let raw = std::fs::read_to_string(&doc.path).expect("read stored memory doc");
-    let old_timestamp = "2026-03-01T00:00:00Z";
-    let rewritten = raw
-        .replace(&doc.frontmatter.updated_at, old_timestamp)
-        .replace(&doc.frontmatter.created_at, old_timestamp);
-    std::fs::write(&doc.path, rewritten).expect("rewrite timestamps");
-    project_memory
-        .rebuild_scope(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-        )
-        .await
-        .expect("rebuild scope after timestamp rewrite");
-
-    let mut session = bamboo_agent_core::Session::new("session-recall-stale", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user("release freeze policy"));
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Relevant Durable Memories"));
-    assert!(system_prompt.contains("Release freeze policy"));
-    assert!(
-        system_prompt.contains("Historical memory")
-            || system_prompt.contains("Older historical memory")
-    );
-    assert!(system_prompt.contains("verify against current"));
-}
-
-#[tokio::test]
-async fn external_memory_omits_block_when_no_match_exists() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path().join("jiandu"));
-    let bamboo_root = temp_dir.path().join("bamboo");
-    let workspace = temp_dir.path().join("workspace-recall-none");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    store
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Global,
-            None,
-            bamboo_memory::memory_store::DurableMemoryType::Reference,
-            "Cedarpath staging relay",
-            "Cedarpath deploys its relay at midnight.",
-            &["cedarpath".to_string(), "relay".to_string()],
-            Some("session-recall-seed"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save unrelated memory in another session");
-
-    let mut session = bamboo_agent_core::Session::new("session-recall-none", "test-model");
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user(
-        "Parabola coefficient derivative algebra",
-    ));
-
-    let exposure = super::refresh_external_memory_context_with_stores(
-        &mut session,
-        &store,
-        &bamboo_root,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-    let observation = exposure.observation("no-match-round", &session.id, chrono::Utc::now());
-    assert_eq!(
-        observation.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::NoMatch
-    );
-    assert_eq!(observation.all_compact_exposed_count, 0);
-    assert!(observation.project_items.is_empty());
+    let temp = tempfile::tempdir().expect("temp dir");
+    let ledger = LedgerStore::new(temp.path());
+    let mut session = Session::new("ledger-context", "test-model");
+    let mut flags = PromptMemoryFlags {
+        ledger_agenda: true,
+        ..Default::default()
+    };
+    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
     assert!(super::render_external_memory_section(&session).is_none());
 
-    let invalid_root = temp_dir.path().join("not-a-directory");
-    let invalid_index = invalid_root.join("memory/v1/scopes/global/indexes/lexical.json");
-    std::fs::create_dir_all(invalid_index.parent().expect("index parent")).expect("index dir");
-    std::fs::write(&invalid_index, "not-json").expect("write corrupt lexical index");
-    let invalid_store = bamboo_memory::memory_store::MemoryStore::new(&invalid_root);
-    let mut error_session = bamboo_agent_core::Session::new("lookup-error", "test-model");
-    error_session.add_message(bamboo_agent_core::Message::user("lookup error query"));
-    let lookup_error = super::refresh_external_memory_context_with_stores(
-        &mut error_session,
-        &invalid_store,
-        &bamboo_root,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await
-    .observation("lookup-error-round", &error_session.id, chrono::Utc::now());
-    assert_eq!(
-        lookup_error.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::LookupError
-    );
-}
-
-#[tokio::test]
-async fn external_memory_limits_relevant_memories_to_top_k() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-topk").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-recall-topk");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    let mut written_ids = Vec::new();
-    for idx in 0..4 {
-        let written = project_memory
-            .write_memory(
-                bamboo_memory::memory_store::MemoryScope::Project,
-                Some(project_key.as_str()),
-                bamboo_memory::memory_store::DurableMemoryType::Project,
-                &format!("Release freeze note {idx}"),
-                &format!("release freeze detail {idx}"),
-                &["release".to_string(), "freeze".to_string()],
-                Some("session-recall-topk"),
-                "main-model",
-                false,
-                None,
-            )
-            .await
-            .expect("save project memory");
-        written_ids.push(written.frontmatter.id);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-
-    let mut session = bamboo_agent_core::Session::new("session-recall-topk", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user("release freeze"));
-
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-    let observation = exposure.observation("top-k-round", &session.id, chrono::Utc::now());
-    assert_eq!(
-        observation.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
-    );
-    assert_eq!(observation.all_compact_exposed_count, 3);
-    assert_eq!(observation.project_items.len(), 3);
-    let observed_ids = observation
-        .project_items
-        .iter()
-        .map(|item| item.memory_id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(observed_ids.len(), 3);
-    assert_eq!(
-        written_ids
-            .iter()
-            .filter(|id| !observed_ids.contains(id.as_str()))
-            .count(),
-        1,
-        "the fourth recall candidate must not be counted as provider-visible"
-    );
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Relevant Durable Memories"));
-    assert_eq!(system_prompt.matches("Summary:").count(), 3);
-    assert_eq!(
-        system_prompt
-            .matches("If selected: `memory` action=get id=")
-            .count(),
-        3
-    );
-}
-
-#[tokio::test]
-async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id =
-        bamboo_domain::ProjectId::parse("project-prompt-fallback").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-recall-fallback");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    let unrelated = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Unrelated project note",
-            "This should not match the fallback query.",
-            &["project".to_string()],
-            Some("session-recall-fallback"),
-            "main-model",
-            false,
+    ledger
+        .write_record(
+            LedgerRecord::new("rec_open", RecordKind::Todo, "Clean the garage"),
             None,
         )
         .await
-        .expect("save unrelated project memory");
-    let global = store
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Global,
-            None,
-            bamboo_memory::memory_store::DurableMemoryType::Reference,
-            "Global release guidance",
-            "Use the release train checklist before shipping.",
-            &["release".to_string(), "checklist".to_string()],
-            Some("session-recall-fallback"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save global fallback memory");
+        .expect("save agenda item");
+    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
+    let context = super::render_external_memory_section(&session).expect("agenda");
+    assert!(context.contains("[OPEN] `rec_open`"));
 
-    let mut session = bamboo_agent_core::Session::new("session-recall-fallback", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user("release checklist"));
-
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-    let observation = exposure.observation("global-only-round", &session.id, chrono::Utc::now());
-    assert_eq!(
-        observation.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
-    );
-    assert_eq!(observation.all_compact_exposed_count, 1);
-    assert_eq!(observation.project_exposed_count, 0);
-    assert!(observation.out_of_project_only);
-    assert!(observation.project_items.is_empty());
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Relevant Durable Memories"));
-    assert!(system_prompt.contains("Global release guidance"));
-    assert!(system_prompt.contains("[active][global]"));
-    assert!(system_prompt.contains(&format!(
-        "If selected: `memory` action=get id={}",
-        global.frontmatter.id
-    )));
-    assert!(!system_prompt.contains(&format!(
-        "If selected: `memory` action=get id={}",
-        unrelated.frontmatter.id
-    )));
-}
-
-#[tokio::test]
-async fn external_memory_prefers_project_dream_over_global_fallback() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-dream").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-project-dream");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    publish_project_dream(
-        &project_memory,
-        project_key.as_str(),
-        "# Bamboo Dream Notebook\n\nProject dream context",
-    )
-    .await;
-    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal dream fallback").await;
-
-    let mut session = bamboo_agent_core::Session::new("session-project-dream", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(system_prompt.contains("### Project Dream Summary"));
-    assert!(system_prompt.contains("Project dream context"));
-    assert!(!system_prompt.contains("### Global Dream Summary (fallback)"));
-    assert!(!system_prompt.contains("Global dream fallback"));
-}
-
-#[tokio::test]
-async fn external_memory_omits_global_dream_when_authorized_project_has_no_memory() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let workspace = temp_dir.path().join("workspace-global-dream-fallback");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-
-    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal fallback dream").await;
-
-    let mut session =
-        bamboo_agent_core::Session::new("session-global-dream-fallback", "test-model");
-    session.set_project_id_meta("different-project".to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        super::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
-        "### Global Dream Summary (fallback)\nGlobal fallback dream".to_string(),
-    );
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags::default(),
-        None,
-    )
-    .await;
-    assert_eq!(
-        exposure
-            .observation("no-query-round", &session.id, chrono::Utc::now())
-            .recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::NoQuery
-    );
-
+    flags.ledger_agenda = false;
+    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
     assert!(super::render_external_memory_section(&session).is_none());
-    let observability = session
-        .metadata
-        .get("runtime_prompt_memory_observability")
-        .and_then(|raw| {
-            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
-        })
-        .expect("observability should be recorded");
-    assert_eq!(
-        observability.resolved_project_key.as_deref(),
-        Some("different-project")
-    );
-    assert_eq!(observability.project_dream_status, "missing");
-    assert_eq!(observability.global_dream_fallback_status, "disabled");
-    assert_eq!(observability.dream_source, "none");
-}
-
-#[tokio::test]
-async fn external_memory_omits_project_index_when_project_prompt_injection_disabled() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id =
-        bamboo_domain::ProjectId::parse("project-prompt-disabled").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-no-project-index");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Project release rule",
-            "Use the strict release checklist.",
-            &["release".to_string()],
-            Some("session-no-project-index"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save project memory");
-    publish_project_dream(
-        &project_memory,
-        project_key.as_str(),
-        "# Bamboo Dream Notebook\n\nProject dream remains available",
-    )
-    .await;
-
-    let mut session = bamboo_agent_core::Session::new("session-no-project-index", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            project_prompt_injection: false,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        None,
-    )
-    .await;
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(!system_prompt.contains("### Project Durable Memory Index"));
-    assert!(!system_prompt.contains("Project release rule"));
-
-    let observability = session
-        .metadata
-        .get("runtime_prompt_memory_observability")
-        .and_then(|raw| {
-            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
-        })
-        .expect("observability should be recorded");
-    assert!(!observability.project_prompt_injection_enabled);
-    assert!(!observability.relevant_recall_rerank_enabled);
-    assert_eq!(observability.project_memory_index_status, "disabled");
-    assert_eq!(observability.project_dream_status, "loaded");
-    assert_eq!(observability.global_dream_fallback_status, "disabled");
-    assert_eq!(observability.dream_source, "project");
-}
-
-#[tokio::test]
-async fn external_memory_omits_dream_and_relevant_recall_when_disabled() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id =
-        bamboo_domain::ProjectId::parse("project-prompt-global-mode").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-global-dream-mode");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "User prefers concise answers",
-            "Keep answers concise.",
-            &["concise".to_string()],
-            Some("session-global-dream-mode"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save relevant project memory");
-    publish_project_dream(
-        &project_memory,
-        project_key.as_str(),
-        "# Bamboo Dream Notebook\n\nProject dream context",
-    )
-    .await;
-    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal dream fallback").await;
-
-    let mut session = bamboo_agent_core::Session::new("session-global-dream-mode", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user("concise answers"));
-
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall: false,
-            project_first_dream: false,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        None,
-    )
-    .await;
-    assert_eq!(
-        exposure
-            .observation("disabled-round", &session.id, chrono::Utc::now())
-            .recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
-    );
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(!system_prompt.contains("### Relevant Durable Memories"));
-    assert!(!system_prompt.contains("### Global Dream Summary (fallback)"));
-    assert!(!system_prompt.contains("Global dream fallback"));
-    assert!(!system_prompt.contains("### Project Dream Summary"));
-    assert!(!system_prompt.contains("Project dream context"));
-
-    let observability = session
-        .metadata
-        .get("runtime_prompt_memory_observability")
-        .and_then(|raw| {
-            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
-        })
-        .expect("observability should be recorded");
-    assert!(!observability.relevant_recall_enabled);
-    assert!(!observability.relevant_recall_rerank_enabled);
-    assert!(!observability.project_first_dream_enabled);
-    assert_eq!(observability.relevant_memory_status, "disabled");
-    assert_eq!(observability.project_dream_status, "disabled");
-    assert_eq!(observability.global_dream_fallback_status, "disabled");
-    assert_eq!(observability.global_dream_fallback_section_chars, 0);
-    assert_eq!(observability.dream_source, "none");
-}
-
-#[tokio::test]
-async fn legacy_background_rerank_retains_session_provider_and_explicit_admission() {
-    use bamboo_domain::{ProjectId, ProviderModelRef};
-    use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
-    use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let store = MemoryStore::new(temp.path());
-    let project = ProjectId::parse("legacy-background-rerank").unwrap();
-    let project_key = project.to_string();
-    let project_memory = store.for_project(&project);
-    let first = project_memory
-        .write_memory(
-            MemoryScope::Project,
-            Some(&project_key),
-            DurableMemoryType::Feedback,
-            "release checklist",
-            "release freeze checklist",
-            &["release".into()],
-            Some("legacy-rerank"),
-            "chat-a",
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-    let second = project_memory
-        .write_memory(
-            MemoryScope::Project,
-            Some(&project_key),
-            DurableMemoryType::Feedback,
-            "mobile release",
-            "mobile release freeze decision",
-            &["release".into()],
-            Some("legacy-rerank"),
-            "chat-a",
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-    let rerank_content = json!({"ids":[second.frontmatter.id, first.frontmatter.id]}).to_string();
-    let chunk =
-        json!({"choices":[{"index":0,"delta":{"content":rerank_content.clone()}}]}).to_string();
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
-        )
-        .mount(&server_a)
-        .await;
-    let b_start = json!({"type":"content_block_start", "index":0, "content_block":{"type":"text", "text":""}});
-    let b_delta = json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":rerank_content}});
-    let b_stop = json!({"type":"content_block_stop", "index":0});
-    let b_end = json!({"type":"message_stop"});
-    let b_sse = format!("event: content_block_start\ndata: {b_start}\n\nevent: content_block_delta\ndata: {b_delta}\n\nevent: content_block_stop\ndata: {b_stop}\n\nevent: message_stop\ndata: {b_end}\n\n");
-    Mock::given(method("POST"))
-        .and(path("/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(b_sse),
-        )
-        .mount(&server_b)
-        .await;
-
-    // The older global field is a model only; the current session provider
-    // supplies its account. Both accounts and endpoints are synthetic.
-    let mut config = bamboo_llm::Config::default();
-    config.provider = "openai".into();
-    config.default_provider_instance = None;
-    config.defaults = None;
-    config.http_proxy = "http://127.0.0.1:9".into();
-    config.https_proxy.clear();
-    config.proxy_auth = None;
-    config.providers_mut().openai = Some(
-        serde_json::from_value(json!({
-            "api_key":"synthetic-a", "base_url":server_a.uri(),
-            "model":"chat-a", "fast_model":"fast-a"
-        }))
-        .unwrap(),
-    );
-    config.providers_mut().anthropic = Some(
-        serde_json::from_value(json!({
-            "api_key":"synthetic-b", "base_url":server_b.uri(),
-            "model":"chat-b", "fast_model":"fast-b"
-        }))
-        .unwrap(),
-    );
-    config
-        .memory_mut()
-        .get_or_insert_with(Default::default)
-        .background_model = Some("background-only".into());
-    let registry = Arc::new(
-        bamboo_llm::ProviderRegistry::from_config(&config, temp.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
-
-    let current_a =
-        crate::model_areas::resolve_global_area_models(&config, "openai", &registry).background;
-    let current_b =
-        crate::model_areas::resolve_global_area_models(&config, "anthropic", &registry).background;
-    let b_generic_denied = registry
-        .provider_for_model(&ProviderModelRef::new("anthropic", "background-only"))
-        .is_err();
-    let b_is_session_provider = current_b.as_ref().is_some_and(|selected| {
-        selected.model_name == "background-only"
-            && registry
-                .get("anthropic")
-                .is_some_and(|handle| Arc::ptr_eq(&selected.provider, &handle))
-    });
-
-    // Build a valid managed generation, then set an excluded legacy role. The
-    // existing explicit allowlist must still reject it without using account B.
-    let mut explicit = config.clone();
-    explicit.memory_mut().as_mut().unwrap().background_model = None;
-    explicit
-        .providers_mut()
-        .openai
-        .as_mut()
-        .unwrap()
-        .extra
-        .insert("runtime_models".into(), json!(["chat-a", "fast-a"]));
-    let explicit_registry = Arc::new(
-        bamboo_llm::ProviderRegistry::from_config(&explicit, temp.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
-    explicit.memory_mut().as_mut().unwrap().background_model = Some("background-only".into());
-    let explicit_denied = crate::model_config_helper::try_resolve_background_model(
-        &explicit,
-        "openai",
-        &explicit_registry,
-    )
-    .is_err();
-
-    // Follow the interactive runtime's background context construction into
-    // the actual memory rerank consumer, with a loopback-only synthetic server.
-    let runtime_context = super::PromptMemoryRuntimeContext {
-        llm: current_a
-            .as_ref()
-            .map(|model| model.provider.clone())
-            .unwrap_or_else(|| registry.get("openai").unwrap()),
-        background_model_name: current_a.as_ref().map(|model| model.model_name.clone()),
-    };
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let mut session = bamboo_agent_core::Session::new("legacy-rerank", "chat-a");
-    session.set_project_id_meta(project_key.clone());
-    session.add_message(Message::system("Synthetic test"));
-    session.metadata.insert(
-        "workspace_path".into(),
-        workspace.to_string_lossy().into_owned(),
-    );
-    session.add_message(Message::user("mobile release freeze"));
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..Default::default()
-        },
-        Some(&runtime_context),
-    )
-    .await;
-    let a_after_a = server_a.received_requests().await.unwrap().len();
-    let b_after_a = server_b.received_requests().await.unwrap().len();
-    let a_outcome = exposure
-        .observation("round-a", &session.id, chrono::Utc::now())
-        .recall_outcome;
-
-    // A second actual rerank runs under session B. It must use only B even
-    // though the global default remains A.
-    let b_context = super::PromptMemoryRuntimeContext {
-        llm: current_b
-            .as_ref()
-            .map(|model| model.provider.clone())
-            .unwrap_or_else(|| registry.get("anthropic").unwrap()),
-        background_model_name: current_b.as_ref().map(|model| model.model_name.clone()),
-    };
-    let mut session_b = bamboo_agent_core::Session::new("legacy-rerank-b", "chat-b");
-    session_b.set_project_id_meta(project_key);
-    session_b.add_message(Message::system("Synthetic test"));
-    session_b.metadata.insert(
-        "workspace_path".into(),
-        workspace.to_string_lossy().into_owned(),
-    );
-    session_b.add_message(Message::user("mobile release freeze"));
-    let b_exposure = super::refresh_external_memory_context_with_store(
-        &mut session_b,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..Default::default()
-        },
-        Some(&b_context),
-    )
-    .await;
-    let b_outcome = b_exposure
-        .observation("round-b", &session_b.id, chrono::Utc::now())
-        .recall_outcome;
-    let requests_a = server_a.received_requests().await.unwrap();
-    let requests_b = server_b.received_requests().await.unwrap();
-    let requested_model = |requests: &[wiremock::Request]| {
-        requests
-            .first()
-            .and_then(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-            .and_then(|body| {
-                body.get("model")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
-            })
-    };
-    let model_a = requested_model(&requests_a);
-    let model_b = requested_model(&requests_b);
-    let reranked = bamboo_metrics::types::PromptMemoryRecallOutcome::Reranked;
-    let all_ok = explicit_denied
-        && b_generic_denied
-        && b_is_session_provider
-        && a_outcome == reranked
-        && b_outcome == reranked
-        && a_after_a == 1
-        && b_after_a == 0
-        && requests_a.len() == 1
-        && requests_b.len() == 1
-        && model_a.as_deref() == Some("background-only")
-        && model_b.as_deref() == Some("background-only");
-    assert!(all_ok,
-        "A outcome={a_outcome:?} A after A={a_after_a} A final={} A model={model_a:?}; B outcome={b_outcome:?} B after A={b_after_a} B final={} B model={model_b:?}; B pair={b_is_session_provider} B generic denied={b_generic_denied} explicit denied={explicit_denied}",
-        requests_a.len(), requests_b.len());
-}
-
-#[tokio::test]
-async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id = bamboo_domain::ProjectId::parse("project-prompt-rerank").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-rerank-recall");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    let lexical_first = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "Release freeze checklist",
-            "Generic release freeze checklist for shipping work.",
-            &["release".to_string(), "freeze".to_string()],
-            Some("session-rerank-recall"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save lexical-first memory");
-    let reranked_first = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "Mobile launch blocker",
-            "This durable note captures the release freeze decision for the mobile app and should be preferred for mobile freeze requests.",
-            &["mobile".to_string(), "launch".to_string()],
-            Some("session-rerank-recall"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save reranked-first memory");
-
-    let provider = StaticResponseProvider::new(format!(
-        "{{\"ids\":[\"{}\",\"{}\"]}}",
-        reranked_first.frontmatter.id, lexical_first.frontmatter.id
-    ));
-    let requested_models = provider.requested_models.clone();
-    let runtime_context = super::PromptMemoryRuntimeContext {
-        llm: Arc::new(provider),
-        background_model_name: Some("rerank-fast-model".to_string()),
-    };
-
-    let mut session = bamboo_agent_core::Session::new("session-rerank-recall", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user(
-        "release freeze for mobile launch",
-    ));
-
-    let exposure = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        Some(&runtime_context),
-    )
-    .await;
-    assert_eq!(
-        exposure
-            .observation("reranked-round", &session.id, chrono::Utc::now())
-            .recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::Reranked
-    );
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    let reranked_pos = system_prompt
-        .find("Mobile launch blocker")
-        .expect("reranked memory should be rendered");
-    let lexical_pos = system_prompt
-        .find("Release freeze checklist")
-        .expect("lexical memory should be rendered");
-    assert!(reranked_pos < lexical_pos);
-
-    let observability = session
-        .metadata
-        .get("runtime_prompt_memory_observability")
-        .and_then(|raw| {
-            serde_json::from_str::<bamboo_agent_core::PromptMemoryObservability>(raw).ok()
-        })
-        .expect("observability should be recorded");
-    assert!(observability.relevant_recall_enabled);
-    assert!(observability.relevant_recall_rerank_enabled);
-    assert_eq!(observability.relevant_memory_status, "reranked");
-    assert_eq!(
-        requested_models.lock().expect("lock poisoned").as_slice(),
-        ["rerank-fast-model"]
-    );
-
-    let fallback_context = super::PromptMemoryRuntimeContext {
-        llm: Arc::new(StaticResponseProvider::new("not a rerank response")),
-        background_model_name: Some("rerank-fallback-model".to_string()),
-    };
-    let fallback = super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        Some(&fallback_context),
-    )
-    .await
-    .observation("rerank-fallback-round", &session.id, chrono::Utc::now());
-    assert_eq!(
-        fallback.recall_outcome,
-        bamboo_metrics::types::PromptMemoryRecallOutcome::RerankFallback
-    );
-}
-
-#[tokio::test]
-async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let project_id =
-        bamboo_domain::ProjectId::parse("project-prompt-rerank-reload").expect("project id");
-    let project_memory = store.for_project(&project_id);
-    let workspace = temp_dir.path().join("workspace-rerank-reload");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = project_id.to_string();
-
-    let lexical_first = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "Release freeze checklist",
-            "Generic release freeze checklist for shipping work.",
-            &["release".to_string(), "freeze".to_string()],
-            Some("session-rerank-reload"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save lexical-first memory");
-    let reranked_first = project_memory
-        .write_memory(
-            bamboo_memory::memory_store::MemoryScope::Project,
-            Some(project_key.as_str()),
-            bamboo_memory::memory_store::DurableMemoryType::Feedback,
-            "Mobile launch blocker",
-            "This durable note captures the release freeze decision for the mobile app and should be preferred for mobile freeze requests.",
-            &["mobile".to_string(), "launch".to_string()],
-            Some("session-rerank-reload"),
-            "main-model",
-            false,
-            None,
-        )
-        .await
-        .expect("save reranked-first memory");
-
-    let provider = StaticResponseProvider::new(format!(
-        "{{\"ids\":[\"{}\",\"{}\"]}}",
-        reranked_first.frontmatter.id, lexical_first.frontmatter.id
-    ));
-    let requested_models = provider.requested_models.clone();
-
-    let mut session = bamboo_agent_core::Session::new("session-rerank-reload", "test-model");
-    session.set_project_id_meta(project_id.to_string());
-    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
-    session.metadata.insert(
-        "workspace_path".to_string(),
-        workspace.to_string_lossy().to_string(),
-    );
-    session.add_message(bamboo_agent_core::Message::user(
-        "release freeze for mobile launch",
-    ));
-
-    let runtime_context_v1 = super::PromptMemoryRuntimeContext {
-        llm: Arc::new(provider.clone()),
-        background_model_name: Some("bg-1".to_string()),
-    };
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        Some(&runtime_context_v1),
-    )
-    .await;
-
-    let runtime_context_v2 = super::PromptMemoryRuntimeContext {
-        llm: Arc::new(provider.clone()),
-        background_model_name: Some("bg-2".to_string()),
-    };
-    super::refresh_external_memory_context_with_store(
-        &mut session,
-        &store,
-        crate::runtime::config::PromptMemoryFlags {
-            relevant_recall_rerank: true,
-            ..crate::runtime::config::PromptMemoryFlags::default()
-        },
-        Some(&runtime_context_v2),
-    )
-    .await;
-
-    assert_eq!(
-        requested_models.lock().expect("lock poisoned").as_slice(),
-        ["bg-1", "bg-2"]
-    );
 }

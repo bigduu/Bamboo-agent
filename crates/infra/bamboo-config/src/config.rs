@@ -463,27 +463,17 @@ pub struct MemoryConfig {
     /// this only lowers how often an active user triggers a real consolidation.
     #[serde(default = "default_auto_dream_interval_secs")]
     pub auto_dream_interval_secs: u64,
-    /// Whether project durable-memory index injection is enabled for the main prompt.
-    #[serde(
-        default = "default_true_memory_project_prompt_injection",
-        alias = "memory_project_prompt_injection"
-    )]
+    /// Deprecated compatibility input for automatic Project memory index injection. Ignored.
+    #[serde(default, alias = "memory_project_prompt_injection")]
     pub project_prompt_injection: bool,
-    /// Whether automatic relevant durable-memory recall is enabled for the main prompt.
-    #[serde(
-        default = "default_true_memory_relevant_recall",
-        alias = "memory_relevant_recall"
-    )]
+    /// Deprecated compatibility input for automatic durable-memory recall. Ignored.
+    #[serde(default, alias = "memory_relevant_recall")]
     pub relevant_recall: bool,
-    /// Whether relevant durable-memory recall should rerank lexical shortlist candidates
-    /// using the configured memory/background model.
+    /// Deprecated compatibility input for model reranking of automatic recall. Ignored.
     #[serde(default, alias = "memory_relevant_recall_rerank")]
     pub relevant_recall_rerank: bool,
-    /// Whether to include the authorized Project Dream in the model prompt.
-    #[serde(
-        default = "default_true_memory_project_first_dream",
-        alias = "memory_project_first_dream"
-    )]
+    /// Deprecated compatibility input for automatic Dream prompt injection. Ignored.
+    #[serde(default, alias = "memory_project_first_dream")]
     pub project_first_dream: bool,
     /// Whether the ledger agenda (overdue/upcoming prospective records — todos,
     /// events, reminders) is injected into the main prompt. Free when the
@@ -588,10 +578,10 @@ impl Default for MemoryConfig {
             summary_safe_window_percent: default_summary_safe_window_percent(),
             auto_dream_enabled: default_true_auto_dream_enabled(),
             auto_dream_interval_secs: default_auto_dream_interval_secs(),
-            project_prompt_injection: default_true_memory_project_prompt_injection(),
-            relevant_recall: default_true_memory_relevant_recall(),
+            project_prompt_injection: false,
+            relevant_recall: false,
             relevant_recall_rerank: false,
-            project_first_dream: default_true_memory_project_first_dream(),
+            project_first_dream: false,
             ledger_agenda_injection: default_true_memory_ledger_agenda(),
             ledger_gardener_enabled: default_true_ledger_gardener_enabled(),
             ledger_gardener_interval_secs: default_ledger_gardener_interval_secs(),
@@ -686,18 +676,6 @@ fn default_dedup_gardener_min_score() -> f64 {
 
 fn default_dedup_gardener_max_merges_per_run() -> usize {
     8
-}
-
-fn default_true_memory_project_prompt_injection() -> bool {
-    true
-}
-
-fn default_true_memory_relevant_recall() -> bool {
-    true
-}
-
-fn default_true_memory_project_first_dream() -> bool {
-    true
 }
 
 /// Per-run resource guardrails (issue #221): a cost/resource ceiling applied
@@ -3779,10 +3757,6 @@ impl Config {
     /// - `BAMBOO_DATA_DIR`: Override data directory
     /// - `BAMBOO_PROVIDER`: Override default provider
     /// - `BAMBOO_HEADLESS`: Enable headless authentication mode
-    /// - `BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION`: Override project durable-memory index prompt injection
-    /// - `BAMBOO_MEMORY_RELEVANT_RECALL`: Override relevant durable-memory recall prompt injection
-    /// - `BAMBOO_MEMORY_RELEVANT_RECALL_RERANK`: Override model-based relevant recall reranking
-    /// - `BAMBOO_MEMORY_PROJECT_FIRST_DREAM`: Override project-first Dream prompt behavior
     pub fn new() -> Self {
         Self::from_data_dir(None)
     }
@@ -4202,28 +4176,6 @@ impl Config {
 
         if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
             self.headless_auth = parse_bool_env(&headless);
-        }
-
-        if let Ok(project_prompt_injection) =
-            std::env::var("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION")
-        {
-            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
-            memory.project_prompt_injection = parse_bool_env(&project_prompt_injection);
-        }
-
-        if let Ok(relevant_recall) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL") {
-            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
-            memory.relevant_recall = parse_bool_env(&relevant_recall);
-        }
-
-        if let Ok(relevant_recall_rerank) = std::env::var("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK") {
-            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
-            memory.relevant_recall_rerank = parse_bool_env(&relevant_recall_rerank);
-        }
-
-        if let Ok(project_first_dream) = std::env::var("BAMBOO_MEMORY_PROJECT_FIRST_DREAM") {
-            let memory = self.memory.get_or_insert_with(MemoryConfig::default);
-            memory.project_first_dream = parse_bool_env(&project_first_dream);
         }
 
         crate::provider_instance::apply_provider_env_overrides(self, true);
@@ -9133,10 +9085,10 @@ mod tests {
                 summary_safe_window_percent: 80,
                 auto_dream_enabled: true,
                 auto_dream_interval_secs: 900,
-                project_prompt_injection: false,
-                relevant_recall: false,
+                project_prompt_injection: true,
+                relevant_recall: true,
                 relevant_recall_rerank: true,
-                project_first_dream: false,
+                project_first_dream: true,
                 ledger_agenda_injection: false,
                 ledger_gardener_enabled: false,
                 ledger_gardener_interval_secs: 7_200,
@@ -9164,12 +9116,15 @@ mod tests {
             .memory()
             .as_ref()
             .is_some_and(|memory| memory.dream_refine_mode));
-        let memory = config.memory.as_ref().expect("memory config should exist");
+        let memory = round_tripped
+            .memory()
+            .as_ref()
+            .expect("memory config should exist");
         assert!(memory.auto_dream_enabled);
-        assert!(!memory.project_prompt_injection);
-        assert!(!memory.relevant_recall);
+        assert!(memory.project_prompt_injection);
+        assert!(memory.relevant_recall);
         assert!(memory.relevant_recall_rerank);
-        assert!(!memory.project_first_dream);
+        assert!(memory.project_first_dream);
         assert!(memory.dream_refine_mode);
         assert!(memory.gardener_enabled);
         assert_eq!(memory.gardener_interval_secs, 3_600);
@@ -9240,25 +9195,31 @@ mod tests {
     }
 
     #[test]
-    fn memory_config_env_overrides_prompt_flags() {
+    fn memory_config_legacy_prompt_flags_default_off() {
+        let parsed: MemoryConfig = serde_json::from_str("{}").unwrap();
+        for memory in [MemoryConfig::default(), parsed] {
+            assert!(!memory.project_prompt_injection);
+            assert!(!memory.relevant_recall);
+            assert!(!memory.relevant_recall_rerank);
+            assert!(!memory.project_first_dream);
+            assert!(memory.auto_dream_enabled);
+            assert!(memory.ledger_agenda_injection);
+        }
+    }
+
+    #[test]
+    fn memory_config_legacy_prompt_environment_is_ignored() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
-        let _project_prompt = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION", "false");
-        let _relevant_recall = EnvVarGuard::set("BAMBOO_MEMORY_RELEVANT_RECALL", "0");
+        let _project_prompt = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_PROMPT_INJECTION", "true");
+        let _relevant_recall = EnvVarGuard::set("BAMBOO_MEMORY_RELEVANT_RECALL", "1");
         let _relevant_recall_rerank =
             EnvVarGuard::set("BAMBOO_MEMORY_RELEVANT_RECALL_RERANK", "yes");
-        let _project_first_dream = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_FIRST_DREAM", "no");
+        let _project_first_dream = EnvVarGuard::set("BAMBOO_MEMORY_PROJECT_FIRST_DREAM", "on");
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        let memory = config
-            .memory
-            .as_ref()
-            .expect("memory config should be created by env overrides");
-        assert!(!memory.project_prompt_injection);
-        assert!(!memory.relevant_recall);
-        assert!(memory.relevant_recall_rerank);
-        assert!(!memory.project_first_dream);
+        assert_eq!(config.memory(), Config::default().memory());
     }
 
     #[test]

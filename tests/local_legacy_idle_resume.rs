@@ -135,6 +135,42 @@ fn is_persisted_parent_context(message: &Value, parent: &Session, expected_guide
     !expected_guide.is_empty() && content == expected_guide
 }
 
+fn expected_parent_memory_guide(
+    schemas: &[ToolSchema],
+    memory_is_eligible: bool,
+) -> Option<String> {
+    if !memory_is_eligible {
+        return None;
+    }
+    // The fixture's ordinary, Project-bound Root uses the Host memory tool and
+    // the loopback OpenAI-compatible provider's sticky discovery fallback.
+    let has_tool = |name| schemas.iter().any(|schema| schema.function.name == name);
+    let discovery = if has_tool("memory") {
+        ""
+    } else if has_tool(bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+        "Call `discover_capabilities` by itself to load `memory`, then use it in a later round. "
+    } else {
+        return None;
+    };
+    Some(
+        ContextBlock::new(
+            ContextBlockType::ToolGuide,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "On-demand memory",
+            format!(
+                "Look up memory only when the current task depends on a prior fact or decision. \
+                 {discovery}Use `memory` action=query with short keywords and action=get for selected IDs. \
+                 Choose scope=section for facts in the assigned Section, scope=project for the assigned Project, \
+                 or scope=global for cross-project facts. \
+                 Use `memory` action=session_read for this Session's continuity notes. \
+                 Follow current instructions and verify recalled facts against live state."
+            ),
+        )
+        .render_runtime_context_text(),
+    )
+}
+
 async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>) -> HttpResponse {
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
@@ -166,7 +202,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             Ok(schemas) => schemas,
             Err(_) => return unexpected_request(&probe, &body, "invalid Parent tool catalog"),
         };
-        {
+        let memory_is_eligible = {
             let allowed_names = probe.parent_tool_names.lock().unwrap();
             let mut seen = BTreeSet::new();
             if schemas.is_empty()
@@ -190,7 +226,8 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                 );
                 return unexpected_request(&probe, &body, "unknown or repeated Parent tool");
             }
-        }
+            allowed_names.contains("memory") && parent.allows_model_tool_execution("memory")
+        };
         // Use the real post-filter provider catalog. The Root surface also
         // contains HostOnly/legacy tools that production removes, while the
         // compatibility adapter appends its public discovery-control schema.
@@ -202,6 +239,24 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             EnhancedPromptBuilder::build(None, &schemas, &GuideBuildContext::default()),
         )
         .render_runtime_context_text();
+        let memory_guide_index =
+            if let Some(expected) = expected_parent_memory_guide(&schemas, memory_is_eligible) {
+                let mut matching = messages.iter().enumerate().filter(|(_, message)| {
+                    message["role"] == "user" && message["content"] == expected.as_str()
+                });
+                match (matching.next(), matching.next()) {
+                    (Some((index, _)), None) => Some(index),
+                    _ => {
+                        return unexpected_request(
+                            &probe,
+                            &body,
+                            "missing or repeated Parent memory guide",
+                        )
+                    }
+                }
+            } else {
+                None
+            };
         let prefix = format!(
             "Runtime notification: child session `{child_id}` finished with status `completed`."
         );
@@ -216,6 +271,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             .skip(last_ack.map_or(0, |index| index + 1))
         {
             if message["role"] == "system"
+                || memory_guide_index == Some(index)
                 || is_persisted_parent_context(message, &parent, &expected_guide)
             {
                 continue;
@@ -240,6 +296,13 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                     parent_context_diagnostic(&parent, &expected_guide)
                 );
                 return unexpected_request(&probe, &body, "unknown new parent input");
+            }
+            if memory_guide_index.is_some_and(|guide| guide >= index) {
+                return unexpected_request(
+                    &probe,
+                    &body,
+                    "Parent memory guide follows the current outcome",
+                );
             }
             fresh.push((outcome.unwrap(), content.to_string()));
         }
