@@ -143,8 +143,7 @@ async fn park_background_command(f: &Fixture) -> (Value, String, String) {
     }
 }
 
-#[actix_web::test]
-async fn exact_background_stop_reaps_the_command_and_does_not_resume_its_run() {
+pub(in crate::app_state) async fn exercise_exact_background_stop() {
     use actix_web::{http::StatusCode, test, App};
 
     let f = Fixture::new_with_native_source(true).await;
