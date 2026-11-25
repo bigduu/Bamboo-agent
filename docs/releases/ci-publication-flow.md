@@ -40,6 +40,16 @@ todo cases. A renamed, missing or duplicated case fails the job. Platform-free
 protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
 the existing native Rust acceptance still runs separately.
 
+For Windows Project read-only proof, dispatch the existing Ticket Platform
+Adapter workflow with the candidate branch and exact source SHA. Its Windows
+job checks the current Project proof, writer contention and unsafe replacement
+paths. The normal Linux Project suite still owns the Unix cases.
+
+```sh
+gh workflow run ticket-platform-adapter.yml -R bigduu/Bamboo-agent \
+  --ref "$candidate_branch" -f windows_project_sha="$candidate_sha"
+```
+
 `frontend-acceptance.yml` checks the embedded frontend package, build scripts and
 server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E

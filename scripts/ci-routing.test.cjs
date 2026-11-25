@@ -266,6 +266,24 @@ test("standalone duplicate acceptances are manual and unique isolation and CodeQ
   for (const name of ["trusted-observer.yml", "delegated-planner-acceptance.yml", "observer-subscriptions.yml"]) assert.match(read(".github/workflows/" + name), /BAMBOO_FRONTEND_BUILD_MODE: api-only/);
 });
 
+test("Windows Project acceptance requires an exact source and stays on its manual owner", () => {
+  const workflow = read(".github/workflows/ticket-platform-adapter.yml");
+  const windows = job(workflow, "windows");
+  assert.match(workflow, /windows_project_sha:\n.*\n        required: false\n        default: ''/);
+  assert.doesNotMatch(job(workflow, "native-budget"), /windows_project_sha|read_only::windows/);
+  assert.match(windows, /runs-on: windows-latest/);
+  assert.match(windows, /ref: \$\{\{ github.sha \}\}\n\s+persist-credentials: false/);
+  assert.match(windows, /test "\$EXPECTED_SNAPSHOT_SHA" = "\$GITHUB_SHA"/);
+  assert.match(windows, /test "\$RUNNER_ARCH" = X64/);
+  assert.match(windows, /host: x86_64-pc-windows-msvc/);
+  assert.match(windows, /cargo test --locked -p bamboo-projects --lib read_only::windows::tests::/);
+  assert.match(windows, /grep -Fxc "test read_only::windows::tests::\$name \.\.\. ok"/);
+  const sourceChecks = windows.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SNAPSHOT_SHA"/g);
+  assert.equal(sourceChecks?.length, 2);
+  const cleanChecks = windows.match(/test -z "\$\(git status --porcelain --untracked-files=all\)"/g);
+  assert.equal(cleanChecks?.length, 2);
+});
+
 test("frontend source acceptance retains the exact-head build and focused frontend tests", () => {
   assert.doesNotMatch(frontend.split("\njobs:\n")[0], /pull_request:|push:/);
   assert.doesNotMatch(frontend, /branches: \[dev\]|paths:/);
