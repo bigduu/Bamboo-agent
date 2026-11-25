@@ -47,7 +47,7 @@ pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'stat
 
 /// Placement and dispatch policy in the Supervisor's role context.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
-    "Resolve the destination for the current assignment before creating an execution Session. ",
+    "For an assignment routed to an independent Session, resolve its destination before creating the Session. ",
     "When the user identifies a Project, workspace or repository for this assignment, use session_control scope to verify it against the current Host Project catalog. ",
     "For Project work, use session_control create with the verified project_id and workspace_path. Use the verified primary project_path when the assignment names only the Project. A saved Project assignment gives the new Session its Project memory scope. ",
     "If the Project or required workspace cannot be resolved unambiguously, ask one focused question or report the create-route blocker. Keep the intended Project on dispatch and retry. ",

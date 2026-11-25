@@ -3847,6 +3847,9 @@ fn supervisor_delegation_first_refreshes_a_saved_prompt_once() {
         None,
         Some(&refreshed.ir.cache),
     );
+    assert!(anthropic["messages"]
+        .to_string()
+        .contains("Prefer Work for authorized deliverables"));
     let user = anthropic["messages"].as_array().unwrap().last().unwrap();
     let blocks = user["content"].as_array().unwrap();
     let last = blocks.last().unwrap();

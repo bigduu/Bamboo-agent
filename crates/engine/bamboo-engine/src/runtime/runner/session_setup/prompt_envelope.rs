@@ -176,9 +176,11 @@ Use SubAgent's explorer role to resolve uncertainty. Its findings are prerequisi
 Use the highest reasoning tier available on the primary model.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy for Standard and Ultra\n\
-Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized independent Sessions. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
+Own scope, planning, dispatch, progress, verification and final synthesis. Use bounded Session/Work/plan views here. Delegate execution, including simple implementation tasks, to authorized workers. Send workspace reads, searches, writes, images, shell and process operations through workers, including work that uses a Skill, Workflow, browser or external tool. Give each worker acceptance criteria and non-goals. Dispatch independent slices in parallel with disjoint writes. Sequence dependent slices and overlapping writes. This role takes precedence over general execution guidance.\n\
+\n\
+Prefer Work for authorized deliverables that benefit from durable tracking, dependencies, parallel ownership or explicit acceptance when Work is enabled and its admitted tools and workspace fit. The user can ask for the outcome without naming Work. Use bounded Work views to find matching Work and advance it from its current state. When the Work views establish no match, use work_update to create a Work with a concrete deliverable, constraints and observable acceptance criteria. Mark it ready when its prerequisites are met and use work_dispatch to start ready Work in the current turn as capacity permits. Honor plan-only and draft-only requests and preserve required User acceptance. Use authorized independent Sessions for one-off execution, an explicitly requested Session or when Work cannot support the assignment and the user's instructions permit a Session.\n\
 Use canonical Host views for the current application user's Projects and Sessions. Report an older per-Project restriction as a Host migration blocker. When selecting a target, locate parallel workstreams with session_control directory and verify candidates with session_history list and bounded inspect. Respect newer Human engagement as a takeover. Follow up a user-engaged Session again only when the user asks. Use authoritative Run evidence for completion.\n\
-Use SubAgent only for auxiliary planning, review or verification. Select the explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Use work_dispatch only for existing explicit Work. Keep the coordinating role with the Supervisor.\n\
+Use SubAgent only for auxiliary planning, review or verification. Select the explorer role for planning. Continue or correct the same child by ActorId. Explicitly authorize scoped nested delegation where needed. Keep the coordinating role with the Supervisor.\n\
 Use discovery for a discoverable route. Tool exposure describes the catalog. Use Host admission to verify target scope and worker readiness. When no authorized route or worker fits, report the specific blocker. Inspect the existing assignment or receipt before retrying. Reuse the complete request and operation UUID on an uncertain response.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
@@ -1235,14 +1237,21 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             "same verified assignment",
             "new independent Session for a separate assignment or requested context isolation",
             "intended Project and workspace",
-            "Resolve the destination for the current assignment",
+            "For an assignment routed to an independent Session, resolve its destination before creating the Session",
             "use session_control scope to verify it",
             "use session_control create with the verified project_id and workspace_path",
             "ask one focused question",
             "Leave both fields unset for this route",
             "session_history list",
             "bounded inspect",
-            "to authorized independent Sessions",
+            "Prefer Work for authorized deliverables",
+            "when Work is enabled and its admitted tools and workspace fit",
+            "without naming Work",
+            "find matching Work and advance it from its current state",
+            "use work_update to create a Work",
+            "use work_dispatch to start ready Work in the current turn",
+            "Honor plan-only and draft-only requests and preserve required User acceptance",
+            "an explicitly requested Session",
             "delegate the memory lookup",
             "Use an authorized Session in the verified Project for Project facts",
             "auxiliary planning",
@@ -1253,6 +1262,14 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             assert!(guidance.contains(concept), "missing {concept}");
         }
         assert!(!guidance.contains("explicitly attach"));
+        assert!(
+            guidance
+                .find("Prefer Work for authorized deliverables")
+                .unwrap()
+                < guidance
+                    .find("For an assignment routed to an independent Session")
+                    .unwrap()
+        );
         assert!(
             guidance.find("session_history list").unwrap()
                 < guidance.find("auxiliary planning").unwrap()
