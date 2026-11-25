@@ -329,6 +329,23 @@ impl SessionMessenger {
         Ok(result)
     }
 
+    /// Validate one live directory candidate against the original ordinary
+    /// caller's canonical tree, independently of the historical listing limits.
+    pub async fn load_same_tree_peer_control(
+        &self,
+        caller: &SessionCallerReference,
+        target_id: &str,
+    ) -> Result<Session, SessionMessengerError> {
+        let (current, target) = self.peer_pair(&caller.session_id, target_id).await?;
+        if !caller.authority_identity.is_ordinary() || !caller.matches_session(&current) {
+            return Err(SessionMessengerError::Unauthorized {
+                source_session_id: caller.session_id.clone(),
+                target: target_id.into(),
+            });
+        }
+        Ok(target)
+    }
+
     /// Send an asynchronous peer instruction. Source identity and association
     /// fields are constructed by the runtime; callers provide no envelope.
     /// Reuse the same operation id and message after an uncertain result.

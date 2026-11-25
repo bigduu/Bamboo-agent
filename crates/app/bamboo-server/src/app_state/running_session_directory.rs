@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolCtx, ToolError};
@@ -102,28 +99,16 @@ impl RunningSessionDirectory for ProjectRunningSessionDirectory {
         }
         candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-        let (scoped, peers) = match scope.as_ref() {
-            Some(token) => (
-                self.storage
-                    .list_host_scoped_targets(token, caller)
-                    .await
-                    .map_err(|_| authority_unavailable())?
-                    .into_iter()
-                    .map(|target| (target.observation.identity.session_id.clone(), target))
-                    .collect::<HashMap<_, _>>(),
-                Default::default(),
-            ),
-            None if caller.authority_identity.is_ordinary() => (
-                HashMap::new(),
-                self.messenger
-                    .list_peer_targets(&caller.session_id)
-                    .await
-                    .map_err(|_| authority_unavailable())?
-                    .targets
-                    .into_iter()
-                    .map(|target| target.session_id)
-                    .collect::<HashSet<_>>(),
-            ),
+        let scoped = match scope.as_ref() {
+            Some(token) => self
+                .storage
+                .list_host_scoped_targets(token, caller)
+                .await
+                .map_err(|_| authority_unavailable())?
+                .into_iter()
+                .map(|target| (target.observation.identity.session_id.clone(), target))
+                .collect::<HashMap<_, _>>(),
+            None if caller.authority_identity.is_ordinary() => HashMap::new(),
             None => return Ok(Vec::new()),
         };
         let source_project = source.project_id_meta();
@@ -150,23 +135,24 @@ impl RunningSessionDirectory for ProjectRunningSessionDirectory {
                     grant.rights.contains(&HostSessionRight::SendPeer),
                     grant.rights.contains(&HostSessionRight::ReadContextView),
                 )
-            } else if peers.contains(&id) {
-                let Ok(Some(target)) = self.storage.load_runtime_control_plane(&id).await else {
-                    continue;
-                };
-                if target.root_session_id != source.root_session_id
-                    || target.project_id_meta() != source_project
-                {
-                    continue;
-                }
-                (target, true, true)
-            } else if can_discover_project {
-                let Ok(target) = self.storage.load_same_project_root_peer(caller, &id).await else {
-                    continue;
-                };
-                (target, true, true)
             } else {
-                continue;
+                let target = match self
+                    .messenger
+                    .load_same_tree_peer_control(caller, &id)
+                    .await
+                {
+                    Ok(target) if target.project_id_meta() == source_project => target,
+                    _ if can_discover_project => {
+                        let Ok(target) =
+                            self.storage.load_same_project_root_peer(caller, &id).await
+                        else {
+                            continue;
+                        };
+                        target
+                    }
+                    _ => continue,
+                };
+                (target, true, true)
             };
             let title = bounded_label(&target.title, 160);
             let brief = may_include_task
@@ -421,5 +407,70 @@ mod tests {
             list(&state, &caller, None, false).await["targets"],
             json!([])
         );
+    }
+
+    #[tokio::test]
+    async fn running_directory_finds_live_child_beyond_historical_peer_page() {
+        use bamboo_engine::session_messaging::MAX_PEER_TARGETS;
+
+        let home = tempfile::tempdir().unwrap();
+        let state = Box::pin(AppState::new_with_provider(
+            home.path().into(),
+            bamboo_llm::Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "running directory must never call a model".into(),
+            }),
+        ))
+        .await
+        .unwrap();
+        let project = "large-coordination-tree";
+        let caller = root("large-tree-parent", project);
+        state.storage.save_session(&caller).await.unwrap();
+        for index in 0..MAX_PEER_TARGETS {
+            let mut idle = Session::new_child_of(
+                format!("large-tree-child-{index:03}"),
+                &caller,
+                "model",
+                "Idle child",
+            );
+            idle.set_project_id_meta(project);
+            state.storage.save_session(&idle).await.unwrap();
+        }
+        let mut live =
+            Session::new_child_of("large-tree-child-live", &caller, "model", "Running child");
+        live.set_project_id_meta(project);
+        state.storage.save_session(&live).await.unwrap();
+        let historical = state
+            .session_messenger
+            .list_peer_targets(&caller.id)
+            .await
+            .unwrap();
+        assert!(historical.truncated);
+        assert_eq!(historical.targets.len(), MAX_PEER_TARGETS);
+        assert!(historical
+            .targets
+            .iter()
+            .all(|peer| peer.session_id != live.id));
+
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let run_id = runner.run_id.clone();
+        let _registration = state
+            .session_activation_router
+            .register_session_run(&live, &run_id)
+            .await
+            .unwrap();
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(live.id.clone(), runner);
+
+        let page = list(&state, &caller, Some(&live.id), false).await;
+        let targets = page["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["session_id"], live.id);
+        assert_eq!(targets[0]["run_id"], run_id);
+        assert_eq!(targets[0]["can_send"], true);
     }
 }
