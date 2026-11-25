@@ -2373,6 +2373,67 @@ mod optional_model_e2e {
         .expect("a committed visible answer prompts a fresh attempt at the pending title");
     }
 
+    #[actix_web::test]
+    async fn wait_for_generated_title_reports_superseded_if_the_user_renames() {
+        let id = "chat-title-wait-rename";
+        let provider = BlockingTitleProvider::new();
+        let state = title_test_state(provider.clone()).await;
+        let mut session = Session::new(id, "chat-model");
+        session.title = "Previous title".into();
+        session.title_generated = true;
+        session.add_message(bamboo_agent_core::Message::user(
+            "Please investigate why rendering stalls after a transport reconnect.",
+        ));
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let regenerate = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{id}/regenerate-title?wait=true"))
+                .to_request(),
+        );
+        tokio::pin!(regenerate);
+        tokio::select! {
+            response = &mut regenerate => {
+                panic!("regeneration completed before the model responded: {}", response.status());
+            }
+            started = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, provider.started.acquire()) => {
+                started.expect("title provider was dispatched").unwrap().forget();
+            }
+        }
+
+        let rename = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({ "title": "User's chosen title" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rename.status(), StatusCode::OK);
+
+        provider.release.add_permits(1);
+        let response = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, regenerate)
+            .await
+            .expect("regeneration returns after the model responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome: Value = test::read_body_json(response).await;
+        assert_eq!(
+            outcome,
+            serde_json::json!({ "status": "superseded", "session_id": id })
+        );
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(persisted.title, "User's chosen title");
+        assert_eq!(persisted.title_version, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
     /// #480: omitting `model` on `POST /chat` falls back to the server's
     /// resolved default (the same resolution `GET /execute/defaults` and the
     /// connect bridge use) — the session ends up with the CONFIGURED default
