@@ -745,7 +745,7 @@ async fn external_memory_omits_block_when_no_match_exists() {
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Global,
             None,
-            bamboo_memory::memory_store::DurableMemoryType::Project,
+            bamboo_memory::memory_store::DurableMemoryType::Reference,
             "Cedarpath staging relay",
             "Cedarpath deploys its relay at midnight.",
             &["cedarpath".to_string(), "relay".to_string()],

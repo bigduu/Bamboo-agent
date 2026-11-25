@@ -70,10 +70,10 @@ jobs:
           assert len(packages) == len(locked) == 1
           package, lock = packages[0], locked[0]
           assert package['source'] == lock['source'] == 'registry+https://github.com/rust-lang/crates.io-index'
-          assert package['version'] == lock['version'] == '0.5.0'
-          assert lock['checksum'] == '3e472df7199508ed1bcb879324c814cb00c152ae0b5e9ea1592563e43263cd9d'
+          assert package['version'] == lock['version'] == '0.5.1'
+          assert lock['checksum'] == 'a93436ad4892a2da45035aed0749c5ace761592dc90f0136e972edcd722faae9'
           vcs = json.loads(pathlib.Path(package['manifest_path']).with_name('.cargo_vcs_info.json').read_text())
-          assert vcs['git']['sha1'] == 'cecbdce879691e3bb9294bf31c8e4faf22e859b3'
+          assert vcs['git']['sha1'] == '2dde2f7e1e71fe95b7a0d9d28cb8084990a8fa9f'
           assert not vcs['git'].get('dirty', False)
           print(json.dumps({'registry_package': lock, 'vcs': vcs}, sort_keys=True))
           PY

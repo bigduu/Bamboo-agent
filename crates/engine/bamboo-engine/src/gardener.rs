@@ -844,7 +844,7 @@ mod tests {
                         .write_memory(
                             MemoryScope::Global,
                             None,
-                            DurableMemoryType::Project,
+                            DurableMemoryType::Reference,
                             title,
                             body,
                             &[],
@@ -1107,7 +1107,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![
-            "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"project\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
+            "{\"same_fact\":true,\"merged\":{\"title\":\"Mobile release freeze is Tuesday\",\"type\":\"reference\",\"content\":\"Mobile release freeze begins Tuesday for the release cut.\",\"tags\":[\"release\"]}}".to_string(),
         ]));
         let config = Arc::new(RwLock::new(config_with_memory(
             bamboo_config::MemoryConfig {
@@ -1146,7 +1146,7 @@ mod tests {
                 .write_memory(
                     MemoryScope::Global,
                     None,
-                    DurableMemoryType::Project,
+                    DurableMemoryType::Reference,
                     title,
                     content,
                     &[],
@@ -1234,11 +1234,11 @@ mod tests {
             "Global fact c",
             "Global fact d",
         ] {
-            memory
+            let doc = memory
                 .write_memory(
                     MemoryScope::Global,
                     None,
-                    DurableMemoryType::Project,
+                    DurableMemoryType::Reference,
                     title,
                     "body content for the memory",
                     &[],
@@ -1249,7 +1249,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            // Existing Project records in this synthetic Global store are evictable.
+            let stored = std::fs::read_to_string(&doc.path).unwrap();
+            let legacy = stored.replacen("\ntype: reference\n", "\ntype: project\n", 1);
+            assert_ne!(legacy, stored);
+            std::fs::write(&doc.path, legacy).unwrap();
         }
+        memory
+            .rebuild_scope(MemoryScope::Global, None)
+            .await
+            .unwrap();
 
         // Off by default (capacity == 0) → Ok(None), archives nothing.
         let off_config = Arc::new(RwLock::new(Config::default()));
@@ -1362,7 +1371,7 @@ mod tests {
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "Freshly written day note",
                 "Not yet old enough to expire.",
                 &[],
