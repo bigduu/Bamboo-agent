@@ -950,16 +950,17 @@ fn fixture_http_client() -> reqwest::Client {
         .unwrap()
 }
 
-#[actix_web::test]
-async fn fixture_sessions_poll_survives_idle_peer_close() {
-    use std::io::{Read, Write};
+async fn run_idle_peer_sessions_fixture(body: &'static str) -> Result<(), String> {
+    use std::error::Error;
+    use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
+    use std::time::Instant;
 
-    let _listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
+    const PEER_WINDOW: Duration = Duration::from_secs(3);
 
-    fn accept_bounded(listener: &TcpListener) -> std::io::Result<TcpStream> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    fn accept_bounded(listener: &TcpListener) -> io::Result<TcpStream> {
+        let deadline = Instant::now() + PEER_WINDOW;
         loop {
             match listener.accept() {
                 Ok((peer, _)) => {
@@ -969,8 +970,7 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
                     return Ok(peer);
                 }
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -978,26 +978,37 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
             }
         }
     }
-    fn sessions_reply(peer: &mut TcpStream) -> std::io::Result<()> {
-        peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+
+    fn sessions_reply(peer: &mut TcpStream, body: &str, writing: impl FnOnce()) -> io::Result<()> {
+        peer.set_read_timeout(Some(PEER_WINDOW))?;
         let mut request = Vec::new();
         let mut byte = [0];
         while !request.ends_with(b"\r\n\r\n") {
             peer.read_exact(&mut byte)?;
             request.push(byte[0]);
-            assert!(request.len() < 8192, "bounded request head");
+            if request.len() >= 8192 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request head exceeded fixture limit",
+                ));
+            }
         }
-        assert!(
-            request.starts_with(b"GET /api/v1/sessions HTTP/1.1"),
-            "unexpected fixture request line: {:?}",
-            String::from_utf8_lossy(
+        if !request.starts_with(b"GET /api/v1/sessions HTTP/1.1") {
+            let line = String::from_utf8_lossy(
                 request
                     .split(|byte| *byte == b'\r')
                     .next()
-                    .unwrap_or_default()
-            )
-        );
-        let body = r#"{"sessions":[{"id":"plain-root","is_running":false}]}"#;
+                    .unwrap_or_default(),
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected fixture request line: {:?}",
+                    bounded_diagnostic(&line, 160)
+                ),
+            ));
+        }
+        writing();
         write!(
             peer,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
@@ -1006,40 +1017,128 @@ async fn fixture_sessions_poll_survives_idle_peer_close() {
         peer.flush()
     }
 
+    let _listener_admission = FIXTURE_LISTENER_ADMISSION.lock().await;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/api/v1/sessions", listener.local_addr().unwrap());
     let (close_tx, close_rx) = mpsc::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || -> std::io::Result<()> {
-        let mut first = accept_bounded(&listener)?;
-        sessions_reply(&mut first)?;
-        close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        let _ = first.shutdown(Shutdown::Both);
-        closed_tx.send(()).unwrap();
-        // The service remains alive and accepts the next connection. Only
-        // the idle peer closes, as when the Host's keep-alive timer expires.
-        let mut second = accept_bounded(&listener)?;
-        sessions_reply(&mut second)
+    let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+    let phase = Arc::new(Mutex::new("accept first peer"));
+    let current_phase = Arc::clone(&phase);
+    let server = std::thread::spawn(move || {
+        let record = |phase| *current_phase.lock().unwrap() = phase;
+        // The listener, peer sockets, and idle-close channels are released
+        // before publishing the terminal outcome.
+        let result = (move || -> io::Result<()> {
+            let mut first = accept_bounded(&listener)?;
+            record("read first request head");
+            sessions_reply(&mut first, body, || record("write first reply"))?;
+            record("wait for explicit idle close");
+            close_rx.recv_timeout(PEER_WINDOW).map_err(|error| {
+                let kind = match error {
+                    mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                    mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+                };
+                io::Error::new(kind, error)
+            })?;
+            record("close first idle peer");
+            let _ = first.shutdown(Shutdown::Both);
+            closed_tx.send(()).map_err(io::Error::other)?;
+            // The service remains alive and accepts the next connection. Only
+            // the idle peer closes, as when the Host's keep-alive timer expires.
+            record("accept second peer");
+            let mut second = accept_bounded(&listener)?;
+            record("read second request head");
+            sessions_reply(&mut second, body, || record("write second reply"))
+        })();
+        let _ = finished_tx.send(result);
     });
     let client = fixture_http_client();
-    let first: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    let first: Result<Value, _> = match client.get(&url).send().await {
+        Ok(response) => response.json().await.map_err(|error| ("body", error)),
+        Err(error) => Err(("transport", error)),
+    };
+    let first = match first {
+        Ok(value) => value,
+        Err((client_phase, error)) => {
+            // Release a peer waiting for idle-close admission before observing
+            // it. A pending read or write cannot keep the failure path waiting.
+            drop(close_tx);
+            let peer = match finished_rx.recv_timeout(PEER_WINDOW) {
+                Ok(result) => {
+                    server.join().unwrap();
+                    match result {
+                        Ok(()) => "joined after successful I/O".to_owned(),
+                        Err(error) => format!(
+                            "joined with kind={:?}, raw_os_error={:?}, detail={:?}",
+                            error.kind(),
+                            error.raw_os_error(),
+                            bounded_diagnostic(&error.to_string(), 256),
+                        ),
+                    }
+                }
+                Err(error) => format!("terminal I/O evidence unavailable ({error})"),
+            };
+            let phase = *phase.lock().unwrap();
+            let chain: Vec<_> =
+                std::iter::successors(Some(&error as &dyn Error), |cause| (*cause).source())
+                    .take(8)
+                    .map(|cause| bounded_diagnostic(&cause.to_string(), 256).to_owned())
+                    .collect();
+            let diagnostic = format!(
+                "first sessions poll {url} failed during {client_phase}: peer_phase={phase:?}, peer={peer}, client_chain={chain:?}"
+            );
+            return Err(bounded_diagnostic(&diagnostic, 4096).to_owned());
+        }
+    };
+
     close_tx.send(()).unwrap();
     // Keep this current-thread client reactor from consuming the idle EOF
     // until the peer confirms closure. No wall-clock expiry or retry is used.
-    closed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    closed_rx.recv_timeout(PEER_WINDOW).unwrap();
     let second = client.get(&url).send().await;
     let second = match second {
         Ok(response) => response.json::<Value>().await,
         Err(error) => Err(error),
     };
-    let served = server.join().unwrap();
+    server.join().unwrap();
     assert!(
         second.is_ok(),
         "sessions poll after idle peer close: {second:?}"
     );
     assert_eq!(second.unwrap(), first);
-    served.expect("live service accepted the second poll");
+    finished_rx
+        .try_recv()
+        .expect("owned peer published its outcome")
+        .expect("live service accepted the second poll");
+    Ok(())
+}
+
+#[actix_web::test]
+async fn fixture_sessions_poll_survives_idle_peer_close() {
+    run_idle_peer_sessions_fixture(r#"{"sessions":[{"id":"plain-root","is_running":false}]}"#)
+        .await
+        .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+}
+
+#[actix_web::test]
+async fn fixture_first_sessions_body_failure_releases_and_reports_the_owned_peer() {
+    let diagnostic = run_idle_peer_sessions_fixture("not JSON")
+        .await
+        .expect_err("the real HTTP body cannot decode as JSON");
+
+    for evidence in [
+        "failed during body",
+        "peer_phase=\"wait for explicit idle close\"",
+        "joined with kind=BrokenPipe, raw_os_error=None",
+        "client_chain=[",
+        "expected ident",
+    ] {
+        assert!(diagnostic.contains(evidence), "{diagnostic}");
+    }
+    assert!(diagnostic.len() <= 4096, "{diagnostic}");
+    eprintln!("{diagnostic}");
 }
 
 const SESSIONS_POLL_ATTEMPTS: usize = 3;
