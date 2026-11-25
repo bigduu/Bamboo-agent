@@ -181,7 +181,7 @@ mod tests {
                     "-n": { "type": "boolean", "description": "Show line numbers" },
                     "-i": { "type": "boolean", "description": "Case insensitive" },
                     "type": { "type": "string", "description": "File type filter (for example rust, js, ts, py)" },
-                    "head_limit": { "type": "number", "description": "Limit output entries. Keep this small for broad queries." },
+                    "head_limit": { "type": "number", "description": "Limit output entries. Reaching the limit may stop the search before remaining files are checked." },
                     "multiline": { "type": "boolean", "description": "Enable multiline regex. Requires a narrowed path." },
                     "include_ignored": { "type": "boolean", "default": false, "description": "Include gitignored files. Requires an explicit path; scan/result limits and fixed directory exclusions still apply." }
                 },

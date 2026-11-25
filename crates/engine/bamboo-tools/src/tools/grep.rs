@@ -683,12 +683,12 @@ impl GrepTool {
 
         result_lines.truncate(head_limit);
         if let Some(detail) = output_limit {
-            result_lines.push(format!(
+            result_lines.insert(0, format!(
                 "[PARTIAL] Output limited by head_limit={head_limit}. {detail} Narrow path/pattern or raise head_limit."
             ));
         }
         if let Some(notice) = coverage.notice(scan_limit) {
-            result_lines.push(notice);
+            result_lines.insert(0, notice);
         }
 
         let result = result_lines.join("\n");
