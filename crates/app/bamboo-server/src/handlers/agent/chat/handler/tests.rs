@@ -1953,7 +1953,9 @@ mod optional_model_e2e {
                 .expect("release semaphore stays open");
 
             Ok(Box::pin(futures::stream::iter(vec![
-                Ok(LLMChunk::Token("Generated Immediately".to_string())),
+                Ok(LLMChunk::Token(
+                    r#"{"title":"Generated Immediately"}"#.to_string(),
+                )),
                 Ok(LLMChunk::Done),
             ])))
         }
@@ -2268,14 +2270,14 @@ mod optional_model_e2e {
                     .any(|message| message.content.contains(TITLE_REPLY));
                 self.title_requests.send(includes_reply).unwrap();
                 if includes_reply {
-                    "会话收件箱游标回放"
+                    r#"{"title":"会话收件箱游标回放"}"#
                 } else {
                     self.allow_deferred_outcome
                         .acquire()
                         .await
                         .unwrap()
                         .forget();
-                    "INSUFFICIENT_CONTEXT"
+                    r#"{"title":null}"#
                 }
             } else {
                 let _allow_reply = self.allow_reply.acquire().await.unwrap();
