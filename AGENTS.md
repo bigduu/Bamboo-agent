@@ -201,6 +201,14 @@ sealed frontend and five original native transports. Only the six proven
 unstarted crates can receive a first verification compile. Follow the
 [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261143-crate-recovery).
 
+The fixed `v2026.11.47` recovery in #3078 retains the original
+`bamboo-sdk` archive after an HTTP 500 from crates.io. The recovery
+authenticates all 27 retained crate archives, the sealed frontend and five
+native transports. Only the four unstarted crates may compile behind the signed
+write-ahead checkpoint. Finalize through the original publisher's failed jobs
+after authenticated readback. See the
+[fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261147-crate-recovery).
+
 The Bamboo npm workflow is a consumer of the completed v3 Release. Use its
 exact source, manifest and publisher attempt. The preparation job owns npm
 packing and the publishing job uses that verified tarball. See the
