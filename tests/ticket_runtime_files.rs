@@ -7,6 +7,8 @@ mod fixture;
 use fixture::{command, post, Fixture};
 use serde_json::json;
 use std::{path::Path, process::Command, sync::atomic::Ordering, time::Duration};
+#[path = "ticket_runtime_files/post_reap.rs"]
+mod post_reap;
 #[path = "ticket_runtime_files/read_pages.rs"]
 mod read_pages;
 
@@ -638,20 +640,37 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
         json!([{"op":"start","work_id":b,"temp_id":"bb","workspace":workspace}]),
     )
     .await;
+    let provider_calls_before_b = f.probe.calls.load(Ordering::SeqCst);
     let admitted = post(&f.client, &f.base, "/tickets/dispatch", &start_b).await;
     assert_eq!(admitted["errors"], json!([]), "{admitted}");
     let inspect = json!({"ids":[b],"depth":0,"sections":["assignments","submissions"],"budget_bytes":65536,"fixed_commit":null});
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let mut last = post_reap::LastInspect::default();
+    let submitted = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let view = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
             if view["data"][0]["ticket"]["state"] == "submitted" {
                 break;
             }
+            last.completed += 1;
+            last.view = Some(view);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if submitted.is_err() {
+        let evidence = post_reap::timeout_evidence(
+            &f,
+            b,
+            &admitted,
+            &last,
+            pid,
+            provider_calls_before_b,
+            &tree,
+        )
+        .await;
+        // The existing fixture teardown reports the owned Host exit and its current-launch log tail.
+        panic!("Work B did not submit within 60s after the old Worker was reaped\n{evidence}");
+    }
     assert_eq!(
         std::fs::read_to_string(tree.join("answer-created.rs")).unwrap(),
         "pub fn answer() -> u8 { 42 }\n"
