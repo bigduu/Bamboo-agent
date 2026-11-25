@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::planned_update::StreamUpdateControl;
 use bamboo_agent_core::tools::ToolCall;
 use bamboo_agent_core::{AgentError, AgentEvent, StreamTimeoutError, StreamTimeoutPhase};
 use bamboo_config::StreamTimeoutConfig;
@@ -395,19 +396,21 @@ pub async fn consume_llm_stream_with_context(
     .await
 }
 
-pub(crate) async fn consume_llm_stream_with_context_and_partial(
+pub(crate) async fn consume_llm_stream_for_round(
     stream: LLMStream,
-    event_tx: &mpsc::Sender<AgentEvent>,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     session_id: &str,
     timeout_context: &StreamTimeoutContext,
+    update: Option<&StreamUpdateControl>,
 ) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
     consume::consume_llm_stream_internal_with_partial(
         stream,
-        Some(event_tx),
+        event_tx,
         cancel_token,
         session_id,
         timeout_context,
+        update,
     )
     .await
 }
@@ -448,6 +451,7 @@ pub(crate) async fn consume_llm_stream_silent_with_context_and_partial(
         cancel_token,
         session_id,
         timeout_context,
+        None,
     )
     .await
 }

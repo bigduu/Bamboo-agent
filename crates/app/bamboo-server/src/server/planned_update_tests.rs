@@ -67,28 +67,7 @@ async fn planned_update_parks_concurrent_live_roots_after_their_real_tool_calls(
         finish_round: Semaphore::new(0),
         path,
     });
-    let mut config = Config::from_data_dir(Some(workspace.clone()));
-    config.provider = "openai".into();
-    config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
-        model: Some(MODEL.into()),
-        ..Default::default()
-    });
-    config
-        .memory_mut()
-        .get_or_insert_with(Default::default)
-        .auto_dream_enabled = false;
-    let state = AppState::new_with_provider_for_legacy_ingress_test(
-        workspace.clone(),
-        config,
-        probe.clone(),
-    )
-    .await
-    .unwrap()
-    .into_http_data();
-    state.provider_registry.replace_with(ProviderRegistry::new(
-        HashMap::from([("openai".into(), probe.clone() as Arc<dyn LLMProvider>)]),
-        "openai".into(),
-    ));
+    let state = fixture_openai_host(&workspace, probe.clone(), None).await;
     let app = test::init_service(
         actix_web::App::new()
             .app_data(state.clone())
@@ -206,6 +185,336 @@ struct ProviderProbe {
     calls: AtomicUsize,
     continue_model: Semaphore,
     reject: bool,
+    expected_read_result: String,
+}
+
+struct InterruptedStreamProbe {
+    in_stream: Arc<Semaphore>,
+    finish_stream: Arc<Semaphore>,
+    partial_tool: bool,
+    calls: AtomicUsize,
+    path: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for InterruptedStreamProbe {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        use futures::StreamExt;
+
+        assert_eq!(model, MODEL);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let tool = ToolCall {
+            id: if call == 0 {
+                "original-call"
+            } else {
+                "discarded-tool"
+            }
+            .into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: serde_json::json!({"file_path": self.path}).to_string(),
+            },
+        };
+        if call == 0 {
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::ToolCalls(vec![tool])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        assert_eq!(
+            call, 1,
+            "the predecessor must not dispatch a replacement response"
+        );
+        let in_stream = self.in_stream.clone();
+        let finish_stream = self.finish_stream.clone();
+        let mut fragments = vec![
+            Ok(LLMChunk::Token("discarded reply".into())),
+            Ok(LLMChunk::ReasoningToken("discarded reasoning".into())),
+            Ok(LLMChunk::ResponseId("discarded-response-id".into())),
+        ];
+        if self.partial_tool {
+            fragments.push(Ok(LLMChunk::ToolCalls(vec![tool])));
+        }
+        Ok(Box::pin(
+            futures::stream::iter(fragments)
+                .chain(futures::stream::once(async move {
+                    in_stream.add_permits(1);
+                    finish_stream.acquire().await.unwrap().forget();
+                    Ok(LLMChunk::Token(" continued in the same stream".into()))
+                }))
+                .chain(futures::stream::iter([Ok(LLMChunk::Done)])),
+        ))
+    }
+}
+
+async fn fixture_openai_host(
+    workspace: &std::path::Path,
+    probe: Arc<dyn LLMProvider>,
+    transport_idle_timeout_secs: Option<u64>,
+) -> actix_web::web::Data<AppState> {
+    let mut config = Config::from_data_dir(Some(workspace.to_owned()));
+    config.provider = "openai".into();
+    config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        model: Some(MODEL.into()),
+        ..Default::default()
+    });
+    if let Some(seconds) = transport_idle_timeout_secs {
+        config.stream_timeout.transport_idle_timeout_secs = seconds;
+    }
+    config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
+    let state = AppState::new_with_provider_for_legacy_ingress_test(
+        workspace.to_owned(),
+        config,
+        probe.clone(),
+    )
+    .await
+    .unwrap()
+    .into_http_data();
+    state.provider_registry.replace_with(ProviderRegistry::new(
+        HashMap::from([("openai".into(), probe)]),
+        "openai".into(),
+    ));
+    state
+}
+
+async fn fixture_streaming_root(
+    workspace: &std::path::Path,
+    partial_tool: bool,
+    transport_idle_timeout_secs: Option<u64>,
+) -> (
+    actix_web::web::Data<AppState>,
+    Session,
+    Arc<InterruptedStreamProbe>,
+) {
+    use actix_web::test;
+
+    let path = workspace.join("immediate-update-read.txt");
+    std::fs::write(&path, "already finished").unwrap();
+    let probe = Arc::new(InterruptedStreamProbe {
+        in_stream: Arc::new(Semaphore::new(0)),
+        finish_stream: Arc::new(Semaphore::new(0)),
+        partial_tool,
+        calls: AtomicUsize::new(0),
+        path,
+    });
+    let state = fixture_openai_host(workspace, probe.clone(), transport_idle_timeout_secs).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let mut session = Session::new("immediate-update-live-root", MODEL);
+    session.title_generated = true;
+    session.set_workspace_path_meta(workspace.to_string_lossy());
+    session.set_provider_name("openai");
+    session.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+        "explicit".into(),
+    );
+    session.add_message(Message::user("Read the fixture and report what you found."));
+    crate::handlers::agent::events::mark_pending_turn(&mut session);
+    state.storage.save_session(&session).await.unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{}", session.id))
+            .set_json(serde_json::json!({"model":MODEL}))
+            .to_request(),
+    )
+    .await;
+    let code = response.status();
+    let response: serde_json::Value = test::read_body_json(response).await;
+    assert!(code.is_success(), "{}: {response}", session.id);
+    tokio::time::timeout(Duration::from_secs(12), probe.in_stream.acquire())
+        .await
+        .expect("the unfinished provider stream was polled")
+        .unwrap()
+        .forget();
+    (state, session, probe)
+}
+
+async fn park_streaming_root(
+    state: &AppState,
+    session: &Session,
+) -> (
+    bamboo_engine::session_activation::SessionUpdateAdmission,
+    ParkedUpdateRoot,
+) {
+    let admission = state
+        .session_activation_router
+        .hold_admissions_for_immediate_update()
+        .await
+        .unwrap();
+    assert_eq!(admission.outstanding_sessions().await, [session.id.clone()]);
+    let checkpoint = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if let Some(root) = admission.parked_roots().await.pop() {
+                return root;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the Root parked without waiting for the stream to complete");
+    (admission, checkpoint)
+}
+
+#[actix_web::test]
+async fn immediate_update_discards_partial_reply_and_resumes_from_saved_tool_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let (state, session, probe) = fixture_streaming_root(&workspace, true, None).await;
+    let (admission, checkpoint) = park_streaming_root(&state, &session).await;
+    let request = uuid::Uuid::new_v4();
+    let mut handoff = None;
+    admission
+        .commit_parked_roots(|roots| {
+            assert_eq!(roots, std::slice::from_ref(&checkpoint));
+            handoff = Some(planned_update_handoff::publish(&workspace, request, roots)?);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let saved = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let owner = state
+                .session_store
+                .inspect_actor(&session.id)
+                .await
+                .unwrap()
+                .activation
+                .unwrap();
+            if owner.status == ActorActivationStatus::Succeeded {
+                assert_eq!(owner.fence(), checkpoint.fence);
+                return state
+                    .session_store
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the old Root released its durable writer");
+    assert!(checkpoint.matches_checkpoint(&saved));
+    assert_eq!(saved.messages.len(), 3);
+    assert_eq!(saved.messages[0].id, session.messages[0].id);
+    assert_eq!(
+        saved.messages[2].tool_call_id.as_deref(),
+        Some("original-call")
+    );
+    assert!(saved.messages[2].content.contains("already finished"));
+    assert!(!serde_json::to_string(&saved).unwrap().contains("discarded"));
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    state.shutdown().await;
+    handoff.unwrap().authorize().unwrap();
+    drop(state);
+
+    let probe = Arc::new(ProviderProbe {
+        expected_read_result: saved.messages[2].content.clone(),
+        ..ProviderProbe::new()
+    });
+    let successor = fixture_openai_host(&workspace, probe.clone(), None).await;
+    probe.continue_model.add_permits(1);
+    planned_update_handoff::resume(&successor, request)
+        .await
+        .unwrap();
+    let resumed = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let saved = successor
+                .session_store
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if bamboo_storage::SessionStoreV2::root_completed_planned_update(
+                &saved,
+                &checkpoint.fence,
+            ) {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the successor completed from the saved transcript");
+    assert_eq!(resumed.created_at, session.created_at);
+    assert_eq!(resumed.messages.len(), saved.messages.len() + 1);
+    assert_eq!(
+        ParkedUpdateRoot::hash_transcript(&resumed.messages[..saved.messages.len()]).unwrap(),
+        checkpoint.transcript_sha256
+    );
+    assert_eq!(
+        resumed.messages.last().unwrap().content,
+        "Continued using the saved result."
+    );
+    planned_update_handoff::resume(&successor, request)
+        .await
+        .unwrap();
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    successor.shutdown().await;
+}
+
+#[actix_web::test]
+async fn aborted_immediate_update_reuses_the_original_provider_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let (state, session, probe) = fixture_streaming_root(&workspace, false, Some(3)).await;
+    let (admission, checkpoint) = park_streaming_root(&state, &session).await;
+    let saved = state
+        .session_store
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.matches_checkpoint(&saved));
+    assert!(!serde_json::to_string(&saved).unwrap().contains("discarded"));
+
+    // Let the old receive deadline expire well before abort. The provider has
+    // no next frame ready when the parked stream becomes runnable again.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    drop(admission);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    probe.finish_stream.add_permits(1);
+    let completed = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let saved = state
+                .session_store
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if saved.last_run_status().as_deref() == Some("completed") {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the original response continued after abort");
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(completed.messages.len(), saved.messages.len() + 1);
+    let response = completed.messages.last().unwrap();
+    assert_eq!(
+        response.content,
+        "discarded reply continued in the same stream"
+    );
+    assert_eq!(response.reasoning.as_deref(), Some("discarded reasoning"));
+    state.shutdown().await;
 }
 
 impl ProviderProbe {
@@ -214,6 +523,7 @@ impl ProviderProbe {
             calls: AtomicUsize::new(0),
             continue_model: Semaphore::new(0),
             reject: false,
+            expected_read_result: "already finished".into(),
         }
     }
 }
@@ -228,14 +538,17 @@ impl LLMProvider for ProviderProbe {
         model: &str,
     ) -> Result<LLMStream, LLMError> {
         assert_eq!(model, MODEL);
+        let mut results = messages
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("original-call"));
         assert_eq!(
-            messages
-                .iter()
-                .filter(|message| message.tool_call_id.as_deref() == Some("original-call"))
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>(),
-            ["already finished"]
+            results.next().map(|message| message.content.as_str()),
+            Some(self.expected_read_result.as_str())
         );
+        assert!(results.next().is_none());
+        assert!(messages
+            .iter()
+            .all(|message| !message.content.contains("discarded reply")));
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.continue_model.acquire().await.unwrap().forget();
         if self.reject {
@@ -605,6 +918,7 @@ async fn assert_planned_update_desktop_retries_expired_claim(startup_saved: bool
     };
     assert!(read_marker("ready").await.is_empty());
     assert!(read_marker("planned-update-v1").await.is_empty());
+    assert!(read_marker("immediate-update-v1").await.is_empty());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
     let mut marker = tempfile::NamedTempFile::new_in(control.path()).unwrap();
     write!(
