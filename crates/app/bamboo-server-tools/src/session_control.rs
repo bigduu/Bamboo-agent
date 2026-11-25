@@ -529,13 +529,12 @@ struct ManagedInputReceipt {
     generation: u64,
 }
 
-impl ManagedInputReceipt {
-    fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Self::deserialize(deserializer).map(Some)
-    }
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -563,9 +562,10 @@ enum SessionControlArgs {
         notify_on_material_event: bool,
     },
     ObserveRun {
-        target_session_id: String,
+        #[serde(default, deserialize_with = "deserialize_present")]
+        target_session_id: Option<String>,
         target_ref: bamboo_domain::SupervisorCurrentUserTarget,
-        #[serde(default, deserialize_with = "ManagedInputReceipt::deserialize_present")]
+        #[serde(default, deserialize_with = "deserialize_present")]
         input_receipt: Option<ManagedInputReceipt>,
     },
     WaitRun {
@@ -810,6 +810,9 @@ impl Tool for SessionControlTool {
         }
         if self.root_run.is_some() {
             schema["required"] = json!(["action"]);
+            schema["properties"]["target_session_id"]["description"] = json!(
+                "Omit this field for observe_run and copy the exact target_ref. If supplied for observe_run, it must match target_ref.session_id."
+            );
             let actions = schema["properties"]["action"]["enum"]
                 .as_array_mut()
                 .expect("action enumeration");
@@ -885,7 +888,7 @@ impl Tool for SessionControlTool {
             ];
             let mut observe = json!({
                 "properties":{"action":{"const":"observe_run"}, "expected_run_id":false},
-                "required":["target_session_id", "target_ref"]
+                "required":["target_ref"]
             });
             let mut wait = json!({
                 "properties":{"action":{"const":"wait_run"}},
@@ -1081,7 +1084,9 @@ impl Tool for SessionControlTool {
                 input_receipt,
             } => {
                 validate_root_run_caller(original, &supervisor)?;
-                validate_root_run_target(&target_session_id, &target_ref)?;
+                target_ref
+                    .validate_root_run_target_id(target_session_id.as_deref())
+                    .map_err(|error| ToolError::InvalidArguments(error.into()))?;
                 let port = self.root_run.as_ref().ok_or_else(|| {
                     ToolError::Execution("supervised_root_run_unavailable".into())
                 })?;
@@ -1327,14 +1332,10 @@ fn validate_root_run_target(
     target_session_id: &str,
     target: &bamboo_domain::SupervisorCurrentUserTarget,
 ) -> Result<(), ToolError> {
-    bamboo_domain::validate_supervisor_target_id(target_session_id)
-        .map_err(|error| ToolError::InvalidArguments(error.into()))?;
-    if target.session_id != target_session_id || target.kind != bamboo_domain::SessionKind::Root {
-        return Err(ToolError::InvalidArguments(
-            "exact run control requires the observed ordinary Root target".into(),
-        ));
-    }
-    Ok(())
+    target
+        .validate_root_run_target_id(Some(target_session_id))
+        .map(|_| ())
+        .map_err(|error| ToolError::InvalidArguments(error.into()))
 }
 
 /// Project the shared bounded fields into the remote adapter's strict actions.

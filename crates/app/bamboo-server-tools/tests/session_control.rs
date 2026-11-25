@@ -29,8 +29,9 @@ impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
     async fn observe_run(
         &self,
         _caller: &SessionCallerReference,
-        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
     ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        assert_eq!(target.session_id, "a");
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(bamboo_agent_core::tools::ToolResult::text(
             true,
@@ -41,9 +42,10 @@ impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
     async fn observe_admission(
         &self,
         _caller: &SessionCallerReference,
-        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
         receipt: &bamboo_domain::SessionInboxReceipt,
     ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        assert_eq!(target.session_id, "a");
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(receipt.id.as_str(), "input-1");
         assert_eq!(receipt.generation, 7);
@@ -93,18 +95,45 @@ async fn exact_root_run_schema_requires_observed_target_and_run_without_granting
         .iter()
         .find(|target| target.session_id == "a")
         .unwrap();
-    let observe = json!({"action":"observe_run", "target_session_id":"a", "target_ref":target});
-    assert_eq!(tool.classify(&observe), ToolClass::READONLY_PARALLEL);
-    let observed = completed(
-        tool.invoke(observe.clone(), fixture.ctx.clone())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(observed["run_id"], "run-1");
+    let observe = json!({"action":"observe_run", "target_ref":target});
     let validator = jsonschema::validator_for(&schema).unwrap();
+    let provider_schema =
+        bamboo_llm::providers::common::tool_schema::sanitize_openai_function_parameters_schema(
+            &schema,
+        );
+    assert_eq!(provider_schema["required"], json!(["action"]));
+    let description = provider_schema["properties"]["target_session_id"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("Omit this field for observe_run"));
+    assert!(description.contains("must match target_ref.session_id"));
+    let provider_validator = jsonschema::validator_for(&provider_schema).unwrap();
+    let mut legacy = observe.clone();
+    legacy["target_session_id"] = json!("a");
+    for args in [observe.clone(), legacy] {
+        assert!(validator.is_valid(&args));
+        assert!(provider_validator.is_valid(&args));
+        assert_eq!(tool.classify(&args), ToolClass::READONLY_PARALLEL);
+        assert_eq!(
+            completed(tool.invoke(args, fixture.ctx.clone()).await.unwrap())["run_id"],
+            "run-1"
+        );
+    }
+    let missing_reference = json!({"action":"observe_run", "target_session_id":"a"});
+    assert!(!validator.is_valid(&missing_reference));
+    assert!(tool
+        .invoke(missing_reference, fixture.ctx.clone())
+        .await
+        .is_err());
+    for invalid_id in [json!("b"), Value::Null, json!(123)] {
+        let mut invalid = observe.clone();
+        invalid["target_session_id"] = invalid_id;
+        assert!(tool.invoke(invalid, fixture.ctx.clone()).await.is_err());
+    }
     let mut admission = observe;
     admission["input_receipt"] = json!({"receipt_id":"input-1","generation":7});
     assert!(validator.is_valid(&admission));
+    assert!(provider_validator.is_valid(&admission));
     assert_eq!(
         completed(
             tool.invoke(admission.clone(), fixture.ctx.clone())
@@ -145,7 +174,7 @@ async fn exact_root_run_schema_requires_observed_target_and_run_without_granting
             .await
             .is_err());
     }
-    assert_eq!(port.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(port.calls.load(Ordering::SeqCst), 4);
 }
 
 #[derive(Default)]

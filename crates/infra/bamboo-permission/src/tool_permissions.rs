@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 
 use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sha2_11::Sha256 as Sha256V11;
@@ -1373,13 +1374,28 @@ pub fn check_permissions(
                 // the approval of an approval.
                 return Ok(None);
             }
-            if matches!(action, "observe_run" | "wait_run" | "cancel") {
+            if action == "observe_run" {
+                let target = bamboo_domain::SupervisorCurrentUserTarget::deserialize(
+                    args.get("target_ref").unwrap_or(&Value::Null),
+                )
+                .map_err(|_| {
+                    PermissionError::CheckFailed(
+                        "session_control observe_run requires a valid target_ref".into(),
+                    )
+                })?;
+                let supplied_id = args
+                    .get("target_session_id")
+                    .map(|_| required_string_arg(args, "target_session_id"))
+                    .transpose()?;
+                target
+                    .validate_root_run_target_id(supplied_id)
+                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                return Ok(None);
+            }
+            if matches!(action, "wait_run" | "cancel") {
                 let target = required_string_arg(args, "target_session_id")?;
                 bamboo_domain::validate_supervisor_target_id(target)
                     .map_err(|error| PermissionError::CheckFailed(error.into()))?;
-                if action == "observe_run" {
-                    return Ok(None);
-                }
                 let run = required_string_arg(args, "expected_run_id")?;
                 if !bamboo_domain::valid_session_run_id(run) {
                     return Err(PermissionError::CheckFailed(format!(
@@ -3082,13 +3098,42 @@ mod tests {
     }
 
     #[test]
-    fn supervised_exact_cancel_requires_its_own_target_permission() {
-        assert!(check_permissions(
-            "session_control",
-            &json!({"action":"observe_run", "target_session_id":"root-a"})
+    fn supervised_observe_run_requires_a_full_matching_root_reference() {
+        let session = bamboo_domain::Session::new("root-a", "model");
+        let target_ref = serde_json::to_value(
+            bamboo_domain::SupervisorCurrentUserTarget::capture(&session).unwrap(),
         )
-        .unwrap()
-        .is_none());
+        .unwrap();
+        for valid in [
+            json!({"action":"observe_run", "target_ref":target_ref}),
+            json!({"action":"observe_run", "target_ref":target_ref, "target_session_id":"root-a"}),
+        ] {
+            assert!(check_permissions("session_control", &valid)
+                .unwrap()
+                .is_none());
+        }
+
+        let mut child_ref = target_ref.clone();
+        child_ref["kind"] = json!("child");
+        let mut bad_id_ref = target_ref.clone();
+        bad_id_ref["session_id"] = json!("bad/target");
+        for invalid in [
+            json!({"action":"observe_run"}),
+            json!({"action":"observe_run", "target_session_id":"root-a"}),
+            json!({"action":"observe_run", "target_ref":null}),
+            json!({"action":"observe_run", "target_ref":{"session_id":"root-a"}}),
+            json!({"action":"observe_run", "target_ref":child_ref}),
+            json!({"action":"observe_run", "target_ref":bad_id_ref}),
+            json!({"action":"observe_run", "target_ref":target_ref, "target_session_id":"root-b"}),
+            json!({"action":"observe_run", "target_ref":target_ref, "target_session_id":null}),
+            json!({"action":"observe_run", "target_ref":target_ref, "target_session_id":123}),
+        ] {
+            assert!(check_permissions("session_control", &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn supervised_exact_cancel_requires_its_own_target_permission() {
         let wait = json!({"action":"wait_run", "target_session_id":"root-a",
             "expected_run_id":"private-run-id"});
         assert!(check_permissions("session_control", &wait)
@@ -3104,7 +3149,6 @@ mod tests {
         assert_eq!(contexts[0].resource, "session_control cancel root-a");
         assert!(!contexts[0].resource.contains("private-run-id"));
         for invalid in [
-            json!({"action":"observe_run"}),
             json!({"action":"wait_run", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a", "expected_run_id":"not a run"}),

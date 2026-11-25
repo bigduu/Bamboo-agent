@@ -83,6 +83,19 @@ impl SupervisorCurrentUserTarget {
     pub fn matches(&self, session: &Session) -> bool {
         Self::capture(session).is_ok_and(|current| current == *self)
     }
+
+    /// Resolve the copied Root Session ID. The Host still verifies the canonical lifetime.
+    pub fn validate_root_run_target_id(
+        &self,
+        supplied_session_id: Option<&str>,
+    ) -> Result<&str, &'static str> {
+        let target = supplied_session_id.unwrap_or(&self.session_id);
+        crate::validate_supervisor_target_id(target)?;
+        if self.session_id != target || self.kind != SessionKind::Root {
+            return Err("exact run control requires the observed ordinary Root target");
+        }
+        Ok(&self.session_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
