@@ -1666,16 +1666,18 @@ mod tests {
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
 
-        spawn_event_forwarder(
+        // Hold the runner lock so startup cannot publish before we queue the token.
+        let startup_guard = state.agent_runners.read().await;
+        let mut history_commit_barrier = spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
-            current_run_id(&state, session_id).await,
+            startup_guard[session_id].run_id.clone(),
             mpsc_rx,
             session_tx.clone(),
             None,
         );
 
-        // Send events with no subscriber.
+        // Queue the first token before any client subscribes.
         mpsc_tx
             .send(AgentEvent::Token {
                 content: "before-sub".into(),
@@ -1683,7 +1685,22 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The barrier follows the first token in the forwarder's event stream.
+        {
+            let published = history_commit_barrier.send_and_wait(&mpsc_tx, session_id.into());
+            tokio::pin!(published);
+            assert!(
+                futures::poll!(&mut published).is_pending(),
+                "publication must wait while forwarder startup is blocked"
+            );
+            drop(startup_guard);
+            assert!(
+                timeout(Duration::from_secs(10), published)
+                    .await
+                    .expect("the forwarder should publish before subscription"),
+                "the forwarder should acknowledge publication"
+            );
+        }
 
         // Now subscribe.
         let mut late_rx = session_tx.subscribe();
