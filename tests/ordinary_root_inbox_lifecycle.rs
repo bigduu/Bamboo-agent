@@ -4,6 +4,8 @@
 
 #[path = "support/ordinary_root_host.rs"]
 mod host_startup;
+#[path = "support/session_coordination_flow.rs"]
+mod session_coordination_flow;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;

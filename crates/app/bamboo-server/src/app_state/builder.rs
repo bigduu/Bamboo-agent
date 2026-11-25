@@ -729,6 +729,8 @@ impl AppState {
             tool_event_publisher.clone(),
             memory_store.clone(),
             session_messenger.clone(),
+            agent_runners.clone(),
+            session_activation_router.clone(),
             Some(root_creator.caller_port()),
             diagnostics.clone(),
             workflow_workspace_scope_guard.clone(),
