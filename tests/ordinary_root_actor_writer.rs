@@ -3,6 +3,9 @@
 //! are controlled. The fixture never creates an Actor claim for either Host.
 #![cfg(unix)]
 
+#[path = "support/root_probe_evidence.rs"]
+mod root_probe_evidence;
+
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::{storage::Storage, AgentEvent};
 use bamboo_domain::{
@@ -12,6 +15,7 @@ use bamboo_domain::{
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::Utc;
 use futures::StreamExt;
+use root_probe_evidence::{current_log_tail, observe_http, HttpEvidence, LOG_TAIL_BYTES};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -293,6 +297,25 @@ impl Host {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    fn initial_execute_evidence(&mut self, generation: &str) -> String {
+        let liveness = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited ({status})"),
+            Ok(None) => "running".into(),
+            Err(error) => format!("unavailable ({error})"),
+        };
+        // Each Host launch creates its own log file before spawning.
+        let tail = match current_log_tail(&self.log, 0) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("unavailable ({error})"),
+        };
+        format!(
+            "host_generation={generation} host_pid={} host_liveness={liveness} host_endpoint={} log={}\nCurrent-launch log tail (at most {LOG_TAIL_BYTES} bytes):\n{tail}",
+            self.child.id(),
+            self.base,
+            self.log.display(),
+        )
+    }
 }
 
 impl Drop for Host {
@@ -439,6 +462,79 @@ async fn expect_graceful_exit(host: &mut Host) {
     .unwrap_or_else(|_| panic!("managed Host is still running: {}", host.tail()));
 }
 
+async fn check_initial_execute_response(
+    response: Result<reqwest::Response, reqwest::Error>,
+    deadline: tokio::time::Instant,
+    host_evidence: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if response
+        .as_ref()
+        .is_ok_and(|response| response.error_for_status_ref().is_ok())
+    {
+        return Ok(());
+    }
+    let phase = if response.is_ok() {
+        "http_response"
+    } else {
+        "transport"
+    };
+    let host = host_evidence();
+    let mut evidence = HttpEvidence::default();
+    let deadline_elapsed = tokio::time::timeout_at(deadline, observe_http(response, &mut evidence))
+        .await
+        .is_err();
+    Err(format!(
+        "phase={phase} response_observation_deadline_elapsed={deadline_elapsed} {evidence}\n{host}"
+    ))
+}
+
+#[actix_web::test]
+async fn initial_execute_failure_records_bounded_503_evidence_without_retry() {
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = format!("controlled 503 {} beyond-evidence-limit", "x".repeat(2048));
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/api/v1/execute/control"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_raw(body, "text/plain")
+                .append_header("retry-after", "1")
+                .append_header("set-cookie", "fixture-private-header"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(WAIT)
+        .build()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let response = client
+        .post(format!("{}/api/v1/execute/control", server.uri()))
+        .json(&json!({}))
+        .send()
+        .await;
+    let failure =
+        check_initial_execute_response(response, deadline, || "owned-host-control".into())
+            .await
+            .unwrap_err();
+    for expected in [
+        "phase=http_response",
+        "status=503",
+        "retry-after=\"1\"",
+        "controlled 503",
+        "body_read=truncated at 1024 bytes",
+        "owned-host-control",
+    ] {
+        assert!(failure.contains(expected), "missing {expected}: {failure}");
+    }
+    assert!(!failure.contains("beyond-evidence-limit"));
+    assert!(!failure.contains("fixture-private-header"));
+    server.verify().await;
+}
+
 #[actix_web::test]
 async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successor() {
     let temp = tempfile::tempdir().unwrap();
@@ -528,14 +624,23 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
             .unwrap()
             .error_for_status()
             .unwrap();
-        client
+        let started = tokio::time::Instant::now();
+        let response = client
             .post(format!("{}/execute/{id}", old.base))
             .json(&json!({}))
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
+            .await;
+        let elapsed = started.elapsed();
+        check_initial_execute_response(response, started + WAIT, || {
+            old.initial_execute_evidence("managed-old")
+        })
+        .await
+        .unwrap_or_else(|evidence| {
+            panic!(
+                "initial Root execute failed: ordinal={} root={id} request_elapsed={elapsed:?} {evidence}",
+                roots.len() + 1
+            )
+        });
         roots.push(id.to_string());
     }
     tokio::time::timeout(WAIT, async {
