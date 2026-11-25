@@ -33,8 +33,8 @@ use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenBudget, Tok
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
-    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, PermissionMode,
-    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
+    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
@@ -754,10 +754,13 @@ pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
 pub(super) fn build_exec_session_continuation_context_block(
     session: &Session,
     tool_schemas: &[ToolSchema],
-    configured_mode: PermissionMode,
+    config: &AgentLoopConfig,
+    loading_mode: CapabilityLoadingMode,
 ) -> Option<ContextBlock> {
-    let flags =
-        ToolExecutionSessionFlags::from_session_and_configured_mode(session, configured_mode);
+    let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+        session,
+        config.permission_mode.unwrap_or_default(),
+    );
     let schemas = effective_tool_schemas(session, tool_schemas);
     if flags.plan_read_only
         || !session.allows_model_tool_execution("write_stdin")
@@ -771,15 +774,49 @@ pub(super) fn build_exec_session_continuation_context_block(
     if ids.is_empty() {
         return None;
     }
-    let guidance = if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
-        && schemas
-            .iter()
-            .any(|schema| schema.function.name == "SubAgent")
+    let mut guidance =
+        "Use write_stdin with an exact session_id below for interactive input, unread output, or a short wait for an exit status you still need. Reuse terminal evidence already returned for that session_id."
+            .to_owned();
+    if bamboo_domain::SessionCallerReference::from(session).is_ordinary_root()
+        && session.allows_model_tool_execution("SubAgent")
+        && !crate::runtime::loop_control::suspension::active(config)
+        && bamboo_agent_core::tools::suspension_allowed()
+        && schemas.iter().any(|schema| {
+            schema.function.name == "SubAgent"
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/intent/enum")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|intents| intents.iter().any(|intent| intent == "wait"))
+                && schema
+                    .function
+                    .parameters
+                    .pointer("/properties/target/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("string")
+        })
+        && (loading_mode != CapabilityLoadingMode::Progressive
+            || crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+                session,
+                &schemas,
+                loading_mode,
+            )
+            .contains_execution_name("SubAgent"))
     {
-        "If you still need a non-interactive command's exit status, use SubAgent with intent=wait and target set to its session_id. Use write_stdin for interactive input or unread output as needed."
-    } else {
-        "Use write_stdin with a session_id below when you need input, unread output, or exit status."
-    };
+        let wait_targets: Vec<_> = ids
+            .iter()
+            .filter(|id| {
+                bamboo_tools::tools::exec_command::exec_wait_target_is_ready(&session.id, id)
+            })
+            .collect();
+        if !wait_targets.is_empty() {
+            guidance = format!(
+                "{guidance} Advance independent work while commands run. When you need to wait for a non-interactive command to exit, use SubAgent with intent=wait and target set to its exact session_id from the exit-wait list.\nExit-wait session IDs: {}",
+                serde_json::to_string(&wait_targets).expect("shell session IDs are serializable"),
+            );
+        }
+    }
     Some(ContextBlock::new(
         ContextBlockType::RecoverySnapshot,
         ContextBlockPriority::Critical,
@@ -1343,8 +1380,9 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     }
     if let Some(block) = build_exec_session_continuation_context_block(
         session,
-        tool_schemas,
-        config.permission_mode.unwrap_or_default(),
+        wire_tool_schemas,
+        config,
+        loading_mode,
     ) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
