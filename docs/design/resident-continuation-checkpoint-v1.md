@@ -51,20 +51,29 @@ operation.
 
 | State proven under the existing owner guards | Commit and response |
 | --- | --- |
-| Exact current Run is busy, including a durable wait | Append one input through an exact staged or `QueueOnly` Inbox delivery. The active owner may consume it at its next permitted safe point. Return `queued` with the delivery receipt. Preserve the Run, tool pairs, Child and Bash waits, user and approval waits, and permission decisions. Never interrupt, resolve a wait or request a new activation from this receipt. |
+| Exact current Run is busy, including a durable wait | Append one continuation input with wait-respecting `QueueOnly` intent bound to that exact Run. Its current owner may consume it at the next permitted safe point. Return `queued` with the delivery receipt. Preserve the Run, tool pairs, Child and Bash waits, user and approval waits, and permission decisions. Never interrupt, resolve a wait or request an activation from this receipt. |
 | Proven idle, or terminal predecessor with all waits and effects reconciled | Stage or locate the exact receipt. Claim it with compare-and-swap under the existing launch and Actor ownership gates, binding it durably to one launch generation and Run attempt. Reload and recheck the exact predecessor, receipt, checkpoint, Project and permission authority after the claim and before scheduling. Return `activation_reserved` only for a committed binding. A competing claimant can read the same binding and cannot start a second Run. |
 | Restart, unresolved prior Run, unknown owner or partial publication | Retain the last confirmed checkpoint and the input. Return `pending_reconciliation` with a confirmed receipt when one is available. Recover the exact predecessor and inspect actual Inbox, checkpoint and activation state before considering a claim. Missing local Worker, lease expiry or stop ACK alone cannot prove that a Run terminated, a wait was released or its effects stopped. |
 
-The Inbox receipt is published with the immutable input and its exact intent.
-Use the normal wait-respecting consumption path for busy delivery. A busy
-receipt that survives its predecessor pending stays inert. A new explicit
-idle request may select that receipt after proving quiescence and passing the
-same ownership checks. It may claim only that exact unconsumed input. A
-committed idle claim can be recovered through the existing scheduler under the
-same live authority. A reservation whose owner is lost must be reconciled by
-the ordinary fenced recovery path before another attempt can consume anything.
-Checkpoint metadata, a backlog watermark and an Inbox ACK are insufficient to
-authorize a launch.
+The Inbox receipt is published with the immutable input and its original Run
+binding. Use the existing `SessionInboxActivationIntent::for_expected_run`
+semantics for an active consumer. The continuation delivery and its replay
+must identify this specific origin so that ending the Run leaves a pending
+input available for reconciliation. Ordinary `QueueOnly` excludes its input
+from wake scans but allows a later independently started Run to consume it.
+An unrelated `TriggerTurn` must leave a pending continuation untouched.
+
+A new explicit idle request may select the original receipt after proving
+quiescence and reconciling the old claim, durable consumption cursor and ACK.
+Under the same owner protections it commits one compare-and-swap from that
+exact unconsumed receipt to an exclusive successor claim. Keep the original
+input ID, receipt and intent. The claim alone supplies the successor's right
+to consume the one selected item, with no generic Inbox wake or staged-prefix
+release. Existing Inbox and activation boundaries own this future binding.
+The scheduler may recover a committed idle claim under the same live
+authority. Reconcile a lost reservation's exact attempt before any successor
+can consume its input. Checkpoint metadata, a backlog watermark and an Inbox
+ACK are insufficient to authorize a launch.
 
 ## Checkpoint publication
 
@@ -93,8 +102,10 @@ consumption. The existing Inbox claim, durable User/cursor write and ACK govern
 consumption in their established order. The checkpoint records which committed
 input it represents and never acknowledges a pending claim. An Inbox ACK does
 not establish provider execution or successful checkpoint save. The [owned
-input checkpoint](actor-owned-input-checkpoint-v1.md) is a storage-only input
-primitive today. Production consumer bindings require their own acceptance.
+input checkpoint](actor-owned-input-checkpoint-v1.md) started as a storage-only
+primitive. The current Actor adapter uses it to publish a durable User and
+cursor on supported input paths. A resident continuation needs its own
+authorization, checkpoint and end-to-end consumption acceptance.
 
 | Failure boundary | Required recovery |
 | --- | --- |
@@ -131,7 +142,7 @@ counter. Check saved receipts and Run attempts as well as the tool response.
 | --- | --- |
 | Busy ordinary Run, then Child, Bash, user and approval waits | Hold the actual original Worker. Use a matched control with no continuation to observe its normal in-flight behavior. Replay the queued request and observe one exact Inbox receipt. The same physical Worker and Run continue, existing tool call/result pairs and waits survive, and no stop, wait release or second primary request occurs. The legitimate coordinator releases its own wait. |
 | Idle and terminal, with concurrent claims | Run two Host contenders against one Store and receipt. Race a competing activation and a changed Source/Project/permission at the claim boundary. Assert one committed binding and one primary request for the winner, conflict or replay for the loser, and zero launches under stale authority. |
-| Restart around Inbox/claim/ACK | Cold-reopen after each real publication cut. Preserve unconsumed input when the old owner is uncertain. Confirm an exact committed terminal witness before idle claim. Replay after a lost reply or ACK and inspect one transcript input, one binding and no extra primary execution. |
+| Restart around Inbox/claim/ACK | Cold-reopen after each real publication cut. Preserve unconsumed input when the old owner is uncertain. After proving its terminal state, send an unrelated `TriggerTurn` and confirm that its Run leaves the original receipt pending. Require a fresh explicit claim for that receipt. Replay after a lost reply or ACK and inspect one transcript input, one binding and no extra primary execution. |
 | Checkpoint replacement and cancellation | Pause the actual Store before replace, after replace and before readback. Fail or cancel the caller at each cut, reopen storage, and verify the previous or exact committed revision. Replay delayed A after B claims or saves, after a reset and after source or permission drift. Require no stale write, wake or changed permission. |
 | Unsupported authority and input | Exercise foreign or recreated Sessions, wrong Project, missing revision, changed replay, forged refs, overflow and unknown versions. Assert zero new receipts, checkpoint writes or provider invocations. |
 
