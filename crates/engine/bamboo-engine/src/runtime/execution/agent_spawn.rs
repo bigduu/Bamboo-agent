@@ -13,10 +13,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Session, TokenUsage};
+use bamboo_agent_core::{AgentError, AgentEvent, MessagePhase, Role, Session, TokenUsage};
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
+use crate::app_context::AgentSessionContext;
 use crate::runtime::config::{
     AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, DisabledFilterResolver, GoldConfig,
     GuardianConfig, GuardianSpawner, ImageFallbackConfig, RunDeadline,
@@ -1374,6 +1375,17 @@ pub fn spawn_session_execution_with_upstream_retry(
     inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     upstream_retry: bamboo_llm::retry::UpstreamRetry,
 ) {
+    spawn_session_execution_with_title_generation(args, inputs, upstream_retry, None);
+}
+
+/// Allow an interactive host to ask for a pending title to be reconsidered
+/// once a new assistant answer is durable.
+pub fn spawn_session_execution_with_title_generation(
+    args: SessionExecutionArgs,
+    inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    title_context: Option<Arc<dyn AgentSessionContext>>,
+) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
     let is_root = args.session.kind == bamboo_domain::SessionKind::Root;
@@ -2091,7 +2103,33 @@ pub fn spawn_session_execution_with_upstream_retry(
             let child_status = session.last_run_status();
             let child_error = session.last_run_error();
 
+            // Inspect the reconciled transcript after the terminal save. Publish
+            // the final cache before title metadata can update that cache again.
+            let title_context = title_context.filter(|_| {
+                history_committed
+                    && result.is_ok()
+                    && !suspended_non_terminal
+                    && is_root
+                    && !managed_root
+                    && session.authority_identity.is_ordinary()
+                    && !session.title_generated
+                    && session
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == Role::Assistant)
+                        .is_some_and(|message| {
+                            !prior_message_ids.contains(&message.id)
+                                && message.phase == Some(MessagePhase::FinalAnswer)
+                                && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+                                && !message.compressed
+                                && !message.content.trim().is_empty()
+                        })
+            });
             publish_final_session_cache(&sessions_cache, session, root_actor_bound, &saved);
+            if let Some(context) = title_context {
+                crate::title_gen::spawn_title_generation(context, session_id.clone());
+            }
 
             if let (Some(handler), Some(parent_session_id), Some(status)) =
                 (child_completion, parent_session_id, child_status)

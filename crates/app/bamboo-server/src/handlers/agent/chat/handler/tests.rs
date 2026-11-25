@@ -1959,7 +1959,7 @@ mod optional_model_e2e {
         }
     }
 
-    async fn title_test_state(provider: Arc<BlockingTitleProvider>) -> web::Data<AppState> {
+    async fn title_test_state(provider: Arc<dyn LLMProvider>) -> web::Data<AppState> {
         let data_dir = tempdir().expect("tempdir").keep();
         crate::app_state::supervisor_owner_authorization::test_support::write_work_disabled_profile(
             &data_dir,
@@ -1973,12 +1973,11 @@ mod optional_model_e2e {
             ..Default::default()
         });
 
-        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-        let mut app_state = AppState::new_with_provider(data_dir, config, provider_trait)
+        let mut app_state = AppState::new_with_provider(data_dir, config, provider.clone())
             .await
             .expect("app state");
         let mut providers = HashMap::new();
-        providers.insert("openai".to_string(), provider as Arc<dyn LLMProvider>);
+        providers.insert("openai".to_string(), provider);
         app_state.provider_registry =
             Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
         app_state.provider_router = Arc::new(ProviderModelRouter::new(
@@ -2229,6 +2228,147 @@ mod optional_model_e2e {
             .is_err(),
             "deduplicated title work must not emit a second metadata event"
         );
+    }
+
+    const TITLE_REPLY: &str = "这个链接描述了 Bamboo 会话收件箱在重连时回放旧游标的竞态。";
+
+    struct DeferredTitleProvider {
+        title_requests: tokio::sync::mpsc::UnboundedSender<bool>,
+        allow_reply: Semaphore,
+        allow_deferred_outcome: Semaphore,
+    }
+
+    #[async_trait]
+    impl LLMProvider for DeferredTitleProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            tools: &[bamboo_agent_core::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
+                .await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let output = if options.and_then(|options| options.request_purpose.as_deref())
+                == Some("title_generation")
+            {
+                assert_eq!(model, "title-model");
+                let includes_reply = messages
+                    .iter()
+                    .any(|message| message.content.contains(TITLE_REPLY));
+                self.title_requests.send(includes_reply).unwrap();
+                if includes_reply {
+                    "会话收件箱游标回放"
+                } else {
+                    self.allow_deferred_outcome
+                        .acquire()
+                        .await
+                        .unwrap()
+                        .forget();
+                    "INSUFFICIENT_CONTEXT"
+                }
+            } else {
+                let _allow_reply = self.allow_reply.acquire().await.unwrap();
+                TITLE_REPLY
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token(output.into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[actix_web::test]
+    async fn native_title_reconsiders_an_ambiguous_link_after_a_durable_assistant_answer() {
+        let id = "chat-title-from-durable-reply";
+        let (title_requests, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let provider = Arc::new(DeferredTitleProvider {
+            title_requests,
+            allow_reply: Semaphore::new(0),
+            allow_deferred_outcome: Semaphore::new(0),
+        });
+        let state = title_test_state(provider.clone()).await;
+        let mut session = Session::new(id, "chat-model");
+        state.save_and_cache_session(&mut session).await;
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let chat = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": id,
+                    "message": "https://example.test/issues/37 我想了解这里的背景",
+                    "model": "chat-model",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::CREATED);
+        let execute = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model": "chat-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            assert_eq!(requests.recv().await, Some(false));
+            provider.allow_reply.add_permits(1);
+
+            loop {
+                let event = events.recv().await.unwrap();
+                assert!(!matches!(event, AgentEvent::SessionTitleUpdated { .. }));
+                if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                    break;
+                }
+            }
+            let pending = state.storage.load_session(id).await.unwrap().unwrap();
+            assert!(pending
+                .messages
+                .iter()
+                .any(|message| message.content == TITLE_REPLY));
+            assert_eq!(pending.title_version, 0);
+            assert!(!pending.title_generated);
+
+            provider.allow_deferred_outcome.add_permits(1);
+            assert_eq!(requests.recv().await, Some(true));
+            loop {
+                if let AgentEvent::SessionTitleUpdated {
+                    title,
+                    title_version,
+                    source,
+                    ..
+                } = events.recv().await.unwrap()
+                {
+                    assert_eq!(title, "会话收件箱游标回放");
+                    assert_eq!(title_version, 1);
+                    assert_eq!(source, bamboo_agent_core::TitleSource::Auto);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a committed visible answer prompts a fresh attempt at the pending title");
     }
 
     /// #480: omitting `model` on `POST /chat` falls back to the server's
