@@ -32,6 +32,7 @@ use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
+use crate::schedule_form::ScheduleForm;
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
@@ -3835,27 +3836,6 @@ impl ActiveQuestion {
             mouse_pressed_option: None,
             submitting: false,
             identity_syncing: !queued.authoritative,
-        }
-    }
-}
-
-/// In-progress "new schedule" form (opened with `n` on the Schedules tab).
-#[derive(Default)]
-pub struct ScheduleForm {
-    pub name: String,
-    pub cron: String,
-    pub prompt: String,
-    /// Focused field: 0 = name, 1 = cron, 2 = prompt.
-    pub field: usize,
-    pub error: Option<String>,
-}
-
-impl ScheduleForm {
-    fn current_mut(&mut self) -> &mut String {
-        match self.field {
-            0 => &mut self.name,
-            1 => &mut self.cron,
-            _ => &mut self.prompt,
         }
     }
 }
@@ -14499,38 +14479,35 @@ impl App {
                 self.schedule_form = None;
             }
             Some(ActionId::NextField) => {
-                form.field = (form.field + 1) % 3;
+                form.move_focus(1);
             }
             Some(ActionId::PreviousField) => {
-                form.field = (form.field + 2) % 3;
+                form.move_focus(-1);
+            }
+            Some(ActionId::NextTrigger) => {
+                form.change_trigger(1);
+            }
+            Some(ActionId::PreviousTrigger) => {
+                form.change_trigger(-1);
             }
             Some(ActionId::Backspace) => {
-                form.error = None;
-                form.current_mut().pop();
+                if let Some(value) = form.current_mut() {
+                    value.pop();
+                    form.error = None;
+                }
             }
             Some(ActionId::Activate) => {
-                if form.name.trim().is_empty()
-                    || form.cron.trim().is_empty()
-                    || form.prompt.trim().is_empty()
-                {
-                    form.error = Some("Fill in name, cron, and prompt".to_string());
-                    return;
-                }
-                let req = CreateScheduleRequest {
-                    name: form.name.trim().to_string(),
-                    trigger: ScheduleTriggerReq::Cron {
-                        expr: form.cron.trim().to_string(),
-                    },
-                    enabled: true,
-                    run_config: ScheduleRunConfigReq {
-                        project_id: self
-                            .sessions
-                            .sessions
-                            .get(self.sessions.selected)
-                            .and_then(|session| session.project_id.clone()),
-                        task_message: Some(form.prompt.trim().to_string()),
-                        auto_execute: true,
-                    },
+                let project_id = self
+                    .sessions
+                    .sessions
+                    .get(self.sessions.selected)
+                    .and_then(|session| session.project_id.clone());
+                let req = match form.request(project_id, Utc::now()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        form.error = Some(error.to_string());
+                        return;
+                    }
                 };
                 self.schedule_form = None;
                 if let Some(tx) = self.event_tx.clone() {
@@ -14549,9 +14526,9 @@ impl App {
                 }
             }
             _ => {
-                if let Some(character) = text_character(key) {
+                if let (Some(character), Some(value)) = (text_character(key), form.current_mut()) {
+                    value.push(character);
                     form.error = None;
-                    form.current_mut().push(character);
                 }
             }
         }
@@ -21965,10 +21942,11 @@ mod question_tests {
         let mut schedule = App::new(BambooClient::new("http://127.0.0.1:0"));
         schedule.schedule_form = Some(ScheduleForm {
             name: "nightly-计划".to_string(),
-            cron: "0 0 * * *".to_string(),
+            timing: "0 0 * * *".to_string(),
             prompt: format!("{}TAIL_🧭e\u{301}", "x".repeat(80)),
-            field: 2,
+            field: 3,
             error: Some("Prompt cannot be empty".to_string()),
+            ..Default::default()
         });
         actual.push(minimum_modal_fingerprint(&schedule));
 
@@ -22040,14 +22018,14 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    12_360_418_717_810_675_712
+                    6_029_952_580_155_610_216
                 } else {
-                    1_603_011_432_197_960_348
+                    10_143_752_667_832_826_917
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
-                13_337_898_881_162_529_494,
+                15_361_603_810_980_377_359,
                 14_839_815_545_818_862_244,
                 14_001_204_281_749_812_417,
                 3_082_197_214_727_898_618,
@@ -23338,6 +23316,7 @@ mod question_tests {
 
     #[test]
     fn schedule_form_cycles_and_validates() {
+        use crate::schedule_form::ScheduleTriggerKind;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         fn k(c: KeyCode) -> KeyEvent {
             KeyEvent::new(c, KeyModifiers::empty())
@@ -23346,12 +23325,29 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.schedule_form = Some(ScheduleForm::default());
 
-        // Type into the name field, then Tab to cron.
+        // Type into the name field, then Tab to the trigger selector.
         app.handle_schedule_form_key(k(KeyCode::Char('h')));
         app.handle_schedule_form_key(k(KeyCode::Char('i')));
         assert_eq!(app.schedule_form.as_ref().unwrap().name, "hi");
         app.handle_schedule_form_key(k(KeyCode::Tab));
         assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
+        for expected in [
+            ScheduleTriggerKind::Once,
+            ScheduleTriggerKind::Interval,
+            ScheduleTriggerKind::Daily,
+            ScheduleTriggerKind::Weekly,
+            ScheduleTriggerKind::Monthly,
+            ScheduleTriggerKind::Cron,
+        ] {
+            app.handle_schedule_form_key(k(KeyCode::Right));
+            assert_eq!(app.schedule_form.as_ref().unwrap().trigger, expected);
+        }
+        app.handle_schedule_form_key(k(KeyCode::Left));
+        assert_eq!(
+            app.schedule_form.as_ref().unwrap().trigger,
+            ScheduleTriggerKind::Monthly
+        );
+        assert_eq!(app.schedule_form.as_ref().unwrap().name, "hi");
 
         // Enter with empty cron/prompt does NOT submit (form stays open).
         app.handle_schedule_form_key(k(KeyCode::Enter));
@@ -23387,6 +23383,70 @@ mod question_tests {
         app.handle_key(k(KeyCode::Tab)).await.unwrap();
         assert_eq!(app.tab, Tab::Schedules, "Tab must not switch tabs");
         assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
+    }
+
+    #[tokio::test]
+    async fn schedule_form_posts_weekly_schedule_from_keyboard_input() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut socket).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("POST /api/v1/schedules HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({
+                    "name": "Study",
+                    "trigger": {
+                        "type": "weekly", "weekdays": ["mon", "fri"],
+                        "hour": 8, "minute": 30, "second": 0,
+                    },
+                    "timezone": "UTC",
+                    "enabled": true,
+                    "run_config": {"task_message": "Check the log", "auto_execute": true},
+                })
+            );
+            respond_test_http(&mut socket, "application/json", "{}").await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        for character in "Study".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Right)).await.unwrap();
+        }
+        for input in ["08:30", "Mon,Fri", "Check the log"] {
+            app.handle_key(key(KeyCode::Tab)).await.unwrap();
+            for character in input.chars() {
+                app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+            }
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::ActionDone {
+                outcome: Ok(_),
+                reload_tab: true,
+                ..
+            }
+        ));
+        assert!(app.schedule_form.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -23476,10 +23536,11 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.schedule_form = Some(ScheduleForm {
             name: "name".to_string(),
-            cron: "* * * * *".to_string(),
+            timing: "* * * * *".to_string(),
             prompt: format!("{}PROMPT_TAIL_🧭e\u{301}", "x".repeat(120)),
-            field: 2,
+            field: 3,
             error: Some("Cron is required".to_string()),
+            ..Default::default()
         });
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal
