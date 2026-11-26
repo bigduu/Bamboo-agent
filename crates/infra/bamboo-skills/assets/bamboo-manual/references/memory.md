@@ -32,8 +32,14 @@ credentials out of memory.
 
 Automatic prompt fields `memory.project_prompt_injection`, `memory.relevant_recall`,
 `memory.relevant_recall_rerank` and `memory.project_first_dream` are deprecated.
-Bamboo ignores them and their legacy environment variables. Prospective ledger
-records use the separate `memory.ledger_agenda_injection` control.
+Bamboo ignores them and their legacy environment variables.
+
+When the task needs upcoming events, reminders, or due commitments, call
+`ledger` with `{"action":"agenda"}`. If the tool is deferred, look up `ledger`
+with tool discovery. For the fallback discovery tool, call
+`discover_capabilities` by itself with `{"query":"ledger","limit":1}`, then call
+`ledger` in a later round. Set `memory.ledger_agenda_injection` to `true` to
+include the agenda automatically.
 
 ## Dream and observations
 

@@ -288,11 +288,11 @@ async fn round_context_clears_when_ledger_is_disabled_or_empty() {
     let temp = tempfile::tempdir().expect("temp dir");
     let ledger = LedgerStore::new(temp.path());
     let mut session = Session::new("ledger-context", "test-model");
-    let mut flags = PromptMemoryFlags {
-        ledger_agenda: true,
+    let enabled = PromptMemoryFlags::from(&bamboo_config::MemoryConfig {
+        ledger_agenda_injection: true,
         ..Default::default()
-    };
-    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
+    });
+    super::refresh_external_memory_context(&mut session, enabled, None, Some(temp.path())).await;
     assert!(super::render_external_memory_section(&session).is_none());
 
     ledger
@@ -302,11 +302,16 @@ async fn round_context_clears_when_ledger_is_disabled_or_empty() {
         )
         .await
         .expect("save agenda item");
-    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
+    let default_flags = PromptMemoryFlags::default();
+    super::refresh_external_memory_context(&mut session, default_flags, None, Some(temp.path()))
+        .await;
+    assert!(super::render_external_memory_section(&session).is_none());
+
+    super::refresh_external_memory_context(&mut session, enabled, None, Some(temp.path())).await;
     let context = super::render_external_memory_section(&session).expect("agenda");
     assert!(context.contains("[OPEN] `rec_open`"));
 
-    flags.ledger_agenda = false;
-    super::refresh_external_memory_context(&mut session, flags, None, Some(temp.path())).await;
+    super::refresh_external_memory_context(&mut session, default_flags, None, Some(temp.path()))
+        .await;
     assert!(super::render_external_memory_section(&session).is_none());
 }

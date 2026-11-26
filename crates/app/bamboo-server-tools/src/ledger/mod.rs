@@ -885,9 +885,10 @@ impl Tool for LedgerTool {
     }
 
     fn description(&self) -> &str {
-        "Personal ledger of prospective records: todos, events, reminders, habits. \
-         Use this — not the session Task list — whenever the user states a commitment, \
-         deadline, appointment, or recurring routine, so it survives across sessions. \
+        "Personal ledger for todos, events, reminders, and habits. Use the read-only \
+         agenda action when the task needs today's agenda, upcoming events, or due commitments. \
+         Use this tool to record a user's commitment, deadline, appointment, or recurring \
+         routine so it survives across sessions. \
          Actions: upsert (create/update a record; due_at/starts_at/remind_at accept \
          RFC3339 or YYYY-MM-DD; remind_at/recurrence become real fired reminders), \
          transition (done/cancel/block/reopen), get, query (by status/kind/time window), \
