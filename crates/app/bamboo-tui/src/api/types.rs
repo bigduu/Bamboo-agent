@@ -7,7 +7,7 @@
 //! crate still warns, since the blanket crate-level allow was removed.
 #![allow(dead_code)]
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 fn default_allow_custom() -> bool {
@@ -829,6 +829,7 @@ pub struct Schedule {
     pub id: String,
     pub name: Option<String>,
     pub cron: Option<String>,
+    pub cadence_detail: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
@@ -839,6 +840,7 @@ impl Schedule {
     pub fn from_view(v: ScheduleView) -> Self {
         Self {
             cron: Some(trigger_display(&v.trigger)),
+            cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
             name: Some(v.name),
             enabled: Some(v.enabled),
             prompt: v.run_config.task_message,
@@ -861,6 +863,127 @@ fn trigger_display(trigger: &serde_json::Value) -> String {
         Some(kind) => kind.to_string(),
         None => "-".to_string(),
     }
+}
+
+fn trigger_cadence(trigger: serde_json::Value, timezone: Option<&str>) -> String {
+    let unavailable = match trigger.get("type").and_then(|tag| tag.as_str()) {
+        Some("once") => "Once cadence unavailable",
+        Some("interval") => "Interval cadence unavailable",
+        Some("daily") => "Daily cadence unavailable",
+        Some("weekly") => "Weekly cadence unavailable",
+        Some("monthly") => "Monthly cadence unavailable",
+        Some("cron") => "Cron cadence unavailable",
+        Some(_) => "Unknown trigger",
+        None => "Cadence unavailable",
+    };
+    serde_json::from_value(trigger)
+        .ok()
+        .and_then(|trigger| known_trigger_cadence(trigger, timezone))
+        .unwrap_or_else(|| unavailable.to_owned())
+}
+
+fn known_trigger_cadence(trigger: ScheduleTriggerReq, timezone: Option<&str>) -> Option<String> {
+    // Calendar and Cron triggers use the saved zone or the scheduler's UTC
+    // default. Once and Interval already describe absolute instants/durations.
+    let zone = || match timezone {
+        Some(zone) => {
+            bounded_cadence_text(zone, 48).unwrap_or_else(|| "Timezone unavailable".into())
+        }
+        None => "UTC".into(),
+    };
+    Some(match trigger {
+        ScheduleTriggerReq::Once { at } => {
+            format!("Once {}", at.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+        }
+        ScheduleTriggerReq::Interval { every_seconds: 1 } => "Every 1 second".into(),
+        ScheduleTriggerReq::Interval { every_seconds } if every_seconds > 0 => {
+            format!("Every {every_seconds} seconds")
+        }
+        ScheduleTriggerReq::Daily {
+            hour,
+            minute,
+            second,
+        } => {
+            format!("Daily {} {}", cadence_time(hour, minute, second)?, zone())
+        }
+        ScheduleTriggerReq::Weekly {
+            mut weekdays,
+            hour,
+            minute,
+            second,
+        } if !weekdays.is_empty() => {
+            weekdays.sort_unstable();
+            weekdays.dedup();
+            let days = weekdays
+                .iter()
+                .map(ScheduleWeekdayReq::short_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Weekly {days} at {} {}",
+                cadence_time(hour, minute, second)?,
+                zone()
+            )
+        }
+        ScheduleTriggerReq::Monthly {
+            mut days,
+            hour,
+            minute,
+            second,
+        } if !days.is_empty() && days.iter().all(|day| (1..=31).contains(day)) => {
+            days.sort_unstable();
+            days.dedup();
+            let days = month_day_choices(&days);
+            format!(
+                "Monthly {days} at {} {}",
+                cadence_time(hour, minute, second)?,
+                zone()
+            )
+        }
+        ScheduleTriggerReq::Cron { expr } => {
+            format!("Cron {} {}", bounded_cadence_text(&expr, 96)?, zone())
+        }
+        _ => return None,
+    })
+}
+
+fn cadence_time(hour: u8, minute: u8, second: u8) -> Option<String> {
+    let time = NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())?;
+    let format = if second == 0 { "%H:%M" } else { "%H:%M:%S" };
+    Some(time.format(format).to_string())
+}
+
+fn month_day_choices(days: &[u8]) -> String {
+    let mut days = days.iter().copied().peekable();
+    let mut choices = Vec::new();
+    while let Some(first) = days.next() {
+        let mut last = first;
+        while let Some(day) = days.next_if(|day| *day == last + 1) {
+            last = day;
+        }
+        choices.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}–{last}")
+        });
+    }
+    choices.join(", ")
+}
+
+fn bounded_cadence_text(value: &str, limit: usize) -> Option<String> {
+    let mut chars = value
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+        .filter(|ch| !ch.is_control());
+    let mut text: String = chars.by_ref().take(limit).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    if chars.next().is_some() {
+        text.push('…');
+    }
+    Some(text)
 }
 
 /// Wire shape of `GET /api/v1/schedules` — the server wraps the list in a
@@ -902,6 +1025,8 @@ pub struct ScheduleView {
     #[serde(default)]
     pub trigger: serde_json::Value,
     #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
     pub state: ScheduleStateView,
     #[serde(default)]
     pub run_config: ScheduleRunConfigView,
@@ -936,8 +1061,10 @@ pub struct CreateScheduleRequest {
     pub run_config: ScheduleRunConfigReq,
 }
 
-/// Serialize-side mirror of the server's internally tagged `ScheduleTrigger`.
-#[derive(Debug, Serialize)]
+/// Known shapes of the server's internally tagged `ScheduleTrigger`.
+/// Cadence projection decodes each trigger separately so future variants
+/// remain readable in the schedule list.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleTriggerReq {
     Cron {
@@ -952,23 +1079,26 @@ pub enum ScheduleTriggerReq {
     Daily {
         hour: u8,
         minute: u8,
+        #[serde(default)]
         second: u8,
     },
     Weekly {
         weekdays: Vec<ScheduleWeekdayReq>,
         hour: u8,
         minute: u8,
+        #[serde(default)]
         second: u8,
     },
     Monthly {
         days: Vec<u8>,
         hour: u8,
         minute: u8,
+        #[serde(default)]
         second: u8,
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleWeekdayReq {
     Mon,
@@ -978,6 +1108,20 @@ pub enum ScheduleWeekdayReq {
     Fri,
     Sat,
     Sun,
+}
+
+impl ScheduleWeekdayReq {
+    fn short_name(&self) -> &'static str {
+        match self {
+            Self::Mon => "Mon",
+            Self::Tue => "Tue",
+            Self::Wed => "Wed",
+            Self::Thu => "Thu",
+            Self::Fri => "Fri",
+            Self::Sat => "Sat",
+            Self::Sun => "Sun",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1137,6 +1281,58 @@ pub struct SkillDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cadence_projection_keeps_calendar_choices_readable_and_bounded() {
+        assert_eq!(
+            trigger_cadence(
+                serde_json::json!({
+                    "type": "weekly", "weekdays": ["fri", "mon", "fri"],
+                    "hour": 8, "minute": 30, "second": 5
+                }),
+                Some("Europe/Paris"),
+            ),
+            "Weekly Mon, Fri at 08:30:05 Europe/Paris"
+        );
+        assert_eq!(
+            trigger_cadence(
+                serde_json::json!({"type": "monthly", "days": [1, 32], "hour": 8, "minute": 30}),
+                None,
+            ),
+            "Monthly cadence unavailable"
+        );
+        let daily = serde_json::json!({"type": "daily", "hour": 8, "minute": 30});
+        assert_eq!(
+            trigger_cadence(daily, Some("  ")),
+            "Daily 08:30 Timezone unavailable"
+        );
+        let expr = format!("0\t30 8 * * * {}", "1".repeat(120));
+        let cron = trigger_cadence(serde_json::json!({"type": "cron", "expr": expr}), None);
+        assert!(cron.starts_with("Cron 0 30 8 * * * "));
+        assert!(cron.ends_with("… UTC"));
+        assert_eq!(cron.chars().count(), 106);
+    }
+
+    #[test]
+    fn monthly_cadence_keeps_all_days_and_the_saved_timezone_readable() {
+        let days: Vec<u8> = (1..=31).collect();
+        let timezone = Some("America/Argentina/ComodRivadavia");
+        for (days, expected) in [
+            (
+                days,
+                "Monthly 1–31 at 08:30:05 America/Argentina/ComodRivadavia",
+            ),
+            (
+                vec![1, 2, 15, 31],
+                "Monthly 1–2, 15, 31 at 08:30:05 America/Argentina/ComodRivadavia",
+            ),
+        ] {
+            let trigger = serde_json::json!({
+                "type": "monthly", "days": days, "hour": 8, "minute": 30, "second": 5
+            });
+            assert_eq!(trigger_cadence(trigger, timezone), expected);
+        }
+    }
 
     /// Fixture mirroring the real `ListSessionsResponse` shape (#421), including
     /// fields the TUI doesn't model (`kind`, `placement`, …) — those must be
