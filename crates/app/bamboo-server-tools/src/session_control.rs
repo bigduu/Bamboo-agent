@@ -662,6 +662,9 @@ impl Tool for SessionControlTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        // Some providers require property subschemas to be objects. This rejects
+        // every value for an action-specific field, just like a false schema.
+        let forbidden_property = json!({"not": {}});
         let mut schema = json!({
             "type": "object", "additionalProperties": false,
             "properties": {
@@ -684,18 +687,18 @@ impl Tool for SessionControlTool {
                 {
                     "properties": {
                         "action": {"const": "followup"},
-                        "command": false,
-                        "expected_link_revision": false,
-                        "receipt_operation_id": false
+                        "command": forbidden_property,
+                        "expected_link_revision": forbidden_property,
+                        "receipt_operation_id": forbidden_property
                     },
                     "required": ["target_session_id", "operation_id", "message", "target_ref"]
                 },
                 {
                     "properties": {
                         "action": {"const": "loop"},
-                        "operation_id": false,
-                        "target_ref": false,
-                        "message": false
+                        "operation_id": forbidden_property,
+                        "target_ref": forbidden_property,
+                        "message": forbidden_property
                     },
                     "required": ["target_session_id", "command"],
                     "oneOf": [
@@ -730,10 +733,10 @@ impl Tool for SessionControlTool {
             schema["required"] = json!(["action"]);
             let variants = schema["oneOf"].as_array_mut().unwrap();
             for variant in variants.iter_mut() {
-                variant["properties"]["request"] = Value::Bool(false);
-                variant["properties"]["query"] = Value::Bool(false);
-                variant["properties"]["limit"] = Value::Bool(false);
-                variant["properties"]["cursor"] = Value::Bool(false);
+                variant["properties"]["request"] = forbidden_property.clone();
+                variant["properties"]["query"] = forbidden_property.clone();
+                variant["properties"]["limit"] = forbidden_property.clone();
+                variant["properties"]["cursor"] = forbidden_property.clone();
             }
             let forbidden = [
                 "target_session_id",
@@ -747,12 +750,13 @@ impl Tool for SessionControlTool {
                 "limit",
                 "cursor",
             ];
-            let mut scope = json!({"properties":{"action":{"const":"scope"},"request":false}});
+            let mut scope =
+                json!({"properties":{"action":{"const":"scope"},"request": forbidden_property}});
             let mut create =
                 json!({"properties":{"action":{"const":"create"}},"required":["request"]});
             for field in forbidden {
-                scope["properties"][field] = Value::Bool(false);
-                create["properties"][field] = Value::Bool(false);
+                scope["properties"][field] = forbidden_property.clone();
+                create["properties"][field] = forbidden_property.clone();
             }
             variants.push(scope);
             variants.push(create);
@@ -767,7 +771,7 @@ impl Tool for SessionControlTool {
             // Installing directory alone must stay independently usable: the
             // top-level requirement narrows to `action` (the followup/loop
             // variants keep their own target requirements). Without this, the
-            // directory variant's target_session_id:false makes every
+            // directory variant excludes target_session_id, making every
             // directory request invalid against the advertised schema.
             let required = schema["required"].as_array_mut().unwrap();
             required.retain(|field| field == "action");
@@ -780,22 +784,22 @@ impl Tool for SessionControlTool {
             let variants = schema["oneOf"].as_array_mut().unwrap();
             for variant in variants.iter_mut() {
                 if variant["properties"].get("query").is_none() {
-                    variant["properties"]["query"] = Value::Bool(false);
+                    variant["properties"]["query"] = forbidden_property.clone();
                 }
                 if variant["properties"].get("limit").is_none() {
-                    variant["properties"]["limit"] = Value::Bool(false);
+                    variant["properties"]["limit"] = forbidden_property.clone();
                 }
                 if variant["properties"].get("cursor").is_none() {
-                    variant["properties"]["cursor"] = Value::Bool(false);
+                    variant["properties"]["cursor"] = forbidden_property.clone();
                 }
             }
             variants.push(json!({
                 "properties": {
                     "action": {"const": "directory"},
-                    "target_session_id": false, "operation_id": false, "message": false,
-                    "expected_link_revision": false, "command": false,
-                    "receipt_operation_id": false, "request": false,
-                    "expected_run_id": false,
+                    "target_session_id": forbidden_property, "operation_id": forbidden_property, "message": forbidden_property,
+                    "expected_link_revision": forbidden_property, "command": forbidden_property,
+                    "receipt_operation_id": forbidden_property, "request": forbidden_property,
+                    "expected_run_id": forbidden_property,
                     // Declare ownership explicitly (same shape as the
                     // top-level definitions) so later install-time loops that
                     // forbid these keys elsewhere never strip them here.
@@ -862,20 +866,20 @@ impl Tool for SessionControlTool {
             });
             let variants = schema["oneOf"].as_array_mut().expect("action variants");
             for variant in variants.iter_mut() {
-                variant["properties"]["expected_run_id"] = Value::Bool(false);
+                variant["properties"]["expected_run_id"] = forbidden_property.clone();
                 // The directory variant OWNS query/limit/cursor (declared when
                 // its port was installed); only forbid them where they were
                 // not already declared. Forbidding them here would break
                 // filtered/continued directory requests for schema-following
-                // clients (e.g. the Anthropic adapter, which preserves oneOf).
+                // clients.
                 if variant["properties"].get("query").is_none() {
-                    variant["properties"]["query"] = Value::Bool(false);
+                    variant["properties"]["query"] = forbidden_property.clone();
                 }
                 if variant["properties"].get("limit").is_none() {
-                    variant["properties"]["limit"] = Value::Bool(false);
+                    variant["properties"]["limit"] = forbidden_property.clone();
                 }
                 if variant["properties"].get("cursor").is_none() {
-                    variant["properties"]["cursor"] = Value::Bool(false);
+                    variant["properties"]["cursor"] = forbidden_property.clone();
                 }
             }
             let forbidden = [
@@ -887,7 +891,7 @@ impl Tool for SessionControlTool {
                 "request",
             ];
             let mut observe = json!({
-                "properties":{"action":{"const":"observe_run"}, "expected_run_id":false},
+                "properties":{"action":{"const":"observe_run"}, "expected_run_id": forbidden_property},
                 "required":["target_ref"]
             });
             let mut wait = json!({
@@ -899,15 +903,15 @@ impl Tool for SessionControlTool {
                 "required":["target_session_id", "target_ref", "expected_run_id"]
             });
             for field in forbidden {
-                observe["properties"][field] = Value::Bool(false);
-                wait["properties"][field] = Value::Bool(false);
-                cancel["properties"][field] = Value::Bool(false);
+                observe["properties"][field] = forbidden_property.clone();
+                wait["properties"][field] = forbidden_property.clone();
+                cancel["properties"][field] = forbidden_property.clone();
             }
             variants.push(observe);
             variants.push(wait);
             variants.push(cancel);
             for variant in variants.iter_mut() {
-                variant["properties"]["outcome_targets"] = Value::Bool(false);
+                variant["properties"]["outcome_targets"] = forbidden_property.clone();
             }
             let mut wait_outcomes = json!({
                 "properties":{"action":{"const":"wait_outcomes"}},
@@ -927,7 +931,7 @@ impl Tool for SessionControlTool {
                 "limit",
                 "cursor",
             ] {
-                wait_outcomes["properties"][field] = Value::Bool(false);
+                wait_outcomes["properties"][field] = forbidden_property.clone();
             }
             variants.push(wait_outcomes);
             let mut decide_approval = json!({
@@ -948,16 +952,16 @@ impl Tool for SessionControlTool {
                 "cursor",
                 "outcome_targets",
             ] {
-                decide_approval["properties"][field] = Value::Bool(false);
+                decide_approval["properties"][field] = forbidden_property.clone();
             }
             variants.push(decide_approval);
             for variant in variants {
                 if variant["properties"]["action"]["const"] != "decide_approval" {
-                    variant["properties"]["approval_reference"] = Value::Bool(false);
-                    variant["properties"]["decision"] = Value::Bool(false);
+                    variant["properties"]["approval_reference"] = forbidden_property.clone();
+                    variant["properties"]["decision"] = forbidden_property.clone();
                 }
                 if variant["properties"]["action"]["const"] != "observe_run" {
-                    variant["properties"]["input_receipt"] = Value::Bool(false);
+                    variant["properties"]["input_receipt"] = forbidden_property.clone();
                 }
             }
         }
@@ -967,7 +971,7 @@ impl Tool for SessionControlTool {
         });
         for variant in schema["oneOf"].as_array_mut().expect("action variants") {
             if variant["properties"]["action"]["const"] != "followup" {
-                variant["properties"]["notify_on_material_event"] = Value::Bool(false);
+                variant["properties"]["notify_on_material_event"] = forbidden_property.clone();
             }
         }
         schema
@@ -1367,6 +1371,7 @@ fn scoped_loop_command_schema() -> Value {
          The same limit applies to start and objective updates. \
          An edit applies no earlier than the next iteration admission; at most one objective edit may be pending."
     );
+    let forbidden_property = json!({"not": {}});
     let variant = |action: &str, required: &[&str], optional: &[&str]| {
         let mut properties = serde_json::Map::new();
         properties.insert("action".into(), json!({"const": action}));
@@ -1375,7 +1380,7 @@ fn scoped_loop_command_schema() -> Value {
                 && !required.contains(&field.as_str())
                 && !optional.contains(&field.as_str())
             {
-                properties.insert(field.clone(), Value::Bool(false));
+                properties.insert(field.clone(), forbidden_property.clone());
             }
         }
         json!({"properties": properties, "required": required})
