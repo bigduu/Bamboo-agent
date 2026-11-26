@@ -153,6 +153,12 @@ independent process and handle contention, reacquisition after release and proce
 the ordinary and POSIX name tests. A changed lock identity or inconclusive name control yields
 an unavailable writer verdict. The default case remains `directory-flush`.
 
+Select `-f windows_ticket_probe_case=publication` for the handle-relative publication fixture.
+It measures a create-only immutable name and a same-volume scratch HEAD replacement. The receipt
+reports the old handle's identity and bytes, the newly opened HEAD, and the preservation results
+for both denied rename controls. The fixture observes those operations under the actual token
+and filesystem. Ordered crash persistence remains a separate qualification.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

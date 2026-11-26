@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -73,6 +73,35 @@ function Assert-WriterProbe($Receipt, [int] $PrimaryProcessId) {
     }
 }
 
+function Assert-PublicationProbe($Receipt) {
+    $proof = $Receipt.publication
+    if ($Receipt.probe -cne 'publication' -or $Receipt.publication_qualified -isnot [bool]) {
+        throw 'The native publication receipt did not identify the measured case.'
+    }
+    $acquisition = $proof.lock.PSObject.Properties['acquisition']
+    if ($null -ne $acquisition) {
+        Assert-ProbeOutcome $acquisition.Value 'publication writer lock' $true
+    }
+    $qualified = $true
+    foreach ($phase in @($proof.lock, $proof.immutable, $proof.head)) {
+        if ($phase.qualified -isnot [bool]) { throw 'The publication receipt has an invalid phase.' }
+        $qualified = $qualified -and $phase.qualified
+    }
+    if ($qualified -and ($null -eq $acquisition -or -not $acquisition.Value.succeeded -or
+        $proof.lock.file_id -cnotmatch '^[0-9a-f]{32}$' -or $proof.lock.file_id -cne $proof.lock.final_file_id -or
+        -not $proof.immutable.insert.qualified -or -not $proof.immutable.collision.qualified -or
+        -not $proof.immutable.reuse.qualified -or -not $proof.immutable.conflict.qualified -or
+        -not $proof.head.initial.qualified -or
+        -not $proof.head.no_source_delete.qualified -or -not $proof.head.no_reader_delete_share.qualified -or
+        -not $proof.head.replace.qualified)) {
+        throw 'The publication verdict lacks a required native control.'
+    }
+    $expectedVerdict = if ($qualified) { 'available' } else { 'unavailable' }
+    if ($Receipt.publication_qualified -ne $qualified -or $Receipt.verdict -cne $expectedVerdict) {
+        throw 'The publication verdict does not match its native phases.'
+    }
+}
+
 $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
@@ -119,9 +148,13 @@ try {
 
     $copiedProbe = Join-Path $workspace 'probe.ps1'
     $probeFiles = [ordered]@{ 'windows-ticket-directory-flush-probe.ps1' = 'probe.ps1' }
-    if ($ProbeCase -eq 'writer-lock') {
+    if ($ProbeCase -ne 'directory-flush') {
         $probeFiles['windows-ticket-writer-lock-native.cs'] = 'windows-ticket-writer-lock-native.cs'
+    }
+    if ($ProbeCase -eq 'writer-lock') {
         $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
+    } elseif ($ProbeCase -eq 'publication') {
+        $probeFiles['windows-ticket-publication-native.cs'] = 'windows-ticket-publication-native.cs'
     }
     $stagedHashes = @{}
     foreach ($filename in $probeFiles.Keys) {
@@ -182,6 +215,7 @@ try {
 
     $receiptJson = Get-Content -LiteralPath $receiptPath -Raw
     $receipt = $receiptJson | ConvertFrom-Json
+    if ($ProbeCase -eq 'publication') { Write-Output $receiptJson.TrimEnd() }
     if ($receipt.schema -ne 1 -or $receipt.process_architecture -cne 'X64' -or
         [string]::IsNullOrWhiteSpace($receipt.windows_version) -or
         $receipt.token.sid -ne $account.SID.Value -or
@@ -196,6 +230,8 @@ try {
     }
     if ($ProbeCase -eq 'writer-lock') {
         Assert-WriterProbe $receipt $process.Id
+    } elseif ($ProbeCase -eq 'publication') {
+        Assert-PublicationProbe $receipt
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
@@ -219,7 +255,7 @@ try {
             throw 'A staged probe file changed during the trial.'
         }
     }
-    Write-Output $receiptJson.TrimEnd()
+    if ($ProbeCase -ne 'publication') { Write-Output $receiptJson.TrimEnd() }
 } finally {
     try {
         if ($process) {

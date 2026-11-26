@@ -255,7 +255,7 @@ public static partial class WindowsTicketDirectoryFlushProbe
         return result;
     }
 
-    public sealed class WriterScope : IDisposable
+    public sealed partial class WriterScope : IDisposable
     {
         private readonly List<SafeFileHandle> ancestry;
         private readonly string path;
@@ -340,29 +340,36 @@ public static partial class WindowsTicketDirectoryFlushProbe
             {
                 if (file == null) return RenameResult(status, "open_source");
                 VerifyFile(file, source);
-                byte[] name = Encoding.Unicode.GetBytes(destination);
-                int nameOffset = Marshal.OffsetOf<WriterRenameRequest>(nameof(WriterRenameRequest.FirstCodeUnit)).ToInt32();
-                int size = checked(Marshal.SizeOf<WriterRenameRequest>() + name.Length);
-                IntPtr buffer = Marshal.AllocHGlobal(size);
-                bool folderHeld = false;
-                try
+                return RenameOpened(file, Folder, destination, flags);
+            }
+        }
+
+        private static Dictionary<string, object> RenameOpened(SafeFileHandle file, SafeFileHandle folder,
+            string destination, uint flags)
+        {
+            ValidateRelativeName(destination);
+            byte[] name = Encoding.Unicode.GetBytes(destination);
+            int nameOffset = Marshal.OffsetOf<WriterRenameRequest>(nameof(WriterRenameRequest.FirstCodeUnit)).ToInt32();
+            int size = checked(Marshal.SizeOf<WriterRenameRequest>() + name.Length);
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            bool folderHeld = false;
+            try
+            {
+                folder.DangerousAddRef(ref folderHeld);
+                Marshal.Copy(new byte[size], 0, buffer, size);
+                Marshal.StructureToPtr(new WriterRenameRequest
                 {
-                    Folder.DangerousAddRef(ref folderHeld);
-                    Marshal.Copy(new byte[size], 0, buffer, size);
-                    Marshal.StructureToPtr(new WriterRenameRequest
-                    {
-                        Flags = flags, RootDirectory = Folder.DangerousGetHandle(), FileNameLength = (uint)name.Length
-                    }, buffer, false);
-                    Marshal.Copy(name, 0, buffer + nameOffset, name.Length);
-                    status = NtSetInformationFile(file, out _, buffer, (uint)size,
-                        (flags & RenamePosix) == 0 ? RenameInfo : RenameInfoEx);
-                    return RenameResult(status, "rename");
-                }
-                finally
-                {
-                    if (folderHeld) Folder.DangerousRelease();
-                    Marshal.FreeHGlobal(buffer);
-                }
+                    Flags = flags, RootDirectory = folder.DangerousGetHandle(), FileNameLength = (uint)name.Length
+                }, buffer, false);
+                Marshal.Copy(name, 0, buffer + nameOffset, name.Length);
+                int status = NtSetInformationFile(file, out _, buffer, (uint)size,
+                    (flags & RenamePosix) == 0 ? RenameInfo : RenameInfoEx);
+                return RenameResult(status, "rename");
+            }
+            finally
+            {
+                if (folderHeld) folder.DangerousRelease();
+                Marshal.FreeHGlobal(buffer);
             }
         }
 

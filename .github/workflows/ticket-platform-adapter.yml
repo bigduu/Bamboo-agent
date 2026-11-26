@@ -26,6 +26,7 @@ on:
         options:
           - directory-flush
           - writer-lock
+          - publication
 
 permissions:
   contents: read
