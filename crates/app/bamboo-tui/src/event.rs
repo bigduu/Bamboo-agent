@@ -4,8 +4,8 @@ use crate::api::types::{
     CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
     ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
     PermissionPolicyResponse, PlanModeState, ProviderCatalog, ReasoningEffort, Schedule,
-    SessionSummary, SessionTreeSummary, Skill, SkillDetail, SubagentSnapshotResponse,
-    TaskListResponse, ToolInfo,
+    ScheduleRunView, SessionSummary, SessionTreeSummary, Skill, SkillDetail,
+    SubagentSnapshotResponse, TaskListResponse, ToolInfo,
 };
 use crate::api::{
     ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
@@ -47,6 +47,11 @@ pub enum AppEvent {
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
     SchedulesLoaded(Loaded<Vec<Schedule>>),
+    ScheduleRunsLoaded {
+        request_id: u64,
+        schedule_id: String,
+        result: Loaded<Vec<ScheduleRunView>>,
+    },
     SkillsLoaded(Loaded<Vec<Skill>>),
     ConfigLoaded(Loaded<serde_json::Value>),
     PermissionPolicyLoaded {

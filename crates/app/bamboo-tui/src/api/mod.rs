@@ -1,7 +1,7 @@
 pub mod sse;
 pub mod types;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use std::fmt;
 
@@ -1044,6 +1044,34 @@ impl BambooClient {
             .collect())
     }
 
+    pub async fn list_schedule_runs(&self, schedule_id: &str) -> Result<Vec<ScheduleRunView>> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "runs"]);
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Could not fetch schedule runs")?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "Could not fetch schedule runs ({status})"
+        );
+        let parsed: ListScheduleRunsResponse = response
+            .json()
+            .await
+            .context("Invalid schedule runs response")?;
+        anyhow::ensure!(
+            parsed.schedule_id == schedule_id,
+            "Schedule runs response has a different schedule ID"
+        );
+        Ok(parsed.runs)
+    }
+
     pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
         let resp = self
             .client
@@ -1387,6 +1415,94 @@ mod tests {
             backend.await.unwrap();
             assert_eq!(result.is_ok(), supported, "{http_status} {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn list_schedule_runs_reads_typed_history_in_server_order() {
+        let runs = schedule_runs_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule-17","runs":[
+                {"run_id":"latest","scheduled_for":"2030-02-13T17:00:00+08:00","status":"future_status","was_catch_up":false},
+                {"run_id":"older","scheduled_for":"2030-02-12T09:00:00Z","status":"succeeded"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runs,
+            [
+                ScheduleRunView {
+                    run_id: "latest".into(),
+                    scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
+                    status: "future_status".into(),
+                },
+                ScheduleRunView {
+                    run_id: "older".into(),
+                    scheduled_for: "2030-02-12T09:00:00Z".parse().unwrap(),
+                    status: "succeeded".into(),
+                },
+            ]
+        );
+        assert!(
+            schedule_runs_reply("200 OK", r#"{"schedule_id":"schedule-17","runs":[]}"#)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_schedule_runs_rejects_wrong_schedule_and_reports_only_http_status() {
+        for (status, body, error) in [
+            (
+                "200 OK",
+                r#"{"schedule_id":"other","runs":[]}"#,
+                "Schedule runs response has a different schedule ID",
+            ),
+            (
+                "200 OK",
+                r#"{"schedule_id":"schedule-17"}"#,
+                "Invalid schedule runs response",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"backend details"}"#,
+                "Could not fetch schedule runs (503 Service Unavailable)",
+            ),
+        ] {
+            assert_eq!(
+                schedule_runs_reply(status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    async fn schedule_runs_reply(status: &str, body: &str) -> Result<Vec<ScheduleRunView>> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("GET /api/v1/schedules/schedule-17/runs HTTP/1.1")
+            );
+            assert_eq!(body_sent, "");
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedule_runs("schedule-17"), serve)
+        })
+        .await
+        .unwrap();
+        result
     }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {

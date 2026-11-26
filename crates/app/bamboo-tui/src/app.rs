@@ -1919,6 +1919,43 @@ pub struct SchedulesState {
     pub error: Option<String>,
 }
 
+pub(crate) enum ScheduleRunsContent {
+    Loading,
+    Loaded(Vec<ScheduleRunView>),
+    Failed(String),
+}
+
+pub(crate) struct ScheduleRunsPane {
+    schedule_id: String,
+    request_id: u64,
+    pub name: String,
+    pub selected: usize,
+    pub rows_per_page: Cell<usize>,
+    pub content: ScheduleRunsContent,
+}
+
+impl ScheduleRunsPane {
+    pub(crate) fn new(schedule_id: String, name: String, request_id: u64) -> Self {
+        Self {
+            schedule_id,
+            request_id,
+            name,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+            content: ScheduleRunsContent::Loading,
+        }
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        if let ScheduleRunsContent::Loaded(runs) = &self.content {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(runs.len().saturating_sub(1));
+        }
+    }
+}
+
 impl SchedulesState {
     pub fn new() -> Self {
         Self {
@@ -4814,6 +4851,8 @@ pub struct App {
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
+    pub(crate) schedule_runs: Option<ScheduleRunsPane>,
+    schedule_runs_request_id: u64,
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
@@ -5063,6 +5102,8 @@ impl App {
             pending_question: None,
             dismissed_question: None,
             schedule_form: None,
+            schedule_runs: None,
+            schedule_runs_request_id: 0,
             config_editor: None,
             permission_editor: None,
             permission_rule_confirm: None,
@@ -6870,6 +6911,22 @@ impl App {
                     }
                 }
             }
+            AppEvent::ScheduleRunsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            } => {
+                if let Some(pane) = self
+                    .schedule_runs
+                    .as_mut()
+                    .filter(|pane| pane.request_id == request_id && pane.schedule_id == schedule_id)
+                {
+                    pane.content = match result {
+                        Ok(runs) => ScheduleRunsContent::Loaded(runs),
+                        Err(error) => ScheduleRunsContent::Failed(error),
+                    };
+                }
+            }
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
@@ -8559,6 +8616,7 @@ impl App {
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_runs.is_some()
             || self.config_editor.is_some()
             || self.permission_editor.is_some()
             || self.permission_rule_confirm.is_some()
@@ -9184,6 +9242,7 @@ impl App {
             || self.model_picker.is_some()
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_runs.is_some()
             || self.config_editor.is_some()
             || self.terminal_settings.is_some()
     }
@@ -9254,6 +9313,8 @@ impl App {
             ActionContext::CommandPalette
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
+        } else if self.schedule_runs.is_some() {
+            ActionContext::ScheduleRuns
         } else if self.config_editor.is_some() {
             ActionContext::ConfigEditor
         } else if self.permission_editor.is_some() {
@@ -9616,6 +9677,7 @@ impl App {
             ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
+            ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
             ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
             ActionContext::TerminalSettings => self.handle_terminal_settings_key(key),
@@ -14417,6 +14479,7 @@ impl App {
             Some(ActionId::NewSchedule) => {
                 self.schedule_form = Some(ScheduleForm::default());
             }
+            Some(ActionId::Activate) => self.open_schedule_runs(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -14465,6 +14528,48 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn open_schedule_runs(&mut self) {
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let schedule_id = schedule.id.clone();
+        let name = schedule.name.as_deref().unwrap_or("(unnamed)").to_owned();
+        self.schedule_runs_request_id = self.schedule_runs_request_id.wrapping_add(1);
+        let request_id = self.schedule_runs_request_id;
+        self.schedule_runs = Some(ScheduleRunsPane::new(schedule_id.clone(), name, request_id));
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_schedule_runs(&schedule_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleRunsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            });
+        });
+    }
+
+    fn handle_schedule_runs_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleRuns, key);
+        let Some(pane) = self.schedule_runs.as_mut() else {
+            return;
+        };
+        let page = pane.rows_per_page.get() as isize;
+        match action {
+            Some(ActionId::Cancel) => self.schedule_runs = None,
+            Some(ActionId::NavigateUp) => pane.move_selection(-1),
+            Some(ActionId::NavigateDown) => pane.move_selection(1),
+            Some(ActionId::PageUp) => pane.move_selection(-page),
+            Some(ActionId::PageDown) => pane.move_selection(page),
+            _ => {}
+        }
     }
 
     /// Drive the new-schedule form modal. On Enter (all fields filled) it POSTs
@@ -22018,9 +22123,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    6_029_952_580_155_610_216
+                    4_038_905_119_346_422_299
                 } else {
-                    10_143_752_667_832_826_917
+                    10_180_952_998_958_642_306
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -23447,6 +23552,134 @@ mod question_tests {
         ));
         assert!(app.schedule_form.is_none());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_opens_selected_history_and_ignores_late_previous_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_request_seen, first_arrived) = tokio::sync::oneshot::channel();
+        let (release_old_reply, wait_to_reply) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut first).await.lines().next(),
+                Some("GET /api/v1/schedules/first/runs HTTP/1.1")
+            );
+            old_request_seen.send(()).unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut second).await.lines().next(),
+                Some("GET /api/v1/schedules/second/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut second,
+                "application/json",
+                r#"{"schedule_id":"second","runs":[
+                    {"run_id":"newer","scheduled_for":"2026-10-20T10:15:00Z","status":"success"},
+                    {"run_id":"older","scheduled_for":"2026-10-20T08:15:00Z","status":"running"}
+                ]}"#,
+            )
+            .await;
+            wait_to_reply.await.unwrap();
+            respond_test_http(
+                &mut first,
+                "application/json",
+                r#"{"schedule_id":"first","runs":[]}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = ["first", "second"]
+            .into_iter()
+            .map(|id| Schedule {
+                id: id.to_owned(),
+                name: Some(format!("{id} schedule")),
+                cron: None,
+                enabled: Some(true),
+                prompt: None,
+                last_run: None,
+                next_run: None,
+            })
+            .collect();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Loading
+        ));
+        tokio::time::timeout(Duration::from_secs(5), first_arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+
+        let current = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(current).await.unwrap();
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        release_old_reply.send(()).unwrap();
+        let late = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(late).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.name, "second schedule");
+        assert_eq!(pane.selected, 1);
+        let ScheduleRunsContent::Loaded(runs) = &pane.content else {
+            panic!("the selected schedule's runs should remain loaded");
+        };
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+        assert_eq!(app.schedules.selected, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_ignores_a_prior_request_for_the_same_schedule() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.schedule_runs = Some(ScheduleRunsPane::new(
+            "schedule".into(),
+            "Schedule".into(),
+            2,
+        ));
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(Vec::new()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Loading
+        ));
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 2,
+            schedule_id: "schedule".into(),
+            result: Err("Could not fetch schedule runs".into()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Failed(_)
+        ));
     }
 
     #[tokio::test]

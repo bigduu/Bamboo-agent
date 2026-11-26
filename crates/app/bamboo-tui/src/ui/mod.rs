@@ -113,6 +113,8 @@ fn render_overlays(f: &mut Frame, app: &App, anchor: Option<Rect>, inline_approv
         permissions::render_rule_confirm(f, app);
     }
 
+    schedules::render_runs(f, app);
+
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
