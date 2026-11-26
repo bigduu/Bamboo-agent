@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity', 'rust-writer')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +21,15 @@ function Grant-ProbeAccess($Acl, [System.Security.Principal.SecurityIdentifier] 
         $Sid, $Rights, $inheritance, 'None', 'Allow'
     )
     $Acl.SetAccessRule($rule)
+}
+
+function Copy-ProbeFile([string] $Source, [string] $Staged) {
+    $sha = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+    [IO.File]::Copy($Source, $Staged, $false)
+    if ((Get-FileHash -LiteralPath $Staged -Algorithm SHA256).Hash -cne $sha) {
+        throw "The staged file differs from the selected probe input $Source."
+    }
+    return $sha
 }
 
 function Assert-ProbeOutcome($Outcome, [string] $Name, [bool] $Attempted) {
@@ -153,6 +162,12 @@ function Assert-ScopeIdentityProbe($Receipt) {
     }
 }
 
+$nativeBinary = $null
+if ($ProbeCase -eq 'rust-writer') {
+    . (Join-Path $PSScriptRoot 'windows-ticket-rust-writer-owner.ps1')
+    $nativeBinary = Get-TicketRustWriterBinary
+}
+
 $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
@@ -197,43 +212,48 @@ try {
     $receiptPath = Join-Path $scratch 'receipt.json'
     $null = New-Item -ItemType Directory -Path $fixture
 
-    $copiedProbe = Join-Path $workspace 'probe.ps1'
-    $probeFiles = [ordered]@{ 'windows-ticket-directory-flush-probe.ps1' = 'probe.ps1' }
-    if ($ProbeCase -ne 'directory-flush') {
-        $probeFiles['windows-ticket-writer-lock-native.cs'] = 'windows-ticket-writer-lock-native.cs'
-    }
-    if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) {
-        $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
-    }
-    if ($ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')) {
-        $probeFiles['windows-ticket-publication-native.cs'] = 'windows-ticket-publication-native.cs'
-    }
-    if ($ProbeCase -eq 'publication-process-exit') {
-        $probeFiles['windows-ticket-publication-process-exit-native.cs'] = 'windows-ticket-publication-process-exit-native.cs'
-        $probeFiles['windows-ticket-publication-process-exit-cases.ps1'] = 'windows-ticket-publication-process-exit-cases.ps1'
-    }
-    if ($ProbeCase -eq 'scope-identity') {
-        $probeFiles['windows-ticket-scope-identity-native.cs'] = 'windows-ticket-scope-identity-native.cs'
-        $probeFiles['windows-ticket-scope-identity-cases.ps1'] = 'windows-ticket-scope-identity-cases.ps1'
-    }
     $stagedHashes = @{}
-    foreach ($filename in $probeFiles.Keys) {
-        $sourcePath = Join-Path $PSScriptRoot $filename
-        $stagedPath = Join-Path $workspace $probeFiles[$filename]
-        $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-        Copy-Item -LiteralPath $sourcePath -Destination $stagedPath
-        if ((Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash -ne $sourceHash) {
-            throw "The staged file differs from the checked-out $filename."
+    if ($nativeBinary) {
+        $launchPath = Join-Path $workspace 'ticket-rust-writer.exe'
+        $binaryHash = Copy-ProbeFile $nativeBinary $launchPath
+        $stagedHashes[$launchPath] = $binaryHash
+        Write-Output "Probe Rust test SHA256 $binaryHash"
+    } else {
+        $copiedProbe = Join-Path $workspace 'probe.ps1'
+        $probeFiles = [ordered]@{ 'windows-ticket-directory-flush-probe.ps1' = 'probe.ps1' }
+        if ($ProbeCase -ne 'directory-flush') {
+            $probeFiles['windows-ticket-writer-lock-native.cs'] = 'windows-ticket-writer-lock-native.cs'
         }
-        $stagedHashes[$stagedPath] = $sourceHash
-        if ($stagedPath -eq $copiedProbe) {
-            Write-Output "Probe script SHA256 $sourceHash"
-        } else {
-            Write-Output "Probe companion $filename SHA256 $sourceHash"
+        if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) {
+            $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
         }
+        if ($ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')) {
+            $probeFiles['windows-ticket-publication-native.cs'] = 'windows-ticket-publication-native.cs'
+        }
+        if ($ProbeCase -eq 'publication-process-exit') {
+            $probeFiles['windows-ticket-publication-process-exit-native.cs'] = 'windows-ticket-publication-process-exit-native.cs'
+            $probeFiles['windows-ticket-publication-process-exit-cases.ps1'] = 'windows-ticket-publication-process-exit-cases.ps1'
+        }
+        if ($ProbeCase -eq 'scope-identity') {
+            $probeFiles['windows-ticket-scope-identity-native.cs'] = 'windows-ticket-scope-identity-native.cs'
+            $probeFiles['windows-ticket-scope-identity-cases.ps1'] = 'windows-ticket-scope-identity-cases.ps1'
+        }
+        foreach ($filename in $probeFiles.Keys) {
+            $sourcePath = Join-Path $PSScriptRoot $filename
+            $stagedPath = Join-Path $workspace $probeFiles[$filename]
+            $sourceHash = Copy-ProbeFile $sourcePath $stagedPath
+            $stagedHashes[$stagedPath] = $sourceHash
+            if ($stagedPath -eq $copiedProbe) {
+                Write-Output "Probe script SHA256 $sourceHash"
+            } else {
+                Write-Output "Probe companion $filename SHA256 $sourceHash"
+            }
+        }
+
+        $launchPath = Join-Path $PSHOME 'pwsh.exe'
     }
 
-    $launch = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    $launch = [System.Diagnostics.ProcessStartInfo]::new($launchPath)
     $launch.WorkingDirectory = $scratch
     $launch.UseShellExecute = $false
     $launch.UserName = $account.Name
@@ -248,17 +268,24 @@ try {
     $launch.Environment['TEMP'] = $scratch
     $launch.Environment['TMP'] = $scratch
 
-    foreach ($argument in @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $copiedProbe,
-        '-ExpectedSid', $account.SID.Value, '-FixtureDirectory', $fixture, '-ReceiptPath', $receiptPath,
-        '-ProbeCase', $ProbeCase
-    )) {
-        $launch.ArgumentList.Add($argument)
+    if ($nativeBinary) {
+        $launch.Environment['BAMBOO_TICKET_WRITER_EXPECTED_SID'] = $account.SID.Value
+        $launch.Environment['BAMBOO_TICKET_WRITER_FIXTURE'] = $fixture
+        $launch.Environment['BAMBOO_TICKET_WRITER_RECEIPT'] = $receiptPath
+        $launch.Environment['BAMBOO_TICKET_WRITER_ROLE'] = 'owner'
+        $arguments = @($TicketRustWriterTest, '--exact', '--ignored', '--nocapture', '--test-threads=1')
+    } else {
+        $arguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $copiedProbe,
+            '-ExpectedSid', $account.SID.Value, '-FixtureDirectory', $fixture, '-ReceiptPath', $receiptPath,
+            '-ProbeCase', $ProbeCase
+        )
     }
+    foreach ($argument in $arguments) { $launch.ArgumentList.Add($argument) }
     $process = [System.Diagnostics.Process]::Start($launch)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) { 180 } else { 90 }
+    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit', 'rust-writer')) { 180 } else { 90 }
     if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
         throw "The standard-user probe exceeded its $timeoutSeconds-second deadline."
     }
@@ -270,12 +297,17 @@ try {
     if ($output) { Write-Output $output.TrimEnd() }
     if ($errorOutput) { Write-Output $errorOutput.TrimEnd() }
     if ($process.ExitCode -ne 0) {
+        if ($nativeBinary -and (Test-Path -LiteralPath $receiptPath)) {
+            Write-Output (Get-Content -LiteralPath $receiptPath -Raw).TrimEnd()
+        }
         throw "The standard-user probe exited $($process.ExitCode)."
     }
+    if ($nativeBinary) { Assert-TicketRustWriterTestOutput $output }
 
     $receiptJson = Get-Content -LiteralPath $receiptPath -Raw
     $receipt = $receiptJson | ConvertFrom-Json
-    $printBeforeValidation = $ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')
+    if ($nativeBinary) { Write-Output "Ticket Rust writer probe verdict: $($receipt.verdict)" }
+    $printBeforeValidation = $ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity', 'rust-writer')
     if ($printBeforeValidation) { Write-Output $receiptJson.TrimEnd() }
     if ($receipt.schema -ne 1 -or $receipt.process_architecture -cne 'X64' -or
         [string]::IsNullOrWhiteSpace($receipt.windows_version) -or
@@ -297,6 +329,8 @@ try {
         Assert-PublicationProcessExitProbe $receipt $process.Id
     } elseif ($ProbeCase -eq 'scope-identity') {
         Assert-ScopeIdentityProbe $receipt
+    } elseif ($nativeBinary) {
+        Assert-RustWriterProbe $receipt $process.Id
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true

@@ -175,6 +175,14 @@ hard-link alias of an existing scratch writer lock. The receipt checks actual ta
 link counts and bytes, and records where the normal writer open refuses each alias. The fixture
 removes the junction itself before recursive scratch cleanup.
 
+Select `-f windows_ticket_probe_case=rust-writer` for the private Rust writer qualification.
+The Windows owner builds one locked Ticket library test executable, records its digest, and
+stages it with read and execute access for the disposable local standard user. The exact test
+checks anchored fixed-NTFS scope and writer identity, native Rust lock contention and
+reacquisition across processes, and two-link rejection. It also exercises the public FileStore
+platform refusal before disk mutation. The Rust primitive is compiled for the Windows test
+target. Windows runtime admission and ordered crash persistence remain separate.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

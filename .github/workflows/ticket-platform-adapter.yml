@@ -29,6 +29,7 @@ on:
           - publication
           - publication-process-exit
           - scope-identity
+          - rust-writer
 
 permissions:
   contents: read
@@ -198,22 +199,11 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Probe Windows Ticket primitives as a standard user
-        if: inputs.windows_ticket_probe_sha != ''
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer'
         env:
           PROBE_CASE: ${{ inputs.windows_ticket_probe_case }}
         shell: pwsh
         run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase $env:PROBE_CASE
-
-      - name: Verify the Windows Ticket probe left the exact source clean
-        if: always() && inputs.windows_ticket_probe_sha != ''
-        env:
-          EXPECTED_PROBE_SHA: ${{ inputs.windows_ticket_probe_sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_PROBE_SHA"
-          source_status=$(git status --porcelain --untracked-files=all)
-          test -z "$source_status"
 
       - name: Bind Windows Project acceptance to the exact clean source
         if: inputs.windows_project_sha != ''
@@ -237,6 +227,22 @@ jobs:
         with:
           shared-key: bamboo-ticket-platform-adapter-${{ runner.os }}
           save-if: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' }}
+
+      - name: Probe the Rust Windows Ticket writer as a standard user
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-writer'
+        shell: pwsh
+        run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-writer
+
+      - name: Verify the Windows Ticket probe left the exact source clean
+        if: always() && inputs.windows_ticket_probe_sha != ''
+        env:
+          EXPECTED_PROBE_SHA: ${{ inputs.windows_ticket_probe_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PROBE_SHA"
+          source_status=$(git status --porcelain --untracked-files=all)
+          test -z "$source_status"
 
       - name: Verify unsupported file operations fail closed
         run: cargo test --locked -p bamboo-tickets --lib workspace_files::physical::tests::unsupported_platform_file_operations_fail_closed_without_mutation -- --exact

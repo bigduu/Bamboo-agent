@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{canonical_bytes, content_hash, Artifact, Error, Result, ScopeBinding, Snapshot};
 
+#[cfg(all(test, windows))]
+mod windows_writer;
+
 pub const MANAGED_ARTIFACT_PREFIX: &str = "artifact://ticket/";
 pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 
