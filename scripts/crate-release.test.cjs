@@ -2205,6 +2205,40 @@ test('3078 reconciles the retained SDK and requires the original published prefi
   assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
 })
 
+test('3115 binds the original config failure and five retained native transports', () => {
+  const recovery = require('./crate-release-2026-11-48-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const now = Date.parse('2026-11-26T00:40:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-29T00:40:00Z')
+  assert.equal(recovery.originalEvidence(read, now).id, 45729058776)
+  assert.equal(TAIL.length, 25)
+  assert.equal(new Set(TAIL).size, TAIL.length)
+  assert.equal(TAIL[0], 'bamboo-compression')
+  assert.equal(TAIL.at(-1), 'bamboo-agent')
+  assert.ok(!TAIL.includes('bamboo-config'))
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  const artifacts = routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts
+  artifacts[1].digest = 'sha256:' + '0'.repeat(64)
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION' })
+})
+
+test('3115 requires the published prefix and reconciles only the retained config archive', () => {
+  const { TARGET, TAIL, verifyRegistryMetadata } = require('./crate-release-2026-11-48-recovery.cjs')
+  const prefix = ['bamboo-a2a', 'bamboo-domain', 'bamboo-agent-core', 'bamboo-subagent', 'bamboo-broker']
+  const checksum = 'a'.repeat(64)
+  const receipt = { crates: [...prefix, 'bamboo-config', ...TAIL], packageChecksums: { 'bamboo-config': checksum } }
+  for (const name of prefix) {
+    assert.throws(() => verifyRegistryMetadata(receipt, name, TARGET.version, null), /published prefix disappeared/)
+  }
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-config', TARGET.version, null), null)
+  const uploaded = { yanked: false, checksum }
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-config', TARGET.version, uploaded), uploaded)
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-config', TARGET.version, {
+    ...uploaded, checksum: 'b'.repeat(64),
+  }), /Registry checksum changed/)
+  assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
+})
+
 const recovery2762 = require('./crate-release-2026-11-22-recovery.cjs')
 test('2762 binds the failed attempt and all five original native transports', () => {
   const { TARGET, ATTEMPTS, ARTIFACTS } = recovery2762

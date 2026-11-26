@@ -53,6 +53,7 @@ separately from its future canonical-merge owner.
 | `recover-crate-2026-11-31.yml` | Protected Dev dispatch for the fixed #2840 reservation. Verifies the original failed registry read and 26 crate originals, completes the four unstarted crates, and retains the five original native transports for the original publisher's finalizer. |
 | `recover-crate-2026-11-43.yml` | Protected Dev dispatch for #3053. Recovers the retained crate upload, completes the six unstarted crates, and preserves the original native transports for finalization. |
 | `recover-crate-2026-11-47.yml` | Protected Dev dispatch for #3078. Reconciles the retained SDK upload, completes the four unstarted crates, and preserves the original native transports for finalization. |
+| `recover-crate-2026-11-48.yml` | Protected Dev dispatch for #3115. Reconciles the retained config upload, completes the 25 unstarted crates, and preserves the original native transports for finalization. |
 | `release-cargo-isolation.yml` | Path-scoped dummy-credential/Cargo isolation and real ENOSPC acceptance, plus package-compatibility verification. These exercise the publication boundary, not the full product Unit/E2E suite; keep their distinct inputs explicit. |
 | `release-credentials-check.yml` | Explicit operator credential check; no ordinary feature/release test producer. Retain without adding automatic credential access. |
 | `claude.yml` | Explicitly mentioned issue/PR assistant. Not an automatic product test or release stage. Retain its existing authorization boundary. |

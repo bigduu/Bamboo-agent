@@ -72,6 +72,63 @@ impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
 }
 
 #[tokio::test]
+async fn session_control_advertises_object_property_schemas_on_anthropic_wire() {
+    fn assert_object_property_schemas(schema: &Value) {
+        if let Some(fields) = schema.get("properties").and_then(Value::as_object) {
+            for (name, property) in fields {
+                assert!(
+                    property.is_object(),
+                    "non-object schema for {name}: {property}"
+                );
+            }
+        }
+        match schema {
+            Value::Object(keywords) => keywords.values().for_each(assert_object_property_schemas),
+            Value::Array(children) => children.iter().for_each(assert_object_property_schemas),
+            _ => {}
+        }
+    }
+
+    let fixture = Fixture::new().await;
+    let registry = bamboo_agent_core::tools::registry::ToolRegistry::new();
+    registry
+        .register(
+            SessionControlTool::new(fixture.messenger.clone())
+                .with_root_run(Arc::new(RecordingRootRunPort::default())),
+        )
+        .unwrap();
+    let tools = registry.list_tools();
+    let advertised = &tools[0].function.parameters;
+    let request = bamboo_llm::providers::anthropic::build_anthropic_request_with_cache(
+        &[Message::user("Inspect the loop status")],
+        &tools,
+        "fixture-model",
+        256,
+        false,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(request["tools"][0]["name"], "session_control");
+    let input_schema = &request["tools"][0]["input_schema"];
+    let command = &input_schema["properties"]["command"];
+    let status = command["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["properties"]["action"]["const"] == "status")
+        .unwrap();
+    for field in ["generation", "max_iterations"] {
+        assert_eq!(status["properties"][field], json!({"not": {}}), "{field}");
+    }
+    assert_object_property_schemas(advertised);
+    assert_object_property_schemas(input_schema);
+    assert_eq!(input_schema["properties"], advertised["properties"]);
+    assert_eq!(input_schema["additionalProperties"], false);
+    assert_eq!(command["additionalProperties"], false);
+}
+
+#[tokio::test]
 async fn exact_root_run_schema_requires_observed_target_and_run_without_granting_authority() {
     let fixture = Fixture::new().await;
     let port = Arc::new(RecordingRootRunPort::default());

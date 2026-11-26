@@ -87,7 +87,8 @@ The flows between horizons are the interesting part:
 conversation ──(Task tool / explicit ask / extractor)──▶ LEDGER record
 session TaskList ──("promote" action)────────────────▶ LEDGER record (survives session)
 LEDGER record.remind_at ──(schedule bridge)──────────▶ ScheduleSpec ──fires──▶ headless session + push notification
-LEDGER agenda view ──(prompt injection)──────────────▶ every session's context ("due today: …")
+LEDGER agenda view ──(explicit tool or API query)───▶ agenda on demand
+LEDGER agenda view ──(opt-in prompt injection)──────▶ current model request
 LEDGER completed/expired ──(ledger gardener)─────────▶ distilled into durable memory ("user renews passport every 10y", habit stats)
 ```
 
@@ -236,27 +237,14 @@ This is where the ledger stops being a database and becomes an assistant.
 
 ## 8. Prompt injection: the agenda layer
 
-Extend `external_memory.rs` with one new layer, inserted between session notes and
-relevant durable memories:
+Use the `ledger` tool's `agenda` action or the agenda HTTP endpoint for an on-demand
+view. Set `memory.ledger_agenda_injection` to `true` to also include confirmed active
+global and current-project records in model requests.
 
-```
-## External Memory (Persistent)
-  [observed state]
-  [session memory note]
-  [📅 Agenda]            ← NEW: overdue + due-today + next-48h events + top open todos
-  [relevant durable memories]
-  [project index / dream summaries]
-```
-
-- Rendered from `indexes/by_time.json` + `by_status.json` — **no LLM cost, no BM25
-  needed**; capped (~1200 chars) and count-limited (e.g. 10 items) like the other layers.
-- Lives in the volatile block, so record churn never busts the prompt prefix cache —
-  the same reason external memory already avoids the system message.
-- Gated by a `PromptMemoryFlags`-style config flag (`ledger_agenda_injection`,
-  default on when the ledger has any open records).
-
-This single layer is what makes the assistant *proactive inside conversations*: any
-session, on any topic, knows the user has a flight tomorrow.
+The opt-in section covers overdue records, the next 24 hours, upcoming records
+within seven days, and undated open items. The model request includes at most five
+items per bucket and up to 1,200 characters of item text. An empty agenda
+adds no section.
 
 ## 9. Background loops: extractor + ledger gardener
 
@@ -304,8 +292,8 @@ gardener's golden rule — **deterministic prefilter first, LLM only when there 
 | **7** | HTTP API + built-in skill + daily-briefing schedule template | 2–4 | ✅ done (SSE change-feed events deferred) |
 
 Phases 1–4 are the minimum lovable assistant: remember commitments across sessions,
-answer "what's due", fire reminders, and mention the agenda proactively. 5–7 make it
-self-maintaining and product-visible.
+answer "what's due", fire reminders, and mention the agenda proactively when
+enabled. 5–7 make it self-maintaining and product-visible.
 
 ## 12. Open questions
 

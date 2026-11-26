@@ -133,6 +133,80 @@ workflow](../../.github/workflows/ticket-platform-adapter.yml) already has an ex
 Windows route for Project reads and a workspace-write refusal. A later probe can extend that
 owner with actual ledger tests.
 
+Measure the initial Windows directory flush capability using the probe input on that owner.
+Set `branch` to the published probe branch and `sha` to its exact commit.
+
+```sh
+gh workflow run ticket-platform-adapter.yml -R bigduu/Bamboo-agent --ref "$branch" \
+  -f windows_ticket_probe_sha="$sha"
+```
+
+The workflow launches the probe under a temporary standard local account and prints the native
+receipt in the Windows job log. The portable PowerShell script can also run directly under an
+existing standard account with `-ExpectedSid`, a fresh `-FixtureDirectory` on local NTFS, and
+an unused sibling `-ReceiptPath`. Its verdict describes the exact directory access mask, flags,
+token, and filesystem tested. The scratch rename and warm reopen record operational behavior.
+The receipt explicitly leaves ordered crash persistence unproven.
+
+Add `-f windows_ticket_probe_case=writer-lock` to select the writer fixture. Its receipt records
+independent process and handle contention, reacquisition after release and process exit, and
+the ordinary and POSIX name tests. A changed lock identity or inconclusive name control yields
+an unavailable writer verdict. The default case remains `directory-flush`.
+
+Select `-f windows_ticket_probe_case=publication` for the handle-relative publication fixture.
+It measures a create-only immutable name and a same-volume scratch HEAD replacement. The receipt
+reports the old handle's identity and bytes, the newly opened HEAD, and the preservation results
+for both denied rename controls. The fixture observes those operations under the actual token
+and filesystem. Ordered crash persistence remains a separate qualification.
+
+Select `-f windows_ticket_probe_case=publication-process-exit` for the warm-reopen fixture.
+It uses one uninterrupted publication and three separate scopes where the controller terminates
+the writer while it still holds the lock. It cuts before HEAD replacement, after the native
+replacement succeeds but before the scope flush, and after that flush but before a success reply.
+A fresh process acquires the existing lock and follows named HEAD through the checksum-linked
+commit, manifest, and object. The receipt includes the staged name and graph before replacement,
+and reads the new HEAD and prior graph after replacement. The running OS and mounted volume are
+shared across each exit and reopen. OS-crash, remount, and power-loss persistence require separate
+evidence.
+
+Select `-f windows_ticket_probe_case=scope-identity` for the scope admission controls. The
+ordinary local user creates one ancestor junction between owned scratch directories and one
+hard-link alias of an existing scratch writer lock. The receipt checks actual tags, identities,
+link counts and bytes, and records where the normal writer open refuses each alias. The fixture
+removes the junction itself before recursive scratch cleanup.
+
+Select `-f windows_ticket_probe_case=rust-writer` for the private Rust writer qualification.
+The Windows owner builds one locked Ticket library test executable, records its digest, and
+stages it with read and execute access for the disposable local standard user. The exact test
+checks anchored fixed-NTFS scope and writer identity, native Rust lock contention and
+reacquisition across processes, and two-link rejection. It also exercises the public FileStore
+platform refusal before disk mutation. The Rust primitive is compiled for the Windows test
+target. Windows runtime admission and ordered crash persistence remain separate.
+
+Select `-f windows_ticket_probe_case=rust-immutable` for the private Rust immutable publication
+test. The same native owner runs one exact test under the disposable standard user. The test
+holds the Rust writer and a single writable NTFS category, stages and synchronizes a file, and
+publishes the digest through a create-only rename on the same handle. It verifies the new name,
+the category barrier, native collision and name preservation, exact-content reuse, and the
+refusal to reuse conflicting bytes. This measures the immutable publication operations. HEAD
+replacement and crash persistence remain separate.
+
+Select `-f windows_ticket_probe_case=rust-head` for the private Rust HEAD replacement test.
+It stages a successor, replaces literal HEAD relative to the retained writable scope, and
+flushes that scope. A held reader with compatible sharing must retain the old file identity and
+bytes while a new relative open reads the successor. The test also applies native rename to a
+source lacking DELETE and to a target with a reader lacking delete sharing, and confirms both
+names and their bytes remain intact on refusal. Full graph recovery and crash persistence
+remain separate.
+
+Select `-f windows_ticket_probe_case=rust-graph` for the private Rust Ticket graph test.
+It uses canonical Ticket snapshot data, manifests and commits under the retained native writer.
+The test publishes two revisions, observes the object, manifest, commit and scope barriers,
+then closes the writer and opens fresh handles in the same process. The verifier starts at
+named HEAD and validates the current and parent graphs by checksum. A final scratch control
+corrupts a referenced object and verifies that readback refuses the graph while preserving
+HEAD, the corrupted file and an intact stale stage. Process exit and OS-crash or remount persistence have separate qualification.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |
