@@ -399,6 +399,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::sessions::copy_session),
         )
         .route(
+            "/sessions/{session_id}/fork",
+            web::post().to(agent::sessions::fork_session),
+        )
+        .route(
             "/sessions/{session_id}/system-prompt",
             web::get().to(agent::sessions::get_system_prompt_snapshot),
         )
