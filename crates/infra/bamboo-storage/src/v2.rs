@@ -1119,6 +1119,13 @@ pub struct SessionPlacement {
     pub host: String,
 }
 
+/// Indexed Session count and latest activity for a Project.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectSessionSummary {
+    pub session_count: usize,
+    pub last_activity_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionIndexEntry {
     pub id: String,
@@ -3568,6 +3575,34 @@ impl SessionStoreV2 {
         let mut items: Vec<_> = index.sessions.values().cloned().collect();
         items.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         items
+    }
+
+    /// Summarize the requested Projects from one snapshot of the Session index.
+    pub async fn project_session_summaries<'a>(
+        &self,
+        project_ids: impl IntoIterator<Item = &'a ProjectId>,
+    ) -> HashMap<String, ProjectSessionSummary> {
+        let mut summaries: HashMap<_, _> = project_ids
+            .into_iter()
+            .map(|id| (id.as_str().to_owned(), ProjectSessionSummary::default()))
+            .collect();
+        if summaries.is_empty() {
+            return summaries;
+        }
+
+        let index = self.index.read().await;
+        for entry in index.sessions.values() {
+            if let Some(summary) = entry
+                .project_id
+                .as_deref()
+                .and_then(|id| summaries.get_mut(id))
+            {
+                summary.session_count += 1;
+                summary.last_activity_at =
+                    summary.last_activity_at.max(Some(entry.last_activity_at));
+            }
+        }
+        summaries
     }
 
     pub async fn recent_index_entries_matching(
