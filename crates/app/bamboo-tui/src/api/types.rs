@@ -885,6 +885,8 @@ pub struct ScheduleRunView {
     pub run_id: String,
     pub scheduled_for: DateTime<Utc>,
     pub status: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Subset of the server's `ScheduleView` the TUI consumes. The full trigger

@@ -1422,8 +1422,11 @@ mod tests {
         let runs = schedule_runs_reply(
             "200 OK",
             r#"{"schedule_id":"schedule-17","runs":[
-                {"run_id":"latest","scheduled_for":"2030-02-13T17:00:00+08:00","status":"future_status","was_catch_up":false},
-                {"run_id":"older","scheduled_for":"2030-02-12T09:00:00Z","status":"succeeded"}
+                {"run_id":"latest","scheduled_for":"2030-02-13T17:00:00+08:00","status":"future_status",
+                 "was_catch_up":false,"session_id":"session-CaSe_42"},
+                {"run_id":"older","scheduled_for":"2030-02-12T09:00:00Z","status":"succeeded",
+                 "workflow_run_id":"workflow-12"},
+                {"run_id":"oldest","scheduled_for":"2030-02-11T09:00:00Z","status":"skipped","session_id":null}
             ]}"#,
         )
         .await
@@ -1435,11 +1438,19 @@ mod tests {
                     run_id: "latest".into(),
                     scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
                     status: "future_status".into(),
+                    session_id: Some("session-CaSe_42".into()),
                 },
                 ScheduleRunView {
                     run_id: "older".into(),
                     scheduled_for: "2030-02-12T09:00:00Z".parse().unwrap(),
                     status: "succeeded".into(),
+                    session_id: None,
+                },
+                ScheduleRunView {
+                    run_id: "oldest".into(),
+                    scheduled_for: "2030-02-11T09:00:00Z".parse().unwrap(),
+                    status: "skipped".into(),
+                    session_id: None,
                 },
             ]
         );

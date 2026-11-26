@@ -801,6 +801,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Mcp,
             Schedules,
             ScheduleForm,
+            ScheduleRuns,
             FenceCopyPicker,
             Skills,
             Permissions,
@@ -821,6 +822,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Mcp, "Enter"),
             (Schedules, "Enter"),
             (ScheduleForm, "Enter"),
+            (ScheduleRuns, "Enter"),
             (FenceCopyPicker, "Enter"),
             (Skills, "Enter"),
             (Permissions, "Enter"),
@@ -2220,6 +2222,16 @@ impl Keymap {
         } else {
             labels.join("/")
         }
+    }
+
+    pub(crate) fn primary_hint(&self, context: ActionContext, action: ActionId) -> String {
+        self.bindings
+            .iter()
+            .find(|binding| binding.context == context && binding.action == action)
+            .map_or_else(
+                || "unbound".to_string(),
+                |binding| binding.sequence.display(),
+            )
     }
 
     pub(crate) fn action_hint(&self, action: ActionId) -> Option<String> {
