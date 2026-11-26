@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity', 'rust-writer')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity', 'rust-writer', 'rust-immutable')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -163,9 +163,10 @@ function Assert-ScopeIdentityProbe($Receipt) {
 }
 
 $nativeBinary = $null
-if ($ProbeCase -eq 'rust-writer') {
+if ($ProbeCase -in @('rust-writer', 'rust-immutable')) {
     . (Join-Path $PSScriptRoot 'windows-ticket-rust-writer-owner.ps1')
-    $nativeBinary = Get-TicketRustWriterBinary
+    $rustTest = Get-TicketRustProbeTest $ProbeCase
+    $nativeBinary = Get-TicketRustProbeBinary
 }
 
 $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -273,7 +274,7 @@ try {
         $launch.Environment['BAMBOO_TICKET_WRITER_FIXTURE'] = $fixture
         $launch.Environment['BAMBOO_TICKET_WRITER_RECEIPT'] = $receiptPath
         $launch.Environment['BAMBOO_TICKET_WRITER_ROLE'] = 'owner'
-        $arguments = @($TicketRustWriterTest, '--exact', '--ignored', '--nocapture', '--test-threads=1')
+        $arguments = @($rustTest, '--exact', '--ignored', '--nocapture', '--test-threads=1')
     } else {
         $arguments = @(
             '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $copiedProbe,
@@ -285,7 +286,7 @@ try {
     $process = [System.Diagnostics.Process]::Start($launch)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit', 'rust-writer')) { 180 } else { 90 }
+    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit', 'rust-writer', 'rust-immutable')) { 180 } else { 90 }
     if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
         throw "The standard-user probe exceeded its $timeoutSeconds-second deadline."
     }
@@ -302,12 +303,15 @@ try {
         }
         throw "The standard-user probe exited $($process.ExitCode)."
     }
-    if ($nativeBinary) { Assert-TicketRustWriterTestOutput $output }
+    if ($nativeBinary) { Assert-TicketRustProbeTestOutput $output $rustTest }
 
     $receiptJson = Get-Content -LiteralPath $receiptPath -Raw
     $receipt = $receiptJson | ConvertFrom-Json
-    if ($nativeBinary) { Write-Output "Ticket Rust writer probe verdict: $($receipt.verdict)" }
-    $printBeforeValidation = $ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity', 'rust-writer')
+    if ($nativeBinary) {
+        $rustLabel = if ($ProbeCase -eq 'rust-writer') { 'Rust writer' } else { 'Rust immutable publication' }
+        Write-Output "Ticket $rustLabel probe verdict: $($receipt.verdict)"
+    }
+    $printBeforeValidation = $nativeBinary -or $ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')
     if ($printBeforeValidation) { Write-Output $receiptJson.TrimEnd() }
     if ($receipt.schema -ne 1 -or $receipt.process_architecture -cne 'X64' -or
         [string]::IsNullOrWhiteSpace($receipt.windows_version) -or
@@ -329,8 +333,10 @@ try {
         Assert-PublicationProcessExitProbe $receipt $process.Id
     } elseif ($ProbeCase -eq 'scope-identity') {
         Assert-ScopeIdentityProbe $receipt
-    } elseif ($nativeBinary) {
+    } elseif ($ProbeCase -eq 'rust-writer') {
         Assert-RustWriterProbe $receipt $process.Id
+    } elseif ($ProbeCase -eq 'rust-immutable') {
+        Assert-RustImmutableProbe $receipt $process.Id
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true

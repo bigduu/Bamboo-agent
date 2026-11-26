@@ -183,6 +183,14 @@ reacquisition across processes, and two-link rejection. It also exercises the pu
 platform refusal before disk mutation. The Rust primitive is compiled for the Windows test
 target. Windows runtime admission and ordered crash persistence remain separate.
 
+Select `-f windows_ticket_probe_case=rust-immutable` for the private Rust immutable publication
+test. The same native owner runs one exact test under the disposable standard user. The test
+holds the Rust writer and a single writable NTFS category, stages and synchronizes a file, and
+publishes the digest through a create-only rename on the same handle. It verifies the new name,
+the category barrier, native collision and name preservation, exact-content reuse, and the
+refusal to reuse conflicting bytes. This measures the immutable publication operations. HEAD
+replacement and crash persistence remain separate.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |
