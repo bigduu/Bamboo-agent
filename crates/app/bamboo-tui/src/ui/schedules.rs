@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{App, ScheduleRunCancelState, ScheduleRunsContent};
 use crate::keymap::{ActionContext, ActionId};
-use crate::text::clip_cells;
+use crate::text::{clip_cells, display_width};
 use crate::theme::colors;
 use crate::ui::sessions::{truncate_cells, visible_window};
 
@@ -18,7 +18,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    if let Some(err) = &app.schedules.error {
+    if let Some(err) = app
+        .schedules
+        .error
+        .as_ref()
+        .filter(|_| app.schedules.schedules.is_empty())
+    {
         let error =
             Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::error()));
         f.render_widget(error, area);
@@ -36,7 +41,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Header
-    let header = if compact {
+    let mut header = if compact {
         Line::from(Span::styled(
             format!(" Schedules · {} configured", app.schedules.schedules.len()),
             Style::default()
@@ -77,20 +82,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             ),
         ])
     };
-    let header = Paragraph::new(header);
-    f.render_widget(header, chunks[0]);
+    if app.schedules.error.is_some() {
+        header.spans.insert(
+            1,
+            Span::styled(" · Refresh failed", Style::default().fg(colors::error())),
+        );
+    }
+    f.render_widget(Paragraph::new(header), chunks[0]);
 
     let body = chunks[1];
     let selected = app
         .schedules
         .selected
         .min(app.schedules.schedules.len().saturating_sub(1));
+    let selected_schedule = app.schedules.schedules.get(selected);
     let detail_width = body.width.saturating_sub(2);
-    let detail_limit = body.height.saturating_sub(2).min(3);
-    let detail = app
-        .schedules
-        .schedules
-        .get(selected)
+    let toggle = selected_schedule
+        .filter(|_| body.height > 2 && detail_width > 0)
+        .and_then(|schedule| toggle_line(app, schedule, usize::from(detail_width)));
+    let toggle_height = u16::from(toggle.is_some());
+    let detail_limit = body.height.saturating_sub(2 + toggle_height).min(3);
+    let detail = selected_schedule
         .and_then(|schedule| schedule.cadence_detail.as_deref())
         .filter(|text| !text.is_empty() && detail_width > 0 && detail_limit > 0)
         .map(|text| {
@@ -107,7 +119,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             .min(usize::from(detail_limit)) as u16
     });
     let list_area = Rect {
-        height: body.height - detail_height,
+        height: body.height - toggle_height - detail_height,
         ..body
     };
 
@@ -147,12 +159,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let list = Paragraph::new(lines);
     f.render_widget(list, list_area);
+    let detail_x = body.x.saturating_add(2);
+    if let Some(toggle) = toggle {
+        f.render_widget(
+            Paragraph::new(toggle),
+            Rect::new(detail_x, list_area.bottom(), detail_width, toggle_height),
+        );
+    }
     if let Some(detail) = detail {
         f.render_widget(
             detail,
             Rect::new(
-                body.x.saturating_add(2),
-                list_area.bottom(),
+                detail_x,
+                list_area.bottom() + toggle_height,
                 detail_width,
                 detail_height,
             ),
@@ -169,6 +188,47 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[2]);
+}
+
+fn toggle_line(
+    app: &App,
+    schedule: &crate::api::types::Schedule,
+    width: usize,
+) -> Option<Line<'static>> {
+    if app.schedules.toggle_pending_for(&schedule.id) {
+        return Some(Line::styled(
+            "Saving schedule…",
+            Style::default().fg(colors::subtle()),
+        ));
+    }
+    if app.schedules.has_pending_toggle() {
+        return Some(Line::styled(
+            "Saving another schedule…",
+            Style::default().fg(colors::subtle()),
+        ));
+    }
+
+    let enabled = schedule.enabled?;
+    let label = if enabled { "Disable" } else { "Enable" };
+    let key = app
+        .keymap
+        .primary_hint(ActionContext::Schedules, ActionId::ToggleScheduleEnabled);
+    let key = clip_schedule_text(&key, width.saturating_sub(label.len() + 1));
+    let action = format!("{key} {label}");
+    let error_width = width.saturating_sub(display_width(&action) + 3);
+    let mut spans = vec![Span::styled(action, Style::default().fg(colors::brand()))];
+    if let Some(error) = app
+        .schedules
+        .toggle_error_for(&schedule.id)
+        .filter(|_| error_width > 0)
+    {
+        let text = clip_schedule_text(error, error_width);
+        spans.push(Span::styled(
+            format!(" · {text}"),
+            Style::default().fg(colors::error()),
+        ));
+    }
+    Some(Line::from(spans))
 }
 
 pub(super) fn render_runs(f: &mut Frame, app: &App) {
@@ -476,6 +536,73 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn compact_schedule_toggle_shows_selected_action_and_remapped_key() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.connected = true;
+        app.status_message = "Ready".into();
+        app.schedules.schedules = (0..3).map(schedule).collect();
+        let release = &mut app.schedules.schedules[0];
+        release.name = Some("Release digest".into());
+        release.cron = Some("weekly".into());
+        release.cadence_detail = Some("Weekly Mon, Wed at 08:30 UTC".into());
+        app.schedules.schedules[1].name = Some("Weekly archive".into());
+        app.schedules.schedules[2].enabled = None;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let ready = terminal_rows(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_TOGGLE").is_some() {
+            eprintln!("SCHEDULE TOGGLE PREVIEW\n{ready}\nEND SCHEDULE TOGGLE PREVIEW");
+        }
+        for expected in [
+            "› Release digest",
+            "t Disable",
+            "Weekly Mon, Wed at 08:30 UTC",
+            "Enter runs",
+            "r run now",
+        ] {
+            assert!(ready.contains(expected), "missing {expected:?}\n{ready}");
+        }
+
+        let remapped = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedules","action":"toggle-schedule-enabled","keys":["/","F8"]}
+            ]}"#,
+        )
+        .unwrap();
+        app.set_keymap(remapped, None);
+        app.schedules.selected = 1;
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let disabled = terminal_rows(&terminal);
+        assert!(disabled.contains("› Weekly archive"), "{disabled}");
+        assert!(disabled.contains("/ Enable"), "{disabled}");
+        assert!(!disabled.contains("t Disable"), "{disabled}");
+
+        app.schedules.error = Some("RAW_REFRESH_DIAGNOSTIC".into());
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let stale = terminal_rows(&terminal);
+        for expected in [
+            "Refresh failed",
+            "› Weekly archive",
+            "/ Enable",
+            "Enter runs",
+            "r run now",
+        ] {
+            assert!(stale.contains(expected), "missing {expected:?}\n{stale}");
+        }
+        assert!(!stale.contains("RAW_REFRESH_DIAGNOSTIC"), "{stale}");
+
+        app.schedules.error = None;
+        app.schedules.selected = 2;
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let unknown = terminal_rows(&terminal);
+        assert!(!unknown.contains("/ Enable"), "{unknown}");
+        assert!(unknown.contains("Enter runs"), "{unknown}");
+        assert!(unknown.contains("r run now"), "{unknown}");
     }
 
     #[test]

@@ -233,6 +233,7 @@ pub(crate) enum ActionId {
     ShowTools,
     NewSchedule,
     RunSchedule,
+    ToggleScheduleEnabled,
     CancelScheduledRun,
     NextField,
     PreviousField,
@@ -1351,6 +1352,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [(Schedules, "r")]
     ),
     spec!(
+        ToggleScheduleEnabled,
+        "Enable or disable schedule",
+        "Change whether the selected schedule runs automatically",
+        false,
+        [Schedules],
+        [(Schedules, "t")]
+    ),
+    spec!(
         CancelScheduledRun,
         "Cancel scheduled run",
         "Request cancellation of the selected active schedule occurrence",
@@ -2465,6 +2474,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn schedule_toggle_is_remappable_and_press_only() {
+        let defaults = Keymap::default();
+        let remapped = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedules","action":"toggle-schedule-enabled","keys":["/","F8"]}
+            ]}"#,
+        )
+        .unwrap();
+        let action = ActionId::ToggleScheduleEnabled;
+        for (keymap, trigger) in [(&defaults, 't'), (&remapped, '/')] {
+            assert_eq!(
+                keymap.resolve(
+                    &[ActionContext::Schedules, ActionContext::Global],
+                    &mut None,
+                    key(KeyCode::Char(trigger), KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::Action {
+                    context: ActionContext::Schedules,
+                    action,
+                }
+            );
+            assert_eq!(
+                keymap.resolve(
+                    &[ActionContext::ScheduleRuns, ActionContext::Global],
+                    &mut None,
+                    key(KeyCode::Char(trigger), KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::NoMatch
+            );
+        }
+        assert!(!action.repeatable());
     }
 
     #[test]
