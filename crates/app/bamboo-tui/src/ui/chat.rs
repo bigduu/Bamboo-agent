@@ -1668,6 +1668,7 @@ mod tests {
         let source = concat!(
             "Build report\n\n",
             "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/notes)\n",
+            "![See [guide](https://example.test/guide)](assets/chart.png)\n",
             "Missing description: ![](assets/empty.png)\n",
             "Inline example: `![inline](assets/code.png)`\n\n",
             "```md\n![fenced](assets/fence.png)\n```\n",
@@ -1697,8 +1698,11 @@ mod tests {
                 description.replace(' ', ""),
                 "build_route输出🧪·notes(https://example.test/notes)"
             );
+            assert!(rows.iter().any(|row| row.trim_end() == "See guide"));
             assert!(rendered.contains("Missing description: [Image]"));
             assert!(!rendered.contains("assets/run(2).png"));
+            assert!(!rendered.contains("https://example.test/guide"));
+            assert!(!rendered.contains("assets/chart.png"));
             assert!(!rendered.contains("assets/empty.png"));
             assert!(rendered.contains("Inline example: ![inline](assets/code.png)"));
             assert!(fence_rows(&rows, "md")[1].contains("![fenced](assets/fence.png)"));
@@ -1711,6 +1715,8 @@ mod tests {
         const INTRO: &str = "Build report [notes](https://example.test/notes)\n\n";
         const ALT: &str = "![build_route 输出 🧪";
         const DESTINATION: &str = "](assets/run(2).png";
+        const LINKED_ALT_PARTIAL: &str =
+            "![See [guide](https://example.test/guide)](assets/chart.png";
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("run:image-alt".into());
@@ -1758,6 +1764,28 @@ mod tests {
             assert_eq!(
                 app.chat.current_response,
                 format!("{INTRO}{ALT}{DESTINATION}) ready.")
+            );
+
+            app.chat.current_response = format!("{INTRO}{LINKED_ALT_PARTIAL}");
+            let partial_linked_image = transcript_rows(&mut terminal, &app, true);
+            assert!(
+                partial_linked_image
+                    .iter()
+                    .any(|row| row.trim_end() == LINKED_ALT_PARTIAL),
+                "missing literal linked description at {width} columns\n{}",
+                partial_linked_image.join("\n")
+            );
+            app.chat.current_response.push(')');
+            let completed_linked_image = transcript_rows(&mut terminal, &app, true);
+            assert!(completed_linked_image
+                .iter()
+                .any(|row| row.trim_end() == "See guide"));
+            assert!(completed_linked_image.iter().all(|row| {
+                !row.contains("https://example.test/guide") && !row.contains("assets/chart.png")
+            }));
+            assert_eq!(
+                app.chat.current_response,
+                format!("{INTRO}{LINKED_ALT_PARTIAL})")
             );
         }
     }

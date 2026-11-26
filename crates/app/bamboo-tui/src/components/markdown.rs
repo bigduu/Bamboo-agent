@@ -463,9 +463,14 @@ type InlineChars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 /// the destination, optional title, and outer parenthesis are all complete.
 fn take_inline_image(chars: &mut InlineChars<'_>) -> String {
     let mut literal = String::from("![");
-    take_image_label(chars, &mut literal);
-    let alt_end = literal.len();
+    let label = take_image_label(chars, &mut literal);
     if chars.next_if_eq(&']').is_none() {
+        // Without the outer label closer, the first complete link can
+        // belong to the surrounding prose.
+        if let Some((start, length)) = label.first_link {
+            *chars = start;
+            literal.truncate(length);
+        }
         return literal;
     }
     literal.push(']');
@@ -477,23 +482,21 @@ fn take_inline_image(chars: &mut InlineChars<'_>) -> String {
         return literal;
     }
 
-    let alt = &literal[2..alt_end];
-    if alt.trim().is_empty() {
-        return "[Image]".into();
+    if label.text.trim().is_empty() {
+        "[Image]".into()
+    } else {
+        label.text
     }
-    let mut rendered = String::with_capacity(alt.len());
-    let mut chars = alt.chars().peekable();
-    while let Some(ch) = chars.next() {
-        rendered.push(if ch == '\\' {
-            chars.next_if(char::is_ascii_punctuation).unwrap_or(ch)
-        } else {
-            ch
-        });
-    }
-    rendered
 }
 
-fn take_image_label(chars: &mut InlineChars<'_>, literal: &mut String) {
+struct ImageLabel<'a> {
+    text: String,
+    first_link: Option<(InlineChars<'a>, usize)>,
+}
+
+fn take_image_label<'a>(chars: &mut InlineChars<'a>, literal: &mut String) -> ImageLabel<'a> {
+    let mut text = String::new();
+    let mut first_link = None;
     let mut depth = 0;
     let mut nested_start = None;
     while let Some(&ch) = chars.peek() {
@@ -501,7 +504,7 @@ fn take_image_label(chars: &mut InlineChars<'_>, literal: &mut String) {
             break;
         }
         if ch == '[' && depth == 0 {
-            nested_start = Some((chars.clone(), literal.len()));
+            nested_start = Some((chars.clone(), literal.len(), text.len()));
         }
         chars.next();
         literal.push(ch);
@@ -509,19 +512,35 @@ fn take_image_label(chars: &mut InlineChars<'_>, literal: &mut String) {
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
-                // Leave a nested link opener for the ordinary inline scan.
-                if depth == 0 && chars.peek() == Some(&'(') {
-                    if let Some((start, length)) = nested_start {
-                        *chars = start;
-                        literal.truncate(length);
+                if depth == 0 && chars.next_if_eq(&'(').is_some() {
+                    let target_start = literal.len();
+                    literal.push('(');
+                    if take_image_target(chars, literal) && chars.next_if_eq(&')').is_some() {
+                        literal.push(')');
+                        if let Some((start, length, text_start)) = nested_start.take() {
+                            // Only the inner label belongs in the projected alt.
+                            text.remove(text_start);
+                            first_link.get_or_insert((start, length));
+                        }
+                    } else {
+                        text.push(']');
+                        text.push_str(&literal[target_start..]);
                     }
-                    break;
+                    continue;
                 }
             }
-            '\\' => literal.extend(chars.next_if(char::is_ascii_punctuation)),
+            '\\' => {
+                if let Some(escaped) = chars.next_if(char::is_ascii_punctuation) {
+                    literal.push(escaped);
+                    text.push(escaped);
+                    continue;
+                }
+            }
             _ => {}
         }
+        text.push(ch);
     }
+    ImageLabel { text, first_link }
 }
 
 fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
@@ -1012,6 +1031,33 @@ mod tests {
             render("![draft](assets/pending_chart.png [docs](https://example.test)"),
             ["![draft](assets/pending_chart.png docs (https://example.test)"]
         );
+        assert_eq!(
+            render("![draft [first](one.md) and [second](two.md)"),
+            ["![draft first (one.md) and second (two.md)"]
+        );
+    }
+
+    #[test]
+    fn direct_links_inside_complete_image_labels_contribute_only_text() {
+        assert_eq!(
+            render("![See [guide](https://example.test)](chart.png)"),
+            ["See guide"]
+        );
+        assert_eq!(
+            render(
+                r#"![See [guide \]](<assets/guide (new).md> "Reference )") and [notes](notes.md)](chart.png)"#
+            ),
+            ["See guide ] and notes"]
+        );
+    }
+
+    #[test]
+    fn closed_image_label_with_an_inner_link_stays_literal_until_its_target_closes() {
+        let label = "![See [guide](https://example.test)]";
+        for target in ["", "(", "(assets/chart_(new).png"] {
+            let image = format!("{label}{target}");
+            assert_eq!(render(&image), [image.as_str()], "{image:?}");
+        }
     }
 
     #[test]
