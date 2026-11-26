@@ -132,13 +132,17 @@ pub async fn detail(
 mod tests {
     use super::*;
     use actix_web::{test, App};
+    use bamboo_agent_core::{Tool, ToolCtx, ToolOutcome};
     use bamboo_domain::{ModelTokenUsage, Session, Storage};
     use bamboo_infrastructure::telemetry::{test_support::LocalTraceTest, Observation, Outcome};
+    use bamboo_tools::tools::GrepTool;
 
     #[actix_web::test]
     async fn authenticates_and_isolates_real_local_spans_with_pagination() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x5a; 32]);
         let temp = tempfile::tempdir().unwrap();
+        let grep_input = temp.path().join("trace-input.txt");
+        std::fs::write(&grep_input, "search needle\n").unwrap();
         let state = web::Data::new(
             AppState::new(temp.path().canonicalize().unwrap())
                 .await
@@ -174,6 +178,16 @@ mod tests {
                             ..Default::default()
                         });
                         llm.finish(Outcome::Success);
+                        let grep = Observation::tool("Grep", "trace-grep", &one.id, "trace-round");
+                        let result = grep
+                            .scope(GrepTool::new().invoke(
+                                serde_json::json!({ "pattern": "needle", "path": grep_input }),
+                                ToolCtx::none("trace-grep"),
+                            ))
+                            .await
+                            .unwrap();
+                        assert!(matches!(result, ToolOutcome::Completed(result) if result.success));
+                        grep.finish(Outcome::Success);
                     })
                     .await;
                     root.finish(Outcome::Success);
@@ -268,6 +282,13 @@ mod tests {
         let llm = spans.iter().find(|span| span["kind"] == "llm").unwrap();
         assert_eq!(llm["usage"]["cache_read_input_tokens"], 0);
         assert!(llm["usage"]["cache_creation_input_tokens"].is_null());
+        let grep = spans.iter().find(|span| span["kind"] == "tool").unwrap();
+        assert_eq!(grep["performance"]["grep_bytes_scanned"], 14);
+        assert!(grep["performance"]["grep_read_buffer_peak_capacity_bytes"]
+            .as_u64()
+            .is_some_and(|capacity| capacity >= 14));
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        assert!(grep["performance"]["grep_scan_cpu_us"].as_u64().is_some());
         let other_uri = format!("/api/v1/sessions/trace-api-two/traces/{trace_id}");
         assert_eq!(
             test::call_service(&app, request(&other_uri)).await.status(),
