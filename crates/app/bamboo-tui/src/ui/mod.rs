@@ -1,4 +1,5 @@
 pub mod chat;
+mod code_fences;
 pub mod config;
 pub mod layout;
 pub mod mcp;
@@ -113,6 +114,7 @@ fn render_overlays(f: &mut Frame, app: &App, anchor: Option<Rect>, inline_approv
         permissions::render_rule_confirm(f, app);
     }
 
+    code_fences::render(f, app);
     schedules::render_runs(f, app);
 
     if app.schedule_form.is_some() {

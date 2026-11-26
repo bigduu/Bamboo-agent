@@ -28,10 +28,20 @@ pub(super) enum FenceKind<'a> {
     Mermaid { language: &'a str },
 }
 
+impl<'a> FenceKind<'a> {
+    pub(super) fn language(self) -> Option<&'a str> {
+        match self {
+            Self::Code { language } => language,
+            Self::Mermaid { language } => Some(language),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FencedBlock<'a> {
     pub kind: FenceKind<'a>,
     pub source: &'a str,
+    pub closed: bool,
 }
 
 /// Read one fenced block from consecutive lines of `source`. An unfinished
@@ -54,11 +64,13 @@ pub(super) fn take_fence<'a>(
     };
 
     let mut end = opening.end;
+    let mut closed = false;
     for line in input {
         if fence_prefix(line.text).is_some_and(|(closing_marker, closing_length, rest)| {
             closing_marker == marker && closing_length >= length && rest.trim().is_empty()
         }) {
             end = line.start;
+            closed = true;
             break;
         }
         end = line.end;
@@ -66,6 +78,7 @@ pub(super) fn take_fence<'a>(
     Some(FencedBlock {
         kind,
         source: &source[opening.end..end],
+        closed,
     })
 }
 
@@ -124,6 +137,7 @@ mod tests {
                     language: Some("rust"),
                 },
                 source: "  let value = \"界👩‍💻\";\r\n```\r\n~~~~\r\n```` trailing\r\n\r\n",
+                closed: true,
             }
         );
         assert_eq!(input.next().unwrap().text, "visible prose");
@@ -141,6 +155,7 @@ mod tests {
                     language: "Mermaid",
                 },
                 source: "flowchart LR\n  A --> B\n",
+                closed: true,
             })
         );
         let opening = input.next().unwrap();
@@ -149,6 +164,7 @@ mod tests {
             Some(FencedBlock {
                 kind: FenceKind::Code { language: None },
                 source: "",
+                closed: true,
             })
         );
         assert_eq!(input.next().unwrap().text, "last");
@@ -161,12 +177,14 @@ mod tests {
         let opening = input.next().unwrap();
         let fenced = take_fence(source, opening, &mut input).unwrap();
         assert_eq!(fenced.source, "  echo 界\r\n👩‍💻");
+        assert!(!fenced.closed);
         assert!(input.next().is_none());
 
         let mut limited = source_lines(source).take(2);
         let opening = limited.next().unwrap();
         let fenced = take_fence(source, opening, &mut limited).unwrap();
         assert_eq!(fenced.source, "  echo 界\r\n");
+        assert!(!fenced.closed);
     }
 
     #[test]
