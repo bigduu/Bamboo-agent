@@ -93,7 +93,9 @@ fn projected_object_fields(schema: &Value) -> (Map<String, Value>, BTreeSet<Stri
             for (name, field) in fields {
                 // An explicit parent definition takes precedence. A branch that
                 // forbids a field in a choice contributes no value for that field.
-                if properties.contains_key(&name) || (keyword != "allOf" && field == false) {
+                if properties.contains_key(&name)
+                    || (keyword != "allOf" && is_always_false_schema(&field))
+                {
                     continue;
                 }
                 let variants = branch_properties.entry(name).or_default();
@@ -120,6 +122,17 @@ fn projected_object_fields(schema: &Value) -> (Map<String, Value>, BTreeSet<Stri
     }
 
     (properties, required)
+}
+
+fn is_always_false_schema(schema: &Value) -> bool {
+    schema == false
+        || schema.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object
+                    .get("not")
+                    .and_then(Value::as_object)
+                    .is_some_and(Map::is_empty)
+        })
 }
 
 /// Canonical object ordering for provider-visible schemas; array order is semantic.
@@ -218,6 +231,31 @@ mod tests {
                     "limit": {"allOf": [{"type": "integer"}, {"minimum": 1}]}
                 },
                 "required": ["mode", "details", "limit", "scope"]
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_skips_equivalent_forbidden_fields_in_choice_branches() {
+        let forbidden = json!({"not": {}});
+        let non_null = json!({"not": {"type": "null"}});
+        let input = json!({
+            "oneOf": [
+                {"properties": {"value": {"type": "string"}, "absent": false}},
+                {"properties": {"value": forbidden, "absent": forbidden, "result": non_null}}
+            ],
+            "allOf": [{"properties": {"always_forbidden": forbidden}}]
+        });
+
+        assert_eq!(
+            sanitize_anthropic_tool_input_schema(&input),
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "result": non_null,
+                    "always_forbidden": forbidden
+                }
             })
         );
     }
