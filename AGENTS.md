@@ -209,6 +209,14 @@ write-ahead checkpoint. Finalize through the original publisher's failed jobs
 after authenticated readback. See the
 [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261147-crate-recovery).
 
+The fixed `v2026.11.48` recovery in #3115 retains the original
+`bamboo-config` archive after an HTTP 500 from crates.io. Recovery verifies
+the five published prefix crates, the six retained crate archives, the sealed
+frontend and five native transports. The 25 unstarted tail crates may compile
+behind the existing signed write-ahead checkpoint. The original publisher
+finalizes after authenticated recovery readback. See the
+[fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261148-crate-recovery).
+
 The Bamboo npm workflow is a consumer of the completed v3 Release. Use its
 exact source, manifest and publisher attempt. The preparation job owns npm
 packing and the publishing job uses that verified tarball. See the
