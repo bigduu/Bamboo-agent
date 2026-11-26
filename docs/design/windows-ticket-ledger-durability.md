@@ -148,6 +148,11 @@ an unused sibling `-ReceiptPath`. Its verdict describes the exact directory acce
 token, and filesystem tested. The scratch rename and warm reopen record operational behavior.
 The receipt explicitly leaves ordered crash persistence unproven.
 
+Add `-f windows_ticket_probe_case=writer-lock` to select the writer fixture. Its receipt records
+independent process and handle contention, reacquisition after release and process exit, and
+the ordinary and POSIX name tests. A changed lock identity or inconclusive name control yields
+an unavailable writer verdict. The default case remains `directory-flush`.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |
