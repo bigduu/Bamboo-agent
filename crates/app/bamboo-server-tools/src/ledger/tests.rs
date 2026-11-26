@@ -338,8 +338,31 @@ async fn query_filters_by_status_and_time_window() {
 
 #[tokio::test]
 async fn agenda_returns_buckets() {
+    use bamboo_domain::DiscoverCapabilitiesRequest;
+    use bamboo_skills::capability_discovery::{
+        project_tool_capability_metadata, CapabilityDiscoveryIndex,
+    };
+    use bamboo_skills::WorkflowCatalogSnapshot;
+
     let dir = tempfile::tempdir().unwrap();
     let (tool, _storage) = build_tool(dir.path());
+
+    let empty_catalog = WorkflowCatalogSnapshot::default();
+    let index = CapabilityDiscoveryIndex::from_snapshots(
+        project_tool_capability_metadata(&[tool.to_schema()]),
+        &empty_catalog,
+        &empty_catalog,
+        &Default::default(),
+    );
+    let found = index
+        .discover(&DiscoverCapabilitiesRequest {
+            query: "upcoming agenda".into(),
+            kinds: None,
+            limit: Some(1),
+        })
+        .unwrap();
+    assert_eq!(found.matches[0].capability_ref, "tool:ledger");
+    assert!(found.matches[0].summary.contains("agenda action"));
 
     invoke(
         &tool,
@@ -352,7 +375,9 @@ async fn agenda_returns_buckets() {
     )
     .await;
 
-    let agenda = invoke(&tool, "session-1", serde_json::json!({"action": "agenda"})).await;
+    let args = serde_json::json!({"action": "agenda"});
+    assert_eq!(tool.classify(&args), ToolClass::READONLY_PARALLEL);
+    let agenda = invoke(&tool, "session-1", args).await;
     assert_eq!(agenda["agenda"]["overdue"][0]["title"], "Yesterday's thing");
 }
 

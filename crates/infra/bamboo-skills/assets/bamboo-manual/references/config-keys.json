@@ -204,10 +204,10 @@
       "aliases": [
         "memory.memory_ledger_agenda_injection"
       ],
-      "default": true,
-      "example": false,
+      "default": false,
+      "example": true,
       "key": "memory.ledger_agenda_injection",
-      "meaning": "Inject the applicable ledger agenda; an empty agenda adds no section.",
+      "meaning": "Opt in to including open ledger records in model requests.",
       "section": "memory",
       "type": "bool"
     },
