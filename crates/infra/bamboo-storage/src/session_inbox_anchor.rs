@@ -126,6 +126,26 @@ impl InboxAnchor {
         platform::exists(&parent, &parts.name)
     }
 
+    /// Legacy ACK reads already-persisted files independently of today's
+    /// delivery limits. Keep the no-follow, regular-file check for those reads.
+    pub(super) fn read_legacy_ack(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+
+        let parts = self.parts(path)?;
+        let parent = self.parent_handle(&parts.parents, false)?;
+        let mut file = platform::open_read_file(&parent, &parts.name)?;
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        if !metadata.is_file() {
+            return Err(invalid("Inbox anchor read target is not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Read an existing regular file relative to the retained Inbox, without
     /// following a link at any component. Returns `None` when the name is absent.
     pub(super) fn read_existing(
@@ -292,13 +312,17 @@ mod platform {
         }
     }
 
-    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
-        use std::io::Read;
-        let file = open_child_file(
+    pub(super) fn open_read_file(parent: &File, name: &OsStr) -> std::io::Result<File> {
+        open_child_file(
             parent.as_raw_fd(),
             &c_name(name)?,
             libc::O_RDONLY | libc::O_NONBLOCK,
-        )?;
+        )
+    }
+
+    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = open_read_file(parent, name)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(invalid("Inbox anchor read target is not a regular file"));
@@ -749,17 +773,20 @@ mod platform {
         }
     }
 
-    /// Read an existing regular file without following a reparse point. The
-    /// relative open already validates the object is a non-reparse disk file.
-    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
-        use std::io::Read;
-        let file = open_relative(
+    /// The relative open validates the object is a non-reparse disk file.
+    pub(super) fn open_read_file(parent: &File, name: &OsStr) -> std::io::Result<File> {
+        open_relative(
             parent,
             name,
             false,
             FILE_OPEN,
             FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        )?;
+        )
+    }
+
+    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = open_read_file(parent, name)?;
         let metadata = file.metadata()?;
         if metadata.len() > limit as u64 {
             return Err(rejected("Inbox anchor read target exceeds byte limit"));
@@ -859,6 +886,10 @@ impl InboxAnchor {
     }
 
     pub(super) fn entry_exists(&self, _: &Path) -> std::io::Result<bool> {
+        Err(unsupported())
+    }
+
+    pub(super) fn read_legacy_ack(&self, _: &Path) -> std::io::Result<Vec<u8>> {
         Err(unsupported())
     }
 

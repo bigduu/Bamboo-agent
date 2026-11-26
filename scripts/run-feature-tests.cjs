@@ -289,7 +289,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3134 updates the feature-sensitive Config source. Ledger regressions stay
 // with the default Config and Server Tools owners in packages-4 and Engine in
 // packages-3. The five additive contexts and 23 cases retain their owners.
-const FEATURE_SOURCE_SHA256 = "81749702069788de338b999d8491ef05600c3f96a3a11c8048f9846e16ce8d5d";
+// #2423 anchors the legacy ACK in existing feature-sensitive Inbox modules.
+// Its ordinary receipt regressions belong to the default storage packages-0 owner.
+const FEATURE_SOURCE_SHA256 = "8d7d06e5522e40b3499635e02db218c61f26dcff0c592bc6d9122ccadf0b4350";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
