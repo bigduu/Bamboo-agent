@@ -32453,6 +32453,104 @@ mod run_status_tests {
     }
 
     #[test]
+    fn atx_closing_markers_follow_stream_boundaries_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use crate::theme::ColorRole;
+        use ratatui::style::Modifier;
+
+        let mut app = running_app("session-atx", "run-atx");
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let steps: [(&str, &[&str]); 5] = [
+            ("# Build *next* ###", &["Build next ###"]),
+            (
+                "\r\n## Release `trace` ##",
+                &["Build next", "Release trace ##"],
+            ),
+            ("\n### Review ###", &["Release trace", "Review ###"]),
+            (" is literal", &["Review ### is literal"]),
+            (
+                "\n# Final *plan* ##",
+                &["Review ### is literal", "Final plan ##"],
+            ),
+        ];
+        let mut source = String::new();
+        for (delta, expected) in steps {
+            source.push_str(delta);
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            let text = terminal_text(&terminal);
+            for expected in expected {
+                assert!(
+                    text.lines().any(|row| row.trim() == *expected),
+                    "missing {expected:?}\n{text}"
+                );
+            }
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                source.as_bytes()
+            );
+        }
+
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let completed = terminal_text(&terminal);
+        assert!(
+            completed.lines().any(|row| row.trim() == "Final plan"),
+            "{completed}"
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-atx".into(),
+            role: "assistant".into(),
+            content: source.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        let restored = terminal_text(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_CLOSE").is_some() {
+            eprintln!("ATX CLOSE PREVIEW\n{restored}\nEND ATX CLOSE PREVIEW");
+        }
+        let title_row = |title: &str| {
+            restored
+                .lines()
+                .position(|row| row.trim() == title)
+                .unwrap_or_else(|| panic!("missing {title:?}\n{restored}"))
+        };
+        let cells = terminal.backend().buffer().content();
+        let primary = cells.chunks(60).nth(title_row("Build next")).unwrap();
+        let secondary = cells.chunks(60).nth(title_row("Release trace")).unwrap();
+        let build = primary.iter().find(|cell| cell.symbol() == "B").unwrap();
+        let release = secondary.iter().find(|cell| cell.symbol() == "R").unwrap();
+        assert_eq!(build.fg, saved.theme.color(ColorRole::Brand));
+        assert!(build.modifier.contains(Modifier::BOLD));
+        assert!(release.modifier.contains(Modifier::BOLD));
+        assert!(primary
+            .iter()
+            .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+        assert!(secondary
+            .iter()
+            .any(|cell| cell.symbol() == "t" && cell.modifier.contains(Modifier::REVERSED)));
+        title_row("Review ### is literal");
+        title_row("Final plan");
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+    }
+
+    #[test]
     fn reducer_replay_is_idempotent_and_terminal_generations_never_regress() {
         fn reduce(state: &mut RunStatusState, replay: bool) {
             assert!(state.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));

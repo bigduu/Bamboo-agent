@@ -104,6 +104,15 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
 
         // Headings: 1–6 leading '#'.
         if let Some((level, content)) = heading(body) {
+            let line_complete = !streaming || source.as_bytes()[line.end - 1] == b'\n';
+            let content = if line_complete
+                && top_level_body(raw_line) == Some(body)
+                && previous_container.enclosing_list(indentation).is_none()
+            {
+                heading_without_closing_hashes(&body[level..]).unwrap_or(content)
+            } else {
+                content
+            };
             let line = if content.contains('`') || content.contains('*') {
                 Line::from(parse_inline(content)).style(heading_style(level))
             } else {
@@ -446,6 +455,18 @@ fn heading(body: &str) -> Option<(usize, &str)> {
         }
     }
     None
+}
+
+/// Inspect the tail with the opener's space still present, so a closing
+/// sequence can also follow an empty title.
+fn heading_without_closing_hashes(tail: &str) -> Option<&str> {
+    let end = tail.trim_end_matches([' ', '\t']);
+    let before_hashes = end.trim_end_matches('#');
+    if before_hashes.len() == end.len() || !before_hashes.ends_with([' ', '\t']) {
+        return None;
+    }
+    let title = before_hashes.trim_end_matches([' ', '\t']);
+    Some(title.strip_prefix(' ').unwrap_or(title))
 }
 
 fn heading_style(level: usize) -> Style {
@@ -952,6 +973,94 @@ mod tests {
         assert_eq!(out, vec!["H1", "H2", "H3", "H6"]);
         // 7 hashes is not a heading.
         assert_eq!(render("####### nope"), vec!["####### nope"]);
+    }
+
+    #[test]
+    fn atx_closing_hashes_trim_only_a_terminal_whitespace_delimited_run() {
+        for (closed, equivalent_title) in [
+            ("# Title ############ \t", "# Title"),
+            ("   ### **重点** 🧪 `code`\t#", "   ### **重点** 🧪 `code`"),
+            ("### ###", "### "),
+            ("##  Title ##", "##  Title"),
+        ] {
+            assert_eq!(
+                render_markdown(closed, 80),
+                render_markdown(equivalent_title, 80),
+                "{closed:?}"
+            );
+        }
+
+        for (source, display) in [
+            ("# C#", "C#"),
+            ("# Section # #", "Section #"),
+            ("# Title ### more", "Title ### more"),
+            (r"# Title \###", r"Title \###"),
+            (r"# Title #\##", r"Title #\##"),
+            ("# Title\u{a0}###", "Title\u{a0}###"),
+            ("# Title ###\u{a0}", "Title ###\u{a0}"),
+            ("# A `###`", "A ###"),
+            ("# A **###**", "A ###"),
+            ("####### Not a heading ##", "####### Not a heading ##"),
+            ("##\tTab opener ##", "##\tTab opener ##"),
+        ] {
+            assert_eq!(render(source), [display], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn streamed_atx_closing_hashes_wait_for_the_heading_line_to_finish() {
+        for partial in ["## Title #", "## Title ###", "## Title ### \t"] {
+            let live = render_streaming_markdown(partial, 80);
+            assert_eq!(text_of(&live[0]), &partial[3..]);
+            let completed = render_markdown(partial, 80);
+            assert_eq!(text_of(&completed[0]), "Title");
+            for ending in ["\n", "\r\n"] {
+                assert_eq!(
+                    render_streaming_markdown(&format!("{partial}{ending}"), 80),
+                    completed
+                );
+            }
+        }
+
+        assert_eq!(
+            text_of(&render_streaming_markdown("## Title ### continues\n", 80)[0]),
+            "Title ### continues"
+        );
+    }
+
+    #[test]
+    fn atx_closing_hashes_preserve_existing_container_and_code_boundaries() {
+        assert_eq!(
+            render(concat!(
+                "- Item\n",
+                "  ### Nested ###\n",
+                "    # Indented ###\n",
+                "\t# Tab indentation ###\n",
+                "\u{a0}# Unicode indentation ###\n",
+                "> # Quoted ###\n",
+                "# Top-level ###\n",
+            )),
+            [
+                "  • Item",
+                "Nested ###",
+                "Indented ###",
+                "Tab indentation ###",
+                "Unicode indentation ###",
+                "│ # Quoted ###",
+                "Top-level",
+            ]
+        );
+
+        let blocks = render(concat!(
+            "```md\n# Fenced ###\n```\n",
+            "Name | Status\n--- | ---\nAlpha | Ready\n",
+            "## Next section ###\n",
+        ));
+        assert!(blocks.iter().any(|row| row.contains("# Fenced ###")));
+        assert!(blocks
+            .iter()
+            .any(|row| row.contains("Alpha") && row.contains("Ready")));
+        assert_eq!(blocks.last().map(String::as_str), Some("Next section"));
     }
 
     #[test]
