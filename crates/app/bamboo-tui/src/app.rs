@@ -2083,9 +2083,55 @@ impl ScheduleRunsPane {
     }
 }
 
-struct ScheduleRunOpenOrigin {
+pub(crate) enum ScheduleSessionsContent {
+    Loading,
+    Loaded(Vec<SessionSummary>),
+    Failed(String),
+}
+
+pub(crate) struct ScheduleSessionsPane {
+    schedule_id: String,
     request_id: u64,
-    run_id: String,
+    pub(crate) name: String,
+    pub(crate) selected: usize,
+    pub(crate) rows_per_page: Cell<usize>,
+    pub(crate) content: ScheduleSessionsContent,
+    pub(crate) session_open_error: Option<&'static str>,
+}
+
+impl ScheduleSessionsPane {
+    pub(crate) fn new(schedule_id: String, name: String, request_id: u64) -> Self {
+        Self {
+            schedule_id,
+            request_id,
+            name,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+            content: ScheduleSessionsContent::Loading,
+            session_open_error: None,
+        }
+    }
+
+    pub(crate) fn selected_session(&self) -> Option<&SessionSummary> {
+        match &self.content {
+            ScheduleSessionsContent::Loaded(sessions) => sessions.get(self.selected),
+            _ => None,
+        }
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        if let ScheduleSessionsContent::Loaded(sessions) = &self.content {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(sessions.len().saturating_sub(1));
+        }
+    }
+}
+
+enum ScheduleSessionOpenOrigin {
+    Run { request_id: u64, run_id: String },
+    SessionList { request_id: u64 },
 }
 
 pub(crate) struct FenceCopyEntry {
@@ -5127,6 +5173,9 @@ pub struct App {
     pub schedule_form: Option<ScheduleForm>,
     pub(crate) schedule_runs: Option<ScheduleRunsPane>,
     schedule_runs_request_id: u64,
+    pub(crate) schedule_sessions: Option<ScheduleSessionsPane>,
+    schedule_sessions_request_id: u64,
+    schedule_sessions_task: Option<tokio::task::JoinHandle<()>>,
     pub(crate) fence_copy_picker: Option<FenceCopyPicker>,
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
@@ -5218,7 +5267,7 @@ pub struct App {
     /// Exact generation of `opening_session_id`, including failures. Repeated
     /// opens of the same session must not let request A satisfy request B.
     opening_session_epoch: u64,
-    opening_schedule_run: Option<ScheduleRunOpenOrigin>,
+    opening_schedule_session: Option<ScheduleSessionOpenOrigin>,
     /// At most one history/summary resume request may exist. Generation
     /// checks protect state; retaining the handle also bounds network tasks.
     opening_session_task: Option<tokio::task::JoinHandle<()>>,
@@ -5380,6 +5429,9 @@ impl App {
             schedule_form: None,
             schedule_runs: None,
             schedule_runs_request_id: 0,
+            schedule_sessions: None,
+            schedule_sessions_request_id: 0,
+            schedule_sessions_task: None,
             fence_copy_picker: None,
             config_editor: None,
             permission_editor: None,
@@ -5416,7 +5468,7 @@ impl App {
             question_draft_order: VecDeque::new(),
             opening_session_id: None,
             opening_session_epoch: 0,
-            opening_schedule_run: None,
+            opening_schedule_session: None,
             opening_session_task: None,
             picker_epoch: 0,
             model_picker_task: None,
@@ -5454,7 +5506,7 @@ impl App {
             task.abort();
         }
         self.opening_session_id = None;
-        self.opening_schedule_run = None;
+        self.opening_schedule_session = None;
     }
 
     fn take_active_context(&mut self) -> SessionUiContext {
@@ -5601,6 +5653,7 @@ impl App {
     fn prepare_visible_session_switch(&mut self) {
         self.terminal_settings = None;
         self.fence_copy_picker = None;
+        self.close_schedule_sessions();
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -7245,6 +7298,23 @@ impl App {
                     }
                 }
             }
+            AppEvent::ScheduleSessionsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            } => {
+                if let Some(pane) = self.schedule_sessions.as_mut().filter(|pane| {
+                    pane.request_id == request_id
+                        && pane.schedule_id == schedule_id
+                        && matches!(pane.content, ScheduleSessionsContent::Loading)
+                }) {
+                    self.schedule_sessions_task = None;
+                    pane.content = match result {
+                        Ok(sessions) => ScheduleSessionsContent::Loaded(sessions),
+                        Err(error) => ScheduleSessionsContent::Failed(error),
+                    };
+                }
+            }
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
@@ -7290,6 +7360,7 @@ impl App {
                 let deleted_opening =
                     succeeded && self.opening_session_id.as_deref() == Some(session_id.as_str());
                 if deleted_active {
+                    self.close_schedule_sessions();
                     // Detach before another input event can be handled. This
                     // preserves the deliberate model/Project/composer draft,
                     // while removing every server-backed trace of the deleted
@@ -7309,15 +7380,15 @@ impl App {
                         }
                         None
                     };
-                    let unrelated_schedule_run = self
-                        .opening_schedule_run
+                    let unrelated_schedule_session = self
+                        .opening_schedule_session
                         .take()
                         .filter(|_| unrelated_opening.is_some());
                     self.replace_with_new_session(false);
                     self.opening_session_id = unrelated_opening;
                     self.opening_session_epoch = unrelated_opening_epoch;
                     self.opening_session_task = unrelated_opening_task;
-                    self.opening_schedule_run = unrelated_schedule_run;
+                    self.opening_schedule_session = unrelated_schedule_session;
                 } else if deleted_opening {
                     self.cancel_opening_session();
                 }
@@ -7558,12 +7629,11 @@ impl App {
                 {
                     return Ok(());
                 }
-                let schedule_run = self.opening_schedule_run.take();
+                let schedule_origin = self.opening_schedule_session.take();
                 self.cancel_opening_session();
-                if schedule_run
-                    .as_ref()
-                    .is_some_and(|origin| !self.schedule_run_open_is_current(origin, &session_id))
-                {
+                if schedule_origin.as_ref().is_some_and(|origin| {
+                    !self.schedule_session_open_is_current(origin, &session_id)
+                }) {
                     return Ok(());
                 }
                 match result {
@@ -7578,15 +7648,15 @@ impl App {
                                     .unwrap_or(0)
                             };
                         if latest_observation_epoch > epoch {
-                            if schedule_run.is_none() {
+                            if schedule_origin.is_none() {
                                 self.status_message =
                                     "Session changed while loading — refreshing history"
                                         .to_string();
                             }
-                            self.resume_session_from(session_id, schedule_run);
+                            self.resume_session_from(session_id, schedule_origin);
                             return Ok(());
                         }
-                        if schedule_run.is_some() {
+                        if matches!(schedule_origin, Some(ScheduleSessionOpenOrigin::Run { .. })) {
                             self.schedule_runs = None;
                         }
                         let target_is_active =
@@ -7709,14 +7779,22 @@ impl App {
                         self.refresh_child_approvals(session_id);
                         self.discover_active_loop();
                     }
-                    Err(_) if schedule_run.is_some() => {
-                        if let Some(pane) = self.schedule_runs.as_mut() {
-                            pane.session_open_error = Some("Could not open this session");
+                    Err(error) => match schedule_origin {
+                        Some(ScheduleSessionOpenOrigin::Run { .. }) => {
+                            if let Some(pane) = self.schedule_runs.as_mut() {
+                                pane.session_open_error = Some("Could not open this session");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
-                    }
+                        Some(ScheduleSessionOpenOrigin::SessionList { .. }) => {
+                            if let Some(pane) = self.schedule_sessions.as_mut() {
+                                pane.session_open_error = Some("Could not open this session");
+                            }
+                        }
+                        None => self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to open session: {error}"),
+                        ),
+                    },
                 }
             }
             AppEvent::TaskPlanSnapshotLoaded {
@@ -8955,6 +9033,7 @@ impl App {
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
             || self.schedule_runs.is_some()
+            || self.schedule_sessions.is_some()
             || self.config_editor.is_some()
             || self.permission_editor.is_some()
             || self.permission_rule_confirm.is_some()
@@ -9691,6 +9770,7 @@ impl App {
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.schedule_runs.is_some()
+            || self.schedule_sessions.is_some()
             || self.fence_copy_picker.is_some()
             || self.config_editor.is_some()
             || self.terminal_settings.is_some()
@@ -9762,6 +9842,8 @@ impl App {
             ActionContext::CommandPalette
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
+        } else if self.schedule_sessions.is_some() {
+            ActionContext::ScheduleSessions
         } else if self.schedule_runs.is_some() {
             ActionContext::ScheduleRuns
         } else if self.fence_copy_picker.is_some() {
@@ -10129,6 +10211,7 @@ impl App {
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
+            ActionContext::ScheduleSessions => self.handle_schedule_sessions_key(key),
             ActionContext::FenceCopyPicker => {
                 self.handle_fence_copy_picker_key(key, copy_via_osc52)
             }
@@ -12461,11 +12544,24 @@ impl App {
     fn resume_session_from(
         &mut self,
         session_id: String,
-        schedule_run: Option<ScheduleRunOpenOrigin>,
+        schedule_origin: Option<ScheduleSessionOpenOrigin>,
     ) {
         self.cancel_opening_session();
-        let from_schedule_run = schedule_run.is_some();
-        if !from_schedule_run && self.activate_cached_session(&session_id) {
+        let require_history_identity = matches!(
+            &schedule_origin,
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        );
+        let mismatch_error = match &schedule_origin {
+            Some(ScheduleSessionOpenOrigin::Run { .. }) => {
+                Some("session response did not match the selected run")
+            }
+            Some(ScheduleSessionOpenOrigin::SessionList { .. }) => {
+                Some("session response did not match the selected session")
+            }
+            None => None,
+        };
+        let from_schedule = mismatch_error.is_some();
+        if !from_schedule && self.activate_cached_session(&session_id) {
             return;
         }
         let Some(tx) = self.event_tx.clone() else {
@@ -12475,10 +12571,10 @@ impl App {
         self.opening_session_id = Some(session_id.clone());
         self.opening_session_epoch = summary_observation_epoch;
         let client = self.client.clone();
-        if !from_schedule_run {
+        if !from_schedule {
             self.status_message = "Resuming session...".to_string();
         }
-        self.opening_schedule_run = schedule_run;
+        self.opening_schedule_session = schedule_origin;
         self.opening_session_task = Some(tokio::spawn(async move {
             // Bracket history with two summary reads. If completion or a
             // permission transition lands between them, retry so a terminal
@@ -12521,15 +12617,16 @@ impl App {
                         return;
                     }
                 };
-                if from_schedule_run
-                    && (before.id != session_id
+                if let Some(error) = mismatch_error.filter(|_| {
+                    before.id != session_id
                         || after.id != session_id
-                        || (!history.session_id.is_empty() && history.session_id != session_id))
-                {
+                        || (history.session_id != session_id
+                            && (require_history_identity || !history.session_id.is_empty()))
+                }) {
                     let _ = tx.send(AppEvent::SessionOpened {
                         session_id,
                         epoch: summary_observation_epoch,
-                        result: Err("session response did not match the selected run".to_string()),
+                        result: Err(error.to_string()),
                     });
                     return;
                 }
@@ -14965,6 +15062,7 @@ impl App {
                 self.schedule_form = Some(ScheduleForm::default());
             }
             Some(ActionId::Activate) => self.open_schedule_runs(),
+            Some(ActionId::OpenScheduleSessions) => self.open_schedule_sessions(),
             Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
@@ -15112,6 +15210,7 @@ impl App {
         };
         let schedule_id = schedule.id.clone();
         let name = schedule.name.as_deref().unwrap_or("(unnamed)").to_owned();
+        self.close_schedule_sessions();
         self.schedule_runs_request_id = self.schedule_runs_request_id.wrapping_add(1);
         let request_id = self.schedule_runs_request_id;
         self.cancel_schedule_run_session_open();
@@ -15186,29 +15285,50 @@ impl App {
         });
     }
 
-    fn schedule_run_open_is_current(
+    fn schedule_session_open_is_current(
         &self,
-        origin: &ScheduleRunOpenOrigin,
+        origin: &ScheduleSessionOpenOrigin,
         session_id: &str,
     ) -> bool {
-        self.schedule_runs.as_ref().is_some_and(|pane| {
-            pane.request_id == origin.request_id
-                && pane
-                    .selected_run()
-                    .is_some_and(|run| run.run_id == origin.run_id)
-                && pane.selected_session_id() == Some(session_id)
-        })
+        match origin {
+            ScheduleSessionOpenOrigin::Run { request_id, run_id } => {
+                self.schedule_runs.as_ref().is_some_and(|pane| {
+                    pane.request_id == *request_id
+                        && pane.selected_run().is_some_and(|run| run.run_id == *run_id)
+                        && pane.selected_session_id() == Some(session_id)
+                })
+            }
+            ScheduleSessionOpenOrigin::SessionList { request_id } => {
+                self.schedule_sessions.as_ref().is_some_and(|pane| {
+                    pane.request_id == *request_id
+                        && pane
+                            .selected_session()
+                            .is_some_and(|session| session.id == session_id)
+                })
+            }
+        }
+    }
+
+    fn active_schedule_session_open(&self) -> Option<&ScheduleSessionOpenOrigin> {
+        self.opening_schedule_session
+            .as_ref()
+            .zip(self.opening_session_id.as_deref())
+            .filter(|(origin, id)| self.schedule_session_open_is_current(origin, id))
+            .map(|(origin, _)| origin)
     }
 
     pub(crate) fn schedule_run_session_is_opening(&self) -> bool {
-        self.opening_schedule_run
-            .as_ref()
-            .zip(self.opening_session_id.as_deref())
-            .is_some_and(|(origin, id)| self.schedule_run_open_is_current(origin, id))
+        matches!(
+            self.active_schedule_session_open(),
+            Some(ScheduleSessionOpenOrigin::Run { .. })
+        )
     }
 
     fn cancel_schedule_run_session_open(&mut self) {
-        if self.opening_schedule_run.is_some() {
+        if matches!(
+            self.opening_schedule_session,
+            Some(ScheduleSessionOpenOrigin::Run { .. })
+        ) {
             self.cancel_opening_session();
         }
     }
@@ -15223,7 +15343,7 @@ impl App {
         let Some((run, session_id)) = pane.selected_run().zip(pane.selected_session_id()) else {
             return;
         };
-        let origin = ScheduleRunOpenOrigin {
+        let origin = ScheduleSessionOpenOrigin::Run {
             request_id: pane.request_id,
             run_id: run.run_id.clone(),
         };
@@ -15266,6 +15386,110 @@ impl App {
         if pane.selected != selected {
             pane.session_open_error = None;
             self.cancel_schedule_run_session_open();
+        }
+    }
+
+    fn open_schedule_sessions(&mut self) {
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let schedule_id = schedule.id.clone();
+        let name = schedule.name.as_deref().unwrap_or("(unnamed)").to_owned();
+        self.cancel_schedule_run_session_open();
+        self.schedule_runs = None;
+        self.close_schedule_sessions();
+        self.schedule_sessions_request_id = self.schedule_sessions_request_id.wrapping_add(1);
+        let request_id = self.schedule_sessions_request_id;
+        self.schedule_sessions = Some(ScheduleSessionsPane::new(
+            schedule_id.clone(),
+            name,
+            request_id,
+        ));
+
+        let client = self.client.clone();
+        self.schedule_sessions_task = Some(tokio::spawn(async move {
+            let result = client
+                .list_schedule_sessions(&schedule_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleSessionsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            });
+        }));
+    }
+
+    pub(crate) fn schedule_session_is_opening(&self) -> bool {
+        matches!(
+            self.active_schedule_session_open(),
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        )
+    }
+
+    fn cancel_schedule_session_list_open(&mut self) {
+        if matches!(
+            self.opening_schedule_session,
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        ) {
+            self.cancel_opening_session();
+        }
+    }
+
+    fn close_schedule_sessions(&mut self) {
+        self.cancel_schedule_session_list_open();
+        if let Some(task) = self.schedule_sessions_task.take() {
+            task.abort();
+        }
+        self.schedule_sessions = None;
+    }
+
+    fn open_selected_schedule_session(&mut self) {
+        if self.schedule_session_is_opening() {
+            return;
+        }
+        let Some(pane) = self.schedule_sessions.as_mut() else {
+            return;
+        };
+        let Some(session) = pane.selected_session() else {
+            return;
+        };
+        let session_id = session.id.clone();
+        let origin = ScheduleSessionOpenOrigin::SessionList {
+            request_id: pane.request_id,
+        };
+        pane.session_open_error = None;
+        self.resume_session_from(session_id, Some(origin));
+    }
+
+    fn handle_schedule_sessions_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleSessions, key);
+        let Some(pane) = self.schedule_sessions.as_mut() else {
+            return;
+        };
+        let page = pane.rows_per_page.get() as isize;
+        let selected = pane.selected;
+        match action {
+            Some(ActionId::Cancel) => {
+                self.close_schedule_sessions();
+                return;
+            }
+            Some(ActionId::Activate) => {
+                self.open_selected_schedule_session();
+                return;
+            }
+            Some(ActionId::NavigateUp) => pane.move_selection(-1),
+            Some(ActionId::NavigateDown) => pane.move_selection(1),
+            Some(ActionId::PageUp) => pane.move_selection(-page),
+            Some(ActionId::PageDown) => pane.move_selection(page),
+            _ => {}
+        }
+        if pane.selected != selected {
+            pane.session_open_error = None;
+            self.cancel_schedule_session_list_open();
         }
     }
 
@@ -22820,9 +23044,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    64_043_856_427_895_820
+                    15_697_706_785_549_981_363
                 } else {
-                    11_340_532_384_430_658_861
+                    6_997_252_207_367_741_014
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -24544,6 +24768,371 @@ mod question_tests {
         assert!(!app.schedules.has_pending_toggle());
         assert!(app.schedules.schedules.is_empty());
         assert_eq!(app.schedules.toggle_error_for(&id), None);
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_opens_a_retained_session_without_running_the_schedule_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let runs = r#"{"schedule_id":"schedule","runs":[
+                {"run_id":"unlinked","scheduled_for":"2026-10-20T10:15:00Z","status":"skipped"}
+            ]}"#;
+            let sessions = r#"{"schedule_id":"schedule","sessions":[
+                {"id":"newer-session","title":"Newer Session","created_by_schedule_id":"schedule"},
+                {"id":"retained-session","title":"Older Session","created_by_schedule_id":"schedule","is_running":true}
+            ]}"#;
+            let summary = r#"{"session":{"id":"retained-session","title":"Older Session","is_running":true,"message_count":1}}"#;
+            let history = r#"{"session_id":"retained-session","messages":[{"id":"a1","role":"assistant","content":"retained schedule history"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/runs", runs),
+                ("/api/v1/schedules/schedule/sessions", sessions),
+                ("/api/v1/sessions/retained-session", summary),
+                ("/api/v1/history/retained-session", history),
+                ("/api/v1/sessions/retained-session", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert_eq!(
+                    request.lines().next(),
+                    Some(format!("GET {path} HTTP/1.1").as_str())
+                );
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+
+            // A resumed active Session subscribes to its own events. The
+            // other requests are the standard read-only Chat refreshes.
+            let mut expected = HashMap::from([
+                (
+                    "/api/v1/events/retained-session",
+                    ("text/event-stream", "data: [DONE]\n\n"),
+                ),
+                (
+                    "/api/v1/sessions/retained-session",
+                    ("application/json", summary),
+                ),
+                (
+                    "/api/v1/sessions/retained-session/task",
+                    ("application/json", r#"{"tasks":[]}"#),
+                ),
+                (
+                    "/api/v1/sessions/retained-session/loop",
+                    ("application/json", "null"),
+                ),
+                (
+                    "/api/v1/subagents/snapshot",
+                    ("application/json", r#"{"sessions":[]}"#),
+                ),
+            ]);
+            while !expected.is_empty() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                let mut request_line = request.lines().next().unwrap().split_whitespace();
+                assert_eq!(request_line.next(), Some("GET"), "{request}");
+                let path = request_line.next().unwrap();
+                let (content_type, body) = expected
+                    .remove(path)
+                    .unwrap_or_else(|| panic!("unexpected read {path}"));
+                respond_test_http(&mut socket, content_type, body).await;
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let mut cached = SessionUiContext::blank(app.allocate_context_id());
+        cached.chat.session_id = Some("retained-session".into());
+        cached.chat.history_loaded = true;
+        cached.chat.messages = vec![asst_msg("stale cache")];
+        app.cache_context(cached);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let budget = Duration::from_secs(5);
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert_eq!(
+            app.schedule_runs.as_ref().unwrap().selected_session_id(),
+            None
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.opening_session_id.is_none());
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        assert!(matches!(
+            app.schedule_sessions.as_ref().unwrap().content,
+            ScheduleSessionsContent::Loading
+        ));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.opening_session_id.is_none());
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert_eq!(
+            app.schedule_sessions
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "newer-session"
+        );
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        assert_eq!(
+            app.schedule_sessions
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "retained-session"
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let opening_epoch = app.opening_session_epoch;
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(app.opening_session_epoch, opening_epoch);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        assert!(app.schedule_runs.is_none());
+        assert!(!app.schedule_session_is_opening());
+        assert_eq!(app.tab, Tab::Chat);
+        assert_eq!(app.chat.session_id.as_deref(), Some("retained-session"));
+        assert_eq!(app.chat.messages[0].content, "retained schedule history");
+        assert!(app.chat.streaming);
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_ignores_queued_replies_after_close_and_reselection() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let initial = r#"{"schedule_id":"schedule","sessions":[{"id":"obsolete","created_by_schedule_id":"schedule"}]}"#;
+            let replacement = r#"{"schedule_id":"second","sessions":[
+                {"id":"first-session","created_by_schedule_id":"second"},
+                {"id":"gone-session","created_by_schedule_id":"second"}
+            ]}"#;
+            let summary = r#"{"session":{"id":"first-session","message_count":1}}"#;
+            let history = r#"{"session_id":"first-session","messages":[{"id":"a1","role":"assistant","content":"stale history"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/sessions", initial),
+                ("/api/v1/schedules/second/sessions", replacement),
+                ("/api/v1/sessions/first-session", summary),
+                ("/api/v1/history/first-session", history),
+                ("/api/v1/sessions/first-session", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+            let (mut gone, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut gone).await,
+                "/api/v1/sessions/gone-session"
+            );
+            let body = "RAW_SESSION_ERROR";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            gone.write_all(response.as_bytes()).await.unwrap();
+            gone.shutdown().await.unwrap();
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let mut second = app.schedules.schedules[0].clone();
+        second.id = "second".into();
+        second.name = Some("Second schedule".into());
+        app.schedules.schedules.push(second);
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+            {"context":"schedules","action":"open-schedule-sessions","keys":["F8"]}
+        ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        app.handle_event(late).await.unwrap();
+        let pane = app.schedule_sessions.as_ref().unwrap();
+        assert_eq!(pane.name, "Second schedule");
+        assert!(matches!(pane.content, ScheduleSessionsContent::Loading));
+
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_event(late).await.unwrap();
+        assert!(!app.schedule_session_is_opening());
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        assert!(app.chat.messages.is_empty());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let pane = app.schedule_sessions.as_ref().unwrap();
+        assert_eq!(pane.selected_session().unwrap().id, "gone-session");
+        assert_eq!(pane.session_open_error, Some("Could not open this session"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        assert_eq!(app.tab, Tab::Schedules);
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_rejects_history_without_a_session_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut list, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut list).await,
+                "/api/v1/schedules/schedule/sessions"
+            );
+            respond_test_http(
+                &mut list,
+                "application/json",
+                r#"{"schedule_id":"schedule","sessions":[{"id":"row","created_by_schedule_id":"schedule"}]}"#,
+            ).await;
+            let summary = r#"{"session":{"id":"row","message_count":0}}"#;
+            for history in [r#"{"messages":[]}"#, r#"{"session_id":"","messages":[]}"#] {
+                for (path, body) in [
+                    ("/api/v1/sessions/row", summary),
+                    ("/api/v1/history/row", history),
+                    ("/api/v1/sessions/row", summary),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_test_http_path(&mut socket).await, path);
+                    respond_test_http(&mut socket, "application/json", body).await;
+                }
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        let list = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(list).await.unwrap();
+        for _ in 0..2 {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let refusal = tokio::time::timeout(budget, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&refusal, AppEvent::SessionOpened { result: Err(error), .. }
+                if error == "session response did not match the selected session")
+            );
+            app.handle_event(refusal).await.unwrap();
+            let pane = app.schedule_sessions.as_ref().unwrap();
+            assert_eq!(pane.selected_session().unwrap().id, "row");
+            assert_eq!(pane.session_open_error, Some("Could not open this session"));
+            assert_eq!(app.tab, Tab::Schedules);
+            assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+            assert!(!app.schedule_session_is_opening());
+        }
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_active_chat_closes_schedule_sessions_and_discards_queued_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let list = r#"{"schedule_id":"schedule","sessions":[{"id":"row","created_by_schedule_id":"schedule"}]}"#;
+            let summary = r#"{"session":{"id":"row","message_count":1}}"#;
+            let history = r#"{"session_id":"row","messages":[{"id":"a1","role":"assistant","content":"must stay out of the new chat"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/sessions", list),
+                ("/api/v1/sessions/row", summary),
+                ("/api/v1/history/row", history),
+                ("/api/v1/sessions/row", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        let list = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(list).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&late, AppEvent::SessionOpened { session_id, result: Ok(_), .. } if session_id == "row")
+        );
+
+        // An earlier Session delete completes while the scoped open is queued.
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "current-session".into(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_sessions.is_none());
+        assert!(app.opening_session_task.is_none());
+        assert!(app.opening_session_id.is_none());
+        app.handle_event(late).await.unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
     }
 
     #[tokio::test]

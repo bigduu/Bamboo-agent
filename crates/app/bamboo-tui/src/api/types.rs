@@ -994,6 +994,20 @@ pub struct ListSchedulesResponse {
     pub schedules: Vec<ScheduleView>,
 }
 
+/// Wire envelope for the schedule Sessions route.
+#[derive(Deserialize)]
+pub(super) struct ListScheduleSessionsResponse {
+    pub(super) schedule_id: String,
+    pub(super) sessions: Vec<ScheduleSessionView>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ScheduleSessionView {
+    pub(super) created_by_schedule_id: String,
+    #[serde(flatten)]
+    pub(super) session: SessionSummary,
+}
+
 /// Wire envelope of `GET /api/v1/schedules/{schedule_id}/runs`.
 #[derive(Deserialize, Debug)]
 pub struct ListScheduleRunsResponse {

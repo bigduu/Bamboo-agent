@@ -60,6 +60,11 @@ pub enum AppEvent {
         schedule_id: String,
         result: Loaded<Vec<ScheduleRunView>>,
     },
+    ScheduleSessionsLoaded {
+        request_id: u64,
+        schedule_id: String,
+        result: Loaded<Vec<SessionSummary>>,
+    },
     ScheduleRunCancellationFinished {
         request_id: u64,
         schedule_id: String,
