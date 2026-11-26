@@ -46,7 +46,15 @@ pub enum AppEvent {
     },
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
-    SchedulesLoaded(Loaded<Vec<Schedule>>),
+    SchedulesLoaded {
+        generation: u64,
+        result: Loaded<Vec<Schedule>>,
+    },
+    ScheduleToggleFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<Schedule>,
+    },
     ScheduleRunsLoaded {
         request_id: u64,
         schedule_id: String,

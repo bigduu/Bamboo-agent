@@ -4,6 +4,7 @@ pub mod types;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::fmt;
+use std::time::Duration;
 
 pub use types::CancelScheduleRunOutcome;
 use types::*;
@@ -302,6 +303,35 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
             "answer response returned unsupported auto_resume_status '{other}'"
         ))),
     }
+}
+
+async fn schedule_has_no_future_occurrence(mut response: reqwest::Response) -> bool {
+    const MAX_ERROR_BYTES: usize = 8 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ERROR_BYTES as u64)
+    {
+        return false;
+    }
+
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_ERROR_BYTES - body.len() => {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .is_some_and(|error| {
+            error
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str)
+                == Some("schedule_no_future_occurrence")
+        })
 }
 
 #[derive(Clone)]
@@ -1045,6 +1075,77 @@ impl BambooClient {
             .collect())
     }
 
+    pub async fn set_schedule_enabled(&self, schedule_id: &str, enabled: bool) -> Result<Schedule> {
+        self.set_schedule_enabled_with_timeout(schedule_id, enabled, Duration::from_secs(30))
+            .await
+    }
+
+    async fn set_schedule_enabled_with_timeout(
+        &self,
+        schedule_id: &str,
+        enabled: bool,
+        timeout: Duration,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct ToggleReply {
+            // The list projection permits an omitted enabled flag. A mutation
+            // receipt must state the saved value explicitly.
+            enabled: bool,
+            #[serde(flatten)]
+            view: ScheduleView,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id]);
+        let response = self
+            .client
+            .patch(url)
+            .timeout(timeout)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the schedule")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the schedule")
+                }
+            })?;
+        let status = response.status();
+        if status == StatusCode::OK {
+            let mut reply: ToggleReply = response.json().await.map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out waiting for the schedule update response")
+                } else {
+                    anyhow::anyhow!("Invalid schedule update response")
+                }
+            })?;
+            anyhow::ensure!(
+                reply.view.id == schedule_id,
+                "Schedule update response has a different schedule ID"
+            );
+            anyhow::ensure!(
+                reply.enabled == enabled,
+                "Schedule update response has a different enabled state"
+            );
+            reply.view.enabled = reply.enabled;
+            return Ok(Schedule::from_view(reply.view));
+        }
+        if status == StatusCode::CONFLICT && schedule_has_no_future_occurrence(response).await {
+            anyhow::bail!("Schedule has no future occurrence");
+        }
+        anyhow::bail!("Could not update schedule (HTTP {})", status.as_u16());
+    }
+
     pub async fn list_schedule_runs(&self, schedule_id: &str) -> Result<Vec<ScheduleRunView>> {
         let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
         url.path_segments_mut()
@@ -1706,6 +1807,213 @@ mod tests {
         };
         let (result, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(client.list_schedule_runs("schedule-17"), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const TOGGLE_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn set_schedule_enabled_patches_only_the_saved_flag_and_projects_the_reply() {
+        for enabled in [true, false] {
+            let body = serde_json::json!({
+                "id": TOGGLE_SCHEDULE_ID,
+                "name": "Daily review",
+                "enabled": enabled,
+                "trigger": {"type": "daily", "hour": 8, "minute": 30, "second": 0},
+                "timezone": "America/New_York",
+                "state": {
+                    "next_fire_at": "2030-02-13T13:30:00Z",
+                    "last_finished_at": "2030-02-12T13:31:00Z"
+                },
+                "run_config": {"task_message": "Review progress"}
+            });
+            let schedule = schedule_toggle_reply(enabled, "200 OK", &body.to_string())
+                .await
+                .unwrap();
+            assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+            assert_eq!(schedule.enabled, Some(enabled));
+            assert_eq!(schedule.name.as_deref(), Some("Daily review"));
+            assert_eq!(schedule.cron.as_deref(), Some("daily"));
+            assert_eq!(
+                schedule.cadence_detail.as_deref(),
+                Some("Daily 08:30 America/New_York")
+            );
+            assert_eq!(schedule.prompt.as_deref(), Some("Review progress"));
+            assert_eq!(
+                schedule.next_run,
+                Some("2030-02-13T13:30:00Z".parse().unwrap())
+            );
+            assert_eq!(
+                schedule.last_run,
+                Some("2030-02-12T13:31:00Z".parse().unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_rejects_wrong_identity_and_missing_or_wrong_flag() {
+        for (body, expected) in [
+            (
+                r#"{"id":"DIFFERENT_ID","enabled":false}"#,
+                "Schedule update response has a different schedule ID",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":true}"#,
+                "Schedule update response has a different enabled state",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%"}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":null}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":"false"}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":true,"enabled":false}"#,
+                "Invalid schedule update response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_toggle_reply(false, "200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_reports_only_the_known_conflict_and_sanitized_errors() {
+        let oversized = serde_json::json!({
+            "error": {
+                "code": "schedule_no_future_occurrence",
+                "message": "RAW_BODY".repeat(1_024),
+            }
+        })
+        .to_string();
+        for (status, body, expected) in [
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}}"#,
+                "Schedule has no future occurrence",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"RAW_ERROR_CODE","message":"RAW_BODY"}}"#,
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "409 Conflict",
+                r#"{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}"#,
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "409 Conflict",
+                oversized.as_str(),
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}}"#,
+                "Could not update schedule (HTTP 503)",
+            ),
+            (
+                "201 Created",
+                r#"{"id":"schedule/17 ?#%","enabled":true}"#,
+                "Could not update schedule (HTTP 201)",
+            ),
+        ] {
+            assert_eq!(
+                schedule_toggle_reply(true, status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_times_out_while_the_host_holds_the_response_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, hold_response) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /api/v1/schedules/schedule-17 HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({ "enabled": false })
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            // Hold the partial body until the caller returns.
+            hold_response.await.unwrap();
+        };
+        let request = async {
+            let result = client
+                .set_schedule_enabled_with_timeout("schedule-17", false, Duration::from_secs(1))
+                .await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(request, serve)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Timed out waiting for the schedule update response"
+        );
+    }
+
+    async fn schedule_toggle_reply(enabled: bool, status: &str, body: &str) -> Result<Schedule> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25 HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({ "enabled": enabled })
+            );
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.set_schedule_enabled(TOGGLE_SCHEDULE_ID, enabled),
+                serve
+            )
         })
         .await
         .unwrap();

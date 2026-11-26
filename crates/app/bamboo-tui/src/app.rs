@@ -1918,6 +1918,16 @@ pub struct SchedulesState {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    catalog_generation: u64,
+    toggle_generation: u64,
+    pending_toggle: Option<PendingScheduleToggle>,
+    toggle_error: Option<(String, String)>,
+}
+
+struct PendingScheduleToggle {
+    generation: u64,
+    schedule_id: String,
+    enabled: bool,
 }
 
 pub(crate) enum ScheduleRunsContent {
@@ -2189,7 +2199,45 @@ impl SchedulesState {
             selected: 0,
             loading: false,
             error: None,
+            catalog_generation: 0,
+            toggle_generation: 0,
+            pending_toggle: None,
+            toggle_error: None,
         }
+    }
+
+    pub(crate) fn has_pending_toggle(&self) -> bool {
+        self.pending_toggle.is_some()
+    }
+
+    pub(crate) fn toggle_pending_for(&self, id: &str) -> bool {
+        self.pending_toggle
+            .as_ref()
+            .is_some_and(|pending| pending.schedule_id == id)
+    }
+
+    pub(crate) fn toggle_error_for(&self, id: &str) -> Option<&str> {
+        self.toggle_error
+            .as_ref()
+            .filter(|(schedule_id, _)| schedule_id == id)
+            .map(|(_, error)| error.as_str())
+    }
+
+    fn install_catalog(&mut self, schedules: Vec<Schedule>) {
+        self.selected = self
+            .schedules
+            .get(self.selected)
+            .and_then(|selected| schedules.iter().position(|row| row.id == selected.id))
+            .unwrap_or_else(|| self.selected.min(schedules.len().saturating_sub(1)));
+        if self
+            .toggle_error
+            .as_ref()
+            .is_some_and(|(id, _)| !schedules.iter().any(|row| row.id == *id))
+        {
+            self.toggle_error = None;
+        }
+        self.schedules = schedules;
+        self.error = None;
     }
 }
 
@@ -6702,17 +6750,21 @@ impl App {
                     Err(e) => self.mcp.error = Some(e),
                 }
             }
-            AppEvent::SchedulesLoaded(r) => {
-                self.schedules.loading = false;
-                match r {
-                    Ok(s) => {
-                        self.schedules.selected =
-                            self.schedules.selected.min(s.len().saturating_sub(1));
-                        self.schedules.schedules = s;
-                        self.schedules.error = None;
+            AppEvent::SchedulesLoaded { generation, result } => {
+                if self.schedules.loading && self.schedules.catalog_generation == generation {
+                    self.schedules.loading = false;
+                    match result {
+                        Ok(schedules) => self.schedules.install_catalog(schedules),
+                        Err(error) => self.schedules.error = Some(error),
                     }
-                    Err(e) => self.schedules.error = Some(e),
                 }
+            }
+            AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_toggle(generation, schedule_id, result);
             }
             AppEvent::SkillsLoaded(r) => {
                 self.skills.loading = false;
@@ -11758,13 +11810,7 @@ impl App {
                     let _ = tx.send(AppEvent::McpServersLoaded(r));
                 });
             }
-            Tab::Schedules => {
-                self.schedules.loading = true;
-                tokio::spawn(async move {
-                    let r = client.list_schedules().await.map_err(|e| e.to_string());
-                    let _ = tx.send(AppEvent::SchedulesLoaded(r));
-                });
-            }
+            Tab::Schedules => self.load_schedule_catalog(client, tx),
             Tab::Skills => {
                 self.skills.loading = true;
                 tokio::spawn(async move {
@@ -11793,6 +11839,19 @@ impl App {
                 }
             }
         }
+    }
+
+    fn load_schedule_catalog(&mut self, client: BambooClient, tx: mpsc::UnboundedSender<AppEvent>) {
+        let generation = self.schedules.catalog_generation.wrapping_add(1);
+        self.schedules.catalog_generation = generation;
+        self.schedules.loading = true;
+        tokio::spawn(async move {
+            let result = client
+                .list_schedules()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SchedulesLoaded { generation, result });
+        });
     }
 
     fn start_clipboard_paste(&mut self) {
@@ -14906,6 +14965,7 @@ impl App {
                 self.schedule_form = Some(ScheduleForm::default());
             }
             Some(ActionId::Activate) => self.open_schedule_runs(),
+            Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -14954,6 +15014,93 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn toggle_selected_schedule(&mut self) {
+        if self.schedules.has_pending_toggle() {
+            return;
+        }
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let Some(enabled) = schedule.enabled else {
+            return;
+        };
+        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str()) {
+            return;
+        }
+
+        let schedule_id = schedule.id.clone();
+        let enabled = !enabled;
+        let generation = self.schedules.toggle_generation.wrapping_add(1);
+        self.schedules.toggle_generation = generation;
+        if self.schedules.toggle_error_for(&schedule_id).is_some() {
+            self.schedules.toggle_error = None;
+        }
+        self.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation,
+            schedule_id: schedule_id.clone(),
+            enabled,
+        });
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .set_schedule_enabled(&schedule_id, enabled)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result,
+            });
+        });
+    }
+
+    fn finish_schedule_toggle(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<Schedule, String>,
+    ) {
+        let Some(pending) = self.schedules.pending_toggle.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        let result = result.and_then(|schedule| {
+            if schedule.id == schedule_id && schedule.enabled == Some(pending.enabled) {
+                Ok(schedule)
+            } else {
+                Err("Invalid schedule toggle response".into())
+            }
+        });
+        let row = self
+            .schedules
+            .schedules
+            .iter_mut()
+            .find(|row| row.id == schedule_id);
+        match result {
+            Ok(schedule) => {
+                if let Some(row) = row {
+                    *row = schedule;
+                }
+                // Any catalog request already in flight may have read the old
+                // enabled flag. Replace it with a read after the mutation.
+                if std::mem::take(&mut self.schedules.loading) {
+                    if let Some(tx) = self.event_tx.clone() {
+                        self.load_schedule_catalog(self.client.clone(), tx);
+                    }
+                }
+            }
+            Err(error) if row.is_some() => {
+                self.schedules.toggle_error = Some((schedule_id, error));
+            }
+            Err(_) => {}
+        }
     }
 
     fn open_schedule_runs(&mut self) {
@@ -22673,9 +22820,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    5_350_942_093_694_435_996
+                    64_043_856_427_895_820
                 } else {
-                    934_301_848_595_209_156
+                    11_340_532_384_430_658_861
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -24102,6 +24249,301 @@ mod question_tests {
         ));
         assert!(app.schedule_form.is_none());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_toggle_key_updates_only_its_row_and_fences_an_older_catalog() {
+        use ratatui::backend::TestBackend;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        const ORIGINAL: &str = r#"{"schedules":[
+            {"id":"first","name":"First review","enabled":true,"trigger":{"type":"interval","every_seconds":90}},
+            {"id":"second","name":"Second review","enabled":true}
+        ]}"#;
+        const DISABLED: &str = r#"{"id":"first","name":"First review","enabled":false,
+            "trigger":{"type":"interval","every_seconds":90},
+            "state":{"next_fire_at":"2028-01-26T09:10:00Z"}}"#;
+        const REORDERED: &str = r#"{"schedules":[
+            {"id":"second","name":"Second review","enabled":true},
+            {"id":"first","name":"First review","enabled":false,"trigger":{"type":"interval","every_seconds":90},
+             "state":{"next_fire_at":"2028-01-26T09:10:00Z"}}
+        ]}"#;
+
+        async fn read_toggle(stream: &mut tokio::net::TcpStream, enabled: bool) {
+            let request = read_test_http_request(stream).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("PATCH /api/v1/schedules/first HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"enabled": enabled})
+            );
+        }
+
+        async fn reply_error(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+
+        let preview = |app: &App, phase: &str| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(60)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_TOGGLE").is_some() {
+                eprintln!(
+                    "SCHEDULE TOGGLE {phase} PREVIEW\n{text}\nEND SCHEDULE TOGGLE {phase} PREVIEW"
+                );
+            }
+            text
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_get_seen, old_get_started) = oneshot::channel();
+        let (patch_seen, patch_started) = oneshot::channel();
+        let (allow_patch, wait_patch) = oneshot::channel();
+        let (allow_refresh, wait_refresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut first).await, "/api/v1/schedules");
+            respond_test_http(&mut first, "application/json", ORIGINAL).await;
+
+            let (mut old, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut old).await, "/api/v1/schedules");
+            old_get_seen.send(()).unwrap();
+            let (mut patch, _) = listener.accept().await.unwrap();
+            read_toggle(&mut patch, false).await;
+            patch_seen.send(()).unwrap();
+            wait_patch.await.unwrap();
+            respond_test_http(&mut patch, "application/json", DISABLED).await;
+
+            let (mut current, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut current).await, "/api/v1/schedules");
+            respond_test_http(&mut old, "application/json", ORIGINAL).await;
+            wait_refresh.await.unwrap();
+            respond_test_http(&mut current, "application/json", REORDERED).await;
+
+            let (mut refused, _) = listener.accept().await.unwrap();
+            read_toggle(&mut refused, true).await;
+            reply_error(
+                &mut refused,
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_SCHEDULE_ERROR"}}"#,
+            ).await;
+
+            let (mut failed_refresh, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut failed_refresh)
+                    .await
+                    .lines()
+                    .next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            reply_error(
+                &mut failed_refresh,
+                "503 Service Unavailable",
+                r#"{"error":{"message":"RAW_REFRESH_DIAGNOSTIC"}}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Mcp;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+            {"context":"schedules","action":"toggle-schedule-enabled","keys":["/"]}
+        ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let budget = Duration::from_secs(5);
+        async fn next_event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert_eq!(app.tab, Tab::Schedules);
+        app.handle_key(key(KeyCode::Char('t'))).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        tokio::time::timeout(budget, old_get_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        tokio::time::timeout(budget, patch_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(app.schedules.toggle_pending_for("first"));
+        assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        let pending = preview(&app, "PENDING");
+        assert!(pending.contains("Saving schedule…"), "{pending}");
+        assert!(
+            pending.contains("r run now") && pending.contains("Enter runs"),
+            "{pending}"
+        );
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(!app.schedules.toggle_pending_for("second"));
+        assert_eq!(app.schedules.selected, 1);
+        let busy = preview(&app, "OTHER ROW");
+        assert!(busy.contains("Saving another schedule…"), "{busy}");
+        allow_patch.send(()).unwrap();
+        let saved = next_event(&mut rx).await;
+        assert!(
+            matches!(&saved, AppEvent::ScheduleToggleFinished { schedule_id, .. } if schedule_id == "first")
+        );
+        app.handle_event(saved).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(app.schedules.loading);
+        assert_eq!(app.schedules.selected, 1);
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
+        assert_eq!(
+            app.schedules.schedules[0].next_run,
+            Some("2028-01-26T09:10:00Z".parse().unwrap())
+        );
+        assert_eq!(app.schedules.schedules[1].enabled, Some(true));
+
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.loading);
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
+        allow_refresh.send(()).unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.selected, 0);
+        assert_eq!(app.schedules.schedules[0].id, "second");
+        assert_eq!(app.schedules.schedules[1].id, "first");
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        let settled = preview(&app, "SETTLED");
+        assert!(
+            settled.contains("/ Enable") && settled.contains("Every 90 seconds"),
+            "{settled}"
+        );
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.schedules[1].enabled, Some(false));
+        assert_eq!(
+            app.schedules.toggle_error_for("first"),
+            Some("Schedule has no future occurrence")
+        );
+        assert_eq!(app.schedules.toggle_error_for("second"), None);
+        let refusal = preview(&app, "REFUSAL");
+        assert!(
+            refusal.contains("Schedule has no future occurrence"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("RAW_SCHEDULE_ERROR"), "{refusal}");
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        assert!(app.schedules.loading);
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.loading);
+        let selected = &app.schedules.schedules[app.schedules.selected];
+        assert_eq!(selected.id, "first");
+        assert_eq!(selected.enabled, Some(false));
+        let cached = preview(&app, "REFRESH FAILED");
+        let row = cached
+            .lines()
+            .find(|row| row.contains("› First review"))
+            .unwrap();
+        assert!(row.contains("disabled"), "{cached}");
+        for expected in [
+            "Refresh failed",
+            "Every 90 seconds",
+            "/ Enable",
+            "Enter runs",
+            "r run now",
+        ] {
+            assert!(cached.contains(expected), "missing {expected:?}\n{cached}");
+        }
+        assert!(!cached.contains("RAW_REFRESH_DIAGNOSTIC"), "{cached}");
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_toggle_ignores_unmatched_events_and_does_not_reinsert_a_missing_row() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let id = app.schedules.schedules[0].id.clone();
+        let previous = app.schedules.schedules[0].clone();
+        let mut saved = previous.clone();
+        saved.enabled = Some(false);
+        app.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation: 2,
+            schedule_id: id.clone(),
+            enabled: false,
+        });
+        for (generation, schedule_id) in [(1, id.clone()), (2, "second".into())] {
+            app.handle_event(AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result: Ok(saved.clone()),
+            })
+            .await
+            .unwrap();
+            assert!(app.schedules.toggle_pending_for(&id));
+            assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        }
+        app.handle_event(AppEvent::ScheduleToggleFinished {
+            generation: 2,
+            schedule_id: id.clone(),
+            result: Ok(previous),
+        })
+        .await
+        .unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        assert_eq!(
+            app.schedules.toggle_error_for(&id),
+            Some("Invalid schedule toggle response")
+        );
+
+        app.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation: 3,
+            schedule_id: id.clone(),
+            enabled: false,
+        });
+        app.schedules.install_catalog(Vec::new());
+        app.handle_event(AppEvent::ScheduleToggleFinished {
+            generation: 3,
+            schedule_id: id.clone(),
+            result: Ok(saved),
+        })
+        .await
+        .unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(app.schedules.schedules.is_empty());
+        assert_eq!(app.schedules.toggle_error_for(&id), None);
     }
 
     #[tokio::test]
