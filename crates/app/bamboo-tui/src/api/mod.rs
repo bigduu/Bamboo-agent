@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use std::fmt;
 
+pub use types::CancelScheduleRunOutcome;
 use types::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -1072,6 +1073,100 @@ impl BambooClient {
         Ok(parsed.runs)
     }
 
+    pub async fn cancel_schedule_run(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+    ) -> Result<CancelScheduleRunOutcome> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct Acknowledgment {
+            schedule_id: String,
+            run_id: String,
+            status: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TerminalRecord {
+            schedule_id: String,
+            #[serde(flatten)]
+            run: ScheduleRunView,
+        }
+
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend([
+                "api",
+                "v1",
+                "schedules",
+                schedule_id,
+                "runs",
+                run_id,
+                "cancel",
+            ]);
+        let response = self.client.post(url).send().await.map_err(|_| {
+            anyhow::anyhow!("Could not contact the Host to cancel the schedule run")
+        })?;
+        let status = response.status();
+        let check_identity = |response_schedule: &str, response_run: &str| -> Result<()> {
+            anyhow::ensure!(
+                response_schedule == schedule_id && response_run == run_id,
+                "Schedule cancellation response has a different schedule or run ID"
+            );
+            Ok(())
+        };
+
+        match status {
+            StatusCode::ACCEPTED => {
+                let reply: Acknowledgment = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Invalid schedule cancellation response"))?;
+                check_identity(&reply.schedule_id, &reply.run_id)?;
+                anyhow::ensure!(
+                    reply.status == "cancel_requested",
+                    "Invalid schedule cancellation acknowledgment"
+                );
+                Ok(CancelScheduleRunOutcome::Requested)
+            }
+            StatusCode::OK => {
+                let reply: TerminalRecord = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Invalid schedule cancellation response"))?;
+                check_identity(&reply.schedule_id, &reply.run.run_id)?;
+                anyhow::ensure!(
+                    reply.run.is_terminal(),
+                    "Schedule cancellation response is not a terminal result"
+                );
+                Ok(CancelScheduleRunOutcome::Terminal(reply.run))
+            }
+            StatusCode::NOT_FOUND | StatusCode::CONFLICT => {
+                let error = response.json::<serde_json::Value>().await.ok();
+                let code = error
+                    .as_ref()
+                    .and_then(|value| value.pointer("/error/code"))
+                    .and_then(serde_json::Value::as_str);
+                match (status, code) {
+                    (StatusCode::NOT_FOUND, Some("schedule_run_not_found")) => {
+                        anyhow::bail!("Schedule run not found")
+                    }
+                    (StatusCode::NOT_FOUND, _) => {
+                        anyhow::bail!("This Host does not support schedule-run cancellation")
+                    }
+                    (StatusCode::CONFLICT, Some("schedule_run_not_cancellable")) => {
+                        anyhow::bail!("Schedule run has no cancellable live execution")
+                    }
+                    _ => anyhow::bail!("Could not cancel schedule run (HTTP {})", status.as_u16()),
+                }
+            }
+            _ => anyhow::bail!("Could not cancel schedule run (HTTP {})", status.as_u16()),
+        }
+    }
+
     pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
         let resp = self
             .client
@@ -1537,18 +1632,21 @@ mod tests {
                     scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
                     status: "future_status".into(),
                     session_id: Some("session-CaSe_42".into()),
+                    workflow_run_id: None,
                 },
                 ScheduleRunView {
                     run_id: "older".into(),
                     scheduled_for: "2030-02-12T09:00:00Z".parse().unwrap(),
                     status: "succeeded".into(),
                     session_id: None,
+                    workflow_run_id: Some("workflow-12".into()),
                 },
                 ScheduleRunView {
                     run_id: "oldest".into(),
                     scheduled_for: "2030-02-11T09:00:00Z".parse().unwrap(),
                     status: "skipped".into(),
                     session_id: None,
+                    workflow_run_id: None,
                 },
             ]
         );
@@ -1608,6 +1706,187 @@ mod tests {
         };
         let (result, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(client.list_schedule_runs("schedule-17"), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_posts_exact_ids_and_reads_requested_or_terminal() {
+        let requested = schedule_cancel_reply(
+            "202 Accepted",
+            r#"{"schedule_id":"schedule-17","run_id":"run-42","status":"cancel_requested"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requested, CancelScheduleRunOutcome::Requested);
+
+        for status in ["success", "failed", "skipped", "missed", "cancelled"] {
+            let completed = schedule_cancel_reply(
+                "200 OK",
+                &serde_json::json!({
+                    "schedule_id": "schedule-17",
+                    "run_id": "run-42",
+                    "scheduled_for": "2030-02-13T09:00:00Z",
+                    "status": status,
+                    "session_id": "session-18",
+                    "outcome_reason": (status == "cancelled").then(|| "x".repeat(64 * 1024 + 1))
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                completed,
+                CancelScheduleRunOutcome::Terminal(ScheduleRunView {
+                    run_id: "run-42".into(),
+                    scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
+                    status: status.into(),
+                    session_id: Some("session-18".into()),
+                    workflow_run_id: None,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_requires_matching_identity_and_expected_state() {
+        for (status, schedule_id, run_id, run_status, error) in [
+            (
+                "202 Accepted",
+                "other",
+                "run-42",
+                "cancel_requested",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "202 Accepted",
+                "schedule-17",
+                "other",
+                "cancel_requested",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "202 Accepted",
+                "schedule-17",
+                "run-42",
+                "cancelled",
+                "Invalid schedule cancellation acknowledgment",
+            ),
+            (
+                "200 OK",
+                "other",
+                "run-42",
+                "cancelled",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "other",
+                "cancelled",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "run-42",
+                "running",
+                "Schedule cancellation response is not a terminal result",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "run-42",
+                "future_status",
+                "Schedule cancellation response is not a terminal result",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "schedule_id": schedule_id,
+                "run_id": run_id,
+                "status": run_status,
+                "scheduled_for": "2030-02-13T09:00:00Z"
+            });
+            assert_eq!(
+                schedule_cancel_reply(status, &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_errors_are_bounded_and_do_not_display_response_body() {
+        for (status, body, error) in [
+            (
+                "404 Not Found",
+                r#"{"error":{"code":"schedule_run_not_found","message":"RAW_BODY"}}"#,
+                "Schedule run not found",
+            ),
+            (
+                "404 Not Found",
+                "RAW_BODY",
+                "This Host does not support schedule-run cancellation",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_run_not_cancellable","message":"RAW_BODY"}}"#,
+                "Schedule run has no cancellable live execution",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"future_error","message":"RAW_BODY"}}"#,
+                "Could not cancel schedule run (HTTP 409)",
+            ),
+            (
+                "503 Service Unavailable",
+                "RAW_BODY",
+                "Could not cancel schedule run (HTTP 503)",
+            ),
+            (
+                "202 Accepted",
+                "RAW_BODY",
+                "Invalid schedule cancellation response",
+            ),
+            (
+                "200 OK",
+                r#"{"schedule_id":"schedule-17","run_id":"run-42","status":"cancelled"}"#,
+                "Invalid schedule cancellation response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_cancel_reply(status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    async fn schedule_cancel_reply(status: &str, body: &str) -> Result<CancelScheduleRunOutcome> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("POST /api/v1/schedules/schedule-17/runs/run-42/cancel HTTP/1.1")
+            );
+            assert!(body_sent.is_empty());
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.cancel_schedule_run("schedule-17", "run-42"), serve)
         })
         .await
         .unwrap();

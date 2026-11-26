@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ScheduleRunsContent};
+use crate::app::{App, ScheduleRunCancelState, ScheduleRunsContent};
 use crate::keymap::{ActionContext, ActionId};
 use crate::text::clip_cells;
 use crate::theme::colors;
@@ -186,9 +186,36 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
     );
     let content_width = usize::from(width.saturating_sub(2));
     let content_height = usize::from(height.saturating_sub(2));
-    let key = |action| app.primary_key_hint(ActionContext::ScheduleRuns, action);
+    let key = |action| app.keymap.primary_hint(ActionContext::ScheduleRuns, action);
+    let opening = app.schedule_run_session_is_opening();
     let mut close = format!("  {} close", key(ActionId::Cancel));
+    if !opening && pane.selected_session_id().is_some() {
+        close = format!(
+            "  {} open session · {} close",
+            key(ActionId::Activate),
+            key(ActionId::Cancel)
+        );
+    }
+    let refresh = format!("{} refresh", key(ActionId::Refresh));
     let mut footer = Vec::new();
+    if matches!(&pane.content, ScheduleRunsContent::Loaded(runs) if !runs.is_empty()) {
+        footer.push(format!(
+            "  {}/{} move · {}/{} page",
+            key(ActionId::NavigateUp),
+            key(ActionId::NavigateDown),
+            key(ActionId::PageUp),
+            key(ActionId::PageDown),
+        ));
+    }
+    if pane.selected_run_can_request_cancel() {
+        footer.push(format!(
+            "  {} Cancel run · {refresh}",
+            key(ActionId::CancelScheduledRun)
+        ));
+        footer.push(close);
+    } else {
+        footer.push(format!("{close} · {refresh}"));
+    }
     let mut lines = vec![Line::from(Span::styled(
         format!(
             "  {}",
@@ -199,55 +226,55 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
             .add_modifier(Modifier::BOLD),
     ))];
     let muted = Style::default().fg(colors::subtle());
+    let error_line = |error: &str| {
+        Line::styled(
+            format!(
+                "  {}",
+                clip_schedule_text(error, content_width.saturating_sub(2))
+            ),
+            Style::default().fg(colors::error()),
+        )
+    };
+    if pane.refreshing && !matches!(&pane.content, ScheduleRunsContent::Loading) {
+        lines.push(Line::styled("  Refreshing runs…", muted));
+    } else if let Some(error) = pane
+        .refresh_error
+        .as_deref()
+        .filter(|_| matches!(&pane.content, ScheduleRunsContent::Loaded(_)))
+    {
+        lines.push(error_line(error));
+    }
     match &pane.content {
         ScheduleRunsContent::Loading => {
             lines.push(Line::styled("  Loading runs…", muted));
         }
         ScheduleRunsContent::Failed(error) => {
-            lines.push(Line::styled(
-                format!(
-                    "  {}",
-                    clip_schedule_text(error, content_width.saturating_sub(2))
-                ),
-                Style::default().fg(colors::error()),
-            ));
+            lines.push(error_line(pane.refresh_error.as_deref().unwrap_or(error)));
         }
         ScheduleRunsContent::Loaded(runs) if runs.is_empty() => {
             lines.push(Line::styled("  No runs recorded.", muted));
         }
         ScheduleRunsContent::Loaded(runs) => {
-            let opening = app.schedule_run_session_is_opening();
             if opening {
                 lines.push(Line::styled("  Opening Session…", muted));
             } else if let Some(error) = pane.session_open_error {
-                lines.push(Line::styled(
-                    format!(
-                        "  {}",
-                        clip_schedule_text(error, content_width.saturating_sub(2))
-                    ),
-                    Style::default().fg(colors::error()),
-                ));
+                lines.push(error_line(error));
             }
-            if !opening && pane.selected_session_id().is_some() {
-                close = format!(
-                    "  {} open session · {} close",
-                    app.keymap
-                        .primary_hint(ActionContext::ScheduleRuns, ActionId::Activate),
-                    key(ActionId::Cancel)
-                );
-            }
-            footer.push(format!(
-                "  {}/{} move · {}/{} page",
-                key(ActionId::NavigateUp),
-                key(ActionId::NavigateDown),
-                key(ActionId::PageUp),
-                key(ActionId::PageDown),
-            ));
             lines.push(Line::styled(
                 format!("  {:<19}  Status", "Scheduled (UTC)"),
                 muted,
             ));
-            let capacity = content_height.saturating_sub(lines.len() + footer.len() + 1);
+            let mut cancel_feedback = pane.selected_cancel_state().map(|state| match state {
+                ScheduleRunCancelState::Sending => Line::styled("  Sending cancellation…", muted),
+                ScheduleRunCancelState::Requested => Line::styled(
+                    "  Cancel requested · refresh for outcome",
+                    Style::default().fg(colors::warning()),
+                ),
+                ScheduleRunCancelState::Failed(error) => error_line(error),
+            });
+            let capacity = content_height.saturating_sub(
+                lines.len() + footer.len() + usize::from(cancel_feedback.is_some()),
+            );
             let selected = pane.selected.min(runs.len() - 1);
             let visible = visible_window(runs.len(), selected, capacity);
             pane.rows_per_page.set(visible.len().max(1));
@@ -280,10 +307,12 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
                         Style::default().fg(status_color),
                     ),
                 ]));
+                if is_selected {
+                    lines.extend(cancel_feedback.take());
+                }
             }
         }
     }
-    footer.push(close);
     lines.resize_with(content_height.saturating_sub(footer.len()), || {
         Line::raw("")
     });
@@ -577,6 +606,7 @@ mod tests {
                     }
                     .into(),
                     session_id: None,
+                    workflow_run_id: None,
                 })
                 .collect(),
         );
@@ -635,12 +665,14 @@ mod tests {
                     scheduled_for: time,
                     status: "success".into(),
                     session_id: Some("session-1".into()),
+                    workflow_run_id: None,
                 },
                 ScheduleRunView {
                     run_id: "unlinked-run".into(),
                     scheduled_for: time - TimeDelta::days(1),
                     status: "missed".into(),
                     session_id: None,
+                    workflow_run_id: None,
                 },
             ]);
             app.schedule_runs = Some(pane);
@@ -692,6 +724,141 @@ mod tests {
     }
 
     #[test]
+    fn recent_runs_keeps_exact_row_cancel_feedback_and_shortcuts_visible_at_minimum_width() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        let mut pane = ScheduleRunsPane::new("schedule-1".into(), "Daily review".into(), 1);
+        let time = Utc.with_ymd_and_hms(2026, 11, 26, 8, 0, 0).unwrap();
+        pane.content = ScheduleRunsContent::Loaded(
+            [
+                ("ordinary", "running", Some("session-1"), None),
+                ("queued", "queued", None, None),
+                ("unlinked", "running", None, None),
+                ("workflow", "running", Some("session-4"), Some("workflow-4")),
+                ("finished", "cancelled", Some("session-5"), None),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, status, session, workflow))| ScheduleRunView {
+                run_id: id.into(),
+                scheduled_for: time - TimeDelta::minutes(index as i64),
+                status: status.into(),
+                session_id: session.map(str::to_owned),
+                workflow_run_id: workflow.map(str::to_owned),
+            })
+            .collect(),
+        );
+        app.schedule_runs = Some(pane);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            terminal_rows(terminal)
+        };
+        let capture = std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_RUN_CANCEL").is_some();
+        let initial = draw(&mut terminal, &app);
+        if capture {
+            eprintln!("SCHEDULE RUN CANCEL PREVIEW\n{initial}\nEND SCHEDULE RUN CANCEL PREVIEW");
+        }
+        for expected in [
+            "› 2026-11-26 08:00:00  running",
+            "x Cancel run · r refresh",
+            "Enter open session · Esc close",
+            "PageUp/PageDown page",
+        ] {
+            assert!(
+                initial.contains(expected),
+                "missing {expected:?}\n{initial}"
+            );
+        }
+
+        app.schedule_runs
+            .as_mut()
+            .unwrap()
+            .cancellations
+            .insert("ordinary".into(), ScheduleRunCancelState::Sending);
+        let sending = draw(&mut terminal, &app);
+        assert!(sending.contains("Sending cancellation…"), "{sending}");
+        assert!(!sending.contains("x Cancel run"), "{sending}");
+
+        app.schedule_runs
+            .as_mut()
+            .unwrap()
+            .cancellations
+            .insert("ordinary".into(), ScheduleRunCancelState::Requested);
+        let pending = draw(&mut terminal, &app);
+        if capture {
+            eprintln!("SCHEDULE RUN CANCEL PENDING PREVIEW\n{pending}\nEND SCHEDULE RUN CANCEL PENDING PREVIEW");
+        }
+        let mut rows = pending.lines();
+        assert!(
+            rows.any(|row| row.contains("› 2026-11-26 08:00:00  running")),
+            "{pending}"
+        );
+        assert!(
+            rows.next()
+                .unwrap()
+                .contains("Cancel requested · refresh for outcome"),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("Enter open session · Esc close · r refresh"),
+            "{pending}"
+        );
+        assert!(pending.contains("PageUp/PageDown page"), "{pending}");
+        assert!(!pending.contains("x Cancel run"), "{pending}");
+
+        for index in 1..5 {
+            app.schedule_runs.as_mut().unwrap().selected = index;
+            let other = draw(&mut terminal, &app);
+            assert!(!other.contains("Cancel requested"), "{other}");
+            assert!(!other.contains("x Cancel run"), "{other}");
+        }
+
+        let pane = app.schedule_runs.as_mut().unwrap();
+        pane.selected = 0;
+        pane.refreshing = true;
+        let refreshing = draw(&mut terminal, &app);
+        assert!(refreshing.contains("Refreshing runs…"), "{refreshing}");
+        assert!(refreshing.contains("Cancel requested"), "{refreshing}");
+
+        let pane = app.schedule_runs.as_mut().unwrap();
+        pane.refreshing = false;
+        pane.refresh_error = Some("Could not refresh runs".into());
+        pane.cancellations.insert(
+            "ordinary".into(),
+            ScheduleRunCancelState::Failed("No cancellable live execution".into()),
+        );
+        let failed = draw(&mut terminal, &app);
+        assert!(failed.contains("No cancellable live execution"), "{failed}");
+        assert!(failed.contains("Could not refresh runs"), "{failed}");
+        app.schedule_runs.as_mut().unwrap().selected = 1;
+        let other = draw(&mut terminal, &app);
+        assert!(!other.contains("No cancellable live execution"), "{other}");
+        assert!(other.contains("Could not refresh runs"), "{other}");
+
+        let pane = app.schedule_runs.as_mut().unwrap();
+        pane.selected = 0;
+        pane.cancellations.clear();
+        pane.refresh_error = None;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"schedule-runs","action":"cancel-scheduled-run","keys":["/","F8"]},
+                    {"context":"schedule-runs","action":"refresh","keys":["F9"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let remapped = draw(&mut terminal, &app);
+        assert!(remapped.contains("/ Cancel run · F9 refresh"), "{remapped}");
+        assert!(!remapped.contains("x Cancel run"), "{remapped}");
+    }
+
+    #[test]
     fn recent_run_states_remain_closable_and_list_advertises_remapped_action() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Schedules;
@@ -729,6 +896,7 @@ mod tests {
             assert!(
                 text.contains("Recent runs")
                     && text.contains(expected)
+                    && text.contains("r refresh")
                     && text.contains("Esc close"),
                 "{text}"
             );
