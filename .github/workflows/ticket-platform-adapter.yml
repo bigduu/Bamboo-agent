@@ -32,6 +32,7 @@ on:
           - rust-writer
           - rust-immutable
           - rust-head
+          - rust-graph
 
 permissions:
   contents: read
@@ -201,7 +202,7 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Probe Windows Ticket primitives as a standard user
-        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable' && inputs.windows_ticket_probe_case != 'rust-head'
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable' && inputs.windows_ticket_probe_case != 'rust-head' && inputs.windows_ticket_probe_case != 'rust-graph'
         env:
           PROBE_CASE: ${{ inputs.windows_ticket_probe_case }}
         shell: pwsh
@@ -244,6 +245,11 @@ jobs:
         if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-head'
         shell: pwsh
         run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-head
+
+      - name: Probe Rust Windows Ticket graph publication as a standard user
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-graph'
+        shell: pwsh
+        run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-graph
 
       - name: Verify the Windows Ticket probe left the exact source clean
         if: always() && inputs.windows_ticket_probe_sha != ''
