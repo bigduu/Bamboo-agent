@@ -149,7 +149,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
     let content_width = usize::from(width.saturating_sub(2));
     let content_height = usize::from(height.saturating_sub(2));
     let key = |action| app.primary_key_hint(ActionContext::ScheduleRuns, action);
-    let close = format!("  {} close", key(ActionId::Cancel));
+    let mut close = format!("  {} close", key(ActionId::Cancel));
     let mut footer = Vec::new();
     let mut lines = vec![Line::from(Span::styled(
         format!(
@@ -178,6 +178,26 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
             lines.push(Line::styled("  No runs recorded.", muted));
         }
         ScheduleRunsContent::Loaded(runs) => {
+            let opening = app.schedule_run_session_is_opening();
+            if opening {
+                lines.push(Line::styled("  Opening Session…", muted));
+            } else if let Some(error) = pane.session_open_error {
+                lines.push(Line::styled(
+                    format!(
+                        "  {}",
+                        clip_run_text(error, content_width.saturating_sub(2))
+                    ),
+                    Style::default().fg(colors::error()),
+                ));
+            }
+            if !opening && pane.selected_session_id().is_some() {
+                close = format!(
+                    "  {} open session · {} close",
+                    app.keymap
+                        .primary_hint(ActionContext::ScheduleRuns, ActionId::Activate),
+                    key(ActionId::Cancel)
+                );
+            }
             footer.push(format!(
                 "  {}/{} move · {}/{} page",
                 key(ActionId::NavigateUp),
@@ -406,6 +426,7 @@ mod tests {
                         "success"
                     }
                     .into(),
+                    session_id: None,
                 })
                 .collect(),
         );
@@ -435,6 +456,89 @@ mod tests {
         );
         assert!(!text.contains("08:00:30"), "{text}");
         assert_eq!(app.schedule_runs.as_ref().unwrap().rows_per_page.get(), 7);
+    }
+
+    #[test]
+    fn recent_runs_advertises_open_session_for_the_selected_linked_run() {
+        for (width, height, open_key) in [(60, 20, "Enter"), (80, 24, "/")] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.tab = Tab::Schedules;
+            if open_key == "/" {
+                app.set_keymap(
+                    Keymap::from_json(
+                        r#"{"bindings":[
+                            {"context":"schedule-runs","action":"activate","keys":["/","F8"]}
+                        ]}"#,
+                    )
+                    .unwrap(),
+                    None,
+                );
+            }
+            let mut entry = schedule(1);
+            entry.name = Some("Daily review".into());
+            app.schedules.schedules = vec![entry];
+            let mut pane = ScheduleRunsPane::new("schedule-1".into(), "Daily review".into(), 1);
+            let time = Utc.with_ymd_and_hms(2026, 11, 26, 8, 0, 0).unwrap();
+            pane.content = ScheduleRunsContent::Loaded(vec![
+                ScheduleRunView {
+                    run_id: "linked-run".into(),
+                    scheduled_for: time,
+                    status: "success".into(),
+                    session_id: Some("session-1".into()),
+                },
+                ScheduleRunView {
+                    run_id: "unlinked-run".into(),
+                    scheduled_for: time - TimeDelta::days(1),
+                    status: "missed".into(),
+                    session_id: None,
+                },
+            ]);
+            app.schedule_runs = Some(pane);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let draw = |terminal: &mut Terminal<TestBackend>, app: &App| {
+                terminal
+                    .draw(|frame| crate::ui::render(frame, app))
+                    .unwrap();
+                terminal_rows(terminal)
+            };
+
+            let linked = draw(&mut terminal, &app);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_RUN_SESSION").is_some()
+            {
+                eprintln!(
+                    "SCHEDULE RUN SESSION PREVIEW\n{linked}\nEND SCHEDULE RUN SESSION PREVIEW"
+                );
+            }
+            let open_hint = format!("{open_key} open session · Esc close");
+            assert!(linked.contains(&open_hint), "{linked}");
+            assert!(
+                linked.contains("› 2026-11-26 08:00:00  success"),
+                "{linked}"
+            );
+            assert!(linked.contains("PageUp/PageDown page"), "{linked}");
+
+            let pane = app.schedule_runs.as_mut().unwrap();
+            pane.session_open_error = Some("Could not open this session");
+            let failed = draw(&mut terminal, &app);
+            assert!(failed.contains("Could not open this session"), "{failed}");
+            assert!(failed.contains(&open_hint), "{failed}");
+            assert!(
+                failed.contains("› 2026-11-26 08:00:00  success"),
+                "{failed}"
+            );
+
+            let pane = app.schedule_runs.as_mut().unwrap();
+            pane.selected = 1;
+            pane.session_open_error = None;
+            let unlinked = draw(&mut terminal, &app);
+            assert!(
+                unlinked.contains("› 2026-11-25 08:00:00  missed"),
+                "{unlinked}"
+            );
+            assert!(!unlinked.contains("open session"), "{unlinked}");
+            assert!(unlinked.contains("PageUp/PageDown page"), "{unlinked}");
+            assert!(unlinked.contains("Esc close"), "{unlinked}");
+        }
     }
 
     #[test]
