@@ -284,12 +284,13 @@ test("Windows Project acceptance requires an exact source and stays on its manua
   assert.equal(cleanChecks?.length, 2);
 });
 
-test("the Windows Ticket directory probe is opt-in and exact-source", () => {
+test("the Windows Ticket probes are opt-in and exact-source", () => {
   const workflow = read(".github/workflows/ticket-platform-adapter.yml");
   const windows = job(workflow, "windows");
   assert.match(workflow, /windows_ticket_probe_sha:\n.*\n        required: false\n        default: ''/);
-  assert.doesNotMatch(job(workflow, "native-budget"), /windows_ticket_probe_sha|directory-flush-probe/);
-  assert.match(windows, /Probe Windows Ticket directory flush as a standard user\n\s+if: inputs\.windows_ticket_probe_sha != ''\n\s+shell: pwsh\n\s+run: \.\/scripts\/run-windows-ticket-directory-flush-probe\.ps1/);
+  assert.match(workflow, /windows_ticket_probe_case:\n.*\n        required: false\n        default: directory-flush\n        type: choice\n        options:\n          - directory-flush\n          - writer-lock/);
+  assert.doesNotMatch(job(workflow, "native-budget"), /windows_ticket_probe_(?:sha|case)|directory-flush-probe/);
+  assert.match(windows, /Probe Windows Ticket primitives as a standard user\n\s+if: inputs\.windows_ticket_probe_sha != ''\n\s+env:\n\s+PROBE_CASE: \$\{\{ inputs\.windows_ticket_probe_case \}\}\n\s+shell: pwsh\n\s+run: \.\/scripts\/run-windows-ticket-directory-flush-probe\.ps1 -ProbeCase \$env:PROBE_CASE/);
   assert.match(windows, /test "\$EXPECTED_PROBE_SHA" = "\$GITHUB_SHA"/);
   assert.match(windows, /if: always\(\) && inputs\.windows_ticket_probe_sha != ''/);
   const exactChecks = windows.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_PROBE_SHA"\n\s+source_status=\$\(git status --porcelain --untracked-files=all\)\n\s+test -z "\$source_status"/g);

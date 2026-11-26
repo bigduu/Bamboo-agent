@@ -3,14 +3,21 @@
 param(
   [Parameter(Mandatory)][string]$ExpectedSid,
   [Parameter(Mandatory)][string]$FixtureDirectory,
-  [Parameter(Mandatory)][string]$ReceiptPath
+  [Parameter(Mandatory)][string]$ReceiptPath,
+  [ValidateSet('directory-flush', 'writer-lock')][string]$ProbeCase = 'directory-flush',
+  [ValidateSet('primary', 'contender', 'alias-contender', 'name-contender', 'exit-holder')]
+  [string]$WriterRole = 'primary',
+  [ValidatePattern('^(?:[0-9a-f]{32})?$')][string]$WriterExpectedLockId = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if (-not $IsWindows) { throw 'The Ticket directory flush probe requires native Windows.' }
+if (-not $IsWindows) { throw 'The Ticket platform probe requires native Windows.' }
+if ($ProbeCase -eq 'directory-flush' -and ($WriterRole -ne 'primary' -or $WriterExpectedLockId)) {
+  throw 'Writer lock process roles require the writer-lock probe.'
+}
 
-Add-Type -TypeDefinition @'
+$interopSource = @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -20,7 +27,7 @@ using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-public static class WindowsTicketDirectoryFlushProbe
+public static partial class WindowsTicketDirectoryFlushProbe
 {
     private const string AdministratorsSid = "S-1-5-32-544";
     private const string LocalAccountSid = "S-1-5-113";
@@ -389,6 +396,12 @@ public static class WindowsTicketDirectoryFlushProbe
 }
 '@
 
+if ($ProbeCase -eq 'writer-lock') {
+  $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-native.cs') -Raw
+  $interopSource += [Environment]::NewLine + $nativeSource
+}
+Add-Type -TypeDefinition $interopSource
+
 if (-not [IO.Path]::IsPathFullyQualified($FixtureDirectory) -or
     -not [IO.Path]::IsPathFullyQualified($ReceiptPath)) {
   throw 'Provide fully qualified fixture and receipt paths.'
@@ -404,8 +417,28 @@ if (-not [string]::Equals([IO.Path]::GetDirectoryName($receiptFile),
   throw 'The receipt must be a new sibling file beside the fresh fixture directory.'
 }
 
-$receipt = [WindowsTicketDirectoryFlushProbe]::Run($ExpectedSid, $fixture)
-$json = ConvertTo-Json -InputObject $receipt -Depth 6
+if ($ProbeCase -eq 'writer-lock') {
+  . (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-cases.ps1')
+  $caseArguments = @{
+    ExpectedSid = $ExpectedSid
+    FixtureDirectory = $fixture
+    ReceiptPath = $receiptFile
+    EntryScript = $PSCommandPath
+    Role = $WriterRole
+    ExpectedLockId = $WriterExpectedLockId
+  }
+  $receipt = Invoke-TicketWriterLockCases @caseArguments
+  if ($WriterRole -eq 'exit-holder') { return }
+  if ($WriterRole -ne 'primary') {
+    [Console]::WriteLine((ConvertTo-Json -InputObject $receipt -Depth 16 -Compress))
+    return
+  }
+  $probeLabel = 'writer lock'
+} else {
+  $receipt = [WindowsTicketDirectoryFlushProbe]::Run($ExpectedSid, $fixture)
+  $probeLabel = 'directory flush'
+}
+$json = ConvertTo-Json -InputObject $receipt -Depth 16
 $stream = [IO.File]::Open($receiptFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
   $utf8 = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
@@ -413,4 +446,4 @@ try {
 } finally {
   $stream.Dispose()
 }
-Write-Output "Ticket directory flush probe verdict: $($receipt['verdict'])"
+Write-Output "Ticket $probeLabel probe verdict: $($receipt['verdict'])"

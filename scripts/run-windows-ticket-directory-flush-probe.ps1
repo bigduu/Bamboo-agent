@@ -1,6 +1,8 @@
 #Requires -Version 7.2
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('directory-flush', 'writer-lock')][string] $ProbeCase = 'directory-flush'
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -32,6 +34,42 @@ function Assert-ProbeOutcome($Outcome, [string] $Name, [bool] $Attempted) {
         }
     } elseif ($Outcome.succeeded -or $null -ne $Outcome.win32_error) {
         throw "Unexpected Win32 result for unattempted $Name."
+    }
+}
+
+function Assert-WriterProbe($Receipt, [int] $PrimaryProcessId) {
+    $proof = $Receipt.writer_lock
+    $names = $proof.name_contender.names
+    if ($Receipt.probe -cne 'writer-lock' -or $proof.owner.pid -ne $PrimaryProcessId -or
+        $proof.same_process.pid -ne $PrimaryProcessId -or
+        $proof.after_clean_release.pid -eq $PrimaryProcessId -or
+        $proof.exit_holder_exited -ne $true -or $proof.exit_holder.pid -eq $PrimaryProcessId -or
+        $proof.while_exit_holder_held.pid -eq $proof.exit_holder.pid -or
+        $proof.name_contender.pid -eq $PrimaryProcessId -or
+        $Receipt.writer_lock_name_stable -isnot [bool] -or
+        $names.name_preserved -ne $Receipt.writer_lock_name_stable -or
+        $names.qualified -isnot [bool] -or ($names.qualified -and -not $names.name_preserved)) {
+        throw 'The writer receipt did not verify the process boundaries and name result.'
+    }
+    $contenders = @('same_process', 'contender', 'alias_contender', 'while_exit_holder_held')
+    $successful = @('owner', 'after_clean_release', 'exit_holder', 'after_process_exit')
+    $lockId = $proof.owner.file_id
+    if ($lockId -cnotmatch '^[0-9a-f]{32}$' -or
+        $proof.contender.pid -eq $PrimaryProcessId -or $proof.alias_contender.pid -eq $PrimaryProcessId) {
+        throw 'The writer receipt did not identify the lock and independent contenders.'
+    }
+    foreach ($phase in ($contenders + $successful)) {
+        $observation = $proof.$phase
+        Assert-ProbeOutcome $observation.operation $phase $true
+        $expectedError = if ($phase -in $contenders) { 33 } else { 0 }
+        if ($observation.operation.win32_error -ne $expectedError -or
+            $observation.file_id -cne $lockId -or $observation.volume_serial -cne $proof.owner.volume_serial) {
+            throw "Unexpected lock or identity evidence during $phase."
+        }
+    }
+    $expectedVerdict = if ($names.qualified) { 'available' } else { 'unavailable' }
+    if ($Receipt.verdict -cne $expectedVerdict) {
+        throw 'The writer verdict does not match the name qualification.'
     }
 }
 
@@ -79,14 +117,28 @@ try {
     $receiptPath = Join-Path $scratch 'receipt.json'
     $null = New-Item -ItemType Directory -Path $fixture
 
-    $sourceProbe = Join-Path $PSScriptRoot 'windows-ticket-directory-flush-probe.ps1'
     $copiedProbe = Join-Path $workspace 'probe.ps1'
-    $probeHash = (Get-FileHash -LiteralPath $sourceProbe -Algorithm SHA256).Hash
-    Copy-Item -LiteralPath $sourceProbe -Destination $copiedProbe
-    if ((Get-FileHash -LiteralPath $copiedProbe -Algorithm SHA256).Hash -ne $probeHash) {
-        throw 'The staged probe differs from the checked-out script.'
+    $probeFiles = [ordered]@{ 'windows-ticket-directory-flush-probe.ps1' = 'probe.ps1' }
+    if ($ProbeCase -eq 'writer-lock') {
+        $probeFiles['windows-ticket-writer-lock-native.cs'] = 'windows-ticket-writer-lock-native.cs'
+        $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
     }
-    Write-Output "Probe script SHA256 $probeHash"
+    $stagedHashes = @{}
+    foreach ($filename in $probeFiles.Keys) {
+        $sourcePath = Join-Path $PSScriptRoot $filename
+        $stagedPath = Join-Path $workspace $probeFiles[$filename]
+        $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
+        Copy-Item -LiteralPath $sourcePath -Destination $stagedPath
+        if ((Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash -ne $sourceHash) {
+            throw "The staged file differs from the checked-out $filename."
+        }
+        $stagedHashes[$stagedPath] = $sourceHash
+        if ($stagedPath -eq $copiedProbe) {
+            Write-Output "Probe script SHA256 $sourceHash"
+        } else {
+            Write-Output "Probe companion $filename SHA256 $sourceHash"
+        }
+    }
 
     $launch = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
     $launch.WorkingDirectory = $scratch
@@ -105,15 +157,20 @@ try {
 
     foreach ($argument in @(
         '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $copiedProbe,
-        '-ExpectedSid', $account.SID.Value, '-FixtureDirectory', $fixture, '-ReceiptPath', $receiptPath
+        '-ExpectedSid', $account.SID.Value, '-FixtureDirectory', $fixture, '-ReceiptPath', $receiptPath,
+        '-ProbeCase', $ProbeCase
     )) {
         $launch.ArgumentList.Add($argument)
     }
     $process = [System.Diagnostics.Process]::Start($launch)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit(90000)) {
-        throw 'The standard-user probe exceeded its 90-second deadline.'
+    $timeoutSeconds = if ($ProbeCase -eq 'writer-lock') { 180 } else { 90 }
+    if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
+        throw "The standard-user probe exceeded its $timeoutSeconds-second deadline."
+    }
+    if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdout, $stderr), 5000)) {
+        throw 'The standard-user probe output remained open after process exit.'
     }
     $output = $stdout.GetAwaiter().GetResult()
     $errorOutput = $stderr.GetAwaiter().GetResult()
@@ -137,24 +194,30 @@ try {
         $receipt.ordered_crash_persistence_proven -ne $false) {
         throw 'Probe output did not attest the native standard user and fixed NTFS or exceeded the probe scope.'
     }
-    Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
-    Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
-    if (-not $receipt.staged_file_flush.succeeded -or -not $receipt.scratch_name_publication.succeeded -or
-        $receipt.warm_reopen.succeeded -ne $true -or $receipt.staged_file_id -cnotmatch '^[0-9a-f]{32}$' -or
-        $receipt.warm_reopen.published_file_id -cne $receipt.staged_file_id -or $receipt.warm_reopen.bytes -le 0) {
-        throw 'Probe output did not verify the staged file and same-file warm reopen.'
+    if ($ProbeCase -eq 'writer-lock') {
+        Assert-WriterProbe $receipt $process.Id
+    } else {
+        Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
+        Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
+        if (-not $receipt.staged_file_flush.succeeded -or -not $receipt.scratch_name_publication.succeeded -or
+            $receipt.warm_reopen.succeeded -ne $true -or $receipt.staged_file_id -cnotmatch '^[0-9a-f]{32}$' -or
+            $receipt.warm_reopen.published_file_id -cne $receipt.staged_file_id -or $receipt.warm_reopen.bytes -le 0) {
+            throw 'Probe output did not verify the staged file and same-file warm reopen.'
+        }
+        Assert-ProbeOutcome $receipt.directory_open 'writable directory open' $true
+        Assert-ProbeOutcome $receipt.directory_flush_before 'directory flush before publication' $receipt.directory_open.succeeded
+        Assert-ProbeOutcome $receipt.directory_flush_after 'directory flush after publication' $receipt.directory_open.succeeded
+        $directoryAvailable = $receipt.directory_open.succeeded -and
+            $receipt.directory_flush_before.succeeded -and $receipt.directory_flush_after.succeeded
+        $expectedVerdict = if ($directoryAvailable) { 'available' } else { 'unavailable' }
+        if ($receipt.verdict -cne $expectedVerdict) {
+            throw 'The directory verdict does not match the reported native outcomes.'
+        }
     }
-    Assert-ProbeOutcome $receipt.directory_open 'writable directory open' $true
-    Assert-ProbeOutcome $receipt.directory_flush_before 'directory flush before publication' $receipt.directory_open.succeeded
-    Assert-ProbeOutcome $receipt.directory_flush_after 'directory flush after publication' $receipt.directory_open.succeeded
-    $directoryAvailable = $receipt.directory_open.succeeded -and
-        $receipt.directory_flush_before.succeeded -and $receipt.directory_flush_after.succeeded
-    $expectedVerdict = if ($directoryAvailable) { 'available' } else { 'unavailable' }
-    if ($receipt.verdict -cne $expectedVerdict) {
-        throw 'The directory verdict does not match the reported native outcomes.'
-    }
-    if ((Get-FileHash -LiteralPath $copiedProbe -Algorithm SHA256).Hash -ne $probeHash) {
-        throw 'The probe script changed during the trial.'
+    foreach ($stagedPath in $stagedHashes.Keys) {
+        if ((Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash -ne $stagedHashes[$stagedPath]) {
+            throw 'A staged probe file changed during the trial.'
+        }
     }
     Write-Output $receiptJson.TrimEnd()
 } finally {
@@ -162,7 +225,9 @@ try {
         if ($process) {
             if (-not $process.HasExited) {
                 $process.Kill($true)
-                $process.WaitForExit()
+                if (-not $process.WaitForExit(5000)) {
+                    throw 'The stopped probe did not exit within the cleanup deadline.'
+                }
             }
             $process.Dispose()
         }
