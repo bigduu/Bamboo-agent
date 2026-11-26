@@ -1370,6 +1370,109 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_renders_assistant_checklist_and_neighboring_markdown_at_each_width() {
+        let source = concat!(
+            "# Launch checklist\n\n",
+            "-  [ ] Verify **接口** 🧪\n",
+            "  *\t[x] Build **组件** 🧭\n",
+            "+ [x] Ship sample\n",
+            "7)   [X] Review `日志` ✅\n",
+            "- Plain bullet\n",
+            "- [x]no marker boundary\n",
+            "- [x](https://example.test/check) remains a link.\n",
+            "Read [release notes](https://example.test/notes).\n\n",
+            "```text\n- [x] literal inside fence\n```\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-checklist".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MARKDOWN_CHECKLIST").is_some() {
+                eprintln!(
+                    "MARKDOWN CHECKLIST PREVIEW\n{}\nEND MARKDOWN CHECKLIST PREVIEW",
+                    rows.join("\n")
+                );
+            }
+
+            let row_for = |text: &str| {
+                rows.iter()
+                    .find(|row| row.contains(text))
+                    .unwrap_or_else(|| {
+                        panic!("missing {text:?} at width {width}:\n{}", rows.join("\n"))
+                    })
+            };
+            let pending = row_for("Verify");
+            assert!(pending.contains("☐ Verify "));
+            assert!(pending.replace(' ', "").contains("接口🧪"));
+            let nested = row_for("Build");
+            assert!(nested.contains("☑ Build "));
+            assert!(nested.find('☑').unwrap() > pending.find('☐').unwrap());
+            assert!(nested.replace(' ', "").contains("组件🧭"));
+            assert!(row_for("Ship sample").contains("☑ Ship sample"));
+            let ordered = row_for("Review");
+            assert!(ordered.contains("7) ☑ Review "));
+            assert!(ordered.replace(' ', "").contains("日志✅"));
+
+            assert!(row_for("Plain bullet").contains("• Plain bullet"));
+            assert!(row_for("no marker boundary").contains("• [x]no marker boundary"));
+            assert!(row_for("remains a link").contains("• x (https://example.test/check)"));
+            assert!(row_for("release notes").contains("release notes (https://example.test/notes)"));
+            assert!(fence_rows(&rows, "text")[1].contains("- [x] literal inside fence"));
+            assert!(terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol() == "接" && cell.modifier.contains(Modifier::BOLD) }));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_checkboxes_only_after_streamed_markers_are_complete() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:checklist".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            app.chat.current_response = "Progress\n\n- [x".into();
+            let partial = transcript_rows(&mut terminal, &app, true);
+            assert!(partial.iter().any(|row| row.contains("• [x")));
+            assert!(partial
+                .iter()
+                .all(|row| !row.contains('☑') && !row.contains('☐')));
+
+            app.chat
+                .current_response
+                .push_str("] Verify 输入 🧭\n  - [ ");
+            let checked = transcript_rows(&mut terminal, &app, true);
+            let checked_row = checked.iter().find(|row| row.contains("☑ Verify")).unwrap();
+            assert!(checked_row.replace(' ', "").contains("输入🧭"));
+            assert!(checked.iter().any(|row| row.trim() == "• ["));
+            assert!(checked.iter().all(|row| !row.contains('☐')));
+
+            app.chat.current_response.push_str("] Document 输出 🧪");
+            let complete = transcript_rows(&mut terminal, &app, true);
+            assert!(complete.contains(checked_row));
+            let new_row = complete
+                .iter()
+                .find(|row| row.contains("☐ Document"))
+                .unwrap();
+            assert!(new_row.replace(' ', "").contains("输出🧪"));
+            assert!(complete
+                .iter()
+                .any(|row| row.contains("Bamboo · streaming")));
+        }
+    }
+
+    #[test]
     fn testbackend_keeps_streaming_composer_visible_with_structured_rows() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("parent".to_string());

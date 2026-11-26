@@ -40,8 +40,8 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
-/// [links](url), `#`..`######` headings, `-`/`*` and ordered (`1.`) lists with
-/// nesting, `>` blockquotes, and pipe tables.
+/// [links](url), `#`..`######` headings, nested bullet and ordered lists,
+/// task-list checkboxes, `>` blockquotes, and pipe tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
     if width == 0 {
@@ -103,25 +103,8 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Ordered list: "N. text".
-        if let Some((num, content)) = ordered_item(body) {
-            let mut spans = vec![Span::styled(
-                format!("{indent}  {num}. "),
-                Style::default().fg(colors::subtle()),
-            )];
-            spans.extend(parse_inline(content));
-            lines.push(Line::from(spans));
-            continue;
-        }
-
-        // Unordered list: "- text" / "* text".
-        if let Some(content) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
-            let mut spans = vec![Span::styled(
-                format!("{indent}  • "),
-                Style::default().fg(colors::subtle()),
-            )];
-            spans.extend(parse_inline(content));
-            lines.push(Line::from(spans));
+        if let Some(item) = render_list_item(raw_line, &indent) {
+            lines.push(item);
             continue;
         }
 
@@ -180,17 +163,90 @@ fn heading(body: &str) -> Option<(usize, &str)> {
     None
 }
 
-/// If `body` starts with an ordered-list marker (`N. `), return `(number, rest)`.
-fn ordered_item(body: &str) -> Option<(&str, &str)> {
-    let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
+struct ListAnchor<'a> {
+    indent: &'a str,
+    marker: &'a str,
+    rest: &'a str,
+}
+
+impl<'a> ListAnchor<'a> {
+    fn task(&self) -> Option<(char, &'a str)> {
+        let content = self.rest.trim_start_matches([' ', '\t']);
+        let task = task_item(content)?;
+        let padding = &self.rest[..self.rest.len() - content.len()];
+        // Apply the 1–4 column marker padding within this line. Container
+        // nesting is handled by the existing line-oriented renderer.
+        let marker_end = column_after(0, self.indent) + self.marker.len();
+        (column_after(marker_end, padding) - marker_end <= 4).then_some(task)
     }
-    let rest = &body[digits..];
-    if let Some(content) = rest.strip_prefix(". ") {
-        return Some((&body[..digits], content));
-    }
-    None
+}
+
+fn column_after(start: usize, text: &str) -> usize {
+    text.chars().fold(start, |column, character| {
+        if character == '\t' {
+            column + (4 - column % 4)
+        } else {
+            column + 1
+        }
+    })
+}
+
+fn list_anchor(line: &str) -> Option<ListAnchor<'_>> {
+    let body = line.trim_start();
+    let marker_len = if body.starts_with(['-', '*', '+']) {
+        1
+    } else {
+        let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || !matches!(body.as_bytes().get(digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    };
+    let (marker, rest) = body.split_at(marker_len);
+    rest.starts_with([' ', '\t']).then_some(ListAnchor {
+        indent: &line[..line.len() - body.len()],
+        marker,
+        rest,
+    })
+}
+
+/// The ordinary ordered-list syntax already supported by the renderer.
+fn ordered_item(line: &str) -> Option<(&str, &str)> {
+    let anchor = list_anchor(line)?;
+    Some((
+        anchor.marker.strip_suffix('.')?,
+        anchor.rest.strip_prefix(' ')?,
+    ))
+}
+
+fn render_list_item(line: &str, indent: &str) -> Option<Line<'static>> {
+    let anchor = list_anchor(line)?;
+    let (prefix, content) = match (anchor.marker, anchor.task()) {
+        (marker, Some((box_mark, text))) if marker.len() > 1 => {
+            (format!("{indent}  {marker} {box_mark} "), text)
+        }
+        (_, Some((box_mark, text))) => (format!("{indent}  {box_mark} "), text),
+        (marker, None) if marker.ends_with('.') => (
+            format!("{indent}  {marker} "),
+            anchor.rest.strip_prefix(' ')?,
+        ),
+        ("-" | "*", None) => (format!("{indent}  • "), anchor.rest.strip_prefix(' ')?),
+        _ => return None,
+    };
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(colors::subtle()))];
+    spans.extend(parse_inline(content));
+    Some(Line::from(spans))
+}
+
+fn task_item(content: &str) -> Option<(char, &str)> {
+    let box_mark = match content.as_bytes() {
+        [b'[', b' ', b']', ..] => '☐',
+        [b'[', b'x' | b'X', b']', ..] => '☑',
+        _ => return None,
+    };
+    let rest = &content[3..];
+    (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .then_some((box_mark, rest.trim_start()))
 }
 
 fn render_code_block(lines: &mut Vec<Line>, block: FencedBlock<'_>, width: usize) {
@@ -410,6 +466,118 @@ mod tests {
         assert_eq!(out[1], "  2. second");
         assert!(out[2].contains("• nested"));
         assert!(out[2].starts_with("  "), "nested indent preserved");
+    }
+
+    #[test]
+    fn task_lists_preserve_nesting_numbering_and_inline_styles() {
+        let rows = render_markdown(
+            "- [ ] **准备** 🧭\n  * [x] `done`\n\t7. [X] _完成_\n+ [ ]\n1. ordinary\n+ ordinary",
+            80,
+        );
+        assert_eq!(
+            rows.iter().map(text_of).collect::<Vec<_>>(),
+            [
+                "  ☐ 准备 🧭",
+                "    ☑ done",
+                "    7. ☑ 完成",
+                "  ☐ ",
+                "  1. ordinary",
+                "+ ordinary",
+            ]
+        );
+        for (row, text, modifier) in [
+            (&rows[0], "准备", Modifier::BOLD),
+            (&rows[1], "done", Modifier::REVERSED),
+            (&rows[2], "完成", Modifier::ITALIC),
+        ] {
+            assert!(row
+                .spans
+                .iter()
+                .any(|span| span.content == text && span.style.add_modifier.contains(modifier)));
+        }
+    }
+
+    #[test]
+    fn task_markers_require_an_exact_checkbox_and_a_separator() {
+        assert_eq!(
+            render(concat!(
+                "- [\n- [x\n- [] empty\n- [o] wrong\n- [x]suffix\n",
+                "- [x](https://example.test)\n- [X]\tTabbed\n[x] Plain prose",
+            )),
+            [
+                "  • [",
+                "  • [x",
+                "  • [] empty",
+                "  • [o] wrong",
+                "  • [x]suffix",
+                "  • x (https://example.test)",
+                "  ☑ Tabbed",
+                "[x] Plain prose",
+            ]
+        );
+    }
+
+    #[test]
+    fn checklist_anchors_accept_spaces_tabs_and_both_ordered_delimiters() {
+        assert_eq!(
+            render(concat!(
+                "-   [ ] spacing\n*\t[x] tab\n+\t[X] plus\n09.\t[x] period\n",
+                "7)  [X] parenthesis\n   7)\t[X] nested\n-\t [x] four columns",
+            )),
+            [
+                "  ☐ spacing",
+                "  ☑ tab",
+                "  ☑ plus",
+                "  09. ☑ period",
+                "  7) ☑ parenthesis",
+                "     7) ☑ nested",
+                "  ☑ four columns",
+            ]
+        );
+    }
+
+    #[test]
+    fn checklist_anchors_keep_missing_or_excessive_padding_literal() {
+        assert_eq!(
+            render(concat!(
+                "-[x] no separator\n7)[X] no separator\n1.[ ] no separator\n",
+                "-     [x] five spaces\n-\t  [x] five columns\n7)\t[x\n",
+                "3.  ordinary\n7) ordinary\n*\tordinary",
+            )),
+            [
+                "-[x] no separator",
+                "7)[X] no separator",
+                "1.[ ] no separator",
+                "  •     [x] five spaces",
+                "-\t  [x] five columns",
+                "7)\t[x",
+                "  3.  ordinary",
+                "7) ordinary",
+                "\tordinary",
+            ]
+        );
+    }
+
+    #[test]
+    fn checklist_anchors_end_a_preceding_table() {
+        for (item, expected) in [
+            ("-\t[X] tab", "  ☑ tab"),
+            ("7)  [ ] ordered", "  7) ☐ ordered"),
+            ("   +\t[x] nested", "     ☑ nested"),
+        ] {
+            let rows = render(&format!("| Item |\n| --- |\n| table |\n{item}"));
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows[2].trim_end(), "table");
+            assert_eq!(rows[3], expected);
+        }
+    }
+
+    #[test]
+    fn task_marker_text_stays_literal_in_code_and_table_cells() {
+        let rows = render("~~~md\n- [x] code\n~~~\n| Item |\n| --- |\n| [ ] cell |");
+        assert!(rows[1].contains("- [x] code"));
+        assert_eq!(rows[5].trim_end(), "[ ] cell");
+        assert!(rows.iter().all(|row| !row.contains(['☐', '☑'])));
     }
 
     #[test]
