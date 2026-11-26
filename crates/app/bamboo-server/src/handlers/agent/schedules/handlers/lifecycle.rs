@@ -1,9 +1,11 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{http::StatusCode, web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::schedule_app::ScheduleRunJob;
+use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
-use super::super::types::{CreateScheduleRequest, PatchScheduleRequest, ScheduleView};
+use super::super::types::{
+    CreateScheduleRequest, PatchScheduleRequest, ScheduleRunRecordView, ScheduleView,
+};
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
     validate_auto_execute_run_config, validate_schedule_name, validate_workflow_target,
@@ -156,6 +158,62 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
     })))
 }
 
+/// `POST /api/v1/schedules/{schedule_id}/runs/{run_id}/cancel`
+pub async fn cancel_schedule_run(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (schedule_id, run_id) = path.into_inner();
+    let store = &state.schedule_store;
+    let lookup = || store.get_public_schedule_run_record(&schedule_id, &run_id);
+    let not_found = || {
+        crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule run not found".into(),
+            Some("schedule_run_not_found"),
+        )
+    };
+    let Some(record) = lookup().await else {
+        return not_found();
+    };
+    if record.status.is_terminal() {
+        return HttpResponse::Ok().json(ScheduleRunRecordView::from(record));
+    }
+
+    let requested = match record.session_id.as_deref() {
+        Some(session_id)
+            if record.status == ScheduleRunStatus::Running && record.workflow_run_id.is_none() =>
+        {
+            state
+                .schedule_manager
+                .request_ordinary_run_cancel(&schedule_id, &run_id, session_id)
+                .await
+        }
+        _ => false,
+    };
+    if requested {
+        return HttpResponse::Accepted().json(serde_json::json!({
+            "schedule_id": schedule_id,
+            "run_id": run_id,
+            "status": "cancel_requested"
+        }));
+    }
+
+    // The owner may have finished or the schedule may have been deleted
+    // since the initial lookup. Report the current record without writing it.
+    match lookup().await {
+        None => not_found(),
+        Some(record) if record.status.is_terminal() => {
+            HttpResponse::Ok().json(ScheduleRunRecordView::from(record))
+        }
+        Some(_) => crate::error::json_error_with_code(
+            StatusCode::CONFLICT,
+            "Schedule run has no cancellable live execution".into(),
+            Some("schedule_run_not_cancellable"),
+        ),
+    }
+}
+
 pub(in crate::handlers::agent::schedules) fn normalize_optional_name(
     value: Option<&str>,
 ) -> Option<String> {
@@ -182,6 +240,7 @@ mod tests {
         use tempfile::tempdir;
 
         use crate::routes::configure_routes;
+        use crate::schedule_app::{ScheduleRunConfig, ScheduleRunStatus, ScheduleTrigger};
         use crate::AppState;
 
         /// `DELETE /api/v1/schedules/{id}` for an unknown schedule must use
@@ -217,6 +276,186 @@ mod tests {
             assert_eq!(body["error"]["type"], "api_error");
             assert_eq!(body["error"]["message"], "Schedule not found");
             assert_eq!(body["schedule_id"], "does-not-exist");
+        }
+
+        #[actix_web::test]
+        async fn cancel_schedule_run_reports_recorded_outcomes_and_rejects_unowned_runs() {
+            let temp_dir = tempdir().expect("tempdir");
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(
+                AppState::new(temp_dir.path().to_path_buf())
+                    .await
+                    .expect("app state"),
+            );
+            let store = &state.schedule_store;
+            let schedule = store
+                .create_schedule(
+                    "Recurring task".into(),
+                    ScheduleTrigger::Interval {
+                        every_seconds: 3600,
+                        anchor_at: None,
+                    },
+                    true,
+                    ScheduleRunConfig {
+                        auto_execute: true,
+                        task_message: Some("fixture task".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let workflow = store
+                .create_schedule(
+                    "Workflow".into(),
+                    ScheduleTrigger::Once {
+                        at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    },
+                    true,
+                    ScheduleRunConfig {
+                        auto_execute: true,
+                        workflow_target: Some(bamboo_domain::ScheduledWorkflowTarget {
+                            workflow_id: "fixture-workflow".into(),
+                            revision: 1,
+                            args: serde_json::json!({}),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let queued = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            let unbound = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            store
+                .mark_run_started(&schedule.id, &unbound.run_id)
+                .await
+                .unwrap();
+            let stale = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            store
+                .mark_run_started(&schedule.id, &stale.run_id)
+                .await
+                .unwrap();
+            store
+                .bind_run_session(&schedule.id, &stale.run_id, "prior-host-session")
+                .await
+                .unwrap();
+            let workflow_run = store.create_run_now(&workflow.id).await.unwrap().unwrap();
+            assert!(store
+                .start_workflow_occurrence(&workflow.id, &workflow_run.run_id)
+                .await
+                .unwrap());
+            store
+                .bind_run_session(&workflow.id, &workflow_run.run_id, "workflow-session")
+                .await
+                .unwrap();
+            store
+                .bind_run_workflow(&workflow.id, &workflow_run.run_id, "workflow-execution")
+                .await
+                .unwrap();
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let cancel = |schedule_id: &str, run_id: &str| {
+                test::TestRequest::post()
+                    .uri(&format!(
+                        "/api/v1/schedules/{schedule_id}/runs/{run_id}/cancel"
+                    ))
+                    .to_request()
+            };
+            for (schedule_id, run_id, expected, code) in [
+                (
+                    "missing",
+                    queued.run_id.as_str(),
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    workflow.id.as_str(),
+                    queued.run_id.as_str(),
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    schedule.id.as_str(),
+                    "missing",
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    schedule.id.as_str(),
+                    queued.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    schedule.id.as_str(),
+                    unbound.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    schedule.id.as_str(),
+                    stale.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    workflow.id.as_str(),
+                    workflow_run.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+            ] {
+                let record_before = store.get_run_record(run_id).await;
+                let response = test::call_service(&app, cancel(schedule_id, run_id)).await;
+                assert_eq!(response.status(), expected, "{schedule_id}/{run_id}");
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], code);
+                assert_eq!(store.get_run_record(run_id).await, record_before);
+            }
+
+            for (status, wire_status) in [
+                (ScheduleRunStatus::Success, "success"),
+                (ScheduleRunStatus::Cancelled, "cancelled"),
+            ] {
+                let run = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+                store
+                    .mark_run_started(&schedule.id, &run.run_id)
+                    .await
+                    .unwrap();
+                store
+                    .mark_run_terminal(
+                        &schedule.id,
+                        &run.run_id,
+                        status,
+                        Some("fixture outcome".into()),
+                    )
+                    .await
+                    .unwrap();
+                let recorded = store.get_run_record(&run.run_id).await.unwrap();
+                for _ in 0..2 {
+                    let response =
+                        test::call_service(&app, cancel(&schedule.id, &run.run_id)).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body: Value = test::read_body_json(response).await;
+                    assert_eq!(body["schedule_id"], schedule.id);
+                    assert_eq!(body["run_id"], run.run_id);
+                    assert_eq!(body["status"], wire_status);
+                    assert_eq!(body["outcome_reason"], "fixture outcome");
+                    assert_eq!(
+                        body["completed_at"],
+                        serde_json::to_value(recorded.completed_at).unwrap()
+                    );
+                }
+                assert_eq!(store.get_run_record(&run.run_id).await, Some(recorded));
+            }
+            let retained = store.get_schedule(&schedule.id).await.unwrap();
+            assert!(retained.enabled);
+            assert_eq!(retained.state.next_fire_at, schedule.state.next_fire_at);
         }
 
         #[actix_web::test]

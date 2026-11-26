@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -11,7 +11,7 @@ use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
-    spawn_session_execution, AgentRunner, SessionCompletionHook, SessionExecutionArgs,
+    spawn_session_execution, AgentRunner, AgentStatus, SessionCompletionHook, SessionExecutionArgs,
     SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
@@ -97,8 +97,66 @@ enum ScheduleRunLifecycleResult {
 pub struct ScheduleManager {
     tx: mpsc::Sender<ScheduleRunJob>,
     update_admission: crate::app_state::update_admission::UntrackedUpdateAdmission,
+    ordinary_run_owners: OrdinaryRunOwners,
+    agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     #[cfg(test)]
     guard_progress: ScheduleGuardObservers,
+}
+
+type OrdinaryRunOwners = Arc<Mutex<HashMap<String, OrdinaryRunOwner>>>;
+
+struct OrdinaryRunOwner {
+    schedule_id: String,
+    session_id: String,
+    execution_run_id: String,
+    cancellation_acknowledged: bool,
+}
+
+/// The completion hook owns this registration, including startup paths where
+/// the execution drops the hook before reaching normal finalization.
+struct OrdinaryRunRegistration {
+    owners: OrdinaryRunOwners,
+    run_id: String,
+    execution_run_id: String,
+}
+
+impl OrdinaryRunRegistration {
+    fn new(
+        owners: &OrdinaryRunOwners,
+        job: &ScheduleRunJob,
+        session_id: &str,
+        execution_run_id: &str,
+    ) -> Option<Self> {
+        use std::collections::hash_map::Entry;
+
+        let mut live = owners.lock().unwrap();
+        let Entry::Vacant(entry) = live.entry(job.run_id.clone()) else {
+            return None;
+        };
+        entry.insert(OrdinaryRunOwner {
+            schedule_id: job.schedule_id.clone(),
+            session_id: session_id.to_owned(),
+            execution_run_id: execution_run_id.to_owned(),
+            cancellation_acknowledged: false,
+        });
+        Some(Self {
+            owners: owners.clone(),
+            run_id: job.run_id.clone(),
+            execution_run_id: execution_run_id.to_owned(),
+        })
+    }
+}
+
+impl Drop for OrdinaryRunRegistration {
+    fn drop(&mut self) {
+        let mut live = self.owners.lock().unwrap();
+        if live
+            .get(&self.run_id)
+            .is_some_and(|current| current.execution_run_id == self.execution_run_id)
+        {
+            live.remove(&self.run_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -229,12 +287,14 @@ impl ScheduleManager {
         let (tx, mut rx) = mpsc::channel::<ScheduleRunJob>(128);
         let update_admission =
             crate::app_state::update_admission::UntrackedUpdateAdmission::default();
+        let ordinary_run_owners = OrdinaryRunOwners::default();
         #[cfg(test)]
         let guard_progress = ScheduleGuardObservers::default();
 
         // Worker: executes jobs sequentially (simple + predictable).
         tokio::spawn({
             let ctx = ctx.clone();
+            let ordinary_run_owners = ordinary_run_owners.clone();
             #[cfg(test)]
             let guard_progress = guard_progress.clone();
             async move {
@@ -281,9 +341,10 @@ impl ScheduleManager {
                     }
                     let schedule_id = job.schedule_id.clone();
                     let run_id = job.run_id.clone();
-                    match run_schedule_job(
+                    match run_schedule_job_with_owners(
                         ctx.clone(),
                         job,
+                        &ordinary_run_owners,
                         #[cfg(test)]
                         progress.clone(),
                     )
@@ -403,9 +464,42 @@ impl ScheduleManager {
         Self {
             tx,
             update_admission,
+            ordinary_run_owners,
+            agent_runners: ctx.agent_runners,
             #[cfg(test)]
             guard_progress,
         }
+    }
+
+    /// Signal an exact current ordinary execution, or acknowledge its
+    /// previously accepted signal while its completion hook settles.
+    pub(crate) async fn request_ordinary_run_cancel(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) -> bool {
+        let runners = self.agent_runners.read().await;
+        let mut owners = self.ordinary_run_owners.lock().unwrap();
+        let Some(owner) = owners
+            .get_mut(run_id)
+            .filter(|owner| owner.schedule_id == schedule_id && owner.session_id == session_id)
+        else {
+            return false;
+        };
+        if owner.cancellation_acknowledged {
+            return true;
+        }
+        let Some(runner) = runners.get(session_id).filter(|runner| {
+            runner.run_id == owner.execution_run_id
+                && matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                && !runner.exact_execution_finalized()
+        }) else {
+            return false;
+        };
+        runner.cancel_token.cancel();
+        owner.cancellation_acknowledged = true;
+        true
     }
 
     pub(crate) fn update_admission(
@@ -533,9 +627,19 @@ async fn notify_schedule_run_outcome(
     }
 }
 
+#[cfg(test)]
 async fn run_schedule_job(
     ctx: ScheduleContext,
     job: ScheduleRunJob,
+    progress: Option<Arc<ScheduleGuardProgress>>,
+) -> Result<ScheduleRunLifecycleResult, String> {
+    run_schedule_job_with_owners(ctx, job, &OrdinaryRunOwners::default(), progress).await
+}
+
+async fn run_schedule_job_with_owners(
+    ctx: ScheduleContext,
+    job: ScheduleRunJob,
+    ordinary_run_owners: &OrdinaryRunOwners,
     #[cfg(test)] progress: Option<Arc<ScheduleGuardProgress>>,
 ) -> Result<ScheduleRunLifecycleResult, String> {
     if let Some(status) = super::log_monitor::run_log_monitor(&ctx, &job)
@@ -700,24 +804,28 @@ async fn run_schedule_job(
     let scheduled_startup_expected = session.clone();
     #[cfg(test)]
     progress.at("session_bind_pending");
-    if let Err(error) = ctx
+    let session_bound = match ctx
         .schedule_store
         .bind_run_session(&job.schedule_id, &job.run_id, &session_id)
         .await
     {
-        if job.run_config.workflow_target.is_some() {
+        Ok(()) => true,
+        Err(_) if job.run_config.workflow_target.is_some() => {
             return Err(
                 "scheduled Workflow session correlation could not be persisted".to_string(),
             );
         }
-        tracing::warn!(
-            "failed to bind session {} to schedule run {} / {}: {}",
-            session_id,
-            job.schedule_id,
-            job.run_id,
-            error
-        );
-    }
+        Err(error) => {
+            tracing::warn!(
+                "failed to bind session {} to schedule run {} / {}: {}",
+                session_id,
+                job.schedule_id,
+                job.run_id,
+                error
+            );
+            false
+        }
+    };
     ctx.sessions_cache.insert(
         session_id.clone(),
         Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
@@ -878,8 +986,8 @@ async fn run_schedule_job(
     // path (`spawn_session_execution`), the same one the HTTP execute handler
     // and the child-completion coordinator use. Schedule-specific finalization
     // (marking the run terminal, and writing a visible failure marker) is
-    // carried by the `on_complete` hook, which runs after the runner is
-    // finalized but before the session is persisted — so the marker is saved.
+    // carried by the `on_complete` hook after the execution result is known
+    // and before the session is persisted, so the marker is saved.
     // Unmodified custom contexts retain their roster snapshot. The standard
     // builder's Agent factory replaces this with a live resolver for this run.
     let aux_fast_model = resolved.model_roster.fast_model();
@@ -904,9 +1012,20 @@ async fn run_schedule_job(
     let log_session_id = session_id.clone();
     let schedule_name_for_notify = job.schedule_name.clone();
     let notification_relay_for_hook = ctx.notification_relay.clone();
+    let ordinary_run = if session_bound {
+        OrdinaryRunRegistration::new(
+            ordinary_run_owners,
+            &job,
+            &session_id,
+            execution_reservation.run_id(),
+        )
+    } else {
+        None
+    };
 
     let on_complete: SessionCompletionHook = Box::new(move |outcome, session| {
         Box::pin(async move {
+            let _ordinary_run = ordinary_run;
             let terminal_status = if outcome.success {
                 tracing::info!(
                     "[schedule:{}][run:{}][session:{}] scheduled run completed",
@@ -1838,6 +1957,10 @@ mod build_context_tests {
 #[cfg(test)]
 #[path = "model_routing_tests.rs"]
 mod model_routing_tests;
+
+#[cfg(test)]
+#[path = "ordinary_cancel_tests.rs"]
+mod ordinary_cancel_tests;
 
 #[cfg(test)]
 mod notify_outcome_tests {
