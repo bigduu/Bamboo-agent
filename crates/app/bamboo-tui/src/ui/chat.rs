@@ -1664,6 +1664,105 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_renders_assistant_image_alt_text_alongside_links_and_code() {
+        let source = concat!(
+            "Build report\n\n",
+            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/notes)\n",
+            "Missing description: ![](assets/empty.png)\n",
+            "Inline example: `![inline](assets/code.png)`\n\n",
+            "```md\n![fenced](assets/fence.png)\n```\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-image-alt".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_IMAGE_ALT").is_some() {
+                eprintln!("IMAGE ALT PREVIEW\n{rendered}\nEND IMAGE ALT PREVIEW");
+            }
+            let description = rows
+                .iter()
+                .find(|row| row.contains("build_route"))
+                .unwrap_or_else(|| {
+                    panic!("missing image description at {width} columns\n{rendered}")
+                });
+            assert_eq!(
+                description.replace(' ', ""),
+                "build_route输出🧪·notes(https://example.test/notes)"
+            );
+            assert!(rendered.contains("Missing description: [Image]"));
+            assert!(!rendered.contains("assets/run(2).png"));
+            assert!(!rendered.contains("assets/empty.png"));
+            assert!(rendered.contains("Inline example: ![inline](assets/code.png)"));
+            assert!(fence_rows(&rows, "md")[1].contains("![fenced](assets/fence.png)"));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_image_syntax_visible_through_the_outer_close() {
+        const INTRO: &str = "Build report [notes](https://example.test/notes)\n\n";
+        const ALT: &str = "![build_route 输出 🧪";
+        const DESTINATION: &str = "](assets/run(2).png";
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:image-alt".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let partial_destination = format!("{ALT}{DESTINATION}");
+            for literal in [ALT, partial_destination.as_str()] {
+                let source = format!("{INTRO}{literal}");
+                app.chat.current_response = source.clone();
+                let rows = transcript_rows(&mut terminal, &app, true);
+                let expected = literal.replace(' ', "");
+                assert!(
+                    rows.iter().any(|row| row.replace(' ', "") == expected),
+                    "missing literal {literal:?} at {width} columns\n{}",
+                    rows.join("\n")
+                );
+                assert!(rows
+                    .iter()
+                    .any(|row| row.contains("notes (https://example.test/notes)")));
+                assert_eq!(app.chat.current_response, source);
+            }
+
+            app.chat.current_response.push(')');
+            let completed = transcript_rows(&mut terminal, &app, true);
+            let description = completed
+                .iter()
+                .position(|row| row.replace(' ', "") == "build_route输出🧪")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing completed image at {width} columns\n{}",
+                        completed.join("\n")
+                    )
+                });
+            assert!(completed.iter().all(|row| !row.contains("assets/run")));
+
+            app.chat.current_response.push_str(" ready.");
+            let continued = transcript_rows(&mut terminal, &app, true);
+            assert_eq!(
+                continued[description].replace(' ', ""),
+                "build_route输出🧪ready."
+            );
+            assert!(continued
+                .iter()
+                .any(|row| row.contains("Bamboo · streaming")));
+            assert_eq!(
+                app.chat.current_response,
+                format!("{INTRO}{ALT}{DESTINATION}) ready.")
+            );
+        }
+    }
+
+    #[test]
     fn testbackend_keeps_streaming_composer_visible_with_structured_rows() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("parent".to_string());
