@@ -1,11 +1,11 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
-    ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
-    PermissionPolicyResponse, PlanModeState, ProviderCatalog, ReasoningEffort, Schedule,
-    ScheduleRunView, SessionSummary, SessionTreeSummary, Skill, SkillDetail,
-    SubagentSnapshotResponse, TaskListResponse, ToolInfo,
+    CancelScheduleRunOutcome, CatalogModel, CommandDetail, CommandListResponse,
+    ListSessionTreeEnvelope, ListSessionsEnvelope, McpServer, PendingQuestion,
+    PermissionDecisionResponse, PermissionPolicyResponse, PlanModeState, ProviderCatalog,
+    ReasoningEffort, Schedule, ScheduleRunView, SessionSummary, SessionTreeSummary, Skill,
+    SkillDetail, SubagentSnapshotResponse, TaskListResponse, ToolInfo,
 };
 use crate::api::{
     ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
@@ -51,6 +51,12 @@ pub enum AppEvent {
         request_id: u64,
         schedule_id: String,
         result: Loaded<Vec<ScheduleRunView>>,
+    },
+    ScheduleRunCancellationFinished {
+        request_id: u64,
+        schedule_id: String,
+        run_id: String,
+        result: Loaded<CancelScheduleRunOutcome>,
     },
     SkillsLoaded(Loaded<Vec<Skill>>),
     ConfigLoaded(Loaded<serde_json::Value>),

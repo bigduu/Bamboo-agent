@@ -233,6 +233,7 @@ pub(crate) enum ActionId {
     ShowTools,
     NewSchedule,
     RunSchedule,
+    CancelScheduledRun,
     NextField,
     PreviousField,
     NextTrigger,
@@ -916,6 +917,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             Sessions,
             Mcp,
+            ScheduleRuns,
             SubagentTree,
             TaskPlan,
             SessionPickerBrowse,
@@ -929,6 +931,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             (Sessions, "r"),
             (Mcp, "r"),
+            (ScheduleRuns, "r"),
             (SubagentTree, "r; Ctrl+R"),
             (TaskPlan, "r; Ctrl+R"),
             (SessionPickerBrowse, "Ctrl+R"),
@@ -1346,6 +1349,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "r")]
+    ),
+    spec!(
+        CancelScheduledRun,
+        "Cancel scheduled run",
+        "Request cancellation of the selected active schedule occurrence",
+        false,
+        [ScheduleRuns],
+        [(ScheduleRuns, "x")]
     ),
     spec!(
         NextField,
@@ -2454,6 +2465,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn schedule_run_cancel_and_refresh_resolve_only_in_their_context() {
+        let defaults = Keymap::default();
+        let remapped = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedule-runs","action":"cancel-scheduled-run","keys":["/","F8"]},
+                {"context":"schedule-runs","action":"refresh","keys":["F9"]}
+            ]}"#,
+        )
+        .unwrap();
+        for (keymap, context, code, action) in [
+            (
+                &defaults,
+                ActionContext::Schedules,
+                KeyCode::Char('r'),
+                ActionId::RunSchedule,
+            ),
+            (
+                &defaults,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('x'),
+                ActionId::CancelScheduledRun,
+            ),
+            (
+                &defaults,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('r'),
+                ActionId::Refresh,
+            ),
+            (
+                &remapped,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('/'),
+                ActionId::CancelScheduledRun,
+            ),
+            (
+                &remapped,
+                ActionContext::ScheduleRuns,
+                KeyCode::F(9),
+                ActionId::Refresh,
+            ),
+        ] {
+            assert_eq!(
+                keymap.resolve(
+                    &[context],
+                    &mut None,
+                    key(code, KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::Action { context, action }
+            );
+        }
+        assert_eq!(
+            remapped.primary_hint(ActionContext::ScheduleRuns, ActionId::CancelScheduledRun),
+            "/"
+        );
+        assert!(!ActionId::CancelScheduledRun.repeatable());
     }
 
     #[test]

@@ -1010,6 +1010,23 @@ pub struct ScheduleRunView {
     pub status: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub workflow_run_id: Option<String>,
+}
+
+impl ScheduleRunView {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "success" | "failed" | "skipped" | "missed" | "cancelled"
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelScheduleRunOutcome {
+    Requested,
+    Terminal(ScheduleRunView),
 }
 
 /// Subset of the server's `ScheduleView` the TUI consumes. The full trigger

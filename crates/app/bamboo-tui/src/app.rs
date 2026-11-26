@@ -1926,6 +1926,13 @@ pub(crate) enum ScheduleRunsContent {
     Failed(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleRunCancelState {
+    Sending,
+    Requested,
+    Failed(String),
+}
+
 pub(crate) struct ScheduleRunsPane {
     schedule_id: String,
     request_id: u64,
@@ -1934,6 +1941,9 @@ pub(crate) struct ScheduleRunsPane {
     pub rows_per_page: Cell<usize>,
     pub content: ScheduleRunsContent,
     pub session_open_error: Option<&'static str>,
+    pub(crate) cancellations: HashMap<String, ScheduleRunCancelState>,
+    pub(crate) refreshing: bool,
+    pub(crate) refresh_error: Option<String>,
 }
 
 impl ScheduleRunsPane {
@@ -1946,6 +1956,9 @@ impl ScheduleRunsPane {
             rows_per_page: Cell::new(1),
             content: ScheduleRunsContent::Loading,
             session_open_error: None,
+            cancellations: HashMap::new(),
+            refreshing: false,
+            refresh_error: None,
         }
     }
 
@@ -1961,6 +1974,93 @@ impl ScheduleRunsPane {
             .session_id
             .as_deref()
             .filter(|id| !id.trim().is_empty())
+    }
+
+    pub(crate) fn selected_run_can_request_cancel(&self) -> bool {
+        self.selected_run().is_some_and(|run| {
+            run.status == "running"
+                && run.workflow_run_id.is_none()
+                && self.selected_session_id().is_some()
+                && !matches!(
+                    self.cancellations.get(&run.run_id),
+                    Some(ScheduleRunCancelState::Sending | ScheduleRunCancelState::Requested)
+                )
+        })
+    }
+
+    pub(crate) fn selected_cancel_state(&self) -> Option<&ScheduleRunCancelState> {
+        self.cancellations.get(&self.selected_run()?.run_id)
+    }
+
+    fn install_refreshed_runs(&mut self, mut runs: Vec<ScheduleRunView>) {
+        let selected = self
+            .selected_run()
+            .map(|run| (run.run_id.as_str(), run.session_id.as_deref()));
+        if let ScheduleRunsContent::Loaded(previous) = &self.content {
+            // A History GET sampled before cancellation can finish after the
+            // exact POST receipt. Keep any terminal outcome already observed.
+            let terminal: HashMap<_, _> = previous
+                .iter()
+                .filter(|run| run.is_terminal())
+                .map(|run| (run.run_id.as_str(), run))
+                .collect();
+            for run in &mut runs {
+                if let Some(previous) = terminal
+                    .get(run.run_id.as_str())
+                    .copied()
+                    .filter(|_| !run.is_terminal())
+                {
+                    *run = previous.clone();
+                }
+            }
+        }
+        let selection = selected
+            .and_then(|(run_id, _)| runs.iter().position(|run| run.run_id == run_id))
+            .unwrap_or_else(|| self.selected.min(runs.len().saturating_sub(1)));
+        let new_selected = runs
+            .get(selection)
+            .map(|run| (run.run_id.as_str(), run.session_id.as_deref()));
+        if new_selected != selected {
+            self.session_open_error = None;
+        }
+        self.selected = selection;
+        self.cancellations.retain(|run_id, _| {
+            runs.iter()
+                .any(|run| &run.run_id == run_id && !run.is_terminal())
+        });
+        self.content = ScheduleRunsContent::Loaded(runs);
+    }
+
+    fn finish_cancellation(
+        &mut self,
+        run_id: String,
+        result: Result<CancelScheduleRunOutcome, String>,
+    ) {
+        if self.cancellations.get(&run_id) != Some(&ScheduleRunCancelState::Sending) {
+            return;
+        }
+        let next = match result {
+            Ok(CancelScheduleRunOutcome::Requested) => ScheduleRunCancelState::Requested,
+            Ok(CancelScheduleRunOutcome::Terminal(run))
+                if run.run_id == run_id && run.is_terminal() =>
+            {
+                if let ScheduleRunsContent::Loaded(runs) = &mut self.content {
+                    if let Some(current) = runs
+                        .iter_mut()
+                        .find(|item| item.run_id == run_id && !item.is_terminal())
+                    {
+                        *current = run;
+                    }
+                }
+                self.cancellations.remove(&run_id);
+                return;
+            }
+            Ok(CancelScheduleRunOutcome::Terminal(_)) => {
+                ScheduleRunCancelState::Failed("Invalid schedule cancellation response".into())
+            }
+            Err(error) => ScheduleRunCancelState::Failed(error),
+        };
+        self.cancellations.insert(run_id, next);
     }
 
     fn move_selection(&mut self, distance: isize) {
@@ -7060,10 +7160,37 @@ impl App {
                     .as_mut()
                     .filter(|pane| pane.request_id == request_id && pane.schedule_id == schedule_id)
                 {
-                    pane.content = match result {
-                        Ok(runs) => ScheduleRunsContent::Loaded(runs),
-                        Err(error) => ScheduleRunsContent::Failed(error),
-                    };
+                    if std::mem::take(&mut pane.refreshing) {
+                        match result {
+                            Ok(runs) => pane.install_refreshed_runs(runs),
+                            Err(error) => pane.refresh_error = Some(error),
+                        }
+                    } else if matches!(pane.content, ScheduleRunsContent::Loading) {
+                        pane.content = match result {
+                            Ok(runs) => ScheduleRunsContent::Loaded(runs),
+                            Err(error) => ScheduleRunsContent::Failed(error),
+                        };
+                    }
+                    if !self.schedule_run_session_is_opening() {
+                        self.cancel_schedule_run_session_open();
+                    }
+                }
+            }
+            AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id,
+                run_id,
+                result,
+            } => {
+                if let Some(pane) = self
+                    .schedule_runs
+                    .as_mut()
+                    .filter(|pane| pane.request_id == request_id && pane.schedule_id == schedule_id)
+                {
+                    pane.finish_cancellation(run_id, result);
+                    if !self.schedule_run_session_is_opening() {
+                        self.cancel_schedule_run_session_open();
+                    }
                 }
             }
             AppEvent::ActionDone {
@@ -14842,7 +14969,15 @@ impl App {
         let request_id = self.schedule_runs_request_id;
         self.cancel_schedule_run_session_open();
         self.schedule_runs = Some(ScheduleRunsPane::new(schedule_id.clone(), name, request_id));
-        let client = self.client.clone();
+        Self::load_schedule_runs(self.client.clone(), tx, schedule_id, request_id);
+    }
+
+    fn load_schedule_runs(
+        client: BambooClient,
+        tx: mpsc::UnboundedSender<AppEvent>,
+        schedule_id: String,
+        request_id: u64,
+    ) {
         tokio::spawn(async move {
             let result = client
                 .list_schedule_runs(&schedule_id)
@@ -14851,6 +14986,54 @@ impl App {
             let _ = tx.send(AppEvent::ScheduleRunsLoaded {
                 request_id,
                 schedule_id,
+                result,
+            });
+        });
+    }
+
+    fn refresh_schedule_runs(&mut self) {
+        let (Some(pane), Some(tx)) = (self.schedule_runs.as_mut(), self.event_tx.clone()) else {
+            return;
+        };
+        // Initial load and refresh share one history request in this pane.
+        if pane.refreshing || matches!(pane.content, ScheduleRunsContent::Loading) {
+            return;
+        }
+        pane.refreshing = true;
+        pane.refresh_error = None;
+        Self::load_schedule_runs(
+            self.client.clone(),
+            tx,
+            pane.schedule_id.clone(),
+            pane.request_id,
+        );
+    }
+
+    fn request_schedule_run_cancel(&mut self) {
+        let (Some(pane), Some(tx)) = (self.schedule_runs.as_mut(), self.event_tx.clone()) else {
+            return;
+        };
+        let Some(run) = pane
+            .selected_run()
+            .filter(|_| pane.selected_run_can_request_cancel())
+        else {
+            return;
+        };
+        let run_id = run.run_id.clone();
+        let schedule_id = pane.schedule_id.clone();
+        let request_id = pane.request_id;
+        pane.cancellations
+            .insert(run_id.clone(), ScheduleRunCancelState::Sending);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .cancel_schedule_run(&schedule_id, &run_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id,
+                run_id,
                 result,
             });
         });
@@ -14917,6 +15100,14 @@ impl App {
             }
             Some(ActionId::Activate) => {
                 self.open_schedule_run_session();
+                return;
+            }
+            Some(ActionId::CancelScheduledRun) => {
+                self.request_schedule_run_cancel();
+                return;
+            }
+            Some(ActionId::Refresh) => {
+                self.refresh_schedule_runs();
                 return;
             }
             Some(ActionId::NavigateUp) => pane.move_selection(-1),
@@ -22482,9 +22673,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    1_027_509_463_112_486_121
+                    5_350_942_093_694_435_996
                 } else {
-                    15_443_388_967_839_319_700
+                    934_301_848_595_209_156
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -24069,10 +24260,274 @@ mod question_tests {
                     scheduled_for: Utc::now(),
                     status: "success".to_owned(),
                     session_id: Some(session.to_owned()),
+                    workflow_run_id: None,
                 })
                 .collect(),
         );
         pane
+    }
+
+    #[tokio::test]
+    async fn schedule_run_cancel_key_requests_exact_run_and_refreshes_in_place() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (post_seen, posted) = tokio::sync::oneshot::channel();
+        let (release_post, hold_post) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut initial).await.lines().next(),
+                Some("GET /api/v1/schedules/schedule/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut initial,
+                "application/json",
+                r#"{"schedule_id":"schedule","runs":[
+                    {"run_id":"ordinary","scheduled_for":"2026-10-20T08:15:00Z","status":"running","session_id":"linked-session"},
+                    {"run_id":"workflow","scheduled_for":"2026-10-20T10:15:00Z","status":"running","session_id":"workflow-session","workflow_run_id":"wf-1"}
+                ]}"#,
+            )
+            .await;
+
+            let (mut post, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut post).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("POST /api/v1/schedules/schedule/runs/ordinary/cancel HTTP/1.1")
+            );
+            assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+            post_seen.send(()).unwrap();
+            hold_post.await.unwrap();
+            let body =
+                r#"{"schedule_id":"schedule","run_id":"ordinary","status":"cancel_requested"}"#;
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            post.write_all(response.as_bytes()).await.unwrap();
+            post.shutdown().await.unwrap();
+
+            let (mut refreshed, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut refreshed).await.lines().next(),
+                Some("GET /api/v1/schedules/schedule/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut refreshed,
+                "application/json",
+                r#"{"schedule_id":"schedule","runs":[
+                    {"run_id":"workflow","scheduled_for":"2026-10-20T10:15:00Z","status":"running","session_id":"workflow-session","workflow_run_id":"wf-1"},
+                    {"run_id":"ordinary","scheduled_for":"2026-10-20T08:15:00Z","status":"cancelled","session_id":"linked-session"}
+                ]}"#,
+            )
+            .await;
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedule-runs","action":"cancel-scheduled-run","keys":["/"]}
+            ]}"#,
+        )
+        .unwrap();
+        app.set_keymap(keymap, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let initial = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(initial).await.unwrap();
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert!(pane.selected_run_can_request_cancel());
+        assert!(pane.selected_cancel_state().is_none());
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), posted)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Sending)
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().run_id, "workflow");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.selected_run_can_request_cancel());
+        release_post.send(()).unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(ack).await.unwrap();
+        assert!(app
+            .schedule_runs
+            .as_ref()
+            .unwrap()
+            .selected_cancel_state()
+            .is_none());
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Requested)
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        assert_eq!(pane.selected_session_id(), Some("linked-session"));
+        let request_id = pane.request_id;
+
+        app.handle_key(key(KeyCode::Char('r'))).await.unwrap();
+        assert!(app.schedule_runs.as_ref().unwrap().refreshing);
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refreshed).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.request_id, request_id);
+        assert_eq!(pane.selected, 1);
+        assert_eq!(pane.selected_run().unwrap().run_id, "ordinary");
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.refreshing);
+        assert_eq!(app.tab, Tab::Schedules);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_schedule_cancel_receipt_survives_an_older_run_history_refresh() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let mut pane = linked_test_schedule_runs();
+        let mut running = pane.selected_run().unwrap().clone();
+        running.status = "running".into();
+        pane.content = ScheduleRunsContent::Loaded(vec![running.clone()]);
+        pane.refreshing = true;
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        let mut terminal = running.clone();
+        terminal.status = "cancelled".into();
+        app.handle_event(AppEvent::ScheduleRunCancellationFinished {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            run_id: "run-1".into(),
+            result: Ok(CancelScheduleRunOutcome::Terminal(terminal)),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![running]),
+        })
+        .await
+        .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.selected_run_can_request_cancel());
+
+        let mut current = pane.selected_run().unwrap().clone();
+        current.session_id = Some("recorded-session".into());
+        app.schedule_runs.as_mut().unwrap().refreshing = true;
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![current]),
+        })
+        .await
+        .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert_eq!(pane.selected_session_id(), Some("recorded-session"));
+    }
+
+    #[tokio::test]
+    async fn schedule_cancel_replies_are_scoped_to_the_exact_open_pane_and_run() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let mut pane = linked_test_schedule_runs();
+        if let ScheduleRunsContent::Loaded(runs) = &mut pane.content {
+            runs[0].status = "running".into();
+        }
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        let result = |request_id, schedule_id: &str, run_id: &str| {
+            AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id: schedule_id.to_owned(),
+                run_id: run_id.to_owned(),
+                result: Err("Schedule run not found".into()),
+            }
+        };
+        for wrong in [
+            result(2, "schedule", "run-1"),
+            result(1, "different-schedule", "run-1"),
+            result(1, "schedule", "run-2"),
+        ] {
+            app.handle_event(wrong).await.unwrap();
+            assert_eq!(
+                app.schedule_runs.as_ref().unwrap().selected_cancel_state(),
+                Some(&ScheduleRunCancelState::Sending)
+            );
+        }
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Failed(
+                "Schedule run not found".into()
+            ))
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        assert!(app.schedule_runs.is_none());
+
+        let mut pane = linked_test_schedule_runs();
+        pane.request_id = 2;
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.schedule_runs.as_ref().unwrap().selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Sending)
+        );
+
+        app.schedule_runs.as_mut().unwrap().refreshing = true;
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 2,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![]),
+        })
+        .await
+        .unwrap();
+        app.handle_event(result(2, "schedule", "run-1"))
+            .await
+            .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert!(pane.selected_run().is_none());
+        assert!(pane.cancellations.is_empty());
     }
 
     #[tokio::test]
