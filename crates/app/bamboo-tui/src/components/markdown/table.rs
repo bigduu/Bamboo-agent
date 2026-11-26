@@ -1,5 +1,4 @@
 use std::iter::Peekable;
-use std::str::Lines;
 
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
@@ -9,17 +8,17 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::text::display_width;
 use crate::theme::colors;
 
-use super::{heading, ordered_item, parse_inline};
+use super::{fence::SourceLine, heading, ordered_item, parse_inline};
 
 const COLUMN_GAP: &str = "   ";
 type Row = Vec<Line<'static>>;
 
-pub(super) fn render_if_table(
+pub(super) fn render_if_table<'a>(
     header: &str,
-    input: &mut Peekable<Lines<'_>>,
+    input: &mut Peekable<impl Iterator<Item = SourceLine<'a>>>,
     width: usize,
 ) -> Option<Vec<Line<'static>>> {
-    let delimiter = input.peek()?;
+    let delimiter = input.peek()?.text;
     if !delimiter.contains('|') || ends_table(header) {
         return None;
     }
@@ -35,8 +34,8 @@ pub(super) fn render_if_table(
     input.next();
 
     let mut rows = vec![styled_row(header, columns)];
-    while let Some(line) = input.next_if(|line| !ends_table(line)) {
-        rows.push(styled_row(split_row(line), columns));
+    while let Some(line) = input.next_if(|line| !ends_table(line.text)) {
+        rows.push(styled_row(split_row(line.text), columns));
     }
 
     let Some(widths) = column_widths(&rows, columns, width) else {

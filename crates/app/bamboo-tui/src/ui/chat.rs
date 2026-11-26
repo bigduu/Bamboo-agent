@@ -1242,6 +1242,133 @@ mod tests {
         assert!(rendered.visual_line_count as usize > rendered.lines.len());
     }
 
+    fn transcript_rows(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        workspace: bool,
+    ) -> Vec<String> {
+        terminal
+            .draw(|frame| render_transcript(frame, frame.area(), app, workspace))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area().width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn fence_rows<'a>(rows: &'a [String], language: &str) -> &'a [String] {
+        let top = rows
+            .iter()
+            .position(|row| {
+                row.starts_with('┌')
+                    && row.ends_with('┐')
+                    && row.trim_matches(['┌', '┐', '─', ' ']) == language
+            })
+            .unwrap_or_else(|| panic!("missing {language} fence:\n{}", rows.join("\n")));
+        let bottom = top
+            + 1
+            + rows[top + 1..]
+                .iter()
+                .position(|row| row.starts_with('└') && row.ends_with('┘'))
+                .expect("fence closes within the transcript width");
+        let fence = &rows[top..=bottom];
+        assert!(fence[1..fence.len() - 1]
+            .iter()
+            .all(|row| row.starts_with('│') && row.ends_with('│')));
+        fence
+    }
+
+    #[test]
+    fn testbackend_renders_complete_assistant_fences_and_resumes_prose_at_each_width() {
+        let source = concat!(
+            "Before the examples.\n\n",
+            "```rust linenos\nlet label = \"中文 🧭\";\n```\n\n",
+            "Between the examples.\n\n",
+            "~~~~mermaid theme=neutral\ngraph TD\n  A[图 🧪] --> B[完成]\n~~~~\n\n",
+            "After the examples.\n\n",
+            "Metric | Value\n--- | ---\nFence | Ready\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-with-fences".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MARKDOWN_FENCES").is_some() {
+                eprintln!(
+                    "MARKDOWN FENCE PREVIEW\n{}\nEND MARKDOWN FENCE PREVIEW",
+                    rows.join("\n")
+                );
+            }
+            let rust = fence_rows(&rows, "rust");
+            assert_eq!(rust.len(), 3);
+            // Wide graphemes reserve continuation cells in the TestBackend buffer.
+            assert!(rust[1].replace(' ', "").contains("letlabel=\"中文🧭\";"));
+            let mermaid = fence_rows(&rows, "mermaid");
+            assert_eq!(mermaid.len(), 4);
+            assert!(mermaid[1].contains("graph TD"));
+            assert!(mermaid[2].replace(' ', "").contains("A[图🧪]-->B[完成]"));
+
+            let row_for = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+            assert!(row_for("Before the examples.") < row_for("let label"));
+            assert!(row_for("let label") < row_for("Between the examples."));
+            assert!(row_for("Between the examples.") < row_for("graph TD"));
+            assert!(row_for("graph TD") < row_for("After the examples."));
+            let table = &rows[row_for("Metric")];
+            assert!(table.contains("Value") && !table.contains('|'));
+            assert!(rows[row_for("Ready")].contains("Fence"));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streaming_assistant_fences_stable_when_they_close() {
+        for (marker, language, code) in [
+            ("```", "rust", "let label = \"输入 🧭\";"),
+            ("~~~", "mermaid", "A[输入 🧭] --> B[完成]"),
+        ] {
+            let source = format!("Leading prose.\n\n{marker}{language}\n{code}");
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.chat.current_turn_id = Some("run:preview".into());
+            for width in [60, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                app.chat.current_response = source.clone();
+                let open_rows = transcript_rows(&mut terminal, &app, true);
+                let open = fence_rows(&open_rows, language);
+                assert_eq!(open.len(), 3);
+                assert!(open[1].replace(' ', "").contains("输入🧭"));
+                assert!(open_rows
+                    .iter()
+                    .any(|row| row.contains("Bamboo · streaming")));
+
+                let closing_delta = format!("\n{marker}\n\nProse after the fence.");
+                app.chat.current_response.push_str(&closing_delta);
+                let closed_rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(fence_rows(&closed_rows, language), open);
+                assert!(closed_rows
+                    .iter()
+                    .any(|row| row.starts_with("Prose after the fence.")));
+                let blocks = app.conversation_blocks();
+                assert_eq!(blocks[0].id, "run:preview:assistant");
+                assert!(matches!(
+                    blocks[0].kind,
+                    ConversationBlockKind::AssistantMarkdown {
+                        streaming: true,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
     #[test]
     fn testbackend_keeps_streaming_composer_visible_with_structured_rows() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));

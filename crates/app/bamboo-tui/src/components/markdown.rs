@@ -1,37 +1,38 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::text::{clip_cells, display_width, truncate_cells};
 use crate::theme::colors;
 
+mod fence;
 mod table;
 
+use fence::{FenceKind, FencedBlock};
+
+const MAX_PREVIEW_BYTES: usize = 128 * 1024;
+const MAX_PREVIEW_SOURCE_LINES: usize = 2_048;
+const MAX_FENCE_PREVIEW_ROWS: usize = 64;
+const MAX_FENCE_LABEL_CELLS: usize = 24;
+
 /// Render markdown text into a list of ratatui Lines with styling.
-/// Handles: fenced code blocks (```), inline `code`, **bold**, _italic_,
+/// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// [links](url), `#`..`######` headings, `-`/`*` and ordered (`1.`) lists with
 /// nesting, `>` blockquotes, and pipe tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
+    if width == 0 {
+        return Vec::new();
+    }
+    let source = preview_source(text);
     let mut lines: Vec<Line> = Vec::new();
-    let mut in_code_block = false;
-    let mut code_lines: Vec<String> = Vec::new();
 
-    let mut input = text.lines().peekable();
-    while let Some(raw_line) = input.next() {
-        if raw_line.trim_start().starts_with("```") {
-            if in_code_block {
-                render_code_block(&mut lines, &code_lines, width);
-                code_lines.clear();
-                in_code_block = false;
-            } else {
-                in_code_block = true;
-            }
+    let mut input = fence::source_lines(source).peekable();
+    while let Some(line) = input.next() {
+        if let Some(block) = fence::take_fence(source, line, &mut input) {
+            render_code_block(&mut lines, block, width);
             continue;
         }
-
-        if in_code_block {
-            code_lines.push(raw_line.to_string());
-            continue;
-        }
+        let raw_line = line.text;
 
         if let Some(rows) = table::render_if_table(raw_line, &mut input, width) {
             lines.extend(rows);
@@ -112,11 +113,35 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         }
     }
 
-    if in_code_block && !code_lines.is_empty() {
-        render_code_block(&mut lines, &code_lines, width);
+    if source.len() < text.len() {
+        lines.push(Line::styled(
+            clip_cells("… Markdown preview clipped", width),
+            Style::default().fg(colors::subtle()),
+        ));
     }
 
     lines
+}
+
+fn preview_source(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    // End on a line boundary when cutting a byte-limited preview. A partial
+    // line at the budget boundary could otherwise look like a closing fence.
+    let byte_end = if bytes.len() <= MAX_PREVIEW_BYTES {
+        bytes.len()
+    } else {
+        bytes[..MAX_PREVIEW_BYTES]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1)
+    };
+    let line_end = bytes[..byte_end]
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .nth(MAX_PREVIEW_SOURCE_LINES - 1)
+        .map_or(byte_end, |(position, _)| position + 1);
+    &text[..line_end]
 }
 
 /// If `body` is an ATX heading, return `(level, content)`.
@@ -144,33 +169,49 @@ fn ordered_item(body: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn render_code_block(lines: &mut Vec<Line>, code_lines: &[String], width: usize) {
-    let inner_width = width.saturating_sub(4);
-    // The content rows reserve one space on either side of the code. Keep the
-    // horizontal borders at the same terminal-cell width as those rows.
-    let border_width = inner_width.saturating_add(2);
-    let top_border = format!("┌{}┐", "─".repeat(border_width));
-    let bottom_border = format!("└{}┘", "─".repeat(border_width));
-
-    lines.push(Line::from(Span::styled(
-        top_border,
-        Style::default().fg(colors::code_border()),
-    )));
-
-    for code_line in code_lines {
-        let visible = crate::text::clip_cells(code_line, inner_width);
-        let padding = inner_width.saturating_sub(crate::text::display_width(&visible));
-        let padded = format!("│ {visible}{} │", " ".repeat(padding));
-        lines.push(Line::from(Span::styled(
-            padded,
-            Style::default().fg(colors::inactive()),
-        )));
+fn render_code_block(lines: &mut Vec<Line>, block: FencedBlock<'_>, width: usize) {
+    let framed = width >= 4;
+    let inner_width = if framed { width - 4 } else { width };
+    let border_style = Style::default().fg(colors::code_border());
+    if framed {
+        let language = match block.kind {
+            FenceKind::Code { language } => language.unwrap_or_default(),
+            FenceKind::Mermaid { language } => language,
+        };
+        let label = clip_cells(language, inner_width.min(MAX_FENCE_LABEL_CELLS));
+        let label = if label.is_empty() {
+            label
+        } else {
+            format!(" {label} ")
+        };
+        let rule = "─".repeat(width - 2 - display_width(&label));
+        lines.push(Line::styled(format!("┌{label}{rule}┐"), border_style));
     }
 
-    lines.push(Line::from(Span::styled(
-        bottom_border,
-        Style::default().fg(colors::code_border()),
-    )));
+    let row = |code: &str, style| {
+        let code = code.replace('\t', "    ");
+        let cells = if framed {
+            format!("│ {} │", truncate_cells(&code, inner_width))
+        } else {
+            clip_cells(&code, inner_width)
+        };
+        Line::styled(cells, style)
+    };
+    let mut code = block.source.lines();
+    let code_style = Style::default().fg(colors::inactive());
+    lines.extend(
+        code.by_ref()
+            .take(MAX_FENCE_PREVIEW_ROWS)
+            .map(|line| row(line, code_style)),
+    );
+    if code.next().is_some() {
+        lines.push(row("… more code", Style::default().fg(colors::subtle())));
+    }
+
+    if framed {
+        let rule = "─".repeat(width - 2);
+        lines.push(Line::styled(format!("└{rule}┘"), border_style));
+    }
 }
 
 /// Parse inline formatting: `code`, **bold**, _italic_ / *italic*,
@@ -453,5 +494,52 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(widths.iter().all(|width| *width == widths[0]), "{widths:?}");
         assert_eq!(widths[0], 18);
+    }
+
+    #[test]
+    fn long_fence_emits_a_fixed_preview_and_reports_both_limits() {
+        let source = format!(
+            "```rust\n{}```\nAfter the preview.",
+            "println!(\"still streaming\");\n".repeat(MAX_PREVIEW_SOURCE_LINES),
+        );
+
+        let rows = render(&source);
+
+        assert_eq!(rows.len(), MAX_FENCE_PREVIEW_ROWS + 4);
+        assert!(rows[0].contains(" rust "));
+        assert!(rows[1..=MAX_FENCE_PREVIEW_ROWS]
+            .iter()
+            .all(|row| row.contains("still streaming")));
+        assert!(rows[MAX_FENCE_PREVIEW_ROWS + 1].contains("… more code"));
+        assert!(rows[MAX_FENCE_PREVIEW_ROWS + 2].starts_with('└'));
+        assert_eq!(rows.last().unwrap(), "… Markdown preview clipped");
+    }
+
+    #[test]
+    fn byte_budget_ends_before_a_partial_unicode_source_line() {
+        let source = format!(
+            "~~~rust\r\nretained\r\n{}\r\n~~~\r\nAfter the preview.",
+            "界".repeat(MAX_PREVIEW_BYTES / 3),
+        );
+
+        assert_eq!(preview_source(&source), "~~~rust\r\nretained\r\n");
+        let rows = render(&source);
+        assert!(rows[1].contains("retained"));
+        assert!(rows[2].starts_with('└'));
+        assert_eq!(rows[3], "… Markdown preview clipped");
+    }
+
+    #[test]
+    fn code_preview_fits_tiny_areas_and_clips_wide_graphemes() {
+        let source = "```language\n界e\u{301}👨‍👩‍👧‍👦more text\n```";
+        assert!(render_markdown(source, 0).is_empty());
+        for width in 1..=12 {
+            let rows = render_markdown(source, width);
+            assert!(!rows.is_empty());
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+        let rows = render_markdown(source, 9);
+        assert!(text_of(&rows[1]).contains("界e\u{301}…"));
+        assert!(!text_of(&rows[1]).contains("👨"));
     }
 }
