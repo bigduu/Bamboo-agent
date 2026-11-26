@@ -12,6 +12,11 @@ public static partial class WindowsTicketDirectoryFlushProbe
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     private static extern bool CreateHardLinkW(string newName, string existingName, IntPtr security);
 
+    public static void ValidateScopeIdentityFixture(string expectedSid, string fixtureDirectory)
+    {
+        using var scope = OpenWriterScope(expectedSid, fixtureDirectory, requireEmpty: true);
+    }
+
     public static Dictionary<string, object> RunScopeIdentity(string expectedSid, string fixtureDirectory)
     {
         using (WriterScope scope = OpenWriterScope(expectedSid, fixtureDirectory, requireEmpty: false))

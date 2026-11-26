@@ -38,6 +38,7 @@ function Remove-TicketScopeJunction {
 function Invoke-TicketScopeIdentityCases {
     param([string]$ExpectedSid, [string]$FixtureDirectory)
 
+    [WindowsTicketDirectoryFlushProbe]::ValidateScopeIdentityFixture($ExpectedSid, $FixtureDirectory)
     $source = Join-Path $FixtureDirectory 'junction-source'
     $target = Join-Path $FixtureDirectory 'junction-target'
     $bridge = Join-Path $source 'bridge'
