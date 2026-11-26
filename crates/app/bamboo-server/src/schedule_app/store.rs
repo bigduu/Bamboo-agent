@@ -1176,7 +1176,7 @@ impl ScheduleStore {
         let mut index = self.index.write().await;
         let Some(existing) = index
             .schedules
-            .get_mut(id)
+            .get(id)
             .filter(|entry| entry.log_monitor.is_none())
         else {
             return Ok(None);
@@ -1240,8 +1240,10 @@ impl ScheduleStore {
             )?);
         }
         candidate.updated_at = now;
-        *existing = candidate.clone();
-        self.persist_updated_index(&mut index).await?;
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
         Ok(Some(candidate))
     }
 
@@ -1940,6 +1942,67 @@ mod tests {
                 .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>()),
             Some(&expected)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_schedule_toggle_save_leaves_live_state_for_the_same_request_to_retry() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let created = store
+            .create_schedule(
+                "scheduled task".into(),
+                ScheduleTrigger::Once {
+                    at: Utc::now() + Duration::hours(1),
+                },
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let id = &created.id;
+        let index_path = store.index_path();
+        let saved = fs::read(index_path).await.unwrap();
+        let index_updated_at = store.index.read().await.updated_at;
+        let backup = dir.path().join("saved-schedules.json");
+
+        // A file cannot replace this directory, although the staged file can be written.
+        fs::rename(index_path, &backup).await.unwrap();
+        fs::create_dir(index_path).await.unwrap();
+        let error = store
+            .patch_schedule(id, None, Some(false), None, None)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_eq!(store.get_schedule(id).await, Some(created.clone()));
+        assert_eq!(store.index.read().await.updated_at, index_updated_at);
+        assert_eq!(fs::read(&backup).await.unwrap(), saved);
+
+        fs::remove_dir(index_path).await.unwrap();
+        fs::rename(&backup, index_path).await.unwrap();
+        let disabled = store
+            .patch_schedule(id, None, Some(false), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.state, created.state);
+        let published = fs::read(index_path).await.unwrap();
+        assert_ne!(published, saved);
+
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule(id).await, Some(disabled.clone()));
+        assert_eq!(
+            reopened.index.read().await.updated_at,
+            store.index.read().await.updated_at
+        );
+        assert_eq!(
+            reopened
+                .patch_schedule(id, None, Some(false), None, None)
+                .await
+                .unwrap(),
+            Some(disabled)
+        );
+        assert_eq!(fs::read(index_path).await.unwrap(), published);
     }
 
     #[tokio::test]
