@@ -226,7 +226,7 @@ fn open_drive(disk: u8) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     // QueryDosDevice supplies a multi-string. The first mapping is the current one.
-    let local_device = [b'\\', b'D', b'e', b'v', b'i', b'c', b'e', b'\\'].map(u16::from);
+    let local_device = (*b"\\Device\\").map(u16::from);
     if !device_mapping
         .get(..units)
         .is_some_and(|mapping| mapping.starts_with(&local_device))
@@ -267,7 +267,7 @@ fn open_drive(disk: u8) -> io::Result<File> {
     let final_name = final_name
         .strip_suffix(&[u16::from(b'\\')])
         .unwrap_or(final_name);
-    let prefix = [b'\\', b'\\', b'?', b'\\'].map(u16::from);
+    let prefix = (*b"\\\\?\\").map(u16::from);
     if let [head @ .., actual, colon] = final_name {
         if head == prefix
             && u8::try_from(*actual).is_ok_and(|actual| actual.eq_ignore_ascii_case(&disk))

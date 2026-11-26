@@ -211,10 +211,9 @@ fn contender(fixture: &Path, replies: &Path, token: token::Token) {
         .inspect_file(WRITER)
         .expect("contender sees the actual writer name");
     assert_eq!(before.link_count, 1);
-    let error = scope
-        .acquire_writer(false)
-        .err()
-        .expect("blocking owner must exclude contender");
+    let Err(error) = scope.acquire_writer(false) else {
+        panic!("blocking owner must exclude contender");
+    };
     assert_eq!(error.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
     let mut reply = ChildReply {
         phase: "held".into(),
@@ -357,10 +356,9 @@ fn verify_hard_link(fixture: &Path) -> Value {
     let busy = FileExt::try_lock_exclusive(&raw_alias).expect_err("same-file alias contends");
     assert_eq!(busy.raw_os_error(), Some(ERROR_LOCK_VIOLATION as i32));
 
-    let refusal = scope
-        .acquire_writer(false)
-        .err()
-        .expect("multi-link writer must be refused");
+    let Err(refusal) = scope.acquire_writer(false) else {
+        panic!("multi-link writer must be refused");
+    };
     assert_eq!(refusal.kind(), io::ErrorKind::InvalidData);
     assert_eq!(refusal.raw_os_error(), None);
     assert_eq!(refusal.to_string(), WRITER_LINK_ERROR);
