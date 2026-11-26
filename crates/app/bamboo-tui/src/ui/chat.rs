@@ -1566,6 +1566,122 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_preserves_atx_heading_style_around_inline_formatting() {
+        let source = concat!(
+            "# Build **输出** 🧪 with `cargo`\n",
+            "## Plan *next* steps\n",
+            "### Inspect `trace` details\n",
+            "###### Keep *final* checks\n",
+            "### Release_v2\n\n",
+            "Report the result.\n",
+        );
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-atx-headings".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+        let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live.chat.streaming = true;
+        live.chat.current_turn_id = Some("run:atx".into());
+        live.chat.current_response = source.into();
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            for (app, streaming) in [(&saved, false), (&live, true)] {
+                let rows = transcript_rows(&mut terminal, app, true);
+                let rendered = rows.join("\n");
+                let row_for = |prefix: &str| {
+                    rows.iter()
+                        .position(|row| row.starts_with(prefix))
+                        .unwrap_or_else(|| {
+                            panic!("missing {prefix:?} at {width} columns\n{rendered}")
+                        })
+                };
+                let cell_rows: Vec<_> = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(usize::from(width))
+                    .collect();
+                let primary = row_for("Build ");
+                let secondary = row_for("Plan next steps");
+                let mut visible_title = String::new();
+                let mut column = 0;
+                while let Some(cell) = cell_rows[primary].get(column) {
+                    let symbol = cell.symbol();
+                    visible_title.push_str(symbol);
+                    column += display_width(symbol).max(1);
+                }
+                assert_eq!(
+                    visible_title.trim_end(),
+                    "Build 输出 🧪 with cargo",
+                    "{width} columns, streaming: {streaming}\n{rendered}"
+                );
+                for (row, expected_color) in [
+                    (primary, colors::brand()),
+                    (secondary, app.theme.text()),
+                    (row_for("Inspect trace details"), colors::inactive()),
+                    (row_for("Keep final checks"), colors::inactive()),
+                    (row_for("Release_v2"), colors::inactive()),
+                ] {
+                    let cell = &cell_rows[row][0];
+                    assert_eq!(cell.fg, expected_color, "{width} columns\n{rendered}");
+                    assert!(cell.modifier.contains(Modifier::BOLD), "{rendered}");
+                }
+                assert!(cell_rows[primary].iter().any(|cell| {
+                    cell.symbol() == "c"
+                        && cell.fg == colors::inactive()
+                        && cell.modifier.contains(Modifier::REVERSED)
+                }));
+                assert!(cell_rows[secondary]
+                    .iter()
+                    .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+                assert_eq!(rows[row_for("Release_v2")].trim_end(), "Release_v2");
+                assert!(matches!(
+                    app.conversation_blocks()[0].kind,
+                    ConversationBlockKind::AssistantMarkdown { content, streaming: current }
+                        if content == source && current == streaming
+                ));
+
+                if width == 60
+                    && !streaming
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_HEADING").is_some()
+                {
+                    let rgb = |color| match color {
+                        ratatui::style::Color::Rgb(red, green, blue) => Some([red, green, blue]),
+                        _ => None,
+                    };
+                    let capture: Vec<Vec<_>> = cell_rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|cell| {
+                                    let modifiers = [
+                                        Modifier::BOLD,
+                                        Modifier::ITALIC,
+                                        Modifier::REVERSED,
+                                        Modifier::UNDERLINED,
+                                    ];
+                                    (
+                                        cell.symbol(),
+                                        rgb(cell.fg),
+                                        rgb(cell.bg),
+                                        modifiers.map(|modifier| cell.modifier.contains(modifier)),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let capture = serde_json::to_string(&capture).unwrap();
+                    eprintln!("ATX HEADING CELLS\n{capture}\nEND ATX HEADING CELLS");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn testbackend_renders_assistant_setext_headings_at_each_width() {
         let source = concat!(
             "Build **输出** 🧪 and `plan`\n=====\n\n",

@@ -105,7 +105,7 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         // Headings: 1–6 leading '#'.
         if let Some((level, content)) = heading(body) {
             let line = if content.contains('`') || content.contains('*') {
-                Line::from(parse_inline(content))
+                Line::from(parse_inline(content)).style(heading_style(level))
             } else {
                 Line::from(Span::styled(
                     render_heading_images(content),
