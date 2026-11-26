@@ -179,8 +179,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Footer
+    let sessions = selected_schedule.map_or_else(String::new, |_| {
+        format!(
+            " · {} sessions",
+            app.keymap
+                .primary_hint(ActionContext::Schedules, ActionId::OpenScheduleSessions)
+        )
+    });
     let footer_text = format!(
-        " {} runs · {} new · {} delete · {} run now",
+        " {} runs{sessions} · {} new · {} delete · {} run now",
         app.primary_key_hint(ActionContext::Schedules, ActionId::Activate),
         app.key_hint(ActionContext::Schedules, ActionId::NewSchedule),
         app.key_hint(ActionContext::Schedules, ActionId::DeleteSelection),
@@ -394,7 +401,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
     );
 }
 
-fn clip_schedule_text(value: &str, width: usize) -> String {
+pub(super) fn clip_schedule_text(value: &str, width: usize) -> String {
     let text: String = value
         .chars()
         .filter(|character| !character.is_control())
@@ -524,6 +531,7 @@ mod tests {
             text.contains("Enter runs"),
             "runs action footer missing:\n{text}"
         );
+        assert!(text.contains("s sessions"), "{text}");
         assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
         assert!(!text.contains("Cadence"), "{text}");
     }

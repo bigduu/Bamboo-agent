@@ -305,25 +305,39 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
     }
 }
 
-async fn schedule_has_no_future_occurrence(mut response: reqwest::Response) -> bool {
-    const MAX_ERROR_BYTES: usize = 8 * 1024;
+const MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+enum ScheduleBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+async fn read_bounded_schedule_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, ScheduleBodyError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_ERROR_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
-        return false;
+        return Err(ScheduleBodyError::TooLarge);
     }
 
     let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if chunk.len() <= MAX_ERROR_BYTES - body.len() => {
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            _ => return false,
+    while let Some(chunk) = response.chunk().await.map_err(ScheduleBodyError::Read)? {
+        if chunk.len() > limit - body.len() {
+            return Err(ScheduleBodyError::TooLarge);
         }
+        body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
+
+async fn schedule_has_no_future_occurrence(response: reqwest::Response) -> bool {
+    const MAX_ERROR_BYTES: usize = 8 * 1024;
+    let Ok(body) = read_bounded_schedule_body(response, MAX_ERROR_BYTES).await else {
+        return false;
+    };
     serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .is_some_and(|error| {
@@ -1146,6 +1160,58 @@ impl BambooClient {
         anyhow::bail!("Could not update schedule (HTTP {})", status.as_u16());
     }
 
+    pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "sessions"]);
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out fetching schedule sessions")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to fetch schedule sessions")
+                }
+            })?;
+        let status = response.status();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK,
+            "Could not fetch schedule sessions (HTTP {})",
+            status.as_u16()
+        );
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule sessions response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out fetching schedule sessions")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
+            })?;
+        let reply: ListScheduleSessionsResponse = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule sessions response"))?;
+        anyhow::ensure!(
+            reply.schedule_id == schedule_id
+                && reply.sessions.iter().all(|row| {
+                    row.created_by_schedule_id == schedule_id && !row.session.id.trim().is_empty()
+                }),
+            "Invalid schedule sessions response"
+        );
+        Ok(reply.sessions.into_iter().map(|row| row.session).collect())
+    }
+
     pub async fn list_schedule_runs(&self, schedule_id: &str) -> Result<Vec<ScheduleRunView>> {
         let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
         url.path_segments_mut()
@@ -1709,6 +1775,158 @@ mod tests {
         assert_eq!(cron.prompt.as_deref(), Some("Review the overnight changes"));
         assert_eq!(cron.last_run, Some("2026-10-20T08:31:00Z".parse().unwrap()));
         assert_eq!(cron.next_run, Some("2026-10-21T08:30:00Z".parse().unwrap()));
+    }
+
+    const SESSIONS_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn list_schedule_sessions_preserves_host_order_and_session_summaries() {
+        let sessions = schedule_sessions_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":"schedule/17 ?#%","title":"Saved review",
+                 "updated_at":"2030-02-11T09:00:00Z","project_id":"project-42","is_running":true},
+                {"id":"session-a","created_by_schedule_id":"schedule/17 ?#%","title":"Newer review",
+                 "updated_at":"2030-02-12T09:00:00Z","last_run_status":"success"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "session-z");
+        assert_eq!(sessions[0].title, "Saved review");
+        assert_eq!(sessions[0].project_id.as_deref(), Some("project-42"));
+        assert!(sessions[0].is_running);
+        assert_eq!(sessions[1].id, "session-a");
+        assert_eq!(sessions[1].last_run_status.as_deref(), Some("success"));
+        assert!(sessions[0].updated_at < sessions[1].updated_at);
+
+        let empty = schedule_sessions_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[]}"#,
+        )
+        .await
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_schedule_sessions_rejects_malformed_and_foreign_rows_without_echoing_the_body() {
+        for body in [
+            r#"{"schedule_id":"DIFFERENT_SCHEDULE","sessions":[]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%"}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[{"id":"UNRELATED_SESSION"}]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":"schedule/17 ?#%"},
+                {"id":"UNRELATED_SESSION","created_by_schedule_id":"DIFFERENT_SCHEDULE"}
+            ]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":null}
+            ]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"   ","created_by_schedule_id":"schedule/17 ?#%"}
+            ]}"#,
+            "RAW_HOST_RESPONSE",
+        ] {
+            assert_eq!(
+                schedule_sessions_reply("200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid schedule sessions response"
+            );
+        }
+
+        for (status, code) in [("202 Accepted", 202), ("404 Not Found", 404)] {
+            assert_eq!(
+                schedule_sessions_reply(status, "RAW_HOST_RESPONSE")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                format!("Could not fetch schedule sessions (HTTP {code})")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_schedule_sessions_bounds_advertised_and_chunked_responses() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        for advertised in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let (release, held) = oneshot::channel();
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await.lines().next(),
+                    Some("GET /api/v1/schedules/schedule-17/sessions HTTP/1.1")
+                );
+                if advertised {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES + 1
+                    );
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                } else {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    const CHUNK_BYTES: usize = 64 * 1024;
+                    let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
+                    frame.resize(frame.len() + CHUNK_BYTES, b'x');
+                    frame.extend_from_slice(b"\r\n");
+                    for _ in 0..(MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES / CHUNK_BYTES) {
+                        socket.write_all(&frame).await.unwrap();
+                    }
+                    socket.write_all(b"1\r\nx\r\n").await.unwrap();
+                }
+                // Do not finish the HTTP body before the client rejects it.
+                held.await.unwrap();
+                drop(socket);
+            };
+            let fetch = async {
+                let result = client.list_schedule_sessions("schedule-17").await;
+                release.send(()).unwrap();
+                result
+            };
+            let (result, ()) =
+                timeout(Duration::from_secs(5), async { tokio::join!(fetch, serve) })
+                    .await
+                    .unwrap();
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Schedule sessions response is too large (2 MiB limit)"
+            );
+        }
+    }
+
+    async fn schedule_sessions_reply(status: &str, body: &str) -> Result<Vec<SessionSummary>> {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("GET /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/sessions HTTP/1.1")
+            );
+            assert!(body_sent.is_empty());
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedule_sessions(SESSIONS_SCHEDULE_ID), serve)
+        })
+        .await
+        .unwrap();
+        result
     }
 
     #[tokio::test]
