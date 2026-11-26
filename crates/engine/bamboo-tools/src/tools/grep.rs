@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use bamboo_infrastructure::telemetry::{record_grep_performance, GrepPerformance};
+use bamboo_infrastructure::telemetry::{
+    is_current_span_recording, record_grep_performance, record_grep_resources, GrepPerformance,
+};
 use globset::{GlobBuilder, GlobSet};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{sinks::UTF8, SearcherBuilder};
@@ -14,6 +16,8 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::{parameter_schema, search_traversal, workspace_state};
+
+mod thread_cpu;
 
 const DEFAULT_HEAD_LIMIT: usize = 200;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
@@ -31,6 +35,13 @@ enum SearchTextRead {
     Complete,
     TooLarge,
     Unreadable,
+}
+
+#[derive(Default)]
+struct SearchMetrics {
+    performance: GrepPerformance,
+    record_resources: bool,
+    read_buffer_peak_capacity_bytes: usize,
 }
 
 #[derive(Default)]
@@ -477,32 +488,43 @@ impl Tool for GrepTool {
 
         let queued_at = Instant::now();
         let permit = GREP_WORKERS.acquire().await.expect("static Grep semaphore");
+        let record_resources = is_current_span_recording();
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
         // Keep both filesystem and matching work off the Actix worker. One
         // search uses one worker and reuses its read buffer between files.
-        let (result, performance) = tokio::task::spawn_blocking(move || {
+        let (result, metrics, scan_cpu_time) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let started_at = Instant::now();
-            let mut performance = GrepPerformance {
-                queue_time: started_at.duration_since(queued_at),
-                ..GrepPerformance::default()
+            let mut metrics = SearchMetrics {
+                performance: GrepPerformance {
+                    queue_time: started_at.duration_since(queued_at),
+                    ..GrepPerformance::default()
+                },
+                record_resources,
+                read_buffer_peak_capacity_bytes: 0,
             };
+            let cpu_started_at = record_resources.then(thread_cpu::time).flatten();
             let result = Self::search(
                 &parsed,
                 &root,
                 &regex,
                 glob_filter.as_ref(),
                 &cancel,
-                &mut performance,
+                &mut metrics,
                 MAX_SCANNED_FILES,
             );
-            performance.scan_time = started_at.elapsed();
-            (result, performance)
+            let scan_cpu_time =
+                cpu_started_at.and_then(|start| thread_cpu::time()?.checked_sub(start));
+            metrics.performance.scan_time = started_at.elapsed();
+            (result, metrics, scan_cpu_time)
         })
         .await
         .map_err(|error| ToolError::Execution(format!("Grep worker failed: {error}")))?;
-        record_grep_performance(&performance);
+        record_grep_performance(&metrics.performance);
+        if record_resources {
+            record_grep_resources(scan_cpu_time, metrics.read_buffer_peak_capacity_bytes);
+        }
         result
     }
 }
@@ -514,9 +536,11 @@ impl GrepTool {
         regex: &Regex,
         glob_filter: Option<&GlobSet>,
         cancel: &CancellationToken,
-        performance: &mut GrepPerformance,
+        metrics: &mut SearchMetrics,
         scan_limit: usize,
     ) -> Result<ToolOutcome, ToolError> {
+        let record_resources = metrics.record_resources;
+        let performance = &mut metrics.performance;
         let output_mode = parsed.output_mode.unwrap_or_default();
         let context = parsed.context.unwrap_or(0);
         let before = parsed.before.unwrap_or(context);
@@ -588,7 +612,13 @@ impl GrepTool {
                 coverage.unreadable_files += 1;
                 continue;
             };
-            match Self::read_search_text(reader, &mut read_buffer) {
+            let read = Self::read_search_text(reader, &mut read_buffer);
+            if record_resources {
+                metrics.read_buffer_peak_capacity_bytes = metrics
+                    .read_buffer_peak_capacity_bytes
+                    .max(read_buffer.capacity());
+            }
+            match read {
                 SearchTextRead::Complete if !read_buffer.contains('\0') => {}
                 SearchTextRead::TooLarge if exact_file => {
                     return Err(Self::exact_file_size_limit_error());
@@ -814,6 +844,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn grep_resource_fields_follow_each_search_when_scans_overlap() {
+        use bamboo_infrastructure::telemetry::{
+            test_support::LocalTraceTest, Observation, Outcome,
+        };
+
+        let large = tempfile::tempdir().unwrap();
+        let small = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let mut rejected_contents = vec![b'x'; 128 * 1024];
+        rejected_contents[0] = 0;
+        std::fs::write(large.path().join("binary.txt"), &rejected_contents).unwrap();
+        let small_file = small.path().join("small.txt");
+        std::fs::write(&small_file, "needle\n").unwrap();
+
+        let local = LocalTraceTest::isolated();
+        let birth = chrono::Utc::now();
+        let tool = GrepTool::new();
+        let scan = async |session_id: &str, path: &Path| {
+            let observation = Observation::tool("Grep", "call", session_id, "round")
+                .bind_session_lifetime(session_id, birth);
+            let (trace_id, _) = observation.trace_ids().unwrap();
+            let result = observation
+                .scope(run(&tool, json!({"pattern": "needle", "path": path})))
+                .await
+                .unwrap();
+            assert!(result.success);
+            observation.finish(Outcome::Success);
+            let detail = local.store.detail(session_id, birth, &trace_id).unwrap();
+            let performance = &detail.spans[0].performance;
+            if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+                assert!(performance.contains_key("grep_scan_cpu_us"));
+            }
+            (
+                performance["grep_files_scanned"],
+                performance["grep_read_buffer_peak_capacity_bytes"],
+            )
+        };
+        let (started, release) = pause_next_discovery(large.path());
+        let (large, (small, empty)) = local
+            .scope(async {
+                tokio::join!(scan("large", large.path()), async {
+                    started.await.unwrap();
+                    let measurements =
+                        tokio::join!(scan("small", &small_file), scan("empty", empty.path()));
+                    release.send(()).unwrap();
+                    measurements
+                })
+            })
+            .await;
+
+        assert_eq!(large.0, 0, "the binary file was read and rejected");
+        assert!(large.1 >= rejected_contents.len() as u64);
+        assert_eq!(small.0, 1);
+        assert!(small.1 >= 7 && small.1 < large.1);
+        assert_eq!(empty, (0, 0));
+    }
+
     #[test]
     fn grep_args_preserve_flag_names_and_all_values() {
         let parsed: GrepArgs = serde_json::from_value(json!({
@@ -1011,7 +1099,7 @@ mod tests {
                 &regex,
                 None,
                 &CancellationToken::new(),
-                &mut GrepPerformance::default(),
+                &mut SearchMetrics::default(),
                 scan_limit,
             )
             .unwrap() else {
