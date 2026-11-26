@@ -25,6 +25,6 @@ pub use v2::{
     ActorModelContextError, ActorModelContextOutcome, ActorTranscriptAppend,
     ActorTranscriptAppendError, ActorTranscriptGroupAppend, CleanupFailure, CleanupMode,
     CleanupResult, DurationMetricsSnapshot, ProjectSessionSummary, SavePersistenceMetricsSnapshot,
-    SessionCopyProjectionGuard, SessionDeletionResult, SessionIndexEntry,
+    SessionCopyProjectionGuard, SessionDeletionResult, SessionForkError, SessionIndexEntry,
     SessionPersistenceMetricsSnapshot, SessionPlacement, SessionStoreV2, SessionsIndex,
 };

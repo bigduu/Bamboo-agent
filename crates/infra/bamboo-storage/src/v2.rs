@@ -122,6 +122,8 @@ mod scoped_loop_control;
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 mod session_archive;
+mod session_fork;
+pub use session_fork::SessionForkError;
 mod side_chat;
 pub use side_chat::{SideChatRunLease, SIDE_CHAT_CLEAR_EPOCH_KEY, SIDE_CHAT_MAX_RECORD_BYTES};
 #[cfg(test)]
@@ -1974,7 +1976,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "todo_list_version",
 ];
 
-fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
+fn copied_session_snapshot(source: &Session, new_id: &str, is_fork: bool) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
     copy.session_version = Some(bamboo_domain::CURRENT_SESSION_VERSION);
@@ -1993,7 +1995,8 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.parent_created_at = None;
     copy.root_session_id = new_id.to_string();
     copy.spawn_depth = 0;
-    copy.title = format!("{} (copy)", source.title.trim_end());
+    let suffix = if is_fork { "fork" } else { "copy" };
+    copy.title = format!("{} ({suffix})", source.title.trim_end());
     copy.title_version = 0;
     copy.title_generated = true;
     copy.metadata_version = 0;
@@ -2007,9 +2010,19 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     // resolve the current model limit on its first execution instead.
     copy.token_budget = None;
     copy.resolved_token_budget = None;
-    copy.agent_runtime_state = source.agent_runtime_state.as_ref().map(|state| {
+    let source_permission_mode = match source.agent_runtime_state.as_ref() {
+        Some(state) => Some(state.effective_permission_mode()),
+        // Match the engine's typed-first read of older persisted sessions.
+        None if is_fork => source
+            .metadata
+            .get("agent.runtime.state")
+            .and_then(|raw| serde_json::from_str::<bamboo_domain::AgentRuntimeState>(raw).ok())
+            .map(|state| state.effective_permission_mode()),
+        None => None,
+    };
+    copy.agent_runtime_state = source_permission_mode.map(|mode| {
         let mut clean = bamboo_domain::AgentRuntimeState::default();
-        clean.set_permission_mode(state.effective_permission_mode());
+        clean.set_permission_mode(mode);
         clean
     });
     copy.force_manual_compression = None;
@@ -2063,8 +2076,24 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
             && !key.starts_with("skill_runtime_")
             && (!key.starts_with("workflow.") || durable_workflow_config)
     });
+    if is_fork {
+        // These bindings and receipts belong to the original Child lifetime.
+        copy.metadata.retain(|key, _| !key.starts_with("child."));
+        for key in [
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+            bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+            broker_receipt::COMPLETION_SOURCE_KEY,
+        ] {
+            copy.metadata.remove(key);
+        }
+    }
     if let Some(runtime) = copy.runtime_metadata.as_mut() {
         runtime.subagent_type = None;
+        if is_fork {
+            runtime.child_launch_generation = None;
+            runtime.child_cancelled_generation = None;
+            runtime.child_auto_run_launch_intent_generation = None;
+        }
         runtime.last_run_status = None;
         runtime.last_run_error = None;
         runtime.pending_injected_messages = None;
@@ -2080,24 +2109,33 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy
 }
 
-fn rewrite_attachment_session_urls(session: &mut Session, source_id: &str, new_id: &str) {
+fn rewrite_attachment_session_urls(
+    session: &mut Session,
+    source_id: &str,
+    new_id: &str,
+    mut retained_attachments: Option<&mut HashSet<String>>,
+) {
     let source_prefix = format!("bamboo-attachment://{source_id}/");
     let target_prefix = format!("bamboo-attachment://{new_id}/");
+    let mut rewrite = |url: &mut String| {
+        if let Some(attachment_id) = url.strip_prefix(&source_prefix) {
+            if let Some(retained_attachments) = retained_attachments.as_deref_mut() {
+                retained_attachments.insert(attachment_id.to_string());
+            }
+            *url = format!("{target_prefix}{attachment_id}");
+        }
+    };
     for message in &mut session.messages {
         if let Some(parts) = message.content_parts.as_mut() {
             for part in parts {
                 if let MessagePart::ImageUrl { image_url } = part {
-                    if let Some(attachment_id) = image_url.url.strip_prefix(&source_prefix) {
-                        image_url.url = format!("{target_prefix}{attachment_id}");
-                    }
+                    rewrite(&mut image_url.url);
                 }
             }
         }
         if let Some(results) = message.image_ocr.as_mut() {
             for result in results {
-                if let Some(attachment_id) = result.image_url.strip_prefix(&source_prefix) {
-                    result.image_url = format!("{target_prefix}{attachment_id}");
-                }
+                rewrite(&mut result.image_url);
             }
         }
     }
@@ -6359,10 +6397,36 @@ impl SessionStoreV2 {
         source_id: &str,
         new_id: &str,
     ) -> io::Result<Option<(Session, SessionCopyProjectionGuard)>> {
+        self.copy_session_snapshot(source_id, new_id, None)
+            .await
+            .map_err(|error| match error {
+                SessionForkError::Io(error) => error,
+                error => io::Error::new(io::ErrorKind::InvalidInput, error),
+            })
+    }
+
+    /// Fork the authoritative transcript through one exact user or assistant message.
+    /// Uses the same durable transaction and projection guard as a full copy.
+    pub async fn fork_session_with_projection_guard(
+        &self,
+        source_id: &str,
+        new_id: &str,
+        up_to_message_id: &str,
+    ) -> Result<Option<(Session, SessionCopyProjectionGuard)>, SessionForkError> {
+        self.copy_session_snapshot(source_id, new_id, Some(up_to_message_id))
+            .await
+    }
+
+    async fn copy_session_snapshot(
+        &self,
+        source_id: &str,
+        new_id: &str,
+        up_to_message_id: Option<&str>,
+    ) -> Result<Option<(Session, SessionCopyProjectionGuard)>, SessionForkError> {
         validate_session_id(source_id)?;
         validate_session_id(new_id)?;
         if source_id == new_id {
-            return Err(other_io_error("source and copied session ids must differ"));
+            return Err(other_io_error("source and copied session ids must differ").into());
         }
 
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
@@ -6382,17 +6446,19 @@ impl SessionStoreV2 {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "copied session id already exists",
-            ));
+            )
+            .into());
         }
         if self.root_revocation(new_id).await?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "copied session ID was deleted; use a new ID or trusted Root recreation",
-            ));
+            )
+            .into());
         }
 
         let source_dir = self.abs_path_from_rel(&source_rel);
-        let source = self
+        let mut source = self
             .load_session_from_dir_strict(
                 &source_dir,
                 source_id,
@@ -6406,13 +6472,17 @@ impl SessionStoreV2 {
                     "indexed source session.json is missing",
                 )
             })?;
+        if let Some(message_id) = up_to_message_id {
+            session_fork::retain_message_prefix(&mut source.messages, message_id)?;
+        }
         let target_rel = Self::root_rel_path(new_id);
         let target_dir = self.abs_path_from_rel(&target_rel);
         if fs::try_exists(&target_dir).await? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "copied session directory already exists",
-            ));
+            )
+            .into());
         }
         let transaction_id = Uuid::new_v4().to_string();
         let journal = SessionCopyTransactionJournal {
@@ -6422,60 +6492,73 @@ impl SessionStoreV2 {
             target_id: new_id.to_string(),
         };
         let staging_dir = self.session_copy_staging_dir(&journal);
-        let mut copied = copied_session_snapshot(&source, new_id);
-        rewrite_attachment_session_urls(&mut copied, source_id, new_id);
+        let mut copied = copied_session_snapshot(&source, new_id, up_to_message_id.is_some());
+        let mut retained_attachments = up_to_message_id.map(|_| HashSet::new());
+        rewrite_attachment_session_urls(
+            &mut copied,
+            source_id,
+            new_id,
+            retained_attachments.as_mut(),
+        );
         let main_bytes = compact_main::serialize_main(&copied)?;
         let journal_path = self.write_session_copy_journal(&journal).await?;
         let has_attachments = match self
-            .write_copied_session(&source_dir, &staging_dir, &target_dir, &copied, &main_bytes)
+            .write_copied_session(
+                &source_dir,
+                &staging_dir,
+                &target_dir,
+                &copied,
+                &main_bytes,
+                retained_attachments.as_ref(),
+            )
             .await
         {
             Ok(has_attachments) => has_attachments,
             Err(error) => {
-                return self
-                    .fail_session_copy_with_rollback(&journal_path, &journal, error)
+                return Err(self
+                    .rollback_session_copy_error(&journal_path, &journal, error)
                     .await
-                    .map(|()| None)
+                    .into());
             }
         };
         let (search_revision_path, search_revision) =
             match self.publish_search_revision(&target_dir).await {
                 Ok(revision) => revision,
                 Err(error) => {
-                    return self
-                        .fail_session_copy_with_rollback(&journal_path, &journal, error)
+                    return Err(self
+                        .rollback_session_copy_error(&journal_path, &journal, error)
                         .await
-                        .map(|()| None)
+                        .into());
                 }
             };
         let committing = journal_path.with_extension("committing");
         if let Err(error) = atomic_rename(&journal_path, &committing).await {
-            return self
-                .fail_session_copy_with_rollback(&journal_path, &journal, error)
+            return Err(self
+                .rollback_session_copy_error(&journal_path, &journal, error)
                 .await
-                .map(|()| None);
+                .into());
         }
         if let Err(error) = sync_parent_directory_entry(&committing).await {
-            return self
-                .fail_session_copy_with_rollback(&committing, &journal, error)
+            return Err(self
+                .rollback_session_copy_error(&committing, &journal, error)
                 .await
-                .map(|()| None);
+                .into());
         }
         let committed = journal_path.with_extension("committed");
         if let Err(error) = atomic_rename(&committing, &committed).await {
-            return self
-                .fail_session_copy_with_rollback(&committing, &journal, error)
+            return Err(self
+                .rollback_session_copy_error(&committing, &journal, error)
                 .await
-                .map(|()| None);
+                .into());
         }
         if let Err(error) = sync_parent_directory_entry(&committed).await {
             // A rename is not a durable commit boundary until its containing
             // directory is synchronized. Do not acknowledge a copy whose
             // recovery decision could revert to `.committing` after power loss.
-            return self
-                .fail_session_copy_with_rollback(&committed, &journal, error)
+            return Err(self
+                .rollback_session_copy_error(&committed, &journal, error)
                 .await
-                .map(|()| None);
+                .into());
         }
         // Only a durable committed marker may precede public index visibility.
         // A crash from here is completed by startup recovery; while this call
@@ -6484,10 +6567,10 @@ impl SessionStoreV2 {
             .upsert_index_from_session_inner(&copied, target_rel, false, Some(has_attachments))
             .await
         {
-            return self
-                .fail_session_copy_with_rollback(&committed, &journal, error)
+            return Err(self
+                .rollback_session_copy_error(&committed, &journal, error)
                 .await
-                .map(|()| None);
+                .into());
         }
         self.search_index_queue
             .enqueue_upsert(&copied, search_revision_path, search_revision);
@@ -6514,6 +6597,7 @@ impl SessionStoreV2 {
         target_dir: &Path,
         copied: &Session,
         main_bytes: &[u8],
+        retained_attachments: Option<&HashSet<String>>,
     ) -> io::Result<bool> {
         fs::create_dir(staging_dir).await?;
         fs::create_dir(staging_dir.join("children")).await?;
@@ -6524,11 +6608,18 @@ impl SessionStoreV2 {
         if fs::try_exists(&source_attachments).await? {
             let mut entries = fs::read_dir(&source_attachments).await?;
             while let Some(entry) = entries.next_entry().await? {
-                if !entry.file_type().await?.is_file() {
+                let file_name = entry.file_name();
+                if !entry.file_type().await?.is_file()
+                    || retained_attachments.is_some_and(|ids| {
+                        !file_name
+                            .to_str()
+                            .and_then(|name| name.rsplit_once('.'))
+                            .is_some_and(|(id, _)| ids.contains(id))
+                    })
+                {
                     continue;
                 }
-                durable_copy_file(&entry.path(), &staging_attachments.join(entry.file_name()))
-                    .await?;
+                durable_copy_file(&entry.path(), &staging_attachments.join(file_name)).await?;
                 has_attachments = true;
             }
         }
@@ -6556,12 +6647,12 @@ impl SessionStoreV2 {
         Ok(has_attachments)
     }
 
-    async fn fail_session_copy_with_rollback(
+    async fn rollback_session_copy_error(
         &self,
         marker_path: &Path,
         journal: &SessionCopyTransactionJournal,
         primary: io::Error,
-    ) -> io::Result<()> {
+    ) -> io::Error {
         let primary_kind = primary.kind();
         let primary_message = primary.to_string();
         // A durable `.committed` marker tells startup to finish the copy. If a
@@ -6580,9 +6671,9 @@ impl SessionStoreV2 {
             }
             .await
             {
-                return Err(other_io_error(format!(
+                return other_io_error(format!(
                     "session copy failed ({primary_message}); could not persist rollback decision ({error}); recovery required"
-                )));
+                ));
             }
         }
         match self
@@ -6590,17 +6681,17 @@ impl SessionStoreV2 {
             .await
         {
             Ok(()) => match self.remove_session_copy_journal_family(journal).await {
-                Ok(()) => Err(io::Error::new(
+                Ok(()) => io::Error::new(
                     primary_kind,
                     format!("session copy failed and was rolled back: {primary_message}"),
-                )),
-                Err(cleanup_error) => Err(other_io_error(format!(
+                ),
+                Err(cleanup_error) => other_io_error(format!(
                     "session copy failed ({primary_message}); rollback succeeded but journal cleanup failed ({cleanup_error}); recovery required"
-                ))),
+                )),
             },
-            Err(rollback_error) => Err(other_io_error(format!(
+            Err(rollback_error) => other_io_error(format!(
                 "session copy failed ({primary_message}); rollback failed ({rollback_error}); recovery required"
-            ))),
+            )),
         }
     }
 

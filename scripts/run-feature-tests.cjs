@@ -295,7 +295,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // HTTP case belongs to server-handlers; additive contexts and selectors stay intact.
 // #3163 extends the Grep trace fields. Worker, projection and HTTP checks
 // stay with their existing default Tools, Infrastructure and Server owners.
-const FEATURE_SOURCE_SHA256 = "1078b66d11e4d794cb397d6b5bbdf4b504dc50a999508774c0bf3b6662d52295";
+// #3169 keeps message-fork tests in default Storage/packages-0 and server-handlers.
+// The five additive contexts and 23 case selections retain their current owners.
+const FEATURE_SOURCE_SHA256 = "7427d8db7715a9f32c6287fbef9a33220ac73c8bd33d926567925c31ad535eb4";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
