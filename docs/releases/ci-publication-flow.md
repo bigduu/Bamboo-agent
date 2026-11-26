@@ -248,6 +248,30 @@ no pending compilation, `receipt.completed=false`, and
 `publisherRunId=45610087197`. Retry the original failed jobs to complete the
 same version using its retained native outputs.
 
+### Fixed v2026.11.48 crate recovery
+
+Issue #3115 binds draft 458800022 and source
+`e54b55afdc40fbd9231550852c3f6b64a5029351` to the original
+[publisher 45729058776, attempt 1](https://github.com/bigduu/Bamboo-agent/actions/runs/45729058776/attempts/1).
+The first five crates were verified in the registry. The publisher retained
+and recorded the `bamboo-config` archive before its upload returned HTTP 500.
+Recovery checks the registry before uploading that original again. It preserves
+the signed crate prefix, sealed Lotus Next 2026.11.33 frontend and the five
+original native transports. The 25 crates from `bamboo-compression` through
+`bamboo-agent` use the existing signed first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev.
+
+```bash
+gh workflow run recover-crate-2026-11-48.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Require authenticated remote readback with `recovery20261148.completed=true`,
+no pending compilation, `receipt.completed=false`, and
+`publisherRunId=45729058776`. Retry the original failed jobs to complete the
+same version using its retained native outputs.
+
 ## Main and consumers
 
 ### Desktop browser runtime
