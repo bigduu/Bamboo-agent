@@ -4,7 +4,7 @@ param(
   [Parameter(Mandatory)][string]$ExpectedSid,
   [Parameter(Mandatory)][string]$FixtureDirectory,
   [Parameter(Mandatory)][string]$ReceiptPath,
-  [ValidateSet('directory-flush', 'writer-lock')][string]$ProbeCase = 'directory-flush',
+  [ValidateSet('directory-flush', 'writer-lock', 'publication')][string]$ProbeCase = 'directory-flush',
   [ValidateSet('primary', 'contender', 'alias-contender', 'name-contender', 'exit-holder')]
   [string]$WriterRole = 'primary',
   [ValidatePattern('^(?:[0-9a-f]{32})?$')][string]$WriterExpectedLockId = ''
@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'The Ticket platform probe requires native Windows.' }
-if ($ProbeCase -eq 'directory-flush' -and ($WriterRole -ne 'primary' -or $WriterExpectedLockId)) {
+if ($ProbeCase -ne 'writer-lock' -and ($WriterRole -ne 'primary' -or $WriterExpectedLockId)) {
   throw 'Writer lock process roles require the writer-lock probe.'
 }
 
@@ -396,8 +396,12 @@ public static partial class WindowsTicketDirectoryFlushProbe
 }
 '@
 
-if ($ProbeCase -eq 'writer-lock') {
+if ($ProbeCase -ne 'directory-flush') {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-native.cs') -Raw
+  $interopSource += [Environment]::NewLine + $nativeSource
+}
+if ($ProbeCase -eq 'publication') {
+  $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-publication-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
 Add-Type -TypeDefinition $interopSource
@@ -434,6 +438,9 @@ if ($ProbeCase -eq 'writer-lock') {
     return
   }
   $probeLabel = 'writer lock'
+} elseif ($ProbeCase -eq 'publication') {
+  $receipt = [WindowsTicketDirectoryFlushProbe]::RunPublication($ExpectedSid, $fixture)
+  $probeLabel = 'publication'
 } else {
   $receipt = [WindowsTicketDirectoryFlushProbe]::Run($ExpectedSid, $fixture)
   $probeLabel = 'directory flush'
