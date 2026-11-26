@@ -65,7 +65,7 @@ pub(super) struct WindowsScope {
 
 #[derive(Debug)]
 pub(super) struct WriterGuard<'scope> {
-    _scope: &'scope WindowsScope,
+    scope: &'scope WindowsScope,
     file: File,
     identity: FileIdentity,
 }
@@ -139,6 +139,17 @@ fn open_relative(
     access: u32,
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
 ) -> io::Result<File> {
+    open_relative_shared(parent, component, directory, access, disposition, SHARE)
+}
+
+fn open_relative_shared(
+    parent: &File,
+    component: &OsStr,
+    directory: bool,
+    access: u32,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    sharing: u32,
+) -> io::Result<File> {
     let name_units: Vec<u16> = component.encode_wide().collect();
     if name_units.is_empty()
         || name_units == [u16::from(b'.')]
@@ -186,7 +197,7 @@ fn open_relative(
             &mut io_status,
             ptr::null(),
             0,
-            SHARE,
+            sharing,
             disposition,
             FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | kind,
             ptr::null(),
@@ -409,7 +420,7 @@ impl WindowsScope {
         }
         FileExt::try_lock_exclusive(&file)?;
         let guard = WriterGuard {
-            _scope: self,
+            scope: self,
             file,
             identity: observed.identity,
         };
@@ -426,4 +437,5 @@ impl WindowsScope {
     }
 }
 
+mod immutable;
 mod tests;
