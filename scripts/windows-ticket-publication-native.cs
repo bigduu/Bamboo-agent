@@ -283,15 +283,16 @@ public static partial class WindowsTicketDirectoryFlushProbe
                 {
                     // Model a damaged hash entry with actual wrong bytes at the expected name.
                     string conflictingName = ContentName(different);
+                    byte[] corrupt = Encoding.ASCII.GetBytes("corrupted scratch object\n");
                     string conflictId;
                     using (var bad = OpenPublicationObject(conflict, "stage_create", category, conflictingName,
-                        GenericWrite | WriterSynchronize, PublicationShare, NtCreate, directory: false))
-                        conflictId = WriteStage(conflict, bad, Path.Combine(directoryPath, conflictingName), canonical);
+                        GenericWrite | ReadAttributes | WriterSynchronize, PublicationShare, NtCreate, directory: false))
+                        conflictId = WriteStage(conflict, bad, Path.Combine(directoryPath, conflictingName), corrupt);
                     bool accepted = ReuseObject(conflict, "conflicting_file", category, directoryPath, directoryId,
                         conflictingName, conflictId, different);
                     var observed = (Dictionary<string, object>)conflict.Receipt["conflicting_file"];
                     bool denied = !accepted && observed.TryGetValue("bytes_hex", out object actual) &&
-                        (string)actual == Hex(canonical) && observed.TryGetValue("file_id", out object fileId) &&
+                        (string)actual == Hex(corrupt) && observed.TryGetValue("file_id", out object fileId) &&
                         (string)fileId == conflictId && (string)observed["volume_serial"] == volumeSerial;
                     conflict.Receipt["expected_content_address"] = conflictingName;
                     conflict.Receipt["reuse_refused"] = denied;
