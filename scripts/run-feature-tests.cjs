@@ -291,7 +291,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // packages-3. The five additive contexts and 23 cases retain their owners.
 // #2423 anchors the legacy ACK in existing feature-sensitive Inbox modules.
 // Its ordinary receipt regressions belong to the default storage packages-0 owner.
-const FEATURE_SOURCE_SHA256 = "8d7d06e5522e40b3499635e02db218c61f26dcff0c592bc6d9122ccadf0b4350";
+// #727 updates the feature-sensitive Session index source. The new Project list
+// HTTP case belongs to server-handlers; additive contexts and selectors stay intact.
+const FEATURE_SOURCE_SHA256 = "5f2e477675a94ab76e93a8c7171133f51757dd29b030097585aa00870531285f";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

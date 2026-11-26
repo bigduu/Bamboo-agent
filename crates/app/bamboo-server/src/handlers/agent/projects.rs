@@ -20,7 +20,8 @@ use bamboo_domain::{
 use bamboo_projects::{
     canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
 };
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 
@@ -448,17 +449,38 @@ fn with_etag(project: ProjectManifest, status: StatusCode) -> HttpResponse {
         .json(project.into_public_view())
 }
 
+#[derive(Serialize)]
+struct ProjectListEntry {
+    #[serde(flatten)]
+    project: ProjectManifest,
+    session_count: usize,
+    last_activity_at: Option<DateTime<Utc>>,
+}
+
 pub async fn list_projects(state: web::Data<AppState>) -> Result<HttpResponse> {
-    match state.project_store.list() {
-        Ok(projects) => {
-            let projects: Vec<_> = projects
-                .into_iter()
-                .map(ProjectManifest::into_public_view)
-                .collect();
-            Ok(HttpResponse::Ok().json(serde_json::json!({ "projects": projects })))
-        }
-        Err(error) => Ok(project_error(error)),
-    }
+    let projects = match state.project_store.list() {
+        Ok(projects) => projects,
+        Err(error) => return Ok(project_error(error)),
+    };
+    let summaries = state
+        .session_store
+        .project_session_summaries(projects.iter().map(|project| &project.id))
+        .await;
+    let projects: Vec<_> = projects
+        .into_iter()
+        .map(|project| {
+            let summary = summaries
+                .get(project.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            ProjectListEntry {
+                project: project.into_public_view(),
+                session_count: summary.session_count,
+                last_activity_at: summary.last_activity_at,
+            }
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "projects": projects })))
 }
 
 pub async fn create_project(
@@ -817,6 +839,10 @@ pub fn is_active(project: &ProjectManifest) -> bool {
 #[cfg(test)]
 #[path = "projects/sidebar_tests.rs"]
 mod sidebar_tests;
+
+#[cfg(test)]
+#[path = "projects/summary_tests.rs"]
+mod summary_tests;
 
 #[cfg(test)]
 mod tests {
