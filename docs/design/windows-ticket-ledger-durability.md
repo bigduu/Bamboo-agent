@@ -133,6 +133,21 @@ workflow](../../.github/workflows/ticket-platform-adapter.yml) already has an ex
 Windows route for Project reads and a workspace-write refusal. A later probe can extend that
 owner with actual ledger tests.
 
+Measure the initial Windows directory flush capability using the probe input on that owner.
+Set `branch` to the published probe branch and `sha` to its exact commit.
+
+```sh
+gh workflow run ticket-platform-adapter.yml -R bigduu/Bamboo-agent --ref "$branch" \
+  -f windows_ticket_probe_sha="$sha"
+```
+
+The workflow launches the probe under a temporary standard local account and prints the native
+receipt in the Windows job log. The portable PowerShell script can also run directly under an
+existing standard account with `-ExpectedSid`, a fresh `-FixtureDirectory` on local NTFS, and
+an unused sibling `-ReceiptPath`. Its verdict describes the exact directory access mask, flags,
+token, and filesystem tested. The scratch rename and warm reopen record operational behavior.
+The receipt explicitly leaves ordered crash persistence unproven.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |
