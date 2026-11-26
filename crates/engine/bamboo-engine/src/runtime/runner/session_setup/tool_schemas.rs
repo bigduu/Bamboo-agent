@@ -8,7 +8,8 @@ use bamboo_agent_core::tools::{
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_disabled_tool_reference_name, CapabilityLoadingMode, ClassifiedToolSchema,
-    EffectiveCallableSet, SessionKind, PACED_LOOP_WAKEUP_TOOL_NAME, SESSION_LOOP_TOOL_NAME,
+    EffectiveCallableSet, SessionKind, PACED_LOOP_WAKEUP_TOOL_NAME, SESSION_COORDINATION_TOOL_NAME,
+    SESSION_LOOP_TOOL_NAME,
 };
 #[cfg(test)]
 use bamboo_skills::runtime_metadata::{
@@ -165,7 +166,7 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     tool_schemas.retain(|schema| {
         let name = schema.function.name.as_str();
         !framework.contains_key(name)
-            && name != "spawn_session"
+            && !matches!(name, "spawn_session" | SESSION_COORDINATION_TOOL_NAME)
             && !((session.model_orchestration_only_enabled() || session.kind == SessionKind::Child)
                 && SessionToolKind::from_execution_name(name).is_some())
     });
@@ -177,6 +178,16 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
         // Ticket native execution has a Host file capability rather than the
         // ambient Builtin Read/Write schema. Keep catalog and executor identical.
         tool_schemas = tools.list_tools();
+        tool_schemas.retain_mut(|schema| {
+            if schema.function.name != SESSION_COORDINATION_TOOL_NAME {
+                return true;
+            }
+            let Some(proof) = framework.get(SESSION_COORDINATION_TOOL_NAME) else {
+                return false;
+            };
+            *schema = proof.schema();
+            true
+        });
         for schema in tool_schemas
             .iter_mut()
             .filter(|s| s.function.name == "Task")
@@ -941,6 +952,41 @@ mod live_disabled_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn coordination_catalog_uses_only_the_current_concrete_host_schema() {
+        let session = Session::new("standard-coordination", "model");
+        let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+            "Read",
+            SESSION_COORDINATION_TOOL_NAME,
+        ]);
+        let config = AgentLoopConfig {
+            additional_tool_schemas: vec![schema(SESSION_COORDINATION_TOOL_NAME)],
+            ..Default::default()
+        };
+        let expected = tools
+            .framework_session_tool_for_exact(SESSION_COORDINATION_TOOL_NAME)
+            .unwrap()
+            .schema();
+        let schemas = resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &session);
+        let coordination: Vec<_> = schemas
+            .iter()
+            .filter(|schema| schema.function.name == SESSION_COORDINATION_TOOL_NAME)
+            .collect();
+        assert_eq!(coordination.len(), 1);
+        assert_eq!(
+            coordination[0].function.description,
+            expected.function.description
+        );
+        tools.proofs_enabled.store(false, Ordering::SeqCst);
+        assert!(!offered(
+            &config,
+            tools.as_ref(),
+            &session,
+            SESSION_COORDINATION_TOOL_NAME
+        ));
+        assert!(offered(&config, tools.as_ref(), &session, "Read"));
     }
 
     #[test]

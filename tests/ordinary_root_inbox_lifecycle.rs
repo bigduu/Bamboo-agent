@@ -4,12 +4,14 @@
 
 #[path = "support/ordinary_root_host.rs"]
 mod host_startup;
+#[path = "support/session_coordination_flow.rs"]
+mod session_coordination_flow;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{Role, Session, SessionInboxPort, SessionMessageEnvelope, SessionMessageId};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
-use host_startup::{start_host, Host};
+use host_startup::{observe_http, start_host, Host, HttpEvidence};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
@@ -233,12 +235,28 @@ impl Drop for Fixture {
 fn fixture_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         // Canonical/provider waits can outlive the Host's idle keep-alive.
         // Each control request gets a fresh connection, with no transport retry.
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap()
+}
+
+async fn post_control(
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: &Value,
+) -> Result<(), HttpEvidence> {
+    let response = client.post(endpoint).json(body).send().await;
+    let mut evidence = HttpEvidence::default();
+    if observe_http(response, &mut evidence).await {
+        Ok(())
+    } else {
+        Err(evidence)
+    }
 }
 
 mod fixture_transport_regression {
@@ -392,22 +410,103 @@ mod fixture_transport_regression {
                 }
             }
         });
-        let response = fixture_http_client()
-            .post(format!("{base}/api/v1/stop/{ROOT_ID}"))
-            .send()
-            .await;
+        let response = post_control(
+            &fixture_http_client(),
+            &format!("{base}/api/v1/stop/{ROOT_ID}"),
+            &json!({}),
+        )
+        .await;
         done.store(true, Ordering::SeqCst);
         let served = server.join().unwrap();
-        assert!(
-            response.is_err(),
-            "transport failure must not become success"
-        );
+        let error = response.unwrap_err().to_string();
+        assert!(error.starts_with("transport_error="), "{error}");
         served.expect("control-error fixture exits cleanly");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "failed POST is not replayed"
         );
+    }
+
+    #[actix_web::test]
+    async fn control_refusals_report_empty_and_bounded_http_evidence_without_retry() {
+        let calls = web::Data::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(server_calls.clone())
+                .route(
+                    "/api/v1/chat",
+                    web::post().to(|calls: web::Data<AtomicUsize>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        HttpResponse::Forbidden()
+                            .insert_header(("x-request-id", "fixture-refusal"))
+                            .insert_header(("set-cookie", "private=fixture-value"))
+                            .finish()
+                    }),
+                )
+                .route(
+                    "/api/v1/execute",
+                    web::post().to(|calls: web::Data<AtomicUsize>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        HttpResponse::ServiceUnavailable()
+                            .insert_header((
+                                "x-request-id",
+                                format!("{}header-tail", "x".repeat(4096)),
+                            ))
+                            .body(format!("body-prefix{}body-tail", "y".repeat(4096)))
+                    }),
+                )
+                .route(
+                    "/api/v1/redirect",
+                    web::post().to(|calls: web::Data<AtomicUsize>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        HttpResponse::TemporaryRedirect()
+                            .insert_header(("location", "/api/v1/execute"))
+                            .finish()
+                    }),
+                )
+        })
+        .workers(1)
+        .bind(("127.0.0.1", 0))
+        .unwrap();
+        let base = format!("http://{}/api/v1", server.addrs()[0]);
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+        let client = fixture_http_client();
+
+        let chat = post_control(&client, &format!("{base}/chat"), &json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(chat.contains("status=403"), "{chat}");
+        assert!(chat.contains("x-request-id=\"fixture-refusal\""), "{chat}");
+        assert!(chat.contains("body=\"\" body_read=complete"), "{chat}");
+        assert!(!chat.contains("fixture-value"), "{chat}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one chat POST");
+
+        let execute = post_control(&client, &format!("{base}/execute"), &json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(execute.contains("status=503"), "{execute}");
+        assert!(execute.contains("(truncated)"), "{execute}");
+        assert!(execute.contains("body=\"body-prefix"), "{execute}");
+        assert!(execute.contains("body_read=truncated at"), "{execute}");
+        assert!(
+            !execute.contains("header-tail") && !execute.contains("body-tail"),
+            "{execute}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one execute POST");
+
+        let redirect = post_control(&client, &format!("{base}/redirect"), &json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(redirect.contains("status=307"), "{redirect}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "one redirecting POST");
+        handle.stop(true).await;
     }
 }
 
@@ -496,29 +595,23 @@ impl Fixture {
             provider_handle,
         };
         fixture.healthy().await;
-        let chat = fixture.client.post(format!("{}/chat", fixture.base)).json(&json!({
+        fixture.initial_control("/chat", &json!({
             "session_id":ROOT_ID,"message":if matches!(case, Case::PendingRestart) {RESTART_WAIT} else {"Delegate one original Child and wait for its result."},
             "model":"inbox-root","provider":"openai","model_ref":{"provider":"openai","model":"inbox-root"},
             "thinking_mode":"standard","permission_mode":"bypass","workspace_path":workspace,"project_id":project.id
-        })).send().await.unwrap();
-        assert!(
-            chat.status().is_success(),
-            "chat: {}",
-            chat.text().await.unwrap()
-        );
-        let execute = fixture
-            .client
-            .post(format!("{}/execute/{ROOT_ID}", fixture.base))
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            execute.status().is_success(),
-            "execute: {}",
-            execute.text().await.unwrap()
-        );
+        })).await;
         fixture
+            .initial_control(&format!("/execute/{ROOT_ID}"), &json!({}))
+            .await;
+        fixture
+    }
+
+    async fn initial_control(&self, path: &str, body: &Value) {
+        let endpoint = format!("{}{path}", self.base);
+        if let Err(evidence) = post_control(&self.client, &endpoint, body).await {
+            // Host teardown reports this launch's process state and log tail.
+            panic!("POST {endpoint}: {evidence}");
+        }
     }
 
     async fn healthy(&mut self) {

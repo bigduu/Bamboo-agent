@@ -17,6 +17,19 @@ pub(crate) struct CurrentUserTargetGuard {
     pub(crate) _send_scope: Option<super::super::host_session_scope::CurrentUserSendScope>,
 }
 
+struct CurrentUserPeerGuards {
+    source: Session,
+    target_root: String,
+    _authority: super::super::host_session_scope::HostScopedSessionGuards,
+    _absence: crate::host_session_scope::HostSessionScopeAbsence,
+}
+
+pub(crate) struct ProjectPeerDeliveryGuard {
+    pub(crate) inbox_dir: PathBuf,
+    pub(crate) target: Session,
+    _authority: CurrentUserPeerGuards,
+}
+
 impl SessionStoreV2 {
     /// Run a synchronous Host Root-control effect while retaining the original
     /// Supervisor, target, ancestry and never-installed finite-scope fences.
@@ -197,12 +210,22 @@ impl SessionStoreV2 {
         caller: &bamboo_domain::SessionCallerReference,
         target_id: &str,
     ) -> io::Result<Session> {
+        let authority = self.lock_current_user_peer(caller, target_id).await?;
+        self.peer_delivery_session(target_id, &authority.target_root)
+            .await
+    }
+
+    async fn lock_current_user_peer(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<CurrentUserPeerGuards> {
         if !caller.is_ordinary_root() {
             return Err(denied(
                 "current-user peer history requires an ordinary Root",
             ));
         }
-        let _scope = self
+        let scope = self
             .host_scope_registry
             .retain_never_installed(&caller.session_id)
             .await?;
@@ -217,7 +240,7 @@ impl SessionStoreV2 {
             .await?
             .ok_or_else(|| denied("current-user history target is unavailable"))?;
         let target_root = target.identity.root_session_id.clone();
-        let _guards = self
+        let guards = self
             .lock_host_scope_control_observations(&[source_observation, target], wait)
             .await?;
         for root_id in [&caller.root_session_id, &target_root] {
@@ -229,7 +252,38 @@ impl SessionStoreV2 {
             .peer_delivery_control_session(&caller.session_id, &caller.root_session_id)
             .await?;
         validate_peer_history_caller(caller, &current)?;
-        self.peer_delivery_session(target_id, &target_root).await
+        Ok(CurrentUserPeerGuards {
+            source: current,
+            target_root,
+            _authority: guards,
+            _absence: scope,
+        })
+    }
+
+    pub(crate) async fn lock_same_project_root_peer(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<ProjectPeerDeliveryGuard> {
+        if caller.session_id == target_id {
+            return Err(denied("Project peer requires a distinct Root"));
+        }
+        let authority = self.lock_current_user_peer(caller, target_id).await?;
+        let target = self
+            .peer_delivery_control_session(target_id, &authority.target_root)
+            .await?;
+        super::super::host_session_scope::validate_project_root_peer_pair(
+            &authority.source,
+            &target,
+        )?;
+        let inbox_dir = self
+            .abs_path_from_rel(&Self::root_rel_path(target_id))
+            .join("inbox");
+        Ok(ProjectPeerDeliveryGuard {
+            inbox_dir,
+            target,
+            _authority: authority,
+        })
     }
 
     pub(crate) async fn lock_current_user_target(

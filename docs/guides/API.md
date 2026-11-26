@@ -262,7 +262,16 @@ read it after reload instead of treating a local choice as persisted state.
 }
 ```
 
-**Next Steps:** After creating a chat, call `POST /api/v1/execute/{session_id}` to start the agent.
+For accepted native chat input, `message_id` and `ingress_seq` identify the
+admitted message and its inbox order. The serialized inbox envelope requires
+semantic content and has a 256 KiB limit. Attachments retain their original
+content. Once the consumer checkpoints and acknowledges the input, the server
+shows the message in history and emits `MessageAppended`. An active run may
+consume the input before the client calls `execute`.
+
+For an idle session, connect to the returned SSE URL, then call
+`POST /api/v1/execute/{session_id}`. The [HTTP quickstart](./GETTING_STARTED.md#b-http-server--curl)
+shows the order.
 
 ---
 

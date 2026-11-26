@@ -2025,6 +2025,33 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Accept attributed peer text for only the selected run, while retaining
+    /// the finite SendPeer grant and the exact runtime owner at publication.
+    /// Independent Roots must also satisfy the native Project peer policy.
+    async fn deliver_host_scoped_peer_for_run(
+        &self,
+        _token: &crate::HostSessionScopeToken,
+        _caller: &crate::SessionCallerReference,
+        _envelope: &SessionMessageEnvelope,
+        expected_run_id: &str,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionRunConflict::unsupported(expected_run_id).into())
+    }
+
+    /// Native Host coordination between independent ordinary Roots in one
+    /// Project. Retain the never-installed scope, both canonical Project and
+    /// lifetime checks, and the exact runtime owner through publication.
+    async fn deliver_project_root_peer_for_run(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _envelope: &SessionMessageEnvelope,
+        expected_run_id: &str,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionRunConflict::unsupported(expected_run_id).into())
+    }
+
     /// First input for one exact creation permit and reserved independent Root.
     /// This never borrows SendPeer, inspect or Supervisor management authority.
     /// The concrete writer must retain the current scope, original caller and
@@ -2082,6 +2109,20 @@ pub trait SessionInboxPort: Send + Sync {
         Err(SessionInboxError::Storage(
             "unscoped observed peer admission is unsupported".into(),
         ))
+    }
+
+    /// Run-fenced variant of the ordinary observed same-tree writer. Retain
+    /// the never-installed scope and original execution caller during admission.
+    async fn deliver_unscoped_peer_for_run(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _envelope: &SessionMessageEnvelope,
+        _source: &crate::ActorSession,
+        _target: &crate::ActorSession,
+        expected_run_id: &str,
+        _activation: std::sync::Arc<dyn SessionActivationPort>,
+    ) -> Result<SessionInboxSteerReceipt, SessionInboxError> {
+        Err(SessionRunConflict::unsupported(expected_run_id).into())
     }
 
     /// The original Supervisor's canonical followup authority, with

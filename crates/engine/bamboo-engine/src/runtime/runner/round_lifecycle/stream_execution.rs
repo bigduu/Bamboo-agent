@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::planned_update::{StreamInterruption, StreamUpdateControl};
 use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block, build_child_tool_guidance,
@@ -16,8 +17,9 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_instruction_overlay_context_block, build_memory_usage_context_block,
     build_plan_mode_context_block, build_plan_runtime_context_block,
     build_project_resources_context_block, build_root_orchestration_context_block,
-    build_session_identity_context_block, build_supervisor_route_observation,
-    build_task_list_context_block, build_workspace_context_block,
+    build_session_coordination_context_block, build_session_identity_context_block,
+    build_supervisor_route_observation, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -859,7 +861,8 @@ pub(super) async fn project_request_usage(
     let mut shadow = session.clone();
     let required_tool = required_tool_for_session(&shadow);
     let (loading_mode, selection) = request_tool_policy(llm.as_ref(), model, required_tool).await?;
-    let effective_tool_schemas = select_request_tool_schemas(&shadow, tool_schemas, &selection)?;
+    let effective_tool_schemas =
+        select_request_tool_schemas(&shadow, tool_schemas, &selection, loading_mode)?;
     let wire_schemas = request_tool_schemas_for_loading_mode(
         &shadow,
         effective_tool_schemas.as_ref(),
@@ -1293,15 +1296,23 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let has_ledger_context = ledger_context.is_some();
     let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
     if !standalone_discovery {
+        let permission_mode = config.permission_mode.unwrap_or_default();
         current_context.extend(build_memory_usage_context_block(
             session,
             tool_schemas,
             wire_tool_schemas,
             loading_mode,
-            config.permission_mode.unwrap_or_default(),
+            permission_mode,
+        ));
+        current_context.extend(build_session_coordination_context_block(
+            session,
+            tool_schemas,
+            wire_tool_schemas,
+            loading_mode,
+            permission_mode,
         ));
     }
-    // The agenda and recall instructions are current context, outside the
+    // The agenda and tool guidance are current context, outside the
     // generated ledger. Present them before the user who owns this turn.
     let external_memory_message_id = if current_context.is_empty() {
         None
@@ -1332,7 +1343,7 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
                 .into_iter()
                 .map(|block| block.render_runtime_context_message()),
         );
-        // Anthropic moves this ID to the live tail. The recall instructions
+        // Anthropic moves this ID to the live tail. The tool guidance
         // stay with the context that precedes the current user request.
         has_ledger_context.then(|| model_transcript[index].id.clone())
     };
@@ -1820,7 +1831,7 @@ pub(super) async fn execute_llm_stream(
             (required_tool, loading_mode, selection)
         };
         let effective_schemas =
-            select_request_tool_schemas(session, base_tool_schemas, &selection)?;
+            select_request_tool_schemas(session, base_tool_schemas, &selection, loading_mode)?;
         let tool_schemas = effective_schemas.as_ref();
         let wire_schemas = request_tool_schemas_for_loading_mode(
             session,
@@ -2448,32 +2459,33 @@ pub(super) async fn execute_llm_stream(
         );
     // The opt-in evidence check must publish only the final, checked answer.
     // A cap summary also stays private until its completion is validated.
-    let stream_output_result = observation
-        .scope(async {
-            if activation_pending
-                || config.features_final_evidence_check
-                || private_plan
-                || round_cap_summary
-            {
-                crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-                    stream,
-                    cancel_token,
-                    session_id,
-                    &timeout_context,
-                )
-                .await
-            } else {
-                crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-                    stream,
-                    event_tx,
-                    cancel_token,
-                    session_id,
-                    &timeout_context,
-                )
-                .await
-            }
-        })
-        .await;
+    let visible = !activation_pending
+        && !config.features_final_evidence_check
+        && !private_plan
+        && !round_cap_summary;
+    let update = frame
+        .output_limit_recovery
+        .and_then(|policy| policy.immediate_update)
+        .and_then(|committed| StreamInterruption::for_session(session, config, committed));
+    let update_control = update.as_ref().map(|_| StreamUpdateControl::default());
+    let consume = observation.scope(
+        crate::runtime::stream::handler::consume_llm_stream_for_round(
+            stream,
+            visible.then_some(event_tx),
+            cancel_token,
+            session_id,
+            &timeout_context,
+            update_control.as_ref(),
+        ),
+    );
+    let stream_output_result =
+        if let Some((update, control)) = update.as_ref().zip(update_control.as_ref()) {
+            update
+                .drive(consume, session, config, cancel_token, control)
+                .await?
+        } else {
+            consume.await
+        };
     if observation.is_recording() {
         if let Some((typed_text, full_json)) = completion.gemini_decode_counts() {
             observation.gemini_decode_counts(typed_text, full_json);
@@ -2481,6 +2493,23 @@ pub(super) async fn execute_llm_stream(
     }
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
+        Err(failure) if update.as_ref().is_some_and(StreamInterruption::committed) => {
+            usage_guard.finish(
+                usage_status(&failure.error),
+                failure.partial_output.provider_usage,
+            );
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(
+                &failure.error,
+            ));
+            if let Some(identity) = failure.partial_output.visible_message.filter(|_| visible) {
+                let _ = event_tx
+                    .send(AgentEvent::VisibleMessageDiscard {
+                        message_id: identity.message_id,
+                    })
+                    .await;
+            }
+            return Err(failure.error);
+        }
         Err(mut failure) => {
             // A generic SSE/body error is no safer to replay than a watchdog
             // expiry once text, reasoning or a tool-call delta was observed.

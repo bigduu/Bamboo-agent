@@ -17,11 +17,13 @@ use bamboo_domain::{
     SessionMessageKind, SessionMessageSource, SessionProviderMessage,
 };
 
+use crate::app_context::AgentSessionContext;
+use crate::execution::agent_spawn::spawn_session_execution_with_title_generation;
 use crate::execution::{
-    reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
-    AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
-    SessionCompletionHook, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    reserve_runner_core, reserve_session_execution, AgentRunner, AgentStatus, ChildCompletion,
+    ChildCompletionHandler, ChildCompletionSource, ReserveOutcome, SessionCompletionHook,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{
     BashResumeHook, GuardianSpawner, RunDeadline, BASH_COMPLETION_RESUME_KIND,
@@ -930,6 +932,7 @@ pub struct ChildCompletionCoordinator {
     app_data_dir: std::path::PathBuf,
     account_feed_inbox: Option<crate::execution::AccountFeedInbox>,
     root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
+    root_title_context: Arc<OnceLock<Weak<dyn AgentSessionContext>>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
     reserved_root_adapter: Arc<StdRwLock<Option<ReservedRootExecutionAdapter>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
@@ -976,6 +979,7 @@ impl ChildCompletionCoordinator {
             app_data_dir,
             account_feed_inbox,
             root_account_sink: None,
+            root_title_context: Arc::default(),
             root_tools: Arc::new(RwLock::new(None)),
             reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
@@ -1006,6 +1010,11 @@ impl ChildCompletionCoordinator {
             .upgrade()
             .filter(|binding| binding.session_id == session_id)
             .map(|binding| binding.deadline)
+    }
+
+    /// Bind the HTTP host without retaining its lifetime through the activation router.
+    pub fn bind_root_title_context(&self, context: Weak<dyn AgentSessionContext>) {
+        let _ = self.root_title_context.set(context);
     }
 
     /// Register a host producer at the existing genuine reserved Root seam.
@@ -2808,6 +2817,15 @@ impl ChildCompletionCoordinator {
                 self.account_feed_inbox.clone(),
                 root_publication,
             );
+        let title_context = if session.kind == SessionKind::Root
+            && session.authority_identity.is_ordinary()
+            && !session.title_generated
+            && !crate::ticket_runtime::is_managed_work_root(&session)
+        {
+            self.root_title_context.get().and_then(Weak::upgrade)
+        } else {
+            None
+        };
         if let Some(message) = startup_message {
             // The Message and its ACK are durable, so the round prelude
             // cannot rediscover it. Confirm publication before model startup.
@@ -2823,6 +2841,11 @@ impl ChildCompletionCoordinator {
                 tracing::warn!(%session_id, "Root Runtime input publication was not confirmed");
                 execution_reservation.abandon().await;
                 return;
+            }
+            if crate::title_gen::is_human_title_input(&message) {
+                if let Some(context) = &title_context {
+                    crate::title_gen::spawn_title_generation(context.clone(), session_id.clone());
+                }
             }
         }
 
@@ -2856,7 +2879,7 @@ impl ChildCompletionCoordinator {
 
         consume_pending_clarification_resume(&mut session);
         execution_reservation.set_run_deadline(self.headless_run_deadline_for(&session_id));
-        spawn_session_execution(SessionExecutionArgs {
+        let execution = SessionExecutionArgs {
             agent,
             session_id,
             session,
@@ -2901,7 +2924,13 @@ impl ChildCompletionCoordinator {
             // must publish its terminal completion so ITS parent is woken
             // in turn (issue #546).
             child_completion_handler: Some(Arc::new(self.clone())),
-        });
+        };
+        spawn_session_execution_with_title_generation(
+            execution,
+            None,
+            Default::default(),
+            title_context,
+        );
     }
 }
 
@@ -4894,6 +4923,7 @@ impl ChildCompletionCoordinator {
         }
 
         if !dead.is_empty() {
+            let mut published_synthetic_completion = false;
             for entry in dead {
                 tracing::warn!(
                     %parent_session_id,
@@ -4921,10 +4951,15 @@ impl ChildCompletionCoordinator {
                         Some(entry.reason),
                     )
                     .await;
+                    published_synthetic_completion = true;
                 }
             }
-            // The publishes above re-evaluate the wait policy themselves.
-            return false;
+            // Synthetic publications re-evaluate the wait themselves. Owned
+            // Child reconciliation does not publish an outcome, so it cannot
+            // replace replaying the terminal siblings observed in this sweep.
+            if published_synthetic_completion {
+                return false;
+            }
         }
 
         // A lost callback must not hide one ready result behind an unfinished
@@ -7156,6 +7191,83 @@ mod tests {
                 .waiting_for_children
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_replays_sealed_sibling_with_stale_owned_child() {
+        for policy in [
+            ChildWaitPolicy::All,
+            ChildWaitPolicy::Any,
+            ChildWaitPolicy::FirstError,
+        ] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "stale-sibling-parent";
+            let stale_id = "stale-owned-child";
+            let sealed_id = "sealed-sibling";
+            save_waiting_test_parent(
+                &store,
+                parent_id,
+                vec![stale_id.into(), sealed_id.into()],
+                policy,
+            )
+            .await;
+            let mut parent = store.load_session(parent_id).await.unwrap().unwrap();
+            let mut runtime = read_runtime_state(&parent);
+            let wait = runtime.waiting_for_children.as_mut().unwrap();
+            wait.registered_at -= chrono::Duration::seconds(CHILD_WAIT_REGISTRATION_GRACE_SECS + 1);
+            let wait = wait.clone();
+            write_runtime_state(&mut parent, &runtime);
+            store.save_session(&parent).await.unwrap();
+
+            // An owned Child with no Actor activation or Host completion can
+            // remain stale across sweeps. The sibling's callback has been lost.
+            let mut stale = Session::new_child_of(stale_id, &parent, "model", "Child");
+            stale.set_last_run_status("running");
+            stale.updated_at -= chrono::Duration::seconds(DEAD_CHILD_GRACE_SECS + 1);
+            store.save_session(&stale).await.unwrap();
+            let stale = store
+                .load_runtime_control_plane(stale_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.parent_session_id.as_deref(), Some(parent_id));
+            assert!(
+                Utc::now()
+                    .signed_duration_since(stale.updated_at)
+                    .num_seconds()
+                    >= DEAD_CHILD_GRACE_SECS
+            );
+            assert!(stale.host_run_id().is_none());
+            assert!(!ChildCompletionSource::has_source_record(&stale));
+            let sealed = save_completion_test_child(&store, parent_id, sealed_id, "error").await;
+            assert!(sealed.source.is_some());
+
+            coordinator.sweep_child_wait_for_test(parent_id, wait).await;
+
+            let claims = inbox.claim(parent_id, 8).await.unwrap();
+            assert_eq!(
+                claims.len(),
+                1,
+                "sealed sibling must be delivered for {policy:?}"
+            );
+            assert!(matches!(
+                &claims[0].envelope.body,
+                SessionMessageBody::ChildOutcome(outcome)
+                    if outcome.child_session_id == sealed_id && outcome.status == "error"
+            ));
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            let parent = store.load_session(parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                read_runtime_state(&parent).waiting_for_children.is_some(),
+                policy == ChildWaitPolicy::All
+            );
+            let stale = store
+                .load_runtime_control_plane(stale_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.last_run_status().as_deref(), Some("running"));
+        }
     }
 
     struct CountingReplayStorage {

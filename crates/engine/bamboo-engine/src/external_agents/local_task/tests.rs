@@ -1453,9 +1453,40 @@ async fn production_local_task_queued_cancellation_does_not_enter_provider_or_bl
     let active_call = control.next().await;
     harness.launch(&queued).await.unwrap();
     assert_eq!(harness.runner.concurrency.available_permits(), 0);
-    harness.ctx.agent_runners.read().await[&queued.id]
-        .cancel_token
-        .cancel();
+    let (active_run, queued_run, queued_cancel) = {
+        let runners = harness.ctx.agent_runners.read().await;
+        (
+            runners[&active.id].run_id.clone(),
+            runners[&queued.id].run_id.clone(),
+            runners[&queued.id].cancel_token.clone(),
+        )
+    };
+    let active_startup = harness
+        .runner
+        .native_task_startup(&active.id, &active_run, active.created_at)
+        .unwrap();
+    assert_eq!(*active_startup.borrow(), NativeTaskStartup::Started);
+    let queued_startup = harness
+        .runner
+        .native_task_startup(&queued.id, &queued_run, queued.created_at)
+        .unwrap();
+    assert_eq!(
+        *queued_startup.borrow(),
+        NativeTaskStartup::WaitingForCapacity
+    );
+    assert!(harness
+        .runner
+        .native_task_startup(&queued.id, &active_run, queued.created_at)
+        .is_none());
+    assert!(harness
+        .runner
+        .native_task_startup(
+            &queued.id,
+            &queued_run,
+            queued.created_at + chrono::Duration::seconds(1),
+        )
+        .is_none());
+    queued_cancel.cancel();
     let (id, status, error) = harness.completion().await;
     assert_eq!(
         id, queued.id,
@@ -1463,6 +1494,10 @@ async fn production_local_task_queued_cancellation_does_not_enter_provider_or_bl
     );
     assert_eq!(status, "cancelled", "{error:?}");
     harness.assert_terminal(&queued, "cancelled").await;
+    assert!(harness
+        .runner
+        .native_task_startup(&queued.id, &queued_run, queued.created_at)
+        .is_none());
     assert!(matches!(
         control.calls.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)

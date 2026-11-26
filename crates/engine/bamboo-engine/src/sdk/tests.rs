@@ -55,21 +55,41 @@ impl LLMProvider for CountingCompletedProvider {
     }
 }
 
-/// Actual V2 binding followed by actual runtime-file refusal on the second
-/// (resumed) Run. Restore the file before owned cleanup, as Ready's real IO
-/// fixture does; no mocked terminal status or successful save is supplied.
-struct BoundStartupIoStorage {
+enum StartupStorageFault {
+    SecondHostBinding,
+    InterruptedChildRead(Arc<AtomicUsize>),
+}
+
+const SDK_TEST_CHILD_ID: &str = "child-session";
+
+/// Inject a startup fault around real V2 storage. The second-bind case
+/// restores the runtime file before owned cleanup, as Ready's real IO fixture does.
+struct StartupFaultStorage {
     inner: Arc<dyn Storage>,
     home: std::path::PathBuf,
     binds: AtomicUsize,
+    fault: StartupStorageFault,
 }
 #[async_trait]
-impl Storage for BoundStartupIoStorage {
+impl Storage for StartupFaultStorage {
     async fn save_session(&self, s: &Session) -> std::io::Result<()> {
         self.inner.save_session(s).await
     }
     async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
-        self.inner.load_session(id).await
+        match &self.fault {
+            StartupStorageFault::InterruptedChildRead(state)
+                if id == SDK_TEST_CHILD_ID
+                    && state
+                        .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok() =>
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "controlled Child startup read interruption",
+                ))
+            }
+            _ => self.inner.load_session(id).await,
+        }
     }
     async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
         self.inner.delete_session(id).await
@@ -79,7 +99,9 @@ impl Storage for BoundStartupIoStorage {
     }
     async fn begin_host_run(&self, expected: &Session, run: &str) -> std::io::Result<()> {
         self.inner.begin_host_run(expected, run).await?;
-        if self.binds.fetch_add(1, Ordering::SeqCst) != 1 {
+        if !matches!(self.fault, StartupStorageFault::SecondHostBinding)
+            || self.binds.fetch_add(1, Ordering::SeqCst) != 1
+        {
             return Ok(());
         }
         let bound = self.inner.load_session(&expected.id).await?.unwrap();
@@ -448,7 +470,7 @@ async fn terminal_runtime_sdk_child_resumed_through_session_entrypoint_seals_new
             vec![],
             &[],
             true,
-            startup_fault,
+            startup_fault.then_some(StartupStorageFault::SecondHostBinding),
         )
         .await;
         harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
@@ -1111,6 +1133,10 @@ impl ExternalChildRunner for InProcessTestRunner {
         true
     }
 
+    fn supports_native_child_startup(&self, _: &Session) -> bool {
+        true
+    }
+
     async fn execute_external_child(
         &self,
         session: &mut Session,
@@ -1356,7 +1382,7 @@ async fn build_harness_backend(
     child_metadata: &[(&str, &str)],
     v2: bool,
 ) -> Harness {
-    build_harness_backend_controlled(provider, tool_names, child_metadata, v2, false).await
+    build_harness_backend_controlled(provider, tool_names, child_metadata, v2, None).await
 }
 
 async fn build_harness_backend_controlled(
@@ -1364,7 +1390,7 @@ async fn build_harness_backend_controlled(
     tool_names: Vec<String>,
     child_metadata: &[(&str, &str)],
     v2: bool,
-    startup_fault: bool,
+    startup_fault: Option<StartupStorageFault>,
 ) -> Harness {
     let home = temp_dir("bamboo-sdk-test");
     tokio::fs::create_dir_all(&home).await.unwrap();
@@ -1375,11 +1401,12 @@ async fn build_harness_backend_controlled(
             .unwrap(),
     );
     let storage: Arc<dyn Storage> = if v2 {
-        if startup_fault {
-            Arc::new(BoundStartupIoStorage {
+        if let Some(fault) = startup_fault {
+            Arc::new(StartupFaultStorage {
                 inner: session_store.clone(),
                 home: home.clone(),
                 binds: AtomicUsize::new(0),
+                fault,
             })
         } else {
             session_store.clone()
@@ -1405,7 +1432,7 @@ async fn build_harness_backend_controlled(
     >::new()));
 
     let parent_session_id = "root-session".to_string();
-    let child_session_id = "child-session".to_string();
+    let child_session_id = SDK_TEST_CHILD_ID.to_string();
     let (parent_tx, parent_rx) = broadcast::channel(1000);
     {
         let mut senders = session_event_senders.write().await;
@@ -1717,6 +1744,100 @@ async fn collect_until_completed_with_budget(
             Err(_) => panic!("timed out waiting for SubAgentCompleted; saw: {events:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn queued_child_retries_interrupted_startup_read_in_the_same_launch_generation() {
+    use crate::execution::spawn::ChildRunLaunchHook;
+    use bamboo_domain::AdmissionCommit;
+
+    struct InterruptNextChildRead(Arc<AtomicUsize>);
+
+    impl ChildRunLaunchHook for InterruptNextChildRead {
+        fn before_child_launch(&self, _: &SpawnJob, _: broadcast::Sender<AgentEvent>) {}
+
+        fn before_queued_reservation(
+            &self,
+            _: &SpawnJob,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            assert_eq!(self.0.swap(1, Ordering::SeqCst), 0);
+            Box::pin(async {})
+        }
+    }
+
+    let fault_state = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut harness = build_harness_backend_controlled(
+        Arc::new(CountingCompletedProvider(calls.clone())),
+        vec![],
+        &[],
+        true,
+        Some(StartupStorageFault::InterruptedChildRead(
+            fault_state.clone(),
+        )),
+    )
+    .await;
+    // Arm after the queue's generation check and before SDK reads the Child
+    // to reserve execution. The regular producer admission remains intact.
+    harness.ctx.child_run_launch_hook = Some(Arc::new(InterruptNextChildRead(fault_state.clone())));
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    child.set_last_run_status("pending");
+    let generation = child.advance_child_launch_generation().unwrap();
+    child.mark_child_auto_run_launch_intent();
+    harness.storage.save_session(&child).await.unwrap();
+
+    let scheduler = crate::execution::SpawnScheduler::new(harness.ctx.clone());
+    let AdmissionCommit::Committed(reservation) =
+        scheduler.reserve_queue_capacity(None).await.unwrap()
+    else {
+        panic!("ordinary Child launch must get its queue reservation");
+    };
+    let result = reservation
+        .with_child_startup(&child)
+        .enqueue_announced_for_generation_revalidated(
+            SpawnJob {
+                parent_session_id: harness.parent_session_id.clone(),
+                child_session_id: child.id.clone(),
+                model: child.model.clone(),
+                disabled_tools: None,
+            },
+            Some(child.title.clone()),
+            Some(generation),
+            None,
+            Ok(()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, AdmissionCommit::Committed(())));
+    let events = collect_until_completed(&mut harness.parent_rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::SubAgentCompleted { child_session_id, status, error: None, .. })
+            if child_session_id == &child.id && status == "completed"
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::SubAgentStarted { .. }))
+            .count(),
+        1,
+    );
+    assert_eq!(fault_state.load(Ordering::SeqCst), 2, "fault was consumed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let saved = harness
+        .storage
+        .load_session(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.created_at, child.created_at);
+    assert_eq!(saved.child_launch_generation(), generation);
+    assert_eq!(saved.last_run_status().as_deref(), Some("completed"));
 }
 
 #[tokio::test]

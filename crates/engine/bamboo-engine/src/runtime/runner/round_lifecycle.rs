@@ -14,7 +14,7 @@ use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolIdentity, ProviderFamily,
     ProviderProtocol, ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
-    ReasoningEffort, SessionKind,
+    ReasoningEffort, SessionKind, SESSION_COORDINATION_TOOL_NAME,
 };
 use bamboo_llm::provider::{
     OutputLimitRecovery, RequestToolSelection, REASONING_REPETITION_FINISH_REASON,
@@ -274,11 +274,16 @@ pub(super) fn select_request_tool_schemas<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
     selection: &RequestToolSelection,
+    mode: CapabilityLoadingMode,
 ) -> Result<Cow<'a, [ToolSchema]>, AgentError> {
     let eligible = |schema: &ToolSchema| {
         let name = &schema.function.name;
         selection.allows(name)
             && session.allows_model_tool_execution(name)
+            // This capability requires discovery even when the current route
+            // would otherwise disclose every eligible tool up front.
+            && !(mode == CapabilityLoadingMode::LegacyFullCatalog
+                && name == SESSION_COORDINATION_TOOL_NAME)
             && ClassifiedToolIdentity::from_schema_name(name)
                 .is_some_and(|tool| tool.loading_class() != CapabilityLoadingClass::HostOnly)
     };
@@ -365,7 +370,7 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
     let (mode, selection) = request_tool_policy(llm.as_ref(), model_name, required_tool)
         .await
         .unwrap();
-    let eligible = select_request_tool_schemas(session, tool_schemas, &selection).unwrap();
+    let eligible = select_request_tool_schemas(session, tool_schemas, &selection, mode).unwrap();
     request_tool_schemas_for_loading_mode(session, eligible.as_ref(), mode, true).into_owned()
 }
 
@@ -408,6 +413,7 @@ pub(crate) struct RoundRecoveryPolicy<'a> {
     pub task_split: Option<TaskSplitPrompt<'a>>,
     pub standalone_discovery: bool,
     pub round_cap_summary: bool,
+    pub immediate_update: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable
@@ -806,7 +812,7 @@ mod tests {
     use bamboo_agent_core::{AgentEvent, Message, Session};
     use bamboo_domain::{
         CapabilityLoadingMode, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
-        ProviderTranscriptItem, ProviderTranscriptOrigin,
+        ProviderTranscriptItem, ProviderTranscriptOrigin, SESSION_COORDINATION_TOOL_NAME,
     };
     use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
     use futures::stream;
@@ -1009,7 +1015,12 @@ mod tests {
                 names: names.into_iter().map(str::to_owned).collect(),
                 required: false,
             };
-            let selected = select_request_tool_schemas(session, &tools, &selection);
+            let selected = select_request_tool_schemas(
+                session,
+                &tools,
+                &selection,
+                CapabilityLoadingMode::LegacyFullCatalog,
+            );
             match expected {
                 Some(names) => assert_eq!(
                     selected
@@ -1022,11 +1033,42 @@ mod tests {
                 None => assert!(selected.is_err()),
             }
         }
-        assert!(
-            select_request_tool_schemas(&ultra, &tools, &RequestToolSelection::Disabled)
-                .unwrap()
-                .is_empty()
+        assert!(select_request_tool_schemas(
+            &ultra,
+            &tools,
+            &RequestToolSelection::Disabled,
+            CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn legacy_full_catalog_keeps_existing_messaging_but_excludes_running_coordination() {
+        let session = Session::new("legacy-coordination", "model");
+        let tools = ["session_message", SESSION_COORDINATION_TOOL_NAME].map(schema);
+        let mode = CapabilityLoadingMode::LegacyFullCatalog;
+        let eligible =
+            select_request_tool_schemas(&session, &tools, &RequestToolSelection::Automatic, mode)
+                .unwrap();
+        let wire = request_tool_schemas_for_loading_mode(&session, &eligible, mode, true);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].function.name, "session_message");
+        let callable = crate::runtime::runner::loop_execution::effective_callable_set_for_round(
+            &session, &eligible, mode,
         );
+        assert!(callable.contains_execution_name("session_message"));
+        assert!(!callable.contains_execution_name(SESSION_COORDINATION_TOOL_NAME));
+        assert!(select_request_tool_schemas(
+            &session,
+            &tools,
+            &RequestToolSelection::Forced {
+                name: SESSION_COORDINATION_TOOL_NAME.into(),
+                exactly_one: true,
+            },
+            mode,
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1136,7 +1178,8 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(mode, CapabilityLoadingMode::StickyFallback);
-                let eligible = select_request_tool_schemas(session, &schemas, &selection).unwrap();
+                let eligible =
+                    select_request_tool_schemas(session, &schemas, &selection, mode).unwrap();
                 let projected =
                     request_tool_schemas_for_loading_mode(session, &eligible, mode, true);
                 assert_eq!(

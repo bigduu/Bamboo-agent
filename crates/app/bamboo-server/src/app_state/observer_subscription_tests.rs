@@ -1472,7 +1472,6 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let admission_request = |target: &SupervisorCurrentUserTarget, delivery: &Value| {
         json!({
             "action":"observe_run",
-            "target_session_id":target.session_id,
             "target_ref":target,
             "input_receipt":{"receipt_id":delivery["receipt_id"],"generation":delivery["generation"]},
         })
@@ -3013,7 +3012,7 @@ pub(in crate::app_state) async fn exercise_subscribed_wait_yields_to_inbox() {
         &f.state,
         &f.reference,
         "subscribed-wait-observe",
-        json!({"action":"observe_run", "target_session_id":ROOT_A, "target_ref":target}),
+        json!({"action":"observe_run", "target_ref":target}),
     )
     .await;
     assert_eq!(observed["status"], "running");

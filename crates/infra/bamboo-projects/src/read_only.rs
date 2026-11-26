@@ -1,17 +1,35 @@
 //! Existing current Project facts only. Never initializes, migrates or repairs.
 use super::{ProjectId, ProjectManifest, ProjectStore, ProjectStoreResult};
 
+#[cfg(any(unix, windows))]
+use crate::{decode_manifest, FileLock, ProjectStoreError};
+#[cfg(any(unix, windows))]
+use fs2::FileExt;
+#[cfg(any(unix, windows))]
+use std::{fs::File, io::Read};
+
+#[cfg(unix)]
+use self::unix as platform;
+#[cfg(windows)]
+#[path = "read_only_windows.rs"]
+mod windows;
+#[cfg(windows)]
+use self::windows as platform;
+
+#[cfg(any(unix, windows))]
+use platform::{check_at, check_root, open_at, root_at};
+
 impl ProjectStore {
     /// Read a current primary under the existing writer's shared lock, without
     /// creating files, consulting the index/backup, or normalizing revisions.
     /// Busy, missing, legacy and inconsistent stores require their normal owner.
     /// This snapshot grants no retained resource or execution authority.
     pub fn get_read_only(&self, project_id: &ProjectId) -> ProjectStoreResult<ProjectManifest> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            unix::read(self, project_id, || {})
+            read(self, project_id, || {})
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = project_id;
             Err(std::io::Error::new(
@@ -23,28 +41,82 @@ impl ProjectStore {
     }
 }
 
+#[cfg(any(unix, windows))]
+const MAX_MANIFEST_BYTES: usize = 1_048_576;
+#[cfg(any(unix, windows))]
+const MAX_FLOOR_BYTES: usize = 64;
+
+#[cfg(any(unix, windows))]
+fn invalid() -> ProjectStoreError {
+    ProjectStoreError::Validation("current read-only Project proof unavailable".into())
+}
+
+#[cfg(any(unix, windows))]
+fn bounded(parent: &File, component: &str, cap: usize) -> ProjectStoreResult<(File, Vec<u8>)> {
+    let mut file = open_at(parent, component, false)?;
+    check_at(parent, component, &file, false)?;
+    if file.metadata()?.len() > cap as u64 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > cap || file.metadata()?.len() != bytes.len() as u64 {
+        return Err(invalid());
+    }
+    check_at(parent, component, &file, false)?;
+    Ok((file, bytes))
+}
+
+#[cfg(any(unix, windows))]
+fn read(
+    store: &ProjectStore,
+    id: &ProjectId,
+    after_read: impl FnOnce(),
+) -> ProjectStoreResult<ProjectManifest> {
+    let root = root_at(store.paths.data_dir())?;
+    check_root(&root, store.paths.data_dir())?;
+    let projects = open_at(&root, "projects", true)?;
+    let home = open_at(&projects, id.as_str(), true)?;
+    let lock = open_at(&home, ".project.lock", false)?;
+    check_at(&home, ".project.lock", &lock, false)?;
+    FileExt::try_lock_shared(&lock)?;
+    let lock = FileLock(lock);
+    check_at(&home, ".project.lock", &lock.0, false)?;
+    let state = open_at(&home, "state", true)?;
+    let (primary, bytes) = bounded(&home, "project.json", MAX_MANIFEST_BYTES)?;
+    let (floor, floor_bytes) = bounded(&state, "manifest-revision", MAX_FLOOR_BYTES)?;
+    let decoded = decode_manifest(&bytes, id)?;
+    let revision = std::str::from_utf8(&floor_bytes)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(invalid)?;
+    if decoded.migrated_from.is_some() || revision != decoded.manifest.revision {
+        return Err(invalid());
+    }
+    after_read();
+    check_root(&root, store.paths.data_dir())?;
+    check_at(&root, "projects", &projects, true)?;
+    check_at(&projects, id.as_str(), &home, true)?;
+    check_at(&home, "state", &state, true)?;
+    check_at(&home, ".project.lock", &lock.0, false)?;
+    check_at(&home, "project.json", &primary, false)?;
+    check_at(&state, "manifest-revision", &floor, false)?;
+    Ok(decoded.manifest)
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use crate::{decode_manifest, FileLock, ProjectStoreError};
-    use fs2::FileExt;
     use std::{
         ffi::{CString, OsStr},
         fs::{File, OpenOptions},
-        io::Read,
         os::{
             fd::AsRawFd,
             unix::{ffi::OsStrExt, fs::MetadataExt},
         },
         path::{Component, Path},
     };
-
-    const MAX_MANIFEST_BYTES: usize = 1_048_576;
-    const MAX_FLOOR_BYTES: usize = 64;
-
-    fn invalid() -> ProjectStoreError {
-        ProjectStoreError::Validation("current read-only Project proof unavailable".into())
-    }
 
     fn name(value: &OsStr) -> ProjectStoreResult<CString> {
         let bytes = value.as_bytes();
@@ -54,7 +126,11 @@ mod unix {
         CString::new(bytes).map_err(|_| invalid())
     }
 
-    fn open_at(parent: &File, component: &str, directory: bool) -> ProjectStoreResult<File> {
+    pub(super) fn open_at(
+        parent: &File,
+        component: &str,
+        directory: bool,
+    ) -> ProjectStoreResult<File> {
         open_component(parent, OsStr::new(component), directory)
     }
 
@@ -80,7 +156,7 @@ mod unix {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn check_at(
+    pub(super) fn check_at(
         parent: &File,
         component: &str,
         file: &File,
@@ -125,22 +201,7 @@ mod unix {
         Ok(())
     }
 
-    fn bounded(parent: &File, component: &str, cap: usize) -> ProjectStoreResult<(File, Vec<u8>)> {
-        let mut file = open_at(parent, component, false)?;
-        check_at(parent, component, &file, false)?;
-        if file.metadata()?.len() > cap as u64 {
-            return Err(invalid());
-        }
-        let mut bytes = Vec::new();
-        (&mut file).take(cap as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > cap || file.metadata()?.len() != bytes.len() as u64 {
-            return Err(invalid());
-        }
-        check_at(parent, component, &file, false)?;
-        Ok((file, bytes))
-    }
-
-    fn root_at(path: &Path) -> ProjectStoreResult<File> {
+    pub(super) fn root_at(path: &Path) -> ProjectStoreResult<File> {
         use std::os::unix::fs::OpenOptionsExt;
         if !path.is_absolute() {
             return Err(invalid());
@@ -159,7 +220,7 @@ mod unix {
         Ok(current)
     }
 
-    fn check_root(root: &File, path: &Path) -> ProjectStoreResult<()> {
+    pub(super) fn check_root(root: &File, path: &Path) -> ProjectStoreResult<()> {
         let opened = root.metadata()?;
         // Walk every existing ancestor again, rather than following an alias
         // back to the old inode through an intermediate replacement symlink.
@@ -173,43 +234,6 @@ mod unix {
             return Err(invalid());
         }
         Ok(())
-    }
-
-    pub(super) fn read(
-        store: &ProjectStore,
-        id: &ProjectId,
-        after_read: impl FnOnce(),
-    ) -> ProjectStoreResult<ProjectManifest> {
-        let root = root_at(store.paths.data_dir())?;
-        check_root(&root, store.paths.data_dir())?;
-        let projects = open_at(&root, "projects", true)?;
-        let home = open_at(&projects, id.as_str(), true)?;
-        let lock = open_at(&home, ".project.lock", false)?;
-        check_at(&home, ".project.lock", &lock, false)?;
-        FileExt::try_lock_shared(&lock)?;
-        let lock = FileLock(lock);
-        check_at(&home, ".project.lock", &lock.0, false)?;
-        let state = open_at(&home, "state", true)?;
-        let (primary, bytes) = bounded(&home, "project.json", MAX_MANIFEST_BYTES)?;
-        let (floor, floor_bytes) = bounded(&state, "manifest-revision", MAX_FLOOR_BYTES)?;
-        let decoded = decode_manifest(&bytes, id)?;
-        let revision = std::str::from_utf8(&floor_bytes)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .ok_or_else(invalid)?;
-        if decoded.migrated_from.is_some() || revision != decoded.manifest.revision {
-            return Err(invalid());
-        }
-        after_read();
-        check_root(&root, store.paths.data_dir())?;
-        check_at(&root, "projects", &projects, true)?;
-        check_at(&projects, id.as_str(), &home, true)?;
-        check_at(&home, "state", &state, true)?;
-        check_at(&home, ".project.lock", &lock.0, false)?;
-        check_at(&home, "project.json", &primary, false)?;
-        check_at(&state, "manifest-revision", &floor, false)?;
-        Ok(decoded.manifest)
     }
 
     #[cfg(test)]

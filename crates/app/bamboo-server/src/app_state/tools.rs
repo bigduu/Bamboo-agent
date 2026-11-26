@@ -3,7 +3,7 @@
 //! These functions compose the tool executor chain:
 //! ```text
 //! base_tools (builtin + MCP + memory + scoped session messaging + skills + context controls
-//!             + Host-routed session_history + current history + fresh independent Root spawn)
+//!             + Host-routed session_history + current history + live coordination + fresh Root spawn)
 //!   └─> root_tools (base + SubAgent + scheduler + Supervisor controls)
 //! ```
 
@@ -19,6 +19,9 @@ use bamboo_agent_core::AgentEvent;
 use bamboo_llm::Config;
 use bamboo_mcp::manager::McpServerManager;
 use bamboo_plugin_protocol::ToolEventPublisher;
+use bamboo_server_tools::framework_session_tools::{
+    assemble_framework_session_tools_with_messaging, FrameworkMessagingTools,
+};
 use bamboo_skills::SkillManager;
 use bamboo_storage::LockedSessionStore;
 use bamboo_storage::SessionStoreV2;
@@ -47,6 +50,8 @@ pub(super) fn build_base_tools(
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     root_creator: Option<
         Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>,
     >,
@@ -126,8 +131,22 @@ pub(super) fn build_base_tools(
         ),
     );
     let session_message_tool = Arc::new(
-        bamboo_server_tools::SessionMessageTool::new(session_messenger)
+        bamboo_server_tools::SessionMessageTool::new(session_messenger.clone())
             .with_scoped_sender(scoped_sender),
+    );
+    let coordination_tool = Arc::new(
+        bamboo_server_tools::session_coordination::SessionCoordinationTool::new(
+            Arc::new(
+                super::running_session_directory::ProjectRunningSessionDirectory {
+                    storage: storage.clone(),
+                    messenger: session_messenger.clone(),
+                    router: session_activation_router,
+                    runners: agent_runners,
+                },
+            ),
+            storage.clone(),
+            session_messenger,
+        ),
     );
     // The shared factory installs this exact typed instance once, after the
     // other Base overlays. A second message overlay would nest its single
@@ -197,16 +216,18 @@ pub(super) fn build_base_tools(
     // One real assembly serves Agent defaults, schedules and the Base supplied
     // to Child execution. LocalChildTools still applies its own immutable
     // native ceiling; registration here does not widen that separate boundary.
-    let base =
-        bamboo_server_tools::framework_session_tools::assemble_framework_session_tools_with_message(
-            base,
-            builtin_executor.clone(),
-            session_store,
-            storage,
-            config,
-            root_creator,
-            Some(session_message_tool),
-        );
+    let base = assemble_framework_session_tools_with_messaging(
+        base,
+        builtin_executor.clone(),
+        session_store,
+        storage,
+        config,
+        root_creator,
+        FrameworkMessagingTools {
+            message: Some(session_message_tool),
+            coordination: Some(coordination_tool),
+        },
+    );
     let ceiling = Arc::new(HostNativeToolCeiling {
         builtin: builtin_executor.clone(),
         base: base.clone(),

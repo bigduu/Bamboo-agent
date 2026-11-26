@@ -1,6 +1,7 @@
 //! Durable Root tool authority, separate from prompt or permission suggestions.
 
 use super::{model_context::ModelContextResetReason, Session, SessionKind};
+use crate::SESSION_COORDINATION_TOOL_NAME;
 
 /// Root product policy, independent of a model call's `ReasoningEffort`.
 /// Ultra coordinates parallel work and keeps verification at the Root.
@@ -54,13 +55,14 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an ordinary Ultra Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 16] = [
     "SubAgent",
     "spawn_session",
     "Task",
     "session_history_current",
     "session_history",
     "session_message",
+    SESSION_COORDINATION_TOOL_NAME,
     "Read",
     "Grep",
     "Glob",
@@ -80,13 +82,14 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 /// These are delegation or bounded business views, never raw workspace/file,
 /// process, Skill, Workflow or external-provider execution. Concrete Session
 /// ports still require their live Host instance proof; names grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 15] = [
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 16] = [
     "SubAgent",
     "spawn_session",
     "Task",
     "session_history_current",
     "session_history",
     "session_message",
+    SESSION_COORDINATION_TOOL_NAME,
     "session_control",
     "supervisor_log_monitor",
     "work_overview",

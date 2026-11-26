@@ -10,7 +10,7 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
   command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
-  resumePrepared, assertAdmissionCompatibility, waitForCargoArchive } = require('./crate-release.cjs')
+  resumePrepared, assertAdmissionCompatibility, waitForCargoArchive, makePackagedCrateReader } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -23,6 +23,37 @@ const checksum = 'f'.repeat(64)
 const now = new Date('2026-10-07T12:00:00Z')
 const signingKey = '7'.repeat(64)
 const signingKeyDigest = sha256(Buffer.from(signingKey, 'hex'))
+
+test('locate packaged crates once per publisher without querying Cargo before the first read', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-package-directory-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const firstTarget = path.join(directory, 'first target')
+  const secondTarget = path.join(directory, 'second target')
+  const domainArchive = 'bamboo-domain-2026.11.39.crate'
+  const agentArchive = 'bamboo-agent-2026.11.39.crate'
+  for (const target of [firstTarget, secondTarget]) {
+    fs.mkdirSync(path.join(target, 'package'), { recursive: true })
+  }
+  fs.writeFileSync(path.join(firstTarget, 'package', domainArchive), 'first domain')
+  fs.writeFileSync(path.join(firstTarget, 'package', agentArchive), 'first agent')
+  fs.writeFileSync(path.join(secondTarget, 'package', domainArchive), 'second domain')
+
+  let queries = 0
+  const readMetadata = (args) => {
+    assert.deepEqual(args, ['cargo', 'metadata', '--format-version', '1', '--no-deps'])
+    return { target_directory: [firstTarget, secondTarget][queries++] }
+  }
+  const readFirst = makePackagedCrateReader(readMetadata)
+  assert.equal(queries, 0)
+  assert.deepEqual(readFirst(domainArchive), Buffer.from('first domain'))
+  assert.deepEqual(readFirst(agentArchive), Buffer.from('first agent'))
+  assert.equal(queries, 1)
+
+  const readSecond = makePackagedCrateReader(readMetadata)
+  assert.equal(queries, 1)
+  assert.deepEqual(readSecond(domainArchive), Buffer.from('second domain'))
+  assert.equal(queries, 2)
+})
 
 test('wait for the exact Cargo download route before accepting the archived crate', async () => {
   const archive = new Response('crate bytes')
@@ -2142,6 +2173,33 @@ test('3053 requires its published prefix and permits a retry only from the retai
   const uploaded = { yanked: false, checksum }
   assert.equal(verifyRegistryMetadata(receipt, 'bamboo-projects', TARGET.version, uploaded), uploaded)
   assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-projects', TARGET.version, {
+    ...uploaded, checksum: 'b'.repeat(64),
+  }), /Registry checksum changed/)
+  assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)
+})
+
+test('3078 binds the original failure and all five successful native transports', () => {
+  const recovery = require('./crate-release-2026-11-47-recovery.cjs')
+  const { TARGET, TAIL, ATTEMPTS, ARTIFACTS } = recovery
+  const now = Date.parse('2026-11-25T13:00:00Z')
+  const { read, routes } = frozenRecoveryEvidence(TARGET, ATTEMPTS, ARTIFACTS, '2026-11-28T12:04:41Z')
+  assert.equal(recovery.originalEvidence(read, now).id, 45610087197)
+  assert.deepEqual(TAIL, ['bamboo-server', 'bamboo-client-core', 'bamboo-tui', 'bamboo-agent'])
+  assert.equal(ARTIFACTS.filter(([, name]) => name.startsWith('bamboo-executable-')).length, 5)
+  routes['actions/runs/' + TARGET.runId + '/artifacts?per_page=100'].artifacts.at(-1).expired = true
+  assert.throws(() => recovery.originalEvidence(read, now), { code: 'ERR_ASSERTION' })
+})
+
+test('3078 reconciles the retained SDK and requires the original published prefix', () => {
+  const { TARGET, TAIL, verifyRegistryMetadata } = require('./crate-release-2026-11-47-recovery.cjs')
+  const checksum = 'a'.repeat(64)
+  const prefix = [...Array.from({ length: 25 }, (_, index) => 'published-' + index), 'bamboo-server-tools']
+  const receipt = { crates: [...prefix, 'bamboo-sdk', ...TAIL], packageChecksums: { 'bamboo-sdk': checksum } }
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-server-tools', TARGET.version, null), /published prefix disappeared/)
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, null), null)
+  const uploaded = { yanked: false, checksum }
+  assert.equal(verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, uploaded), uploaded)
+  assert.throws(() => verifyRegistryMetadata(receipt, 'bamboo-sdk', TARGET.version, {
     ...uploaded, checksum: 'b'.repeat(64),
   }), /Registry checksum changed/)
   assert.throws(() => verifyRegistryMetadata(receipt, TAIL[0], TARGET.version, uploaded), /no reserved package checksum/)

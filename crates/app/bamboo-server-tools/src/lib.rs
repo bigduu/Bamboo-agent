@@ -22,6 +22,7 @@ pub mod project_tools;
 pub mod registry_keys;
 pub mod scoped_session_messaging;
 pub mod session_control;
+pub mod session_coordination;
 pub mod session_inspector;
 pub mod session_message;
 pub mod skill_runtime;

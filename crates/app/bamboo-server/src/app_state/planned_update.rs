@@ -89,13 +89,23 @@ impl AppState {
         self.managed_update_runtime.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_planned_update(&self) -> io::Result<HostUpdatePreparation> {
+        self.begin_update(false).await
+    }
+
+    pub(crate) async fn begin_update(&self, immediate: bool) -> io::Result<HostUpdatePreparation> {
         let runtime = self
             .managed_update_runtime
             .as_ref()
             .ok_or_else(|| unsupported("This Host was not started for managed updates"))?;
         if let Some(reason) = runtime.boot_refusal {
             return Err(unsupported(reason));
+        }
+        if immediate {
+            if let Some(reason) = unsupported_host_routes(&*self.config.read().await) {
+                return Err(unsupported(reason));
+            }
         }
         let boot_reconcile = self.boot_reconcile_services_handle.lock().await;
         if boot_reconcile
@@ -105,11 +115,13 @@ impl AppState {
             return Err(busy("Waiting for plugin service startup reconciliation"));
         }
         drop(boot_reconcile);
-        let admission = self
-            .session_activation_router
-            .hold_admissions_for_update()
-            .await
-            .ok_or_else(|| busy("Another planned update owns session admission"))?;
+        let router = &self.session_activation_router;
+        let admission = if immediate {
+            router.hold_admissions_for_immediate_update().await
+        } else {
+            router.hold_admissions_for_update().await
+        }
+        .ok_or_else(|| busy("Another planned update owns session admission"))?;
         Ok(HostUpdatePreparation {
             admission,
             child: self.external_child_runner.clone(),

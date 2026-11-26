@@ -54,10 +54,13 @@ impl OverlayToolExecutor {
             self.base
                 .check_permissions_for_resolved(call, self.overlay.name(), args, ctx);
         let selected_contract = self.local_execution_contract(self.overlay.name());
-        let outcome = if self.overlay.name() == "session_message"
+        let send_contract =
+            bamboo_tools::scoped_session_send_permission::framework_session_send_contract(
+                self.overlay.name(),
+            );
+        let outcome = if send_contract.is_some()
+            && selected_contract == send_contract
             && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
-            && selected_contract
-                == Some(crate::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
         {
             bamboo_tools::scoped_session_send_permission::with_framework_scoped_session_send_restriction(
                 call,
@@ -114,6 +117,7 @@ impl OverlayToolExecutor {
                 "browser",
                 "browser_eval",
                 "session_message",
+                "session_coordination",
                 "session_loop",
                 "spawn_session",
                 "work_overview",

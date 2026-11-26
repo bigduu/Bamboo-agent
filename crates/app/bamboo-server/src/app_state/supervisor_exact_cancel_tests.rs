@@ -109,15 +109,45 @@ async fn supervisor_wait_wakes_only_after_the_observed_run_finalizes() {
     let runners = &fixture.state.agent_runners;
     runners.write().await.insert(TARGET.into(), runner);
 
+    let mismatch = invoke(
+        &fixture,
+        json!({"action": "observe_run", "target_session_id": "different-root", "target_ref": target}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(mismatch, ToolError::InvalidArguments(ref error)
+            if error.starts_with("Permission check failed:")
+                && error.contains("requires the observed ordinary Root target")),
+        "{mismatch:?}"
+    );
+
+    let mut stale = target.clone();
+    stale.created_at += chrono::Duration::seconds(1);
+    let rejected = invoke(
+        &fixture,
+        json!({"action": "observe_run", "target_ref": stale}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(rejected, ToolError::Execution(ref error)
+            if error.contains("Supervisor caller or Root target changed")),
+        "{rejected:?}"
+    );
+
     let wait = args("wait_run", &target, Some(&run_id));
     assert_eq!(
         invoke(&fixture, wait.clone()).await.unwrap()["reason"],
         "run_not_observed"
     );
     assert_eq!(
-        invoke(&fixture, args("observe_run", &target, None))
-            .await
-            .unwrap()["run_id"],
+        invoke(
+            &fixture,
+            json!({"action": "observe_run", "target_ref": target})
+        )
+        .await
+        .unwrap()["run_id"],
         run_id
     );
     let plan_attempt = invoke_in_mode(&fixture, wait.clone(), true).await;

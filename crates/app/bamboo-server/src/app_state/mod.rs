@@ -499,11 +499,8 @@ pub struct AppState {
     /// Unified model catalog service (used when features.provider_model_ref is enabled).
     pub model_catalog: Arc<bamboo_llm::ModelCatalogService>,
 
-    /// Tracks session ids whose auto-title generation is currently in flight.
-    ///
-    /// Used by [`crate::title_gen`] to dedupe concurrent invocations
-    /// (e.g. multiple chat messages arriving while a regenerate-title request is running).
-    pub title_gen_in_flight: Arc<dashmap::DashSet<String>>,
+    /// Tracks active title requests and the latest attempted transcript evidence.
+    pub title_gen_in_flight: Arc<bamboo_engine::title_gen::TitleGenerationTracker>,
 
     /// v2-P2 (#181, slice 2): in-memory one-time pairing codes. A 6-digit numeric
     /// code (keyed by the code string) maps to an entry holding its expiry. Codes
@@ -536,12 +533,12 @@ impl AppState {
     /// Try to claim the title-generation slot for `session_id`.
     /// Returns `true` on success, `false` if generation is already in flight.
     pub fn title_gen_acquire(&self, session_id: &str) -> bool {
-        self.title_gen_in_flight.insert(session_id.to_string())
+        self.title_gen_in_flight.acquire(session_id, false)
     }
 
     /// Release the title-generation slot for `session_id`. Idempotent.
     pub fn title_gen_release(&self, session_id: &str) {
-        self.title_gen_in_flight.remove(session_id);
+        self.title_gen_in_flight.release(session_id);
     }
 
     /// The compatibility API has no caller-provided revision. Serialize its
@@ -643,6 +640,7 @@ pub mod session_events;
 mod session_loader;
 mod supervisor_observers;
 pub use observer_subscriptions::ObserverSubscriptionStart;
+mod running_session_directory;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;

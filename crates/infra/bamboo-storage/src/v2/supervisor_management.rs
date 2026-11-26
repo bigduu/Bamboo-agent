@@ -2,7 +2,7 @@
 
 #[path = "supervisor_current_user.rs"]
 mod current_user;
-pub(crate) use current_user::CurrentUserTargetGuard;
+pub(crate) use current_user::{CurrentUserTargetGuard, ProjectPeerDeliveryGuard};
 #[path = "observer_subscriptions.rs"]
 pub(super) mod subscriptions;
 

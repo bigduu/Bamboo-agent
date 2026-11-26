@@ -6,4 +6,5 @@
 
 pub use bamboo_engine::title_gen::{
     build_title_messages, heuristic_title, spawn_title_generation, spawn_title_generation_force,
+    spawn_title_regeneration, TitleGenerationOutcome,
 };

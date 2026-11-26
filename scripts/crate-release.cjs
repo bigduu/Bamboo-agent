@@ -496,6 +496,15 @@ function command(args, options = {}) {
 
 function jsonCommand(args) { return JSON.parse(command(args)) }
 
+function makePackagedCrateReader(readMetadata = jsonCommand) {
+  let packageDirectory
+  return (filename) => {
+    packageDirectory ??= path.join(
+      readMetadata(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory, 'package')
+    return fs.readFileSync(path.join(packageDirectory, filename))
+  }
+}
+
 function githubArgs(repository, route, payload, method = payload === undefined ? 'GET' : 'POST') {
   const args = ['gh', 'api', `repos/${repository}/${route}`]
   if (payload !== undefined) args.push('--method', method, '--input', '-')
@@ -804,6 +813,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   const frozen = requireCurrentMain && env.GITHUB_EVENT_NAME === 'workflow_dispatch'
   if (frozen) assert.match(env.GITHUB_RUN_ID || '', /^[1-9][0-9]*$/)
   const originals = new Map()
+  const readPackagedCrate = makePackagedCrateReader()
   const guard = recovery ? () => recovery.guard() : requireCurrentMain ? frozen
     ? () => require('./release-source.cjs').frozenGuard(JSON.parse(env.SOURCE_VALIDATION), env)
     : () => assertCurrentMain(repository, sourceRevision) : async () => {}
@@ -889,8 +899,9 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       return response ? (await response.json()).version : null
     },
     package: async (name, version, expected, release) => {
+      const filename = `${name}-${version}.crate`
       if (frozen) {
-        const filename = name + '-' + version + '.crate', current = github(repository, 'releases/' + release.id)
+        const current = github(repository, 'releases/' + release.id)
         const assets = current.assets.filter(asset => asset.name === filename), file = path.join(directory, filename)
         const seal = bytes => {
           const metadata = require('./release-cargo-upload.cjs').describeArchive(bytes, name, version)
@@ -910,8 +921,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
             else assertCrateCompilationAllowed(reservation, env, route => github(repository, route))
             assert.ok(!fs.existsSync(file), 'Unexplained crate original in scratch; do not rebuild')
             command(['cargo', 'package', '--locked', '--allow-dirty', '-p', name]) // One isolated verification compile.
-            const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
-            return seal(fs.readFileSync(path.join(target, 'package', filename)))
+            return seal(readPackagedCrate(filename))
           },
           persist: async original => {
             await write(() => command(['gh', 'release', 'upload', original.tag, original.file, '--repo', repository]))
@@ -926,8 +936,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
         return sha256(original.bytes)
       }
       command(['cargo', 'package', '--locked', '--allow-dirty', '--no-verify', '-p', name])
-      const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
-      return sha256(fs.readFileSync(path.join(target, 'package', `${name}-${version}.crate`)))
+      return sha256(readPackagedCrate(filename))
     },
     cargoPublish: async (name) => {
       if (frozen) {
@@ -1017,5 +1026,6 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   frontendIdentity, verifyPackageArchive, waitForCargoArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
-  assertAdmissionCompatibility, assertFrozenPublisherRun, assertCrateCompilationAllowed, prepareFrozenCrateOriginal }
+  assertAdmissionCompatibility, assertFrozenPublisherRun, assertCrateCompilationAllowed, prepareFrozenCrateOriginal,
+  makePackagedCrateReader }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

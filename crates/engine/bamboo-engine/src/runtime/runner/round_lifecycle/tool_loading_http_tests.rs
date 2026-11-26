@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{Message, Session};
 use bamboo_config::RequestOverridesConfig;
-use bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+use bamboo_domain::{DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, SESSION_COORDINATION_TOOL_NAME};
 use bamboo_llm::providers::BodhiProvider;
 use bamboo_llm::{AnthropicProvider, GeminiProvider, LLMProvider, OpenAIProvider};
 use serde_json::{json, Value};
@@ -16,6 +16,7 @@ use crate::runtime::config::AgentLoopConfig;
 const MODEL: &str = "fixture-model";
 const DENIED_SCHEMA_MARKER: &str = "PRIVATE_TOOL_DEFINITION_TEST_MARKER";
 const CHILD_GUIDANCE_TITLE: &str = "Child Tool Availability";
+const COORDINATION_GUIDANCE_TITLE: &str = "On-demand Session coordination";
 
 fn schema(name: &str) -> ToolSchema {
     ToolSchema {
@@ -349,6 +350,122 @@ fn tool_names(body: &Value) -> Vec<&str> {
 
 fn body_override(path: &str, value: Value) -> RequestOverridesConfig {
     serde_json::from_value(json!({"common":{"body_patch":[{"path":path,"value":value}]}})).unwrap()
+}
+
+fn coordination_schema() -> ToolSchema {
+    let mut coordination = schema(SESSION_COORDINATION_TOOL_NAME);
+    coordination.function.parameters = json!({
+        "type":"object","properties":{"action":{"type":"string","enum":["list_running","send"]}},
+        "required":["action"],"additionalProperties":false,
+    });
+    coordination
+}
+
+#[tokio::test]
+async fn running_coordination_guidance_precedes_the_user_without_disclosing_the_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("fixture request captured"))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        OpenAIProvider::new("fixture")
+            .with_base_url(server.uri())
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+    );
+    let catalog = [schema("Read"), coordination_schema()];
+    let mut session = Session::new("coordination-wire", MODEL);
+    const USER_REQUEST: &str = "Check for overlapping implementation before editing.";
+    session.add_message(Message::user(USER_REQUEST));
+
+    send(&mut session, &provider, &catalog).await;
+    record_discovery(&mut session, &catalog[1..]);
+    send(&mut session, &provider, &catalog).await;
+    send(&mut session, &provider, &catalog[..1]).await;
+
+    let bodies = capture(&server).await;
+    assert_eq!(bodies.len(), 3);
+    let first = &bodies[0];
+    assert_eq!(
+        tool_names(first),
+        ["Read", DISCOVERY_CONTROL_FALLBACK_TOOL_NAME]
+    );
+    assert!(!first["tools"].to_string().contains("list_running"));
+    let messages = first["messages"].as_array().unwrap();
+    let guide_index = messages
+        .iter()
+        .position(|message| {
+            message["content"]
+                .to_string()
+                .contains(COORDINATION_GUIDANCE_TITLE)
+        })
+        .expect("on-demand tool hint in the provider request");
+    let user_index = messages
+        .iter()
+        .position(|message| message["content"].to_string().contains(USER_REQUEST))
+        .expect("user request in the provider request");
+    assert!(guide_index < user_index);
+    assert!(messages[guide_index]["content"]
+        .to_string()
+        .contains("Call `discover_capabilities` by itself"));
+
+    assert!(tool_names(&bodies[1]).contains(&SESSION_COORDINATION_TOOL_NAME));
+    assert!(bodies[1].to_string().contains("list_running"));
+    assert_eq!(tool_names(&bodies[2]), ["Read"]);
+    assert!(!bodies[2].to_string().contains(COORDINATION_GUIDANCE_TITLE));
+    assert!(!bodies[2].to_string().contains("list_running"));
+    assert!(!session
+        .messages
+        .iter()
+        .any(|message| message.content.contains(COORDINATION_GUIDANCE_TITLE)));
+}
+
+#[tokio::test]
+async fn native_search_accounts_for_running_coordination_as_deferred() {
+    use bamboo_domain::CapabilityLoadingMode;
+    use bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution;
+    use bamboo_llm::{PromptIR, ProviderVisibleToolSegmentKind};
+
+    let openai = |execution| {
+        OpenAIProvider::new("fixture")
+            .with_responses_only_models(vec![MODEL.into()])
+            .with_tool_search_execution(execution)
+    };
+    let providers: [(Box<dyn LLMProvider>, &str); 3] = [
+        (
+            Box::new(openai(ResponsesToolSearchExecution::Client)),
+            MODEL,
+        ),
+        (
+            Box::new(openai(ResponsesToolSearchExecution::Server)),
+            MODEL,
+        ),
+        (
+            Box::new(AnthropicProvider::new("fixture")),
+            "claude-sonnet-4-6",
+        ),
+    ];
+    let catalog = [schema("Read"), coordination_schema()];
+    for (provider, model) in providers {
+        let mode = provider.capability_loading_mode(model, None).await;
+        assert_eq!(mode, CapabilityLoadingMode::Progressive);
+        let footprint = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &catalog, model, None)
+            .await
+            .unwrap();
+        let initial = footprint
+            .segments
+            .iter()
+            .find(|segment| segment.kind == ProviderVisibleToolSegmentKind::InitialFullDefinition)
+            .unwrap();
+        assert!(initial.serialized.contains("Read"));
+        assert!(!initial.serialized.contains(SESSION_COORDINATION_TOOL_NAME));
+        assert!(footprint
+            .segments
+            .iter()
+            .any(|segment| { segment.kind == ProviderVisibleToolSegmentKind::ProviderLateBound }));
+    }
 }
 
 #[tokio::test]
@@ -1037,6 +1154,7 @@ async fn rejected_round_cap_summary_clears_responses_id_before_resume() {
             task_split: None,
             standalone_discovery: false,
             round_cap_summary: true,
+            immediate_update: None,
         }),
     )
     .await
@@ -1165,6 +1283,7 @@ async fn output_limit_split_does_not_advertise_discovery_on_gemini_wires() {
                 }),
                 round_cap_summary: false,
                 standalone_discovery: false,
+                immediate_update: None,
             }),
         )
         .await;

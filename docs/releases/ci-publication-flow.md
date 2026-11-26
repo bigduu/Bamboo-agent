@@ -40,10 +40,24 @@ todo cases. A renamed, missing or duplicated case fails the job. Platform-free
 protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
 the existing native Rust acceptance still runs separately.
 
+For Windows Project read-only proof, dispatch the existing Ticket Platform
+Adapter workflow with the candidate branch and exact source SHA. Its Windows
+job checks the current Project proof, writer contention and unsafe replacement
+paths. The normal Linux Project suite still owns the Unix cases.
+
+```sh
+gh workflow run ticket-platform-adapter.yml -R bigduu/Bamboo-agent \
+  --ref "$candidate_branch" -f windows_project_sha="$candidate_sha"
+```
+
 `frontend-acceptance.yml` checks the embedded frontend package, build scripts and
 server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
+
+The Linux and Windows ARM64 embedded frontend jobs upload their Cargo output and
+bounded Host failure diagnostics on failure. The `arm64-embedded-frontend` artifact
+name includes the target, workflow run and attempt.
 
 The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 `trusted-observer.yml` runs both Observer runtime selections in one feature job,
@@ -209,6 +223,30 @@ Require authenticated remote readback with `recovery20261143.completed=true`,
 no pending compilation, `receipt.completed=false` and
 `publisherRunId=45451853467`. Retry the original failed jobs to finalize the
 same version with the retained native outputs.
+
+### Fixed v2026.11.47 crate recovery
+
+Issue #3078 binds draft 458057047 and source
+`f8f9b0bc98025ae3acd0c771dc98b96e33c1bfba` to the original
+[publisher 45610087197, attempt 1](https://github.com/bigduu/Bamboo-agent/actions/runs/45610087197/attempts/1).
+The first 26 crates were verified in the registry. The publisher retained and
+recorded the `bamboo-sdk` archive before its upload returned HTTP 500.
+Recovery checks the registry before uploading that original again. It preserves
+the signed crate prefix, sealed frontend and all five original native transports.
+The four crates from `bamboo-server` through `bamboo-agent` use the existing
+signed first-compilation checkpoint.
+
+Dispatch after the reviewed controller merges into protected Dev.
+
+```bash
+gh workflow run recover-crate-2026-11-47.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+Require authenticated remote readback with `recovery20261147.completed=true`,
+no pending compilation, `receipt.completed=false`, and
+`publisherRunId=45610087197`. Retry the original failed jobs to complete the
+same version using its retained native outputs.
 
 ## Main and consumers
 
