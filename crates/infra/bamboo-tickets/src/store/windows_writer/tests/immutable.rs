@@ -371,6 +371,8 @@ fn absence_win32(category: &ImmutableCategory<'_, '_>, name: &str) -> i32 {
 }
 
 fn rename(result: &RenameReceipt) -> Value {
+    assert_eq!(result.information_class, 10);
+    assert_eq!(result.flags, 0);
     json!({
         "ntstatus": format!("{:08x}", result.ntstatus as u32),
         "win32_error": result.win32_error,

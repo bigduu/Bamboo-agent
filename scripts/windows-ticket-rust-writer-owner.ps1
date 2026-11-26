@@ -2,6 +2,7 @@ function Get-TicketRustProbeTest([string] $ProbeCase) {
     switch ($ProbeCase) {
         'rust-writer' { return 'store::windows_writer::tests::native_standard_user_scope_and_writer' }
         'rust-immutable' { return 'store::windows_writer::tests::immutable::native_standard_user_immutable_publication' }
+        'rust-head' { return 'store::windows_writer::tests::head::native_standard_user_head_replacement' }
         default { throw 'The Rust Ticket probe case is outside the owner test selection.' }
     }
 }
@@ -206,6 +207,66 @@ function Assert-RustImmutableProbe($Receipt, [int]$OwnerProcessId) {
         -not (Test-TicketRustObjectObservation $conflict.observed $conflict.before) -or
         -not (Test-TicketRustObjectObservation $conflict.after $conflict.observed)) {
         throw 'The Rust conflict control did not preserve the wrong bytes and refuse before the category barrier.'
+    }
+    Assert-TicketRustFileStoreGate $Receipt
+}
+
+function Test-TicketRustHeadObservation($Observed, $Expected) {
+    return $Observed.bytes_hex -cmatch '^(?:3[0-9]|6[1-6]){64}$' -and
+        $Observed.bytes_hex -ceq $Expected.bytes_hex -and
+        (Test-TicketRustWriterFileIdentity $Observed.identity $Expected.identity)
+}
+
+function Assert-RustHeadProbe($Receipt, [int]$OwnerProcessId) {
+    if ($Receipt.probe -cne 'rust-head' -or $Receipt.case -cne 'native_standard_user_head_replacement' -or
+        $Receipt.owner_pid -ne $OwnerProcessId -or $Receipt.verdict -cne 'available') {
+        throw 'The Rust receipt did not identify the exact HEAD replacement test.'
+    }
+    $proof = $Receipt.head
+    if ($proof.writer.win32_error -ne 0 -or $proof.writer.link_count -ne 1 -or
+        $proof.writer.file.volume_serial -cne $Receipt.volume.volume_serial -or
+        $proof.scope.file_id -cne $Receipt.volume.fixture_directory_file_id -or
+        $proof.scope.volume_serial -cne $proof.writer.file.volume_serial -or
+        -not (Test-TicketRustWriterFileIdentity $proof.writer_final_file $proof.writer.file)) {
+        throw 'The Rust HEAD receipt did not retain the original writable scope and writer identity.'
+    }
+    $initial = $proof.initial.named
+    if ($proof.initial.scope_flush_win32_error -ne 0 -or $initial.link_count -ne 1 -or
+        $initial.identity.volume_serial -cne $proof.scope.volume_serial -or
+        -not (Test-TicketRustHeadObservation $initial $initial)) {
+        throw 'The old Rust HEAD was not published with its expected bytes and scope barrier.'
+    }
+
+    foreach ($name in @('no_source_delete', 'no_reader_delete_share', 'replace')) {
+        $phase = $proof.$name
+        if ($phase.source_delete_access -ne ($name -ne 'no_source_delete') -or
+            $phase.reader_delete_share -ne ($name -ne 'no_reader_delete_share') -or
+            $phase.rename.information_class -ne 65 -or $phase.rename.flags -ne 3 -or
+            $phase.named_before.link_count -ne 1 -or $phase.named_after.link_count -ne 1 -or
+            $phase.staged_before.link_count -ne 1 -or $phase.staged_before.identity.volume_serial -cne $proof.scope.volume_serial -or
+            $phase.staged_before.identity.file_id -ceq $initial.identity.file_id -or
+            $phase.staged_before.bytes_hex -ceq $initial.bytes_hex -or
+            -not (Test-TicketRustHeadObservation $phase.old_reader_before $initial) -or
+            -not (Test-TicketRustHeadObservation $phase.old_reader_after $phase.old_reader_before) -or
+            -not (Test-TicketRustHeadObservation $phase.named_before $initial)) {
+            throw "The Rust HEAD identities or sharing controls were invalid for '$name'."
+        }
+        if ($name -eq 'replace') {
+            if ($phase.rename.win32_error -ne 0 -or $phase.rename.ntstatus -cne '00000000' -or
+                $phase.scope_flush_win32_error -ne 0 -or $phase.stage_absence_win32_error -ne 2 -or
+                -not (Test-TicketRustHeadObservation $phase.named_after $phase.staged_before)) {
+                throw 'The Rust HEAD replacement did not publish the staged successor and flush its scope.'
+            }
+        } else {
+            $win32 = if ($name -eq 'no_source_delete') { 5 } else { 32 }
+            $status = if ($name -eq 'no_source_delete') { 'c0000022' } else { 'c0000043' }
+            if ($phase.rename.win32_error -ne $win32 -or $phase.rename.ntstatus -cne $status -or
+                $null -ne $phase.scope_flush_win32_error -or $phase.staged_after.link_count -ne 1 -or
+                -not (Test-TicketRustHeadObservation $phase.named_after $initial) -or
+                -not (Test-TicketRustHeadObservation $phase.staged_after $phase.staged_before)) {
+                throw "The actual denied Rust HEAD rename did not preserve both files at '$name'."
+            }
+        }
     }
     Assert-TicketRustFileStoreGate $Receipt
 }
