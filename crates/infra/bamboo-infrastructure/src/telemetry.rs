@@ -20,9 +20,16 @@ mod timeout;
 pub use config::{
     init, init_from_env, init_local_from_env, TelemetryConfig, TelemetryError, TelemetryGuard,
 };
-pub use performance::{record_first_model_text, record_grep_performance, GrepPerformance};
+pub use performance::{
+    record_first_model_text, record_grep_performance, record_grep_resources, GrepPerformance,
+};
 pub use propagation::TraceContext;
 pub use timeout::with_timeout;
+
+/// Check whether the current observation can accept measurements.
+pub fn is_current_span_recording() -> bool {
+    Context::map_current(|context| context.span().is_recording())
+}
 
 /// GenAI conventions are Development. This source revision, not a floating
 /// schema URL, defines our deliberately small attribute mapping.

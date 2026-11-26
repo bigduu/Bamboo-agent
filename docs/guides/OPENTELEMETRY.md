@@ -77,6 +77,12 @@ The application attribute allowlist is:
 - `bamboo.tool.observation` (`dispatch`), `bamboo.outcome`, `error.type`
 - `bamboo.perf.grep.*` includes worker queue and scan durations (microseconds),
   scanned files/bytes, matches and files scanned with the literal matcher.
+  `scan_cpu_us` measures CPU time on the worker thread during the scan. It
+  excludes queue time, preflight and parallel searches and is omitted when the
+  platform thread clock is unavailable. `read_buffer_peak_capacity_bytes`
+  measures the maximum capacity of the reusable input buffer, including after
+  an attempted read that failed. Process RSS and other allocations are outside
+  this measurement.
 - `bamboo.perf.token_cache.process_hits`, `process_misses` and `process_entries`
   are process-wide snapshots taken before provider dispatch and available
   through OTel export. Use successive samples from the same process for

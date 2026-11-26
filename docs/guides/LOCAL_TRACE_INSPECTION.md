@@ -132,6 +132,13 @@ operation: Grep queue and scan time and counts, time to the first upstream text
 chunk, or Gemini frame counts. The process-wide token cache totals are available
 through OpenTelemetry export.
 
+For Grep, compare `grep_scan_cpu_us` (scan worker thread CPU time) with
+`grep_scan_us` (elapsed scan time) and `grep_queue_us` (time before the worker
+started). The CPU field is absent when its clock is unavailable.
+`grep_read_buffer_peak_capacity_bytes` reports the high-water capacity of
+Grep's reusable input buffer. It is zero if no capacity was allocated and
+excludes other allocations and process RSS.
+
 ## Read-only hook event
 
 Configured native hooks and reviewed portable plugins may subscribe to the
