@@ -71,7 +71,7 @@ pub fn entries() -> Vec<Entry> {
         relevant_recall => ("bool", true, "Deprecated compatibility input, ignored: retrieve durable memories through the memory tool.", ["memory.memory_relevant_recall"]),
         relevant_recall_rerank => ("bool", true, "Deprecated compatibility input, ignored: on-demand memory queries use lexical retrieval.", ["memory.memory_relevant_recall_rerank"]),
         project_first_dream => ("bool", true, "Deprecated compatibility input, ignored: Dream refresh uses separate background settings.", ["memory.memory_project_first_dream"]),
-        ledger_agenda_injection => ("bool", false, "Inject the applicable ledger agenda; an empty agenda adds no section.", ["memory.memory_ledger_agenda_injection"]),
+        ledger_agenda_injection => ("bool", true, "Opt in to including open ledger records in model requests.", ["memory.memory_ledger_agenda_injection"]),
         ledger_gardener_enabled => ("bool", false, "Enable background ledger maintenance; expiry and reconciliation are deterministic.", []),
         ledger_gardener_interval_secs => ("u64", 43200, "Seconds between ledger gardener runs.", []),
         ledger_distillation_enabled => ("bool", false, "Allow model-backed distillation of completed ledger records when a model is available.", []),

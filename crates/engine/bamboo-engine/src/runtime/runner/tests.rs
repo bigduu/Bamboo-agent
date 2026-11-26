@@ -1993,8 +1993,11 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
 
 #[tokio::test]
 async fn provider_gets_jiandu_text_only_after_explicit_memory_call() {
+    use crate::runtime::config::PromptMemoryFlags;
     use bamboo_agent_core::tools::ToolCall;
     use bamboo_agent_core::Role;
+    use bamboo_domain::ledger::{LedgerRecord, RecordKind};
+    use bamboo_memory::ledger_store::LedgerStore;
     use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
     use bamboo_metrics::types::{PromptMemoryRecallOutcome, TokenUsage};
 
@@ -2002,10 +2005,18 @@ async fn provider_gets_jiandu_text_only_after_explicit_memory_call() {
     const LEGACY_STATE: &str = "LEGACY_RENDERED_MEMORY_CANARY";
     const LEGACY_PROMPT: &str = "LEGACY_SYSTEM_PROMPT_MEMORY_CANARY";
     const DREAM: &str = "PROJECT_DREAM_CANARY";
+    const LEDGER: &str = "LEDGER_AGENDA_CANARY";
     let session_id = "metrics-on-demand-memory";
     let project_id = bamboo_domain::ProjectId::parse("on-demand-wire-project").unwrap();
     let (_metrics_directory, collector, metrics) = create_runner_metrics().await;
     let memory_directory = tempfile::tempdir().expect("memory tempdir");
+    LedgerStore::new(memory_directory.path())
+        .write_record(
+            LedgerRecord::new("rec_open", RecordKind::Todo, LEDGER),
+            None,
+        )
+        .await
+        .expect("save open agenda item");
     let store = MemoryStore::new(memory_directory.path());
     store
         .write_session_topic(session_id, "default", NOTE)
@@ -2099,10 +2110,14 @@ async fn provider_gets_jiandu_text_only_after_explicit_memory_call() {
     config.system_prompt = Some(format!(
         "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n{LEGACY_PROMPT}\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->"
     ));
-    config.prompt_memory_flags.project_prompt_injection = true;
-    config.prompt_memory_flags.relevant_recall = true;
-    config.prompt_memory_flags.relevant_recall_rerank = true;
-    config.prompt_memory_flags.project_first_dream = true;
+    config.app_data_dir = Some(memory_directory.path().to_path_buf());
+    config.prompt_memory_flags = PromptMemoryFlags {
+        project_prompt_injection: true,
+        relevant_recall: true,
+        relevant_recall_rerank: true,
+        project_first_dream: true,
+        ..Default::default()
+    };
 
     let (events, _receiver) = mpsc::channel(128);
     super::run_agent_loop_with_config(
@@ -2124,6 +2139,7 @@ async fn provider_gets_jiandu_text_only_after_explicit_memory_call() {
             assert!(!message.content.contains(LEGACY_STATE));
             assert!(!message.content.contains(LEGACY_PROMPT));
             assert!(!message.content.contains(DREAM));
+            assert!(!message.content.contains(LEDGER));
             assert!(!message.content.contains("Previously adopted Compass rule."));
             assert!(durable_ids.iter().all(|id| !message.content.contains(id)));
         }

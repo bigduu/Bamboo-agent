@@ -380,7 +380,7 @@ pub struct ImageFallbackConfig {
     pub vision_model: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PromptMemoryFlags {
     // Legacy prompt-memory switches remain accepted by earlier SDK callers.
     // Task requests retrieve Jiandu memory through tools.
@@ -389,18 +389,6 @@ pub struct PromptMemoryFlags {
     pub relevant_recall_rerank: bool,
     pub project_first_dream: bool,
     pub ledger_agenda: bool,
-}
-
-impl Default for PromptMemoryFlags {
-    fn default() -> Self {
-        Self {
-            project_prompt_injection: false,
-            relevant_recall: false,
-            relevant_recall_rerank: false,
-            project_first_dream: false,
-            ledger_agenda: true,
-        }
-    }
 }
 
 impl From<&MemoryConfig> for PromptMemoryFlags {
