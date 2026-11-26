@@ -207,6 +207,16 @@ named HEAD and validates the current and parent graphs by checksum. A final scra
 corrupts a referenced object and verifies that readback refuses the graph while preserving
 HEAD, the corrupted file and an intact stale stage. Process exit and OS-crash or remount persistence have separate qualification.
 
+Select `-f windows_ticket_probe_case=rust-graph-process-exit` to reopen the canonical Rust
+Ticket graph after its writer exits. The same exact test executable runs the coordinator,
+writer and independent verifier under the ordinary local user. Separate scopes cover a clean
+publication and three stops around native HEAD replacement and scope synchronization. The
+coordinator waits for the actual writer to exit before starting the verifier. The verifier
+reacquires the same physical lock and reads named HEAD and its canonical graph from disk.
+Before replacement, it reads the initial graph and the intact staged successor. After
+replacement, it reads the successor and parent graph and confirms the staging name is absent.
+The OS and NTFS mount stay live across writer exit and verifier reopen.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |
