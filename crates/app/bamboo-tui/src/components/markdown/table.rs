@@ -56,15 +56,16 @@ pub(super) fn render_if_table<'a>(
 }
 
 fn ends_table(line: &str) -> bool {
-    let line = line.trim();
-    line.is_empty()
-        || line.starts_with('>')
+    let trimmed = line.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with('>')
         || ["```", "~~~", "- ", "* ", "+ "]
             .iter()
-            .any(|&prefix| line.starts_with(prefix))
-        || heading(line).is_some()
-        || ordered_item(line).is_some()
-        || line.starts_with("---") && line.bytes().all(|byte| byte == b'-')
+            .any(|&prefix| trimmed.starts_with(prefix))
+        || heading(trimmed).is_some()
+        || ordered_item(trimmed).is_some()
+        || super::list_anchor(line).is_some_and(|anchor| anchor.task().is_some())
+        || trimmed.starts_with("---") && trimmed.bytes().all(|byte| byte == b'-')
 }
 
 fn split_row(line: &str) -> Vec<String> {
