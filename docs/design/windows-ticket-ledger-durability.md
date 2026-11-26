@@ -169,6 +169,12 @@ and reads the new HEAD and prior graph after replacement. The running OS and mou
 shared across each exit and reopen. OS-crash, remount, and power-loss persistence require separate
 evidence.
 
+Select `-f windows_ticket_probe_case=scope-identity` for the scope admission controls. The
+ordinary local user creates one ancestor junction between owned scratch directories and one
+hard-link alias of an existing scratch writer lock. The receipt checks actual tags, identities,
+link counts and bytes, and records where the normal writer open refuses each alias. The fixture
+removes the junction itself before recursive scratch cleanup.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

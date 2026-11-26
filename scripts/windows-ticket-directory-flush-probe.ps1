@@ -4,7 +4,7 @@ param(
   [Parameter(Mandatory)][string]$ExpectedSid,
   [Parameter(Mandatory)][string]$FixtureDirectory,
   [Parameter(Mandatory)][string]$ReceiptPath,
-  [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit')][string]$ProbeCase = 'directory-flush',
+  [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity')][string]$ProbeCase = 'directory-flush',
   [ValidateSet('primary', 'contender', 'alias-contender', 'name-contender', 'exit-holder')]
   [string]$WriterRole = 'primary',
   [ValidatePattern('^(?:[0-9a-f]{32})?$')][string]$WriterExpectedLockId = '',
@@ -407,12 +407,16 @@ if ($ProbeCase -ne 'directory-flush') {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
-if ($ProbeCase -in @('publication', 'publication-process-exit')) {
+if ($ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')) {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-publication-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
 if ($ProbeCase -eq 'publication-process-exit') {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-publication-process-exit-native.cs') -Raw
+  $interopSource += [Environment]::NewLine + $nativeSource
+}
+if ($ProbeCase -eq 'scope-identity') {
+  $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-scope-identity-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
 Add-Type -TypeDefinition $interopSource
@@ -477,6 +481,10 @@ if ($ProbeCase -eq 'writer-lock') {
     return
   }
   $probeLabel = 'publication process exit'
+} elseif ($ProbeCase -eq 'scope-identity') {
+  . (Join-Path $PSScriptRoot 'windows-ticket-scope-identity-cases.ps1')
+  $receipt = Invoke-TicketScopeIdentityCases -ExpectedSid $ExpectedSid -FixtureDirectory $fixture
+  $probeLabel = 'scope identity'
 } else {
   $receipt = [WindowsTicketDirectoryFlushProbe]::Run($ExpectedSid, $fixture)
   $probeLabel = 'directory flush'

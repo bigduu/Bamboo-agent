@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -135,6 +135,24 @@ function Assert-PublicationProcessExitProbe($Receipt, [int] $CoordinatorProcessI
     }
 }
 
+function Assert-ScopeIdentityProbe($Receipt) {
+    if ($Receipt.probe -cne 'scope-identity' -or $Receipt.scope_identity_qualified -isnot [bool] -or
+        $Receipt.junction_removed -isnot [bool]) {
+        throw 'The scope identity receipt did not identify the measured case or junction cleanup.'
+    }
+    $proof = $Receipt.scope_identity
+    $preservedTarget = $Receipt.PSObject.Properties['junction_target_preserved_after_cleanup']
+    $qualified = $Receipt.junction_removed -and $null -ne $preservedTarget -and $preservedTarget.Value -eq $true
+    foreach ($phase in @($proof.positive, $proof.junction, $proof.multilink)) {
+        if ($phase.qualified -isnot [bool]) { throw 'Invalid scope identity phase.' }
+        $qualified = $qualified -and $phase.qualified
+    }
+    $expectedVerdict = if ($qualified) { 'available' } else { 'unavailable' }
+    if ($Receipt.scope_identity_qualified -ne $qualified -or $Receipt.verdict -cne $expectedVerdict) {
+        throw 'The scope identity verdict does not match its native phases.'
+    }
+}
+
 $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
@@ -187,12 +205,16 @@ try {
     if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) {
         $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
     }
-    if ($ProbeCase -in @('publication', 'publication-process-exit')) {
+    if ($ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')) {
         $probeFiles['windows-ticket-publication-native.cs'] = 'windows-ticket-publication-native.cs'
     }
     if ($ProbeCase -eq 'publication-process-exit') {
         $probeFiles['windows-ticket-publication-process-exit-native.cs'] = 'windows-ticket-publication-process-exit-native.cs'
         $probeFiles['windows-ticket-publication-process-exit-cases.ps1'] = 'windows-ticket-publication-process-exit-cases.ps1'
+    }
+    if ($ProbeCase -eq 'scope-identity') {
+        $probeFiles['windows-ticket-scope-identity-native.cs'] = 'windows-ticket-scope-identity-native.cs'
+        $probeFiles['windows-ticket-scope-identity-cases.ps1'] = 'windows-ticket-scope-identity-cases.ps1'
     }
     $stagedHashes = @{}
     foreach ($filename in $probeFiles.Keys) {
@@ -253,8 +275,8 @@ try {
 
     $receiptJson = Get-Content -LiteralPath $receiptPath -Raw
     $receipt = $receiptJson | ConvertFrom-Json
-    $publicationProbe = $ProbeCase -in @('publication', 'publication-process-exit')
-    if ($publicationProbe) { Write-Output $receiptJson.TrimEnd() }
+    $printBeforeValidation = $ProbeCase -in @('publication', 'publication-process-exit', 'scope-identity')
+    if ($printBeforeValidation) { Write-Output $receiptJson.TrimEnd() }
     if ($receipt.schema -ne 1 -or $receipt.process_architecture -cne 'X64' -or
         [string]::IsNullOrWhiteSpace($receipt.windows_version) -or
         $receipt.token.sid -ne $account.SID.Value -or
@@ -273,6 +295,8 @@ try {
         Assert-PublicationProbe $receipt
     } elseif ($ProbeCase -eq 'publication-process-exit') {
         Assert-PublicationProcessExitProbe $receipt $process.Id
+    } elseif ($ProbeCase -eq 'scope-identity') {
+        Assert-ScopeIdentityProbe $receipt
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
@@ -296,7 +320,7 @@ try {
             throw 'A staged probe file changed during the trial.'
         }
     }
-    if (-not $publicationProbe) { Write-Output $receiptJson.TrimEnd() }
+    if (-not $printBeforeValidation) { Write-Output $receiptJson.TrimEnd() }
 } finally {
     try {
         if ($process) {
@@ -313,7 +337,13 @@ try {
         try {
             if ($account) { Remove-LocalUser -SID $account.SID }
         } finally {
-            if ($createdWorkspace) { Remove-Item -LiteralPath $workspace -Recurse -Force }
+            if ($createdWorkspace) {
+                if ($ProbeCase -eq 'scope-identity') {
+                    . (Join-Path $PSScriptRoot 'windows-ticket-scope-identity-cases.ps1')
+                    Remove-TicketScopeJunction (Join-Path $workspace 'scratch/fixture')
+                }
+                Remove-Item -LiteralPath $workspace -Recurse -Force
+            }
         }
     }
 }
