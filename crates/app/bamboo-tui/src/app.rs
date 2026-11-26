@@ -24,6 +24,7 @@ use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
 use crate::clipboard::{self, ClipboardContents, ClipboardImage};
+use crate::components::markdown::copyable_fences;
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::file_reference::{pasted_files, FileReference};
@@ -1953,6 +1954,48 @@ impl ScheduleRunsPane {
                 .saturating_add_signed(distance)
                 .min(runs.len().saturating_sub(1));
         }
+    }
+}
+
+pub(crate) struct FenceCopyEntry {
+    pub(crate) language: Option<String>,
+    pub(crate) source: String,
+}
+
+pub(crate) struct FenceCopyPicker {
+    context_id: u64,
+    block_id: String,
+    original_len: usize,
+    seen_source: String,
+    pub(crate) entries: Vec<FenceCopyEntry>,
+    pub(crate) selected: usize,
+    pub(crate) rows_per_page: Cell<usize>,
+}
+
+impl FenceCopyPicker {
+    pub(crate) fn new(
+        context_id: u64,
+        block_id: String,
+        original_len: usize,
+        seen_source: String,
+        entries: Vec<FenceCopyEntry>,
+    ) -> Self {
+        Self {
+            context_id,
+            block_id,
+            original_len,
+            seen_source,
+            entries,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+        }
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        self.selected = self
+            .selected
+            .saturating_add_signed(distance)
+            .min(self.entries.len().saturating_sub(1));
     }
 }
 
@@ -4853,6 +4896,7 @@ pub struct App {
     pub schedule_form: Option<ScheduleForm>,
     pub(crate) schedule_runs: Option<ScheduleRunsPane>,
     schedule_runs_request_id: u64,
+    pub(crate) fence_copy_picker: Option<FenceCopyPicker>,
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
@@ -5104,6 +5148,7 @@ impl App {
             schedule_form: None,
             schedule_runs: None,
             schedule_runs_request_id: 0,
+            fence_copy_picker: None,
             config_editor: None,
             permission_editor: None,
             permission_rule_confirm: None,
@@ -5321,6 +5366,7 @@ impl App {
 
     fn prepare_visible_session_switch(&mut self) {
         self.terminal_settings = None;
+        self.fence_copy_picker = None;
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -6150,6 +6196,13 @@ impl App {
                 self.chat
                     .run_status
                     .restore_summary(false, false, last_run_status.as_deref());
+                if self
+                    .fence_copy_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.context_id == self.chat.context_id)
+                {
+                    self.fence_copy_picker = None;
+                }
                 self.chat.messages = map_history(history.messages);
                 self.chat.history_loaded = true;
                 self.active_needs_history_refresh = false;
@@ -8763,6 +8816,21 @@ impl App {
             return;
         }
 
+        if self.fence_copy_picker.is_some() {
+            if !self.fence_copy_picker_matches_reply() {
+                self.fence_copy_picker = None;
+                return;
+            }
+            if let Some(picker) = self.fence_copy_picker.as_mut() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => picker.move_selection(-3),
+                    MouseEventKind::ScrollDown => picker.move_selection(3),
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if self.tab == Tab::Chat && self.workspace_controls_enabled() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -9159,20 +9227,94 @@ impl App {
         let Some(id) = self.chat.focused_block.clone() else {
             return;
         };
-        let child_id = self
+        let block = self
             .conversation_blocks()
             .into_iter()
-            .find(|block| block.id == id)
-            .and_then(|block| match block.kind {
-                ConversationBlockKind::SubAgent { child, .. } => {
-                    Some(child.child_session_id.clone())
+            .find(|block| block.id == id);
+        match block.map(|block| block.kind) {
+            Some(ConversationBlockKind::SubAgent { child, .. }) => {
+                let child_id = child.child_session_id.clone();
+                self.resume_session(child_id);
+            }
+            Some(ConversationBlockKind::AssistantMarkdown {
+                content,
+                streaming: false,
+            }) => {
+                let (seen_source, fences) = copyable_fences(content);
+                if !fences.is_empty() {
+                    let entries = fences
+                        .into_iter()
+                        .map(|fence| FenceCopyEntry {
+                            language: fence.language.map(str::to_owned),
+                            source: fence.source.to_owned(),
+                        })
+                        .collect();
+                    self.fence_copy_picker = Some(FenceCopyPicker::new(
+                        self.chat.context_id,
+                        id,
+                        content.len(),
+                        seen_source.to_owned(),
+                        entries,
+                    ));
                 }
-                _ => None,
-            });
-        if let Some(child_id) = child_id {
-            self.resume_session(child_id);
-        } else {
-            self.toggle_conversation_details();
+            }
+            _ => self.toggle_conversation_details(),
+        }
+    }
+
+    fn fence_copy_picker_matches_reply(&self) -> bool {
+        let Some(picker) = self.fence_copy_picker.as_ref() else {
+            return false;
+        };
+        if self.tab != Tab::Chat
+            || self.chat.context_id != picker.context_id
+            || self.chat.focused_block.as_ref() != Some(&picker.block_id)
+        {
+            return false;
+        }
+        self.conversation_blocks().into_iter().any(|block| {
+            block.id == picker.block_id
+                && matches!(
+                    block.kind,
+                    ConversationBlockKind::AssistantMarkdown { content, streaming: false }
+                        if content.len() == picker.original_len
+                            && content.starts_with(&picker.seen_source)
+                )
+        })
+    }
+
+    fn handle_fence_copy_picker_key(
+        &mut self,
+        key: KeyEvent,
+        copy: impl FnOnce(&str) -> std::io::Result<()>,
+    ) {
+        let action = self.resolve_context_action(ActionContext::FenceCopyPicker, key);
+        if !self.fence_copy_picker_matches_reply() {
+            self.fence_copy_picker = None;
+            return;
+        }
+        let Some(picker) = self.fence_copy_picker.as_mut() else {
+            return;
+        };
+        let page = picker.rows_per_page.get() as isize;
+        match action {
+            Some(ActionId::Cancel) => self.fence_copy_picker = None,
+            Some(ActionId::NavigateUp) => picker.move_selection(-1),
+            Some(ActionId::NavigateDown) => picker.move_selection(1),
+            Some(ActionId::PageUp) => picker.move_selection(-page),
+            Some(ActionId::PageDown) => picker.move_selection(page),
+            Some(ActionId::CopyValue) => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    match copy(&entry.source) {
+                        Ok(()) => self.status_message = "Copied code fence".to_string(),
+                        Err(error) => self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to copy code fence: {error}"),
+                        ),
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9229,8 +9371,7 @@ impl App {
     }
 
     /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
-    /// Ctrl+L are gated on this so they can't stack a second overlay on top
-    /// of one of these eight — see the precedence comment on `handle_key`.
+    /// Ctrl+L are gated on this so they can't stack a second overlay on top.
     fn any_modal_open(&self) -> bool {
         self.serve_offer.is_some()
             || self.pending_question.is_some()
@@ -9243,6 +9384,7 @@ impl App {
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.schedule_runs.is_some()
+            || self.fence_copy_picker.is_some()
             || self.config_editor.is_some()
             || self.terminal_settings.is_some()
     }
@@ -9315,6 +9457,8 @@ impl App {
             ActionContext::ScheduleForm
         } else if self.schedule_runs.is_some() {
             ActionContext::ScheduleRuns
+        } else if self.fence_copy_picker.is_some() {
+            ActionContext::FenceCopyPicker
         } else if self.config_editor.is_some() {
             ActionContext::ConfigEditor
         } else if self.permission_editor.is_some() {
@@ -9678,6 +9822,9 @@ impl App {
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
+            ActionContext::FenceCopyPicker => {
+                self.handle_fence_copy_picker_key(key, copy_via_osc52)
+            }
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
             ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
             ActionContext::TerminalSettings => self.handle_terminal_settings_key(key),
@@ -22123,9 +22270,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    4_038_905_119_346_422_299
+                    6_009_758_378_098_620_769
                 } else {
-                    10_180_952_998_958_642_306
+                    12_650_247_049_472_380_141
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -26064,6 +26211,146 @@ mod question_tests {
             image_count: 0,
             terminal_status: None,
         }
+    }
+
+    #[tokio::test]
+    async fn focused_reply_opens_fence_picker_and_copies_the_selected_exact_body() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let code = "first line\r\n";
+        let diagram = "\tA[中文 🧭] --> B\r\n".repeat(70);
+        let reply = format!(
+            "Instructions\r\n```rust options\r\n{code}```\r\n~~~mermaid\r\n{diagram}~~~\r\n```\r\nunfinished",
+        );
+        app.chat.messages.push(ChatMessage {
+            id: "fenced-reply".into(),
+            ..asst_msg(&reply)
+        });
+        let focused = "fenced-reply:assistant".to_string();
+        app.chat.focused_block = Some(focused.clone());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(
+            app.active_action_contexts()[0],
+            ActionContext::FenceCopyPicker
+        );
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.entries.len(), 2);
+        assert_eq!(picker.entries[0].language.as_deref(), Some("rust"));
+        assert_eq!(picker.entries[0].source, code);
+        assert_eq!(picker.entries[1].language.as_deref(), Some("mermaid"));
+        assert_eq!(picker.selected, 0);
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.fence_copy_picker.as_ref().unwrap().selected, 1);
+
+        let mut copied = Vec::new();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |value| {
+            copied.extend_from_slice(value.as_bytes());
+            Ok(())
+        });
+        assert_eq!(copied, diagram.as_bytes());
+        assert_eq!(app.status_message, "Copied code fence");
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
+        assert_eq!(app.chat.focused_block.as_ref(), Some(&focused));
+        assert_eq!(app.conversation_blocks()[0].copy_text(), reply);
+    }
+
+    #[tokio::test]
+    async fn fence_picker_rejects_replaced_source_and_closes_on_session_switch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages.push(ChatMessage {
+            id: "reply".into(),
+            ..asst_msg("```rust\nfirst\n```")
+        });
+        app.chat.focused_block = Some("reply:assistant".into());
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_some());
+
+        app.chat.messages[0].content = "```rust\nother\n```".into();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |_| {
+            panic!("a replaced reply must never reach the clipboard")
+        });
+        assert!(app.fence_copy_picker.is_none());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_some());
+        app.new_session();
+        assert!(app.fence_copy_picker.is_none());
+        assert!(app.chat.focused_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_history_for_another_context_preserves_the_fence_picker() {
+        let watch = || LoopWatch {
+            id: "loop".into(),
+            token: "watch-token".into(),
+            pending: true,
+            displayed_run: None,
+            attached_run: None,
+            draining: false,
+            question_recovery: LoopQuestionRecovery::None,
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("visible".into());
+        app.chat.loop_watch = Some(watch());
+        app.chat.messages.push(ChatMessage {
+            id: "reply".into(),
+            ..asst_msg("```rust\nlet value = 1;\n```")
+        });
+        app.chat.focused_block = Some("reply:assistant".into());
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_some());
+
+        let background_context = app.allocate_context_id();
+        let mut background = SessionUiContext::blank(background_context);
+        background.chat.session_id = Some("background".into());
+        background.chat.loop_watch = Some(watch());
+        app.cache_context(background);
+
+        for (context_id, session_id, keeps_picker) in [
+            (background_context, "background", true),
+            (app.chat.context_id, "visible", false),
+        ] {
+            app.handle_event(AppEvent::SessionLoopObserved {
+                context_id,
+                session_id: session_id.into(),
+                watch_token: "watch-token".into(),
+                stream_epoch: 0,
+                result: Ok(LoopObservation::History {
+                    run_id: "latest".into(),
+                    history: HistoryResponse::default(),
+                    last_run_status: Some("completed".into()),
+                    draining: false,
+                }),
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.chat.session_id.as_deref(), Some("visible"));
+            assert_eq!(app.fence_copy_picker.is_some(), keeps_picker);
+        }
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_reply_does_not_open_the_fence_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("active".into());
+        app.chat.current_response = "```rust\nlet value = 1;\n```".into();
+        app.chat.focused_block = Some("active:assistant".into());
+        assert!(app.conversation_blocks().iter().any(|block| {
+            block.id == "active:assistant"
+                && matches!(
+                    block.kind,
+                    ConversationBlockKind::AssistantMarkdown {
+                        streaming: true,
+                        ..
+                    }
+                )
+        }));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
     }
 
     #[test]

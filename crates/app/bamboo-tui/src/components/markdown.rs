@@ -7,12 +7,36 @@ use crate::theme::colors;
 mod fence;
 mod table;
 
-use fence::{FenceKind, FencedBlock};
+use fence::FencedBlock;
 
 const MAX_PREVIEW_BYTES: usize = 128 * 1024;
 const MAX_PREVIEW_SOURCE_LINES: usize = 2_048;
 const MAX_FENCE_PREVIEW_ROWS: usize = 64;
 const MAX_FENCE_LABEL_CELLS: usize = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CopyableFence<'a> {
+    pub language: Option<&'a str>,
+    pub source: &'a str,
+}
+
+/// Return the bounded preview source and the exact bodies of its closed fences.
+pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
+    let source = preview_source(text);
+    let mut input = fence::source_lines(source);
+    let mut fences = Vec::new();
+    while let Some(line) = input.next() {
+        if let Some(block) =
+            fence::take_fence(source, line, &mut input).filter(|block| block.closed)
+        {
+            fences.push(CopyableFence {
+                language: block.kind.language(),
+                source: block.source,
+            });
+        }
+    }
+    (source, fences)
+}
 
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
@@ -174,10 +198,7 @@ fn render_code_block(lines: &mut Vec<Line>, block: FencedBlock<'_>, width: usize
     let inner_width = if framed { width - 4 } else { width };
     let border_style = Style::default().fg(colors::code_border());
     if framed {
-        let language = match block.kind {
-            FenceKind::Code { language } => language.unwrap_or_default(),
-            FenceKind::Mermaid { language } => language,
-        };
+        let language = block.kind.language().unwrap_or_default();
         let label = clip_cells(language, inner_width.min(MAX_FENCE_LABEL_CELLS));
         let label = if label.is_empty() {
             label
@@ -527,6 +548,96 @@ mod tests {
         assert!(rows[1].contains("retained"));
         assert!(rows[2].starts_with('└'));
         assert_eq!(rows[3], "… Markdown preview clipped");
+    }
+
+    #[test]
+    fn copyable_fences_keep_original_bodies_in_source_order() {
+        let source = concat!(
+            "Leading prose.\r\n",
+            "````rust options\r\n",
+            "\tfirst 界👩‍💻\r\n",
+            "```\r\n",
+            "~~~~\r\n",
+            "```` trailing\r\n",
+            "\r\n",
+            "````` \t\r\n",
+            "Between fences.\n",
+            "~~~ Mermaid\n",
+            "\tA --> B\n",
+            "~~~\n",
+            "```\n",
+            "still open",
+        );
+        let (prefix, fences) = copyable_fences(source);
+        assert_eq!(prefix, source);
+        assert_eq!(
+            fences,
+            [
+                CopyableFence {
+                    language: Some("rust"),
+                    source: "\tfirst 界👩‍💻\r\n```\r\n~~~~\r\n```` trailing\r\n\r\n",
+                },
+                CopyableFence {
+                    language: Some("Mermaid"),
+                    source: "\tA --> B\n",
+                },
+            ]
+        );
+
+        let (_, at_eof) = copyable_fences("```\nunlabelled\n```");
+        assert_eq!(
+            at_eof,
+            [CopyableFence {
+                language: None,
+                source: "unlabelled\n",
+            }]
+        );
+    }
+
+    #[test]
+    fn copyable_fences_keep_rows_beyond_the_rendered_preview() {
+        let body = "\tfirst\r\n".repeat(MAX_FENCE_PREVIEW_ROWS) + "\tlast 👩‍💻\r\n";
+        let source = format!("~~~sh\r\n{body}~~~\r\n");
+        let (_, fences) = copyable_fences(&source);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].source, body);
+        let rows = render(&source);
+        assert!(rows.iter().any(|row| row.contains("… more code")));
+        assert!(rows.iter().all(|row| !row.contains("last")));
+    }
+
+    #[test]
+    fn copyable_fences_do_not_treat_a_truncated_physical_line_as_a_closer() {
+        let early = "```rust\r\n\tfirst\r\n```\r\n~~~sh\n";
+        let fill = "x".repeat(MAX_PREVIEW_BYTES - early.len() - 4);
+        let source = format!("{early}{fill}\n~~~ still code\n~~~\n");
+        assert_eq!(&source[MAX_PREVIEW_BYTES - 3..MAX_PREVIEW_BYTES], "~~~");
+        let (prefix, fences) = copyable_fences(&source);
+        assert_eq!(prefix.len(), MAX_PREVIEW_BYTES - 3);
+        assert_eq!(prefix, preview_source(&source));
+        assert_eq!(
+            fences,
+            [CopyableFence {
+                language: Some("rust"),
+                source: "\tfirst\r\n",
+            }]
+        );
+    }
+
+    #[test]
+    fn copyable_fences_require_closure_within_the_source_line_budget() {
+        let early = "```rust\nfirst\n```\n~~~sh\n";
+        let source = format!("{early}{}~~~\n", "more\n".repeat(MAX_PREVIEW_SOURCE_LINES));
+        let (prefix, fences) = copyable_fences(&source);
+        assert_eq!(prefix.lines().count(), MAX_PREVIEW_SOURCE_LINES);
+        assert_eq!(prefix, preview_source(&source));
+        assert_eq!(
+            fences,
+            [CopyableFence {
+                language: Some("rust"),
+                source: "first\n",
+            }]
+        );
     }
 
     #[test]
