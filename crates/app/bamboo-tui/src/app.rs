@@ -1962,6 +1962,62 @@ pub(crate) struct FenceCopyEntry {
     pub(crate) source: String,
 }
 
+pub(crate) struct FenceSourcePreview {
+    pub(crate) line_count: usize,
+    widest_line: usize,
+    first_line: Cell<usize>,
+    first_column: Cell<usize>,
+    rows_per_page: Cell<usize>,
+    columns_per_page: Cell<usize>,
+}
+
+impl FenceSourcePreview {
+    pub(crate) fn new(source: &str) -> Self {
+        let mut line_count = 0;
+        let mut widest_line = 0;
+        for line in source.lines() {
+            line_count += 1;
+            let line = crate::text::code_source_line(line);
+            widest_line = widest_line.max(crate::text::grapheme_cell_width(&line));
+        }
+        Self {
+            line_count,
+            widest_line,
+            first_line: Cell::new(0),
+            first_column: Cell::new(0),
+            rows_per_page: Cell::new(1),
+            columns_per_page: Cell::new(1),
+        }
+    }
+
+    pub(crate) fn set_viewport(&self, rows: usize, cols: usize) {
+        self.rows_per_page.set(rows.max(1));
+        self.columns_per_page.set(cols.max(1));
+        self.move_by(0, 0);
+    }
+
+    pub(crate) fn first_line(&self) -> usize {
+        self.first_line.get()
+    }
+
+    pub(crate) fn first_column(&self) -> usize {
+        self.first_column.get()
+    }
+
+    pub(crate) fn move_by(&self, lines: isize, columns: isize) {
+        self.first_line.set(
+            self.first_line()
+                .saturating_add_signed(lines)
+                .min(self.line_count.saturating_sub(self.rows_per_page.get())),
+        );
+        self.first_column.set(
+            self.first_column()
+                .saturating_add_signed(columns)
+                .min(self.widest_line.saturating_sub(self.columns_per_page.get())),
+        );
+    }
+}
+
 pub(crate) struct FenceCopyPicker {
     context_id: u64,
     block_id: String,
@@ -1970,6 +2026,7 @@ pub(crate) struct FenceCopyPicker {
     pub(crate) entries: Vec<FenceCopyEntry>,
     pub(crate) selected: usize,
     pub(crate) rows_per_page: Cell<usize>,
+    pub(crate) preview: Option<FenceSourcePreview>,
 }
 
 impl FenceCopyPicker {
@@ -1988,14 +2045,19 @@ impl FenceCopyPicker {
             entries,
             selected: 0,
             rows_per_page: Cell::new(1),
+            preview: None,
         }
     }
 
-    fn move_selection(&mut self, distance: isize) {
-        self.selected = self
-            .selected
-            .saturating_add_signed(distance)
-            .min(self.entries.len().saturating_sub(1));
+    fn move_vertical(&mut self, distance: isize) {
+        if let Some(preview) = &self.preview {
+            preview.move_by(distance, 0);
+        } else {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(self.entries.len().saturating_sub(1));
+        }
     }
 }
 
@@ -8823,8 +8885,8 @@ impl App {
             }
             if let Some(picker) = self.fence_copy_picker.as_mut() {
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => picker.move_selection(-3),
-                    MouseEventKind::ScrollDown => picker.move_selection(3),
+                    MouseEventKind::ScrollUp => picker.move_vertical(-3),
+                    MouseEventKind::ScrollDown => picker.move_vertical(3),
                     _ => {}
                 }
             }
@@ -9296,13 +9358,35 @@ impl App {
         let Some(picker) = self.fence_copy_picker.as_mut() else {
             return;
         };
-        let page = picker.rows_per_page.get() as isize;
+        let page = picker.preview.as_ref().map_or_else(
+            || picker.rows_per_page.get(),
+            |preview| preview.rows_per_page.get(),
+        ) as isize;
         match action {
-            Some(ActionId::Cancel) => self.fence_copy_picker = None,
-            Some(ActionId::NavigateUp) => picker.move_selection(-1),
-            Some(ActionId::NavigateDown) => picker.move_selection(1),
-            Some(ActionId::PageUp) => picker.move_selection(-page),
-            Some(ActionId::PageDown) => picker.move_selection(page),
+            Some(ActionId::Cancel) => {
+                if picker.preview.take().is_none() {
+                    self.fence_copy_picker = None;
+                }
+            }
+            Some(ActionId::Activate) if picker.preview.is_none() => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    picker.preview = Some(FenceSourcePreview::new(&entry.source));
+                }
+            }
+            Some(ActionId::NavigateUp) => picker.move_vertical(-1),
+            Some(ActionId::NavigateDown) => picker.move_vertical(1),
+            Some(ActionId::PageUp) => picker.move_vertical(-page),
+            Some(ActionId::PageDown) => picker.move_vertical(page),
+            Some(ActionId::PanLeft | ActionId::PanRight) => {
+                if let Some(preview) = &picker.preview {
+                    let columns = if action == Some(ActionId::PanLeft) {
+                        -4
+                    } else {
+                        4
+                    };
+                    preview.move_by(0, columns);
+                }
+            }
             Some(ActionId::CopyValue) => {
                 if let Some(entry) = picker.entries.get(picker.selected) {
                     match copy(&entry.source) {
@@ -22270,9 +22354,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    6_009_758_378_098_620_769
+                    14_281_149_071_101_102_805
                 } else {
-                    12_650_247_049_472_380_141
+                    1_798_553_485_212_242_660
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -26257,6 +26341,98 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn fence_source_view_routes_scrolling_and_returns_to_the_same_selection() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut source = format!("\t界e\u{301}👩‍💻{} far end\r\n", "x".repeat(96));
+        for line in 2..=90 {
+            source.push_str(&format!("source line {line}\r\n"));
+        }
+        let reply = format!("```rust\r\n{source}```\r\n~~~text\nsecond fence\n~~~");
+        app.chat.messages.push(ChatMessage {
+            id: "source-reply".into(),
+            ..asst_msg(&reply)
+        });
+        app.chat.focused_block = Some("source-reply:assistant".into());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let preview = app
+            .fence_copy_picker
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap();
+        assert_eq!(preview.line_count, 90);
+        preview.set_viewport(5, 24);
+
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        for key_code in [KeyCode::Right, KeyCode::Right, KeyCode::Left] {
+            app.handle_key(key(key_code)).await.unwrap();
+        }
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0);
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!((preview.first_line(), preview.first_column()), (9, 4));
+
+        let mut copied = String::new();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |value| {
+            copied.push_str(value);
+            Ok(())
+        });
+        assert_eq!(copied, source);
+        let preview = app
+            .fence_copy_picker
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap();
+        preview.set_viewport(90, 200);
+        preview.set_viewport(5, 24);
+        assert_eq!((preview.first_line(), preview.first_column()), (0, 0));
+
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0);
+        assert!(picker.preview.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 1);
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!(preview.line_count, 1);
+        assert_eq!((preview.first_line(), preview.first_column()), (0, 0));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert_eq!(app.fence_copy_picker.as_ref().unwrap().selected, 1);
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
+        assert_eq!(
+            app.chat.focused_block.as_deref(),
+            Some("source-reply:assistant")
+        );
+    }
+
+    #[test]
+    fn fence_source_pan_reaches_the_suffix_of_contextually_measured_text() {
+        let source = format!("{}SUFFIX", "لا".repeat(56));
+        let preview = FenceSourcePreview::new(&source);
+        preview.set_viewport(10, 56);
+        preview.move_by(0, isize::MAX);
+
+        assert_eq!(preview.first_column(), 62);
+        let final_window = crate::text::slice_cells(&source, preview.first_column(), 56);
+        assert!(final_window.ends_with("SUFFIX"));
+    }
+
+    #[tokio::test]
     async fn fence_picker_rejects_replaced_source_and_closes_on_session_switch() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.messages.push(ChatMessage {
@@ -26265,7 +26441,11 @@ mod question_tests {
         });
         app.chat.focused_block = Some("reply:assistant".into());
         app.handle_key(key(KeyCode::Enter)).await.unwrap();
-        assert!(app.fence_copy_picker.is_some());
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app
+            .fence_copy_picker
+            .as_ref()
+            .is_some_and(|picker| picker.preview.is_some()));
 
         app.chat.messages[0].content = "```rust\nother\n```".into();
         app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |_| {

@@ -172,6 +172,8 @@ pub(crate) enum ActionId {
     NavigateDown,
     PageUp,
     PageDown,
+    PanLeft,
+    PanRight,
     JumpFirst,
     JumpLast,
     Activate,
@@ -769,6 +771,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         ]
     ),
     spec!(
+        PanLeft,
+        "Pan left",
+        "View earlier columns of the code fence source",
+        false,
+        [FenceCopyPicker],
+        [(FenceCopyPicker, "Left")]
+    ),
+    spec!(
+        PanRight,
+        "Pan right",
+        "View later columns of the code fence source",
+        false,
+        [FenceCopyPicker],
+        [(FenceCopyPicker, "Right")]
+    ),
+    spec!(
         Activate,
         "Activate",
         "Use, submit, open, or toggle the selected item",
@@ -783,6 +801,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Mcp,
             Schedules,
             ScheduleForm,
+            FenceCopyPicker,
             Skills,
             Permissions,
             SubagentTree,
@@ -802,6 +821,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Mcp, "Enter"),
             (Schedules, "Enter"),
             (ScheduleForm, "Enter"),
+            (FenceCopyPicker, "Enter"),
             (Skills, "Enter"),
             (Permissions, "Enter"),
             (SubagentTree, "Enter"),
@@ -1516,6 +1536,8 @@ impl ActionId {
                 | Self::NavigateDown
                 | Self::PageUp
                 | Self::PageDown
+                | Self::PanLeft
+                | Self::PanRight
                 | Self::ScrollTranscriptUp
                 | Self::ScrollTranscriptDown
                 | Self::ScrollBlockUp
