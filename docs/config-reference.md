@@ -575,7 +575,8 @@ Dream and gardener toggles default **on**.
 | `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. Input and its margin must also fit any independent input ceiling. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
-| `ledger_agenda_injection` / `ledger_gardener_enabled` / `ledger_distillation_enabled` | `true` | Personal-assistant ledger subsystem toggles. |
+| `ledger_agenda_injection` | `false` | Opt in to including open ledger records in model requests. The `ledger` tool can query the agenda on demand. |
+| `ledger_gardener_enabled` / `ledger_distillation_enabled` | `true` | Background ledger maintenance and distillation. |
 | `ledger_gardener_interval_secs` | `21600` (6h) | Ledger gardener cadence. |
 | `gardener_enabled` | `true` | Background job that splits "multi-topic blob" memories; **calls no LLM when its deterministic pre-screen finds no candidates.** |
 | `gardener_interval_secs` | `86400` (daily) | Gardener cadence. |

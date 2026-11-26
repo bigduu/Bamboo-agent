@@ -475,13 +475,8 @@ pub struct MemoryConfig {
     /// Deprecated compatibility input for automatic Dream prompt injection. Ignored.
     #[serde(default, alias = "memory_project_first_dream")]
     pub project_first_dream: bool,
-    /// Whether the ledger agenda (overdue/upcoming prospective records — todos,
-    /// events, reminders) is injected into the main prompt. Free when the
-    /// ledger is empty: the section is simply omitted.
-    #[serde(
-        default = "default_true_memory_ledger_agenda",
-        alias = "memory_ledger_agenda_injection"
-    )]
+    /// Opt in to including open ledger records in the main prompt.
+    #[serde(default, alias = "memory_ledger_agenda_injection")]
     pub ledger_agenda_injection: bool,
     /// Whether the background ledger gardener runs (expires past events/reminders,
     /// reconciles record↔schedule drift, distills completed records into durable
@@ -582,7 +577,7 @@ impl Default for MemoryConfig {
             relevant_recall: false,
             relevant_recall_rerank: false,
             project_first_dream: false,
-            ledger_agenda_injection: default_true_memory_ledger_agenda(),
+            ledger_agenda_injection: false,
             ledger_gardener_enabled: default_true_ledger_gardener_enabled(),
             ledger_gardener_interval_secs: default_ledger_gardener_interval_secs(),
             ledger_distillation_enabled: default_true_ledger_distillation_enabled(),
@@ -628,10 +623,6 @@ fn default_true_gardener_enabled() -> bool {
 }
 
 fn default_true_dedup_gardener_enabled() -> bool {
-    true
-}
-
-fn default_true_memory_ledger_agenda() -> bool {
     true
 }
 
@@ -9203,7 +9194,19 @@ mod tests {
             assert!(!memory.relevant_recall_rerank);
             assert!(!memory.project_first_dream);
             assert!(memory.auto_dream_enabled);
-            assert!(memory.ledger_agenda_injection);
+        }
+    }
+
+    #[test]
+    fn ledger_agenda_injection_requires_opt_in() {
+        let omitted: MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!omitted.ledger_agenda_injection);
+        assert!(!MemoryConfig::default().ledger_agenda_injection);
+
+        for key in ["ledger_agenda_injection", "memory_ledger_agenda_injection"] {
+            let enabled: MemoryConfig =
+                serde_json::from_value(serde_json::json!({ (key): true })).unwrap();
+            assert!(enabled.ledger_agenda_injection);
         }
     }
 
