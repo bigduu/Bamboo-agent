@@ -33,9 +33,11 @@ pub(super) fn render_if_table<'a>(
     }
     input.next();
 
-    let mut rows = vec![styled_row(header, columns)];
+    let mut rows = vec![styled_row(header, columns, false)];
     while let Some(line) = input.next_if(|line| !ends_table(line.text)) {
-        rows.push(styled_row(split_row(line.text), columns));
+        // A marker-only row still inside the table is an unfinished rule.
+        let literal = super::rule_markers(line.text).is_some();
+        rows.push(styled_row(split_row(line.text), columns, literal));
     }
 
     let Some(widths) = column_widths(&rows, columns, width) else {
@@ -65,6 +67,7 @@ fn ends_table(line: &str) -> bool {
         || heading(trimmed).is_some()
         || ordered_item(trimmed).is_some()
         || super::list_anchor(line).is_some_and(|anchor| anchor.task().is_some())
+        || super::rule_markers(line).is_some_and(|markers| markers.forms_break())
         || trimmed.starts_with("---") && trimmed.bytes().all(|byte| byte == b'-')
 }
 
@@ -109,11 +112,18 @@ fn column_alignment(cell: &str) -> Option<Alignment> {
     })
 }
 
-fn styled_row(cells: Vec<String>, columns: usize) -> Row {
+fn styled_row(cells: Vec<String>, columns: usize, literal: bool) -> Row {
     let mut row = cells
         .into_iter()
         .take(columns)
-        .map(|cell| Line::from(parse_inline(&cell.replace('\t', "  "))))
+        .map(|cell| {
+            let text = cell.replace('\t', "  ");
+            if literal {
+                Line::raw(text)
+            } else {
+                Line::from(parse_inline(&text))
+            }
+        })
         .collect::<Row>();
     row.resize_with(columns, Line::default);
     row

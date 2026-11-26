@@ -41,7 +41,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// [links](url), `#`..`######` headings, nested bullet and ordered lists,
-/// task-list checkboxes, `>` blockquotes, and pipe tables.
+/// task-list checkboxes, thematic breaks, `>` blockquotes, and pipe tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
     if width == 0 {
@@ -51,7 +51,9 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let mut input = fence::source_lines(source).peekable();
+    let mut after_prose = false;
     while let Some(line) = input.next() {
+        let follows_prose = std::mem::take(&mut after_prose);
         if let Some(block) = fence::take_fence(source, line, &mut input) {
             render_code_block(&mut lines, block, width);
             continue;
@@ -60,6 +62,20 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
 
         if let Some(rows) = table::render_if_table(raw_line, &mut input, width) {
             lines.extend(rows);
+            continue;
+        }
+
+        if let Some(markers) = rule_markers(raw_line) {
+            let possible_setext = follows_prose && markers.contiguous_dashes;
+            if markers.forms_break() && !possible_setext {
+                lines.push(Line::styled(
+                    "─".repeat(width),
+                    Style::default().fg(colors::inactive()),
+                ));
+            } else {
+                lines.push(Line::raw(raw_line.to_owned()));
+                after_prose = !possible_setext;
+            }
             continue;
         }
 
@@ -117,6 +133,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             }
             spans.extend(parse_inline(body));
             lines.push(Line::from(spans));
+            after_prose = !body.is_empty();
         }
     }
 
@@ -149,6 +166,42 @@ fn preview_source(text: &str) -> &str {
         .nth(MAX_PREVIEW_SOURCE_LINES - 1)
         .map_or(byte_end, |(position, _)| position + 1);
     &text[..line_end]
+}
+
+struct RuleMarkers {
+    count: usize,
+    contiguous_dashes: bool,
+}
+
+impl RuleMarkers {
+    fn forms_break(&self) -> bool {
+        self.count >= 3
+    }
+}
+
+/// Classify top-level marker-only lines, including unfinished streaming input.
+fn rule_markers(line: &str) -> Option<RuleMarkers> {
+    let body = line.trim_start_matches(' ');
+    if line.len() - body.len() > 3 {
+        return None;
+    }
+    let markers = body.trim_end_matches([' ', '\t']);
+    let marker = markers.bytes().next()?;
+    if !matches!(marker, b'-' | b'*' | b'_') {
+        return None;
+    }
+    let mut count = 0;
+    for byte in markers.bytes() {
+        if byte == marker {
+            count += 1;
+        } else if !matches!(byte, b' ' | b'\t') {
+            return None;
+        }
+    }
+    Some(RuleMarkers {
+        count,
+        contiguous_dashes: marker == b'-' && count == markers.len(),
+    })
 }
 
 /// If `body` is an ATX heading, return `(level, content)`.
@@ -466,6 +519,150 @@ mod tests {
         assert_eq!(out[1], "  2. second");
         assert!(out[2].contains("• nested"));
         assert!(out[2].starts_with("  "), "nested indent preserved");
+    }
+
+    #[test]
+    fn thematic_breaks_use_one_full_terminal_width_row() {
+        for width in [1, 60, 80, 120] {
+            for raw in ["---", "***", "___", " - - -", "  *\t* *\t", "   _ _ _ _  "] {
+                let rows = render_markdown(raw, width);
+                assert_eq!(rows.len(), 1, "{raw:?}");
+                assert_eq!(text_of(&rows[0]), "─".repeat(usize::from(width)), "{raw:?}");
+                assert_eq!(rows[0].width(), usize::from(width));
+            }
+        }
+        assert!(render_markdown("---", 0).is_empty());
+    }
+
+    #[test]
+    fn thematic_breaks_only_accept_homogeneous_marker_lines() {
+        for raw in [
+            "- * -",
+            "--_",
+            "---suffix",
+            "***bold***",
+            "word ---",
+            "+++",
+            "===",
+            "    ---",
+            "\t***",
+            "---\u{a0}",
+        ] {
+            assert!(rule_markers(raw).is_none(), "{raw:?}");
+            assert!(render(raw).iter().all(|row| !row.contains('─')), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn unfinished_thematic_breaks_remain_literal_during_streaming() {
+        for (partial, complete) in [
+            ("-", "---"),
+            ("--", "---"),
+            ("**", "***"),
+            ("__", "___"),
+            ("- -", "- - -"),
+            ("* *", "* * *"),
+            ("_ _", "_ _ _"),
+        ] {
+            assert_eq!(render(partial), [partial]);
+            assert_eq!(render(complete), ["─".repeat(80)]);
+        }
+        assert_eq!(render("---suffix"), ["---suffix"]);
+    }
+
+    #[test]
+    fn thematic_breaks_precede_list_and_inline_rendering() {
+        let rows = render("- - -\n* * *\n- regular item\n- [x] done\n**strong**\n_italic_");
+        assert_eq!(&rows[..2], ["─".repeat(80), "─".repeat(80)]);
+        assert_eq!(
+            &rows[2..],
+            ["  • regular item", "  ☑ done", "strong", "italic"]
+        );
+    }
+
+    #[test]
+    fn contiguous_dashes_after_prose_preserve_possible_setext_underlines() {
+        let rows = render("Title 界\n   ---\t\n---\nProse\n- - -\n# Heading\n---");
+        let rule = "─".repeat(80);
+        assert_eq!(
+            rows,
+            [
+                "Title 界",
+                "   ---\t",
+                &rule,
+                "Prose",
+                &rule,
+                "Heading",
+                &rule
+            ]
+        );
+        assert_eq!(render("Title\n-\n---"), ["Title", "-", &rule]);
+        assert_eq!(render("Prose\n\n---"), ["Prose", "", &rule]);
+    }
+
+    #[test]
+    fn thematic_breaks_leave_fenced_marker_lines_literal() {
+        let rows = render("~~~text\n---\n***\n_ _ _\n~~~\n---");
+        assert!(rows[1].contains("---"));
+        assert!(rows[2].contains("***"));
+        assert!(rows[3].contains("_ _ _"));
+        assert_eq!(rows[5], "─".repeat(80));
+    }
+
+    #[test]
+    fn thematic_breaks_end_pipe_tables_without_consuming_the_delimiter() {
+        for rule in ["---", "***", "___", "*\t* *", "- - -"] {
+            let rows = render(&format!(
+                "| Key | Value |\n| :--- | ---: |\n| A | 12 |\n{rule}\nAfter"
+            ));
+            assert_eq!(rows.len(), 5, "{rule:?}");
+            assert_eq!(
+                rows[0].split_whitespace().collect::<Vec<_>>(),
+                ["Key", "Value"]
+            );
+            assert_eq!(rows[2].split_whitespace().collect::<Vec<_>>(), ["A", "12"]);
+            assert_eq!(rows[3], "─".repeat(80));
+            assert_eq!(rows[4], "After");
+        }
+        let rows = render("| Key |\n| --- |\n| A |\n    ---\nAfter");
+        assert_eq!(&rows[3..], ["    ---", "After"]);
+    }
+
+    #[test]
+    fn unpiped_partial_rule_markers_stay_literal_in_the_table_until_complete() {
+        let table = "| Name | Status |\n| --- | --- |\n| Alpha | Ready |\n| ** | Explicit |\n";
+        let preceding = render(table);
+        assert_eq!(preceding.len(), 4);
+        assert_eq!(
+            preceding[2].split_whitespace().collect::<Vec<_>>(),
+            ["Alpha", "Ready"]
+        );
+        assert_eq!(preceding[3].trim(), "Explicit");
+        for (partial, delta, displayed) in [
+            ("*", " * *", "*"),
+            ("**", "*", "**"),
+            ("_", "__", "_"),
+            ("__", "_", "__"),
+            ("*\t*", " *", "*  *"),
+        ] {
+            let mut source = format!("{table}{partial}");
+            let rows = render(&source);
+            assert_eq!(rows.len(), preceding.len() + 1, "{partial:?}");
+            assert_eq!(
+                &rows[..preceding.len()],
+                preceding.as_slice(),
+                "{partial:?}"
+            );
+            let row = rows.last().unwrap();
+            assert_eq!(row.trim_end(), displayed, "{partial:?}");
+            assert_eq!(row.len(), preceding[0].len(), "{partial:?}");
+
+            source.push_str(delta);
+            let rows = render(&source);
+            assert_eq!(rows.len(), preceding.len() + 1, "{source:?}");
+            assert_eq!(&rows[..preceding.len()], preceding.as_slice(), "{source:?}");
+            assert_eq!(rows.last().unwrap(), &"─".repeat(80));
+        }
     }
 
     #[test]
