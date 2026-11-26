@@ -28,6 +28,7 @@ on:
           - writer-lock
           - publication
           - publication-process-exit
+          - scope-identity
 
 permissions:
   contents: read
