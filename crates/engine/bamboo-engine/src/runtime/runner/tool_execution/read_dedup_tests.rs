@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -49,18 +49,29 @@ impl LLMProvider for ReadProvider {
             requests.push((messages, wire));
             requests.len()
         };
-        let read = |id: &str, offset: usize| ToolCall {
+        let read = |id: &str, name: &str, path: &Path, offset: usize| ToolCall {
             id: id.into(),
             tool_type: "function".into(),
             function: FunctionCall {
-                name: "Read".into(),
-                arguments: json!({"file_path": self.path, "offset": offset, "limit": 12})
-                    .to_string(),
+                name: name.into(),
+                arguments: json!({"file_path": path, "offset": offset, "limit": 12}).to_string(),
             },
         };
         let output = match round {
-            1 => LLMChunk::ToolCalls(vec![read("read-earlier", 0)]),
-            2 => LLMChunk::ToolCalls(vec![read("read-latest", 0), read("read-other-range", 12)]),
+            1 => LLMChunk::ToolCalls(vec![read("read-earlier", "Read", &self.path, 0)]),
+            2 => {
+                let alternate_path = self
+                    .path
+                    .parent()
+                    .unwrap()
+                    .join(".")
+                    .join("observations.txt");
+                assert_ne!(alternate_path.as_os_str(), self.path.as_os_str());
+                LLMChunk::ToolCalls(vec![
+                    read("read-latest", "read_file", &alternate_path, 0),
+                    read("read-other-range", "Read", &self.path, 12),
+                ])
+            }
             3 => LLMChunk::Token("Read results received.".into()),
             _ => panic!("unexpected model request {round}"),
         };
@@ -192,6 +203,11 @@ async fn outgoing_model_request_deduplicates_real_reads_and_preserves_saved_tran
     let expected = BTreeSet::from(["read-earlier", "read-latest", "read-other-range"]);
     assert_eq!(pair_ids("tool_use", "id"), expected);
     assert_eq!(pair_ids("tool_result", "tool_use_id"), expected);
+    let aliased_call = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_use" && block["id"] == "read-latest")
+        .unwrap();
+    assert_eq!(aliased_call["name"], "read_file");
     for block in blocks.iter().filter(|block| block["type"] == "tool_result") {
         let call_id = block["tool_use_id"].as_str().unwrap();
         assert_eq!(block["content"], read_result(outgoing, call_id).content);

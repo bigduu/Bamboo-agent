@@ -90,10 +90,14 @@ fn read_identity(message: &Message) -> Option<ReadResultIdentity> {
         return None;
     }
     let metadata = message.metadata.as_ref()?;
-    if metadata.get("tool_name")?.as_str()? != "Read" {
+    if !is_read_name(metadata.get("tool_name")?.as_str()?) {
         return None;
     }
     ReadResultIdentity::deserialize(metadata.get(READ_RESULT_IDENTITY_KEY)?).ok()
+}
+
+fn is_read_name(name: &str) -> bool {
+    name == "Read" || bamboo_domain::tool_names::normalize_tool_ref(name).as_deref() == Some("Read")
 }
 
 fn full_read_call_id<'a>(message: &'a Message, identity: &ReadResultIdentity) -> Option<&'a str> {
@@ -160,7 +164,7 @@ fn paired_read_results(ir: &PromptIR, transcript: &[Message]) -> HashSet<usize> 
             || !ordinary_message(assistant)
             || !calls
                 .iter()
-                .any(|call| call.tool_type == "function" && call.function.name == "Read")
+                .any(|call| call.tool_type == "function" && is_read_name(&call.function.name))
             || calls.iter().any(|call| {
                 let id = call.id.as_str();
                 id.trim().is_empty()
@@ -193,7 +197,7 @@ fn paired_read_results(ir: &PromptIR, transcript: &[Message]) -> HashSet<usize> 
         }
         paired.extend(results.iter().enumerate().filter_map(|(offset, result)| {
             let call = call_by_id.get(result.tool_call_id.as_deref()?)?;
-            (call.tool_type == "function" && call.function.name == "Read")
+            (call.tool_type == "function" && is_read_name(&call.function.name))
                 .then_some(index + 1 + offset)
         }));
     }
