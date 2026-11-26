@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, ScheduleRunsContent};
@@ -80,6 +80,37 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let header = Paragraph::new(header);
     f.render_widget(header, chunks[0]);
 
+    let body = chunks[1];
+    let selected = app
+        .schedules
+        .selected
+        .min(app.schedules.schedules.len().saturating_sub(1));
+    let detail_width = body.width.saturating_sub(2);
+    let detail_limit = body.height.saturating_sub(2).min(3);
+    let detail = app
+        .schedules
+        .schedules
+        .get(selected)
+        .and_then(|schedule| schedule.cadence_detail.as_deref())
+        .filter(|text| !text.is_empty() && detail_width > 0 && detail_limit > 0)
+        .map(|text| {
+            let width = usize::from(detail_width) * usize::from(detail_limit);
+            Paragraph::new(Line::from(vec![
+                Span::styled("Cadence  ", Style::default().fg(colors::brand())),
+                Span::raw(clip_schedule_text(text, width.saturating_sub(9))),
+            ]))
+            .wrap(Wrap { trim: true })
+        });
+    let detail_height = detail.as_ref().map_or(0, |paragraph| {
+        paragraph
+            .line_count(detail_width)
+            .min(usize::from(detail_limit)) as u16
+    });
+    let list_area = Rect {
+        height: body.height - detail_height,
+        ..body
+    };
+
     // Schedule list
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -89,16 +120,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 "  Name  Schedule  Status  Last run"
             },
-            chunks[1].width as usize,
+            usize::from(list_area.width),
         ),
         Style::default().fg(colors::subtle()),
     )));
 
-    let selected = app
-        .schedules
-        .selected
-        .min(app.schedules.schedules.len().saturating_sub(1));
-    let capacity = chunks[1].height.saturating_sub(1) as usize;
+    let capacity = usize::from(list_area.height.saturating_sub(1));
     let visible = visible_window(app.schedules.schedules.len(), selected, capacity);
     for (i, schedule) in app
         .schedules
@@ -108,7 +135,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .take(visible.end)
         .skip(visible.start)
     {
-        lines.push(schedule_row_line(schedule, i == selected, chunks[1].width));
+        lines.push(schedule_row_line(schedule, i == selected, list_area.width));
     }
 
     if app.schedules.schedules.is_empty() {
@@ -119,7 +146,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let list = Paragraph::new(lines);
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, list_area);
+    if let Some(detail) = detail {
+        f.render_widget(
+            detail,
+            Rect::new(
+                body.x.saturating_add(2),
+                list_area.bottom(),
+                detail_width,
+                detail_height,
+            ),
+        );
+    }
 
     // Footer
     let footer_text = format!(
@@ -154,7 +192,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         format!(
             "  {}",
-            clip_run_text(&pane.name, content_width.saturating_sub(2))
+            clip_schedule_text(&pane.name, content_width.saturating_sub(2))
         ),
         Style::default()
             .fg(colors::brand())
@@ -169,7 +207,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
             lines.push(Line::styled(
                 format!(
                     "  {}",
-                    clip_run_text(error, content_width.saturating_sub(2))
+                    clip_schedule_text(error, content_width.saturating_sub(2))
                 ),
                 Style::default().fg(colors::error()),
             ));
@@ -185,7 +223,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
                 lines.push(Line::styled(
                     format!(
                         "  {}",
-                        clip_run_text(error, content_width.saturating_sub(2))
+                        clip_schedule_text(error, content_width.saturating_sub(2))
                     ),
                     Style::default().fg(colors::error()),
                 ));
@@ -238,7 +276,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
                 lines.push(Line::from(vec![
                     Span::styled(time, time_style),
                     Span::styled(
-                        clip_run_text(&run.status, content_width.saturating_sub(23)),
+                        clip_schedule_text(&run.status, content_width.saturating_sub(23)),
                         Style::default().fg(status_color),
                     ),
                 ]));
@@ -267,7 +305,7 @@ pub(super) fn render_runs(f: &mut Frame, app: &App) {
     );
 }
 
-fn clip_run_text(value: &str, width: usize) -> String {
+fn clip_schedule_text(value: &str, width: usize) -> String {
     let text: String = value
         .chars()
         .filter(|character| !character.is_control())
@@ -356,6 +394,7 @@ mod tests {
             prompt: None,
             last_run: None,
             next_run: None,
+            cadence_detail: None,
         }
     }
 
@@ -397,6 +436,7 @@ mod tests {
             "runs action footer missing:\n{text}"
         );
         assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
+        assert!(!text.contains("Cadence"), "{text}");
     }
 
     fn terminal_rows(terminal: &Terminal<TestBackend>) -> String {
@@ -407,6 +447,116 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn selected_schedule_shows_saved_cadence_without_displacing_its_row_or_actions() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = (0..28).map(schedule).collect();
+        for schedule in [
+            serde_json::json!({
+                "id": "future",
+                "name": "Future schedule",
+                "trigger": {"type": "future", "unsupported_payload": "RAW_TRIGGER_VALUE"},
+                "timezone": "RAW_ZONE_VALUE"
+            }),
+            serde_json::json!({
+                "id": "weekly",
+                "name": "Release 计划 🧭",
+                "enabled": true,
+                "trigger": {
+                    "type": "weekly",
+                    "weekdays": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                    "hour": 8,
+                    "minute": 30,
+                    "second": 5
+                },
+                "timezone": "America/Argentina/Buenos_Aires"
+            }),
+        ] {
+            app.schedules.schedules.push(Schedule::from_view(
+                serde_json::from_value(schedule).unwrap(),
+            ));
+        }
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            app.schedules.selected = 29;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal_rows(&terminal);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_CADENCE").is_some() {
+                eprintln!("SCHEDULE CADENCE PREVIEW\n{text}\nEND SCHEDULE CADENCE PREVIEW");
+            }
+            let selected = text.lines().find(|row| row.contains("› Release")).unwrap();
+            assert!(
+                selected.replace(' ', "").contains("Release计划🧭"),
+                "{text}"
+            );
+            for expected in [
+                "Weekly Mon, Tue, Wed, Thu, Fri, Sat, Sun",
+                "08:30:05",
+                "America/Argentina/Buenos_Aires",
+                "r run now",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?}\n{text}");
+            }
+            let row_for = |needle: &str| text.lines().position(|row| row.contains(needle)).unwrap();
+            let detail = row_for("Cadence");
+            let footer = row_for("Enter runs");
+            assert!(row_for("› Release") < detail);
+            assert!((1..=3).contains(&(footer - detail)), "{text}");
+
+            app.schedules.selected = 28;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let fallback = terminal_rows(&terminal);
+            assert!(fallback.contains("› Future schedule"), "{fallback}");
+            assert!(fallback.contains("Cadence  Unknown trigger"), "{fallback}");
+            assert!(fallback.contains("Enter runs"), "{fallback}");
+            for hidden in ["RAW_TRIGGER_VALUE", "RAW_ZONE_VALUE", "Buenos_Aires"] {
+                assert!(!fallback.contains(hidden), "{fallback}");
+            }
+        }
+    }
+
+    #[test]
+    fn monthly_schedule_keeps_all_days_time_and_zone_visible_at_minimum_width() {
+        let view = serde_json::from_value(serde_json::json!({
+            "id": "monthly",
+            "name": "Monthly archive",
+            "enabled": true,
+            "trigger": {
+                "type": "monthly",
+                "days": (1..=31).collect::<Vec<_>>(),
+                "hour": 8,
+                "minute": 30,
+                "second": 5
+            },
+            "timezone": "America/Argentina/ComodRivadavia"
+        }))
+        .unwrap();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = (0..15).map(schedule).collect();
+        app.schedules.schedules.push(Schedule::from_view(view));
+        app.schedules.selected = 15;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal_rows(&terminal);
+        for expected in [
+            "› Monthly archive",
+            "Monthly 1–31 at 08:30:05",
+            "America/Argentina/ComodRivadavia",
+            "Enter runs",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
+        }
     }
 
     #[test]

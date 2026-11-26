@@ -1418,6 +1418,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_schedules_projects_saved_cadence_in_server_order() {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            assert!(body.is_empty());
+            respond(
+                &mut socket,
+                "200 OK",
+                "1",
+                r#"{"schedules":[
+                    {"id":"cron","name":"晨间检查 🧭","enabled":true,"timezone":"UTC",
+                     "trigger":{"type":"cron","expr":"0 30 8 * * *"},
+                     "state":{"last_finished_at":"2026-10-20T08:31:00Z","next_fire_at":"2026-10-21T08:30:00Z"},
+                     "run_config":{"task_message":"Review the overnight changes"}},
+                    {"id":"once","enabled":false,"trigger":{"type":"once","at":"2026-10-20T16:15:00.125+08:00"}},
+                    {"id":"weekly","timezone":"America/New_York",
+                     "trigger":{"type":"weekly","weekdays":["mon","wed"],"hour":8,"minute":30,"second":5}},
+                    {"id":"interval","trigger":{"type":"interval","every_seconds":90,"anchor_at":"2026-10-20T08:15:00Z"}},
+                    {"id":"daily","trigger":{"type":"daily","hour":8,"minute":30}},
+                    {"id":"monthly","timezone":null,
+                     "trigger":{"type":"monthly","days":[1,15,31],"hour":8,"minute":30,"second":0}},
+                    {"id":"future","trigger":{"type":"quarterly","months":[1,4,7,10]}},
+                    {"id":"incomplete","trigger":{"type":"daily","hour":8}},
+                    {"id":"legacy-cron","trigger":{"type":"cron"}},
+                    {"id":"legacy-unknown"}
+                ]}"#,
+            )
+            .await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedules(), serve)
+        })
+        .await
+        .unwrap();
+        let schedules = result.unwrap();
+
+        let cadence: Vec<_> = schedules
+            .iter()
+            .map(|schedule| {
+                (
+                    schedule.id.as_str(),
+                    schedule.cron.as_deref(),
+                    schedule.cadence_detail.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cadence,
+            [
+                ("cron", Some("0 30 8 * * *"), Some("Cron 0 30 8 * * * UTC")),
+                ("once", Some("once"), Some("Once 2026-10-20T08:15:00.125Z")),
+                (
+                    "weekly",
+                    Some("weekly"),
+                    Some("Weekly Mon, Wed at 08:30:05 America/New_York")
+                ),
+                ("interval", Some("interval"), Some("Every 90 seconds")),
+                ("daily", Some("daily"), Some("Daily 08:30 UTC")),
+                (
+                    "monthly",
+                    Some("monthly"),
+                    Some("Monthly 1, 15, 31 at 08:30 UTC")
+                ),
+                ("future", Some("quarterly"), Some("Unknown trigger")),
+                (
+                    "incomplete",
+                    Some("daily"),
+                    Some("Daily cadence unavailable")
+                ),
+                (
+                    "legacy-cron",
+                    Some("cron"),
+                    Some("Cron cadence unavailable")
+                ),
+                ("legacy-unknown", Some("-"), Some("Cadence unavailable")),
+            ]
+        );
+
+        let cron = &schedules[0];
+        assert_eq!(cron.name.as_deref(), Some("晨间检查 🧭"));
+        assert_eq!(cron.enabled, Some(true));
+        assert_eq!(schedules[1].enabled, Some(false));
+        assert_eq!(cron.prompt.as_deref(), Some("Review the overnight changes"));
+        assert_eq!(cron.last_run, Some("2026-10-20T08:31:00Z".parse().unwrap()));
+        assert_eq!(cron.next_run, Some("2026-10-21T08:30:00Z".parse().unwrap()));
+    }
+
+    #[tokio::test]
     async fn list_schedule_runs_reads_typed_history_in_server_order() {
         let runs = schedule_runs_reply(
             "200 OK",
