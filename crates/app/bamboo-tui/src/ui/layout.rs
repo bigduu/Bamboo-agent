@@ -15,6 +15,7 @@ use crate::app::{
     SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
+use crate::schedule_form::ScheduleField;
 use crate::theme::{self, colors};
 use crate::ui::sessions::session_row_line_with_activity;
 
@@ -2292,80 +2293,78 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
         return;
     };
     let screen = f.area();
-    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
-    let value_width = popup_width.saturating_sub(16) as usize;
-    let fields = [
-        ("Name", &form.name),
-        ("Cron", &form.cron),
-        ("Prompt", &form.prompt),
-    ];
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            " New schedule",
-            Style::default()
-                .fg(colors::brand())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    for (i, (label, val)) in fields.iter().enumerate() {
+    let inner_width = centered_rect(90, 0, screen).width.saturating_sub(2);
+    let label_width = form
+        .fields()
+        .iter()
+        .map(|&field| display_width(form.field_label(field)))
+        .max()
+        .unwrap_or_default();
+    let value_width = usize::from(inner_width).saturating_sub(label_width + 4);
+    let mut lines = Vec::new();
+    for (i, &field) in form.fields().iter().enumerate() {
+        let value = form.field_value(field);
         let focused = i == form.field;
-        let cursor = if focused { "\u{258f}" } else { "" };
         let style = if focused {
             Style::default().fg(colors::brand())
         } else {
             Style::default().fg(colors::inactive())
         };
+        let value = if focused && field == ScheduleField::Trigger {
+            clip_cells(&format!("‹ {value} ›"), value_width)
+        } else if focused && value_width > 0 {
+            format!("{}▏", clip_tail_cells(value, value_width - 1))
+        } else {
+            clip_cells(value, value_width)
+        };
+        let label = form.field_label(field);
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {label:<7}: "),
+                format!("  {label:<label_width$}: "),
                 Style::default().fg(colors::subtle()),
             ),
-            Span::styled(
-                if focused {
-                    format!(
-                        "{}{}",
-                        clip_tail_cells(val, value_width.saturating_sub(1)),
-                        cursor
-                    )
-                } else {
-                    clip_cells(val, value_width)
-                },
-                style,
-            ),
+            Span::styled(value, style),
         ]));
     }
+    lines.push(Line::from(Span::styled(
+        format!("  {}", form.hint()),
+        Style::default().fg(colors::subtle()),
+    )));
     if let Some(error) = &form.error {
         lines.push(Line::from(Span::styled(
             format!(
                 "  ! {}",
-                clip_cells(error, popup_width.saturating_sub(6) as usize)
+                clip_cells(error, usize::from(inner_width).saturating_sub(4))
             ),
             Style::default().fg(colors::error()),
         )));
     }
-    lines.push(Line::raw(""));
+    let key = |action| app.primary_key_hint(ActionContext::ScheduleForm, action);
     lines.push(Line::raw(format!(
-        "  {}/{} field · {} create · {} cancel",
-        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::NextField),
-        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::PreviousField),
-        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::Activate),
-        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::Cancel),
+        "  {}/{} trigger · {}/{} field",
+        key(ActionId::PreviousTrigger),
+        key(ActionId::NextTrigger),
+        key(ActionId::NextField),
+        key(ActionId::PreviousField),
+    )));
+    lines.push(Line::raw(format!(
+        "  {} create · {} cancel",
+        key(ActionId::Activate),
+        key(ActionId::Cancel),
     )));
 
-    let height = (lines.len() as u16 + 2).min(screen.height);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = paragraph
+        .line_count(inner_width)
+        .saturating_add(2)
+        .min(usize::from(screen.height)) as u16;
     let area = centered_rect(90, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::brand()))
-        .title(" Schedule ");
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+        .title(" New schedule ");
+    f.render_widget(paragraph.block(block), area);
 }
 
 /// Contextual session picker (`Ctrl+P` on Chat). It renders over the
@@ -3711,6 +3710,7 @@ mod tests {
     use crate::api::BambooClient;
     use crate::app::{App, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger};
     use crate::keymap::{ActionId, Keymap};
+    use crate::schedule_form::{ScheduleForm, ScheduleTriggerKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::text::Line;
@@ -3802,6 +3802,85 @@ mod tests {
         let text = terminal_text(&terminal);
         assert!(text.contains("[F8] Chat"), "{text}");
         assert!(!text.contains("[1] Chat"), "{text}");
+    }
+
+    #[test]
+    fn schedule_form_shows_trigger_fields_syntax_and_actions_at_narrow_width() {
+        use ScheduleTriggerKind::{Cron, Daily, Interval, Monthly, Once, Weekly};
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut terminal = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        for (trigger, title, timing, days, syntax) in [
+            (Cron, "Cron", "Cron expression", None, "weekday"),
+            (Once, "Once", "Run at", None, "RFC3339"),
+            (
+                Interval,
+                "Interval",
+                "Every (seconds)",
+                None,
+                "whole seconds",
+            ),
+            (Daily, "Daily", "Time (UTC)", None, "HH:MM[:SS]"),
+            (
+                Weekly,
+                "Weekly",
+                "Time (UTC)",
+                Some("Weekdays"),
+                "mon, wed, fri",
+            ),
+            (
+                Monthly,
+                "Monthly",
+                "Time (UTC)",
+                Some("Days of month"),
+                "1, 15, 31",
+            ),
+        ] {
+            app.schedule_form = Some(ScheduleForm {
+                trigger,
+                field: 1,
+                error: Some("Check the timing".into()),
+                ..ScheduleForm::default()
+            });
+            terminal
+                .draw(|frame| super::render_schedule_form(frame, &app))
+                .unwrap();
+            let text = terminal_text(&terminal);
+            if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_FORM").is_some() {
+                println!("{title} schedule preview\n{text}");
+            }
+            let words = text
+                .replace('│', "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for expected in [
+                "New schedule",
+                "Name",
+                "Prompt",
+                &format!("‹ {title} ›"),
+                timing,
+                syntax,
+                "Check the timing",
+                "Left/Right trigger",
+                "Enter create",
+                "Esc cancel",
+            ] {
+                assert!(
+                    words.contains(expected),
+                    "{title} omitted {expected:?}\n{text}"
+                );
+            }
+            if matches!(trigger, Cron | Daily | Weekly | Monthly) {
+                assert!(words.contains("UTC"), "{text}");
+            }
+            if trigger == Once {
+                assert!(words.contains("offset"), "{text}");
+            }
+            for label in ["Weekdays", "Days of month"] {
+                assert_eq!(text.contains(label), days == Some(label), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -4007,9 +4086,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [5_465_196_706_881_833_946, 17_600_003_573_125_186_612]
+                [16_557_340_456_998_918_282, 9_127_507_640_451_636_068]
             } else {
-                [5_943_157_576_016_431_056, 4_628_304_044_703_891_390]
+                [12_094_400_248_715_051_436, 5_158_084_342_632_959_466]
             },
             "complete help-overlay buffer golden changed"
         );

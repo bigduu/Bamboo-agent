@@ -227,6 +227,8 @@ pub(crate) enum ActionId {
     RunSchedule,
     NextField,
     PreviousField,
+    NextTrigger,
+    PreviousTrigger,
     EditConfig,
     SaveConfig,
     OpenPermissionPolicy,
@@ -1304,6 +1306,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [ScheduleForm],
         [(ScheduleForm, "Shift+Tab; Up")]
+    ),
+    spec!(
+        PreviousTrigger,
+        "Previous trigger",
+        "Choose the previous schedule trigger while the Trigger field has focus",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Left")]
+    ),
+    spec!(
+        NextTrigger,
+        "Next trigger",
+        "Choose the next schedule trigger while the Trigger field has focus",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Right")]
     ),
     spec!(
         EditConfig,

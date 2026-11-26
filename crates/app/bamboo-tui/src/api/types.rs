@@ -908,23 +908,61 @@ pub struct ScheduleRunConfigView {
 /// Body of `POST /api/v1/schedules`. Must match the server's
 /// `CreateScheduleRequest`: a tagged `trigger` and a `run_config` carrying the
 /// prompt (there is no flat `cron`/`prompt` on the server side).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct CreateScheduleRequest {
     pub name: String,
     pub trigger: ScheduleTriggerReq,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<&'static str>,
     pub enabled: bool,
     pub run_config: ScheduleRunConfigReq,
 }
 
-/// Serialize-side mirror of the server's internally-tagged `ScheduleTrigger`.
-/// The TUI form only authors cron triggers today.
-#[derive(Serialize)]
+/// Serialize-side mirror of the server's internally tagged `ScheduleTrigger`.
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScheduleTriggerReq {
-    Cron { expr: String },
+    Cron {
+        expr: String,
+    },
+    Once {
+        at: DateTime<Utc>,
+    },
+    Interval {
+        every_seconds: u64,
+    },
+    Daily {
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
+    Weekly {
+        weekdays: Vec<ScheduleWeekdayReq>,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
+    Monthly {
+        days: Vec<u8>,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
 }
 
-#[derive(Serialize, Default)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleWeekdayReq {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+#[derive(Debug, Serialize, Default)]
 pub struct ScheduleRunConfigReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
