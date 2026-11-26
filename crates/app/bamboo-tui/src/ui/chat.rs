@@ -1473,6 +1473,197 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_renders_thematic_breaks_among_assistant_markdown_at_each_width() {
+        let source = concat!(
+            "Delivery notes for **输入** 🧭 and _output_.\n\n",
+            "---\n",
+            "- Real bullet\n",
+            "2. Real ordered item\n\n",
+            "***\n",
+            "Examples follow.\n\n",
+            "___\n",
+            "Possible Setext heading\n",
+            "---\n\n",
+            "- - -\n",
+            "* * *\n",
+            "_ _ _\n",
+            "Metric | Value\n",
+            "--- | ---\n",
+            "Table | Ready\n",
+            "***\n",
+            "Prepared 输出 🧪\n\n",
+            "```text\n---\n* * *\n___\n```\n",
+            "After the fenced text.\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-thematic-breaks".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_THEMATIC_BREAKS").is_some() {
+                eprintln!("THEMATIC BREAK PREVIEW\n{rendered}\nEND THEMATIC BREAK PREVIEW");
+            }
+
+            let divider = "─".repeat(usize::from(width));
+            let divider_rows: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| (row == &divider).then_some(index))
+                .collect();
+            assert_eq!(divider_rows.len(), 7, "{width} columns\n{rendered}");
+            let row_for = |text: &str| {
+                rows.iter()
+                    .position(|row| row.contains(text))
+                    .unwrap_or_else(|| panic!("missing {text:?} at {width} columns\n{rendered}"))
+            };
+            let prose = row_for("Delivery notes");
+            assert!(rows[prose].replace(' ', "").contains("输入🧭"));
+            assert!(rows[prose].contains("and output."));
+            assert!(prose < divider_rows[0]);
+            assert!(rows[row_for("Real bullet")].contains("• Real bullet"));
+            assert!(rows[row_for("Real ordered item")].contains("2. Real ordered item"));
+            let possible_heading = row_for("Possible Setext heading");
+            assert_eq!(rows[possible_heading + 1].trim(), "---");
+            assert!(divider_rows[2] < possible_heading && possible_heading < divider_rows[3]);
+
+            let table_header = row_for("Metric");
+            let table_body = row_for("Ready");
+            assert!(rows[table_header].contains("Value") && !rows[table_header].contains('|'));
+            let table_separator = rows[table_header + 1].trim_end();
+            assert!(table_separator.contains('─') && table_separator.contains(' '));
+            assert!(table_separator
+                .chars()
+                .all(|cell| cell == '─' || cell == ' '));
+            assert_eq!(table_body, table_header + 2);
+            assert_eq!(divider_rows[6], table_body + 1);
+            assert!(rows[table_body + 2].replace(' ', "").contains("输出🧪"));
+            let fence = fence_rows(&rows, "text");
+            assert_eq!(fence.len(), 5);
+            for (row, literal) in fence[1..4].iter().zip(["---", "* * *", "___"]) {
+                assert_eq!(row.trim_matches(['│', ' ']), literal);
+            }
+            assert!(row_for("After the fenced text.") > row_for("Prepared"));
+            let cells = terminal.backend().buffer().content();
+            assert!(cells
+                .iter()
+                .any(|cell| cell.symbol() == "入" && cell.modifier.contains(Modifier::BOLD)));
+            assert!(cells
+                .iter()
+                .any(|cell| cell.symbol() == "o" && cell.modifier.contains(Modifier::ITALIC)));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_thematic_break_markers_literal_until_the_third() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:thematic-breaks".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let divider = "─".repeat(usize::from(width));
+            for (first, next) in [
+                ("-", "-"),
+                ("*", "*"),
+                ("_", "_"),
+                ("-", " -"),
+                ("*", " *"),
+                ("_", " _"),
+            ] {
+                app.chat.current_response = format!("Input 输入 🧭\n\n{first}");
+                for incomplete in [first.to_owned(), format!("{first}{next}")] {
+                    let rows = transcript_rows(&mut terminal, &app, true);
+                    assert!(
+                        rows.iter().any(|row| row.trim() == incomplete),
+                        "missing literal {incomplete:?} at {width} columns\n{}",
+                        rows.join("\n")
+                    );
+                    assert!(
+                        !rows.contains(&divider),
+                        "unexpected rule for {incomplete:?}"
+                    );
+                    app.chat.current_response.push_str(next);
+                }
+
+                let at_threshold = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(
+                    at_threshold.iter().filter(|row| *row == &divider).count(),
+                    1
+                );
+                app.chat.current_response.push_str("\nOutput 输出 🧪");
+                let continued = transcript_rows(&mut terminal, &app, true);
+                let rule = continued.iter().position(|row| row == &divider).unwrap();
+                assert_eq!(continued[rule], at_threshold[rule]);
+                assert!(continued[..rule]
+                    .iter()
+                    .any(|row| row.replace(' ', "").contains("输入🧭")));
+                assert!(continued[rule + 1].replace(' ', "").contains("输出🧪"));
+                assert!(continued
+                    .iter()
+                    .any(|row| row.contains("Bamboo · streaming")));
+                assert_eq!(
+                    app.chat.current_response,
+                    format!("Input 输入 🧭\n\n{first}{next}{next}\nOutput 输出 🧪")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_break_markers_literal_after_a_pipe_table() {
+        const TABLE: &str = "| Name | Status |\n| --- | --- |\n| Alpha | Ready |\n";
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:table-thematic-break".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let divider = "─".repeat(usize::from(width));
+            app.chat.current_response = TABLE.into();
+            let baseline = transcript_rows(&mut terminal, &app, true);
+            let header = baseline
+                .iter()
+                .position(|row| row.contains("Name"))
+                .unwrap();
+            let alpha = header + 2;
+            assert!(baseline[header].contains("Status"));
+            assert!(baseline[alpha].contains("Alpha") && baseline[alpha].contains("Ready"));
+            let table = &baseline[header..=alpha];
+
+            for (first, next) in [("*", "*"), ("_", "_"), ("*", " *"), ("_", " _")] {
+                app.chat.current_response = format!("{TABLE}{first}");
+                for literal in [first.to_owned(), format!("{first}{next}")] {
+                    let partial = transcript_rows(&mut terminal, &app, true);
+                    assert_eq!(&partial[header..=alpha], table);
+                    assert_eq!(
+                        partial[alpha + 1].trim(),
+                        literal,
+                        "{width} columns\n{}",
+                        partial.join("\n")
+                    );
+                    assert!(!partial.contains(&divider));
+                    assert_eq!(app.chat.current_response, format!("{TABLE}{literal}"));
+                    app.chat.current_response.push_str(next);
+                }
+
+                let completed = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(&completed[header..=alpha], table);
+                assert_eq!(completed[alpha + 1], divider);
+                assert_eq!(
+                    app.chat.current_response,
+                    format!("{TABLE}{first}{next}{next}")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn testbackend_keeps_streaming_composer_visible_with_structured_rows() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("parent".to_string());
