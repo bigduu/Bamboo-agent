@@ -488,6 +488,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/schedules/{schedule_id}/runs",
             web::get().to(agent::schedules::list_runs_for_schedule),
         )
+        .route(
+            "/schedules/{schedule_id}/runs/{run_id}/cancel",
+            web::post().to(agent::schedules::cancel_schedule_run),
+        )
         // New separated execute + events endpoints
         // `/execute/defaults` MUST be registered before the `/execute/{session_id}`
         // dynamic route below (same precedent as `/sessions/cleanup` vs

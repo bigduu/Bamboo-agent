@@ -5,7 +5,7 @@ mod types;
 mod validation;
 
 pub use handlers::{
-    create_schedule, delete_schedule, list_runs_for_schedule, list_schedules,
+    cancel_schedule_run, create_schedule, delete_schedule, list_runs_for_schedule, list_schedules,
     list_sessions_for_schedule, patch_schedule, run_now,
 };
 pub use types::{

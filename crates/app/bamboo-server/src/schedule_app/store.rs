@@ -932,6 +932,23 @@ impl ScheduleStore {
         index.run_records.get(run_id).cloned()
     }
 
+    pub(crate) async fn get_public_schedule_run_record(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+    ) -> Option<ScheduleRunRecord> {
+        let index = self.index.read().await;
+        index
+            .schedules
+            .get(schedule_id)
+            .filter(|entry| entry.id == schedule_id && entry.log_monitor.is_none())?;
+        index
+            .run_records
+            .get(run_id)
+            .filter(|record| record.schedule_id == schedule_id && record.run_id == run_id)
+            .cloned()
+    }
+
     pub async fn list_run_records_for_schedule(&self, schedule_id: &str) -> Vec<ScheduleRunRecord> {
         let index = self.index.read().await;
         let mut items = index
@@ -2561,16 +2578,45 @@ mod tests {
             .await
             .unwrap();
 
+        let other = store
+            .create_schedule(
+                "other-schedule".to_string(),
+                created.trigger.clone(),
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
         let claimed = store
             .create_run_now(&created.id)
             .await
             .unwrap()
             .expect("run descriptor should be created");
-        assert!(store.get_run_record(&claimed.run_id).await.is_some());
+        let record = store.get_run_record(&claimed.run_id).await.unwrap();
+        assert_eq!(
+            store
+                .get_public_schedule_run_record(&created.id, &claimed.run_id)
+                .await,
+            Some(record)
+        );
+        for wrong_schedule_id in [other.id.as_str(), "missing-schedule"] {
+            assert!(store
+                .get_public_schedule_run_record(wrong_schedule_id, &claimed.run_id)
+                .await
+                .is_none());
+        }
+        assert!(store
+            .get_public_schedule_run_record(&created.id, "missing-run")
+            .await
+            .is_none());
 
         let deleted = store.delete_schedule(&created.id).await.unwrap();
         assert!(deleted);
         assert!(store.get_run_record(&claimed.run_id).await.is_none());
+        assert!(store
+            .get_public_schedule_run_record(&created.id, &claimed.run_id)
+            .await
+            .is_none());
     }
 }
 
