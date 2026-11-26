@@ -42,14 +42,20 @@ pub(super) fn retain_message_prefix(
             continue;
         }
 
-        let mut results = Vec::new();
-        while let Some(row) = source.next_if(|row| row.role == Role::Tool) {
-            results.push(row);
+        let mut batch_rows = Vec::new();
+        while let Some(row) = source.next_if(|row| matches!(row.role, Role::Tool | Role::System)) {
+            batch_rows.push(row);
         }
-        // IDs only relate a call to its adjacent results. A stale batch can
-        // reuse one of its IDs in a later turn or contain ambiguous duplicates.
+        // Only results in the same assistant batch can resolve its calls.
+        // System rows can occur between a call and its result without ending
+        // the batch. The next user or assistant row always ends it.
         let call_ids = unique_ids(calls.iter().map(|call| call.id.as_str()));
-        let result_ids = unique_ids(results.iter().filter_map(|row| row.tool_call_id.as_deref()));
+        let result_ids = unique_ids(
+            batch_rows
+                .iter()
+                .filter(|row| row.role == Role::Tool)
+                .filter_map(|row| row.tool_call_id.as_deref()),
+        );
         let paired: HashSet<String> = call_ids
             .intersection(&result_ids)
             .map(|id| id.to_string())
@@ -64,13 +70,16 @@ pub(super) fn retain_message_prefix(
         if message.tool_calls.is_some() || has_content(&message) || message.reasoning.is_some() {
             messages.push(message);
         }
-        messages.extend(results.into_iter().filter_map(|mut row| {
-            let id = row.tool_call_id.as_deref()?;
-            if paired.contains(id) {
-                row.tool_calls = None;
-                return Some(row);
+        messages.extend(batch_rows.into_iter().filter_map(|mut row| {
+            if row.role == Role::Tool {
+                if !paired.contains(row.tool_call_id.as_deref()?) {
+                    return None;
+                }
+            } else {
+                row.tool_call_id = None;
             }
-            None
+            row.tool_calls = None;
+            Some(row)
         }));
     }
     Ok(())
@@ -392,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn session_fork_pairs_only_adjacent_tool_calls_in_retained_history() {
+    fn session_fork_pairs_tool_calls_across_system_rows_only_within_the_same_batch() {
         let call = |id: &str| ToolCall {
             id: id.into(),
             tool_type: "function".into(),
@@ -410,17 +419,23 @@ mod tests {
                 call("duplicate"),
             ]),
         );
-        let next = Message::assistant("Second round", Some(vec![call("b")]));
+        let next = Message::assistant("Second round", Some(vec![call("b"), call("c")]));
+        let first_system = Message::system("first system message");
+        let first_system_id = first_system.id.clone();
         let anchor = Message::user("continue here");
         let anchor_id = anchor.id.clone();
         let mut messages = vec![
             Message::tool_result("b", "leading orphan"),
             old,
+            first_system,
             Message::tool_result("a", "first result"),
             Message::tool_result("duplicate", "ambiguous result"),
             Message::user("next turn"),
             next,
+            Message::system("second system message"),
             Message::tool_result("b", "later result"),
+            Message::assistant("Separate response", None),
+            Message::tool_result("c", "result after assistant boundary"),
             anchor,
             Message::tool_result("a", "after fork point"),
         ];
@@ -433,10 +448,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "First round",
+                "first system message",
                 "first result",
                 "next turn",
                 "Second round",
+                "second system message",
                 "later result",
+                "Separate response",
                 "continue here"
             ]
         );
@@ -450,7 +468,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a"]
         );
-        assert_eq!(messages[3].tool_calls.as_ref().unwrap()[0].id, "b");
+        assert_eq!(messages[1].role, Role::System);
+        assert_eq!(messages[1].id, first_system_id);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("a"));
+        let next_calls = messages[4].tool_calls.as_ref().unwrap();
+        assert_eq!(next_calls.len(), 1);
+        assert_eq!(next_calls[0].id, "b");
+        assert_eq!(messages[6].tool_call_id.as_deref(), Some("b"));
         assert_eq!(messages.last().unwrap().id, anchor_id);
     }
 }
