@@ -33140,6 +33140,129 @@ mod run_status_tests {
     }
 
     #[test]
+    fn atx_openers_follow_stream_boundaries_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use crate::theme::ColorRole;
+        use ratatui::style::Modifier;
+
+        let mut app = running_app("session-atx-openers", "run-atx-openers");
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let steps: [(&str, &[&str]); 4] = [
+            ("#\tBuild *next*", &["Build next"]),
+            ("\r\n##", &["Build next", "##"]),
+            (
+                "\r\nRelease details\n######",
+                &["Release details", "######"],
+            ),
+            (
+                "\n#hashtag\n#6 bolt\n####### Too many\n##\tReview `trace`\n###",
+                &[
+                    "#hashtag",
+                    "#6 bolt",
+                    "####### Too many",
+                    "Review trace",
+                    "###",
+                ],
+            ),
+        ];
+        let mut source = String::new();
+        for (delta, expected) in steps {
+            source.push_str(delta);
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            let text = terminal_text(&terminal);
+            for expected in expected {
+                assert!(
+                    text.lines().any(|row| row.trim() == *expected),
+                    "missing {expected:?}\n{text}"
+                );
+            }
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                source.as_bytes()
+            );
+        }
+
+        let assert_headings = |terminal: &Terminal<TestBackend>, app: &App| {
+            let text = terminal_text(terminal);
+            let rows: Vec<_> = text.lines().map(str::trim).collect();
+            let title_row = |title: &str| {
+                rows.iter()
+                    .position(|row| *row == title)
+                    .unwrap_or_else(|| panic!("missing {title:?}\n{text}"))
+            };
+            let primary = title_row("Build next");
+            let secondary = title_row("Review trace");
+            assert_eq!(
+                &rows[primary..primary + 5],
+                &["Build next", "", "Release details", "", "#hashtag"],
+                "bare markers become empty rows at CRLF and LF\n{text}"
+            );
+            let cells = terminal.backend().buffer().content();
+            let first = cells.chunks(60).nth(primary).unwrap();
+            let second = cells.chunks(60).nth(secondary).unwrap();
+            let build = first.iter().find(|cell| cell.symbol() == "B").unwrap();
+            assert_eq!(build.fg, app.theme.color(ColorRole::Brand));
+            assert!(build.modifier.contains(Modifier::BOLD));
+            assert!(first
+                .iter()
+                .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+            assert!(second
+                .iter()
+                .any(|cell| cell.symbol() == "R" && cell.modifier.contains(Modifier::BOLD)));
+            assert!(second
+                .iter()
+                .any(|cell| cell.symbol() == "t" && cell.modifier.contains(Modifier::REVERSED)));
+        };
+        assert_headings(&terminal, &app);
+
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let completed = terminal_text(&terminal);
+        assert!(
+            completed.lines().any(|row| row.trim() == "Review trace"),
+            "{completed}"
+        );
+        assert!(
+            !completed.lines().any(|row| row.trim() == "###"),
+            "{completed}"
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-atx-openers".into(),
+            role: "assistant".into(),
+            content: source.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        assert_headings(&terminal, &saved);
+        let restored = terminal_text(&terminal);
+        assert!(
+            !restored.lines().any(|row| row.trim() == "###"),
+            "{restored}"
+        );
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_OPENER").is_some() {
+            eprintln!("ATX OPENER PREVIEW\n{restored}\nEND ATX OPENER PREVIEW");
+        }
+    }
+
+    #[test]
     fn reducer_replay_is_idempotent_and_terminal_generations_never_regress() {
         fn reduce(state: &mut RunStatusState, replay: bool) {
             assert!(state.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));

@@ -57,6 +57,8 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
     }
     let source = preview_source(text);
     let mut lines: Vec<Line> = Vec::new();
+    let line_is_complete =
+        |line: fence::SourceLine<'_>| !streaming || source.as_bytes()[line.end - 1] == b'\n';
 
     let mut input = fence::source_lines(source).peekable();
     let mut after_prose = false;
@@ -68,20 +70,31 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         let body = raw_line.trim_start();
         let raw_indent = &raw_line[..raw_line.len() - body.len()];
         let indentation = column_after(0, raw_indent);
+        let block_container = previous_container.after_indented_block(indentation);
         if let Some(block) = fence::take_fence(source, line, &mut input) {
             render_code_block(&mut lines, block, width);
-            container = previous_container.after_indented_block(indentation);
+            container = block_container;
             continue;
         }
 
-        if let Some(rows) = table::render_if_table(raw_line, &mut input, width) {
-            lines.extend(rows);
-            container = previous_container.after_indented_block(indentation);
-            continue;
+        let line_complete = line_is_complete(line);
+        let top_level_atx = top_level_atx_body(raw_line, previous_container);
+        let additional_heading =
+            top_level_atx.and_then(|body| additional_atx_heading(body, line_complete));
+        if additional_heading.is_none() {
+            if let Some(rows) = table::render_if_table(raw_line, &mut input, width, |row| {
+                top_level_atx_body(row.text, block_container)
+                    .and_then(|body| additional_atx_heading(body, line_is_complete(row)))
+                    .is_some()
+            }) {
+                lines.extend(rows);
+                container = block_container;
+                continue;
+            }
         }
 
         if let Some(markers) = rule_markers(raw_line) {
-            container = previous_container.after_indented_block(indentation);
+            container = block_container;
             let possible_setext = follows_prose && markers.contiguous_dashes;
             if markers.forms_break() && !possible_setext {
                 lines.push(Line::styled(
@@ -103,12 +116,8 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         let indent = raw_indent.replace('\t', "  ");
 
         // Headings: 1–6 leading '#'.
-        if let Some((level, content)) = heading(body) {
-            let line_complete = !streaming || source.as_bytes()[line.end - 1] == b'\n';
-            let content = if line_complete
-                && top_level_body(raw_line) == Some(body)
-                && previous_container.enclosing_list(indentation).is_none()
-            {
+        if let Some((level, content)) = heading(body).or(additional_heading) {
+            let content = if line_complete && top_level_atx == Some(body) {
                 heading_without_closing_hashes(&body[level..]).unwrap_or(content)
             } else {
                 content
@@ -122,7 +131,7 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
                 ))
             };
             lines.push(line);
-            container = previous_container.after_indented_block(indentation);
+            container = block_container;
             continue;
         }
 
@@ -281,9 +290,7 @@ fn setext_title(line: &str) -> Option<&str> {
 }
 
 fn is_atx_heading_anchor(body: &str) -> bool {
-    let after_hashes = body.trim_start_matches('#');
-    let hashes = body.len() - after_hashes.len();
-    (1..=6).contains(&hashes) && (after_hashes.is_empty() || after_hashes.starts_with([' ', '\t']))
+    atx_opening(body).is_some()
 }
 
 fn paragraph_can_be_lazy(content: &str) -> bool {
@@ -445,19 +452,36 @@ fn rule_markers(line: &str) -> Option<RuleMarkers> {
     })
 }
 
-/// If `body` is an ATX heading, return `(level, content)`.
-fn heading(body: &str) -> Option<(usize, &str)> {
-    let hashes = body.chars().take_while(|&c| c == '#').count();
-    if (1..=6).contains(&hashes) {
-        let rest = &body[hashes..];
-        if let Some(content) = rest.strip_prefix(' ') {
-            return Some((hashes, content));
-        }
-    }
-    None
+fn atx_opening(body: &str) -> Option<(usize, &str)> {
+    let tail = body.trim_start_matches('#');
+    let level = body.len() - tail.len();
+    ((1..=6).contains(&level) && (tail.is_empty() || tail.starts_with([' ', '\t'])))
+        .then_some((level, tail))
 }
 
-/// Inspect the tail with the opener's space still present, so a closing
+/// Keep the existing space-delimited path for indented rows and tables.
+fn heading(body: &str) -> Option<(usize, &str)> {
+    let (level, tail) = atx_opening(body)?;
+    Some((level, tail.strip_prefix(' ')?))
+}
+
+fn top_level_atx_body(line: &str, container: ParagraphContainer) -> Option<&str> {
+    let body = top_level_body(line)?;
+    container
+        .enclosing_list(line.len() - body.len())
+        .is_none()
+        .then_some(body)
+}
+
+fn additional_atx_heading(body: &str, line_complete: bool) -> Option<(usize, &str)> {
+    let (level, tail) = atx_opening(body)?;
+    let content = tail
+        .strip_prefix('\t')
+        .or_else(|| (line_complete && tail.is_empty()).then_some(tail))?;
+    Some((level, content))
+}
+
+/// Inspect the tail with the opener's separator still present, so a closing
 /// sequence can also follow an empty title.
 fn heading_without_closing_hashes(tail: &str) -> Option<&str> {
     let end = tail.trim_end_matches([' ', '\t']);
@@ -466,7 +490,7 @@ fn heading_without_closing_hashes(tail: &str) -> Option<&str> {
         return None;
     }
     let title = before_hashes.trim_end_matches([' ', '\t']);
-    Some(title.strip_prefix(' ').unwrap_or(title))
+    Some(title.strip_prefix([' ', '\t']).unwrap_or(title))
 }
 
 fn heading_style(level: usize) -> Style {
@@ -976,12 +1000,113 @@ mod tests {
     }
 
     #[test]
+    fn top_level_atx_tab_opener_keeps_the_existing_heading_style() {
+        for level in 1..=6 {
+            let hashes = "#".repeat(level);
+            let tabbed = format!("   {hashes}\t重点 *next* 🧪 `code`");
+            let spaced = format!("{hashes} 重点 *next* 🧪 `code`");
+            assert_eq!(
+                render_streaming_markdown(&tabbed, 80),
+                render_markdown(&spaced, 80),
+                "{tabbed:?}"
+            );
+        }
+        assert_eq!(render("##\tTitle ##"), ["Title"]);
+        assert_eq!(render("##\t###"), [""]);
+        assert_eq!(render("##\tC#"), ["C#"]);
+        assert_eq!(
+            text_of(&render_streaming_markdown("##\tTitle ##", 80)[0]),
+            "Title ##"
+        );
+    }
+
+    #[test]
+    fn bare_atx_openers_wait_for_a_physical_line_or_completed_eof() {
+        for level in 1..=6 {
+            let hashes = "#".repeat(level);
+            let empty_heading = render_markdown(&format!("{hashes} "), 80);
+            assert_eq!(text_of(&render_streaming_markdown(&hashes, 80)[0]), hashes);
+            assert_eq!(render_markdown(&hashes, 80), empty_heading);
+            assert_eq!(
+                render_streaming_markdown(&format!("   {hashes}\r\n"), 80),
+                empty_heading
+            );
+        }
+        for source in ["#######", "#tag", "#5 bolt", "#\u{a0}name", r"\#"] {
+            assert_eq!(render(source), [source], "{source:?}");
+            assert_eq!(text_of(&render_streaming_markdown(source, 80)[0]), source);
+        }
+
+        assert_eq!(
+            render("###\n---\n\nAnother heading\n---"),
+            ["", &"─".repeat(80), "", "Another heading"]
+        );
+        assert_eq!(render("##\tATX\n---"), ["ATX", &"─".repeat(80)]);
+    }
+
+    #[test]
+    fn new_atx_openers_leave_existing_indented_and_contained_lines_literal() {
+        assert_eq!(
+            render(concat!(
+                "    ##\n",
+                "\t##\tTab indentation\n",
+                "\u{a0}##\tUnicode indentation\n",
+                "- Item\n",
+                "  ##\tList heading\n",
+                "  ###\n",
+                "> ##\tQuoted heading\n",
+            )),
+            [
+                "    ##",
+                "  ##\tTab indentation",
+                "\u{a0}##\tUnicode indentation",
+                "  • Item",
+                "  ##\tList heading",
+                "  ###",
+                "│ ##\tQuoted heading",
+            ]
+        );
+        let fenced = render("```md\n##\tFenced heading\n###\n```");
+        assert!(fenced
+            .iter()
+            .any(|line| line.contains("##    Fenced heading")));
+        assert!(fenced.iter().any(|line| line.contains("###")));
+    }
+
+    #[test]
+    fn table_boundaries_use_only_confirmed_top_level_atx_openers() {
+        const TABLE: &str = "| Name | Status |\n| --- | --- |\n| Alpha | Ready |\n";
+        let table = render_markdown(TABLE, 80);
+        let heading = render_markdown("### ", 80);
+        let finished = render_streaming_markdown(&format!("{TABLE}###\r\n"), 80);
+        assert_eq!(finished, [table.clone(), heading].concat());
+        let incomplete = render_streaming_markdown(&format!("{TABLE}###"), 80);
+        assert_eq!(&incomplete[..table.len()], table.as_slice());
+        assert!(text_of(incomplete.last().unwrap()).contains("###"));
+
+        let rejected_header = render_markdown("##\tName | Status\n--- | ---\nAlpha | Ready", 80);
+        assert_eq!(
+            rejected_header[0],
+            render_markdown("## Name | Status", 80)[0]
+        );
+
+        // The table at column zero ends the previous list before its rows.
+        let outside = render(&format!("- Item\n\n{TABLE}  ##\tNext section"));
+        assert_eq!(outside.last().map(String::as_str), Some("Next section"));
+        let inside = render(
+            "- Item\n\n  | Name | Status |\n  | --- | --- |\n  | Alpha | Ready |\n  ##\tNested",
+        );
+        assert!(inside.last().unwrap().contains("##  Nested"));
+    }
+
+    #[test]
     fn atx_closing_hashes_trim_only_a_terminal_whitespace_delimited_run() {
         for (closed, equivalent_title) in [
             ("# Title ############ \t", "# Title"),
             ("   ### **重点** 🧪 `code`\t#", "   ### **重点** 🧪 `code`"),
             ("### ###", "### "),
             ("##  Title ##", "##  Title"),
+            ("##\tTab opener ##", "## Tab opener"),
         ] {
             assert_eq!(
                 render_markdown(closed, 80),
@@ -1001,7 +1126,6 @@ mod tests {
             ("# A `###`", "A ###"),
             ("# A **###**", "A ###"),
             ("####### Not a heading ##", "####### Not a heading ##"),
-            ("##\tTab opener ##", "##\tTab opener ##"),
         ] {
             assert_eq!(render(source), [display], "{source:?}");
         }
@@ -1165,8 +1289,6 @@ mod tests {
     #[test]
     fn setext_does_not_promote_block_openers_or_invalid_indentation() {
         for title in [
-            "#",
-            "##\tATX",
             ">quote",
             "+ item",
             "1) item",

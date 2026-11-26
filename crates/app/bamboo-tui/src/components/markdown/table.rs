@@ -17,6 +17,7 @@ pub(super) fn render_if_table<'a>(
     header: &str,
     input: &mut Peekable<impl Iterator<Item = SourceLine<'a>>>,
     width: usize,
+    opens_heading: impl Fn(SourceLine<'a>) -> bool,
 ) -> Option<Vec<Line<'static>>> {
     let delimiter = input.peek()?.text;
     if !delimiter.contains('|') || ends_table(header) {
@@ -34,7 +35,7 @@ pub(super) fn render_if_table<'a>(
     input.next();
 
     let mut rows = vec![styled_row(header, columns, false)];
-    while let Some(line) = input.next_if(|line| !ends_table(line.text)) {
+    while let Some(line) = input.next_if(|line| !ends_table(line.text) && !opens_heading(*line)) {
         // A marker-only row still inside the table is an unfinished rule.
         let literal = super::rule_markers(line.text).is_some();
         rows.push(styled_row(split_row(line.text), columns, literal));
