@@ -871,6 +871,22 @@ pub struct ListSchedulesResponse {
     pub schedules: Vec<ScheduleView>,
 }
 
+/// Wire envelope of `GET /api/v1/schedules/{schedule_id}/runs`.
+#[derive(Deserialize, Debug)]
+pub struct ListScheduleRunsResponse {
+    pub schedule_id: String,
+    pub runs: Vec<ScheduleRunView>,
+}
+
+/// The fields shown in a schedule's run history. A string status keeps newly
+/// added server statuses readable without a corresponding TUI update.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRunView {
+    pub run_id: String,
+    pub scheduled_for: DateTime<Utc>,
+    pub status: String,
+}
+
 /// Subset of the server's `ScheduleView` the TUI consumes. The full trigger
 /// enum is kept as an opaque `Value` (see [`trigger_display`]) so new trigger
 /// kinds don't break deserialization.

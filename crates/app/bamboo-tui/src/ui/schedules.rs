@@ -1,11 +1,12 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, ScheduleRunsContent};
 use crate::keymap::{ActionContext, ActionId};
+use crate::text::clip_cells;
 use crate::theme::colors;
 use crate::ui::sessions::{truncate_cells, visible_window};
 
@@ -122,13 +123,137 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Footer
     let footer_text = format!(
-        " {} new · {} delete · {} run now",
+        " {} runs · {} new · {} delete · {} run now",
+        app.primary_key_hint(ActionContext::Schedules, ActionId::Activate),
         app.key_hint(ActionContext::Schedules, ActionId::NewSchedule),
         app.key_hint(ActionContext::Schedules, ActionId::DeleteSelection),
         app.key_hint(ActionContext::Schedules, ActionId::RunSchedule),
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[2]);
+}
+
+pub(super) fn render_runs(f: &mut Frame, app: &App) {
+    let Some(pane) = &app.schedule_runs else {
+        return;
+    };
+    let screen = f.area();
+    let width = screen.width.saturating_sub(2).min(72);
+    let height = screen.height.saturating_sub(2).min(16);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let content_width = usize::from(width.saturating_sub(2));
+    let content_height = usize::from(height.saturating_sub(2));
+    let key = |action| app.primary_key_hint(ActionContext::ScheduleRuns, action);
+    let close = format!("  {} close", key(ActionId::Cancel));
+    let mut footer = Vec::new();
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "  {}",
+            clip_run_text(&pane.name, content_width.saturating_sub(2))
+        ),
+        Style::default()
+            .fg(colors::brand())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let muted = Style::default().fg(colors::subtle());
+    match &pane.content {
+        ScheduleRunsContent::Loading => {
+            lines.push(Line::styled("  Loading runs…", muted));
+        }
+        ScheduleRunsContent::Failed(error) => {
+            lines.push(Line::styled(
+                format!(
+                    "  {}",
+                    clip_run_text(error, content_width.saturating_sub(2))
+                ),
+                Style::default().fg(colors::error()),
+            ));
+        }
+        ScheduleRunsContent::Loaded(runs) if runs.is_empty() => {
+            lines.push(Line::styled("  No runs recorded.", muted));
+        }
+        ScheduleRunsContent::Loaded(runs) => {
+            footer.push(format!(
+                "  {}/{} move · {}/{} page",
+                key(ActionId::NavigateUp),
+                key(ActionId::NavigateDown),
+                key(ActionId::PageUp),
+                key(ActionId::PageDown),
+            ));
+            lines.push(Line::styled(
+                format!("  {:<19}  Status", "Scheduled (UTC)"),
+                muted,
+            ));
+            let capacity = content_height.saturating_sub(lines.len() + footer.len() + 1);
+            let selected = pane.selected.min(runs.len() - 1);
+            let visible = visible_window(runs.len(), selected, capacity);
+            pane.rows_per_page.set(visible.len().max(1));
+            for index in visible {
+                let run = &runs[index];
+                let is_selected = index == selected;
+                let marker = if is_selected { '›' } else { ' ' };
+                let time = format!(
+                    "{marker} {}  ",
+                    run.scheduled_for.format("%Y-%m-%d %H:%M:%S")
+                );
+                let time_style = if is_selected {
+                    Style::default()
+                        .fg(colors::brand())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(colors::inactive())
+                };
+                let status_color = match run.status.as_str() {
+                    "success" => colors::success(),
+                    "running" => colors::tool_running(),
+                    "failed" => colors::error(),
+                    "missed" | "skipped" => colors::warning(),
+                    _ => colors::inactive(),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(time, time_style),
+                    Span::styled(
+                        clip_run_text(&run.status, content_width.saturating_sub(23)),
+                        Style::default().fg(status_color),
+                    ),
+                ]));
+            }
+        }
+    }
+    footer.push(close);
+    lines.resize_with(content_height.saturating_sub(footer.len()), || {
+        Line::raw("")
+    });
+    lines.extend(
+        footer
+            .into_iter()
+            .map(|hint| Line::styled(clip_cells(&hint, content_width), muted)),
+    );
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::brand()))
+                .title(" Recent runs "),
+        ),
+        area,
+    );
+}
+
+fn clip_run_text(value: &str, width: usize) -> String {
+    let text: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(width.saturating_mul(4))
+        .collect();
+    clip_cells(&text, width)
 }
 
 fn schedule_row_line(
@@ -193,8 +318,12 @@ fn schedule_row_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::Schedule;
+    use chrono::{TimeDelta, TimeZone, Utc};
+
+    use crate::api::types::{Schedule, ScheduleRunView};
     use crate::api::BambooClient;
+    use crate::app::{ScheduleRunsPane, Tab};
+    use crate::keymap::Keymap;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -243,6 +372,113 @@ mod tests {
             "compact action footer missing:\n{text}"
         );
         assert!(text.contains("n new"), "new action footer missing:\n{text}");
+        assert!(
+            text.contains("Enter runs"),
+            "runs action footer missing:\n{text}"
+        );
         assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
+    }
+
+    fn terminal_rows(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area().width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn recent_runs_keeps_the_selected_unknown_status_and_shortcuts_visible() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        let mut pane = ScheduleRunsPane::new("schedule-1".into(), "Daily review".into(), 1);
+        let time = Utc.with_ymd_and_hms(2026, 11, 26, 8, 0, 30).unwrap();
+        pane.content = ScheduleRunsContent::Loaded(
+            (0..30)
+                .map(|index| ScheduleRunView {
+                    run_id: format!("run-{index}"),
+                    scheduled_for: time - TimeDelta::seconds(index),
+                    status: if index == 24 {
+                        "future_status"
+                    } else {
+                        "success"
+                    }
+                    .into(),
+                })
+                .collect(),
+        );
+        pane.selected = 24;
+        app.schedule_runs = Some(pane);
+        let mut terminal = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        terminal.draw(|frame| render_runs(frame, &app)).unwrap();
+        let text = terminal_rows(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_RUNS").is_some() {
+            println!("Schedule runs preview\n{text}");
+        }
+        for expected in [
+            "Recent runs",
+            "Daily review",
+            "Scheduled (UTC)",
+            "Status",
+            "› 2026-11-26 08:00:06  future_status",
+            "Up/Down move",
+            "PageUp/PageDown page",
+            "Esc close",
+        ] {
+            assert!(text.contains(expected), "expected {expected:?}\n{text}");
+        }
+        assert!(
+            text.find("08:00:07").unwrap() < text.find("08:00:06").unwrap(),
+            "{text}"
+        );
+        assert!(!text.contains("08:00:30"), "{text}");
+        assert_eq!(app.schedule_runs.as_ref().unwrap().rows_per_page.get(), 7);
+    }
+
+    #[test]
+    fn recent_run_states_remain_closable_and_list_advertises_remapped_action() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"activate","keys":["F8"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal_rows(&terminal);
+        assert!(
+            text.contains("F8 runs") && text.contains("r run now"),
+            "{text}"
+        );
+        let mut pane = ScheduleRunsPane::new("schedule-1".into(), "Daily review".into(), 1);
+        for (content, expected) in [
+            (ScheduleRunsContent::Loading, "Loading runs"),
+            (ScheduleRunsContent::Loaded(Vec::new()), "No runs recorded"),
+            (
+                ScheduleRunsContent::Failed("Unable to load runs.".into()),
+                "Unable to load runs.",
+            ),
+        ] {
+            pane.content = content;
+            app.schedule_runs = Some(pane);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal_rows(&terminal);
+            assert!(
+                text.contains("Recent runs")
+                    && text.contains(expected)
+                    && text.contains("Esc close"),
+                "{text}"
+            );
+            pane = app.schedule_runs.take().unwrap();
+        }
     }
 }
