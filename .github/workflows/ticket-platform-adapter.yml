@@ -33,6 +33,7 @@ on:
           - rust-immutable
           - rust-head
           - rust-graph
+          - rust-graph-process-exit
 
 permissions:
   contents: read
@@ -202,7 +203,7 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Probe Windows Ticket primitives as a standard user
-        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable' && inputs.windows_ticket_probe_case != 'rust-head' && inputs.windows_ticket_probe_case != 'rust-graph'
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable' && inputs.windows_ticket_probe_case != 'rust-head' && inputs.windows_ticket_probe_case != 'rust-graph' && inputs.windows_ticket_probe_case != 'rust-graph-process-exit'
         env:
           PROBE_CASE: ${{ inputs.windows_ticket_probe_case }}
         shell: pwsh
@@ -250,6 +251,11 @@ jobs:
         if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-graph'
         shell: pwsh
         run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-graph
+
+      - name: Probe Rust Windows Ticket graph reopen after writer exit
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-graph-process-exit'
+        shell: pwsh
+        run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-graph-process-exit
 
       - name: Verify the Windows Ticket probe left the exact source clean
         if: always() && inputs.windows_ticket_probe_sha != ''
