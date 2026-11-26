@@ -137,8 +137,20 @@ public static partial class WindowsTicketDirectoryFlushProbe
             return error == 0;
         }
 
-        private bool ReadHeld(SafeFileHandle file, Dictionary<string, object> receipt,
-            string expectedId, byte[] expected)
+        private SafeFileHandle OpenPublicationScope(PublicationPhase phase)
+        {
+            SafeFileHandle handle = OpenPublicationObject(phase, "scope_write_open", ancestry[ancestry.Count - 2],
+                Path.GetFileName(path), GenericWrite | WriterDirectoryAccess, WriterShare, NtOpen, directory: true);
+            try
+            {
+                if (PublicationIdentity(handle, path, true).Id != folderId)
+                    throw new IOException("The writable scope handle does not name the retained scope.");
+                return handle;
+            }
+            catch { handle.Dispose(); throw; }
+        }
+
+        private static byte[] ReadPublicationBytes(SafeFileHandle file, Dictionary<string, object> receipt, int limit)
         {
             // Replaced old readers may have no current name. FileIdInfo and I/O work through the handle.
             bool identityRead = ReadFileIdentity(file, FileIdInfo, out FileIdentity identity,
@@ -153,16 +165,24 @@ public static partial class WindowsTicketDirectoryFlushProbe
             bool seek = SetFilePointerEx(file, 0, out long position, 0);
             int seekError = seek ? 0 : FailureCode("Seek the publication file");
             receipt["seek"] = Operation(seekError);
-            if (!seek || position != 0) return false;
+            if (!seek || position != 0) return null;
 
-            var buffer = new byte[expected.Length + 1];
+            var buffer = new byte[limit + 1];
             bool read = ReadFile(file, buffer, (uint)buffer.Length, out uint count, IntPtr.Zero);
             int readError = read ? 0 : FailureCode("Read the publication file");
             receipt["read"] = Operation(readError);
-            if (!read || count > buffer.Length) return false;
-            receipt["bytes_hex"] = Convert.ToHexString(buffer.AsSpan(0, (int)count)).ToLowerInvariant();
-            bool exact = identityRead && identity.Id == expectedId && identity.Volume == volumeSerial &&
-                buffer.AsSpan(0, (int)count).SequenceEqual(expected);
+            if (!read || count > buffer.Length) return null;
+            byte[] actual = buffer.AsSpan(0, (int)count).ToArray();
+            receipt["bytes_hex"] = Hex(actual);
+            return actual;
+        }
+
+        private bool MatchPublicationRead(byte[] actual, Dictionary<string, object> receipt,
+            string expectedId, byte[] expected)
+        {
+            if (actual == null) return false;
+            bool exact = receipt.TryGetValue("file_id", out object id) && (string)id == expectedId &&
+                (string)receipt["volume_serial"] == volumeSerial && actual.AsSpan().SequenceEqual(expected);
             receipt["matched"] = exact;
             return exact;
         }
@@ -172,21 +192,30 @@ public static partial class WindowsTicketDirectoryFlushProbe
         {
             var receipt = new Dictionary<string, object>();
             phase.Record(operation, receipt);
-            return ReadHeld(file, receipt, expectedId, expected);
+            byte[] actual = ReadPublicationBytes(file, receipt, expected.Length);
+            return MatchPublicationRead(actual, receipt, expectedId, expected);
+        }
+
+        private byte[] ReadPublicationName(PublicationPhase phase, string operation, SafeFileHandle directory,
+            string dirPath, string name, int limit, out Dictionary<string, object> receipt, out int status)
+        {
+            using (var handle = OpenWriterRelative(directory, name, GenericRead | WriterSynchronize,
+                PublicationShare, NtOpen, directory: false, out status))
+            {
+                receipt = new Dictionary<string, object> { ["open"] = RenameResult(status, "open"), ["name"] = name };
+                phase.Record(operation, receipt);
+                if (handle == null) return null;
+                PublicationIdentity(handle, Path.Combine(dirPath, name), false);
+                return ReadPublicationBytes(handle, receipt, limit);
+            }
         }
 
         private bool ReadNamed(PublicationPhase phase, string operation, SafeFileHandle directory,
             string dirPath, string name, string expectedId, byte[] expected)
         {
-            using (var handle = OpenWriterRelative(directory, name, GenericRead | WriterSynchronize,
-                PublicationShare, NtOpen, directory: false, out int status))
-            {
-                var receipt = new Dictionary<string, object> { ["open"] = RenameResult(status, "open"), ["name"] = name };
-                phase.Record(operation, receipt);
-                if (handle == null) return false;
-                PublicationIdentity(handle, Path.Combine(dirPath, name), false);
-                return ReadHeld(handle, receipt, expectedId, expected);
-            }
+            byte[] actual = ReadPublicationName(phase, operation, directory, dirPath, name, expected.Length,
+                out Dictionary<string, object> receipt, out _);
+            return MatchPublicationRead(actual, receipt, expectedId, expected);
         }
 
         private static bool CheckAbsent(PublicationPhase phase, SafeFileHandle directory, string name)
@@ -335,12 +364,8 @@ public static partial class WindowsTicketDirectoryFlushProbe
             var noSourceDelete = head.Child("no_source_delete");
             var noReaderDeleteShare = head.Child("no_reader_delete_share");
             var replace = head.Child("replace");
-            string scopeName = Path.GetFileName(path);
-            using (var writable = OpenPublicationObject(head, "scope_write_open", ancestry[ancestry.Count - 2],
-                scopeName, GenericWrite | WriterDirectoryAccess, WriterShare, NtOpen, directory: true))
+            using (var writable = OpenPublicationScope(head))
             {
-                if (PublicationIdentity(writable, path, true).Id != folderId)
-                    throw new IOException("The writable scope handle does not name the retained scope.");
                 byte[] oldContent = Encoding.ASCII.GetBytes(ContentName(Encoding.ASCII.GetBytes("old snapshot")) + "\n");
                 byte[] newContent = Encoding.ASCII.GetBytes(ContentName(Encoding.ASCII.GetBytes("new snapshot")) + "\n");
                 string oldId = null;

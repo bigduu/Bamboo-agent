@@ -1,5 +1,5 @@
-function Start-TicketWriterChild {
-    param($Role, $ExpectedSid, $FixtureDirectory, $ReceiptPath, $EntryScript, $ExpectedLockId)
+function Start-TicketProbeChild {
+    param($Role, $EntryScript, [string[]]$Arguments)
 
     $launch = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
     $launch.UseShellExecute = $false
@@ -7,16 +7,8 @@ function Start-TicketWriterChild {
     $launch.RedirectStandardInput = $true
     $launch.RedirectStandardOutput = $true
     $launch.RedirectStandardError = $true
-    foreach ($argument in @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $EntryScript,
-        '-ExpectedSid', $ExpectedSid, '-FixtureDirectory', $FixtureDirectory,
-        '-ReceiptPath', $ReceiptPath, '-ProbeCase', 'writer-lock', '-WriterRole', $Role
-    )) {
+    foreach ($argument in (@('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $EntryScript) + $Arguments)) {
         $launch.ArgumentList.Add($argument)
-    }
-    if ($ExpectedLockId) {
-        $launch.ArgumentList.Add('-WriterExpectedLockId')
-        $launch.ArgumentList.Add($ExpectedLockId)
     }
     $process = [System.Diagnostics.Process]::Start($launch)
     $errorBuffer = [char[]]::new(4097)
@@ -28,14 +20,25 @@ function Start-TicketWriterChild {
     }
 }
 
-function Stop-TicketWriterChild {
+function Start-TicketWriterChild {
+    param($Role, $ExpectedSid, $FixtureDirectory, $ReceiptPath, $EntryScript, $ExpectedLockId)
+
+    $arguments = @(
+        '-ExpectedSid', $ExpectedSid, '-FixtureDirectory', $FixtureDirectory,
+        '-ReceiptPath', $ReceiptPath, '-ProbeCase', 'writer-lock', '-WriterRole', $Role
+    )
+    if ($ExpectedLockId) { $arguments += @('-WriterExpectedLockId', $ExpectedLockId) }
+    return Start-TicketProbeChild -Role $Role -EntryScript $EntryScript -Arguments $arguments
+}
+
+function Stop-TicketProbeChild {
     param($Child)
 
     try {
         if (-not $Child.Process.HasExited) {
             $Child.Process.Kill($true)
             if (-not $Child.Process.WaitForExit(3000)) {
-                throw "Writer probe child '$($Child.Role)' failed to stop."
+                throw "Ticket probe child '$($Child.Role)' failed to stop."
             }
         }
     } finally {
@@ -43,7 +46,7 @@ function Stop-TicketWriterChild {
     }
 }
 
-function Read-TicketWriterChildReceipt {
+function Read-TicketProbeChildReceipt {
     param($Child)
 
     # The holder keeps stdout open after its ready receipt, so read one bounded
@@ -54,7 +57,7 @@ function Read-TicketWriterChildReceipt {
     while ($count -lt $buffer.Length) {
         $remaining = [TimeSpan]::FromSeconds(20) - $deadline.Elapsed
         if ($remaining -le [TimeSpan]::Zero) {
-            throw "Writer probe child '$($Child.Role)' timed out before its receipt."
+            throw "Ticket probe child '$($Child.Role)' timed out before its receipt."
         }
         $readTask = $Child.Process.StandardOutput.ReadAsync($buffer, $count, $buffer.Length - $count)
         $read = $readTask.WaitAsync($remaining).GetAwaiter().GetResult()
@@ -63,7 +66,7 @@ function Read-TicketWriterChildReceipt {
         $count += $read
         if ($lineEnd -ge 0) {
             if ($lineEnd -ne $count - 1) {
-                throw "Writer probe child '$($Child.Role)' emitted extra stdout."
+                throw "Ticket probe child '$($Child.Role)' emitted extra stdout."
             }
             $line = [string]::new($buffer, 0, $lineEnd).TrimEnd([char]13)
             return ConvertFrom-Json -InputObject $line -AsHashtable -Depth 16
@@ -71,31 +74,31 @@ function Read-TicketWriterChildReceipt {
     }
 
     if ($count -eq $buffer.Length) {
-        throw "Writer probe child '$($Child.Role)' exceeded the stdout receipt limit."
+        throw "Ticket probe child '$($Child.Role)' exceeded the stdout receipt limit."
     }
-    Complete-TicketWriterChild $Child
-    throw "Writer probe child '$($Child.Role)' did not emit a complete receipt."
+    Complete-TicketProbeChild $Child
+    throw "Ticket probe child '$($Child.Role)' did not emit a complete receipt."
 }
 
-function Complete-TicketWriterChild {
-    param($Child)
+function Complete-TicketProbeChild {
+    param($Child, [int]$ExpectedExitCode = 0)
 
     $process = $Child.Process
     if (-not $process.WaitForExit(20000)) {
-        throw "Writer probe child '$($Child.Role)' did not exit."
+        throw "Ticket probe child '$($Child.Role)' did not exit."
     }
     $limit = [TimeSpan]::FromSeconds(2)
     $errorLength = $Child.ErrorRead.WaitAsync($limit).GetAwaiter().GetResult()
     if ($errorLength -eq $Child.ErrorBuffer.Length) {
-        throw "Writer probe child '$($Child.Role)' exceeded the stderr limit."
+        throw "Ticket probe child '$($Child.Role)' exceeded the stderr limit."
     }
-    if ($process.ExitCode -ne 0 -or $errorLength -ne 0) {
+    if ($process.ExitCode -ne $ExpectedExitCode -or $errorLength -ne 0) {
         $errorText = [string]::new($Child.ErrorBuffer, 0, $errorLength).TrimEnd()
-        throw "Writer probe child '$($Child.Role)' exited $($process.ExitCode). $errorText"
+        throw "Ticket probe child '$($Child.Role)' exited $($process.ExitCode). $errorText"
     }
     $extra = [char[]]::new(1)
     if ($process.StandardOutput.ReadAsync($extra, 0, 1).WaitAsync($limit).GetAwaiter().GetResult() -ne 0) {
-        throw "Writer probe child '$($Child.Role)' emitted extra stdout."
+        throw "Ticket probe child '$($Child.Role)' emitted extra stdout."
     }
 }
 
@@ -104,14 +107,14 @@ function Invoke-TicketWriterChild {
 
     $child = Start-TicketWriterChild @PSBoundParameters
     try {
-        $result = Read-TicketWriterChildReceipt $child
-        Complete-TicketWriterChild $child
+        $result = Read-TicketProbeChildReceipt $child
+        Complete-TicketProbeChild $child
         if ($result.pid -ne $child.Process.Id) {
-            throw "Writer probe child '$Role' did not attest its own process identity."
+            throw "Ticket probe child '$Role' did not attest its own process identity."
         }
         return $result
     } finally {
-        Stop-TicketWriterChild $child
+        Stop-TicketProbeChild $child
     }
 }
 
@@ -230,7 +233,7 @@ function Invoke-TicketWriterLockCases {
 
         $holder = Start-TicketWriterChild -Role exit-holder @childArgs
         try {
-            $exitHolder = Read-TicketWriterChildReceipt $holder
+            $exitHolder = Read-TicketProbeChildReceipt $holder
             if ($exitHolder.pid -ne $holder.Process.Id -or $holder.Process.HasExited) {
                 throw 'The exit holder did not attest a live process.'
             }
@@ -240,9 +243,9 @@ function Invoke-TicketWriterLockCases {
             if ($holder.Process.HasExited) { throw 'The exit holder dropped before the exit signal.' }
             $holder.Process.StandardInput.WriteLine('exit')
             $holder.Process.StandardInput.Close()
-            Complete-TicketWriterChild $holder
+            Complete-TicketProbeChild $holder
         } finally {
-            Stop-TicketWriterChild $holder
+            Stop-TicketProbeChild $holder
         }
 
         $exitAttempts = [System.Collections.Generic.List[object]]::new()

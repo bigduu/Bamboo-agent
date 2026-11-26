@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock', 'publication')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -102,6 +102,39 @@ function Assert-PublicationProbe($Receipt) {
     }
 }
 
+function Assert-PublicationProcessExitProbe($Receipt, [int] $CoordinatorProcessId) {
+    $cuts = @('complete', 'before-head-replace', 'after-head-replace', 'after-scope-flush')
+    if ($Receipt.probe -cne 'publication-process-exit' -or $Receipt.coordinator_pid -ne $CoordinatorProcessId -or
+        $Receipt.process_exit_qualified -isnot [bool] -or @($Receipt.cases.PSObject.Properties).Count -ne $cuts.Count) {
+        throw 'The publication process receipt did not identify its coordinator and cases.'
+    }
+    $qualified = $true
+    foreach ($cut in $cuts) {
+        $trial = $Receipt.cases.PSObject.Properties[$cut].Value
+        if ($trial.cut -cne $cut -or $trial.qualified -isnot [bool]) {
+            throw "Invalid publication process receipt for '$cut'."
+        }
+        $qualified = $qualified -and $trial.qualified
+        if (-not $trial.qualified) { continue }
+        $clean = $cut -eq 'complete'
+        $writerRecord = if ($clean) { 'complete' } else { 'cut_reached' }
+        $expectedExitCode = if ($clean) { 0 } else { 0x4254 }
+        $expectedTermination = if ($clean) { $null } else { 0 }
+        if ($trial.writer_terminated -ne (-not $clean) -or $trial.writer_exit_code -ne $expectedExitCode -or
+            $trial.termination_win32_error -ne $expectedTermination -or $trial.writer.record -cne $writerRecord -or
+            $trial.verifier.record -cne 'verification' -or $trial.writer.pid -eq $trial.verifier.pid -or
+            $trial.writer.pid -eq $CoordinatorProcessId -or $trial.verifier.pid -eq $CoordinatorProcessId -or
+            $trial.writer.lock.file_id -cne $trial.verifier.lock.file_id -or
+            $trial.writer.volume.fixture_directory_file_id -cne $trial.verifier.volume.fixture_directory_file_id) {
+            throw "The qualified '$cut' receipt lacks its process boundary or independent reopen."
+        }
+    }
+    $expectedVerdict = if ($qualified) { 'available' } else { 'unavailable' }
+    if ($Receipt.process_exit_qualified -ne $qualified -or $Receipt.verdict -cne $expectedVerdict) {
+        throw 'The publication process verdict does not match its native cases.'
+    }
+}
+
 $runnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $usersSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
@@ -151,10 +184,15 @@ try {
     if ($ProbeCase -ne 'directory-flush') {
         $probeFiles['windows-ticket-writer-lock-native.cs'] = 'windows-ticket-writer-lock-native.cs'
     }
-    if ($ProbeCase -eq 'writer-lock') {
+    if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) {
         $probeFiles['windows-ticket-writer-lock-cases.ps1'] = 'windows-ticket-writer-lock-cases.ps1'
-    } elseif ($ProbeCase -eq 'publication') {
+    }
+    if ($ProbeCase -in @('publication', 'publication-process-exit')) {
         $probeFiles['windows-ticket-publication-native.cs'] = 'windows-ticket-publication-native.cs'
+    }
+    if ($ProbeCase -eq 'publication-process-exit') {
+        $probeFiles['windows-ticket-publication-process-exit-native.cs'] = 'windows-ticket-publication-process-exit-native.cs'
+        $probeFiles['windows-ticket-publication-process-exit-cases.ps1'] = 'windows-ticket-publication-process-exit-cases.ps1'
     }
     $stagedHashes = @{}
     foreach ($filename in $probeFiles.Keys) {
@@ -198,7 +236,7 @@ try {
     $process = [System.Diagnostics.Process]::Start($launch)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $timeoutSeconds = if ($ProbeCase -eq 'writer-lock') { 180 } else { 90 }
+    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit')) { 180 } else { 90 }
     if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
         throw "The standard-user probe exceeded its $timeoutSeconds-second deadline."
     }
@@ -215,7 +253,8 @@ try {
 
     $receiptJson = Get-Content -LiteralPath $receiptPath -Raw
     $receipt = $receiptJson | ConvertFrom-Json
-    if ($ProbeCase -eq 'publication') { Write-Output $receiptJson.TrimEnd() }
+    $publicationProbe = $ProbeCase -in @('publication', 'publication-process-exit')
+    if ($publicationProbe) { Write-Output $receiptJson.TrimEnd() }
     if ($receipt.schema -ne 1 -or $receipt.process_architecture -cne 'X64' -or
         [string]::IsNullOrWhiteSpace($receipt.windows_version) -or
         $receipt.token.sid -ne $account.SID.Value -or
@@ -232,6 +271,8 @@ try {
         Assert-WriterProbe $receipt $process.Id
     } elseif ($ProbeCase -eq 'publication') {
         Assert-PublicationProbe $receipt
+    } elseif ($ProbeCase -eq 'publication-process-exit') {
+        Assert-PublicationProcessExitProbe $receipt $process.Id
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
@@ -255,7 +296,7 @@ try {
             throw 'A staged probe file changed during the trial.'
         }
     }
-    if ($ProbeCase -ne 'publication') { Write-Output $receiptJson.TrimEnd() }
+    if (-not $publicationProbe) { Write-Output $receiptJson.TrimEnd() }
 } finally {
     try {
         if ($process) {
