@@ -519,7 +519,11 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                 }
-                let rendered = markdown::render_markdown(content, width);
+                let rendered = if streaming {
+                    markdown::render_streaming_markdown(content, width)
+                } else {
+                    markdown::render_markdown(content, width)
+                };
                 lines.extend(rendered);
             }
             ConversationBlockKind::Reasoning { content, streaming } => {
@@ -1482,7 +1486,7 @@ mod tests {
             "***\n",
             "Examples follow.\n\n",
             "___\n",
-            "Possible Setext heading\n",
+            "Setext heading\n",
             "---\n\n",
             "- - -\n",
             "* * *\n",
@@ -1529,9 +1533,9 @@ mod tests {
             assert!(prose < divider_rows[0]);
             assert!(rows[row_for("Real bullet")].contains("• Real bullet"));
             assert!(rows[row_for("Real ordered item")].contains("2. Real ordered item"));
-            let possible_heading = row_for("Possible Setext heading");
-            assert_eq!(rows[possible_heading + 1].trim(), "---");
-            assert!(divider_rows[2] < possible_heading && possible_heading < divider_rows[3]);
+            let heading = row_for("Setext heading");
+            assert!(rows[heading + 1].trim().is_empty());
+            assert!(divider_rows[2] < heading && heading < divider_rows[3]);
 
             let table_header = row_for("Metric");
             let table_body = row_for("Ready");
@@ -1558,6 +1562,110 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "o" && cell.modifier.contains(Modifier::ITALIC)));
             assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_assistant_setext_headings_at_each_width() {
+        let source = concat!(
+            "Build **输出** 🧪 and `plan`\n=====\n\n",
+            "Next _steps_\n---\n---\n\n",
+            "```text\nLiteral title\n====\n---\n```\n\n",
+            "Metric | Value\n--- | ---\nBuild | Ready\n***\n",
+            "This paragraph has\ntwo lines.\n---\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-setext-headings".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 22)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, true);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SETEXT_HEADING").is_some() {
+                eprintln!("SETEXT HEADING PREVIEW\n{rendered}\nEND SETEXT HEADING PREVIEW");
+            }
+            let row_for = |prefix: &str| {
+                rows.iter()
+                    .position(|row| row.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("missing {prefix:?} at {width} columns\n{rendered}"))
+            };
+            let primary = row_for("Build ");
+            let secondary = row_for("Next steps");
+            let divider = "─".repeat(usize::from(width));
+            assert_eq!(rows[primary].replace(' ', ""), "Build输出🧪andplan");
+            assert!(rows[primary + 1].trim().is_empty());
+            assert_eq!(rows[secondary + 1], divider);
+
+            let cells = terminal.backend().buffer().content();
+            let cell_rows = cells.chunks(usize::from(width)).collect::<Vec<_>>();
+            assert_eq!(cell_rows[primary][0].fg, colors::brand());
+            assert!(cell_rows[primary][0].modifier.contains(Modifier::BOLD));
+            assert!(cell_rows[primary]
+                .iter()
+                .any(|cell| cell.symbol() == "p" && cell.modifier.contains(Modifier::REVERSED)));
+            assert!(cell_rows[secondary][0].modifier.contains(Modifier::BOLD));
+            assert!(cell_rows[secondary]
+                .iter()
+                .any(|cell| cell.symbol() == "s" && cell.modifier.contains(Modifier::ITALIC)));
+
+            let fence = fence_rows(&rows, "text");
+            assert_eq!(fence[2].trim_matches(['│', ' ']), "====");
+            assert_eq!(fence[3].trim_matches(['│', ' ']), "---");
+            let table = row_for("Metric");
+            assert!(rows[table].contains("Value") && !rows[table].contains('|'));
+            assert!(rows[table + 2].contains("Ready"));
+            assert_eq!(rows[table + 3], divider);
+            assert_eq!(rows[row_for("two lines.") + 1].trim(), "---");
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_defers_streamed_setext_until_newline_or_completion() {
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            for (title, marker) in [("Build outline", "="), ("Next steps", "-")] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.chat.streaming = true;
+                app.chat.current_turn_id = Some("run:setext".into());
+                let source = format!("{title}\r\n   {}\t", marker.repeat(3));
+                for partial in [format!("{title}\r\n{marker}"), source.clone()] {
+                    app.chat.current_response = partial.clone();
+                    let rows = transcript_rows(&mut terminal, &app, true);
+                    let first = rows.iter().position(|row| row.trim() == title).unwrap();
+                    assert_eq!(
+                        rows[first + 1].trim(),
+                        partial.lines().last().unwrap().trim()
+                    );
+                    let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                    assert!(!cell.modifier.contains(Modifier::BOLD));
+                    assert_eq!(app.chat.current_response, partial);
+                }
+
+                app.chat.current_response.push('\n');
+                let rows = transcript_rows(&mut terminal, &app, true);
+                let first = rows.iter().position(|row| row.trim() == title).unwrap();
+                assert!(rows[first + 1].trim().is_empty());
+                let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(app.chat.current_response, format!("{source}\n"));
+
+                app.chat.current_response.pop();
+                let rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(rows[first + 1].trim(), marker.repeat(3));
+                app.chat.streaming = false;
+                let rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(rows[first].trim(), title);
+                assert!(rows[first + 1].trim().is_empty());
+                let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(app.chat.current_response, source);
+            }
         }
     }
 

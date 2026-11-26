@@ -40,9 +40,17 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
-/// links, image descriptions, `#`..`######` headings, nested bullet and ordered lists,
-/// task-list checkboxes, thematic breaks, `>` blockquotes, and pipe tables.
+/// links, image descriptions, ATX and single-line Setext headings, nested
+/// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    render_markdown_preview(text, width, false)
+}
+
+pub(crate) fn render_streaming_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    render_markdown_preview(text, width, true)
+}
+
+fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
     let width = width as usize;
     if width == 0 {
         return Vec::new();
@@ -52,20 +60,28 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
 
     let mut input = fence::source_lines(source).peekable();
     let mut after_prose = false;
+    let mut container = ParagraphContainer::None;
     while let Some(line) = input.next() {
         let follows_prose = std::mem::take(&mut after_prose);
+        let previous_container = std::mem::take(&mut container);
+        let raw_line = line.text;
+        let body = raw_line.trim_start();
+        let raw_indent = &raw_line[..raw_line.len() - body.len()];
+        let indentation = column_after(0, raw_indent);
         if let Some(block) = fence::take_fence(source, line, &mut input) {
             render_code_block(&mut lines, block, width);
+            container = previous_container.after_indented_block(indentation);
             continue;
         }
-        let raw_line = line.text;
 
         if let Some(rows) = table::render_if_table(raw_line, &mut input, width) {
             lines.extend(rows);
+            container = previous_container.after_indented_block(indentation);
             continue;
         }
 
         if let Some(markers) = rule_markers(raw_line) {
+            container = previous_container.after_indented_block(indentation);
             let possible_setext = follows_prose && markers.contiguous_dashes;
             if markers.forms_break() && !possible_setext {
                 lines.push(Line::styled(
@@ -75,37 +91,35 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             } else {
                 lines.push(Line::raw(raw_line.to_owned()));
                 after_prose = !possible_setext;
+                if matches!(raw_line.trim(), "-" | "*") {
+                    if let Some(anchor) = list_anchor(raw_line) {
+                        container = previous_container.after_list(indentation, &anchor);
+                    }
+                }
             }
             continue;
         }
 
-        let indent_len = raw_line.len() - raw_line.trim_start().len();
-        let indent: String = raw_line[..indent_len].replace('\t', "  ");
-        let body = &raw_line[indent_len..];
+        let indent = raw_indent.replace('\t', "  ");
 
         // Headings: 1–6 leading '#'.
         if let Some((level, content)) = heading(body) {
-            let style = if level <= 1 {
-                Style::default()
-                    .fg(colors::brand())
-                    .add_modifier(Modifier::BOLD)
-            } else if level == 2 {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(colors::inactive())
-                    .add_modifier(Modifier::BOLD)
-            };
             let line = if content.contains('`') || content.contains('*') {
                 Line::from(parse_inline(content))
             } else {
-                Line::from(Span::styled(render_heading_images(content), style))
+                Line::from(Span::styled(
+                    render_heading_images(content),
+                    heading_style(level),
+                ))
             };
             lines.push(line);
+            container = previous_container.after_indented_block(indentation);
             continue;
         }
 
         // Blockquote.
+        let quote = body.strip_prefix('>');
+        let quote_can_continue = quote.is_some_and(paragraph_can_be_lazy);
         if let Some(content) = body
             .strip_prefix("> ")
             .or_else(|| body.eq("> ").then_some(""))
@@ -116,12 +130,34 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             )];
             spans.extend(parse_inline(content));
             lines.push(Line::from(spans));
+            container = previous_container.after_quote(indentation, quote_can_continue);
             continue;
         }
 
-        if let Some(item) = render_list_item(raw_line, &indent) {
-            lines.push(item);
-            continue;
+        if let Some(anchor) = list_anchor(raw_line) {
+            container = previous_container.after_list(indentation, &anchor);
+            if let Some(item) = render_list_item(&anchor, &indent) {
+                lines.push(item);
+                continue;
+            }
+        } else if quote.is_some() {
+            container = previous_container.after_quote(indentation, quote_can_continue);
+        } else {
+            container = previous_container.after_plain_line(body, indentation);
+        }
+
+        if !follows_prose && container == ParagraphContainer::None {
+            if let Some(content) = setext_title(raw_line) {
+                let level = input
+                    .peek()
+                    .filter(|underline| !streaming || source.as_bytes()[underline.end - 1] == b'\n')
+                    .and_then(|underline| setext_level(underline.text));
+                if let Some(level) = level {
+                    input.next();
+                    lines.push(Line::from(parse_inline(content)).style(heading_style(level)));
+                    continue;
+                }
+            }
         }
 
         if raw_line.is_empty() {
@@ -133,7 +169,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             }
             spans.extend(parse_inline(body));
             lines.push(Line::from(spans));
-            after_prose = !body.is_empty();
+            after_prose = !body.is_empty() && (quote.is_none() || quote_can_continue);
         }
     }
 
@@ -145,6 +181,205 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Keep ambiguous lazy continuations and indented list lines out of the
+/// single-line Setext path.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ParagraphContainer {
+    #[default]
+    None,
+    Quote,
+    List {
+        content_column: usize,
+        lazy: bool,
+    },
+}
+
+impl ParagraphContainer {
+    fn enclosing_list(self, indentation: usize) -> Option<usize> {
+        match self {
+            Self::List { content_column, .. } if indentation >= content_column => {
+                Some(content_column)
+            }
+            _ => None,
+        }
+    }
+
+    fn after_indented_block(self, indentation: usize) -> Self {
+        self.enclosing_list(indentation)
+            .map_or(Self::None, |content_column| Self::List {
+                content_column,
+                lazy: false,
+            })
+    }
+
+    fn after_quote(self, indentation: usize, lazy: bool) -> Self {
+        let outer = if lazy { Self::Quote } else { Self::None };
+        self.enclosing_list(indentation)
+            .map_or(outer, |content_column| Self::List {
+                content_column,
+                lazy,
+            })
+    }
+
+    fn after_list(self, indentation: usize, anchor: &ListAnchor<'_>) -> Self {
+        let content_column = self
+            .enclosing_list(indentation)
+            .unwrap_or_else(|| anchor.continuation_column());
+        Self::List {
+            content_column,
+            lazy: paragraph_can_be_lazy(anchor.rest),
+        }
+    }
+
+    fn after_plain_line(self, body: &str, indentation: usize) -> Self {
+        match self {
+            Self::List { content_column, .. } if body.is_empty() => Self::List {
+                content_column,
+                lazy: false,
+            },
+            Self::List {
+                content_column,
+                lazy,
+            } if lazy || indentation >= content_column => Self::List {
+                content_column,
+                lazy: true,
+            },
+            Self::Quote if !body.is_empty() => Self::Quote,
+            _ => Self::None,
+        }
+    }
+}
+
+fn top_level_body(line: &str) -> Option<&str> {
+    let body = line.trim_start_matches(' ');
+    (line.len() - body.len() <= 3 && !body.starts_with('\t')).then_some(body)
+}
+
+fn setext_title(line: &str) -> Option<&str> {
+    let title = top_level_body(line)?.trim_end_matches([' ', '\t']);
+    let reference_definition = title
+        .strip_prefix('[')
+        .and_then(|text| text.split_once("]:"))
+        .is_some_and(|(label, _)| !label.trim().is_empty() && !label.contains(['[', ']']));
+    (!title.is_empty()
+        && !title.starts_with('>')
+        && !is_atx_heading_anchor(title)
+        && !reference_definition
+        && !obvious_html_block_anchor(title))
+    .then_some(title)
+}
+
+fn is_atx_heading_anchor(body: &str) -> bool {
+    let after_hashes = body.trim_start_matches('#');
+    let hashes = body.len() - after_hashes.len();
+    (1..=6).contains(&hashes) && (after_hashes.is_empty() || after_hashes.starts_with([' ', '\t']))
+}
+
+fn paragraph_can_be_lazy(content: &str) -> bool {
+    let body = content.trim_start_matches([' ', '\t']);
+    !body.is_empty() && !is_atx_heading_anchor(body)
+}
+
+/// Leave obvious HTML block anchors on the existing literal path.
+fn obvious_html_block_anchor(line: &str) -> bool {
+    let Some(markup) = line.strip_prefix('<') else {
+        return false;
+    };
+    if markup.starts_with(['!', '?']) {
+        return true;
+    }
+    let tag = markup.strip_prefix('/').unwrap_or(markup);
+    if !tag.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let rest = tag.trim_start_matches(|ch: char| ch.is_ascii_alphanumeric() || ch == '-');
+    if !(rest.is_empty() || rest.starts_with([' ', '\t', '>']) || rest.starts_with("/>")) {
+        return false;
+    }
+    let name = &tag[..tag.len() - rest.len()];
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "base",
+        "basefont",
+        "blockquote",
+        "body",
+        "caption",
+        "center",
+        "col",
+        "colgroup",
+        "dd",
+        "details",
+        "dialog",
+        "dir",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "frame",
+        "frameset",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "header",
+        "hr",
+        "html",
+        "iframe",
+        "legend",
+        "li",
+        "link",
+        "main",
+        "menu",
+        "menuitem",
+        "nav",
+        "noframes",
+        "ol",
+        "optgroup",
+        "option",
+        "p",
+        "param",
+        "pre",
+        "script",
+        "search",
+        "section",
+        "style",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "textarea",
+        "tfoot",
+        "th",
+        "thead",
+        "title",
+        "tr",
+        "track",
+        "ul",
+    ];
+    BLOCK_TAGS.iter().any(|tag| tag.eq_ignore_ascii_case(name))
+        || (tag.ends_with('>') && !tag.contains('<'))
+}
+
+fn setext_level(line: &str) -> Option<usize> {
+    let markers = top_level_body(line)?.trim_end_matches([' ', '\t']);
+    let marker = markers.bytes().next()?;
+    let level = match marker {
+        b'=' => 1,
+        b'-' => 2,
+        _ => return None,
+    };
+    markers.bytes().all(|byte| byte == marker).then_some(level)
 }
 
 fn preview_source(text: &str) -> &str {
@@ -181,10 +416,7 @@ impl RuleMarkers {
 
 /// Classify top-level marker-only lines, including unfinished streaming input.
 fn rule_markers(line: &str) -> Option<RuleMarkers> {
-    let body = line.trim_start_matches(' ');
-    if line.len() - body.len() > 3 {
-        return None;
-    }
+    let body = top_level_body(line)?;
     let markers = body.trim_end_matches([' ', '\t']);
     let marker = markers.bytes().next()?;
     if !matches!(marker, b'-' | b'*' | b'_') {
@@ -216,6 +448,15 @@ fn heading(body: &str) -> Option<(usize, &str)> {
     None
 }
 
+fn heading_style(level: usize) -> Style {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    match level {
+        1 => bold.fg(colors::brand()),
+        2 => bold,
+        _ => bold.fg(colors::inactive()),
+    }
+}
+
 struct ListAnchor<'a> {
     indent: &'a str,
     marker: &'a str,
@@ -226,11 +467,27 @@ impl<'a> ListAnchor<'a> {
     fn task(&self) -> Option<(char, &'a str)> {
         let content = self.rest.trim_start_matches([' ', '\t']);
         let task = task_item(content)?;
-        let padding = &self.rest[..self.rest.len() - content.len()];
         // Apply the 1–4 column marker padding within this line. Container
         // nesting is handled by the existing line-oriented renderer.
+        let (_, padding) = self.marker_and_padding_columns(content);
+        (padding <= 4).then_some(task)
+    }
+
+    fn marker_and_padding_columns(&self, content: &str) -> (usize, usize) {
+        let padding = &self.rest[..self.rest.len() - content.len()];
         let marker_end = column_after(0, self.indent) + self.marker.len();
-        (column_after(marker_end, padding) - marker_end <= 4).then_some(task)
+        (marker_end, column_after(marker_end, padding) - marker_end)
+    }
+
+    fn continuation_column(&self) -> usize {
+        let content = self.rest.trim_start_matches([' ', '\t']);
+        let (marker_end, padding) = self.marker_and_padding_columns(content);
+        let padding = if content.is_empty() || !(1..=4).contains(&padding) {
+            1
+        } else {
+            padding
+        };
+        marker_end + padding
     }
 }
 
@@ -256,7 +513,7 @@ fn list_anchor(line: &str) -> Option<ListAnchor<'_>> {
         digits + 1
     };
     let (marker, rest) = body.split_at(marker_len);
-    rest.starts_with([' ', '\t']).then_some(ListAnchor {
+    (rest.is_empty() || rest.starts_with([' ', '\t'])).then_some(ListAnchor {
         indent: &line[..line.len() - body.len()],
         marker,
         rest,
@@ -272,8 +529,7 @@ fn ordered_item(line: &str) -> Option<(&str, &str)> {
     ))
 }
 
-fn render_list_item(line: &str, indent: &str) -> Option<Line<'static>> {
-    let anchor = list_anchor(line)?;
+fn render_list_item(anchor: &ListAnchor<'_>, indent: &str) -> Option<Line<'static>> {
     let (prefix, content) = match (anchor.marker, anchor.task()) {
         (marker, Some((box_mark, text))) if marker.len() > 1 => {
             (format!("{indent}  {marker} {box_mark} "), text)
@@ -699,6 +955,175 @@ mod tests {
     }
 
     #[test]
+    fn setext_headings_apply_level_styles_around_existing_inline_rendering() {
+        let rows = render_markdown(
+            "  摘要 **重点** _斜体_ [docs](manual) ![图 🧭](plot.png) `code`  \n   =\t\nSection\n---",
+            80,
+        );
+        assert_eq!(
+            rows.iter().map(text_of).collect::<Vec<_>>(),
+            ["摘要 重点 斜体 docs (manual) 图 🧭 code", "Section"]
+        );
+        assert_eq!(rows[0].style, heading_style(1));
+        assert_eq!(rows[1].style, heading_style(2));
+        for (text, modifier) in [
+            ("重点", Modifier::BOLD),
+            ("斜体", Modifier::ITALIC),
+            ("docs", Modifier::UNDERLINED),
+            ("code", Modifier::REVERSED),
+        ] {
+            assert!(rows[0].spans.iter().any(|span| {
+                span.content == text && span.style.add_modifier.contains(modifier)
+            }));
+        }
+    }
+
+    #[test]
+    fn streaming_setext_waits_for_a_physical_underline_newline() {
+        for (partial, ending, level) in [
+            ("Title 界\n=", "\n", 1),
+            ("Title 界\n==\t", "\n", 1),
+            ("Title 界\n---", "\n", 2),
+            ("Title 界\r\n   -\t", "\r\n", 2),
+        ] {
+            let streaming = render_streaming_markdown(partial, 80);
+            assert_eq!(
+                streaming.iter().map(text_of).collect::<Vec<_>>(),
+                ["Title 界", partial.rsplit('\n').next().unwrap()]
+            );
+            let completed = render_markdown(partial, 80);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(text_of(&completed[0]), "Title 界");
+            assert_eq!(completed[0].style, heading_style(level));
+            let terminated = format!("{partial}{ending}");
+            assert_eq!(render_streaming_markdown(&terminated, 80), completed);
+        }
+    }
+
+    #[test]
+    fn setext_leaves_multiline_and_possible_container_paragraphs_on_their_old_paths() {
+        for (source, expected) in [
+            ("Intro\nSecond\n---", vec!["Intro", "Second", "---"]),
+            (
+                "> quoted\ncontinued\n---",
+                vec!["│ quoted", "continued", "---"],
+            ),
+            (
+                "- item\n  continued\n---",
+                vec!["  • item", "  continued", "---"],
+            ),
+            (
+                "- item\n\n  nested\n  ===",
+                vec!["  • item", "", "  nested", "  ==="],
+            ),
+        ] {
+            let rows = render_markdown(source, 80);
+            assert_eq!(rows.iter().map(text_of).collect::<Vec<_>>(), expected);
+            assert!(rows
+                .iter()
+                .all(|row| !row.style.add_modifier.contains(Modifier::BOLD)));
+        }
+        assert_eq!(
+            render("- item\n\nHeading\n==="),
+            ["  • item", "", "Heading"]
+        );
+        assert_eq!(
+            render("- item\n\n Heading\n==="),
+            ["  • item", "", "Heading"]
+        );
+        assert_eq!(
+            render("10. item\n\n   Heading\n==="),
+            ["  10. item", "", "Heading"]
+        );
+        assert_eq!(
+            render("> quoted\n\n  Heading\n==="),
+            ["│ quoted", "", "Heading"]
+        );
+        assert_eq!(
+            render("> quoted\n>\nFresh\n==="),
+            ["│ quoted", ">", "Fresh"]
+        );
+        assert_eq!(
+            render("> # Quoted heading\nFresh\n==="),
+            ["│ # Quoted heading", "Fresh"]
+        );
+        assert_eq!(
+            render("- # List heading\nFresh\n==="),
+            ["  • # List heading", "Fresh"]
+        );
+    }
+
+    #[test]
+    fn setext_does_not_promote_block_openers_or_invalid_indentation() {
+        for title in [
+            "#",
+            "##\tATX",
+            ">quote",
+            "+ item",
+            "1) item",
+            "1.",
+            "<div>",
+            "<DiV>Text</DiV>",
+            "<!-- comment -->",
+            "[ref]: manual.md",
+            "[ref]:",
+            "    title",
+            "\ttitle",
+        ] {
+            let rows = render_markdown(&format!("{title}\n---"), 80);
+            assert_eq!(rows.len(), 2, "{title:?}");
+            assert!(
+                !rows[0].style.add_modifier.contains(Modifier::BOLD),
+                "{title:?}"
+            );
+        }
+        for underline in ["    ===", "\t---", "= =", "=-", "===suffix"] {
+            assert_eq!(
+                render(&format!("Title\n{underline}")).len(),
+                2,
+                "{underline:?}"
+            );
+        }
+        assert_eq!(render("==="), ["==="]);
+        assert_eq!(render(">\n==="), [">", "==="]);
+        assert_eq!(render("[docs](manual.md)\n="), ["docs (manual.md)"]);
+        assert_eq!(render("![描述](plot.png)\n---"), ["描述"]);
+        assert_eq!(
+            render("<em>Inline text</em>\n---"),
+            ["<em>Inline text</em>"]
+        );
+    }
+
+    #[test]
+    fn setext_leaves_fences_and_tables_on_their_existing_paths() {
+        let fenced = render("~~~text\nInside\n===\n~~~\nOutside\n===");
+        assert!(fenced[1].contains("Inside"));
+        assert!(fenced[2].contains("==="));
+        assert_eq!(&fenced[4..], ["Outside"]);
+
+        let table = render("| Key | Value |\n| --- | --- |\n| A | 12 |\n\nAfter\n---");
+        assert_eq!(
+            table[0].split_whitespace().collect::<Vec<_>>(),
+            ["Key", "Value"]
+        );
+        assert_eq!(table[2].split_whitespace().collect::<Vec<_>>(), ["A", "12"]);
+        assert_eq!(&table[3..], ["", "After"]);
+
+        for source in [
+            "-\n\n  Nested\n  ===",
+            "- item\n\n  ~~~text\n  sample\n  ~~~\n  Nested\n  ===",
+            "- item\n\n  | Key |\n  | --- |\n  | sample |\n\n  Nested\n  ===",
+            "- item\n\n  # Inner\n  Nested\n  ===",
+            "- item\n\n  ***\n  Nested\n  ===",
+            "- item\n\n  > quote\n\n  Nested\n  ===",
+            "- item\n  10. subitem\n\n  Nested\n  ===",
+        ] {
+            let rows = render(source);
+            assert_eq!(&rows[rows.len() - 2..], ["  Nested", "  ==="]);
+        }
+    }
+
+    #[test]
     fn ordered_and_nested_lists() {
         let out = render("1. first\n2. second\n  - nested");
         assert_eq!(out[0], "  1. first");
@@ -767,22 +1192,11 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_dashes_after_prose_preserve_possible_setext_underlines() {
+    fn contiguous_setext_dashes_take_precedence_over_adjacent_thematic_breaks() {
         let rows = render("Title 界\n   ---\t\n---\nProse\n- - -\n# Heading\n---");
         let rule = "─".repeat(80);
-        assert_eq!(
-            rows,
-            [
-                "Title 界",
-                "   ---\t",
-                &rule,
-                "Prose",
-                &rule,
-                "Heading",
-                &rule
-            ]
-        );
-        assert_eq!(render("Title\n-\n---"), ["Title", "-", &rule]);
+        assert_eq!(rows, ["Title 界", &rule, "Prose", &rule, "Heading", &rule]);
+        assert_eq!(render("Title\n-\n---"), ["Title", &rule]);
         assert_eq!(render("Prose\n\n---"), ["Prose", "", &rule]);
     }
 
