@@ -288,9 +288,12 @@ test("the Windows Ticket probes are opt-in and exact-source", () => {
   const workflow = read(".github/workflows/ticket-platform-adapter.yml");
   const windows = job(workflow, "windows");
   assert.match(workflow, /windows_ticket_probe_sha:\n.*\n        required: false\n        default: ''/);
-  assert.match(workflow, /windows_ticket_probe_case:\n.*\n        required: false\n        default: directory-flush\n        type: choice\n        options:\n          - directory-flush\n          - writer-lock\n          - publication\n          - publication-process-exit\n          - scope-identity/);
+  assert.match(workflow, /windows_ticket_probe_case:\n.*\n        required: false\n        default: directory-flush\n        type: choice\n        options:\n          - directory-flush\n          - writer-lock\n          - publication\n          - publication-process-exit\n          - scope-identity\n          - rust-writer/);
   assert.doesNotMatch(job(workflow, "native-budget"), /windows_ticket_probe_(?:sha|case)|directory-flush-probe/);
-  assert.match(windows, /Probe Windows Ticket primitives as a standard user\n\s+if: inputs\.windows_ticket_probe_sha != ''\n\s+env:\n\s+PROBE_CASE: \$\{\{ inputs\.windows_ticket_probe_case \}\}\n\s+shell: pwsh\n\s+run: \.\/scripts\/run-windows-ticket-directory-flush-probe\.ps1 -ProbeCase \$env:PROBE_CASE/);
+  assert.match(windows, /Probe Windows Ticket primitives as a standard user\n\s+if: inputs\.windows_ticket_probe_sha != '' && inputs\.windows_ticket_probe_case != 'rust-writer'\n\s+env:\n\s+PROBE_CASE: \$\{\{ inputs\.windows_ticket_probe_case \}\}\n\s+shell: pwsh\n\s+run: \.\/scripts\/run-windows-ticket-directory-flush-probe\.ps1 -ProbeCase \$env:PROBE_CASE/);
+  assert.match(windows, /Probe the Rust Windows Ticket writer as a standard user\n\s+if: inputs\.windows_ticket_probe_sha != '' && inputs\.windows_ticket_probe_case == 'rust-writer'\n\s+shell: pwsh\n\s+run: \.\/scripts\/run-windows-ticket-directory-flush-probe\.ps1 -ProbeCase rust-writer/);
+  assert.ok(windows.indexOf("Install Rust") < windows.indexOf("Probe the Rust Windows Ticket writer as a standard user"));
+  assert.ok(windows.indexOf("Probe the Rust Windows Ticket writer as a standard user") < windows.indexOf("Verify the Windows Ticket probe left the exact source clean"));
   assert.match(windows, /test "\$EXPECTED_PROBE_SHA" = "\$GITHUB_SHA"/);
   assert.match(windows, /if: always\(\) && inputs\.windows_ticket_probe_sha != ''/);
   const exactChecks = windows.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_PROBE_SHA"\n\s+source_status=\$\(git status --porcelain --untracked-files=all\)\n\s+test -z "\$source_status"/g);
