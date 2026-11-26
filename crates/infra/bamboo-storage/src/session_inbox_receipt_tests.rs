@@ -1,4 +1,4 @@
-//! Exact selection reuses the real owned lease, physical lock and ACK path.
+//! Receipt selection and ACK exercise the physical lock and canonical Inbox files.
 use super::*;
 use bamboo_domain::{
     Session, SessionInboxConsumerId, SessionInboxFailureOutcome, SessionInboxFailureReport,
@@ -510,4 +510,159 @@ fn receipt_claim_cancelled_caller_keeps_real_filesystem_job_locked_until_recover
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].claim.envelope, input);
     assert_eq!(claims[0].lease.epoch, 2);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn legacy_claim(inbox: &FileSessionInbox) -> SessionInboxClaim {
+    let delivered = immediate(inbox, "acknowledge the canonical claim").await;
+    let mut claims = inbox.claim("target", 1).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    let claim = claims.remove(0);
+    assert_eq!(claim.envelope.id, delivered.id);
+    assert_eq!(claim.generation, delivered.generation);
+    claim
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn legacy_ack_refuses_a_linked_receipt_directory_without_consuming_the_claim() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let (temp, _, inbox) = fixture().await;
+    let claim = legacy_claim(&inbox).await;
+    let dir = inbox.inbox_dir("target").await.unwrap();
+    let cur = dir.join("cur").join(&claim.claim_id);
+    let claim_bytes = fs::read(&cur).unwrap();
+    let receipt = FileSessionInbox::admitted_path(&dir, &claim.envelope.id);
+    let admitted = receipt.parent().unwrap();
+    let saved = dir.join("original-admitted");
+    let other = temp.path().join("unrelated-receipts");
+    fs::create_dir_all(admitted).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::rename(admitted, &saved).unwrap();
+    symlink(&other, admitted).unwrap();
+
+    let result = inbox.ack("target", &claim).await;
+    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+    assert_eq!(fs::read(&cur).unwrap(), claim_bytes);
+    assert!(matches!(result, Err(SessionInboxError::Storage(_))));
+
+    fs::remove_file(admitted).unwrap();
+    fs::rename(saved, admitted).unwrap();
+    inbox.ack("target", &claim).await.unwrap();
+    assert!(!cur.exists());
+    assert!(inbox
+        .was_admitted("target", &claim.envelope.id)
+        .await
+        .unwrap());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn legacy_ack_retry_refuses_a_linked_receipt_after_the_claim_is_gone() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let (temp, _, inbox) = fixture().await;
+    let claim = legacy_claim(&inbox).await;
+    let dir = inbox.inbox_dir("target").await.unwrap();
+    let cur = dir.join("cur").join(&claim.claim_id);
+    let receipt = FileSessionInbox::admitted_path(&dir, &claim.envelope.id);
+    inbox.ack("target", &claim).await.unwrap();
+    assert!(!cur.exists());
+    let saved_bytes = fs::read(&receipt).unwrap();
+    let saved = temp.path().join("unrelated-receipt");
+    fs::rename(&receipt, &saved).unwrap();
+    symlink(&saved, &receipt).unwrap();
+
+    let replay = inbox.ack("target", &claim).await;
+    assert!(matches!(replay, Err(SessionInboxError::Storage(_))));
+    assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+    assert!(!cur.exists());
+
+    fs::remove_file(&receipt).unwrap();
+    fs::rename(saved, &receipt).unwrap();
+    let activation_marker = dir.join(ACTIVATION_GENERATION_FILE);
+    let legacy_generation = format!("{}\n", claim.generation);
+    fs::write(&activation_marker, &legacy_generation).unwrap();
+    inbox.ack("target", &claim).await.unwrap();
+    assert_eq!(fs::read(receipt).unwrap(), saved_bytes);
+    assert_eq!(
+        fs::read_to_string(activation_marker).unwrap(),
+        legacy_generation
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn legacy_ack_refuses_a_linked_claim_without_creating_a_receipt() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let (temp, _, inbox) = fixture().await;
+    let claim = legacy_claim(&inbox).await;
+    let dir = inbox.inbox_dir("target").await.unwrap();
+    let cur = dir.join("cur").join(&claim.claim_id);
+    let saved_bytes = fs::read(&cur).unwrap();
+    let saved = temp.path().join("unrelated-claim");
+    fs::rename(&cur, &saved).unwrap();
+    symlink(&saved, &cur).unwrap();
+
+    let result = inbox.ack("target", &claim).await;
+    assert!(!FileSessionInbox::admitted_path(&dir, &claim.envelope.id).exists());
+    assert!(fs::symlink_metadata(cur).unwrap().is_symlink());
+    assert_eq!(fs::read(saved).unwrap(), saved_bytes);
+    assert!(matches!(result, Err(SessionInboxError::Storage(_))));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn legacy_ack_revalidates_the_receipt_directory_at_publication() {
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    let (temp, _, inbox) = fixture().await;
+    let claim = legacy_claim(&inbox).await;
+    let dir = inbox.inbox_dir("target").await.unwrap();
+    let cur = dir.join("cur").join(&claim.claim_id);
+    let claim_bytes = fs::read(&cur).unwrap();
+    let receipt = FileSessionInbox::admitted_path(&dir, &claim.envelope.id);
+    let admitted = receipt.parent().unwrap().to_owned();
+    let saved = dir.join("original-admitted");
+    let other = temp.path().join("unrelated-receipts");
+    fs::create_dir(&other).unwrap();
+
+    let observed = Arc::new(AtomicBool::new(false));
+    let mut guarded = inbox.clone();
+    guarded.owned_fs_hook = Some(Arc::new({
+        let observed = observed.clone();
+        let (receipt, admitted, saved, other) = (
+            receipt.clone(),
+            admitted.clone(),
+            saved.clone(),
+            other.clone(),
+        );
+        move |phase, path| {
+            if phase == "write" && path == receipt {
+                fs::rename(&admitted, &saved)?;
+                symlink(&other, &admitted)?;
+                observed.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    }));
+
+    let result = guarded.ack("target", &claim).await;
+    assert!(observed.load(Ordering::Acquire));
+    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&saved).unwrap().count(), 0);
+    assert_eq!(fs::read(&cur).unwrap(), claim_bytes);
+    assert!(matches!(result, Err(SessionInboxError::Storage(_))));
+
+    fs::remove_file(&admitted).unwrap();
+    fs::rename(saved, admitted).unwrap();
+    inbox.ack("target", &claim).await.unwrap();
+    assert!(receipt.is_file());
+    assert!(!cur.exists());
 }
