@@ -33263,6 +33263,103 @@ mod run_status_tests {
     }
 
     #[test]
+    fn table_preview_clips_the_transcript_and_copies_the_complete_report() {
+        use crate::api::types::HistoryMessage;
+
+        const MARKER: &str = "… Table preview clipped";
+        const OMITTED_CELL: &str = "ZX";
+        const OMITTED_ROW: &str = "33";
+        const FOLLOWING: &str = "## Next steps\r\nArchive the report.\r\n";
+        let mut report = String::from(
+            "# Release verification\r\n\r\n| ID\t | OS | CI | UT | IT | QA | PR | Doc | API | Env | DB | UI | Ticket |\r\n",
+        );
+        report.push('|');
+        report.push_str(&" --- |".repeat(13));
+        report.push_str("\r\n");
+        for number in 1..=33 {
+            report.push_str(&format!(
+                "| {number:02} | Mac | OK | OK | OK | OK | OK | OK | OK | QA | OK | OK | {OMITTED_CELL} |\r\n"
+            ));
+        }
+        let full_report = format!("{report}{FOLLOWING}");
+
+        let assert_preview = |terminal: &Terminal<TestBackend>, has_following: bool| {
+            let text = terminal_text(terminal);
+            let row = |value: &str| {
+                text.lines()
+                    .position(|line| line.contains(value))
+                    .unwrap_or_else(|| panic!("missing {value:?}\n{text}"))
+            };
+            let first = row("01 ");
+            let last = row("32 ");
+            let clipped = row(MARKER);
+            assert!(last == first + 31 && clipped == last + 1, "{text}");
+            assert_eq!(text.matches(MARKER).count(), 1, "{text}");
+            assert!(!text.contains(OMITTED_CELL), "{text}");
+            assert!(!text.contains(OMITTED_ROW), "{text}");
+            if has_following {
+                let heading = row("Next steps");
+                assert!(
+                    clipped < heading && row("Archive the report.") == heading + 1,
+                    "{text}"
+                );
+            }
+        };
+
+        let mut app = running_app("session-table-preview", "run-table-preview");
+        let mut terminal = Terminal::new(TestBackend::new(60, 80)).unwrap();
+        for (delta, original, has_following) in [
+            (report.as_str(), report.as_str(), false),
+            (FOLLOWING, full_report.as_str(), true),
+        ] {
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            assert!(app.chat.streaming);
+            assert_preview(&terminal, has_following);
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                original.as_bytes()
+            );
+        }
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            full_report.as_bytes()
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-table-preview".into(),
+            role: "assistant".into(),
+            content: full_report.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        assert_preview(&terminal, true);
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            full_report.as_bytes()
+        );
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_TABLE_PREVIEW").is_some() {
+            let mut compact = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            compact.draw(|f| crate::ui::render(f, &saved)).unwrap();
+            let text = terminal_text(&compact);
+            assert!(
+                text.contains(MARKER) && text.contains("Archive the report."),
+                "{text}"
+            );
+            eprintln!("TABLE PREVIEW CAPTURE\n{text}\nEND TABLE PREVIEW CAPTURE");
+        }
+    }
+
+    #[test]
     fn reducer_replay_is_idempotent_and_terminal_generations_never_regress() {
         fn reduce(state: &mut RunStatusState, replay: bool) {
             assert!(state.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));
