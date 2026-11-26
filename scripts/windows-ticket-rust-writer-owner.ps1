@@ -90,6 +90,11 @@ function Assert-RustWriterProbe($Receipt, [int]$OwnerProcessId) {
             throw 'The Rust writer child observed a different scope or lock identity.'
         }
     }
+    $nameOpen = $proof.lock_name_delete_open
+    if ($nameOpen.held_win32_error -ne 32 -or $nameOpen.released_win32_error -ne 0 -or
+        -not (Test-TicketRustWriterFileIdentity $nameOpen.released_file $positive.file)) {
+        throw 'The held Rust writer did not deny DELETE access to the existing lock name.'
+    }
     $token = $proof.contender_token
     if ($token.sid -cne $Receipt.token.sid -or $token.elevated -ne $false -or
         $token.integrity_sid -cne 'S-1-16-8192' -or $token.administrators_group_present -ne $false -or

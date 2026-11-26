@@ -40,7 +40,7 @@ pub(super) fn attest(expected_sid: &str) -> Token {
 
     let user = token_info(&process_token, TokenUser);
     let integrity = token_info(&process_token, TokenIntegrityLevel);
-    let elevation = token_info(&process_token, TokenElevation);
+    let elevated = token_elevated(&process_token);
     let groups = token_info(&process_token, TokenGroups);
     let privileges = token_info(&process_token, TokenPrivileges);
 
@@ -49,7 +49,6 @@ pub(super) fn attest(expected_sid: &str) -> Token {
     let token = unsafe {
         let user: TOKEN_USER = user.read(0);
         let integrity: TOKEN_MANDATORY_LABEL = integrity.read(0);
-        let elevation: TOKEN_ELEVATION = elevation.read(0);
         let group_count: u32 = groups.read(0);
         let group_list: &[SID_AND_ATTRIBUTES] =
             groups.array(offset_of!(TOKEN_GROUPS, Groups), group_count);
@@ -58,7 +57,7 @@ pub(super) fn attest(expected_sid: &str) -> Token {
             privileges.array(offset_of!(TOKEN_PRIVILEGES, Privileges), privilege_count);
         Token {
             sid: sid_string(user.User.Sid),
-            elevated: elevation.TokenIsElevated != 0,
+            elevated,
             integrity_sid: sid_string(integrity.Label.Sid),
             local_account_group_present: group_list
                 .iter()
@@ -87,6 +86,25 @@ fn check(result: i32, operation: &str) {
     if result == 0 {
         panic!("{operation}: {}", io::Error::last_os_error());
     }
+}
+
+fn token_elevated(token: &OwnedHandle) -> bool {
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let size = size_of::<TOKEN_ELEVATION>() as u32;
+    let mut written = 0;
+    // SAFETY: TokenElevation writes one TOKEN_ELEVATION to this sized buffer.
+    let result = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenElevation,
+            ptr::from_mut(&mut elevation).cast(),
+            size,
+            &mut written,
+        )
+    };
+    check(result, "read token elevation");
+    assert_eq!(written, size, "unexpected token elevation size");
+    elevation.TokenIsElevated != 0
 }
 
 struct TokenInfo {

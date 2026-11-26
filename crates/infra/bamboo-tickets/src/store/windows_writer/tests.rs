@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     mem::size_of,
+    os::windows::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf, Prefix},
     process::{self, Child, Command, Stdio},
     ptr, thread,
@@ -15,14 +16,17 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use windows_sys::Win32::{
-    Foundation::ERROR_LOCK_VIOLATION,
-    Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW},
+    Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION},
+    Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationW, DELETE, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    },
     System::SystemInformation::{
         GetNativeSystemInfo, OSVERSIONINFOW, PROCESSOR_ARCHITECTURE_AMD64, SYSTEM_INFO,
     },
 };
 
-use super::{FileIdentity, WindowsScope, WRITER_LINK_ERROR};
+use super::{entry_identity, FileIdentity, WindowsScope, WRITER_LINK_ERROR};
 use crate::{store::FileStore, Error, ScopeBinding};
 
 const SID: &str = "BAMBOO_TICKET_WRITER_EXPECTED_SID";
@@ -124,6 +128,23 @@ fn owner(expected_sid: &str, fixture: &Path, receipt: &Path, token: token::Token
     assert_eq!(Identity::from(observed.identity), owner_observation.file);
     assert_eq!(observed.link_count, 1);
 
+    // Request DELETE access without using it to distinguish name retention
+    // from byte-range exclusivity on the same physical file.
+    let writer_file = writer_path.join(WRITER);
+    let open_for_delete = || {
+        OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&writer_file)
+    };
+    let held_delete_error =
+        open_for_delete().expect_err("writer must deny a concurrent DELETE open");
+    assert_eq!(
+        held_delete_error.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION as i32)
+    );
+
     let mut child = ProbeChild::spawn(expected_sid, &writer_path, &replies_path);
     let held = child.reply(&replies_path, "held");
     assert_contender(
@@ -135,6 +156,13 @@ fn owner(expected_sid: &str, fixture: &Path, receipt: &Path, token: token::Token
     );
 
     drop(owned);
+    let released_delete_file = {
+        let file = open_for_delete().expect("released writer must permit a DELETE open");
+        Identity::from(
+            entry_identity(&file, false).expect("read file identity through the DELETE handle"),
+        )
+    };
+    assert_eq!(released_delete_file, owner_observation.file);
     child.release();
     let released = child.reply(&replies_path, "released");
     assert_contender(&released, &token, child.0.id(), &owner_observation, 0);
@@ -165,6 +193,11 @@ fn owner(expected_sid: &str, fixture: &Path, receipt: &Path, token: token::Token
             "released": released.observation,
             "contender_token": held.token,
             "final_file": Identity::from(final_file.identity),
+            "lock_name_delete_open": {
+                "held_win32_error": held_delete_error.raw_os_error(),
+                "released_win32_error": 0,
+                "released_file": released_delete_file,
+            },
             "hard_link": hard_link,
         },
     });
