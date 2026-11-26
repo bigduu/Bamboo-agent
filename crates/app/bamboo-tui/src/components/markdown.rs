@@ -40,7 +40,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 
 /// Render markdown text into a list of ratatui Lines with styling.
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
-/// [links](url), `#`..`######` headings, nested bullet and ordered lists,
+/// links, image descriptions, `#`..`######` headings, nested bullet and ordered lists,
 /// task-list checkboxes, thematic breaks, `>` blockquotes, and pipe tables.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
@@ -96,12 +96,12 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                     .fg(colors::inactive())
                     .add_modifier(Modifier::BOLD)
             };
-            let mut spans = vec![Span::styled(content.to_string(), style)];
-            // Keep any inline emphasis inside a heading readable too.
-            if content.contains('`') || content.contains('*') {
-                spans = parse_inline(content);
-            }
-            lines.push(Line::from(spans));
+            let line = if content.contains('`') || content.contains('*') {
+                Line::from(parse_inline(content))
+            } else {
+                Line::from(Span::styled(render_heading_images(content), style))
+            };
+            lines.push(line);
             continue;
         }
 
@@ -345,7 +345,7 @@ fn render_code_block(lines: &mut Vec<Line>, block: FencedBlock<'_>, width: usize
 }
 
 /// Parse inline formatting: `code`, **bold**, _italic_ / *italic*,
-/// [links](url), and plain text into Spans.
+/// links, image descriptions, and plain text into Spans.
 fn parse_inline(text: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut chars = text.chars().peekable();
@@ -359,7 +359,10 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
         };
     }
 
+    let mut previous_escape = false;
     while let Some(ch) = chars.next() {
+        let escaped = previous_escape;
+        previous_escape = ch == '\\' && !escaped;
         // Inline code.
         if ch == '`' {
             flush!();
@@ -370,6 +373,11 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
                     .fg(colors::inactive())
                     .add_modifier(Modifier::REVERSED),
             ));
+            continue;
+        }
+
+        if ch == '!' && !escaped && chars.next_if_eq(&'[').is_some() {
+            current.push_str(&take_inline_image(&mut chars));
             continue;
         }
 
@@ -427,6 +435,184 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+/// Plain headings keep their existing literal text around images.
+fn render_heading_images(text: &str) -> String {
+    if !text.contains("![") {
+        return text.to_owned();
+    }
+    let mut chars = text.chars().peekable();
+    let mut rendered = String::with_capacity(text.len());
+    let mut previous_escape = false;
+    while let Some(ch) = chars.next() {
+        let escaped = previous_escape;
+        previous_escape = ch == '\\' && !escaped;
+        if ch == '!' && !escaped && chars.next_if_eq(&'[').is_some() {
+            rendered.push_str(&take_inline_image(&mut chars));
+        } else {
+            rendered.push(ch);
+        }
+    }
+    rendered
+}
+
+type InlineChars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// Consume a direct image after `![`. Keep the consumed bytes literal until
+/// the destination, optional title, and outer parenthesis are all complete.
+fn take_inline_image(chars: &mut InlineChars<'_>) -> String {
+    let mut literal = String::from("![");
+    let label = take_image_label(chars, &mut literal);
+    if chars.next_if_eq(&']').is_none() {
+        // Without the outer label closer, the first complete link can
+        // belong to the surrounding prose.
+        if let Some((start, length)) = label.first_link {
+            *chars = start;
+            literal.truncate(length);
+        }
+        return literal;
+    }
+    literal.push(']');
+    if chars.next_if_eq(&'(').is_none() {
+        return literal;
+    }
+    literal.push('(');
+    if !take_image_target(chars, &mut literal) || chars.next_if_eq(&')').is_none() {
+        return literal;
+    }
+
+    if label.text.trim().is_empty() {
+        "[Image]".into()
+    } else {
+        label.text
+    }
+}
+
+struct ImageLabel<'a> {
+    text: String,
+    first_link: Option<(InlineChars<'a>, usize)>,
+}
+
+fn take_image_label<'a>(chars: &mut InlineChars<'a>, literal: &mut String) -> ImageLabel<'a> {
+    let mut text = String::new();
+    let mut first_link = None;
+    let mut depth = 0;
+    let mut nested_start = None;
+    while let Some(&ch) = chars.peek() {
+        if ch == ']' && depth == 0 {
+            break;
+        }
+        if ch == '[' && depth == 0 {
+            nested_start = Some((chars.clone(), literal.len(), text.len()));
+        }
+        chars.next();
+        literal.push(ch);
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 && chars.next_if_eq(&'(').is_some() {
+                    let target_start = literal.len();
+                    literal.push('(');
+                    if take_image_target(chars, literal) && chars.next_if_eq(&')').is_some() {
+                        literal.push(')');
+                        if let Some((start, length, text_start)) = nested_start.take() {
+                            // Only the inner label belongs in the projected alt.
+                            text.remove(text_start);
+                            first_link.get_or_insert((start, length));
+                        }
+                    } else {
+                        text.push(']');
+                        text.push_str(&literal[target_start..]);
+                    }
+                    continue;
+                }
+            }
+            '\\' => {
+                if let Some(escaped) = chars.next_if(char::is_ascii_punctuation) {
+                    literal.push(escaped);
+                    text.push(escaped);
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        text.push(ch);
+    }
+    ImageLabel { text, first_link }
+}
+
+fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+    take_image_spaces(chars, literal);
+    let complete = if chars.next_if_eq(&'<').is_some() {
+        literal.push('<');
+        take_image_delimited(chars, literal, '<', '>')
+    } else {
+        take_image_bare_destination(chars, literal)
+    };
+    if !complete {
+        return false;
+    }
+
+    if !take_image_spaces(chars, literal) {
+        return true;
+    }
+    // A title is optional. Leave other bytes for the surrounding inline scan.
+    let Some(open) = chars.next_if(|ch| matches!(ch, '"' | '\'' | '(')) else {
+        return true;
+    };
+    literal.push(open);
+    let close = if open == '(' { ')' } else { open };
+    if !take_image_delimited(chars, literal, open, close) {
+        return false;
+    }
+    take_image_spaces(chars, literal);
+    true
+}
+
+fn take_image_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+    let start = literal.len();
+    literal.extend(std::iter::from_fn(|| {
+        chars.next_if(|ch| matches!(ch, ' ' | '\t'))
+    }));
+    literal.len() > start
+}
+
+fn take_image_bare_destination(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+    let mut depth = 0;
+    while let Some(ch) = chars.next_if(|ch| !matches!(ch, ' ' | '\t') && (*ch != ')' || depth > 0))
+    {
+        literal.push(ch);
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '\\' => literal.extend(chars.next_if(char::is_ascii_punctuation)),
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn take_image_delimited(
+    chars: &mut InlineChars<'_>,
+    literal: &mut String,
+    open: char,
+    close: char,
+) -> bool {
+    while let Some(ch) = chars.next() {
+        literal.push(ch);
+        if ch == close {
+            return true;
+        }
+        if ch == open {
+            return false;
+        }
+        if ch == '\\' {
+            literal.extend(chars.next_if(char::is_ascii_punctuation));
+        }
+    }
+    false
 }
 
 /// Consume chars until `stop` returns true (consuming the terminator).
@@ -783,6 +969,137 @@ mod tests {
         assert_eq!(out[0], "see docs (https://x.io) now");
         // A bare bracket is left literal.
         assert_eq!(render("[not a link"), vec!["[not a link"]);
+    }
+
+    #[test]
+    fn inline_images_render_plain_alt_without_destinations() {
+        let out = render(concat!(
+            "see ![build_route *完成* 🧭](assets/chart(1).png) and ",
+            "![escaped](assets/chart\\(2\\).png) [docs](https://example.test) ",
+            "![angled](<assets/chart (wide 2).png>) ![](empty.png) ![ \t ](blank.png)",
+        ));
+        assert_eq!(
+            out,
+            [
+                "see build_route *完成* 🧭 and escaped docs (https://example.test) angled [Image] [Image]"
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_image_prefixes_remain_literal_until_the_outer_close() {
+        for image in [
+            r#"![build_route *完成* 🧭](assets/chart_(1)\).png)"#,
+            r#"![build_route *完成* 🧭](<assets/chart (draft 1).png> "title with \"quotes\", ) and *")"#,
+            "![build_route *完成* 🧭](chart.png 'single quoted ) _title')",
+            r#"![build_route *完成* 🧭](chart.png (parenthesized \) _title))"#,
+        ] {
+            for (end, _) in image.char_indices().skip(1) {
+                let partial = &image[..end];
+                assert_eq!(render(partial), [partial], "{partial:?}");
+            }
+            assert_eq!(render(image), ["build_route *完成* 🧭"]);
+        }
+    }
+
+    #[test]
+    fn bracketed_image_labels_stay_literal_until_the_outer_close() {
+        for (image, alt) in [
+            ("![API [v2]](chart.png)", "API [v2]"),
+            (
+                "![API [v2 [LTS]] [guide]](chart.png)",
+                "API [v2 [LTS]] [guide]",
+            ),
+            (r"![API \] release](chart.png)", "API ] release"),
+            (r"![API \[draft\] 🧪](chart.png)", "API [draft] 🧪"),
+        ] {
+            for (end, _) in image.char_indices().skip(1) {
+                let partial = &image[..end];
+                assert_eq!(render(partial), [partial], "{partial:?}");
+            }
+            assert_eq!(render(image), [alt]);
+        }
+    }
+
+    #[test]
+    fn unfinished_images_leave_neighboring_ordinary_links_visible() {
+        assert_eq!(
+            render("![draft [docs](https://example.test)"),
+            ["![draft docs (https://example.test)"]
+        );
+        assert_eq!(
+            render("![draft](assets/pending_chart.png [docs](https://example.test)"),
+            ["![draft](assets/pending_chart.png docs (https://example.test)"]
+        );
+        assert_eq!(
+            render("![draft [first](one.md) and [second](two.md)"),
+            ["![draft first (one.md) and second (two.md)"]
+        );
+    }
+
+    #[test]
+    fn direct_links_inside_complete_image_labels_contribute_only_text() {
+        assert_eq!(
+            render("![See [guide](https://example.test)](chart.png)"),
+            ["See guide"]
+        );
+        assert_eq!(
+            render(
+                r#"![See [guide \]](<assets/guide (new).md> "Reference )") and [notes](notes.md)](chart.png)"#
+            ),
+            ["See guide ] and notes"]
+        );
+    }
+
+    #[test]
+    fn closed_image_label_with_an_inner_link_stays_literal_until_its_target_closes() {
+        let label = "![See [guide](https://example.test)]";
+        for target in ["", "(", "(assets/chart_(new).png"] {
+            let image = format!("{label}{target}");
+            assert_eq!(render(&image), [image.as_str()], "{image:?}");
+        }
+    }
+
+    #[test]
+    fn images_in_headings_render_with_heading_style() {
+        let lines = render_markdown(
+            "# release_notes ![说明 🧭](assets/chart.png)\n# release_notes",
+            80,
+        );
+        assert_eq!(text_of(&lines[0]), "release_notes 说明 🧭");
+        assert_eq!(text_of(&lines[1]), "release_notes");
+        for row in lines {
+            let style = row.spans[0].style;
+            assert_eq!(style.fg, Some(colors::brand()));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn escaped_image_openers_keep_the_existing_link_and_heading_paths() {
+        assert_eq!(
+            render(r"\![literal](chart.png) \\![image](chart.png)"),
+            [r"\!literal (chart.png) \\image"]
+        );
+        assert_eq!(
+            render(r"# release_notes \![literal](chart.png)"),
+            [r"release_notes \![literal](chart.png)"]
+        );
+    }
+
+    #[test]
+    fn invalid_nested_destination_and_title_delimiters_stay_literal() {
+        for image in ["![alt](<a<b.png>)", "![alt](chart.png (title (nested)))"] {
+            assert_eq!(render(image), [image]);
+        }
+    }
+
+    #[test]
+    fn inline_and_fenced_code_keep_literal_image_syntax() {
+        let example = "![a_b*](file(1).png)";
+        let out = render(&format!("`{example}`\n~~~md\n{example}\n~~~"));
+        assert_eq!(out[0], example);
+        assert!(out[2].contains(example));
     }
 
     #[test]
