@@ -26,7 +26,7 @@ public static class WindowsTicketDirectoryFlushProbe
     private const string LocalAccountSid = "S-1-5-113";
     private const string MediumIntegritySid = "S-1-16-8192";
     private const int TokenGroups = 2, TokenPrivileges = 3, TokenElevation = 20, TokenIntegrityLevel = 25;
-    private const int ErrorFileNotFound = 2, ErrorInsufficientBuffer = 122;
+    private const int ErrorFileNotFound = 2, ErrorBadLength = 24, ErrorInsufficientBuffer = 122;
     private const uint DriveFixed = 3, FileTypeDisk = 1;
     private const uint GenericRead = 0x80000000, GenericWrite = 0x40000000, ReadAttributes = 0x80;
     private const uint ShareRead = 1, ShareWrite = 2, CreateNew = 1, OpenExisting = 3;
@@ -83,6 +83,10 @@ public static class WindowsTicketDirectoryFlushProbe
     [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
     private static extern bool GetTokenInformation(SafeAccessTokenHandle token, int informationClass,
         IntPtr buffer, uint bufferSize, out uint required);
+
+    [DllImport("advapi32.dll", EntryPoint = "GetTokenInformation", ExactSpelling = true, SetLastError = true)]
+    private static extern bool ReadTokenElevation(SafeAccessTokenHandle token, int informationClass,
+        out uint elevation, uint bufferSize, out uint required);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     private static extern bool LookupPrivilegeValueW(string system, string name, out Luid id);
@@ -143,7 +147,7 @@ public static class WindowsTicketDirectoryFlushProbe
     {
         bool succeeded = GetTokenInformation(token, informationClass, IntPtr.Zero, 0, out uint size);
         int error = Marshal.GetLastWin32Error();
-        if (succeeded || error != ErrorInsufficientBuffer || size == 0)
+        if (succeeded || size == 0 || (error != ErrorInsufficientBuffer && error != ErrorBadLength))
             throw WindowsError($"Measure token information {informationClass}", error);
 
         IntPtr buffer = Marshal.AllocHGlobal(checked((int)size));
@@ -162,7 +166,10 @@ public static class WindowsTicketDirectoryFlushProbe
         {
             SafeAccessTokenHandle token = identity.AccessToken;
             string sid = identity.User.Value;
-            bool elevated = InspectToken(token, TokenElevation, p => Marshal.ReadInt32(p) != 0);
+            RequireWin32(ReadTokenElevation(token, TokenElevation, out uint elevation, sizeof(uint),
+                out uint elevationSize), "Read token elevation");
+            if (elevationSize != sizeof(uint)) throw new InvalidOperationException("Unexpected token elevation size.");
+            bool elevated = elevation != 0;
             string integrity = InspectToken(token, TokenIntegrityLevel, p =>
                 new SecurityIdentifier(Marshal.PtrToStructure<SidAndAttributes>(p).Sid).Value);
             var groups = InspectToken(token, TokenGroups, p =>
