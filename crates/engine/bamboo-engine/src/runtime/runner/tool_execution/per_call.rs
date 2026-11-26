@@ -10,12 +10,15 @@ use bamboo_agent_core::tools::{
     ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
     ToolResult, ToolSchema,
 };
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
     HookToolOutcome, SessionCallerReference, SESSION_COORDINATION_TOOL_NAME,
 };
 use bamboo_metrics::MetricsCollector;
+use bamboo_tools::tools::read::{
+    observe_read_result, ReadResultIdentity, READ_RESULT_IDENTITY_KEY,
+};
 
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
@@ -153,6 +156,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 pub(super) struct PortableToolExecution {
     name: String,
     input: serde_json::Value,
+    read_result_identity: Option<ReadResultIdentity>,
 }
 
 impl PortableToolExecution {
@@ -177,6 +181,7 @@ impl PortableToolExecution {
         Self {
             name: execution_name.to_owned(),
             input,
+            read_result_identity: None,
         }
     }
 }
@@ -206,6 +211,7 @@ pub(super) fn portable_tool_for_admitted_call(
         PortableToolExecution {
             name,
             input: parse_tool_args_best_effort(&call.function.arguments).0,
+            read_result_identity: None,
         }
     })
 }
@@ -901,12 +907,17 @@ async fn execute_tool_call_only_with_execution_name_inner(
         dispatch,
     );
     let await_quiet_exec = ctx.await_quiet_exec && execution_name == "write_stdin";
-    let observed_dispatch = if await_quiet_exec {
-        bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await
+    let (observed_dispatch, read_result_identity) = if execution_name == "Read" {
+        observe_read_result(&ctx.tool_call.id, dispatch).await
+    } else if await_quiet_exec {
+        (
+            bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await,
+            None,
+        )
     } else {
-        dispatch.await
-    }
-    .map(ToolOutcome::enforce_suspension_restriction);
+        (dispatch.await, None)
+    };
+    let observed_dispatch = observed_dispatch.map(ToolOutcome::enforce_suspension_restriction);
     // Await the same admitted command before completing the tool lifecycle.
     // The outer runner's cancellation still covers this tool future.
     let observed_dispatch = match observed_dispatch {
@@ -1007,6 +1018,7 @@ async fn execute_tool_call_only_with_execution_name_inner(
         portable_tool: Some(PortableToolExecution {
             name: execution_name.to_owned(),
             input: args,
+            read_result_identity,
         }),
         tool_duration,
     })
@@ -1574,6 +1586,7 @@ async fn apply_completed_tool_execution_outcome(
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
+    let first_new_message = ctx.session.messages.len();
 
     // The tool asked for a human decision (Phase B): suspend directly on the
     // returned PendingQuestion — no marker sniff. Its rich display result is the
@@ -1696,13 +1709,26 @@ async fn apply_completed_tool_execution_outcome(
         "tool_name": tool_name_for_meta,
         "success": is_success,
     });
-    if let Some(msg) = ctx
+    if let Some((index, msg)) = ctx
         .session
         .messages
         .iter_mut()
+        .enumerate()
         .rev()
-        .find(|m| m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
+        .find(|(_, message)| message.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
     {
+        let read_identity = outcome
+            .portable_tool
+            .as_ref()
+            .and_then(|tool| tool.read_result_identity.as_ref())
+            .filter(|identity| {
+                index >= first_new_message
+                    && msg.role == Role::Tool
+                    && msg.tool_success == Some(true)
+                    && msg.content_parts.is_none()
+                    && identity.matches_full_result(&msg.content)
+            })
+            .and_then(|identity| serde_json::to_value(identity).ok());
         let metadata = msg.metadata.get_or_insert_with(|| serde_json::json!({}));
         if let Some(object) = metadata.as_object_mut() {
             object.extend(
@@ -1711,6 +1737,9 @@ async fn apply_completed_tool_execution_outcome(
                     .expect("lifecycle metadata object")
                     .clone(),
             );
+            if let Some(identity) = read_identity {
+                object.insert(READ_RESULT_IDENTITY_KEY.to_string(), identity);
+            }
         }
     }
 
@@ -1798,6 +1827,7 @@ mod task_progress_tests {
             portable_tool: Some(PortableToolExecution {
                 name: execution_name.into(),
                 input: serde_json::json!({}),
+                read_result_identity: None,
             }),
             permission_replay_origin: None,
             result: Ok(result),
@@ -1924,6 +1954,7 @@ mod task_progress_tests {
             portable_tool: Some(PortableToolExecution {
                 name: "write_stdin".into(),
                 input: serde_json::json!({"session_id":"log", "output_offset":0}),
+                read_result_identity: None,
             }),
             permission_replay_origin: None,
             result: Ok(ToolResult::text(
@@ -2659,6 +2690,7 @@ mod hook_tests {
                         portable_tool: Some(PortableToolExecution {
                             name: execution_name.into(),
                             input: serde_json::json!({}),
+                            read_result_identity: None,
                         }),
                         permission_replay_origin: None,
                         result: Ok(ToolResult::text(true, payload.to_string())),

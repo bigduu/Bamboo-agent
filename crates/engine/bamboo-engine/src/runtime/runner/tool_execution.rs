@@ -71,6 +71,8 @@ mod progress_feedback;
 mod progress_hint_tests;
 mod quiet_poll;
 #[cfg(test)]
+mod read_dedup_tests;
+#[cfg(test)]
 mod supervisor_dispatch_tests;
 mod task;
 pub(crate) mod tool_error_collector;

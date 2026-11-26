@@ -1,10 +1,150 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use serde::Deserialize;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{cell::RefCell, future::Future, ops::Range, path::Path};
 
 use super::parameter_schema;
 use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
+
+pub const READ_RESULT_IDENTITY_KEY: &str = "bamboo.read_result.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadSourceKind {
+    File,
+    Directory,
+}
+
+/// The exact source and displayed range of a successful built-in Read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadResultIdentity {
+    canonical_path: String,
+    source_kind: ReadSourceKind,
+    source_version: [u8; 32],
+    range_start: usize,
+    range_end: usize,
+    result_sha256: [u8; 32],
+}
+
+impl ReadResultIdentity {
+    pub fn matches_full_result(&self, content: &str) -> bool {
+        let digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+        self.result_sha256 == digest
+    }
+}
+
+struct ReadObservation {
+    call_id: String,
+    captured: Option<ReadResultIdentity>,
+    repeated: bool,
+}
+
+tokio::task_local! {
+    static READ_OBSERVATION: RefCell<ReadObservation>;
+}
+
+/// Capture optional identity from the actual Read invocation with this call ID.
+pub async fn observe_read_result<F: Future>(
+    call_id: &str,
+    invocation: F,
+) -> (F::Output, Option<ReadResultIdentity>) {
+    READ_OBSERVATION
+        .scope(
+            RefCell::new(ReadObservation {
+                call_id: call_id.to_owned(),
+                captured: None,
+                repeated: false,
+            }),
+            async {
+                let output = invocation.await;
+                let identity =
+                    READ_OBSERVATION.with(|observation| observation.borrow_mut().captured.take());
+                (output, identity)
+            },
+        )
+        .await
+}
+
+fn observing_read(call_id: &str) -> bool {
+    READ_OBSERVATION
+        .try_with(|observation| observation.borrow().call_id == call_id)
+        .unwrap_or(false)
+}
+
+fn record_read_result(
+    call_id: &str,
+    canonical_path: String,
+    source_kind: ReadSourceKind,
+    source_version: [u8; 32],
+    result: &RenderedRead,
+) {
+    let _ = READ_OBSERVATION.try_with(|observation| {
+        let mut observation = observation.borrow_mut();
+        if observation.call_id != call_id || observation.repeated {
+            return;
+        }
+        if observation.captured.is_some() {
+            observation.captured = None;
+            observation.repeated = true;
+            return;
+        }
+        observation.captured = Some(ReadResultIdentity {
+            canonical_path,
+            source_kind,
+            source_version,
+            range_start: result.range.start,
+            range_end: result.range.end,
+            result_sha256: Sha256::digest(result.text.as_bytes()).into(),
+        });
+    });
+}
+
+async fn canonical_read_path(path: &Path) -> Option<String> {
+    tokio::fs::canonicalize(path)
+        .await
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+async fn confirm_read_path(path: &Path, initial: Option<String>) -> Option<String> {
+    let initial = initial?;
+    (canonical_read_path(path).await.as_ref() == Some(&initial)).then_some(initial)
+}
+
+async fn confirm_directory_path(
+    path: &Path,
+    initial: Option<String>,
+    initial_modified: Option<std::time::SystemTime>,
+) -> Option<String> {
+    let initial_modified = initial_modified?;
+    let canonical = confirm_read_path(path, initial).await?;
+    let after = tokio::fs::metadata(path).await.ok()?;
+    (after.is_dir() && after.modified().ok() == Some(initial_modified)).then_some(canonical)
+}
+
+fn file_version(stable: &read_tracker::StableFileRead) -> [u8; 32] {
+    let (size, modified, content_digest) = stable.version_parts();
+    let mut digest = Sha256::new();
+    digest.update(size.to_le_bytes());
+    digest.update(content_digest);
+    if let Some(modified) = modified {
+        digest.update(modified.to_le_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn directory_version(entries: &[String]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for entry in entries {
+        digest.update((entry.len() as u64).to_le_bytes());
+        digest.update(entry.as_bytes());
+    }
+    digest.finalize().into()
+}
 
 const BLOCKED_DEVICE_PATHS: &[&str] = &[
     "/dev/zero",
@@ -108,44 +248,36 @@ fn continuation_hint(
     ))
 }
 
-fn render_file_with_line_numbers(content: &str, offset: usize, limit: Option<usize>) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let (start, end) = slice_bounds(lines.len(), offset, limit);
-
-    let mut rendered = lines[start..end]
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| format!("{:>6}\t{}", start + idx + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if let Some(hint) = continuation_hint("lines", start, end, lines.len(), limit) {
-        if !rendered.is_empty() {
-            rendered.push('\n');
-        }
-        rendered.push_str(&hint);
-    }
-
-    rendered
+struct RenderedRead {
+    text: String,
+    range: Range<usize>,
 }
 
-fn render_directory_entries(entries: &[String], offset: usize, limit: Option<usize>) -> String {
+fn render_read_entries(
+    entries: &[impl AsRef<str>],
+    offset: usize,
+    limit: Option<usize>,
+    noun: &str,
+) -> RenderedRead {
     let (start, end) = slice_bounds(entries.len(), offset, limit);
-    let mut rendered = entries[start..end]
+    let mut text = entries[start..end]
         .iter()
         .enumerate()
-        .map(|(idx, entry)| format!("{:>6}\t{}", start + idx + 1, entry))
+        .map(|(idx, entry)| format!("{:>6}\t{}", start + idx + 1, entry.as_ref()))
         .collect::<Vec<_>>()
         .join("\n");
 
-    if let Some(hint) = continuation_hint("entries", start, end, entries.len(), limit) {
-        if !rendered.is_empty() {
-            rendered.push('\n');
+    if let Some(hint) = continuation_hint(noun, start, end, entries.len(), limit) {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        rendered.push_str(&hint);
+        text.push_str(&hint);
     }
 
-    rendered
+    RenderedRead {
+        text,
+        range: start..end,
+    }
 }
 
 #[async_trait]
@@ -187,6 +319,12 @@ impl Tool for ReadTool {
             )));
         }
 
+        let initial_path = if observing_read(&ctx.tool_call_id) {
+            canonical_read_path(path).await
+        } else {
+            None
+        };
+
         let metadata = tokio::fs::metadata(path)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to read path: {}", e)))?;
@@ -196,12 +334,17 @@ impl Tool for ReadTool {
                 .await
                 .map_err(|e| ToolError::Execution(format!("Failed to read directory: {}", e)))?;
             let mut entries = Vec::new();
+            let mut lossless_names = initial_path.is_some();
             while let Some(entry) = dir
                 .next_entry()
                 .await
                 .map_err(|e| ToolError::Execution(format!("Failed to iterate directory: {}", e)))?
             {
-                let mut name = entry.file_name().to_string_lossy().to_string();
+                let file_name = entry.file_name();
+                if lossless_names && file_name.to_str().is_none() {
+                    lossless_names = false;
+                }
+                let mut name = file_name.to_string_lossy().into_owned();
                 if entry
                     .file_type()
                     .await
@@ -214,11 +357,30 @@ impl Tool for ReadTool {
             }
             entries.sort();
 
-            let rendered =
-                render_directory_entries(&entries, parsed.offset.unwrap_or(0), parsed.limit);
+            let rendered = render_read_entries(
+                &entries,
+                parsed.offset.unwrap_or(0),
+                parsed.limit,
+                "entries",
+            );
+            if let Some(canonical_path) = confirm_directory_path(
+                path,
+                initial_path.filter(|_| lossless_names),
+                metadata.modified().ok(),
+            )
+            .await
+            {
+                record_read_result(
+                    &ctx.tool_call_id,
+                    canonical_path,
+                    ReadSourceKind::Directory,
+                    directory_version(&entries),
+                    &rendered,
+                );
+            }
             return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
-                result: rendered,
+                result: rendered.text,
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
             }));
@@ -263,13 +425,23 @@ impl Tool for ReadTool {
             }));
         }
 
-        let content = String::from_utf8_lossy(bytes).to_string();
+        let content = String::from_utf8_lossy(bytes);
+        let lines: Vec<_> = content.lines().collect();
         let rendered =
-            render_file_with_line_numbers(&content, parsed.offset.unwrap_or(0), parsed.limit);
+            render_read_entries(&lines, parsed.offset.unwrap_or(0), parsed.limit, "lines");
+        if let Some(canonical_path) = confirm_read_path(path, initial_path).await {
+            record_read_result(
+                &ctx.tool_call_id,
+                canonical_path,
+                ReadSourceKind::File,
+                file_version(&stable),
+                &rendered,
+            );
+        }
 
         Ok(ToolOutcome::Completed(ToolResult {
             success: true,
-            result: rendered,
+            result: rendered.text,
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
         }))
@@ -337,11 +509,13 @@ mod tests {
         };
 
         let read_tool = ReadTool::new();
-        let read_out = read_tool
-            .invoke(json!({ "file_path": file_path }), make_ctx())
-            .await
-            .unwrap();
-        let ToolOutcome::Completed(read_result) = read_out else {
+        let (read_out, identity) = observe_read_result(
+            "call_1",
+            read_tool.invoke(json!({ "file_path": file_path }), make_ctx()),
+        )
+        .await;
+        assert!(identity.is_none());
+        let ToolOutcome::Completed(read_result) = read_out.unwrap() else {
             panic!("expected Completed")
         };
         assert!(read_result.success);
@@ -362,6 +536,100 @@ mod tests {
             panic!("expected Completed")
         };
         assert!(write_result.success);
+    }
+
+    async fn observed_read(
+        call_id: &str,
+        ctx_call_id: &str,
+        args: serde_json::Value,
+    ) -> (String, Option<ReadResultIdentity>) {
+        let tool = ReadTool::new();
+        let (out, identity) =
+            observe_read_result(call_id, tool.invoke(args, ToolCtx::none(ctx_call_id))).await;
+        let ToolOutcome::Completed(result) = out.unwrap() else {
+            panic!("expected Completed")
+        };
+        assert!(result.success);
+        (result.result, identity)
+    }
+
+    #[tokio::test]
+    async fn read_observation_uses_stable_file_version_and_effective_range() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path();
+        tokio::fs::write(path, "line 1\nline 2\nold\n")
+            .await
+            .unwrap();
+
+        let (full_text, full) = observed_read("full", "full", json!({"file_path": path})).await;
+        let full = full.unwrap();
+        let (clamped_text, clamped) = observed_read(
+            "clamped",
+            "clamped",
+            json!({"file_path": path, "offset": 0, "limit": 1000}),
+        )
+        .await;
+        assert_eq!(full_text, "     1\tline 1\n     2\tline 2\n     3\told");
+        assert_eq!(clamped_text, full_text);
+        assert_eq!(clamped.as_ref(), Some(&full));
+        assert_eq!(full.source_kind, ReadSourceKind::File);
+        assert_eq!((full.range_start, full.range_end), (0, 3));
+        assert_eq!(
+            full.canonical_path,
+            std::fs::canonicalize(path).unwrap().to_str().unwrap()
+        );
+        let wire: ReadResultIdentity =
+            serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+        assert_eq!(wire, full);
+        assert!(wire.matches_full_result(&full_text));
+        assert!(!wire.matches_full_result("     1\tline 1"));
+
+        let args = json!({"file_path": path, "limit": 1});
+        let (before_text, before) = observed_read("before", "before", args.clone()).await;
+        let before = before.unwrap();
+        assert_eq!((before.range_start, before.range_end), (0, 1));
+        assert_eq!(before.source_version, full.source_version);
+        assert_ne!(before, full);
+        tokio::fs::write(path, "line 1\nline 2\nnew\n")
+            .await
+            .unwrap();
+        let (after_text, after) = observed_read("after", "after", args.clone()).await;
+        let after = after.unwrap();
+        assert_eq!(after_text, before_text);
+        assert_eq!(after.result_sha256, before.result_sha256);
+        assert_ne!(after.source_version, before.source_version);
+        assert_ne!(after, before);
+
+        let (unmatched_text, unmatched) = observed_read("observer", "other-call", args).await;
+        assert_eq!(unmatched_text, before_text);
+        assert!(unmatched.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_observation_uses_sorted_directory_snapshot_and_effective_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        tokio::fs::create_dir(path.join("z-dir")).await.unwrap();
+        tokio::fs::write(path.join("a.txt"), "a").await.unwrap();
+        let args = json!({"file_path": path, "offset": 0, "limit": 1});
+        let (before_text, before) = observed_read("before", "before", args.clone()).await;
+        let before = before.unwrap();
+        let (repeat_text, repeat) = observed_read("repeat", "repeat", args.clone()).await;
+        assert_eq!(repeat.as_ref(), Some(&before));
+        assert_eq!(repeat_text, before_text);
+        assert!(before_text.starts_with("     1\ta.txt\n"));
+        assert_eq!(before.source_kind, ReadSourceKind::Directory);
+        assert_eq!((before.range_start, before.range_end), (0, 1));
+
+        tokio::fs::rename(path.join("z-dir"), path.join("y-dir"))
+            .await
+            .unwrap();
+        let (after_text, after) = observed_read("after", "after", args).await;
+        let after = after.unwrap();
+        assert_eq!(after_text, before_text);
+        assert_eq!(after.result_sha256, before.result_sha256);
+        assert_ne!(after.source_version, before.source_version);
+        assert_ne!(after, before);
     }
 
     #[tokio::test]

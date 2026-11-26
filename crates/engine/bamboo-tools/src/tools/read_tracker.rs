@@ -66,6 +66,14 @@ impl StableFileRead {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub(crate) fn version_parts(&self) -> (u64, Option<u128>, [u8; 32]) {
+        (
+            self.snapshot.size_bytes,
+            self.snapshot.modified_ns,
+            self.snapshot.content_digest,
+        )
+    }
 }
 
 #[derive(Debug)]

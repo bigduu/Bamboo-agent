@@ -293,7 +293,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Its ordinary receipt regressions belong to the default storage packages-0 owner.
 // #727 updates the feature-sensitive Session index source. The new Project list
 // HTTP case belongs to server-handlers; additive contexts and selectors stay intact.
-const FEATURE_SOURCE_SHA256 = "5f2e477675a94ab76e93a8c7171133f51757dd29b030097585aa00870531285f";
+// #826 projects repeated Read results in the feature-sensitive request stream.
+// The built-in capture and request tests stay with default Tools and Engine.
+const FEATURE_SOURCE_SHA256 = "9697bcdfc244641b4ac935060be25836d7be124b28830dce825282ad2be23f81";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

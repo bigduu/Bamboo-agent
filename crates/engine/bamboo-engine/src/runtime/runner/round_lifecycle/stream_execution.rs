@@ -55,6 +55,8 @@ use super::{
     PromptMemoryExposureFrame, RoundRecoveryPolicy, RoundToolDispatch,
 };
 
+mod read_dedup;
+
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
 /// keep its parameter count below the clippy threshold.
@@ -1813,6 +1815,7 @@ pub(super) async fn execute_llm_stream(
     let (
         mut prepared_envelope,
         previous_response_id,
+        read_dedup_stats,
         final_usage,
         window_limit,
         required_tool,
@@ -1853,7 +1856,7 @@ pub(super) async fn execute_llm_stream(
         };
         let previous_model_context_state = session.model_context_state.clone();
         let previous_provider_transcript = session.provider_transcript.clone();
-        let prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
+        let mut prepared_envelope = build_request_envelope_reconciled_for_loading_mode(
             session,
             &prepared_context,
             config,
@@ -1867,6 +1870,14 @@ pub(super) async fn execute_llm_stream(
                 .into_iter()
                 .chain(convergence_hint),
         );
+        // Change only this outgoing transcript after the durable ledger has
+        // reconciled the original messages. Continuation requests already have
+        // provider-owned history, so they keep their existing projection.
+        let read_dedup_stats = if previous_response_id.is_none() {
+            read_dedup::project_repeated_reads(&mut prepared_envelope.ir)
+        } else {
+            read_dedup::ReadDedupStats::default()
+        };
         // `prepare_round_context` reserves the already-durable ledger history. The
         // reconciliation above can append a new host-state snapshot, so verify the
         // exact final IR again before checkpoint/provider dispatch. Failing closed
@@ -2053,6 +2064,7 @@ pub(super) async fn execute_llm_stream(
         break (
             prepared_envelope,
             previous_response_id,
+            read_dedup_stats,
             final_usage,
             window_limit,
             required_tool,
@@ -2187,6 +2199,14 @@ pub(super) async fn execute_llm_stream(
     }
     if cancel_token.is_cancelled() {
         return Err(AgentError::Cancelled);
+    }
+    if read_dedup_stats.duplicate_count > 0 {
+        tracing::debug!(
+            session_id,
+            duplicate_read_results = read_dedup_stats.duplicate_count,
+            estimated_prompt_tokens_saved = read_dedup_stats.estimated_saved_tokens,
+            "projected repeated Read results in outgoing model request"
+        );
     }
     // Start only at the actual dispatch boundary: failed prompt preflight is
     // not an LLM request. The same span remains alive through stream consumption.
