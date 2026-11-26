@@ -1,7 +1,9 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{http::StatusCode, web, HttpResponse, Result};
+use bamboo_storage::v2::SessionForkError;
+use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::app_state::AppState;
+use crate::{app_state::AppState, error::json_error_with_code};
 
 use super::super::super::types::{CopySessionResponse, SessionSummary};
 
@@ -14,7 +16,28 @@ pub async fn copy_session(
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> Result<HttpResponse> {
-    let source_id = path.into_inner();
+    duplicate_session(&state, path.into_inner(), None).await
+}
+
+#[derive(Deserialize)]
+pub struct ForkSessionRequest {
+    up_to_message_id: String,
+}
+
+/// Create a fresh Root with the stored conversation through the selected message.
+pub async fn fork_session(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    request: web::Json<ForkSessionRequest>,
+) -> Result<HttpResponse> {
+    duplicate_session(&state, path.into_inner(), Some(&request.up_to_message_id)).await
+}
+
+async fn duplicate_session(
+    state: &AppState,
+    source_id: String,
+    fork_anchor: Option<&str>,
+) -> Result<HttpResponse> {
     let new_id = Uuid::new_v4().to_string();
     // SessionStoreV2 owns the cross-process lifecycle/atomic-publication
     // boundary. Pair it with the same per-session lock used by chat/runtime
@@ -26,28 +49,62 @@ pub async fn copy_session(
         Err(error) => return Ok(crate::events::session_event_queue_unavailable(error)),
     };
 
-    let (copied, projection_guard) = match state
-        .session_store
-        .copy_session_with_projection_guard(&source_id, &new_id)
-        .await
-    {
+    let snapshot = match fork_anchor {
+        Some(message_id) => {
+            state
+                .session_store
+                .fork_session_with_projection_guard(&source_id, &new_id, message_id)
+                .await
+        }
+        None => state
+            .session_store
+            .copy_session_with_projection_guard(&source_id, &new_id)
+            .await
+            .map_err(SessionForkError::Io),
+    };
+    let (copied, projection_guard) = match snapshot {
         Ok(Some(result)) => result,
+        Ok(None) if fork_anchor.is_some() => {
+            return Ok(json_error_with_code(
+                StatusCode::NOT_FOUND,
+                "Source session not found".into(),
+                Some("session_fork_source_not_found"),
+            ));
+        }
         Ok(None) => {
             return Ok(HttpResponse::NotFound().json(serde_json::json!({
                 "error": crate::error::error_value("Session not found"),
                 "session_id": source_id,
             })));
         }
-        Err(error) => {
+        Err(SessionForkError::AnchorNotFound) => {
+            return Ok(json_error_with_code(
+                StatusCode::NOT_FOUND,
+                "The selected message is no longer in this session".into(),
+                Some("session_fork_message_not_found"),
+            ));
+        }
+        Err(SessionForkError::InvalidAnchor) => {
+            return Ok(json_error_with_code(
+                StatusCode::BAD_REQUEST,
+                "The selected message is not a valid fork point".into(),
+                Some("session_fork_invalid_message"),
+            ));
+        }
+        Err(SessionForkError::Io(error)) => {
             tracing::error!(
                 source_session_id = %source_id,
                 target_session_id = %new_id,
+                fork = fork_anchor.is_some(),
                 %error,
-                "failed to copy session"
+                "failed to duplicate session"
             );
-            return Err(crate::error::json_internal_server_error(
-                "Failed to copy session",
-            ));
+            let message = if fork_anchor.is_some() {
+                "Failed to fork session"
+            } else {
+                "Failed to copy session"
+            };
+            return Err(crate::error::json_internal_server_error(message));
         }
     };
 
@@ -73,9 +130,14 @@ pub async fn copy_session(
     // Copy preserves the source's workspace assignment. Publish the copied
     // identity separately so Workspace tools never consult the source id.
     if let Some(workspace) = copied.workspace_path_meta().map(std::path::PathBuf::from) {
+        let origin = if fork_anchor.is_some() {
+            "session_fork"
+        } else {
+            "session_copy"
+        };
         state
             .workspace_resolver
-            .publish_resolved_workspace(&new_id, workspace, "session_copy");
+            .publish_resolved_workspace(&new_id, workspace, origin);
     }
 
     // Account-feed consumers use the ordinary creation event to insert the
@@ -125,7 +187,9 @@ mod tests {
 
         let state = new_state().await;
         let mut root = Session::new("synthetic-feed-root", "test-model");
-        root.add_message(Message::user("synthetic retained history"));
+        let anchor = Message::user("synthetic retained history");
+        let anchor_id = anchor.id.clone();
+        root.add_message(anchor);
         let child = Session::new_child_of("synthetic-feed-child", &root, "test-model", "Task");
         state.session_store.save_session(&root).await.unwrap();
         state.session_store.save_session(&child).await.unwrap();
@@ -143,6 +207,13 @@ mod tests {
             (
                 "copy",
                 test::TestRequest::post().uri("/api/v1/sessions/synthetic-feed-root/copy"),
+                StatusCode::CREATED,
+            ),
+            (
+                "fork",
+                test::TestRequest::post()
+                    .uri("/api/v1/sessions/synthetic-feed-root/fork")
+                    .set_json(serde_json::json!({"up_to_message_id": anchor_id})),
                 StatusCode::CREATED,
             ),
             (
@@ -227,7 +298,7 @@ mod tests {
             if premature.iter().any(|(name, _, _)| *name == operation) {
                 continue;
             }
-            let copied_id = if operation == "copy" {
+            let copied_id = if matches!(operation, "copy" | "fork") {
                 let body: Value = test::read_body_json(response).await;
                 Some(body["session"]["id"].as_str().unwrap().to_owned())
             } else {
@@ -239,7 +310,7 @@ mod tests {
                 while matched.len() < event_count {
                     let change = feed.recv().await.unwrap();
                     let id = match (&change.event, operation) {
-                        (AgentEvent::SessionCreated { session_id, .. }, "copy")
+                        (AgentEvent::SessionCreated { session_id, .. }, "copy" | "fork")
                             if copied_id.as_ref() == Some(session_id) =>
                         {
                             session_id
@@ -390,6 +461,134 @@ mod tests {
         assert_eq!(body["session_id"], "missing");
         assert_eq!(body["error"]["message"], "Session not found");
         assert!(state.session_store.list_index_entries().await.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn fork_endpoint_publishes_an_independent_root_through_the_selected_message() {
+        let state = new_state().await;
+        let mut source = Session::new("fork-source", "gpt-fork");
+        let first = Message::user("original question");
+        let selected = Message::assistant("keep this answer", None);
+        let future = Message::user("exclude this question");
+        source.add_message(first.clone());
+        source.add_message(selected.clone());
+        source.add_message(future.clone());
+        source.set_project_id_meta("project-fork");
+        state.session_store.save_session(&source).await.unwrap();
+
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions/fork-source/fork")
+                .set_json(serde_json::json!({"up_to_message_id": &selected.id}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(response).await;
+        let fork_id = body["session"]["id"].as_str().unwrap();
+        assert_ne!(fork_id, source.id);
+        assert_eq!(body["session"]["kind"], "root");
+        assert_eq!(body["session"]["root_session_id"], fork_id);
+        assert!(body["session"]["parent_session_id"].is_null());
+        assert_eq!(body["session"]["project_id"], "project-fork");
+        assert_eq!(body["session"]["message_count"], 2);
+        assert_eq!(body["session"]["is_running"], false);
+        assert!(state.sessions.contains_key(fork_id));
+
+        let persisted = state
+            .session_store
+            .load_session(fork_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = state
+            .session_store
+            .load_session(&source.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted
+                .messages
+                .iter()
+                .map(|message| &message.id)
+                .collect::<Vec<_>>(),
+            [&first.id, &selected.id]
+        );
+        assert_eq!(
+            original
+                .messages
+                .iter()
+                .map(|message| &message.id)
+                .collect::<Vec<_>>(),
+            [&first.id, &selected.id, &future.id]
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("account feed timeout")
+            .expect("account feed event");
+        assert!(matches!(
+            &event.event,
+            AgentEvent::SessionCreated { session_id, kind, .. }
+                if session_id == fork_id && *kind == bamboo_agent_core::SessionKind::Root
+        ));
+    }
+
+    #[actix_web::test]
+    async fn fork_endpoint_distinguishes_missing_sources_and_invalid_or_stale_messages() {
+        let state = new_state().await;
+        let mut source = Session::new("fork-source", "gpt-fork");
+        let system = Message::system("system instructions");
+        source.add_message(system.clone());
+        state.session_store.save_session(&source).await.unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        for (source_id, message_id, status, code) in [
+            (
+                "absent",
+                "message",
+                StatusCode::NOT_FOUND,
+                "session_fork_source_not_found",
+            ),
+            (
+                "fork-source",
+                "stale",
+                StatusCode::NOT_FOUND,
+                "session_fork_message_not_found",
+            ),
+            (
+                "fork-source",
+                system.id.as_str(),
+                StatusCode::BAD_REQUEST,
+                "session_fork_invalid_message",
+            ),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/sessions/{source_id}/fork"))
+                    .set_json(serde_json::json!({"up_to_message_id": message_id}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], code);
+        }
+        assert_eq!(state.session_store.list_index_entries().await.len(), 1);
     }
 
     #[actix_web::test]

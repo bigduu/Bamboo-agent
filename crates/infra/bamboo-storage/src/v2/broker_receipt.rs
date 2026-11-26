@@ -16,7 +16,7 @@ const MAX_IDS: usize = 4096;
 const MAX_RECEIPT_SCAN_ROOTS: usize = 4096;
 const MAX_RECEIPT_SCAN_CHILDREN: usize = 16384;
 const MAX_RECEIPT_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
-const COMPLETION_SOURCE_KEY: &str = "runtime.child_completion_source_v1";
+pub(super) const COMPLETION_SOURCE_KEY: &str = "runtime.child_completion_source_v1";
 
 /// The durable, bounded Host proof for a strict terminal receipt. This is not
 /// Worker-supplied evidence: only the Host-only prepare/commit APIs can publish
