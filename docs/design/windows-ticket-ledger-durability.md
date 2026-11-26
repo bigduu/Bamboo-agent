@@ -199,6 +199,14 @@ source lacking DELETE and to a target with a reader lacking delete sharing, and 
 names and their bytes remain intact on refusal. Full graph recovery and crash persistence
 remain separate.
 
+Select `-f windows_ticket_probe_case=rust-graph` for the private Rust Ticket graph test.
+It uses canonical Ticket snapshot data, manifests and commits under the retained native writer.
+The test publishes two revisions, observes the object, manifest, commit and scope barriers,
+then closes the writer and opens fresh handles in the same process. The verifier starts at
+named HEAD and validates the current and parent graphs by checksum. A final scratch control
+corrupts a referenced object and verifies that readback refuses the graph while preserving
+HEAD, the corrupted file and an intact stale stage. Process exit and OS-crash or remount persistence have separate qualification.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity', 'rust-writer', 'rust-immutable', 'rust-head')][string] $ProbeCase = 'directory-flush'
+    [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit', 'scope-identity', 'rust-writer', 'rust-immutable', 'rust-head', 'rust-graph')][string] $ProbeCase = 'directory-flush'
 )
 
 Set-StrictMode -Version Latest
@@ -163,7 +163,7 @@ function Assert-ScopeIdentityProbe($Receipt) {
 }
 
 $nativeBinary = $null
-if ($ProbeCase -in @('rust-writer', 'rust-immutable', 'rust-head')) {
+if ($ProbeCase -in @('rust-writer', 'rust-immutable', 'rust-head', 'rust-graph')) {
     . (Join-Path $PSScriptRoot 'windows-ticket-rust-writer-owner.ps1')
     $rustTest = Get-TicketRustProbeTest $ProbeCase
     $nativeBinary = Get-TicketRustProbeBinary
@@ -286,7 +286,7 @@ try {
     $process = [System.Diagnostics.Process]::Start($launch)
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit', 'rust-writer', 'rust-immutable', 'rust-head')) { 180 } else { 90 }
+    $timeoutSeconds = if ($ProbeCase -in @('writer-lock', 'publication-process-exit', 'rust-writer', 'rust-immutable', 'rust-head', 'rust-graph')) { 180 } else { 90 }
     if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
         throw "The standard-user probe exceeded its $timeoutSeconds-second deadline."
     }
@@ -312,6 +312,7 @@ try {
             'rust-writer' { 'Rust writer' }
             'rust-immutable' { 'Rust immutable publication' }
             'rust-head' { 'Rust HEAD replacement' }
+            'rust-graph' { 'Rust graph publication' }
         }
         Write-Output "Ticket $rustLabel probe verdict: $($receipt.verdict)"
     }
@@ -343,6 +344,8 @@ try {
         Assert-RustImmutableProbe $receipt $process.Id
     } elseif ($ProbeCase -eq 'rust-head') {
         Assert-RustHeadProbe $receipt $process.Id
+    } elseif ($ProbeCase -eq 'rust-graph') {
+        Assert-RustGraphProbe $receipt $process.Id
     } else {
         Assert-ProbeOutcome $receipt.staged_file_flush 'staged file flush' $true
         Assert-ProbeOutcome $receipt.scratch_name_publication 'scratch name publication' $true
