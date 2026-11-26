@@ -31,6 +31,7 @@ on:
           - scope-identity
           - rust-writer
           - rust-immutable
+          - rust-head
 
 permissions:
   contents: read
@@ -200,7 +201,7 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Probe Windows Ticket primitives as a standard user
-        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable'
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case != 'rust-writer' && inputs.windows_ticket_probe_case != 'rust-immutable' && inputs.windows_ticket_probe_case != 'rust-head'
         env:
           PROBE_CASE: ${{ inputs.windows_ticket_probe_case }}
         shell: pwsh
@@ -238,6 +239,11 @@ jobs:
         if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-immutable'
         shell: pwsh
         run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-immutable
+
+      - name: Probe Rust Windows Ticket HEAD replacement as a standard user
+        if: inputs.windows_ticket_probe_sha != '' && inputs.windows_ticket_probe_case == 'rust-head'
+        shell: pwsh
+        run: ./scripts/run-windows-ticket-directory-flush-probe.ps1 -ProbeCase rust-head
 
       - name: Verify the Windows Ticket probe left the exact source clean
         if: always() && inputs.windows_ticket_probe_sha != ''

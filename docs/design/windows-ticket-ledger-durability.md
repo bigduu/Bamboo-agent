@@ -191,6 +191,14 @@ the category barrier, native collision and name preservation, exact-content reus
 refusal to reuse conflicting bytes. This measures the immutable publication operations. HEAD
 replacement and crash persistence remain separate.
 
+Select `-f windows_ticket_probe_case=rust-head` for the private Rust HEAD replacement test.
+It stages a successor, replaces literal HEAD relative to the retained writable scope, and
+flushes that scope. A held reader with compatible sharing must retain the old file identity and
+bytes while a new relative open reads the successor. The test also applies native rename to a
+source lacking DELETE and to a target with a reader lacking delete sharing, and confirms both
+names and their bytes remain intact on refusal. Full graph recovery and crash persistence
+remain separate.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

@@ -125,6 +125,10 @@ fn entry_identity(file: &File, directory: bool) -> io::Result<FileIdentity> {
             "Windows Ticket scope requires a plain filesystem entry",
         ));
     }
+    handle_identity(file)
+}
+
+fn handle_identity(file: &File) -> io::Result<FileIdentity> {
     let id = file_info::<FILE_ID_INFO>(file, FileIdInfo)?;
     Ok(FileIdentity {
         volume_serial: id.VolumeSerialNumber,
@@ -437,5 +441,6 @@ impl WindowsScope {
     }
 }
 
+mod head;
 mod immutable;
 mod tests;

@@ -10,8 +10,9 @@ use std::{
 
 use windows_sys::{
     Wdk::Storage::FileSystem::{
-        FileRenameInformation, NtSetInformationFile, FILE_CREATE, FILE_OPEN,
-        FILE_RENAME_INFORMATION,
+        FileRenameInformation, FileRenameInformationEx, NtSetInformationFile, FILE_CREATE,
+        FILE_OPEN, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+        FILE_RENAME_REPLACE_IF_EXISTS,
     },
     Win32::{
         Foundation::{RtlNtStatusToDosError, ERROR_FILE_NOT_FOUND, STATUS_SUCCESS},
@@ -25,10 +26,13 @@ use windows_sys::{
 
 use super::{
     entry_identity, invalid_entry, open_relative, open_relative_shared, FileIdentity,
-    FileObservation, WriterGuard, DIRECTORY_ACCESS, SHARE, WRITER_NAME,
+    FileObservation, WindowsScope, WriterGuard, DIRECTORY_ACCESS, SHARE, WRITER_NAME,
 };
 
-const PUBLICATION_SHARING: u32 = SHARE | FILE_SHARE_DELETE;
+pub(super) const PUBLICATION_SHARING: u32 = SHARE | FILE_SHARE_DELETE;
+pub(super) const HEAD_RENAME_INFORMATION_CLASS: i32 = FileRenameInformationEx;
+pub(super) const HEAD_RENAME_FLAGS: u32 =
+    FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
 
 pub(super) struct ImmutableCategory<'writer, 'scope> {
     writer: &'writer WriterGuard<'scope>,
@@ -38,11 +42,11 @@ pub(super) struct ImmutableCategory<'writer, 'scope> {
 }
 
 pub(super) struct StagedObject {
-    file: File,
-    category: FileIdentity,
-    name: String,
-    identity: FileIdentity,
-    bytes: Vec<u8>,
+    pub(super) file: File,
+    pub(super) category: FileIdentity,
+    pub(super) name: String,
+    pub(super) identity: FileIdentity,
+    pub(super) bytes: Vec<u8>,
 }
 
 impl StagedObject {
@@ -62,6 +66,13 @@ pub(super) struct ObjectObservation {
 pub(super) struct RenameReceipt {
     pub(super) ntstatus: i32,
     pub(super) win32_error: i32,
+    pub(super) information_class: i32,
+    pub(super) flags: u32,
+}
+
+pub(super) enum RenameForm {
+    CreateOnly,
+    PosixReplace,
 }
 
 #[derive(Debug)]
@@ -136,14 +147,6 @@ impl ImmutableCategory<'_, '_> {
         Ok(())
     }
 
-    fn observe_regular(&self, file: &File) -> io::Result<FileObservation> {
-        let observation = self.writer.scope.observe_file(file)?;
-        if observation.link_count != 1 {
-            return Err(invalid_entry("immutable object requires exactly one link"));
-        }
-        Ok(observation)
-    }
-
     pub(super) fn stage(&self, name: &str, bytes: &[u8]) -> io::Result<StagedObject> {
         if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(io::Error::new(
@@ -171,69 +174,19 @@ impl ImmutableCategory<'_, '_> {
 
     fn create_synced(&self, name: &str, bytes: &[u8]) -> io::Result<StagedObject> {
         self.check_binding()?;
-        let mut file = open_relative_shared(
+        stage_synced(
+            self.writer.scope,
             &self.directory,
-            OsStr::new(name),
-            false,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
-            FILE_CREATE,
-            FILE_SHARE_READ,
-        )?;
-        let observed = self.observe_regular(&file)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(StagedObject {
-            file,
-            category: self.identity,
-            name: name.to_owned(),
-            identity: observed.identity,
-            bytes: bytes.to_vec(),
-        })
+            self.identity,
+            name,
+            bytes,
+            true,
+        )
     }
 
     pub(super) fn observe(&self, name: &str, limit: usize) -> io::Result<ObjectObservation> {
         self.check_binding()?;
-        let limit = limit
-            .checked_add(1)
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidInput, "immutable read limit is too large")
-            })?;
-        let file = open_relative_shared(
-            &self.directory,
-            OsStr::new(name),
-            false,
-            FILE_GENERIC_READ,
-            FILE_OPEN,
-            PUBLICATION_SHARING,
-        )?;
-        let observed = self.observe_regular(&file)?;
-        let mut bytes = Vec::new();
-        file.take(limit).read_to_end(&mut bytes)?;
-        Ok(ObjectObservation {
-            identity: observed.identity,
-            link_count: observed.link_count,
-            bytes,
-        })
-    }
-
-    fn require_stage_absent(&self, name: &str) -> io::Result<i32> {
-        match open_relative_shared(
-            &self.directory,
-            OsStr::new(name),
-            false,
-            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_OPEN,
-            PUBLICATION_SHARING,
-        ) {
-            Ok(_) => Err(invalid_entry(
-                "published immutable staging name still exists",
-            )),
-            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
-                Ok(ERROR_FILE_NOT_FOUND as i32)
-            }
-            Err(error) => Err(error),
-        }
+        observe_named(self.writer.scope, &self.directory, name, limit)
     }
 
     pub(super) fn publish_no_replace(
@@ -260,7 +213,7 @@ impl ImmutableCategory<'_, '_> {
                 "immutable staging name changed before publication",
             ));
         }
-        let rename = rename_create_only(&stage.file, &self.directory, digest);
+        let rename = rename_opened(&stage.file, &self.directory, digest, RenameForm::CreateOnly);
         let installation = if rename.ntstatus == STATUS_SUCCESS {
             Some(self.verify_installation(stage, digest))
         } else {
@@ -283,7 +236,7 @@ impl ImmutableCategory<'_, '_> {
                 "installed object did not retain staging identity and bytes",
             ));
         }
-        let stage_absence_win32_error = self.require_stage_absent(&stage.name)?;
+        let stage_absence_win32_error = require_name_absent(&self.directory, &stage.name)?;
         self.check_binding()?;
         self.directory.sync_all()?;
         Ok(InstalledObject {
@@ -318,6 +271,94 @@ impl ImmutableCategory<'_, '_> {
     }
 }
 
+pub(super) fn observe_regular(scope: &WindowsScope, file: &File) -> io::Result<FileObservation> {
+    let observation = scope.observe_file(file)?;
+    if observation.link_count != 1 {
+        return Err(invalid_entry("immutable object requires exactly one link"));
+    }
+    Ok(observation)
+}
+
+pub(super) fn stage_synced(
+    scope: &WindowsScope,
+    directory: &File,
+    identity: FileIdentity,
+    name: &str,
+    bytes: &[u8],
+    delete_access: bool,
+) -> io::Result<StagedObject> {
+    let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | if delete_access { DELETE } else { 0 };
+    let mut file = open_relative_shared(
+        directory,
+        OsStr::new(name),
+        false,
+        access,
+        FILE_CREATE,
+        FILE_SHARE_READ,
+    )?;
+    let observed = observe_regular(scope, &file)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(StagedObject {
+        file,
+        category: identity,
+        name: name.to_owned(),
+        identity: observed.identity,
+        bytes: bytes.to_vec(),
+    })
+}
+
+pub(super) fn read_bounded(file: &File, limit: usize) -> io::Result<Vec<u8>> {
+    let limit = limit
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "immutable read limit is too large")
+        })?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn observe_named(
+    scope: &WindowsScope,
+    directory: &File,
+    name: &str,
+    limit: usize,
+) -> io::Result<ObjectObservation> {
+    let file = open_relative_shared(
+        directory,
+        OsStr::new(name),
+        false,
+        FILE_GENERIC_READ,
+        FILE_OPEN,
+        PUBLICATION_SHARING,
+    )?;
+    let observed = observe_regular(scope, &file)?;
+    Ok(ObjectObservation {
+        identity: observed.identity,
+        link_count: observed.link_count,
+        bytes: read_bounded(&file, limit)?,
+    })
+}
+
+pub(super) fn require_name_absent(directory: &File, name: &str) -> io::Result<i32> {
+    match open_relative_shared(
+        directory,
+        OsStr::new(name),
+        false,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        PUBLICATION_SHARING,
+    ) {
+        Ok(_) => Err(invalid_entry("published staging name still exists")),
+        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+            Ok(ERROR_FILE_NOT_FOUND as i32)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn require_digest(digest: &str) -> io::Result<()> {
     if digest.len() != 64
         || !digest
@@ -332,8 +373,13 @@ fn require_digest(digest: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn rename_create_only(source: &File, parent: &File, digest: &str) -> RenameReceipt {
-    let units: Vec<u16> = digest.encode_utf16().collect();
+pub(super) fn rename_opened(
+    source: &File,
+    parent: &File,
+    name: &str,
+    form: RenameForm,
+) -> RenameReceipt {
+    let units: Vec<u16> = name.encode_utf16().collect();
     let name_bytes = units.len() * size_of::<u16>();
     let request_size = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
     // A machine word matches the native request's alignment. Initialize the
@@ -343,9 +389,16 @@ fn rename_create_only(source: &File, parent: &File, digest: &str) -> RenameRecei
     let request = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let mut io_status = IO_STATUS_BLOCK::default();
     // SAFETY: the aligned owned buffer holds the native header and literal name.
-    // Both the DELETE-capable source and destination parent handles remain live.
-    let ntstatus = unsafe {
-        // The zeroed legacy flags prohibit replacing an existing name.
+    // Both handles remain live, and the native operation checks their access.
+    let (ntstatus, information_class, flags) = unsafe {
+        let (class, flags) = match form {
+            // The zeroed legacy flags prohibit replacing an existing name.
+            RenameForm::CreateOnly => (FileRenameInformation, 0),
+            RenameForm::PosixReplace => {
+                (*request).Anonymous.Flags = HEAD_RENAME_FLAGS;
+                (HEAD_RENAME_INFORMATION_CLASS, HEAD_RENAME_FLAGS)
+            }
+        };
         (*request).RootDirectory = parent.as_raw_handle();
         (*request).FileNameLength = name_bytes as u32;
         let name = buffer
@@ -354,18 +407,21 @@ fn rename_create_only(source: &File, parent: &File, digest: &str) -> RenameRecei
             .add(offset_of!(FILE_RENAME_INFORMATION, FileName))
             .cast::<u16>();
         ptr::copy_nonoverlapping(units.as_ptr(), name, units.len());
-        NtSetInformationFile(
+        let status = NtSetInformationFile(
             source.as_raw_handle(),
             &mut io_status,
             buffer.as_ptr().cast(),
             request_size as u32,
-            FileRenameInformation,
-        )
+            class,
+        );
+        (status, class, flags)
     };
     // SAFETY: the status came from the native rename call above.
     let win32_error = unsafe { RtlNtStatusToDosError(ntstatus) } as i32;
     RenameReceipt {
         ntstatus,
         win32_error,
+        information_class,
+        flags,
     }
 }
