@@ -159,6 +159,16 @@ reports the old handle's identity and bytes, the newly opened HEAD, and the pres
 for both denied rename controls. The fixture observes those operations under the actual token
 and filesystem. Ordered crash persistence remains a separate qualification.
 
+Select `-f windows_ticket_probe_case=publication-process-exit` for the warm-reopen fixture.
+It uses one uninterrupted publication and three separate scopes where the controller terminates
+the writer while it still holds the lock. It cuts before HEAD replacement, after the native
+replacement succeeds but before the scope flush, and after that flush but before a success reply.
+A fresh process acquires the existing lock and follows named HEAD through the checksum-linked
+commit, manifest, and object. The receipt includes the staged name and graph before replacement,
+and reads the new HEAD and prior graph after replacement. The running OS and mounted volume are
+shared across each exit and reopen. OS-crash, remount, and power-loss persistence require separate
+evidence.
+
 | Evidence | Acceptance |
 | --- | --- |
 | Scope and writer | With a writer held, a second open in the same process and an independent process are denied before mutation through both the original name and an equivalent spelling. Attempt to replace the lock name and acquire a second writer while the first lock is held. A fresh process can take ownership after clean release and after actual owner exit. Ancestor or leaf substitution, junctions, alternate streams, hard links, and wrong volume or file identity fail closed without writing to a foreign scope. |

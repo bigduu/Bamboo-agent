@@ -4,10 +4,13 @@ param(
   [Parameter(Mandatory)][string]$ExpectedSid,
   [Parameter(Mandatory)][string]$FixtureDirectory,
   [Parameter(Mandatory)][string]$ReceiptPath,
-  [ValidateSet('directory-flush', 'writer-lock', 'publication')][string]$ProbeCase = 'directory-flush',
+  [ValidateSet('directory-flush', 'writer-lock', 'publication', 'publication-process-exit')][string]$ProbeCase = 'directory-flush',
   [ValidateSet('primary', 'contender', 'alias-contender', 'name-contender', 'exit-holder')]
   [string]$WriterRole = 'primary',
-  [ValidatePattern('^(?:[0-9a-f]{32})?$')][string]$WriterExpectedLockId = ''
+  [ValidatePattern('^(?:[0-9a-f]{32})?$')][string]$WriterExpectedLockId = '',
+  [ValidateSet('primary', 'writer', 'verifier')][string]$ProcessRole = 'primary',
+  [ValidateSet('complete', 'before-head-replace', 'after-head-replace', 'after-scope-flush')]
+  [string]$ProcessCut = 'complete'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +18,10 @@ Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'The Ticket platform probe requires native Windows.' }
 if ($ProbeCase -ne 'writer-lock' -and ($WriterRole -ne 'primary' -or $WriterExpectedLockId)) {
   throw 'Writer lock process roles require the writer-lock probe.'
+}
+if (($ProbeCase -ne 'publication-process-exit' -and $ProcessRole -ne 'primary') -or
+    ($ProcessRole -ne 'writer' -and $ProcessCut -ne 'complete')) {
+  throw 'Publication process roles and cuts require their matching probe mode.'
 }
 
 $interopSource = @'
@@ -400,8 +407,12 @@ if ($ProbeCase -ne 'directory-flush') {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
-if ($ProbeCase -eq 'publication') {
+if ($ProbeCase -in @('publication', 'publication-process-exit')) {
   $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-publication-native.cs') -Raw
+  $interopSource += [Environment]::NewLine + $nativeSource
+}
+if ($ProbeCase -eq 'publication-process-exit') {
+  $nativeSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows-ticket-publication-process-exit-native.cs') -Raw
   $interopSource += [Environment]::NewLine + $nativeSource
 }
 Add-Type -TypeDefinition $interopSource
@@ -441,6 +452,31 @@ if ($ProbeCase -eq 'writer-lock') {
 } elseif ($ProbeCase -eq 'publication') {
   $receipt = [WindowsTicketDirectoryFlushProbe]::RunPublication($ExpectedSid, $fixture)
   $probeLabel = 'publication'
+} elseif ($ProbeCase -eq 'publication-process-exit') {
+  if ($ProcessRole -eq 'writer') {
+    $cutCallback = [Action[System.Collections.Generic.Dictionary[string, object]]] {
+      param($observation)
+
+      [Console]::WriteLine((ConvertTo-Json -InputObject $observation -Depth 16 -Compress))
+      [Console]::Out.Flush()
+      # Keep the writer inside its native lifetime until the known controller
+      # terminates it. EOF or a leaked controller must not look like a cut.
+      [WindowsTicketDirectoryFlushProbe]::WaitAtPublicationProcessCut()
+    }
+    $receipt = [WindowsTicketDirectoryFlushProbe]::RunPublicationProcessWriter(
+      $ExpectedSid, $fixture, $ProcessCut, $cutCallback)
+  } elseif ($ProcessRole -eq 'verifier') {
+    $receipt = [WindowsTicketDirectoryFlushProbe]::RunPublicationProcessVerifier($ExpectedSid, $fixture)
+  } else {
+    . (Join-Path $PSScriptRoot 'windows-ticket-writer-lock-cases.ps1')
+    . (Join-Path $PSScriptRoot 'windows-ticket-publication-process-exit-cases.ps1')
+    $receipt = Invoke-TicketPublicationProcessCases -ExpectedSid $ExpectedSid -FixtureDirectory $fixture -EntryScript $PSCommandPath
+  }
+  if ($ProcessRole -ne 'primary') {
+    [Console]::WriteLine((ConvertTo-Json -InputObject $receipt -Depth 16 -Compress))
+    return
+  }
+  $probeLabel = 'publication process exit'
 } else {
   $receipt = [WindowsTicketDirectoryFlushProbe]::Run($ExpectedSid, $fixture)
   $probeLabel = 'directory flush'

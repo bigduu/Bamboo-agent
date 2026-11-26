@@ -27,6 +27,7 @@ on:
           - directory-flush
           - writer-lock
           - publication
+          - publication-process-exit
 
 permissions:
   contents: read
