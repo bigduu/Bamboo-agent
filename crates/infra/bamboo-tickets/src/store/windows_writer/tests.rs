@@ -1,3 +1,4 @@
+mod graph;
 mod head;
 mod immutable;
 mod token;
@@ -500,9 +501,13 @@ fn publish_child_reply(path: &Path, reply: &ChildReply) {
 }
 
 fn write_json(path: &Path, data: &impl Serialize) {
+    write_json_bounded(path, data, REPLY_LIMIT);
+}
+
+fn write_json_bounded(path: &Path, data: &impl Serialize, limit: u64) {
     let payload = serde_json::to_vec(data).expect("serialize native probe evidence");
     assert!(
-        payload.len() as u64 <= REPLY_LIMIT,
+        payload.len() as u64 <= limit,
         "native probe output exceeded its bound"
     );
     OpenOptions::new()

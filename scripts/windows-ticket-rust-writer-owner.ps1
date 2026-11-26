@@ -3,6 +3,7 @@ function Get-TicketRustProbeTest([string] $ProbeCase) {
         'rust-writer' { return 'store::windows_writer::tests::native_standard_user_scope_and_writer' }
         'rust-immutable' { return 'store::windows_writer::tests::immutable::native_standard_user_immutable_publication' }
         'rust-head' { return 'store::windows_writer::tests::head::native_standard_user_head_replacement' }
+        'rust-graph' { return 'store::windows_writer::tests::graph::native_standard_user_ticket_graph_publication' }
         default { throw 'The Rust Ticket probe case is outside the owner test selection.' }
     }
 }
@@ -266,6 +267,167 @@ function Assert-RustHeadProbe($Receipt, [int]$OwnerProcessId) {
                 -not (Test-TicketRustHeadObservation $phase.staged_after $phase.staged_before)) {
                 throw "The actual denied Rust HEAD rename did not preserve both files at '$name'."
             }
+        }
+    }
+    Assert-TicketRustFileStoreGate $Receipt
+}
+
+function Get-TicketRustGraphHash($Observed) {
+    if ($Observed.bytes_hex -cnotmatch '^(?:[0-9a-f]{2}){1,2048}$') {
+        throw 'The Rust Ticket graph evidence lacked bounded full bytes.'
+    }
+    $bytes = [Convert]::FromHexString($Observed.bytes_hex)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Assert-TicketRustGraphRevision($Graph, $Scope, [int]$Sequence, $Parent) {
+    if ($Graph.schema -ne 1 -or $Graph.sequence -ne $Sequence -or $Graph.parent -cne $Parent -or
+        $Graph.commit_hash -cnotmatch '^[0-9a-f]{64}$' -or $Graph.manifest_hash -cnotmatch '^[0-9a-f]{64}$' -or
+        $Graph.snapshot_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'The Rust Ticket graph did not match the expected schema, sequence, or parent commit.'
+    }
+    $payload = @{}
+    foreach ($kind in @('ticket', 'header', 'manifest', 'commit')) {
+        $object = $Graph.objects.$kind
+        $category = switch ($kind) {
+            'manifest' { 'manifests' }
+            'commit'   { 'commits' }
+            default    { 'objects' }
+        }
+        if ($object.category -cne $category -or $object.identity.volume_serial -cne $Scope.volume_serial -or
+            -not (Test-TicketRustObjectObservation $object $object) -or
+            $object.address -cne (Get-TicketRustGraphHash $object)) {
+            throw "The Rust Ticket $kind did not attest its named bytes and physical identity."
+        }
+        $bytes = [Convert]::FromHexString($object.bytes_hex)
+        $payload[$kind] = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable
+    }
+    $title = if ($Sequence -eq 1) { 'First checkpoint' } else { 'Final checkpoint' }
+    if ($Graph.commit_hash -cne $Graph.objects.commit.address -or
+        $Graph.manifest_hash -cne $Graph.objects.manifest.address -or
+        $payload.commit.schema -ne $Graph.schema -or $payload.commit.seq -ne $Graph.sequence -or
+        $payload.commit.parent -cne $Graph.parent -or $payload.commit.manifest -cne $Graph.manifest_hash -or
+        $payload.manifest.schema -ne $Graph.schema -or $payload.manifest.objects.Count -ne 2 -or
+        $payload.manifest.objects.header -cne $Graph.objects.header.address -or
+        $payload.manifest.objects['tickets:graph-ticket'] -cne $Graph.objects.ticket.address -or
+        $payload.header.schema -ne $Graph.schema -or $payload.header.seq -ne $Graph.sequence -or
+        $Graph.binding.scope_id -cne 'graph-scope' -or
+        $Graph.binding.supervisor_session_id -cne 'graph-supervisor' -or $Graph.binding.binding_revision -ne 1 -or
+        $payload.header.binding.scope_id -cne $Graph.binding.scope_id -or
+        $payload.header.binding.supervisor_session_id -cne $Graph.binding.supervisor_session_id -or
+        $payload.header.binding.binding_revision -ne $Graph.binding.binding_revision -or
+        $payload.ticket.id -cne 'graph-ticket' -or $payload.ticket.scope_id -cne $Graph.binding.scope_id -or
+        $payload.ticket.updated_seq -ne $Sequence -or $payload.ticket.contract.title -cne $title) {
+        throw 'The actual Rust Ticket commit, manifest and objects were not linked to the reported scope and revision.'
+    }
+}
+
+function Assert-TicketRustGraphPublication($Revision) {
+    $kinds = @('ticket', 'header', 'manifest', 'commit')
+    $publications = @($Revision.publications)
+    if ($publications.Count -ne $kinds.Count -or $Revision.head_scope_flush_win32_error -ne 0) {
+        throw 'The Rust Ticket publication lacked its four ordered immutable names and final scope barrier.'
+    }
+    for ($index = 0; $index -lt $kinds.Count; $index++) {
+        $kind = $kinds[$index]
+        $publication = $publications[$index]
+        $object = $Revision.graph.objects.$kind
+        if ($publication.kind -cne $kind -or $publication.category -cne $object.category -or
+            $publication.address -cne $object.address -or
+            -not (Test-TicketRustWriterFileIdentity $publication.stage_identity $object.identity) -or
+            $publication.file_flush_win32_error -ne 0 -or $publication.rename.ntstatus -cne '00000000' -or
+            $publication.rename.win32_error -ne 0 -or $publication.rename.information_class -ne 10 -or
+            $publication.rename.flags -ne 0 -or $publication.stage_absence_win32_error -ne 2 -or
+            $publication.category_flush_win32_error -ne 0) {
+            throw "The Rust Ticket $kind did not attest the staged file, create-only rename and category barrier."
+        }
+    }
+    $headBytes = [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes($Revision.graph.commit_hash)).ToLowerInvariant()
+    if ($Revision.head.link_count -ne 1 -or $Revision.head.bytes_hex -cne $headBytes) {
+        throw 'The Rust Ticket publication did not install the actual commit hash as HEAD.'
+    }
+}
+
+function Assert-TicketRustGraphReopenMatch($Observed, $Published) {
+    if ($Observed.commit_hash -cne $Published.commit_hash -or $Observed.manifest_hash -cne $Published.manifest_hash -or
+        $Observed.snapshot_sha256 -cne $Published.snapshot_sha256) {
+        throw 'The freshly opened Rust Ticket graph did not match the published graph.'
+    }
+    foreach ($kind in @('ticket', 'header', 'manifest', 'commit')) {
+        if (-not (Test-TicketRustObjectObservation $Observed.objects.$kind $Published.objects.$kind)) {
+            throw "The freshly opened Rust Ticket $kind did not retain the published identity and bytes."
+        }
+    }
+}
+
+function Assert-RustGraphProbe($Receipt, [int]$OwnerProcessId) {
+    if ($Receipt.probe -cne 'rust-graph' -or $Receipt.case -cne 'native_standard_user_ticket_graph_publication' -or
+        $Receipt.owner_pid -ne $OwnerProcessId -or $Receipt.verdict -cne 'available') {
+        throw 'The Rust receipt did not identify the exact Ticket graph publication test.'
+    }
+    $proof = $Receipt.graph
+    $initial = $proof.initial
+    $successor = $proof.successor
+    $reopen = $proof.reopen
+    if ($proof.scope.file_id -cne $Receipt.volume.fixture_directory_file_id -or
+        $proof.scope.volume_serial -cne $Receipt.volume.volume_serial -or
+        $proof.writer.file.volume_serial -cne $proof.scope.volume_serial -or
+        $proof.writer.win32_error -ne 0 -or $proof.writer.link_count -ne 1 -or
+        $reopen.writer.win32_error -ne 0 -or $reopen.writer.link_count -ne 1 -or
+        -not (Test-TicketRustWriterFileIdentity $reopen.scope $proof.scope) -or
+        -not (Test-TicketRustWriterFileIdentity $reopen.writer.file $proof.writer.file)) {
+        throw 'The Rust Ticket graph did not reopen its original physical scope and existing writer lock.'
+    }
+
+    Assert-TicketRustGraphRevision $initial.graph $proof.scope 1 $null
+    Assert-TicketRustGraphRevision $successor.graph $proof.scope 2 $initial.graph.commit_hash
+    Assert-TicketRustGraphPublication $initial
+    Assert-TicketRustGraphPublication $successor
+    $categoryOrder = 'ticket.category_flush|header.category_flush|manifest.category_flush|commit.category_flush'
+    if (($initial.operation_order -join '|') -cne "$categoryOrder|head.seed_scope_flush|head.read_named" -or
+        ($successor.operation_order -join '|') -cne "$categoryOrder|head.stage_file_flush|head.replace|head.scope_flush|head.read_named" -or
+        $successor.head_rename.ntstatus -cne '00000000' -or $successor.head_rename.win32_error -ne 0 -or
+        $successor.head_rename.information_class -ne 65 -or $successor.head_rename.flags -ne 3 -or
+        $successor.head_stage_absence_win32_error -ne 2 -or
+        $initial.head.identity.volume_serial -cne $proof.scope.volume_serial -or
+        $successor.head.identity.volume_serial -cne $proof.scope.volume_serial -or
+        $initial.head.identity.file_id -ceq $successor.head.identity.file_id -or
+        -not (Test-TicketRustObjectObservation $successor.head $successor.head_stage)) {
+        throw 'The Rust Ticket HEAD did not publish the distinct staged successor after the graph barriers.'
+    }
+    if (($reopen.operation_order -join '|') -cne 'open_scope|acquire_writer|read_head|selected.commit|selected.manifest|selected.header|selected.ticket|previous.commit|previous.manifest|previous.header|previous.ticket' -or
+        -not (Test-TicketRustObjectObservation $reopen.head $successor.head)) {
+        throw 'The fresh Rust Ticket graph traversal did not start at the published named HEAD.'
+    }
+    Assert-TicketRustGraphRevision $reopen.selected $reopen.scope 2 $initial.graph.commit_hash
+    Assert-TicketRustGraphRevision $reopen.previous $reopen.scope 1 $null
+    Assert-TicketRustGraphReopenMatch $reopen.selected $successor.graph
+    Assert-TicketRustGraphReopenMatch $reopen.previous $initial.graph
+
+    $corruption = $proof.corruption
+    $previousTicket = $reopen.previous.objects.ticket
+    $successorTicket = $reopen.selected.objects.ticket
+    $stale = $corruption.stale_stage_before
+    if ($corruption.kind -cne 'object_hash_mismatch' -or $corruption.address -cne $successorTicket.address -or
+        $corruption.observed_sha256 -cne $previousTicket.address -or
+        $corruption.observed_sha256 -ceq $corruption.address -or
+        (Get-TicketRustGraphHash $corruption.injected) -cne $corruption.observed_sha256 -or
+        $corruption.injected.bytes_hex -cne $previousTicket.bytes_hex -or
+        -not (Test-TicketRustWriterFileIdentity $corruption.injected.identity $successorTicket.identity) -or
+        -not (Test-TicketRustObjectObservation $corruption.object_before $successorTicket) -or
+        -not (Test-TicketRustObjectObservation $corruption.object_after $corruption.injected) -or
+        -not (Test-TicketRustObjectObservation $corruption.head_before $reopen.head) -or
+        -not (Test-TicketRustObjectObservation $corruption.head_after $corruption.head_before) -or
+        $corruption.stale_stage_name -cne '.HEAD-graph-stale' -or $stale.identity.volume_serial -cne $proof.scope.volume_serial -or
+        $stale.identity.file_id -ceq $reopen.head.identity.file_id -or $stale.bytes_hex -cne $initial.head.bytes_hex -or
+        -not (Test-TicketRustObjectObservation $corruption.stale_stage_after $stale) -or
+        ($corruption.operation_order -join '|') -cne 'stage_stale_head|read_stale_stage_before|read_head_before|read_writer_before|read_object_before|inject_object_bytes|sync_injected_object|traverse_named_head|reject_object_checksum|read_head_after|read_writer_after|read_object_after|read_stale_stage_after') {
+        throw 'The Rust Ticket graph did not refuse the referenced content mismatch and preserve the named files.'
+    }
+    foreach ($writer in @($corruption.writer_before, $corruption.writer_after)) {
+        if ($writer.link_count -ne 1 -or $writer.bytes_hex -cne '' -or
+            -not (Test-TicketRustWriterFileIdentity $writer.identity $reopen.writer.file)) {
+            throw 'The Rust Ticket corruption control changed the existing writer lock.'
         }
     }
     Assert-TicketRustFileStoreGate $Receipt
