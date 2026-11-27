@@ -67,7 +67,7 @@ async fn planned_update_parks_concurrent_live_roots_after_their_real_tool_calls(
         finish_round: Semaphore::new(0),
         path,
     });
-    let state = fixture_openai_host(&workspace, probe.clone(), None).await;
+    let state = fixture_openai_host(&workspace, probe.clone(), None, false).await;
     let app = test::init_service(
         actix_web::App::new()
             .app_data(state.clone())
@@ -258,6 +258,7 @@ async fn fixture_openai_host(
     workspace: &std::path::Path,
     probe: Arc<dyn LLMProvider>,
     transport_idle_timeout_secs: Option<u64>,
+    managed_update: bool,
 ) -> actix_web::web::Data<AppState> {
     let mut config = Config::from_data_dir(Some(workspace.to_owned()));
     config.provider = "openai".into();
@@ -272,12 +273,21 @@ async fn fixture_openai_host(
         .memory_mut()
         .get_or_insert_with(Default::default)
         .auto_dream_enabled = false;
-    let state = AppState::new_with_provider_for_legacy_ingress_test(
-        workspace.to_owned(),
-        config,
-        probe.clone(),
-    )
-    .await
+    let state = if managed_update {
+        AppState::new_with_provider_for_managed_update_test(
+            workspace.to_owned(),
+            config,
+            probe.clone(),
+        )
+        .await
+    } else {
+        AppState::new_with_provider_for_legacy_ingress_test(
+            workspace.to_owned(),
+            config,
+            probe.clone(),
+        )
+        .await
+    }
     .unwrap()
     .into_http_data();
     state.provider_registry.replace_with(ProviderRegistry::new(
@@ -291,6 +301,7 @@ async fn fixture_streaming_root(
     workspace: &std::path::Path,
     partial_tool: bool,
     transport_idle_timeout_secs: Option<u64>,
+    managed_update: bool,
 ) -> (
     actix_web::web::Data<AppState>,
     Session,
@@ -307,7 +318,13 @@ async fn fixture_streaming_root(
         calls: AtomicUsize::new(0),
         path,
     });
-    let state = fixture_openai_host(workspace, probe.clone(), transport_idle_timeout_secs).await;
+    let state = fixture_openai_host(
+        workspace,
+        probe.clone(),
+        transport_idle_timeout_secs,
+        managed_update,
+    )
+    .await;
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -370,22 +387,165 @@ async fn park_streaming_root(
     (admission, checkpoint)
 }
 
+async fn configured_update_mcp(workspace: &std::path::Path) -> wiremock::MockServer {
+    use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let request: serde_json::Value = request.body_json().unwrap();
+            let Some(id) = request.get("id") else {
+                return ResponseTemplate::new(202);
+            };
+            let result = match request["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "update-fixture", "version": "1"}
+                }),
+                Some("tools/list") => serde_json::json!({"tools": []}),
+                _ => {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32601, "message": "Method not found"}
+                    }));
+                }
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": result
+            }))
+        })
+        .mount(&endpoint)
+        .await;
+    std::fs::write(
+        workspace.join("config.json"),
+        serde_json::json!({
+            "connect": {"platforms": [{"type": "update-fixture"}]},
+            "mcpServers": {"update-fixture": {"url": endpoint.uri()}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    endpoint
+}
+
+async fn send_update_command(
+    control: &std::path::Path,
+    request: uuid::Uuid,
+    sequence: &mut u64,
+    command: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            *sequence += 1;
+            let mut marker = tempfile::NamedTempFile::new_in(control).unwrap();
+            write!(
+                marker,
+                "{}",
+                serde_json::json!({
+                    "version": 1, "request_id": request, "sequence": *sequence, "command": command,
+                })
+            )
+            .unwrap();
+            marker
+                .persist(control.join("planned-update-command.json"))
+                .unwrap();
+            let reply = loop {
+                match std::fs::read(control.join("planned-update-result.json")) {
+                    Ok(bytes) => {
+                        let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        if reply["request_id"] == request.to_string()
+                            && reply["sequence"] == *sequence
+                        {
+                            break reply;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => panic!("cannot read managed update reply: {error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            if !matches!(reply["status"].as_str(), Some("busy" | "committing")) {
+                return reply;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Bamboo never completed {command}"))
+}
+
 #[actix_web::test]
 async fn immediate_update_discards_partial_reply_and_resumes_from_saved_tool_history() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().canonicalize().unwrap();
-    let (state, session, probe) = fixture_streaming_root(&workspace, true, None).await;
-    let (admission, checkpoint) = park_streaming_root(&state, &session).await;
+    let _mcp = configured_update_mcp(&workspace).await;
+    let (state, session, probe) = fixture_streaming_root(&workspace, true, None, true).await;
+    state.wait_for_boot_reconcile_services().await;
+    assert_eq!(
+        state.config.read().await.connect.platforms[0].platform_type,
+        "update-fixture"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !state.mcp_manager.is_server_running("update-fixture") {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the configured MCP server was connected");
+
+    let control = tempfile::tempdir().unwrap();
+    let managed = ManagedShutdown::new(control.path().to_path_buf()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = HttpServer::new(App::new)
+        .disable_signals()
+        .workers(1)
+        .listen(listener)
+        .unwrap()
+        .run();
+    let managed_state = state.clone();
+    let shutdown = actix_web::rt::spawn(async move {
+        let mut committed = None;
+        managed
+            .run(server, Some(managed_state.clone()), &mut committed)
+            .await
+            .unwrap();
+        managed_state.finish_shutdown(true).await;
+        committed.unwrap().finalize().unwrap();
+    });
+    let mut sequence = 0;
+    let planned = send_update_command(
+        control.path(),
+        uuid::Uuid::new_v4(),
+        &mut sequence,
+        "prepare",
+    )
+    .await;
+    assert_eq!(planned["status"], "error");
+    assert_eq!(
+        planned["message"],
+        "Configured Connect or MCP workers prevent a planned update"
+    );
     let request = uuid::Uuid::new_v4();
-    let mut handoff = None;
-    admission
-        .commit_parked_roots(|roots| {
-            assert_eq!(roots, std::slice::from_ref(&checkpoint));
-            handoff = Some(planned_update_handoff::publish(&workspace, request, roots)?);
-            Ok(())
-        })
-        .await
-        .unwrap();
+    let prepare =
+        send_update_command(control.path(), request, &mut sequence, "prepare_immediate").await;
+    assert_eq!(prepare["status"], "ready", "{prepare}");
+    let commit = send_update_command(control.path(), request, &mut sequence, "commit").await;
+    assert_eq!(commit["status"], "committed", "{commit}");
+    shutdown.await.unwrap();
+    assert!(!state.mcp_manager.is_server_running("update-fixture"));
+
+    let receipts = workspace.join("managed-update");
+    let intent = std::fs::read(receipts.join(format!("{request}.json"))).unwrap();
+    let receipt = std::fs::read_to_string(receipts.join(format!("{request}.ready"))).unwrap();
+    assert_eq!(
+        receipt,
+        bamboo_domain::session::model_context::sha256_hex(&intent)
+    );
+    let intent: planned_update_handoff::UpdateHandoff = serde_json::from_slice(&intent).unwrap();
+    let [checkpoint] = intent.roots.as_slice() else {
+        panic!("expected the running session in the handoff");
+    };
+    assert_eq!(checkpoint.session_id, session.id);
 
     let saved = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
@@ -420,15 +580,13 @@ async fn immediate_update_discards_partial_reply_and_resumes_from_saved_tool_his
     assert!(saved.messages[2].content.contains("already finished"));
     assert!(!serde_json::to_string(&saved).unwrap().contains("discarded"));
     assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
-    state.shutdown().await;
-    handoff.unwrap().authorize().unwrap();
     drop(state);
 
     let probe = Arc::new(ProviderProbe {
         expected_read_result: saved.messages[2].content.clone(),
         ..ProviderProbe::new()
     });
-    let successor = fixture_openai_host(&workspace, probe.clone(), None).await;
+    let successor = fixture_openai_host(&workspace, probe.clone(), None, true).await;
     probe.continue_model.add_permits(1);
     planned_update_handoff::resume(&successor, request)
         .await
@@ -473,7 +631,7 @@ async fn immediate_update_discards_partial_reply_and_resumes_from_saved_tool_his
 async fn aborted_immediate_update_reuses_the_original_provider_stream() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().canonicalize().unwrap();
-    let (state, session, probe) = fixture_streaming_root(&workspace, false, Some(3)).await;
+    let (state, session, probe) = fixture_streaming_root(&workspace, false, Some(3), false).await;
     let (admission, checkpoint) = park_streaming_root(&state, &session).await;
     let saved = state
         .session_store

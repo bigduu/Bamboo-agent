@@ -17,6 +17,7 @@ use crate::browser::{BrowserManager, BrowserUpdateHold};
 
 pub(super) struct ManagedUpdateRuntime {
     pub(super) boot_refusal: Option<&'static str>,
+    pub(super) immediate_boot_refusal: Option<&'static str>,
     pub(super) memory: MemoryMaintenanceAdmission,
     pub(super) lifecycle_hooks: UntrackedUpdateAdmission,
 }
@@ -60,6 +61,7 @@ enum HostUpdatePhase {
 }
 
 pub(crate) struct HostUpdatePreparation {
+    immediate: bool,
     child: Arc<dyn ExternalChildRunner>,
     browser: Arc<BrowserManager>,
     memory: MemoryMaintenanceAdmission,
@@ -99,11 +101,16 @@ impl AppState {
             .managed_update_runtime
             .as_ref()
             .ok_or_else(|| unsupported("This Host was not started for managed updates"))?;
-        if let Some(reason) = runtime.boot_refusal {
+        let boot_refusal = if immediate {
+            runtime.immediate_boot_refusal
+        } else {
+            runtime.boot_refusal
+        };
+        if let Some(reason) = boot_refusal {
             return Err(unsupported(reason));
         }
         if immediate {
-            if let Some(reason) = unsupported_host_routes(&*self.config.read().await) {
+            if let Some(reason) = unsupported_host_routes(&*self.config.read().await, immediate) {
                 return Err(unsupported(reason));
             }
         }
@@ -123,6 +130,7 @@ impl AppState {
         }
         .ok_or_else(|| busy("Another planned update owns session admission"))?;
         Ok(HostUpdatePreparation {
+            immediate,
             admission,
             child: self.external_child_runner.clone(),
             browser: self.browser.clone(),
@@ -178,7 +186,7 @@ impl HostUpdatePreparation {
             .clone()
             .try_lock_owned()
             .map_err(|_| busy("Waiting for a configuration operation"))?;
-        if let Some(reason) = unsupported_host_routes(&*self.config.read().await) {
+        if let Some(reason) = unsupported_host_routes(&*self.config.read().await, self.immediate) {
             return Err(unsupported(reason));
         }
         self.require_supported_host_owners().await?;
@@ -238,7 +246,11 @@ impl HostUpdatePreparation {
                 "Active cluster workers prevent a planned update",
             ));
         }
-        if !self.mcp.list_servers().is_empty() || !self.services.list_status().await.is_empty() {
+        // A connected MCP server is not an ongoing Root call. Immediate updates
+        // still require durable Root checkpoints and shut down MCP at Host exit.
+        if (!self.immediate && !self.mcp.list_servers().is_empty())
+            || !self.services.list_status().await.is_empty()
+        {
             return Err(unsupported(
                 "Active MCP or plugin services prevent a planned update",
             ));
@@ -347,7 +359,10 @@ impl HostUpdatePreparation {
     }
 }
 
-pub(super) fn unsupported_host_routes(config: &bamboo_config::Config) -> Option<&'static str> {
+pub(super) fn unsupported_host_routes(
+    config: &bamboo_config::Config,
+    immediate: bool,
+) -> Option<&'static str> {
     if bamboo_engine::external_agents::runtime::requires_legacy_child_runtime(config)
         || config
             .subagents()
@@ -362,7 +377,7 @@ pub(super) fn unsupported_host_routes(config: &bamboo_config::Config) -> Option<
     {
         return Some("Remote or legacy Child execution prevents a planned update");
     }
-    if !config.connect.platforms.is_empty() || !config.mcp.servers.is_empty() {
+    if !immediate && (!config.connect.platforms.is_empty() || !config.mcp.servers.is_empty()) {
         return Some("Configured Connect or MCP workers prevent a planned update");
     }
     if config.lifecycle_hooks.enabled {
