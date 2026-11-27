@@ -2455,11 +2455,15 @@ fn render_schedule_editor(
         Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Weekly)) => {
             (" Edit weekly time ", "  Time: ")
         }
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly)) => {
+            (" Edit monthly time ", "  Time: ")
+        }
         Some(ScheduleCadenceKind::Interval) => (" Edit interval ", "  Every (seconds): "),
         None => (" Rename schedule ", "  Name: "),
     };
     let screen = f.area();
-    let width = usize::from(centered_rect(90, 0, screen).width.saturating_sub(2));
+    let inner_width = centered_rect(90, 0, screen).width.saturating_sub(2);
+    let width = usize::from(inner_width);
     let cursor = if saving { "" } else { "▏" };
     let draft = clip_tail_cells(
         draft,
@@ -2473,11 +2477,15 @@ fn render_schedule_editor(
             Style::default().fg(colors::brand()),
         ),
     ])];
-    if let Some(weekdays) = cadence.and_then(|edit| edit.weekdays.as_deref()) {
-        lines.push(Line::styled(
-            clip_cells(&format!("  Weekdays  {weekdays}"), width),
-            muted,
-        ));
+    if let Some((kind, days)) =
+        cadence.and_then(|edit| edit.calendar_days.as_deref().map(|days| (edit.kind, days)))
+    {
+        let label = if matches!(kind, ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly)) {
+            "Days of month"
+        } else {
+            "Weekdays"
+        };
+        lines.push(Line::styled(format!("  {label}  {days}"), muted));
     }
     if let Some(timezone) = cadence.and_then(|edit| edit.timezone.as_deref()) {
         lines.push(Line::styled(
@@ -2508,10 +2516,15 @@ fn render_schedule_editor(
         ));
     }
 
-    let area = centered_rect(90, lines.len() as u16 + 2, screen);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = paragraph
+        .line_count(inner_width)
+        .saturating_add(2)
+        .min(usize::from(screen.height)) as u16;
+    let area = centered_rect(90, height, screen);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(
+        paragraph.block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(colors::brand()))
@@ -4240,9 +4253,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [13_512_617_242_485_126_738, 4_461_551_820_010_456_760]
+                [3_513_062_001_625_747_482, 15_347_621_753_759_940_732]
             } else {
-                [2_840_071_730_050_583_212, 1_397_032_988_677_360_470]
+                [18_304_756_250_246_231_972, 12_387_998_535_599_058_050]
             },
             "complete help-overlay buffer golden changed"
         );

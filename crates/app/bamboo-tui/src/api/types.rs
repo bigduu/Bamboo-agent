@@ -833,6 +833,7 @@ pub struct Schedule {
     pub interval_seconds: Option<u64>,
     pub daily_time: Option<ScheduleClockTime>,
     pub weekly_time: Option<ScheduleWeeklyTime>,
+    pub monthly_time: Option<ScheduleMonthlyTime>,
     pub timezone: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
@@ -852,17 +853,17 @@ impl Schedule {
                 None
             };
         let ordinary = v.run_config.workflow_target.is_none();
-        let (daily_time, weekly_time) = if ordinary
+        let (daily_time, weekly_time, monthly_time) = if ordinary
             && matches!(
                 v.trigger.get("type").and_then(|tag| tag.as_str()),
-                Some("daily" | "weekly")
+                Some("daily" | "weekly" | "monthly")
             ) {
             match ScheduleTriggerReq::deserialize(&v.trigger).ok() {
                 Some(ScheduleTriggerReq::Daily {
                     hour,
                     minute,
                     second,
-                }) => (ScheduleClockTime::new(hour, minute, second), None),
+                }) => (ScheduleClockTime::new(hour, minute, second), None, None),
                 Some(ScheduleTriggerReq::Weekly {
                     weekdays,
                     hour,
@@ -872,11 +873,23 @@ impl Schedule {
                     None,
                     ScheduleClockTime::new(hour, minute, second)
                         .map(|time| ScheduleWeeklyTime { time, weekdays }),
+                    None,
                 ),
-                _ => (None, None),
+                Some(ScheduleTriggerReq::Monthly {
+                    days,
+                    hour,
+                    minute,
+                    second,
+                }) if valid_schedule_month_days(&days) => (
+                    None,
+                    None,
+                    ScheduleClockTime::new(hour, minute, second)
+                        .map(|time| ScheduleMonthlyTime { time, days }),
+                ),
+                _ => (None, None, None),
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
         let prompt = if ordinary {
             v.run_config.task_message
@@ -889,6 +902,7 @@ impl Schedule {
             interval_seconds,
             daily_time,
             weekly_time,
+            monthly_time,
             timezone: v.timezone,
             name: Some(v.name),
             enabled: Some(v.enabled),
@@ -903,6 +917,7 @@ impl Schedule {
         match kind {
             ScheduleClockKind::Daily => self.daily_time,
             ScheduleClockKind::Weekly => self.weekly_time.as_ref().map(|weekly| weekly.time),
+            ScheduleClockKind::Monthly => self.monthly_time.as_ref().map(|monthly| monthly.time),
         }
     }
 }
@@ -911,6 +926,7 @@ impl Schedule {
 pub(crate) enum ScheduleClockKind {
     Daily,
     Weekly,
+    Monthly,
 }
 
 impl ScheduleClockKind {
@@ -918,6 +934,7 @@ impl ScheduleClockKind {
         match self {
             Self::Daily => "Daily",
             Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
         }
     }
 }
@@ -944,6 +961,12 @@ impl ScheduleClockTime {
 pub struct ScheduleWeeklyTime {
     pub time: ScheduleClockTime,
     pub weekdays: Vec<ScheduleWeekdayReq>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleMonthlyTime {
+    pub time: ScheduleClockTime,
+    pub days: Vec<u8>,
 }
 
 pub(crate) fn is_valid_schedule_interval(every_seconds: u64) -> bool {
@@ -1023,14 +1046,12 @@ fn known_trigger_cadence(trigger: ScheduleTriggerReq, timezone: Option<&str>) ->
             )
         }
         ScheduleTriggerReq::Monthly {
-            mut days,
+            days,
             hour,
             minute,
             second,
-        } if !days.is_empty() && days.iter().all(|day| (1..=31).contains(day)) => {
-            days.sort_unstable();
-            days.dedup();
-            let days = month_day_choices(&days);
+        } if valid_schedule_month_days(&days) => {
+            let days = format_schedule_month_days(&days);
             format!(
                 "Monthly {days} at {} {}",
                 cadence_time(hour, minute, second)?,
@@ -1050,8 +1071,15 @@ fn cadence_time(hour: u8, minute: u8, second: u8) -> Option<String> {
     Some(time.format(format).to_string())
 }
 
-fn month_day_choices(days: &[u8]) -> String {
-    let mut days = days.iter().copied().peekable();
+fn valid_schedule_month_days(days: &[u8]) -> bool {
+    !days.is_empty() && days.iter().all(|day| (1..=31).contains(day))
+}
+
+pub(crate) fn format_schedule_month_days(days: &[u8]) -> String {
+    let mut sorted_days = days.to_vec();
+    sorted_days.sort_unstable();
+    sorted_days.dedup();
+    let mut days = sorted_days.into_iter().peekable();
     let mut choices = Vec::new();
     while let Some(first) = days.next() {
         let mut last = first;
@@ -1557,6 +1585,57 @@ mod tests {
             malformed[field] = invalid;
             assert!(project(malformed, serde_json::json!({}))
                 .weekly_time
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn schedule_projection_exposes_valid_ordinary_monthly_clocks_and_exact_days() {
+        let project = |trigger, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": "Asia/Shanghai",
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let trigger = serde_json::json!({
+            "type": "monthly", "days": [31, 2, 1, 15, 31], "hour": 8, "minute": 42
+        });
+        let saved = project(trigger.clone(), serde_json::json!({}));
+        assert_eq!(
+            saved.clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(8, 42, 0)
+        );
+        assert_eq!(saved.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(saved.clock_time(ScheduleClockKind::Weekly), None);
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let days = saved.monthly_time.unwrap().days;
+        assert_eq!(days, [31, 2, 1, 15, 31]);
+        assert_eq!(format_schedule_month_days(&days), "1–2, 15, 31");
+        assert_eq!(
+            saved.cadence_detail.as_deref(),
+            Some("Monthly 1–2, 15, 31 at 08:42 Asia/Shanghai")
+        );
+        assert!(project(
+            trigger.clone(),
+            serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+        )
+        .monthly_time
+        .is_none());
+        for (field, invalid) in [
+            ("days", serde_json::json!([])),
+            ("days", serde_json::json!([0])),
+            ("days", serde_json::json!([1, 32])),
+            ("hour", serde_json::json!(24)),
+            ("second", serde_json::json!(null)),
+        ] {
+            let mut malformed = trigger.clone();
+            malformed[field] = invalid;
+            assert!(project(malformed, serde_json::json!({}))
+                .monthly_time
                 .is_none());
         }
     }

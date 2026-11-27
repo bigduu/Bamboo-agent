@@ -1968,7 +1968,7 @@ pub(crate) struct ScheduleCadenceEdit {
     schedule_id: String,
     pub(crate) kind: ScheduleCadenceKind,
     pub(crate) timezone: Option<String>,
-    pub(crate) weekdays: Option<String>,
+    pub(crate) calendar_days: Option<String>,
     pub(crate) draft: String,
     pub(crate) error: Option<String>,
 }
@@ -15251,6 +15251,9 @@ impl App {
             Some(ActionId::EditScheduleWeeklyTime) => {
                 self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Weekly))
             }
+            Some(ActionId::EditScheduleMonthlyTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly))
+            }
             Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
@@ -15442,12 +15445,12 @@ impl App {
         let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
             return;
         };
-        let (draft, timezone) = match kind {
+        let (draft, timezone, calendar_days) = match kind {
             ScheduleCadenceKind::Interval => {
                 let Some(every_seconds) = schedule.interval_seconds else {
                     return;
                 };
-                (every_seconds.to_string(), None)
+                (every_seconds.to_string(), None, None)
             }
             ScheduleCadenceKind::Clock(kind) => {
                 let Some(ScheduleClockTime {
@@ -15464,7 +15467,18 @@ impl App {
                     format!("{hour:02}:{minute:02}:{second:02}")
                 };
                 let timezone = schedule.timezone.as_deref().unwrap_or("UTC").to_owned();
-                (draft, Some(timezone))
+                let calendar_days = match kind {
+                    ScheduleClockKind::Daily => None,
+                    ScheduleClockKind::Weekly => schedule
+                        .weekly_time
+                        .as_ref()
+                        .map(|weekly| format_schedule_weekdays(&weekly.weekdays)),
+                    ScheduleClockKind::Monthly => schedule
+                        .monthly_time
+                        .as_ref()
+                        .map(|monthly| format_schedule_month_days(&monthly.days)),
+                };
+                (draft, Some(timezone), calendar_days)
             }
         };
         if self.schedule_cadence_is_saving()
@@ -15480,10 +15494,7 @@ impl App {
             schedule_id: schedule.id.clone(),
             kind,
             timezone,
-            weekdays: schedule
-                .weekly_time
-                .as_ref()
-                .map(|weekly| format_schedule_weekdays(&weekly.weekdays)),
+            calendar_days,
             draft,
             error: None,
         });
@@ -15586,6 +15597,10 @@ impl App {
             ScheduleCadenceValue::Clock(ScheduleClockKind::Weekly, _) => {
                 ("Invalid Weekly time response", "Weekly schedule time saved")
             }
+            ScheduleCadenceValue::Clock(ScheduleClockKind::Monthly, _) => (
+                "Invalid Monthly time response",
+                "Monthly schedule time saved",
+            ),
         };
         let correct_value = |schedule: &Schedule| match pending.value {
             ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(seconds),
@@ -15614,6 +15629,7 @@ impl App {
                         ScheduleCadenceValue::Clock(..) => {
                             row.daily_time = schedule.daily_time;
                             row.weekly_time = schedule.weekly_time;
+                            row.monthly_time = schedule.monthly_time;
                             row.timezone = schedule.timezone;
                         }
                     }
@@ -23719,9 +23735,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    13_999_327_516_522_842_652
+                    2_127_276_734_221_655_232
                 } else {
-                    6_708_252_717_224_313_537
+                    15_972_041_773_537_586_509
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -25996,6 +26012,147 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_monthly_time_shows_all_saved_days_and_retains_a_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "monthly/review";
+        const ZONE: &str = "America/Argentina/ComodRivadavia";
+        let days: Vec<u8> = std::iter::once(31).chain((1..=31).step_by(2)).collect();
+        let original = serde_json::json!({
+            "id": ID, "name": "Monthly review", "enabled": false, "timezone": ZONE,
+            "trigger": {"type": "monthly", "days": days, "hour": 9, "minute": 15},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": "2028-03-31T12:15:00Z"},
+        });
+        let mut confirmed = original.clone();
+        confirmed["trigger"] = serde_json::json!({
+            "type": "monthly", "days": days, "hour": 18, "minute": 42, "second": 17,
+        });
+        confirmed["state"]["next_fire_at"] = serde_json::json!("2028-03-31T21:42:17Z");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for fail in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/monthly%2Freview/monthly-time HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"hour": 18, "minute": 42, "second": 17})
+                );
+                if fail {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = vec![Schedule::from_view(
+            serde_json::from_value(original).unwrap(),
+        )];
+        app.handle_key(key(KeyCode::Char('w'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(schedule_editor_preview(&app, "MONTHLY", "READY").contains("m edit monthly time"));
+        app.handle_key(key(KeyCode::Char('m'))).await.unwrap();
+        let expected_days =
+            "Days of month  1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31";
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "MONTHLY", "EDITING", width);
+            assert!(opened.contains("Edit monthly time") && opened.contains("Time: 09:15"));
+            assert!(opened.contains(&format!("Time zone  {ZONE}")));
+            let lines: Vec<_> = opened.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| line.contains("Days of month"))
+                .unwrap();
+            let end = lines
+                .iter()
+                .position(|line| line.contains("Time zone  "))
+                .unwrap();
+            let shown = lines[start..end]
+                .iter()
+                .map(|line| line.trim().trim_matches('│').trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(shown, expected_days);
+            assert!(opened.contains("Enter save") && opened.contains("Esc cancel"));
+        }
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "24:00".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CLOCK_INPUT_ERROR)
+        );
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "18:42:17".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let edit = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(edit.draft, "18:42:17");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("Editing Monthly time requires a newer Host")
+        );
+        assert_eq!(
+            app.schedules.schedules[0].clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(9, 15, 0)
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Monthly schedule time saved");
+        let row = &app.schedules.schedules[0];
+        let monthly = row.monthly_time.as_ref().unwrap();
+        assert_eq!(monthly.days, days);
+        assert_eq!(Some(monthly.time), ScheduleClockTime::new(18, 42, 17));
+        assert_eq!(row.timezone.as_deref(), Some(ZONE));
+        assert_eq!(row.next_run, Some("2028-03-31T21:42:17Z".parse().unwrap()));
+        assert_eq!(row.name.as_deref(), Some("Monthly review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "MONTHLY", "SAVED", width);
+            assert!(saved.contains("18:42:17"));
+            assert!(!saved.contains("Edit monthly time"));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_interval_updates_one_row_through_the_host_and_fences_catalogs() {
         use tokio::sync::oneshot;
 
@@ -27009,6 +27166,7 @@ mod question_tests {
                 interval_seconds: None,
                 daily_time: None,
                 weekly_time: None,
+                monthly_time: None,
                 timezone: None,
                 enabled: Some(true),
                 prompt: None,
@@ -27104,6 +27262,7 @@ mod question_tests {
             interval_seconds: None,
             daily_time: None,
             weekly_time: None,
+            monthly_time: None,
             timezone: None,
             enabled: Some(true),
             prompt: None,
@@ -27647,6 +27806,7 @@ mod question_tests {
             interval_seconds: None,
             daily_time: None,
             weekly_time: None,
+            monthly_time: None,
             timezone: None,
             enabled: Some(true),
             prompt: None,
