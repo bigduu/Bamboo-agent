@@ -1,10 +1,12 @@
 pub mod sse;
 pub mod types;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use std::fmt;
+use std::time::Duration;
 
+pub use types::CancelScheduleRunOutcome;
 use types::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -301,6 +303,49 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
             "answer response returned unsupported auto_resume_status '{other}'"
         ))),
     }
+}
+
+const MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+enum ScheduleBodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+async fn read_bounded_schedule_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, ScheduleBodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ScheduleBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(ScheduleBodyError::Read)? {
+        if chunk.len() > limit - body.len() {
+            return Err(ScheduleBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn schedule_has_no_future_occurrence(response: reqwest::Response) -> bool {
+    const MAX_ERROR_BYTES: usize = 8 * 1024;
+    let Ok(body) = read_bounded_schedule_body(response, MAX_ERROR_BYTES).await else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .is_some_and(|error| {
+            error
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str)
+                == Some("schedule_no_future_occurrence")
+        })
 }
 
 #[derive(Clone)]
@@ -1044,6 +1089,251 @@ impl BambooClient {
             .collect())
     }
 
+    pub async fn set_schedule_enabled(&self, schedule_id: &str, enabled: bool) -> Result<Schedule> {
+        self.set_schedule_enabled_with_timeout(schedule_id, enabled, Duration::from_secs(30))
+            .await
+    }
+
+    async fn set_schedule_enabled_with_timeout(
+        &self,
+        schedule_id: &str,
+        enabled: bool,
+        timeout: Duration,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct ToggleReply {
+            // The list projection permits an omitted enabled flag. A mutation
+            // receipt must state the saved value explicitly.
+            enabled: bool,
+            #[serde(flatten)]
+            view: ScheduleView,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id]);
+        let response = self
+            .client
+            .patch(url)
+            .timeout(timeout)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the schedule")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the schedule")
+                }
+            })?;
+        let status = response.status();
+        if status == StatusCode::OK {
+            let mut reply: ToggleReply = response.json().await.map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out waiting for the schedule update response")
+                } else {
+                    anyhow::anyhow!("Invalid schedule update response")
+                }
+            })?;
+            anyhow::ensure!(
+                reply.view.id == schedule_id,
+                "Schedule update response has a different schedule ID"
+            );
+            anyhow::ensure!(
+                reply.enabled == enabled,
+                "Schedule update response has a different enabled state"
+            );
+            reply.view.enabled = reply.enabled;
+            return Ok(Schedule::from_view(reply.view));
+        }
+        if status == StatusCode::CONFLICT && schedule_has_no_future_occurrence(response).await {
+            anyhow::bail!("Schedule has no future occurrence");
+        }
+        anyhow::bail!("Could not update schedule (HTTP {})", status.as_u16());
+    }
+
+    pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "sessions"]);
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out fetching schedule sessions")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to fetch schedule sessions")
+                }
+            })?;
+        let status = response.status();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK,
+            "Could not fetch schedule sessions (HTTP {})",
+            status.as_u16()
+        );
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule sessions response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out fetching schedule sessions")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
+            })?;
+        let reply: ListScheduleSessionsResponse = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule sessions response"))?;
+        anyhow::ensure!(
+            reply.schedule_id == schedule_id
+                && reply.sessions.iter().all(|row| {
+                    row.created_by_schedule_id == schedule_id && !row.session.id.trim().is_empty()
+                }),
+            "Invalid schedule sessions response"
+        );
+        Ok(reply.sessions.into_iter().map(|row| row.session).collect())
+    }
+
+    pub async fn list_schedule_runs(&self, schedule_id: &str) -> Result<Vec<ScheduleRunView>> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "runs"]);
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Could not fetch schedule runs")?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "Could not fetch schedule runs ({status})"
+        );
+        let parsed: ListScheduleRunsResponse = response
+            .json()
+            .await
+            .context("Invalid schedule runs response")?;
+        anyhow::ensure!(
+            parsed.schedule_id == schedule_id,
+            "Schedule runs response has a different schedule ID"
+        );
+        Ok(parsed.runs)
+    }
+
+    pub async fn cancel_schedule_run(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+    ) -> Result<CancelScheduleRunOutcome> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct Acknowledgment {
+            schedule_id: String,
+            run_id: String,
+            status: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TerminalRecord {
+            schedule_id: String,
+            #[serde(flatten)]
+            run: ScheduleRunView,
+        }
+
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend([
+                "api",
+                "v1",
+                "schedules",
+                schedule_id,
+                "runs",
+                run_id,
+                "cancel",
+            ]);
+        let response = self.client.post(url).send().await.map_err(|_| {
+            anyhow::anyhow!("Could not contact the Host to cancel the schedule run")
+        })?;
+        let status = response.status();
+        let check_identity = |response_schedule: &str, response_run: &str| -> Result<()> {
+            anyhow::ensure!(
+                response_schedule == schedule_id && response_run == run_id,
+                "Schedule cancellation response has a different schedule or run ID"
+            );
+            Ok(())
+        };
+
+        match status {
+            StatusCode::ACCEPTED => {
+                let reply: Acknowledgment = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Invalid schedule cancellation response"))?;
+                check_identity(&reply.schedule_id, &reply.run_id)?;
+                anyhow::ensure!(
+                    reply.status == "cancel_requested",
+                    "Invalid schedule cancellation acknowledgment"
+                );
+                Ok(CancelScheduleRunOutcome::Requested)
+            }
+            StatusCode::OK => {
+                let reply: TerminalRecord = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Invalid schedule cancellation response"))?;
+                check_identity(&reply.schedule_id, &reply.run.run_id)?;
+                anyhow::ensure!(
+                    reply.run.is_terminal(),
+                    "Schedule cancellation response is not a terminal result"
+                );
+                Ok(CancelScheduleRunOutcome::Terminal(reply.run))
+            }
+            StatusCode::NOT_FOUND | StatusCode::CONFLICT => {
+                let error = response.json::<serde_json::Value>().await.ok();
+                let code = error
+                    .as_ref()
+                    .and_then(|value| value.pointer("/error/code"))
+                    .and_then(serde_json::Value::as_str);
+                match (status, code) {
+                    (StatusCode::NOT_FOUND, Some("schedule_run_not_found")) => {
+                        anyhow::bail!("Schedule run not found")
+                    }
+                    (StatusCode::NOT_FOUND, _) => {
+                        anyhow::bail!("This Host does not support schedule-run cancellation")
+                    }
+                    (StatusCode::CONFLICT, Some("schedule_run_not_cancellable")) => {
+                        anyhow::bail!("Schedule run has no cancellable live execution")
+                    }
+                    _ => anyhow::bail!("Could not cancel schedule run (HTTP {})", status.as_u16()),
+                }
+            }
+            _ => anyhow::bail!("Could not cancel schedule run (HTTP {})", status.as_u16()),
+        }
+    }
+
     pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
         let resp = self
             .client
@@ -1387,6 +1677,746 @@ mod tests {
             backend.await.unwrap();
             assert_eq!(result.is_ok(), supported, "{http_status} {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn list_schedules_projects_saved_cadence_in_server_order() {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            assert!(body.is_empty());
+            respond(
+                &mut socket,
+                "200 OK",
+                "1",
+                r#"{"schedules":[
+                    {"id":"cron","name":"晨间检查 🧭","enabled":true,"timezone":"UTC",
+                     "trigger":{"type":"cron","expr":"0 30 8 * * *"},
+                     "state":{"last_finished_at":"2026-10-20T08:31:00Z","next_fire_at":"2026-10-21T08:30:00Z"},
+                     "run_config":{"task_message":"Review the overnight changes"}},
+                    {"id":"once","enabled":false,"trigger":{"type":"once","at":"2026-10-20T16:15:00.125+08:00"}},
+                    {"id":"weekly","timezone":"America/New_York",
+                     "trigger":{"type":"weekly","weekdays":["mon","wed"],"hour":8,"minute":30,"second":5}},
+                    {"id":"interval","trigger":{"type":"interval","every_seconds":90,"anchor_at":"2026-10-20T08:15:00Z"}},
+                    {"id":"daily","trigger":{"type":"daily","hour":8,"minute":30}},
+                    {"id":"monthly","timezone":null,
+                     "trigger":{"type":"monthly","days":[1,15,31],"hour":8,"minute":30,"second":0}},
+                    {"id":"future","trigger":{"type":"quarterly","months":[1,4,7,10]}},
+                    {"id":"incomplete","trigger":{"type":"daily","hour":8}},
+                    {"id":"legacy-cron","trigger":{"type":"cron"}},
+                    {"id":"legacy-unknown"}
+                ]}"#,
+            )
+            .await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedules(), serve)
+        })
+        .await
+        .unwrap();
+        let schedules = result.unwrap();
+
+        let cadence: Vec<_> = schedules
+            .iter()
+            .map(|schedule| {
+                (
+                    schedule.id.as_str(),
+                    schedule.cron.as_deref(),
+                    schedule.cadence_detail.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cadence,
+            [
+                ("cron", Some("0 30 8 * * *"), Some("Cron 0 30 8 * * * UTC")),
+                ("once", Some("once"), Some("Once 2026-10-20T08:15:00.125Z")),
+                (
+                    "weekly",
+                    Some("weekly"),
+                    Some("Weekly Mon, Wed at 08:30:05 America/New_York")
+                ),
+                ("interval", Some("interval"), Some("Every 90 seconds")),
+                ("daily", Some("daily"), Some("Daily 08:30 UTC")),
+                (
+                    "monthly",
+                    Some("monthly"),
+                    Some("Monthly 1, 15, 31 at 08:30 UTC")
+                ),
+                ("future", Some("quarterly"), Some("Unknown trigger")),
+                (
+                    "incomplete",
+                    Some("daily"),
+                    Some("Daily cadence unavailable")
+                ),
+                (
+                    "legacy-cron",
+                    Some("cron"),
+                    Some("Cron cadence unavailable")
+                ),
+                ("legacy-unknown", Some("-"), Some("Cadence unavailable")),
+            ]
+        );
+
+        let cron = &schedules[0];
+        assert_eq!(cron.name.as_deref(), Some("晨间检查 🧭"));
+        assert_eq!(cron.enabled, Some(true));
+        assert_eq!(schedules[1].enabled, Some(false));
+        assert_eq!(cron.prompt.as_deref(), Some("Review the overnight changes"));
+        assert_eq!(cron.last_run, Some("2026-10-20T08:31:00Z".parse().unwrap()));
+        assert_eq!(cron.next_run, Some("2026-10-21T08:30:00Z".parse().unwrap()));
+    }
+
+    const SESSIONS_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn list_schedule_sessions_preserves_host_order_and_session_summaries() {
+        let sessions = schedule_sessions_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":"schedule/17 ?#%","title":"Saved review",
+                 "updated_at":"2030-02-11T09:00:00Z","project_id":"project-42","is_running":true},
+                {"id":"session-a","created_by_schedule_id":"schedule/17 ?#%","title":"Newer review",
+                 "updated_at":"2030-02-12T09:00:00Z","last_run_status":"success"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "session-z");
+        assert_eq!(sessions[0].title, "Saved review");
+        assert_eq!(sessions[0].project_id.as_deref(), Some("project-42"));
+        assert!(sessions[0].is_running);
+        assert_eq!(sessions[1].id, "session-a");
+        assert_eq!(sessions[1].last_run_status.as_deref(), Some("success"));
+        assert!(sessions[0].updated_at < sessions[1].updated_at);
+
+        let empty = schedule_sessions_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[]}"#,
+        )
+        .await
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_schedule_sessions_rejects_malformed_and_foreign_rows_without_echoing_the_body() {
+        for body in [
+            r#"{"schedule_id":"DIFFERENT_SCHEDULE","sessions":[]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%"}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[{"id":"UNRELATED_SESSION"}]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":"schedule/17 ?#%"},
+                {"id":"UNRELATED_SESSION","created_by_schedule_id":"DIFFERENT_SCHEDULE"}
+            ]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"session-z","created_by_schedule_id":null}
+            ]}"#,
+            r#"{"schedule_id":"schedule/17 ?#%","sessions":[
+                {"id":"   ","created_by_schedule_id":"schedule/17 ?#%"}
+            ]}"#,
+            "RAW_HOST_RESPONSE",
+        ] {
+            assert_eq!(
+                schedule_sessions_reply("200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid schedule sessions response"
+            );
+        }
+
+        for (status, code) in [("202 Accepted", 202), ("404 Not Found", 404)] {
+            assert_eq!(
+                schedule_sessions_reply(status, "RAW_HOST_RESPONSE")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                format!("Could not fetch schedule sessions (HTTP {code})")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_schedule_sessions_bounds_advertised_and_chunked_responses() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        for advertised in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let (release, held) = oneshot::channel();
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await.lines().next(),
+                    Some("GET /api/v1/schedules/schedule-17/sessions HTTP/1.1")
+                );
+                if advertised {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES + 1
+                    );
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                } else {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    const CHUNK_BYTES: usize = 64 * 1024;
+                    let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
+                    frame.resize(frame.len() + CHUNK_BYTES, b'x');
+                    frame.extend_from_slice(b"\r\n");
+                    for _ in 0..(MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES / CHUNK_BYTES) {
+                        socket.write_all(&frame).await.unwrap();
+                    }
+                    socket.write_all(b"1\r\nx\r\n").await.unwrap();
+                }
+                // Do not finish the HTTP body before the client rejects it.
+                held.await.unwrap();
+                drop(socket);
+            };
+            let fetch = async {
+                let result = client.list_schedule_sessions("schedule-17").await;
+                release.send(()).unwrap();
+                result
+            };
+            let (result, ()) =
+                timeout(Duration::from_secs(5), async { tokio::join!(fetch, serve) })
+                    .await
+                    .unwrap();
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Schedule sessions response is too large (2 MiB limit)"
+            );
+        }
+    }
+
+    async fn schedule_sessions_reply(status: &str, body: &str) -> Result<Vec<SessionSummary>> {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("GET /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/sessions HTTP/1.1")
+            );
+            assert!(body_sent.is_empty());
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedule_sessions(SESSIONS_SCHEDULE_ID), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn list_schedule_runs_reads_typed_history_in_server_order() {
+        let runs = schedule_runs_reply(
+            "200 OK",
+            r#"{"schedule_id":"schedule-17","runs":[
+                {"run_id":"latest","scheduled_for":"2030-02-13T17:00:00+08:00","status":"future_status",
+                 "was_catch_up":false,"session_id":"session-CaSe_42"},
+                {"run_id":"older","scheduled_for":"2030-02-12T09:00:00Z","status":"succeeded",
+                 "workflow_run_id":"workflow-12"},
+                {"run_id":"oldest","scheduled_for":"2030-02-11T09:00:00Z","status":"skipped","session_id":null}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runs,
+            [
+                ScheduleRunView {
+                    run_id: "latest".into(),
+                    scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
+                    status: "future_status".into(),
+                    session_id: Some("session-CaSe_42".into()),
+                    workflow_run_id: None,
+                },
+                ScheduleRunView {
+                    run_id: "older".into(),
+                    scheduled_for: "2030-02-12T09:00:00Z".parse().unwrap(),
+                    status: "succeeded".into(),
+                    session_id: None,
+                    workflow_run_id: Some("workflow-12".into()),
+                },
+                ScheduleRunView {
+                    run_id: "oldest".into(),
+                    scheduled_for: "2030-02-11T09:00:00Z".parse().unwrap(),
+                    status: "skipped".into(),
+                    session_id: None,
+                    workflow_run_id: None,
+                },
+            ]
+        );
+        assert!(
+            schedule_runs_reply("200 OK", r#"{"schedule_id":"schedule-17","runs":[]}"#)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_schedule_runs_rejects_wrong_schedule_and_reports_only_http_status() {
+        for (status, body, error) in [
+            (
+                "200 OK",
+                r#"{"schedule_id":"other","runs":[]}"#,
+                "Schedule runs response has a different schedule ID",
+            ),
+            (
+                "200 OK",
+                r#"{"schedule_id":"schedule-17"}"#,
+                "Invalid schedule runs response",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"backend details"}"#,
+                "Could not fetch schedule runs (503 Service Unavailable)",
+            ),
+        ] {
+            assert_eq!(
+                schedule_runs_reply(status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    async fn schedule_runs_reply(status: &str, body: &str) -> Result<Vec<ScheduleRunView>> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("GET /api/v1/schedules/schedule-17/runs HTTP/1.1")
+            );
+            assert_eq!(body_sent, "");
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.list_schedule_runs("schedule-17"), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const TOGGLE_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn set_schedule_enabled_patches_only_the_saved_flag_and_projects_the_reply() {
+        for enabled in [true, false] {
+            let body = serde_json::json!({
+                "id": TOGGLE_SCHEDULE_ID,
+                "name": "Daily review",
+                "enabled": enabled,
+                "trigger": {"type": "daily", "hour": 8, "minute": 30, "second": 0},
+                "timezone": "America/New_York",
+                "state": {
+                    "next_fire_at": "2030-02-13T13:30:00Z",
+                    "last_finished_at": "2030-02-12T13:31:00Z"
+                },
+                "run_config": {"task_message": "Review progress"}
+            });
+            let schedule = schedule_toggle_reply(enabled, "200 OK", &body.to_string())
+                .await
+                .unwrap();
+            assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+            assert_eq!(schedule.enabled, Some(enabled));
+            assert_eq!(schedule.name.as_deref(), Some("Daily review"));
+            assert_eq!(schedule.cron.as_deref(), Some("daily"));
+            assert_eq!(
+                schedule.cadence_detail.as_deref(),
+                Some("Daily 08:30 America/New_York")
+            );
+            assert_eq!(schedule.prompt.as_deref(), Some("Review progress"));
+            assert_eq!(
+                schedule.next_run,
+                Some("2030-02-13T13:30:00Z".parse().unwrap())
+            );
+            assert_eq!(
+                schedule.last_run,
+                Some("2030-02-12T13:31:00Z".parse().unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_rejects_wrong_identity_and_missing_or_wrong_flag() {
+        for (body, expected) in [
+            (
+                r#"{"id":"DIFFERENT_ID","enabled":false}"#,
+                "Schedule update response has a different schedule ID",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":true}"#,
+                "Schedule update response has a different enabled state",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%"}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":null}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":"false"}"#,
+                "Invalid schedule update response",
+            ),
+            (
+                r#"{"id":"schedule/17 ?#%","enabled":true,"enabled":false}"#,
+                "Invalid schedule update response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_toggle_reply(false, "200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_reports_only_the_known_conflict_and_sanitized_errors() {
+        let oversized = serde_json::json!({
+            "error": {
+                "code": "schedule_no_future_occurrence",
+                "message": "RAW_BODY".repeat(1_024),
+            }
+        })
+        .to_string();
+        for (status, body, expected) in [
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}}"#,
+                "Schedule has no future occurrence",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"RAW_ERROR_CODE","message":"RAW_BODY"}}"#,
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "409 Conflict",
+                r#"{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}"#,
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "409 Conflict",
+                oversized.as_str(),
+                "Could not update schedule (HTTP 409)",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_BODY"}}"#,
+                "Could not update schedule (HTTP 503)",
+            ),
+            (
+                "201 Created",
+                r#"{"id":"schedule/17 ?#%","enabled":true}"#,
+                "Could not update schedule (HTTP 201)",
+            ),
+        ] {
+            assert_eq!(
+                schedule_toggle_reply(true, status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_schedule_enabled_times_out_while_the_host_holds_the_response_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, hold_response) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /api/v1/schedules/schedule-17 HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({ "enabled": false })
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            // Hold the partial body until the caller returns.
+            hold_response.await.unwrap();
+        };
+        let request = async {
+            let result = client
+                .set_schedule_enabled_with_timeout("schedule-17", false, Duration::from_secs(1))
+                .await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(request, serve)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Timed out waiting for the schedule update response"
+        );
+    }
+
+    async fn schedule_toggle_reply(enabled: bool, status: &str, body: &str) -> Result<Schedule> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25 HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({ "enabled": enabled })
+            );
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.set_schedule_enabled(TOGGLE_SCHEDULE_ID, enabled),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_posts_exact_ids_and_reads_requested_or_terminal() {
+        let requested = schedule_cancel_reply(
+            "202 Accepted",
+            r#"{"schedule_id":"schedule-17","run_id":"run-42","status":"cancel_requested"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requested, CancelScheduleRunOutcome::Requested);
+
+        for status in ["success", "failed", "skipped", "missed", "cancelled"] {
+            let completed = schedule_cancel_reply(
+                "200 OK",
+                &serde_json::json!({
+                    "schedule_id": "schedule-17",
+                    "run_id": "run-42",
+                    "scheduled_for": "2030-02-13T09:00:00Z",
+                    "status": status,
+                    "session_id": "session-18",
+                    "outcome_reason": (status == "cancelled").then(|| "x".repeat(64 * 1024 + 1))
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                completed,
+                CancelScheduleRunOutcome::Terminal(ScheduleRunView {
+                    run_id: "run-42".into(),
+                    scheduled_for: "2030-02-13T09:00:00Z".parse().unwrap(),
+                    status: status.into(),
+                    session_id: Some("session-18".into()),
+                    workflow_run_id: None,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_requires_matching_identity_and_expected_state() {
+        for (status, schedule_id, run_id, run_status, error) in [
+            (
+                "202 Accepted",
+                "other",
+                "run-42",
+                "cancel_requested",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "202 Accepted",
+                "schedule-17",
+                "other",
+                "cancel_requested",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "202 Accepted",
+                "schedule-17",
+                "run-42",
+                "cancelled",
+                "Invalid schedule cancellation acknowledgment",
+            ),
+            (
+                "200 OK",
+                "other",
+                "run-42",
+                "cancelled",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "other",
+                "cancelled",
+                "Schedule cancellation response has a different schedule or run ID",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "run-42",
+                "running",
+                "Schedule cancellation response is not a terminal result",
+            ),
+            (
+                "200 OK",
+                "schedule-17",
+                "run-42",
+                "future_status",
+                "Schedule cancellation response is not a terminal result",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "schedule_id": schedule_id,
+                "run_id": run_id,
+                "status": run_status,
+                "scheduled_for": "2030-02-13T09:00:00Z"
+            });
+            assert_eq!(
+                schedule_cancel_reply(status, &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_schedule_run_errors_are_bounded_and_do_not_display_response_body() {
+        for (status, body, error) in [
+            (
+                "404 Not Found",
+                r#"{"error":{"code":"schedule_run_not_found","message":"RAW_BODY"}}"#,
+                "Schedule run not found",
+            ),
+            (
+                "404 Not Found",
+                "RAW_BODY",
+                "This Host does not support schedule-run cancellation",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_run_not_cancellable","message":"RAW_BODY"}}"#,
+                "Schedule run has no cancellable live execution",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"future_error","message":"RAW_BODY"}}"#,
+                "Could not cancel schedule run (HTTP 409)",
+            ),
+            (
+                "503 Service Unavailable",
+                "RAW_BODY",
+                "Could not cancel schedule run (HTTP 503)",
+            ),
+            (
+                "202 Accepted",
+                "RAW_BODY",
+                "Invalid schedule cancellation response",
+            ),
+            (
+                "200 OK",
+                r#"{"schedule_id":"schedule-17","run_id":"run-42","status":"cancelled"}"#,
+                "Invalid schedule cancellation response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_cancel_reply(status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    async fn schedule_cancel_reply(status: &str, body: &str) -> Result<CancelScheduleRunOutcome> {
+        use std::time::Duration;
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let (head, body_sent) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("POST /api/v1/schedules/schedule-17/runs/run-42/cancel HTTP/1.1")
+            );
+            assert!(body_sent.is_empty());
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client.cancel_schedule_run("schedule-17", "run-42"), serve)
+        })
+        .await
+        .unwrap();
+        result
     }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {

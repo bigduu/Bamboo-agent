@@ -356,6 +356,13 @@ impl OwnedFilesystem {
         .await
     }
 
+    pub(super) async fn read_legacy_ack(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.job("legacy-ack-read", path, |filesystem, path| {
+            filesystem.anchor().read_legacy_ack(path)
+        })
+        .await
+    }
+
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         self.job("mkdir", path, |filesystem, path| {
             filesystem.anchor().create_dir_all(path)
@@ -623,48 +630,9 @@ impl OwnedFilesystem {
 
 /// The exact owned lease cannot be dispatched without its actual mutation scope.
 pub(super) enum AckAuthority<'a> {
-    /// Pre-owned ACK surface: deliberately path-based, without an anchor.
-    ///
-    /// The legacy `ack` entry point (`SessionInbox::ack`) never constructs an
-    /// [`OwnedFilesystem`], so this variant has no anchored directory handle to
-    /// dispatch `create_dir`/`write`/`remove` through. Threading one in would
-    /// change the authority signature and ripple through every legacy call
-    /// site, so the enum keeps the raw-path behavior here by design; callers
-    /// that do hold an `OwnedFilesystem` must use [`AckAuthority::ScopedLegacy`]
-    /// or [`AckAuthority::Owned`] instead.
-    ///
-    /// Residual risk (#2423): these operations resolve the `admitted/` receipt
-    /// path by name, so a symlink on that path can redirect the receipt write
-    /// outside the Inbox. The no-follow guarantee below covers the lock
-    /// acquisition moment only; both swap scenarios around it stay residual:
-    ///
-    /// * Mitigated at acquisition time only — the sole caller must already
-    ///   hold the Inbox operation lock, and `lock_operation` resolves it via
-    ///   `InboxAnchor::acquire`, which opens the Inbox directory and the
-    ///   `.session-inbox.lock` name with no-follow semantics: if either name
-    ///   is a link at the moment it is opened, acquisition fails closed. That
-    ///   is the full extent of the guarantee — `lock_file` retains only the
-    ///   lock descriptor and never re-validates the Inbox pathname afterwards.
-    ///   The legacy ACK path is also rejected outright once the owned Inbox
-    ///   mode is enabled.
-    ///
-    /// * Residual — a pre-planted `inbox/admitted` child symlink that already
-    ///   points at an external directory: `create_dir_all` and
-    ///   `atomic_write` follow that link and write into the external
-    ///   directory, and the anchored lock does not stop them. Because the
-    ///   external directory usually holds no matching receipt, the write
-    ///   completes silently instead of failing closed.
-    ///
-    /// * Residual — a post-acquisition replacement of the Inbox directory
-    ///   itself: because `lock_file` holds only the lock descriptor, an
-    ///   external writer that ignores the advisory lock can, after lock
-    ///   acquisition (between the claim validation and this receipt publish),
-    ///   rename the Inbox directory away and swap a symlink in at the same
-    ///   name; the path-based `create_dir_all`/`atomic_write` here then
-    ///   resolve through that link and write outside the Inbox.
-    ///
-    /// #2423 records but does not fix these residual risks.
-    Legacy,
+    /// Public legacy ACK uses the lifecycle authority and the same retained
+    /// Inbox for the mode check, claim, and admitted receipt.
+    Legacy(&'a OwnedFilesystem),
     ScopedLegacy(&'a OwnedFilesystem),
     Owned {
         lease: &'a StoredLease,
@@ -675,30 +643,35 @@ pub(super) enum AckAuthority<'a> {
 impl AckAuthority<'_> {
     pub(super) fn lease(&self) -> Option<&StoredLease> {
         match self {
-            Self::Legacy | Self::ScopedLegacy(_) => None,
+            Self::Legacy(_) | Self::ScopedLegacy(_) => None,
             Self::Owned { lease, .. } => Some(lease),
+        }
+    }
+    pub(super) async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::Legacy(filesystem) => filesystem.read_legacy_ack(path).await,
+            Self::ScopedLegacy(_) | Self::Owned { .. } => tokio::fs::read(path).await,
         }
     }
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         match self {
-            Self::Legacy => tokio::fs::create_dir_all(path).await,
-            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
-                filesystem.create_dir(path).await
-            }
+            Self::Legacy(filesystem)
+            | Self::ScopedLegacy(filesystem)
+            | Self::Owned { filesystem, .. } => filesystem.create_dir(path).await,
         }
     }
     pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         match self {
-            Self::Legacy => atomic_write(path, bytes).await,
-            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
-                filesystem.write(path, bytes).await
-            }
+            Self::Legacy(filesystem)
+            | Self::ScopedLegacy(filesystem)
+            | Self::Owned { filesystem, .. } => filesystem.write(path, bytes).await,
         }
     }
     pub(super) async fn remove_committed_claim(&self, path: &Path) -> std::io::Result<()> {
         match self {
-            Self::Legacy => tokio::fs::remove_file(path).await,
-            Self::ScopedLegacy(filesystem) => filesystem.remove(path).await,
+            Self::Legacy(filesystem) | Self::ScopedLegacy(filesystem) => {
+                filesystem.remove(path).await
+            }
             Self::Owned {
                 filesystem,
                 post_receipt_cleanup,
@@ -905,7 +878,27 @@ impl FileSessionInbox {
     }
 
     async fn watermark_version(dir: &Path, file: &str) -> Result<u32, SessionInboxError> {
-        match tokio::fs::read_to_string(dir.join(file)).await {
+        Self::watermark_version_retaining(dir, file, None).await
+    }
+
+    async fn watermark_version_retaining(
+        dir: &Path,
+        file: &str,
+        filesystem: Option<&OwnedFilesystem>,
+    ) -> Result<u32, SessionInboxError> {
+        let path = dir.join(file);
+        let read = match filesystem {
+            Some(filesystem) => filesystem.read_legacy_ack(&path).await.and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "stream did not contain valid UTF-8",
+                    )
+                })
+            }),
+            None => tokio::fs::read_to_string(path).await,
+        };
+        match read {
             Ok(raw) => {
                 if raw.trim().parse::<u64>().is_ok() {
                     return Ok(0);
@@ -938,8 +931,17 @@ impl FileSessionInbox {
     }
 
     pub(super) async fn owned_enabled(dir: &Path) -> Result<bool, SessionInboxError> {
-        let activation = Self::watermark_version(dir, ACTIVATION_GENERATION_FILE).await?;
-        let interrupt = Self::watermark_version(dir, INTERRUPT_GENERATION_FILE).await?;
+        Self::owned_enabled_retaining(dir, None).await
+    }
+
+    pub(super) async fn owned_enabled_retaining(
+        dir: &Path,
+        filesystem: Option<&OwnedFilesystem>,
+    ) -> Result<bool, SessionInboxError> {
+        let activation =
+            Self::watermark_version_retaining(dir, ACTIVATION_GENERATION_FILE, filesystem).await?;
+        let interrupt =
+            Self::watermark_version_retaining(dir, INTERRUPT_GENERATION_FILE, filesystem).await?;
         if interrupt == 3 && activation != 3 {
             return Err(invalid("owned activation watermark downgraded"));
         }

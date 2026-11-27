@@ -98,9 +98,15 @@ async fn performance_fields_attach_only_to_the_observed_operation() {
                 matches: 0,
                 ripgrep_files: 3,
             });
+            record_grep_resources(Some(Duration::from_micros(25)), 2048);
         })
         .await;
         tool.finish(Outcome::Success);
+        let tool_without_clock = Observation::tool("Grep", "call-2", "session-1", "round-1");
+        tool_without_clock
+            .scope(async { record_grep_resources(None, 0) })
+            .await;
+        tool_without_clock.finish(Outcome::Success);
     })
     .await;
     let spans = test.spans();
@@ -119,6 +125,22 @@ async fn performance_fields_attach_only_to_the_observed_operation() {
         Some(&Value::I64(4096))
     );
     assert_eq!(attr(tool, "bamboo.perf.grep.matches"), Some(&Value::I64(0)));
+    assert_eq!(
+        attr(tool, "bamboo.perf.grep.scan_cpu_us"),
+        Some(&Value::I64(25))
+    );
+    assert_eq!(
+        attr(tool, "bamboo.perf.grep.read_buffer_peak_capacity_bytes"),
+        Some(&Value::I64(2048))
+    );
+    assert!(attr(&spans[2], "bamboo.perf.grep.scan_cpu_us").is_none());
+    assert_eq!(
+        attr(
+            &spans[2],
+            "bamboo.perf.grep.read_buffer_peak_capacity_bytes"
+        ),
+        Some(&Value::I64(0))
+    );
     assert!(attr(model, "bamboo.perf.grep.bytes_scanned").is_none());
     assert!(attr(tool, "bamboo.perf.token_cache.process_hits").is_none());
     assert!(spans.iter().all(|span| span.events.is_empty()));

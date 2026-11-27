@@ -31,6 +31,9 @@ pub(crate) enum ActionContext {
     Mcp,
     Schedules,
     ScheduleForm,
+    ScheduleRuns,
+    ScheduleSessions,
+    FenceCopyPicker,
     Skills,
     Config,
     ConfigEditor,
@@ -50,7 +53,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 33] = [
+    pub(crate) const ALL: [Self; 36] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -68,6 +71,9 @@ impl ActionContext {
         Self::Mcp,
         Self::Schedules,
         Self::ScheduleForm,
+        Self::ScheduleRuns,
+        Self::ScheduleSessions,
+        Self::FenceCopyPicker,
         Self::Skills,
         Self::Config,
         Self::ConfigEditor,
@@ -105,6 +111,9 @@ impl ActionContext {
             Self::Mcp => "MCP",
             Self::Schedules => "Schedules",
             Self::ScheduleForm => "Schedule form",
+            Self::ScheduleRuns => "Schedule runs",
+            Self::ScheduleSessions => "Schedule Sessions",
+            Self::FenceCopyPicker => "Code fence picker",
             Self::Skills => "Skills",
             Self::Config => "Config",
             Self::ConfigEditor => "Config editor",
@@ -166,6 +175,8 @@ pub(crate) enum ActionId {
     NavigateDown,
     PageUp,
     PageDown,
+    PanLeft,
+    PanRight,
     JumpFirst,
     JumpLast,
     Activate,
@@ -224,9 +235,14 @@ pub(crate) enum ActionId {
     PreviousPage,
     ShowTools,
     NewSchedule,
+    OpenScheduleSessions,
     RunSchedule,
+    ToggleScheduleEnabled,
+    CancelScheduledRun,
     NextField,
     PreviousField,
+    NextTrigger,
+    PreviousTrigger,
     EditConfig,
     SaveConfig,
     OpenPermissionPolicy,
@@ -550,6 +566,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Sessions,
             Mcp,
             Schedules,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             Skills,
             Config,
             Permissions,
@@ -569,6 +588,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Sessions, "Up"),
             (Mcp, "Up"),
             (Schedules, "Up"),
+            (ScheduleRuns, "Up"),
+            (ScheduleSessions, "Up"),
+            (FenceCopyPicker, "Up"),
             (Skills, "Up"),
             (Config, "Up; k"),
             (Permissions, "Up; k"),
@@ -594,6 +616,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Sessions,
             Mcp,
             Schedules,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             Skills,
             Config,
             Permissions,
@@ -613,6 +638,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Sessions, "Down"),
             (Mcp, "Down"),
             (Schedules, "Down"),
+            (ScheduleRuns, "Down"),
+            (ScheduleSessions, "Down"),
+            (FenceCopyPicker, "Down"),
             (Skills, "Down"),
             (Config, "Down; j"),
             (Permissions, "Down; j"),
@@ -636,6 +664,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             Config,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             SubagentTree,
             TaskPlan,
             ModelPicker,
@@ -648,6 +679,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "PageUp"),
             (PermissionRuleConfirm, "PageUp"),
             (Config, "PageUp"),
+            (ScheduleRuns, "PageUp"),
+            (ScheduleSessions, "PageUp"),
+            (FenceCopyPicker, "PageUp"),
             (SubagentTree, "PageUp"),
             (TaskPlan, "PageUp"),
             (ModelPicker, "PageUp"),
@@ -666,6 +700,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             Config,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             SubagentTree,
             TaskPlan,
             ModelPicker,
@@ -678,6 +715,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "PageDown"),
             (PermissionRuleConfirm, "PageDown"),
             (Config, "PageDown"),
+            (ScheduleRuns, "PageDown"),
+            (ScheduleSessions, "PageDown"),
+            (FenceCopyPicker, "PageDown"),
             (SubagentTree, "PageDown"),
             (TaskPlan, "PageDown"),
             (ModelPicker, "PageDown"),
@@ -745,6 +785,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         ]
     ),
     spec!(
+        PanLeft,
+        "Pan left",
+        "View earlier columns of the code fence source",
+        false,
+        [FenceCopyPicker],
+        [(FenceCopyPicker, "Left")]
+    ),
+    spec!(
+        PanRight,
+        "Pan right",
+        "View later columns of the code fence source",
+        false,
+        [FenceCopyPicker],
+        [(FenceCopyPicker, "Right")]
+    ),
+    spec!(
         Activate,
         "Activate",
         "Use, submit, open, or toggle the selected item",
@@ -757,7 +813,11 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             Sessions,
             Mcp,
+            Schedules,
             ScheduleForm,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             Skills,
             Permissions,
             SubagentTree,
@@ -775,7 +835,11 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "Enter"),
             (Sessions, "Enter"),
             (Mcp, "Enter"),
+            (Schedules, "Enter"),
             (ScheduleForm, "Enter"),
+            (ScheduleRuns, "Enter"),
+            (ScheduleSessions, "Enter"),
+            (FenceCopyPicker, "Enter"),
             (Skills, "Enter"),
             (Permissions, "Enter"),
             (SubagentTree, "Enter"),
@@ -799,6 +863,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionNumber,
             QuestionInspect,
             ScheduleForm,
+            ScheduleRuns,
+            ScheduleSessions,
+            FenceCopyPicker,
             ConfigEditor,
             Permissions,
             PermissionEditor,
@@ -819,6 +886,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionNumber, "Esc"),
             (QuestionInspect, "Esc; v"),
             (ScheduleForm, "Esc"),
+            (ScheduleRuns, "Esc"),
+            (ScheduleSessions, "Esc"),
+            (FenceCopyPicker, "Esc"),
             (ConfigEditor, "Esc"),
             (Permissions, "Esc"),
             (PermissionEditor, "Esc"),
@@ -864,6 +934,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             Sessions,
             Mcp,
+            ScheduleRuns,
             SubagentTree,
             TaskPlan,
             SessionPickerBrowse,
@@ -877,6 +948,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             (Sessions, "r"),
             (Mcp, "r"),
+            (ScheduleRuns, "r"),
             (SubagentTree, "r; Ctrl+R"),
             (TaskPlan, "r; Ctrl+R"),
             (SessionPickerBrowse, "Ctrl+R"),
@@ -1125,9 +1197,15 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Copy exact value",
         "Copy the focused value through OSC 52",
         false,
-        [ConversationBlock, QuestionOptions, QuestionInspect],
+        [
+            ConversationBlock,
+            QuestionOptions,
+            QuestionInspect,
+            FenceCopyPicker
+        ],
         [
             (ConversationBlock, "y"),
+            (FenceCopyPicker, "y"),
             (QuestionOptions, "y"),
             (QuestionInspect, "y")
         ]
@@ -1282,12 +1360,36 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [(Schedules, "n")]
     ),
     spec!(
+        OpenScheduleSessions,
+        "Open schedule Sessions",
+        "List Sessions created by the selected schedule",
+        false,
+        [Schedules],
+        [(Schedules, "s")]
+    ),
+    spec!(
         RunSchedule,
         "Run schedule now",
         "Trigger the selected schedule immediately",
         false,
         [Schedules],
         [(Schedules, "r")]
+    ),
+    spec!(
+        ToggleScheduleEnabled,
+        "Enable or disable schedule",
+        "Change whether the selected schedule runs automatically",
+        false,
+        [Schedules],
+        [(Schedules, "t")]
+    ),
+    spec!(
+        CancelScheduledRun,
+        "Cancel scheduled run",
+        "Request cancellation of the selected active schedule occurrence",
+        false,
+        [ScheduleRuns],
+        [(ScheduleRuns, "x")]
     ),
     spec!(
         NextField,
@@ -1304,6 +1406,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [ScheduleForm],
         [(ScheduleForm, "Shift+Tab; Up")]
+    ),
+    spec!(
+        PreviousTrigger,
+        "Previous trigger",
+        "Choose the previous schedule trigger while the Trigger field has focus",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Left")]
+    ),
+    spec!(
+        NextTrigger,
+        "Next trigger",
+        "Choose the next schedule trigger while the Trigger field has focus",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Right")]
     ),
     spec!(
         EditConfig,
@@ -1464,6 +1582,8 @@ impl ActionId {
                 | Self::NavigateDown
                 | Self::PageUp
                 | Self::PageDown
+                | Self::PanLeft
+                | Self::PanRight
                 | Self::ScrollTranscriptUp
                 | Self::ScrollTranscriptDown
                 | Self::ScrollBlockUp
@@ -2148,6 +2268,16 @@ impl Keymap {
         }
     }
 
+    pub(crate) fn primary_hint(&self, context: ActionContext, action: ActionId) -> String {
+        self.bindings
+            .iter()
+            .find(|binding| binding.context == context && binding.action == action)
+            .map_or_else(
+                || "unbound".to_string(),
+                |binding| binding.sequence.display(),
+            )
+    }
+
     pub(crate) fn action_hint(&self, action: ActionId) -> Option<String> {
         let labels = self
             .bindings
@@ -2368,6 +2498,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn schedule_toggle_is_remappable_and_press_only() {
+        let defaults = Keymap::default();
+        let remapped = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedules","action":"toggle-schedule-enabled","keys":["/","F8"]}
+            ]}"#,
+        )
+        .unwrap();
+        let action = ActionId::ToggleScheduleEnabled;
+        for (keymap, trigger) in [(&defaults, 't'), (&remapped, '/')] {
+            assert_eq!(
+                keymap.resolve(
+                    &[ActionContext::Schedules, ActionContext::Global],
+                    &mut None,
+                    key(KeyCode::Char(trigger), KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::Action {
+                    context: ActionContext::Schedules,
+                    action,
+                }
+            );
+            assert_eq!(
+                keymap.resolve(
+                    &[ActionContext::ScheduleRuns, ActionContext::Global],
+                    &mut None,
+                    key(KeyCode::Char(trigger), KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::NoMatch
+            );
+        }
+        assert!(!action.repeatable());
+    }
+
+    #[test]
+    fn schedule_run_cancel_and_refresh_resolve_only_in_their_context() {
+        let defaults = Keymap::default();
+        let remapped = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedule-runs","action":"cancel-scheduled-run","keys":["/","F8"]},
+                {"context":"schedule-runs","action":"refresh","keys":["F9"]}
+            ]}"#,
+        )
+        .unwrap();
+        for (keymap, context, code, action) in [
+            (
+                &defaults,
+                ActionContext::Schedules,
+                KeyCode::Char('r'),
+                ActionId::RunSchedule,
+            ),
+            (
+                &defaults,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('x'),
+                ActionId::CancelScheduledRun,
+            ),
+            (
+                &defaults,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('r'),
+                ActionId::Refresh,
+            ),
+            (
+                &remapped,
+                ActionContext::ScheduleRuns,
+                KeyCode::Char('/'),
+                ActionId::CancelScheduledRun,
+            ),
+            (
+                &remapped,
+                ActionContext::ScheduleRuns,
+                KeyCode::F(9),
+                ActionId::Refresh,
+            ),
+        ] {
+            assert_eq!(
+                keymap.resolve(
+                    &[context],
+                    &mut None,
+                    key(code, KeyModifiers::empty()),
+                    Instant::now(),
+                ),
+                KeyResolution::Action { context, action }
+            );
+        }
+        assert_eq!(
+            remapped.primary_hint(ActionContext::ScheduleRuns, ActionId::CancelScheduledRun),
+            "/"
+        );
+        assert!(!ActionId::CancelScheduledRun.repeatable());
     }
 
     #[test]

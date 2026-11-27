@@ -43,6 +43,7 @@ const CAPABILITIES: &[&str] = &[
     // Actor Chat receipts + selected execute/output + exact HTTP stop.
     // This describes implemented transport support, never owner authority.
     "http.native_receipt_run.v1",
+    "http.session_message_fork.v1",
 ];
 
 const SUBPROTOCOLS: &[BootstrapSubprotocol] = &[
@@ -199,6 +200,7 @@ mod tests {
                     "realtime.feed_reset.v1",
                     "realtime.stop_control.v1",
                     "http.native_receipt_run.v1",
+                    "http.session_message_fork.v1",
                 ],
                 "auth": {
                     "policy": "open",

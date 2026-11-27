@@ -1,9 +1,12 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{http::StatusCode, web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use crate::schedule_app::ScheduleRunJob;
+use crate::schedule_app::store::SchedulePatchRejection;
+use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
-use super::super::types::{CreateScheduleRequest, PatchScheduleRequest, ScheduleView};
+use super::super::types::{
+    CreateScheduleRequest, PatchScheduleRequest, ScheduleRunRecordView, ScheduleView,
+};
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
     validate_auto_execute_run_config, validate_schedule_name, validate_workflow_target,
@@ -81,15 +84,31 @@ pub async fn patch_schedule(
         Err(response) => return Ok(*response),
     };
 
-    let updated = state
+    match state
         .schedule_store
         .patch_schedule_with_definition(&id, name, req.enabled, run_config, resolved.definition)
         .await
-        .map_err(|error| internal_server_error("patch schedule", error))?;
-
-    match updated {
-        Some(schedule) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
-        None => Ok(schedule_not_found(&id)),
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(schedule_not_found(&id)),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::NoFutureOccurrence) => {
+                Ok(crate::error::json_error_with_code(
+                    StatusCode::CONFLICT,
+                    "Schedule has no future occurrence".into(),
+                    Some("schedule_no_future_occurrence"),
+                ))
+            }
+            Some(SchedulePatchRejection::InvalidWindow) => Ok(crate::error::json_error_with_code(
+                StatusCode::BAD_REQUEST,
+                "start_at must be earlier than end_at".into(),
+                Some("invalid_schedule_window"),
+            )),
+            None => Err(internal_server_error("patch schedule", error)),
+        },
     }
 }
 
@@ -156,6 +175,62 @@ pub async fn run_now(state: web::Data<AppState>, path: web::Path<String>) -> Res
     })))
 }
 
+/// `POST /api/v1/schedules/{schedule_id}/runs/{run_id}/cancel`
+pub async fn cancel_schedule_run(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (schedule_id, run_id) = path.into_inner();
+    let store = &state.schedule_store;
+    let lookup = || store.get_public_schedule_run_record(&schedule_id, &run_id);
+    let not_found = || {
+        crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule run not found".into(),
+            Some("schedule_run_not_found"),
+        )
+    };
+    let Some(record) = lookup().await else {
+        return not_found();
+    };
+    if record.status.is_terminal() {
+        return HttpResponse::Ok().json(ScheduleRunRecordView::from(record));
+    }
+
+    let requested = match record.session_id.as_deref() {
+        Some(session_id)
+            if record.status == ScheduleRunStatus::Running && record.workflow_run_id.is_none() =>
+        {
+            state
+                .schedule_manager
+                .request_ordinary_run_cancel(&schedule_id, &run_id, session_id)
+                .await
+        }
+        _ => false,
+    };
+    if requested {
+        return HttpResponse::Accepted().json(serde_json::json!({
+            "schedule_id": schedule_id,
+            "run_id": run_id,
+            "status": "cancel_requested"
+        }));
+    }
+
+    // The owner may have finished or the schedule may have been deleted
+    // since the initial lookup. Report the current record without writing it.
+    match lookup().await {
+        None => not_found(),
+        Some(record) if record.status.is_terminal() => {
+            HttpResponse::Ok().json(ScheduleRunRecordView::from(record))
+        }
+        Some(_) => crate::error::json_error_with_code(
+            StatusCode::CONFLICT,
+            "Schedule run has no cancellable live execution".into(),
+            Some("schedule_run_not_cancellable"),
+        ),
+    }
+}
+
 pub(in crate::handlers::agent::schedules) fn normalize_optional_name(
     value: Option<&str>,
 ) -> Option<String> {
@@ -181,8 +256,317 @@ mod tests {
         use serde_json::Value;
         use tempfile::tempdir;
 
+        use crate::handlers::agent::schedules::ScheduleView;
         use crate::routes::configure_routes;
+        use crate::schedule_app::store::ScheduleDefinitionChanges;
+        use crate::schedule_app::{
+            default_trigger_engine, ScheduleRunConfig, ScheduleRunStatus, ScheduleStore,
+            ScheduleTrigger,
+        };
         use crate::AppState;
+
+        #[actix_web::test]
+        async fn patch_schedule_disables_and_resumes_an_upcoming_schedule() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let schedule = state
+                .schedule_store
+                .create_schedule(
+                    "Upcoming schedule".into(),
+                    ScheduleTrigger::Interval {
+                        every_seconds: 3600,
+                        anchor_at: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+                    },
+                    true,
+                    ScheduleRunConfig::default(),
+                )
+                .await
+                .unwrap();
+            let app =
+                test::init_service(App::new().app_data(state).configure(configure_routes)).await;
+            let uri = format!("/api/v1/schedules/{}", schedule.id);
+
+            for enabled in [false, true, true] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .set_json(serde_json::json!({ "enabled": enabled }))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["id"], schedule.id);
+                assert_eq!(body["enabled"], enabled);
+                assert_eq!(
+                    body["state"]["next_fire_at"],
+                    serde_json::json!(schedule.state.next_fire_at)
+                );
+                let reopened = ScheduleStore::new(temp_dir.path().to_path_buf())
+                    .await
+                    .unwrap();
+                let persisted = reopened.get_schedule(&schedule.id).await.unwrap();
+                assert_eq!(persisted.enabled, enabled);
+                assert_eq!(persisted.state.next_fire_at, schedule.state.next_fire_at);
+            }
+        }
+
+        #[actix_web::test]
+        async fn patch_schedule_disables_but_cannot_resume_an_elapsed_cadence() {
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            let now = chrono::Utc::now();
+            let start_at = now - chrono::Duration::hours(4);
+            let end_at = now - chrono::Duration::hours(1);
+            let schedule_id = {
+                let store = ScheduleStore::new(home.clone()).await.unwrap();
+                let schedule = store
+                    .create_schedule(
+                        "Elapsed cadence".into(),
+                        ScheduleTrigger::Interval {
+                            every_seconds: 3600,
+                            anchor_at: Some(start_at),
+                        },
+                        true,
+                        ScheduleRunConfig::default(),
+                    )
+                    .await
+                    .unwrap();
+                // An exhausted cadence is inert when the Host's first tick runs.
+                let path = store.index_path();
+                let mut index: Value =
+                    serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
+                let entry = index["schedules"].get_mut(schedule.id.as_str()).unwrap();
+                entry["enabled"] = serde_json::json!(false);
+                entry["created_at"] = serde_json::json!(start_at);
+                entry["updated_at"] = serde_json::json!(end_at);
+                entry["start_at"] = serde_json::json!(start_at);
+                entry["end_at"] = serde_json::json!(end_at);
+                entry["state"]["next_fire_at"] = Value::Null;
+                entry["state"]["last_scheduled_at"] = serde_json::json!(end_at);
+                tokio::fs::write(path, serde_json::to_vec_pretty(&index).unwrap())
+                    .await
+                    .unwrap();
+                schedule.id
+            };
+
+            let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+            let store = &state.schedule_store;
+            let before = store.get_schedule(&schedule_id).await.unwrap();
+            assert!(!before.enabled);
+            assert_eq!(before.state.next_fire_at, None);
+            assert_eq!(before.state.last_scheduled_at, Some(end_at));
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let uri = format!("/api/v1/schedules/{schedule_id}");
+            let disable = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "enabled": false }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(disable.status(), StatusCode::OK);
+            let disabled: Value = test::read_body_json(disable).await;
+            let expected = serde_json::to_value(ScheduleView::from(before)).unwrap();
+            assert_eq!(disabled, expected);
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+
+            let enable = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "enabled": true }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(enable.status(), StatusCode::CONFLICT);
+            let error: Value = test::read_body_json(enable).await;
+            assert_eq!(error["error"]["code"], "schedule_no_future_occurrence");
+
+            let listed: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/v1/schedules")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(listed["schedules"][0], disabled);
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            let entry = reopened.get_schedule(&schedule_id).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(entry)).unwrap(),
+                disabled
+            );
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+        }
+
+        #[actix_web::test]
+        async fn patch_schedule_cannot_reenable_a_consumed_once_schedule() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let at = chrono::Utc::now() + chrono::Duration::hours(1);
+            let schedule = store
+                .create_schedule(
+                    "Once schedule".into(),
+                    ScheduleTrigger::Once { at },
+                    true,
+                    ScheduleRunConfig::default(),
+                )
+                .await
+                .unwrap();
+            let claimed = store
+                .claim_due_runs_with_engine(at, default_trigger_engine().as_ref())
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].schedule_id, schedule.id);
+            assert!(store
+                .get_schedule(&schedule.id)
+                .await
+                .unwrap()
+                .state
+                .next_fire_at
+                .is_none());
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let uri = format!("/api/v1/schedules/{}", schedule.id);
+            let disabled = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "enabled": false }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(disabled.status(), StatusCode::OK);
+            let disabled_view: Value = test::read_body_json(disabled).await;
+            assert_eq!(disabled_view["enabled"], false);
+            assert!(disabled_view["state"]["next_fire_at"].is_null());
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+
+            let enable = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "enabled": true }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(enable.status(), StatusCode::CONFLICT);
+            let error: Value = test::read_body_json(enable).await;
+            assert_eq!(error["error"]["code"], "schedule_no_future_occurrence");
+            let listed: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/v1/schedules")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(listed["schedules"][0], disabled_view);
+            let reopened = ScheduleStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let entry = reopened.get_schedule(&schedule.id).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(entry)).unwrap(),
+                disabled_view
+            );
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+        }
+
+        #[actix_web::test]
+        async fn patch_schedule_rejects_an_invalid_merged_window_without_changes() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let start_at = chrono::Utc::now() + chrono::Duration::hours(4);
+            let schedule = store
+                .create_schedule_with_definition(
+                    "Original schedule".into(),
+                    true,
+                    ScheduleRunConfig::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Interval {
+                            every_seconds: 3600,
+                            anchor_at: None,
+                        }),
+                        start_at: Some(start_at),
+                        end_at: Some(start_at + chrono::Duration::hours(2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+
+            let rejected = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/schedules/{}", schedule.id))
+                    .set_json(serde_json::json!({
+                        "end_at": start_at,
+                        "enabled": false,
+                        "name": "Rejected schedule"
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            let error: Value = test::read_body_json(rejected).await;
+            assert_eq!(error["error"]["code"], "invalid_schedule_window");
+            assert_eq!(
+                error["error"]["message"],
+                "start_at must be earlier than end_at"
+            );
+            let listed: Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/v1/schedules")
+                    .to_request(),
+            )
+            .await;
+            let reopened = ScheduleStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let entry = reopened.get_schedule(&schedule.id).await.unwrap();
+            let expected = serde_json::to_value(ScheduleView::from(schedule)).unwrap();
+            assert_eq!(listed["schedules"][0], expected);
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(entry)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+        }
 
         /// `DELETE /api/v1/schedules/{id}` for an unknown schedule must use
         /// the canonical nested error envelope (`{"error": {"message",
@@ -217,6 +601,186 @@ mod tests {
             assert_eq!(body["error"]["type"], "api_error");
             assert_eq!(body["error"]["message"], "Schedule not found");
             assert_eq!(body["schedule_id"], "does-not-exist");
+        }
+
+        #[actix_web::test]
+        async fn cancel_schedule_run_reports_recorded_outcomes_and_rejects_unowned_runs() {
+            let temp_dir = tempdir().expect("tempdir");
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(
+                AppState::new(temp_dir.path().to_path_buf())
+                    .await
+                    .expect("app state"),
+            );
+            let store = &state.schedule_store;
+            let schedule = store
+                .create_schedule(
+                    "Recurring task".into(),
+                    ScheduleTrigger::Interval {
+                        every_seconds: 3600,
+                        anchor_at: None,
+                    },
+                    true,
+                    ScheduleRunConfig {
+                        auto_execute: true,
+                        task_message: Some("fixture task".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let workflow = store
+                .create_schedule(
+                    "Workflow".into(),
+                    ScheduleTrigger::Once {
+                        at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    },
+                    true,
+                    ScheduleRunConfig {
+                        auto_execute: true,
+                        workflow_target: Some(bamboo_domain::ScheduledWorkflowTarget {
+                            workflow_id: "fixture-workflow".into(),
+                            revision: 1,
+                            args: serde_json::json!({}),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let queued = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            let unbound = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            store
+                .mark_run_started(&schedule.id, &unbound.run_id)
+                .await
+                .unwrap();
+            let stale = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+            store
+                .mark_run_started(&schedule.id, &stale.run_id)
+                .await
+                .unwrap();
+            store
+                .bind_run_session(&schedule.id, &stale.run_id, "prior-host-session")
+                .await
+                .unwrap();
+            let workflow_run = store.create_run_now(&workflow.id).await.unwrap().unwrap();
+            assert!(store
+                .start_workflow_occurrence(&workflow.id, &workflow_run.run_id)
+                .await
+                .unwrap());
+            store
+                .bind_run_session(&workflow.id, &workflow_run.run_id, "workflow-session")
+                .await
+                .unwrap();
+            store
+                .bind_run_workflow(&workflow.id, &workflow_run.run_id, "workflow-execution")
+                .await
+                .unwrap();
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let cancel = |schedule_id: &str, run_id: &str| {
+                test::TestRequest::post()
+                    .uri(&format!(
+                        "/api/v1/schedules/{schedule_id}/runs/{run_id}/cancel"
+                    ))
+                    .to_request()
+            };
+            for (schedule_id, run_id, expected, code) in [
+                (
+                    "missing",
+                    queued.run_id.as_str(),
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    workflow.id.as_str(),
+                    queued.run_id.as_str(),
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    schedule.id.as_str(),
+                    "missing",
+                    StatusCode::NOT_FOUND,
+                    "schedule_run_not_found",
+                ),
+                (
+                    schedule.id.as_str(),
+                    queued.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    schedule.id.as_str(),
+                    unbound.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    schedule.id.as_str(),
+                    stale.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+                (
+                    workflow.id.as_str(),
+                    workflow_run.run_id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_run_not_cancellable",
+                ),
+            ] {
+                let record_before = store.get_run_record(run_id).await;
+                let response = test::call_service(&app, cancel(schedule_id, run_id)).await;
+                assert_eq!(response.status(), expected, "{schedule_id}/{run_id}");
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], code);
+                assert_eq!(store.get_run_record(run_id).await, record_before);
+            }
+
+            for (status, wire_status) in [
+                (ScheduleRunStatus::Success, "success"),
+                (ScheduleRunStatus::Cancelled, "cancelled"),
+            ] {
+                let run = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+                store
+                    .mark_run_started(&schedule.id, &run.run_id)
+                    .await
+                    .unwrap();
+                store
+                    .mark_run_terminal(
+                        &schedule.id,
+                        &run.run_id,
+                        status,
+                        Some("fixture outcome".into()),
+                    )
+                    .await
+                    .unwrap();
+                let recorded = store.get_run_record(&run.run_id).await.unwrap();
+                for _ in 0..2 {
+                    let response =
+                        test::call_service(&app, cancel(&schedule.id, &run.run_id)).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body: Value = test::read_body_json(response).await;
+                    assert_eq!(body["schedule_id"], schedule.id);
+                    assert_eq!(body["run_id"], run.run_id);
+                    assert_eq!(body["status"], wire_status);
+                    assert_eq!(body["outcome_reason"], "fixture outcome");
+                    assert_eq!(
+                        body["completed_at"],
+                        serde_json::to_value(recorded.completed_at).unwrap()
+                    );
+                }
+                assert_eq!(store.get_run_record(&run.run_id).await, Some(recorded));
+            }
+            let retained = store.get_schedule(&schedule.id).await.unwrap();
+            assert!(retained.enabled);
+            assert_eq!(retained.state.next_fire_at, schedule.state.next_fire_at);
         }
 
         #[actix_web::test]

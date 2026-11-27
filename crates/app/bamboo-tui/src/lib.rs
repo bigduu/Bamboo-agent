@@ -27,6 +27,7 @@ mod file_change;
 mod file_reference;
 mod history;
 mod keymap;
+mod schedule_form;
 mod search;
 mod subagents;
 mod task_plan;

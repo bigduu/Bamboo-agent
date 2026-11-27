@@ -519,7 +519,11 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                 }
-                let rendered = markdown::render_markdown(content, width);
+                let rendered = if streaming {
+                    markdown::render_streaming_markdown(content, width)
+                } else {
+                    markdown::render_markdown(content, width)
+                };
                 lines.extend(rendered);
             }
             ConversationBlockKind::Reasoning { content, streaming } => {
@@ -1240,6 +1244,774 @@ mod tests {
             "long no-newline payloads must stay bounded"
         );
         assert!(rendered.visual_line_count as usize > rendered.lines.len());
+    }
+
+    fn transcript_rows(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        workspace: bool,
+    ) -> Vec<String> {
+        terminal
+            .draw(|frame| render_transcript(frame, frame.area(), app, workspace))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area().width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn fence_rows<'a>(rows: &'a [String], language: &str) -> &'a [String] {
+        let top = rows
+            .iter()
+            .position(|row| {
+                row.starts_with('┌')
+                    && row.ends_with('┐')
+                    && row.trim_matches(['┌', '┐', '─', ' ']) == language
+            })
+            .unwrap_or_else(|| panic!("missing {language} fence:\n{}", rows.join("\n")));
+        let bottom = top
+            + 1
+            + rows[top + 1..]
+                .iter()
+                .position(|row| row.starts_with('└') && row.ends_with('┘'))
+                .expect("fence closes within the transcript width");
+        let fence = &rows[top..=bottom];
+        assert!(fence[1..fence.len() - 1]
+            .iter()
+            .all(|row| row.starts_with('│') && row.ends_with('│')));
+        fence
+    }
+
+    #[test]
+    fn testbackend_renders_complete_assistant_fences_and_resumes_prose_at_each_width() {
+        let source = concat!(
+            "Before the examples.\n\n",
+            "```rust linenos\nlet label = \"中文 🧭\";\n```\n\n",
+            "Between the examples.\n\n",
+            "~~~~mermaid theme=neutral\ngraph TD\n  A[图 🧪] --> B[完成]\n~~~~\n\n",
+            "After the examples.\n\n",
+            "Metric | Value\n--- | ---\nFence | Ready\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-with-fences".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MARKDOWN_FENCES").is_some() {
+                eprintln!(
+                    "MARKDOWN FENCE PREVIEW\n{}\nEND MARKDOWN FENCE PREVIEW",
+                    rows.join("\n")
+                );
+            }
+            let rust = fence_rows(&rows, "rust");
+            assert_eq!(rust.len(), 3);
+            // Wide graphemes reserve continuation cells in the TestBackend buffer.
+            assert!(rust[1].replace(' ', "").contains("letlabel=\"中文🧭\";"));
+            let mermaid = fence_rows(&rows, "mermaid");
+            assert_eq!(mermaid.len(), 4);
+            assert!(mermaid[1].contains("graph TD"));
+            assert!(mermaid[2].replace(' ', "").contains("A[图🧪]-->B[完成]"));
+
+            let row_for = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+            assert!(row_for("Before the examples.") < row_for("let label"));
+            assert!(row_for("let label") < row_for("Between the examples."));
+            assert!(row_for("Between the examples.") < row_for("graph TD"));
+            assert!(row_for("graph TD") < row_for("After the examples."));
+            let table = &rows[row_for("Metric")];
+            assert!(table.contains("Value") && !table.contains('|'));
+            assert!(rows[row_for("Ready")].contains("Fence"));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streaming_assistant_fences_stable_when_they_close() {
+        for (marker, language, code) in [
+            ("```", "rust", "let label = \"输入 🧭\";"),
+            ("~~~", "mermaid", "A[输入 🧭] --> B[完成]"),
+        ] {
+            let source = format!("Leading prose.\n\n{marker}{language}\n{code}");
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.chat.streaming = true;
+            app.chat.current_turn_id = Some("run:preview".into());
+            for width in [60, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                app.chat.current_response = source.clone();
+                let open_rows = transcript_rows(&mut terminal, &app, true);
+                let open = fence_rows(&open_rows, language);
+                assert_eq!(open.len(), 3);
+                assert!(open[1].replace(' ', "").contains("输入🧭"));
+                assert!(open_rows
+                    .iter()
+                    .any(|row| row.contains("Bamboo · streaming")));
+
+                let closing_delta = format!("\n{marker}\n\nProse after the fence.");
+                app.chat.current_response.push_str(&closing_delta);
+                let closed_rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(fence_rows(&closed_rows, language), open);
+                assert!(closed_rows
+                    .iter()
+                    .any(|row| row.starts_with("Prose after the fence.")));
+                let blocks = app.conversation_blocks();
+                assert_eq!(blocks[0].id, "run:preview:assistant");
+                assert!(matches!(
+                    blocks[0].kind,
+                    ConversationBlockKind::AssistantMarkdown {
+                        streaming: true,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_assistant_checklist_and_neighboring_markdown_at_each_width() {
+        let source = concat!(
+            "# Launch checklist\n\n",
+            "-  [ ] Verify **接口** 🧪\n",
+            "  *\t[x] Build **组件** 🧭\n",
+            "+ [x] Ship sample\n",
+            "7)   [X] Review `日志` ✅\n",
+            "- Plain bullet\n",
+            "- [x]no marker boundary\n",
+            "- [x](https://example.test/check) remains a link.\n",
+            "Read [release notes](https://example.test/notes).\n\n",
+            "```text\n- [x] literal inside fence\n```\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-checklist".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MARKDOWN_CHECKLIST").is_some() {
+                eprintln!(
+                    "MARKDOWN CHECKLIST PREVIEW\n{}\nEND MARKDOWN CHECKLIST PREVIEW",
+                    rows.join("\n")
+                );
+            }
+
+            let row_for = |text: &str| {
+                rows.iter()
+                    .find(|row| row.contains(text))
+                    .unwrap_or_else(|| {
+                        panic!("missing {text:?} at width {width}:\n{}", rows.join("\n"))
+                    })
+            };
+            let pending = row_for("Verify");
+            assert!(pending.contains("☐ Verify "));
+            assert!(pending.replace(' ', "").contains("接口🧪"));
+            let nested = row_for("Build");
+            assert!(nested.contains("☑ Build "));
+            assert!(nested.find('☑').unwrap() > pending.find('☐').unwrap());
+            assert!(nested.replace(' ', "").contains("组件🧭"));
+            assert!(row_for("Ship sample").contains("☑ Ship sample"));
+            let ordered = row_for("Review");
+            assert!(ordered.contains("7) ☑ Review "));
+            assert!(ordered.replace(' ', "").contains("日志✅"));
+
+            assert!(row_for("Plain bullet").contains("• Plain bullet"));
+            assert!(row_for("no marker boundary").contains("• [x]no marker boundary"));
+            assert!(row_for("remains a link").contains("• x (https://example.test/check)"));
+            assert!(row_for("release notes").contains("release notes (https://example.test/notes)"));
+            assert!(fence_rows(&rows, "text")[1].contains("- [x] literal inside fence"));
+            assert!(terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol() == "接" && cell.modifier.contains(Modifier::BOLD) }));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_checkboxes_only_after_streamed_markers_are_complete() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:checklist".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            app.chat.current_response = "Progress\n\n- [x".into();
+            let partial = transcript_rows(&mut terminal, &app, true);
+            assert!(partial.iter().any(|row| row.contains("• [x")));
+            assert!(partial
+                .iter()
+                .all(|row| !row.contains('☑') && !row.contains('☐')));
+
+            app.chat
+                .current_response
+                .push_str("] Verify 输入 🧭\n  - [ ");
+            let checked = transcript_rows(&mut terminal, &app, true);
+            let checked_row = checked.iter().find(|row| row.contains("☑ Verify")).unwrap();
+            assert!(checked_row.replace(' ', "").contains("输入🧭"));
+            assert!(checked.iter().any(|row| row.trim() == "• ["));
+            assert!(checked.iter().all(|row| !row.contains('☐')));
+
+            app.chat.current_response.push_str("] Document 输出 🧪");
+            let complete = transcript_rows(&mut terminal, &app, true);
+            assert!(complete.contains(checked_row));
+            let new_row = complete
+                .iter()
+                .find(|row| row.contains("☐ Document"))
+                .unwrap();
+            assert!(new_row.replace(' ', "").contains("输出🧪"));
+            assert!(complete
+                .iter()
+                .any(|row| row.contains("Bamboo · streaming")));
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_thematic_breaks_among_assistant_markdown_at_each_width() {
+        let source = concat!(
+            "Delivery notes for **输入** 🧭 and _output_.\n\n",
+            "---\n",
+            "- Real bullet\n",
+            "2. Real ordered item\n\n",
+            "***\n",
+            "Examples follow.\n\n",
+            "___\n",
+            "Setext heading\n",
+            "---\n\n",
+            "- - -\n",
+            "* * *\n",
+            "_ _ _\n",
+            "Metric | Value\n",
+            "--- | ---\n",
+            "Table | Ready\n",
+            "***\n",
+            "Prepared 输出 🧪\n\n",
+            "```text\n---\n* * *\n___\n```\n",
+            "After the fenced text.\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-thematic-breaks".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_THEMATIC_BREAKS").is_some() {
+                eprintln!("THEMATIC BREAK PREVIEW\n{rendered}\nEND THEMATIC BREAK PREVIEW");
+            }
+
+            let divider = "─".repeat(usize::from(width));
+            let divider_rows: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| (row == &divider).then_some(index))
+                .collect();
+            assert_eq!(divider_rows.len(), 7, "{width} columns\n{rendered}");
+            let row_for = |text: &str| {
+                rows.iter()
+                    .position(|row| row.contains(text))
+                    .unwrap_or_else(|| panic!("missing {text:?} at {width} columns\n{rendered}"))
+            };
+            let prose = row_for("Delivery notes");
+            assert!(rows[prose].replace(' ', "").contains("输入🧭"));
+            assert!(rows[prose].contains("and output."));
+            assert!(prose < divider_rows[0]);
+            assert!(rows[row_for("Real bullet")].contains("• Real bullet"));
+            assert!(rows[row_for("Real ordered item")].contains("2. Real ordered item"));
+            let heading = row_for("Setext heading");
+            assert!(rows[heading + 1].trim().is_empty());
+            assert!(divider_rows[2] < heading && heading < divider_rows[3]);
+
+            let table_header = row_for("Metric");
+            let table_body = row_for("Ready");
+            assert!(rows[table_header].contains("Value") && !rows[table_header].contains('|'));
+            let table_separator = rows[table_header + 1].trim_end();
+            assert!(table_separator.contains('─') && table_separator.contains(' '));
+            assert!(table_separator
+                .chars()
+                .all(|cell| cell == '─' || cell == ' '));
+            assert_eq!(table_body, table_header + 2);
+            assert_eq!(divider_rows[6], table_body + 1);
+            assert!(rows[table_body + 2].replace(' ', "").contains("输出🧪"));
+            let fence = fence_rows(&rows, "text");
+            assert_eq!(fence.len(), 5);
+            for (row, literal) in fence[1..4].iter().zip(["---", "* * *", "___"]) {
+                assert_eq!(row.trim_matches(['│', ' ']), literal);
+            }
+            assert!(row_for("After the fenced text.") > row_for("Prepared"));
+            let cells = terminal.backend().buffer().content();
+            assert!(cells
+                .iter()
+                .any(|cell| cell.symbol() == "入" && cell.modifier.contains(Modifier::BOLD)));
+            assert!(cells
+                .iter()
+                .any(|cell| cell.symbol() == "o" && cell.modifier.contains(Modifier::ITALIC)));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_preserves_atx_heading_style_around_inline_formatting() {
+        let source = concat!(
+            "# Build **输出** 🧪 with `cargo`\n",
+            "## Plan *next* steps\n",
+            "### Inspect `trace` details\n",
+            "###### Keep *final* checks\n",
+            "### Release_v2\n\n",
+            "Report the result.\n",
+        );
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-atx-headings".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+        let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live.chat.streaming = true;
+        live.chat.current_turn_id = Some("run:atx".into());
+        live.chat.current_response = source.into();
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            for (app, streaming) in [(&saved, false), (&live, true)] {
+                let rows = transcript_rows(&mut terminal, app, true);
+                let rendered = rows.join("\n");
+                let row_for = |prefix: &str| {
+                    rows.iter()
+                        .position(|row| row.starts_with(prefix))
+                        .unwrap_or_else(|| {
+                            panic!("missing {prefix:?} at {width} columns\n{rendered}")
+                        })
+                };
+                let cell_rows: Vec<_> = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(usize::from(width))
+                    .collect();
+                let primary = row_for("Build ");
+                let secondary = row_for("Plan next steps");
+                let mut visible_title = String::new();
+                let mut column = 0;
+                while let Some(cell) = cell_rows[primary].get(column) {
+                    let symbol = cell.symbol();
+                    visible_title.push_str(symbol);
+                    column += display_width(symbol).max(1);
+                }
+                assert_eq!(
+                    visible_title.trim_end(),
+                    "Build 输出 🧪 with cargo",
+                    "{width} columns, streaming: {streaming}\n{rendered}"
+                );
+                for (row, expected_color) in [
+                    (primary, colors::brand()),
+                    (secondary, app.theme.text()),
+                    (row_for("Inspect trace details"), colors::inactive()),
+                    (row_for("Keep final checks"), colors::inactive()),
+                    (row_for("Release_v2"), colors::inactive()),
+                ] {
+                    let cell = &cell_rows[row][0];
+                    assert_eq!(cell.fg, expected_color, "{width} columns\n{rendered}");
+                    assert!(cell.modifier.contains(Modifier::BOLD), "{rendered}");
+                }
+                assert!(cell_rows[primary].iter().any(|cell| {
+                    cell.symbol() == "c"
+                        && cell.fg == colors::inactive()
+                        && cell.modifier.contains(Modifier::REVERSED)
+                }));
+                assert!(cell_rows[secondary]
+                    .iter()
+                    .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+                assert_eq!(rows[row_for("Release_v2")].trim_end(), "Release_v2");
+                assert!(matches!(
+                    app.conversation_blocks()[0].kind,
+                    ConversationBlockKind::AssistantMarkdown { content, streaming: current }
+                        if content == source && current == streaming
+                ));
+
+                if width == 60
+                    && !streaming
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_HEADING").is_some()
+                {
+                    let rgb = |color| match color {
+                        ratatui::style::Color::Rgb(red, green, blue) => Some([red, green, blue]),
+                        _ => None,
+                    };
+                    let capture: Vec<Vec<_>> = cell_rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|cell| {
+                                    let modifiers = [
+                                        Modifier::BOLD,
+                                        Modifier::ITALIC,
+                                        Modifier::REVERSED,
+                                        Modifier::UNDERLINED,
+                                    ];
+                                    (
+                                        cell.symbol(),
+                                        rgb(cell.fg),
+                                        rgb(cell.bg),
+                                        modifiers.map(|modifier| cell.modifier.contains(modifier)),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let capture = serde_json::to_string(&capture).unwrap();
+                    eprintln!("ATX HEADING CELLS\n{capture}\nEND ATX HEADING CELLS");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_assistant_setext_headings_at_each_width() {
+        let source = concat!(
+            "Build **输出** 🧪 and `plan`\n=====\n\n",
+            "Next _steps_\n---\n---\n\n",
+            "```text\nLiteral title\n====\n---\n```\n\n",
+            "Metric | Value\n--- | ---\nBuild | Ready\n***\n",
+            "This paragraph has\ntwo lines.\n---\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-setext-headings".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 22)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, true);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SETEXT_HEADING").is_some() {
+                eprintln!("SETEXT HEADING PREVIEW\n{rendered}\nEND SETEXT HEADING PREVIEW");
+            }
+            let row_for = |prefix: &str| {
+                rows.iter()
+                    .position(|row| row.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("missing {prefix:?} at {width} columns\n{rendered}"))
+            };
+            let primary = row_for("Build ");
+            let secondary = row_for("Next steps");
+            let divider = "─".repeat(usize::from(width));
+            assert_eq!(rows[primary].replace(' ', ""), "Build输出🧪andplan");
+            assert!(rows[primary + 1].trim().is_empty());
+            assert_eq!(rows[secondary + 1], divider);
+
+            let cells = terminal.backend().buffer().content();
+            let cell_rows = cells.chunks(usize::from(width)).collect::<Vec<_>>();
+            assert_eq!(cell_rows[primary][0].fg, colors::brand());
+            assert!(cell_rows[primary][0].modifier.contains(Modifier::BOLD));
+            assert!(cell_rows[primary]
+                .iter()
+                .any(|cell| cell.symbol() == "p" && cell.modifier.contains(Modifier::REVERSED)));
+            assert!(cell_rows[secondary][0].modifier.contains(Modifier::BOLD));
+            assert!(cell_rows[secondary]
+                .iter()
+                .any(|cell| cell.symbol() == "s" && cell.modifier.contains(Modifier::ITALIC)));
+
+            let fence = fence_rows(&rows, "text");
+            assert_eq!(fence[2].trim_matches(['│', ' ']), "====");
+            assert_eq!(fence[3].trim_matches(['│', ' ']), "---");
+            let table = row_for("Metric");
+            assert!(rows[table].contains("Value") && !rows[table].contains('|'));
+            assert!(rows[table + 2].contains("Ready"));
+            assert_eq!(rows[table + 3], divider);
+            assert_eq!(rows[row_for("two lines.") + 1].trim(), "---");
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_defers_streamed_setext_until_newline_or_completion() {
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            for (title, marker) in [("Build outline", "="), ("Next steps", "-")] {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.chat.streaming = true;
+                app.chat.current_turn_id = Some("run:setext".into());
+                let source = format!("{title}\r\n   {}\t", marker.repeat(3));
+                for partial in [format!("{title}\r\n{marker}"), source.clone()] {
+                    app.chat.current_response = partial.clone();
+                    let rows = transcript_rows(&mut terminal, &app, true);
+                    let first = rows.iter().position(|row| row.trim() == title).unwrap();
+                    assert_eq!(
+                        rows[first + 1].trim(),
+                        partial.lines().last().unwrap().trim()
+                    );
+                    let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                    assert!(!cell.modifier.contains(Modifier::BOLD));
+                    assert_eq!(app.chat.current_response, partial);
+                }
+
+                app.chat.current_response.push('\n');
+                let rows = transcript_rows(&mut terminal, &app, true);
+                let first = rows.iter().position(|row| row.trim() == title).unwrap();
+                assert!(rows[first + 1].trim().is_empty());
+                let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(app.chat.current_response, format!("{source}\n"));
+
+                app.chat.current_response.pop();
+                let rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(rows[first + 1].trim(), marker.repeat(3));
+                app.chat.streaming = false;
+                let rows = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(rows[first].trim(), title);
+                assert!(rows[first + 1].trim().is_empty());
+                let cell = &terminal.backend().buffer().content()[first * usize::from(width)];
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(app.chat.current_response, source);
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_thematic_break_markers_literal_until_the_third() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:thematic-breaks".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let divider = "─".repeat(usize::from(width));
+            for (first, next) in [
+                ("-", "-"),
+                ("*", "*"),
+                ("_", "_"),
+                ("-", " -"),
+                ("*", " *"),
+                ("_", " _"),
+            ] {
+                app.chat.current_response = format!("Input 输入 🧭\n\n{first}");
+                for incomplete in [first.to_owned(), format!("{first}{next}")] {
+                    let rows = transcript_rows(&mut terminal, &app, true);
+                    assert!(
+                        rows.iter().any(|row| row.trim() == incomplete),
+                        "missing literal {incomplete:?} at {width} columns\n{}",
+                        rows.join("\n")
+                    );
+                    assert!(
+                        !rows.contains(&divider),
+                        "unexpected rule for {incomplete:?}"
+                    );
+                    app.chat.current_response.push_str(next);
+                }
+
+                let at_threshold = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(
+                    at_threshold.iter().filter(|row| *row == &divider).count(),
+                    1
+                );
+                app.chat.current_response.push_str("\nOutput 输出 🧪");
+                let continued = transcript_rows(&mut terminal, &app, true);
+                let rule = continued.iter().position(|row| row == &divider).unwrap();
+                assert_eq!(continued[rule], at_threshold[rule]);
+                assert!(continued[..rule]
+                    .iter()
+                    .any(|row| row.replace(' ', "").contains("输入🧭")));
+                assert!(continued[rule + 1].replace(' ', "").contains("输出🧪"));
+                assert!(continued
+                    .iter()
+                    .any(|row| row.contains("Bamboo · streaming")));
+                assert_eq!(
+                    app.chat.current_response,
+                    format!("Input 输入 🧭\n\n{first}{next}{next}\nOutput 输出 🧪")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_break_markers_literal_after_a_pipe_table() {
+        const TABLE: &str = "| Name | Status |\n| --- | --- |\n| Alpha | Ready |\n";
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:table-thematic-break".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let divider = "─".repeat(usize::from(width));
+            app.chat.current_response = TABLE.into();
+            let baseline = transcript_rows(&mut terminal, &app, true);
+            let header = baseline
+                .iter()
+                .position(|row| row.contains("Name"))
+                .unwrap();
+            let alpha = header + 2;
+            assert!(baseline[header].contains("Status"));
+            assert!(baseline[alpha].contains("Alpha") && baseline[alpha].contains("Ready"));
+            let table = &baseline[header..=alpha];
+
+            for (first, next) in [("*", "*"), ("_", "_"), ("*", " *"), ("_", " _")] {
+                app.chat.current_response = format!("{TABLE}{first}");
+                for literal in [first.to_owned(), format!("{first}{next}")] {
+                    let partial = transcript_rows(&mut terminal, &app, true);
+                    assert_eq!(&partial[header..=alpha], table);
+                    assert_eq!(
+                        partial[alpha + 1].trim(),
+                        literal,
+                        "{width} columns\n{}",
+                        partial.join("\n")
+                    );
+                    assert!(!partial.contains(&divider));
+                    assert_eq!(app.chat.current_response, format!("{TABLE}{literal}"));
+                    app.chat.current_response.push_str(next);
+                }
+
+                let completed = transcript_rows(&mut terminal, &app, true);
+                assert_eq!(&completed[header..=alpha], table);
+                assert_eq!(completed[alpha + 1], divider);
+                assert_eq!(
+                    app.chat.current_response,
+                    format!("{TABLE}{first}{next}{next}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_renders_assistant_image_alt_text_alongside_links_and_code() {
+        let source = concat!(
+            "Build report\n\n",
+            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/notes)\n",
+            "![See [guide](https://example.test/guide)](assets/chart.png)\n",
+            "Missing description: ![](assets/empty.png)\n",
+            "Inline example: `![inline](assets/code.png)`\n\n",
+            "```md\n![fenced](assets/fence.png)\n```\n",
+        );
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-image-alt".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            let rows = transcript_rows(&mut terminal, &app, false);
+            let rendered = rows.join("\n");
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_IMAGE_ALT").is_some() {
+                eprintln!("IMAGE ALT PREVIEW\n{rendered}\nEND IMAGE ALT PREVIEW");
+            }
+            let description = rows
+                .iter()
+                .find(|row| row.contains("build_route"))
+                .unwrap_or_else(|| {
+                    panic!("missing image description at {width} columns\n{rendered}")
+                });
+            assert_eq!(
+                description.replace(' ', ""),
+                "build_route输出🧪·notes(https://example.test/notes)"
+            );
+            assert!(rows.iter().any(|row| row.trim_end() == "See guide"));
+            assert!(rendered.contains("Missing description: [Image]"));
+            assert!(!rendered.contains("assets/run(2).png"));
+            assert!(!rendered.contains("https://example.test/guide"));
+            assert!(!rendered.contains("assets/chart.png"));
+            assert!(!rendered.contains("assets/empty.png"));
+            assert!(rendered.contains("Inline example: ![inline](assets/code.png)"));
+            assert!(fence_rows(&rows, "md")[1].contains("![fenced](assets/fence.png)"));
+            assert_eq!(app.chat.messages[0].content, source);
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_streamed_image_syntax_visible_through_the_outer_close() {
+        const INTRO: &str = "Build report [notes](https://example.test/notes)\n\n";
+        const ALT: &str = "![build_route 输出 🧪";
+        const DESTINATION: &str = "](assets/run(2).png";
+        const LINKED_ALT_PARTIAL: &str =
+            "![See [guide](https://example.test/guide)](assets/chart.png";
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("run:image-alt".into());
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let partial_destination = format!("{ALT}{DESTINATION}");
+            for literal in [ALT, partial_destination.as_str()] {
+                let source = format!("{INTRO}{literal}");
+                app.chat.current_response = source.clone();
+                let rows = transcript_rows(&mut terminal, &app, true);
+                let expected = literal.replace(' ', "");
+                assert!(
+                    rows.iter().any(|row| row.replace(' ', "") == expected),
+                    "missing literal {literal:?} at {width} columns\n{}",
+                    rows.join("\n")
+                );
+                assert!(rows
+                    .iter()
+                    .any(|row| row.contains("notes (https://example.test/notes)")));
+                assert_eq!(app.chat.current_response, source);
+            }
+
+            app.chat.current_response.push(')');
+            let completed = transcript_rows(&mut terminal, &app, true);
+            let description = completed
+                .iter()
+                .position(|row| row.replace(' ', "") == "build_route输出🧪")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing completed image at {width} columns\n{}",
+                        completed.join("\n")
+                    )
+                });
+            assert!(completed.iter().all(|row| !row.contains("assets/run")));
+
+            app.chat.current_response.push_str(" ready.");
+            let continued = transcript_rows(&mut terminal, &app, true);
+            assert_eq!(
+                continued[description].replace(' ', ""),
+                "build_route输出🧪ready."
+            );
+            assert!(continued
+                .iter()
+                .any(|row| row.contains("Bamboo · streaming")));
+            assert_eq!(
+                app.chat.current_response,
+                format!("{INTRO}{ALT}{DESTINATION}) ready.")
+            );
+
+            app.chat.current_response = format!("{INTRO}{LINKED_ALT_PARTIAL}");
+            let partial_linked_image = transcript_rows(&mut terminal, &app, true);
+            assert!(
+                partial_linked_image
+                    .iter()
+                    .any(|row| row.trim_end() == LINKED_ALT_PARTIAL),
+                "missing literal linked description at {width} columns\n{}",
+                partial_linked_image.join("\n")
+            );
+            app.chat.current_response.push(')');
+            let completed_linked_image = transcript_rows(&mut terminal, &app, true);
+            assert!(completed_linked_image
+                .iter()
+                .any(|row| row.trim_end() == "See guide"));
+            assert!(completed_linked_image.iter().all(|row| {
+                !row.contains("https://example.test/guide") && !row.contains("assets/chart.png")
+            }));
+            assert_eq!(
+                app.chat.current_response,
+                format!("{INTRO}{LINKED_ALT_PARTIAL})")
+            );
+        }
     }
 
     #[test]

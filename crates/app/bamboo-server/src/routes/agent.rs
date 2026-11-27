@@ -399,6 +399,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::sessions::copy_session),
         )
         .route(
+            "/sessions/{session_id}/fork",
+            web::post().to(agent::sessions::fork_session),
+        )
+        .route(
             "/sessions/{session_id}/system-prompt",
             web::get().to(agent::sessions::get_system_prompt_snapshot),
         )
@@ -487,6 +491,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/schedules/{schedule_id}/runs",
             web::get().to(agent::schedules::list_runs_for_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}/runs/{run_id}/cancel",
+            web::post().to(agent::schedules::cancel_schedule_run),
         )
         // New separated execute + events endpoints
         // `/execute/defaults` MUST be registered before the `/execute/{session_id}`

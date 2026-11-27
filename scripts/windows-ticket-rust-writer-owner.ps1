@@ -4,6 +4,7 @@ function Get-TicketRustProbeTest([string] $ProbeCase) {
         'rust-immutable' { return 'store::windows_writer::tests::immutable::native_standard_user_immutable_publication' }
         'rust-head' { return 'store::windows_writer::tests::head::native_standard_user_head_replacement' }
         'rust-graph' { return 'store::windows_writer::tests::graph::native_standard_user_ticket_graph_publication' }
+        'rust-graph-process-exit' { return 'store::windows_writer::tests::graph::process_exit::native_standard_user_ticket_graph_process_exit' }
         default { throw 'The Rust Ticket probe case is outside the owner test selection.' }
     }
 }
@@ -428,6 +429,140 @@ function Assert-RustGraphProbe($Receipt, [int]$OwnerProcessId) {
         if ($writer.link_count -ne 1 -or $writer.bytes_hex -cne '' -or
             -not (Test-TicketRustWriterFileIdentity $writer.identity $reopen.writer.file)) {
             throw 'The Rust Ticket corruption control changed the existing writer lock.'
+        }
+    }
+    Assert-TicketRustFileStoreGate $Receipt
+}
+
+function Assert-TicketRustGraphProcessRevision($Graph, $Volume, [int]$Sequence, $Parent) {
+    if ($Graph.schema -ne 1 -or $Graph.sequence -ne $Sequence -or $Graph.parent -cne $Parent -or
+        $Graph.binding.scope_id -cne 'graph-scope' -or $Graph.binding.supervisor_session_id -cne 'graph-supervisor' -or
+        $Graph.binding.binding_revision -ne 1 -or $Graph.snapshot_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $Graph.commit_hash -cne $Graph.objects.commit.address -or $Graph.manifest_hash -cne $Graph.objects.manifest.address) {
+        throw 'The Rust process receipt did not identify the expected revision and canonical graph links.'
+    }
+    foreach ($kind in @('ticket', 'header', 'manifest', 'commit')) {
+        $record = $Graph.objects.$kind
+        if ($record.address -cnotmatch '^[0-9a-f]{64}$' -or $record.link_count -ne 1 -or
+            $record.identity.volume_serial -cne $Volume -or
+            -not (Test-TicketRustWriterFileIdentity $record.identity $record.identity)) {
+            throw "The Rust process receipt did not attest the physical $kind record."
+        }
+    }
+}
+
+function Assert-TicketRustGraphProcessMatch($Observed, $Published) {
+    if ($Observed.commit_hash -cne $Published.commit_hash -or $Observed.manifest_hash -cne $Published.manifest_hash -or
+        $Observed.snapshot_sha256 -cne $Published.snapshot_sha256) {
+        throw 'The independently reopened Rust Ticket graph differed from the published revision.'
+    }
+    foreach ($kind in @('ticket', 'header', 'manifest', 'commit')) {
+        $found = $Observed.objects.$kind
+        $expected = $Published.objects.$kind
+        if ($found.address -cne $expected.address -or
+            -not (Test-TicketRustWriterFileIdentity $found.identity $expected.identity)) {
+            throw "The independently reopened Rust Ticket $kind differed from the published record."
+        }
+    }
+}
+
+function Assert-TicketRustGraphProcessToken($ActorToken, $OwnerToken) {
+    if ($ActorToken.sid -cne $OwnerToken.sid -or $ActorToken.elevated -ne $false -or
+        $ActorToken.integrity_sid -cne 'S-1-16-8192' -or $ActorToken.administrators_group_present -ne $false -or
+        $ActorToken.local_account_group_present -ne $true -or @($ActorToken.excess_privileges_present).Count -ne 0) {
+        throw 'The Rust Ticket process did not attest the same ordinary local account.'
+    }
+}
+
+function Assert-RustGraphProcessExitProbe($Receipt, [int]$OwnerProcessId) {
+    $names = @('complete', 'before-head-replace', 'after-head-replace', 'after-scope-flush')
+    $proof = $Receipt.process_exit
+    if ($Receipt.probe -cne 'rust-graph-process-exit' -or $Receipt.case -cne 'native_standard_user_ticket_graph_process_exit' -or
+        $Receipt.owner_pid -ne $OwnerProcessId -or $Receipt.verdict -cne 'available' -or $proof.qualified -ne $true -or
+        @($proof.cases.PSObject.Properties).Count -ne $names.Count) {
+        throw 'The Rust receipt did not identify the exact writer process-exit test and four cases.'
+    }
+    $volume = $Receipt.volume.volume_serial
+    $scopes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $locks = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $publish = 'open_scope|acquire_writer|initial.ticket.category_flush|initial.header.category_flush|initial.manifest.category_flush|initial.commit.category_flush|initial.head.scope_flush|successor.ticket.category_flush|successor.header.category_flush|successor.manifest.category_flush|successor.commit.category_flush|head.stage_file_flush'
+    $reopen = 'open_scope|acquire_writer|read_head|selected.commit|selected.manifest|selected.header|selected.ticket'
+    foreach ($name in $names) {
+        $trial = $proof.cases.$name
+        $writer = $trial.writer
+        $verifier = $trial.verifier
+        $complete = $name -ceq 'complete'
+        $renamed = $name -cne 'before-head-replace'
+        $flushed = $complete -or $name -ceq 'after-scope-flush'
+        $expectedState = if ($complete) { 'complete' } else { 'cut_reached' }
+        $expectedExit = if ($complete) { 0 } else { 16980 }
+        $expectedTermination = if ($complete) { $null } else { 0 }
+        $expectedHeld = if ($complete) { $null } else { 33 }
+        $expectedFlush = if ($flushed) { 0 } else { $null }
+        if ($writer.phase -cne $name -or $writer.state -cne $expectedState -or
+            $trial.writer_exit_code -ne $expectedExit -or $trial.termination_win32_error -ne $expectedTermination -or
+            $trial.held_lock_win32_error -ne $expectedHeld -or $writer.scope_flush_win32_error -ne $expectedFlush -or
+            $writer.pid -le 0 -or $verifier.pid -le 0 -or $writer.pid -eq $verifier.pid -or
+            $writer.pid -eq $OwnerProcessId -or $verifier.pid -eq $OwnerProcessId -or
+            $writer.scope.volume_serial -cne $volume -or $writer.writer.file.volume_serial -cne $volume -or
+            $writer.scope.file_id -ceq $Receipt.volume.fixture_directory_file_id -or
+            -not (Test-TicketRustWriterFileIdentity $verifier.scope $writer.scope) -or
+            -not (Test-TicketRustWriterFileIdentity $verifier.writer.file $writer.writer.file) -or
+            $writer.writer.link_count -ne 1 -or $verifier.writer.link_count -ne 1 -or
+            $writer.writer.win32_error -ne 0 -or $verifier.writer.win32_error -ne 0 -or $verifier.lock_attempts -ne 1 -or
+            -not $scopes.Add($writer.scope.file_id) -or -not $locks.Add($writer.writer.file.file_id)) {
+            throw "The Rust Ticket '$name' did not attest the actual writer exit and fresh same-lock owner."
+        }
+        Assert-TicketRustGraphProcessToken $writer.token $Receipt.token
+        Assert-TicketRustGraphProcessToken $verifier.token $Receipt.token
+
+        $publishOrder = $publish
+        if ($renamed) { $publishOrder += '|head.replace' }
+        if ($flushed) { $publishOrder += '|head.scope_flush' }
+        if ($complete) { $publishOrder += '|head.read_named' }
+        if (($writer.operation_order -join '|') -cne $publishOrder) {
+            throw "The Rust Ticket '$name' did not stop at its native publication boundary."
+        }
+        if ($renamed) {
+            if ($writer.head_rename.ntstatus -cne '00000000' -or $writer.head_rename.win32_error -ne 0 -or
+                $writer.head_rename.information_class -ne 65 -or $writer.head_rename.flags -ne 3) {
+                throw "The Rust Ticket '$name' lacked the successful class 65 replacement."
+            }
+        } elseif ($null -ne $writer.head_rename) {
+            throw 'The pre-replacement Rust cut reported a native rename.'
+        }
+        Assert-TicketRustGraphProcessRevision $writer.initial $volume 1 $null
+        Assert-TicketRustGraphProcessRevision $writer.successor $volume 2 $writer.initial.commit_hash
+        $oldBytes = [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes($writer.initial.commit_hash)).ToLowerInvariant()
+        $newBytes = [Convert]::ToHexString([Text.Encoding]::ASCII.GetBytes($writer.successor.commit_hash)).ToLowerInvariant()
+        if ($writer.old_head.bytes_hex -cne $oldBytes -or $writer.head_stage.bytes_hex -cne $newBytes -or
+            $writer.old_head.identity.volume_serial -cne $volume -or $writer.head_stage.identity.volume_serial -cne $volume -or
+            $writer.old_head.identity.file_id -ceq $writer.head_stage.identity.file_id -or
+            -not (Test-TicketRustObjectObservation $writer.old_head $writer.old_head) -or
+            -not (Test-TicketRustObjectObservation $writer.head_stage $writer.head_stage)) {
+            throw "The Rust Ticket '$name' lacked distinct physical HEAD and staged successor witnesses."
+        }
+        if ($renamed) {
+            Assert-TicketRustGraphProcessRevision $verifier.selected $volume 2 $writer.initial.commit_hash
+            Assert-TicketRustGraphProcessRevision $verifier.previous $volume 1 $null
+            Assert-TicketRustGraphProcessMatch $verifier.selected $writer.successor
+            Assert-TicketRustGraphProcessMatch $verifier.previous $writer.initial
+            if (($verifier.operation_order -join '|') -cne "$reopen|previous.commit|previous.manifest|previous.header|previous.ticket|stage_absent" -or
+                -not (Test-TicketRustObjectObservation $verifier.head $writer.head_stage) -or
+                $verifier.stage_absence_win32_error -ne 2 -or $null -ne $verifier.stage -or $null -ne $verifier.staged_graph) {
+                throw "The Rust Ticket '$name' did not reopen the successor and prove its former stage absent."
+            }
+        } else {
+            Assert-TicketRustGraphProcessRevision $verifier.selected $volume 1 $null
+            Assert-TicketRustGraphProcessRevision $verifier.staged_graph $volume 2 $writer.initial.commit_hash
+            Assert-TicketRustGraphProcessMatch $verifier.selected $writer.initial
+            Assert-TicketRustGraphProcessMatch $verifier.staged_graph $writer.successor
+            if (($verifier.operation_order -join '|') -cne "$reopen|read_stage|staged.commit|staged.manifest|staged.header|staged.ticket" -or
+                -not (Test-TicketRustObjectObservation $verifier.head $writer.old_head) -or
+                -not (Test-TicketRustObjectObservation $verifier.stage $writer.head_stage) -or
+                $null -ne $verifier.stage_absence_win32_error -or $null -ne $verifier.previous) {
+                throw 'The Rust Ticket pre-replacement cut did not retain the initial graph and intact stage.'
+            }
         }
     }
     Assert-TicketRustFileStoreGate $Receipt

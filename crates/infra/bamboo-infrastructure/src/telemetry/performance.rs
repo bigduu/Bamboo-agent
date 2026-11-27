@@ -9,8 +9,10 @@ use super::Observation;
 
 const GREP_QUEUE: &str = "bamboo.perf.grep.queue_us";
 const GREP_SCAN: &str = "bamboo.perf.grep.scan_us";
+const GREP_SCAN_CPU: &str = "bamboo.perf.grep.scan_cpu_us";
 const GREP_FILES: &str = "bamboo.perf.grep.files_scanned";
 const GREP_BYTES: &str = "bamboo.perf.grep.bytes_scanned";
+const GREP_READ_BUFFER_PEAK_CAPACITY: &str = "bamboo.perf.grep.read_buffer_peak_capacity_bytes";
 const GREP_MATCHES: &str = "bamboo.perf.grep.matches";
 const RIPGREP_FILES: &str = "bamboo.perf.grep.ripgrep_files";
 const CACHE_HITS: &str = "bamboo.perf.token_cache.process_hits";
@@ -23,8 +25,13 @@ const GEMINI_JSON: &str = "bamboo.perf.gemini.full_json_frames";
 pub(super) const LOCAL_FIELDS: &[(&str, &str)] = &[
     (GREP_QUEUE, "grep_queue_us"),
     (GREP_SCAN, "grep_scan_us"),
+    (GREP_SCAN_CPU, "grep_scan_cpu_us"),
     (GREP_FILES, "grep_files_scanned"),
     (GREP_BYTES, "grep_bytes_scanned"),
+    (
+        GREP_READ_BUFFER_PEAK_CAPACITY,
+        "grep_read_buffer_peak_capacity_bytes",
+    ),
     (GREP_MATCHES, "grep_matches"),
     (RIPGREP_FILES, "grep_ripgrep_files"),
     (FIRST_TEXT, "model_first_text_us"),
@@ -68,6 +75,25 @@ pub fn record_grep_performance(stats: &GrepPerformance) {
             (RIPGREP_FILES, stats.ripgrep_files),
         ],
     );
+}
+
+/// Attach worker CPU time and the reusable input buffer's high-water capacity
+/// to the current Grep tool observation.
+pub fn record_grep_resources(
+    scan_cpu_time: Option<Duration>,
+    read_buffer_peak_capacity_bytes: usize,
+) {
+    let context = Context::current();
+    record(
+        &context,
+        &[(
+            GREP_READ_BUFFER_PEAK_CAPACITY,
+            read_buffer_peak_capacity_bytes as u64,
+        )],
+    );
+    if let Some(cpu_time) = scan_cpu_time {
+        record(&context, &[(GREP_SCAN_CPU, micros(cpu_time))]);
+    }
 }
 
 /// Record upstream text arrival on the current request, including silent streams.

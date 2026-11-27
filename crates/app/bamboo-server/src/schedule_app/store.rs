@@ -339,6 +339,25 @@ pub struct ScheduleDefinitionChanges {
     pub overlap_policy: Option<OverlapPolicy>,
 }
 
+impl ScheduleDefinitionChanges {
+    fn is_empty(&self) -> bool {
+        self.trigger.is_none()
+            && self.timezone.is_none()
+            && self.start_at.is_none()
+            && self.end_at.is_none()
+            && self.misfire_policy.is_none()
+            && self.overlap_policy.is_none()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SchedulePatchRejection {
+    #[error("schedule has no next run within configured window")]
+    NoFutureOccurrence,
+    #[error("start_at must be earlier than end_at")]
+    InvalidWindow,
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -358,6 +377,16 @@ fn compute_initial_next_run_at(
     window: &ScheduleWindow,
     now: DateTime<Utc>,
 ) -> io::Result<DateTime<Utc>> {
+    compute_definition_next_run_at(trigger, timezone, window, now)?
+        .ok_or_else(|| other_io_error("schedule has no next run within configured window"))
+}
+
+fn compute_definition_next_run_at(
+    trigger: &ScheduleTrigger,
+    timezone: Option<&str>,
+    window: &ScheduleWindow,
+    now: DateTime<Utc>,
+) -> io::Result<Option<DateTime<Utc>>> {
     let engine = default_trigger_engine();
     let runtime_timezone = match trigger {
         // Interval and Once are defined on absolute UTC instants; the engine
@@ -367,8 +396,49 @@ fn compute_initial_next_run_at(
     };
     engine
         .next_after(trigger, runtime_timezone, now, window)
-        .map_err(|error| other_io_error(format!("failed to compute initial next run: {error}")))?
-        .ok_or_else(|| other_io_error("schedule has no next run within configured window"))
+        .map_err(|error| other_io_error(format!("failed to compute initial next run: {error}")))
+}
+
+fn compute_patch_next_run_at(
+    candidate: &ScheduleEntry,
+    existing: &ScheduleEntry,
+    updates_window: bool,
+    now: DateTime<Utc>,
+) -> io::Result<DateTime<Utc>> {
+    let window = ScheduleWindow {
+        start_at: candidate.start_at,
+        end_at: candidate.end_at,
+    };
+    if window
+        .start_at
+        .zip(window.end_at)
+        .is_some_and(|(start, end)| start > end || (updates_window && start == end))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            SchedulePatchRejection::InvalidWindow,
+        ));
+    }
+
+    let consumed_once = matches!(existing.trigger, ScheduleTrigger::Once { .. })
+        && existing.state.next_fire_at.is_none()
+        && existing.trigger == candidate.trigger;
+    let next = if consumed_once {
+        None
+    } else {
+        compute_definition_next_run_at(
+            &candidate.trigger,
+            candidate.timezone.as_deref(),
+            &window,
+            now,
+        )?
+    };
+    next.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            SchedulePatchRejection::NoFutureOccurrence,
+        )
+    })
 }
 
 fn normalize_trigger_for_storage(
@@ -388,13 +458,14 @@ fn normalize_trigger_for_storage(
 }
 
 fn normalize_loaded_index(mut index: SchedulesIndex) -> (SchedulesIndex, bool) {
+    let has_canonical_exhaustion_state = index.version >= 4;
     let mut changed = false;
-    if index.version < 4 {
+    if !has_canonical_exhaustion_state {
         index.version = 4;
         changed = true;
     }
     for entry in index.schedules.values_mut() {
-        changed |= normalize_loaded_schedule_entry(entry);
+        changed |= normalize_loaded_schedule_entry(entry, has_canonical_exhaustion_state);
         if entry.log_monitor.is_some()
             && (entry.state.queued_run_count != 0 || entry.state.running_run_count != 0)
         {
@@ -422,7 +493,10 @@ fn normalize_loaded_index(mut index: SchedulesIndex) -> (SchedulesIndex, bool) {
     (index, changed)
 }
 
-fn normalize_loaded_schedule_entry(entry: &mut ScheduleEntry) -> bool {
+fn normalize_loaded_schedule_entry(
+    entry: &mut ScheduleEntry,
+    has_canonical_exhaustion_state: bool,
+) -> bool {
     let mut changed = false;
 
     let normalized_timezone = normalize_optional_string(entry.timezone.clone());
@@ -449,11 +523,14 @@ fn normalize_loaded_schedule_entry(entry: &mut ScheduleEntry) -> bool {
         }
     }
 
-    // A `next_fire_at: None` on a one-shot trigger is terminal state (the
-    // single occurrence was already claimed), not missing data — re-arming it
-    // here would make a fired Once schedule fire a second time on reload.
-    if entry.state.next_fire_at.is_none() && !matches!(entry.trigger, ScheduleTrigger::Once { .. })
-    {
+    // Once stores consumption as a missing next fire. Current ordinary
+    // schedules also store exhaustion after their last claimed or missed fire.
+    let terminal_next_fire = matches!(entry.trigger, ScheduleTrigger::Once { .. })
+        || (has_canonical_exhaustion_state
+            && entry.log_monitor.is_none()
+            && !entry.enabled
+            && entry.state.last_scheduled_at.is_some());
+    if entry.state.next_fire_at.is_none() && !terminal_next_fire {
         entry.state.next_fire_at = Some(entry.created_at);
         changed = true;
     }
@@ -796,13 +873,17 @@ impl ScheduleStore {
         let _guard = self.write_lock.lock().await;
         let mut index = self.index.write().await;
         let out = f(&mut index)?;
+        self.persist_updated_index(&mut index).await?;
+        Ok(out)
+    }
+
+    async fn persist_updated_index(&self, index: &mut SchedulesIndex) -> io::Result<()> {
         index.updated_at = Utc::now();
         atomic_write_json(
             &self.index_path,
-            serde_json::to_vec_pretty(&*index).map_err(|e| other_io_error(e.to_string()))?,
+            serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?,
         )
-        .await?;
-        Ok(out)
+        .await
     }
 
     pub async fn list_schedules(&self) -> Vec<ScheduleEntry> {
@@ -930,6 +1011,23 @@ impl ScheduleStore {
     pub async fn get_run_record(&self, run_id: &str) -> Option<ScheduleRunRecord> {
         let index = self.index.read().await;
         index.run_records.get(run_id).cloned()
+    }
+
+    pub(crate) async fn get_public_schedule_run_record(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+    ) -> Option<ScheduleRunRecord> {
+        let index = self.index.read().await;
+        index
+            .schedules
+            .get(schedule_id)
+            .filter(|entry| entry.id == schedule_id && entry.log_monitor.is_none())?;
+        index
+            .run_records
+            .get(run_id)
+            .filter(|record| record.schedule_id == schedule_id && record.run_id == run_id)
+            .cloned()
     }
 
     pub async fn list_run_records_for_schedule(&self, schedule_id: &str) -> Vec<ScheduleRunRecord> {
@@ -1074,69 +1172,79 @@ impl ScheduleStore {
         definition: ScheduleDefinitionChanges,
         expected_project_id: Option<Option<ProjectId>>,
     ) -> io::Result<Option<ScheduleEntry>> {
-        self.update_index(|index| {
-            let Some(existing) = index
-                .schedules
-                .get_mut(id)
-                .filter(|entry| entry.log_monitor.is_none())
-            else {
-                return Ok(None);
-            };
-            if expected_project_id.as_ref().is_some_and(|expected| {
-                existing.run_config.project_id.as_ref() != expected.as_ref()
-            }) {
-                return Ok(None);
-            }
-            let now = Utc::now();
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        if expected_project_id
+            .as_ref()
+            .is_some_and(|expected| existing.run_config.project_id.as_ref() != expected.as_ref())
+        {
+            return Ok(None);
+        }
+
+        let enabled_only =
+            enabled.is_some() && name.is_none() && run_config.is_none() && definition.is_empty();
+        if enabled_only && enabled == Some(existing.enabled) {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let updates_window = definition.start_at.is_some() || definition.end_at.is_some();
+        let mut candidate = existing.clone();
+        if let Some(enabled) = enabled {
+            candidate.enabled = enabled;
+        }
+        if !enabled_only {
             if let Some(name) = name {
-                existing.name = name;
-            }
-            if let Some(enabled) = enabled {
-                existing.enabled = enabled;
+                candidate.name = name;
             }
 
-            let trigger = normalize_trigger_for_storage(
+            candidate.trigger = normalize_trigger_for_storage(
                 definition
                     .trigger
-                    .clone()
                     .unwrap_or_else(|| existing.trigger.clone()),
                 existing.derived_anchor_at().unwrap_or(now),
             );
-            existing.trigger = trigger.clone();
 
             if let Some(timezone) = definition.timezone {
-                existing.timezone = normalize_optional_string(Some(timezone));
+                candidate.timezone = normalize_optional_string(Some(timezone));
             }
             if let Some(start_at) = definition.start_at {
-                existing.start_at = Some(start_at);
+                candidate.start_at = Some(start_at);
             }
             if let Some(end_at) = definition.end_at {
-                existing.end_at = Some(end_at);
+                candidate.end_at = Some(end_at);
             }
             if let Some(misfire_policy) = definition.misfire_policy {
-                existing.misfire_policy = misfire_policy;
+                candidate.misfire_policy = misfire_policy;
             }
             if let Some(overlap_policy) = definition.overlap_policy {
-                existing.overlap_policy = overlap_policy;
+                candidate.overlap_policy = overlap_policy;
             }
             if let Some(run_config) = run_config {
-                existing.run_config = run_config;
+                candidate.run_config = run_config;
             }
-
-            let window = ScheduleWindow {
-                start_at: existing.start_at,
-                end_at: existing.end_at,
-            };
-            existing.state.next_fire_at = Some(compute_initial_next_run_at(
-                &trigger,
-                existing.timezone.as_deref(),
-                &window,
+        }
+        if !enabled_only || candidate.enabled {
+            candidate.state.next_fire_at = Some(compute_patch_next_run_at(
+                &candidate,
+                existing,
+                updates_window,
                 now,
             )?);
-            existing.updated_at = now;
-            Ok(Some(existing.clone()))
-        })
-        .await
+        }
+        candidate.updated_at = now;
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
     }
 
     pub async fn delete_schedule(&self, id: &str) -> io::Result<bool> {
@@ -1672,6 +1780,15 @@ mod tests {
                     "last_run_at": null,
                     "next_run_at": next_run_at,
                     "run_config": { "auto_execute": false }
+                },
+                "legacy-2": {
+                    "id": "legacy-2",
+                    "name": "disabled legacy with no saved next run",
+                    "enabled": false,
+                    "interval_seconds": 3600,
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_run_at": next_run_at
                 }
             }
         });
@@ -1691,6 +1808,14 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(schedule.state.next_fire_at, Some(next_run_at));
+        let legacy_without_next = store.get_schedule("legacy-2").await.unwrap();
+        assert!(!legacy_without_next.enabled);
+        assert_eq!(
+            legacy_without_next.state.last_scheduled_at,
+            Some(next_run_at)
+        );
+        assert_eq!(legacy_without_next.state.next_fire_at, Some(now));
     }
 
     #[tokio::test]
@@ -1807,6 +1932,354 @@ mod tests {
         assert_eq!(patched.timezone.as_deref(), Some("UTC"));
         assert_eq!(patched.misfire_policy, MisFirePolicy::CatchUpAll);
         assert_eq!(patched.overlap_policy, OverlapPolicy::Skip);
+    }
+
+    fn assert_patch_rejection(error: io::Error, expected: SchedulePatchRejection) {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>()),
+            Some(&expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_schedule_toggle_save_leaves_live_state_for_the_same_request_to_retry() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let created = store
+            .create_schedule(
+                "scheduled task".into(),
+                ScheduleTrigger::Once {
+                    at: Utc::now() + Duration::hours(1),
+                },
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let id = &created.id;
+        let index_path = store.index_path();
+        let saved = fs::read(index_path).await.unwrap();
+        let index_updated_at = store.index.read().await.updated_at;
+        let backup = dir.path().join("saved-schedules.json");
+
+        // A file cannot replace this directory, although the staged file can be written.
+        fs::rename(index_path, &backup).await.unwrap();
+        fs::create_dir(index_path).await.unwrap();
+        let error = store
+            .patch_schedule(id, None, Some(false), None, None)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_eq!(store.get_schedule(id).await, Some(created.clone()));
+        assert_eq!(store.index.read().await.updated_at, index_updated_at);
+        assert_eq!(fs::read(&backup).await.unwrap(), saved);
+
+        fs::remove_dir(index_path).await.unwrap();
+        fs::rename(&backup, index_path).await.unwrap();
+        let disabled = store
+            .patch_schedule(id, None, Some(false), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.state, created.state);
+        let published = fs::read(index_path).await.unwrap();
+        assert_ne!(published, saved);
+
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule(id).await, Some(disabled.clone()));
+        assert_eq!(
+            reopened.index.read().await.updated_at,
+            store.index.read().await.updated_at
+        );
+        assert_eq!(
+            reopened
+                .patch_schedule(id, None, Some(false), None, None)
+                .await
+                .unwrap(),
+            Some(disabled)
+        );
+        assert_eq!(fs::read(index_path).await.unwrap(), published);
+    }
+
+    #[tokio::test]
+    async fn enabled_only_patch_preserves_expired_once_and_ended_interval() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let now = Utc::now();
+        let future = now + Duration::hours(1);
+        let past = now - Duration::hours(1);
+        let once = store
+            .create_schedule(
+                "once".into(),
+                ScheduleTrigger::Once { at: future },
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let interval = store
+            .create_schedule_with_definition(
+                "interval".into(),
+                true,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::legacy_interval(300, Some(future))),
+                    end_at: Some(future + Duration::minutes(10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Put both saved schedules past their window without running a tick.
+        store
+            .update_index(|index| {
+                let once_entry = index.schedules.get_mut(&once.id).unwrap();
+                once_entry.trigger = ScheduleTrigger::Once { at: past };
+                let interval_entry = index.schedules.get_mut(&interval.id).unwrap();
+                interval_entry.trigger = ScheduleTrigger::legacy_interval(300, Some(past));
+                interval_entry.end_at = Some(past + Duration::minutes(10));
+                for id in [&once.id, &interval.id] {
+                    let entry = index.schedules.get_mut(id).unwrap();
+                    entry.created_at = past - Duration::minutes(10);
+                    entry.updated_at = entry.created_at;
+                    entry.state.next_fire_at = Some(past);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        for id in [&once.id, &interval.id] {
+            let mut expected = store.get_schedule(id).await.unwrap();
+            let disabled = store
+                .patch_schedule(id, None, Some(false), None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            expected.enabled = false;
+            expected.updated_at = disabled.updated_at;
+            assert_eq!(disabled, expected);
+
+            let saved = fs::read(store.index_path()).await.unwrap();
+            assert_eq!(
+                store
+                    .patch_schedule(id, None, Some(false), None, None)
+                    .await
+                    .unwrap(),
+                Some(disabled.clone())
+            );
+            assert_patch_rejection(
+                store
+                    .patch_schedule(id, None, Some(true), None, None)
+                    .await
+                    .unwrap_err(),
+                SchedulePatchRejection::NoFutureOccurrence,
+            );
+            assert_eq!(store.get_schedule(id).await, Some(disabled.clone()));
+            let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+            assert_eq!(reopened.get_schedule(id).await, Some(disabled));
+            assert_eq!(fs::read(store.index_path()).await.unwrap(), saved);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabling_recurring_schedule_advances_saved_due_time_only_on_transition() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let anchor = Utc::now() - Duration::minutes(30);
+        let trigger = ScheduleTrigger::legacy_interval(3600, Some(anchor));
+        let created = store
+            .create_schedule(
+                "recurring".into(),
+                trigger,
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let due = store
+            .update_index(|index| {
+                let entry = index.schedules.get_mut(&created.id).unwrap();
+                entry.state.next_fire_at = Some(anchor);
+                Ok(entry.clone())
+            })
+            .await
+            .unwrap();
+        let saved = fs::read(store.index_path()).await.unwrap();
+        let id = &created.id;
+        assert_eq!(
+            store
+                .patch_schedule(id, None, Some(true), None, None)
+                .await
+                .unwrap(),
+            Some(due)
+        );
+        assert_eq!(fs::read(store.index_path()).await.unwrap(), saved);
+        let mut disabled = store
+            .patch_schedule(id, None, Some(false), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(disabled.state.next_fire_at, Some(anchor));
+
+        let reenabled = store
+            .patch_schedule(id, None, Some(true), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        disabled.enabled = true;
+        disabled.state.next_fire_at = Some(anchor + Duration::hours(1));
+        disabled.updated_at = reenabled.updated_at;
+        assert_eq!(reenabled, disabled);
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule(id).await, Some(reenabled));
+    }
+
+    #[tokio::test]
+    async fn enabled_only_patch_preserves_an_existing_inclusive_point_window() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let at = Utc::now() + Duration::hours(1);
+        let created = store
+            .create_schedule_with_definition(
+                "point window".into(),
+                false,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::legacy_interval(300, Some(at))),
+                    start_at: Some(at),
+                    end_at: Some(at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let resumed = store
+            .patch_schedule(&created.id, None, Some(true), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resumed.enabled);
+        assert_eq!(resumed.start_at, Some(at));
+        assert_eq!(resumed.end_at, Some(at));
+        assert_eq!(resumed.state.next_fire_at, Some(at));
+    }
+
+    #[tokio::test]
+    async fn exhausted_recurring_schedule_keeps_no_next_fire_on_toggle_and_reload() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let first_at = Utc::now() + Duration::hours(1);
+        let created = store
+            .create_schedule_with_definition(
+                "finite interval".into(),
+                true,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::legacy_interval(300, Some(first_at))),
+                    end_at: Some(first_at + Duration::seconds(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let engine = default_trigger_engine();
+        let claimed = store
+            .claim_due_runs_with_engine(first_at, engine.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].scheduled_for, first_at);
+        let id = &created.id;
+        let exhausted = store.get_schedule(id).await.unwrap();
+        assert!(!exhausted.enabled);
+        assert_eq!(exhausted.state.next_fire_at, None);
+        assert_eq!(exhausted.state.last_scheduled_at, Some(first_at));
+        let records = store.list_run_records_for_schedule(id).await;
+        let saved = fs::read(store.index_path()).await.unwrap();
+
+        assert_eq!(
+            store
+                .patch_schedule(id, None, Some(false), None, None)
+                .await
+                .unwrap(),
+            Some(exhausted.clone())
+        );
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule(id).await, Some(exhausted));
+        assert_eq!(reopened.list_run_records_for_schedule(id).await, records);
+        assert_eq!(fs::read(store.index_path()).await.unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn rejected_merged_definition_preserves_live_entry_and_index_bytes() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let start = Utc::now() + Duration::hours(1);
+        let created = store
+            .create_schedule_with_definition(
+                "interval".into(),
+                true,
+                ScheduleRunConfig::default(),
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::legacy_interval(300, Some(start))),
+                    start_at: Some(start),
+                    end_at: Some(start + Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let saved = fs::read(store.index_path()).await.unwrap();
+        for (definition, rejection) in [
+            (
+                ScheduleDefinitionChanges {
+                    end_at: Some(start),
+                    ..Default::default()
+                },
+                SchedulePatchRejection::InvalidWindow,
+            ),
+            (
+                ScheduleDefinitionChanges {
+                    end_at: Some(start - Duration::seconds(1)),
+                    ..Default::default()
+                },
+                SchedulePatchRejection::InvalidWindow,
+            ),
+            (
+                ScheduleDefinitionChanges {
+                    trigger: Some(ScheduleTrigger::Once {
+                        at: start + Duration::hours(2),
+                    }),
+                    ..Default::default()
+                },
+                SchedulePatchRejection::NoFutureOccurrence,
+            ),
+        ] {
+            assert_patch_rejection(
+                store
+                    .patch_schedule_with_definition(
+                        &created.id,
+                        Some("unapplied name".into()),
+                        Some(false),
+                        Some(ScheduleRunConfig {
+                            task_message: Some("unapplied task".into()),
+                            ..Default::default()
+                        }),
+                        definition,
+                    )
+                    .await
+                    .unwrap_err(),
+                rejection,
+            );
+            assert_eq!(store.get_schedule(&created.id).await, Some(created.clone()));
+            assert_eq!(fs::read(store.index_path()).await.unwrap(), saved);
+        }
     }
 
     #[tokio::test]
@@ -2017,6 +2490,68 @@ mod tests {
             .await
             .unwrap();
         assert!(claimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumed_once_cannot_be_enabled_with_the_same_future_definition() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let at = Utc::now() + Duration::hours(1);
+        let trigger = ScheduleTrigger::Once { at };
+        let created = store
+            .create_schedule(
+                "once".into(),
+                trigger.clone(),
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let engine = default_trigger_engine();
+        let claimed = store
+            .claim_due_runs_with_engine(at, engine.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].scheduled_for, at);
+        let id = &created.id;
+        let consumed = store.get_schedule(id).await.unwrap();
+        assert!(!consumed.enabled);
+        assert_eq!(consumed.state.next_fire_at, None);
+        let saved = fs::read(store.index_path()).await.unwrap();
+        assert!(Utc::now() < at);
+
+        for same_trigger in [None, Some(trigger)] {
+            assert_patch_rejection(
+                store
+                    .patch_schedule(id, None, Some(true), same_trigger, None)
+                    .await
+                    .unwrap_err(),
+                SchedulePatchRejection::NoFutureOccurrence,
+            );
+            assert_eq!(store.get_schedule(id).await, Some(consumed.clone()));
+            assert_eq!(fs::read(store.index_path()).await.unwrap(), saved);
+        }
+
+        let new_at = at + Duration::hours(1);
+        let rescheduled = store
+            .patch_schedule(
+                id,
+                None,
+                Some(true),
+                Some(ScheduleTrigger::Once { at: new_at }),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rescheduled.enabled);
+        assert_eq!(rescheduled.state.next_fire_at, Some(new_at));
+        assert_eq!(
+            rescheduled.state.last_scheduled_at,
+            consumed.state.last_scheduled_at
+        );
+        assert_eq!(store.list_run_records_for_schedule(id).await.len(), 1);
     }
 
     #[tokio::test]
@@ -2561,16 +3096,45 @@ mod tests {
             .await
             .unwrap();
 
+        let other = store
+            .create_schedule(
+                "other-schedule".to_string(),
+                created.trigger.clone(),
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
         let claimed = store
             .create_run_now(&created.id)
             .await
             .unwrap()
             .expect("run descriptor should be created");
-        assert!(store.get_run_record(&claimed.run_id).await.is_some());
+        let record = store.get_run_record(&claimed.run_id).await.unwrap();
+        assert_eq!(
+            store
+                .get_public_schedule_run_record(&created.id, &claimed.run_id)
+                .await,
+            Some(record)
+        );
+        for wrong_schedule_id in [other.id.as_str(), "missing-schedule"] {
+            assert!(store
+                .get_public_schedule_run_record(wrong_schedule_id, &claimed.run_id)
+                .await
+                .is_none());
+        }
+        assert!(store
+            .get_public_schedule_run_record(&created.id, "missing-run")
+            .await
+            .is_none());
 
         let deleted = store.delete_schedule(&created.id).await.unwrap();
         assert!(deleted);
         assert!(store.get_run_record(&claimed.run_id).await.is_none());
+        assert!(store
+            .get_public_schedule_run_record(&created.id, &claimed.run_id)
+            .await
+            .is_none());
     }
 }
 

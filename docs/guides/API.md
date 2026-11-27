@@ -481,6 +481,35 @@ copy could not be committed.
 
 ---
 
+#### Fork a Session from a Message
+
+```http
+POST /api/v1/sessions/{session_id}/fork
+Content-Type: application/json
+
+{"up_to_message_id":"message-id"}
+```
+
+Create an independent root session with the stored transcript through the
+selected user message or assistant reply, inclusive. The source session is
+unchanged. The fork keeps the source's durable configuration, Project and
+Workspace assignments, and attachments referenced by the retained transcript.
+The new session can be continued independently.
+
+Successful requests return `201 Created` with `{ "session": SessionSummary }`.
+The response uses the standard error envelope with these codes.
+
+| HTTP status | Error code |
+|-------------|------------|
+| `404 Not Found` | `session_fork_source_not_found` |
+| `404 Not Found` | `session_fork_message_not_found` |
+| `400 Bad Request` | `session_fork_invalid_message` for an ambiguous or unsupported message |
+
+Supporting servers advertise `http.session_message_fork.v1` in
+`GET /api/v1/bootstrap`.
+
+---
+
 #### Delete Session
 
 ```http

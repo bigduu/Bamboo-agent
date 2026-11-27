@@ -49,6 +49,13 @@ pub(super) struct HeadReplaceReceipt {
     pub(super) installation: Option<io::Result<InstalledHead>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HeadReplaceBoundary {
+    BeforeReplace,
+    AfterReplace(RenameReceipt),
+    AfterScopeFlush(RenameReceipt),
+}
+
 #[derive(Debug)]
 pub(super) struct InstalledHead {
     pub(super) old: HeldHeadObservation,
@@ -214,6 +221,15 @@ impl HeadScope<'_, '_> {
         stage: &StagedObject,
         reader: &HeadReader,
     ) -> io::Result<HeadReplaceReceipt> {
+        self.replace_observed(stage, reader, |_| {})
+    }
+
+    pub(super) fn replace_observed(
+        &self,
+        stage: &StagedObject,
+        reader: &HeadReader,
+        mut on_boundary: impl FnMut(HeadReplaceBoundary),
+    ) -> io::Result<HeadReplaceReceipt> {
         self.check_binding()?;
         require_head_bytes(&stage.bytes)?;
         if reader.scope != self.identity
@@ -242,9 +258,13 @@ impl HeadScope<'_, '_> {
         }
         // Missing DELETE on the source, or missing delete sharing on the
         // reader, must be decided by this same native operation.
+        on_boundary(HeadReplaceBoundary::BeforeReplace);
         let rename = rename_opened(&stage.file, &self.directory, HEAD, RenameForm::PosixReplace);
         let installation = if rename.ntstatus == STATUS_SUCCESS {
-            Some(self.verify_replacement(stage, reader, &old))
+            on_boundary(HeadReplaceBoundary::AfterReplace(rename));
+            Some(self.verify_replacement(stage, reader, &old, || {
+                on_boundary(HeadReplaceBoundary::AfterScopeFlush(rename))
+            }))
         } else {
             None
         };
@@ -259,9 +279,11 @@ impl HeadScope<'_, '_> {
         stage: &StagedObject,
         reader: &HeadReader,
         old_before: &HeldHeadObservation,
+        on_scope_flush: impl FnOnce(),
     ) -> io::Result<InstalledHead> {
         self.check_binding()?;
         self.directory.sync_all()?;
+        on_scope_flush();
         let old = reader.observe(HEAD_LENGTH)?;
         let named = self.observe(HEAD, HEAD_LENGTH)?;
         let stage_absence_win32_error = require_name_absent(&self.directory, &stage.name)?;

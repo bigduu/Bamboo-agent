@@ -24,6 +24,7 @@ use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
 use crate::clipboard::{self, ClipboardContents, ClipboardImage};
+use crate::components::markdown::copyable_fences;
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::file_reference::{pasted_files, FileReference};
@@ -32,6 +33,7 @@ use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
+use crate::schedule_form::ScheduleForm;
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
@@ -1916,6 +1918,324 @@ pub struct SchedulesState {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    catalog_generation: u64,
+    toggle_generation: u64,
+    pending_toggle: Option<PendingScheduleToggle>,
+    toggle_error: Option<(String, String)>,
+}
+
+struct PendingScheduleToggle {
+    generation: u64,
+    schedule_id: String,
+    enabled: bool,
+}
+
+pub(crate) enum ScheduleRunsContent {
+    Loading,
+    Loaded(Vec<ScheduleRunView>),
+    Failed(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleRunCancelState {
+    Sending,
+    Requested,
+    Failed(String),
+}
+
+pub(crate) struct ScheduleRunsPane {
+    schedule_id: String,
+    request_id: u64,
+    pub name: String,
+    pub selected: usize,
+    pub rows_per_page: Cell<usize>,
+    pub content: ScheduleRunsContent,
+    pub session_open_error: Option<&'static str>,
+    pub(crate) cancellations: HashMap<String, ScheduleRunCancelState>,
+    pub(crate) refreshing: bool,
+    pub(crate) refresh_error: Option<String>,
+}
+
+impl ScheduleRunsPane {
+    pub(crate) fn new(schedule_id: String, name: String, request_id: u64) -> Self {
+        Self {
+            schedule_id,
+            request_id,
+            name,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+            content: ScheduleRunsContent::Loading,
+            session_open_error: None,
+            cancellations: HashMap::new(),
+            refreshing: false,
+            refresh_error: None,
+        }
+    }
+
+    fn selected_run(&self) -> Option<&ScheduleRunView> {
+        match &self.content {
+            ScheduleRunsContent::Loaded(runs) => runs.get(self.selected),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn selected_session_id(&self) -> Option<&str> {
+        self.selected_run()?
+            .session_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    pub(crate) fn selected_run_can_request_cancel(&self) -> bool {
+        self.selected_run().is_some_and(|run| {
+            run.status == "running"
+                && run.workflow_run_id.is_none()
+                && self.selected_session_id().is_some()
+                && !matches!(
+                    self.cancellations.get(&run.run_id),
+                    Some(ScheduleRunCancelState::Sending | ScheduleRunCancelState::Requested)
+                )
+        })
+    }
+
+    pub(crate) fn selected_cancel_state(&self) -> Option<&ScheduleRunCancelState> {
+        self.cancellations.get(&self.selected_run()?.run_id)
+    }
+
+    fn install_refreshed_runs(&mut self, mut runs: Vec<ScheduleRunView>) {
+        let selected = self
+            .selected_run()
+            .map(|run| (run.run_id.as_str(), run.session_id.as_deref()));
+        if let ScheduleRunsContent::Loaded(previous) = &self.content {
+            // A History GET sampled before cancellation can finish after the
+            // exact POST receipt. Keep any terminal outcome already observed.
+            let terminal: HashMap<_, _> = previous
+                .iter()
+                .filter(|run| run.is_terminal())
+                .map(|run| (run.run_id.as_str(), run))
+                .collect();
+            for run in &mut runs {
+                if let Some(previous) = terminal
+                    .get(run.run_id.as_str())
+                    .copied()
+                    .filter(|_| !run.is_terminal())
+                {
+                    *run = previous.clone();
+                }
+            }
+        }
+        let selection = selected
+            .and_then(|(run_id, _)| runs.iter().position(|run| run.run_id == run_id))
+            .unwrap_or_else(|| self.selected.min(runs.len().saturating_sub(1)));
+        let new_selected = runs
+            .get(selection)
+            .map(|run| (run.run_id.as_str(), run.session_id.as_deref()));
+        if new_selected != selected {
+            self.session_open_error = None;
+        }
+        self.selected = selection;
+        self.cancellations.retain(|run_id, _| {
+            runs.iter()
+                .any(|run| &run.run_id == run_id && !run.is_terminal())
+        });
+        self.content = ScheduleRunsContent::Loaded(runs);
+    }
+
+    fn finish_cancellation(
+        &mut self,
+        run_id: String,
+        result: Result<CancelScheduleRunOutcome, String>,
+    ) {
+        if self.cancellations.get(&run_id) != Some(&ScheduleRunCancelState::Sending) {
+            return;
+        }
+        let next = match result {
+            Ok(CancelScheduleRunOutcome::Requested) => ScheduleRunCancelState::Requested,
+            Ok(CancelScheduleRunOutcome::Terminal(run))
+                if run.run_id == run_id && run.is_terminal() =>
+            {
+                if let ScheduleRunsContent::Loaded(runs) = &mut self.content {
+                    if let Some(current) = runs
+                        .iter_mut()
+                        .find(|item| item.run_id == run_id && !item.is_terminal())
+                    {
+                        *current = run;
+                    }
+                }
+                self.cancellations.remove(&run_id);
+                return;
+            }
+            Ok(CancelScheduleRunOutcome::Terminal(_)) => {
+                ScheduleRunCancelState::Failed("Invalid schedule cancellation response".into())
+            }
+            Err(error) => ScheduleRunCancelState::Failed(error),
+        };
+        self.cancellations.insert(run_id, next);
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        if let ScheduleRunsContent::Loaded(runs) = &self.content {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(runs.len().saturating_sub(1));
+        }
+    }
+}
+
+pub(crate) enum ScheduleSessionsContent {
+    Loading,
+    Loaded(Vec<SessionSummary>),
+    Failed(String),
+}
+
+pub(crate) struct ScheduleSessionsPane {
+    schedule_id: String,
+    request_id: u64,
+    pub(crate) name: String,
+    pub(crate) selected: usize,
+    pub(crate) rows_per_page: Cell<usize>,
+    pub(crate) content: ScheduleSessionsContent,
+    pub(crate) session_open_error: Option<&'static str>,
+}
+
+impl ScheduleSessionsPane {
+    pub(crate) fn new(schedule_id: String, name: String, request_id: u64) -> Self {
+        Self {
+            schedule_id,
+            request_id,
+            name,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+            content: ScheduleSessionsContent::Loading,
+            session_open_error: None,
+        }
+    }
+
+    pub(crate) fn selected_session(&self) -> Option<&SessionSummary> {
+        match &self.content {
+            ScheduleSessionsContent::Loaded(sessions) => sessions.get(self.selected),
+            _ => None,
+        }
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        if let ScheduleSessionsContent::Loaded(sessions) = &self.content {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(sessions.len().saturating_sub(1));
+        }
+    }
+}
+
+enum ScheduleSessionOpenOrigin {
+    Run { request_id: u64, run_id: String },
+    SessionList { request_id: u64 },
+}
+
+pub(crate) struct FenceCopyEntry {
+    pub(crate) language: Option<String>,
+    pub(crate) source: String,
+}
+
+pub(crate) struct FenceSourcePreview {
+    pub(crate) line_count: usize,
+    widest_line: usize,
+    first_line: Cell<usize>,
+    first_column: Cell<usize>,
+    rows_per_page: Cell<usize>,
+    columns_per_page: Cell<usize>,
+}
+
+impl FenceSourcePreview {
+    pub(crate) fn new(source: &str) -> Self {
+        let mut line_count = 0;
+        let mut widest_line = 0;
+        for line in source.lines() {
+            line_count += 1;
+            let line = crate::text::code_source_line(line);
+            widest_line = widest_line.max(crate::text::grapheme_cell_width(&line));
+        }
+        Self {
+            line_count,
+            widest_line,
+            first_line: Cell::new(0),
+            first_column: Cell::new(0),
+            rows_per_page: Cell::new(1),
+            columns_per_page: Cell::new(1),
+        }
+    }
+
+    pub(crate) fn set_viewport(&self, rows: usize, cols: usize) {
+        self.rows_per_page.set(rows.max(1));
+        self.columns_per_page.set(cols.max(1));
+        self.move_by(0, 0);
+    }
+
+    pub(crate) fn first_line(&self) -> usize {
+        self.first_line.get()
+    }
+
+    pub(crate) fn first_column(&self) -> usize {
+        self.first_column.get()
+    }
+
+    pub(crate) fn move_by(&self, lines: isize, columns: isize) {
+        self.first_line.set(
+            self.first_line()
+                .saturating_add_signed(lines)
+                .min(self.line_count.saturating_sub(self.rows_per_page.get())),
+        );
+        self.first_column.set(
+            self.first_column()
+                .saturating_add_signed(columns)
+                .min(self.widest_line.saturating_sub(self.columns_per_page.get())),
+        );
+    }
+}
+
+pub(crate) struct FenceCopyPicker {
+    context_id: u64,
+    block_id: String,
+    original_len: usize,
+    seen_source: String,
+    pub(crate) entries: Vec<FenceCopyEntry>,
+    pub(crate) selected: usize,
+    pub(crate) rows_per_page: Cell<usize>,
+    pub(crate) preview: Option<FenceSourcePreview>,
+}
+
+impl FenceCopyPicker {
+    pub(crate) fn new(
+        context_id: u64,
+        block_id: String,
+        original_len: usize,
+        seen_source: String,
+        entries: Vec<FenceCopyEntry>,
+    ) -> Self {
+        Self {
+            context_id,
+            block_id,
+            original_len,
+            seen_source,
+            entries,
+            selected: 0,
+            rows_per_page: Cell::new(1),
+            preview: None,
+        }
+    }
+
+    fn move_vertical(&mut self, distance: isize) {
+        if let Some(preview) = &self.preview {
+            preview.move_by(distance, 0);
+        } else {
+            self.selected = self
+                .selected
+                .saturating_add_signed(distance)
+                .min(self.entries.len().saturating_sub(1));
+        }
+    }
 }
 
 impl SchedulesState {
@@ -1925,7 +2245,45 @@ impl SchedulesState {
             selected: 0,
             loading: false,
             error: None,
+            catalog_generation: 0,
+            toggle_generation: 0,
+            pending_toggle: None,
+            toggle_error: None,
         }
+    }
+
+    pub(crate) fn has_pending_toggle(&self) -> bool {
+        self.pending_toggle.is_some()
+    }
+
+    pub(crate) fn toggle_pending_for(&self, id: &str) -> bool {
+        self.pending_toggle
+            .as_ref()
+            .is_some_and(|pending| pending.schedule_id == id)
+    }
+
+    pub(crate) fn toggle_error_for(&self, id: &str) -> Option<&str> {
+        self.toggle_error
+            .as_ref()
+            .filter(|(schedule_id, _)| schedule_id == id)
+            .map(|(_, error)| error.as_str())
+    }
+
+    fn install_catalog(&mut self, schedules: Vec<Schedule>) {
+        self.selected = self
+            .schedules
+            .get(self.selected)
+            .and_then(|selected| schedules.iter().position(|row| row.id == selected.id))
+            .unwrap_or_else(|| self.selected.min(schedules.len().saturating_sub(1)));
+        if self
+            .toggle_error
+            .as_ref()
+            .is_some_and(|(id, _)| !schedules.iter().any(|row| row.id == *id))
+        {
+            self.toggle_error = None;
+        }
+        self.schedules = schedules;
+        self.error = None;
     }
 }
 
@@ -3839,27 +4197,6 @@ impl ActiveQuestion {
     }
 }
 
-/// In-progress "new schedule" form (opened with `n` on the Schedules tab).
-#[derive(Default)]
-pub struct ScheduleForm {
-    pub name: String,
-    pub cron: String,
-    pub prompt: String,
-    /// Focused field: 0 = name, 1 = cron, 2 = prompt.
-    pub field: usize,
-    pub error: Option<String>,
-}
-
-impl ScheduleForm {
-    fn current_mut(&mut self) -> &mut String {
-        match self.field {
-            0 => &mut self.name,
-            1 => &mut self.cron,
-            _ => &mut self.prompt,
-        }
-    }
-}
-
 /// In-place editor for the raw config JSON (opened with `e` on the Config tab).
 /// The buffer is a multi-line `TextArea`; on save it must parse as JSON before
 /// it is PATCHed to the server.
@@ -4834,6 +5171,12 @@ pub struct App {
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
+    pub(crate) schedule_runs: Option<ScheduleRunsPane>,
+    schedule_runs_request_id: u64,
+    pub(crate) schedule_sessions: Option<ScheduleSessionsPane>,
+    schedule_sessions_request_id: u64,
+    schedule_sessions_task: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) fence_copy_picker: Option<FenceCopyPicker>,
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
@@ -4924,6 +5267,7 @@ pub struct App {
     /// Exact generation of `opening_session_id`, including failures. Repeated
     /// opens of the same session must not let request A satisfy request B.
     opening_session_epoch: u64,
+    opening_schedule_session: Option<ScheduleSessionOpenOrigin>,
     /// At most one history/summary resume request may exist. Generation
     /// checks protect state; retaining the handle also bounds network tasks.
     opening_session_task: Option<tokio::task::JoinHandle<()>>,
@@ -5083,6 +5427,12 @@ impl App {
             pending_question: None,
             dismissed_question: None,
             schedule_form: None,
+            schedule_runs: None,
+            schedule_runs_request_id: 0,
+            schedule_sessions: None,
+            schedule_sessions_request_id: 0,
+            schedule_sessions_task: None,
+            fence_copy_picker: None,
             config_editor: None,
             permission_editor: None,
             permission_rule_confirm: None,
@@ -5118,6 +5468,7 @@ impl App {
             question_draft_order: VecDeque::new(),
             opening_session_id: None,
             opening_session_epoch: 0,
+            opening_schedule_session: None,
             opening_session_task: None,
             picker_epoch: 0,
             model_picker_task: None,
@@ -5155,6 +5506,7 @@ impl App {
             task.abort();
         }
         self.opening_session_id = None;
+        self.opening_schedule_session = None;
     }
 
     fn take_active_context(&mut self) -> SessionUiContext {
@@ -5300,6 +5652,8 @@ impl App {
 
     fn prepare_visible_session_switch(&mut self) {
         self.terminal_settings = None;
+        self.fence_copy_picker = None;
+        self.close_schedule_sessions();
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -6129,6 +6483,13 @@ impl App {
                 self.chat
                     .run_status
                     .restore_summary(false, false, last_run_status.as_deref());
+                if self
+                    .fence_copy_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.context_id == self.chat.context_id)
+                {
+                    self.fence_copy_picker = None;
+                }
                 self.chat.messages = map_history(history.messages);
                 self.chat.history_loaded = true;
                 self.active_needs_history_refresh = false;
@@ -6442,17 +6803,21 @@ impl App {
                     Err(e) => self.mcp.error = Some(e),
                 }
             }
-            AppEvent::SchedulesLoaded(r) => {
-                self.schedules.loading = false;
-                match r {
-                    Ok(s) => {
-                        self.schedules.selected =
-                            self.schedules.selected.min(s.len().saturating_sub(1));
-                        self.schedules.schedules = s;
-                        self.schedules.error = None;
+            AppEvent::SchedulesLoaded { generation, result } => {
+                if self.schedules.loading && self.schedules.catalog_generation == generation {
+                    self.schedules.loading = false;
+                    match result {
+                        Ok(schedules) => self.schedules.install_catalog(schedules),
+                        Err(error) => self.schedules.error = Some(error),
                     }
-                    Err(e) => self.schedules.error = Some(e),
                 }
+            }
+            AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_toggle(generation, schedule_id, result);
             }
             AppEvent::SkillsLoaded(r) => {
                 self.skills.loading = false;
@@ -6890,6 +7255,66 @@ impl App {
                     }
                 }
             }
+            AppEvent::ScheduleRunsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            } => {
+                if let Some(pane) = self
+                    .schedule_runs
+                    .as_mut()
+                    .filter(|pane| pane.request_id == request_id && pane.schedule_id == schedule_id)
+                {
+                    if std::mem::take(&mut pane.refreshing) {
+                        match result {
+                            Ok(runs) => pane.install_refreshed_runs(runs),
+                            Err(error) => pane.refresh_error = Some(error),
+                        }
+                    } else if matches!(pane.content, ScheduleRunsContent::Loading) {
+                        pane.content = match result {
+                            Ok(runs) => ScheduleRunsContent::Loaded(runs),
+                            Err(error) => ScheduleRunsContent::Failed(error),
+                        };
+                    }
+                    if !self.schedule_run_session_is_opening() {
+                        self.cancel_schedule_run_session_open();
+                    }
+                }
+            }
+            AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id,
+                run_id,
+                result,
+            } => {
+                if let Some(pane) = self
+                    .schedule_runs
+                    .as_mut()
+                    .filter(|pane| pane.request_id == request_id && pane.schedule_id == schedule_id)
+                {
+                    pane.finish_cancellation(run_id, result);
+                    if !self.schedule_run_session_is_opening() {
+                        self.cancel_schedule_run_session_open();
+                    }
+                }
+            }
+            AppEvent::ScheduleSessionsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            } => {
+                if let Some(pane) = self.schedule_sessions.as_mut().filter(|pane| {
+                    pane.request_id == request_id
+                        && pane.schedule_id == schedule_id
+                        && matches!(pane.content, ScheduleSessionsContent::Loading)
+                }) {
+                    self.schedule_sessions_task = None;
+                    pane.content = match result {
+                        Ok(sessions) => ScheduleSessionsContent::Loaded(sessions),
+                        Err(error) => ScheduleSessionsContent::Failed(error),
+                    };
+                }
+            }
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
@@ -6935,6 +7360,7 @@ impl App {
                 let deleted_opening =
                     succeeded && self.opening_session_id.as_deref() == Some(session_id.as_str());
                 if deleted_active {
+                    self.close_schedule_sessions();
                     // Detach before another input event can be handled. This
                     // preserves the deliberate model/Project/composer draft,
                     // while removing every server-backed trace of the deleted
@@ -6954,10 +7380,15 @@ impl App {
                         }
                         None
                     };
+                    let unrelated_schedule_session = self
+                        .opening_schedule_session
+                        .take()
+                        .filter(|_| unrelated_opening.is_some());
                     self.replace_with_new_session(false);
                     self.opening_session_id = unrelated_opening;
                     self.opening_session_epoch = unrelated_opening_epoch;
                     self.opening_session_task = unrelated_opening_task;
+                    self.opening_schedule_session = unrelated_schedule_session;
                 } else if deleted_opening {
                     self.cancel_opening_session();
                 }
@@ -7198,10 +7629,13 @@ impl App {
                 {
                     return Ok(());
                 }
-                if let Some(task) = self.opening_session_task.take() {
-                    task.abort();
+                let schedule_origin = self.opening_schedule_session.take();
+                self.cancel_opening_session();
+                if schedule_origin.as_ref().is_some_and(|origin| {
+                    !self.schedule_session_open_is_current(origin, &session_id)
+                }) {
+                    return Ok(());
                 }
-                self.opening_session_id = None;
                 match result {
                     Ok(opened) => {
                         let latest_observation_epoch =
@@ -7214,10 +7648,16 @@ impl App {
                                     .unwrap_or(0)
                             };
                         if latest_observation_epoch > epoch {
-                            self.status_message =
-                                "Session changed while loading — refreshing history".to_string();
-                            self.resume_session(session_id);
+                            if schedule_origin.is_none() {
+                                self.status_message =
+                                    "Session changed while loading — refreshing history"
+                                        .to_string();
+                            }
+                            self.resume_session_from(session_id, schedule_origin);
                             return Ok(());
+                        }
+                        if matches!(schedule_origin, Some(ScheduleSessionOpenOrigin::Run { .. })) {
+                            self.schedule_runs = None;
                         }
                         let target_is_active =
                             self.chat.session_id.as_deref() == Some(session_id.as_str());
@@ -7339,9 +7779,22 @@ impl App {
                         self.refresh_child_approvals(session_id);
                         self.discover_active_loop();
                     }
-                    Err(e) => {
-                        self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
-                    }
+                    Err(error) => match schedule_origin {
+                        Some(ScheduleSessionOpenOrigin::Run { .. }) => {
+                            if let Some(pane) = self.schedule_runs.as_mut() {
+                                pane.session_open_error = Some("Could not open this session");
+                            }
+                        }
+                        Some(ScheduleSessionOpenOrigin::SessionList { .. }) => {
+                            if let Some(pane) = self.schedule_sessions.as_mut() {
+                                pane.session_open_error = Some("Could not open this session");
+                            }
+                        }
+                        None => self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to open session: {error}"),
+                        ),
+                    },
                 }
             }
             AppEvent::TaskPlanSnapshotLoaded {
@@ -8579,6 +9032,8 @@ impl App {
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_runs.is_some()
+            || self.schedule_sessions.is_some()
             || self.config_editor.is_some()
             || self.permission_editor.is_some()
             || self.permission_rule_confirm.is_some()
@@ -8721,6 +9176,21 @@ impl App {
             }
             if activate {
                 self.activate_command_palette_selection();
+            }
+            return;
+        }
+
+        if self.fence_copy_picker.is_some() {
+            if !self.fence_copy_picker_matches_reply() {
+                self.fence_copy_picker = None;
+                return;
+            }
+            if let Some(picker) = self.fence_copy_picker.as_mut() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => picker.move_vertical(-3),
+                    MouseEventKind::ScrollDown => picker.move_vertical(3),
+                    _ => {}
+                }
             }
             return;
         }
@@ -9121,20 +9591,116 @@ impl App {
         let Some(id) = self.chat.focused_block.clone() else {
             return;
         };
-        let child_id = self
+        let block = self
             .conversation_blocks()
             .into_iter()
-            .find(|block| block.id == id)
-            .and_then(|block| match block.kind {
-                ConversationBlockKind::SubAgent { child, .. } => {
-                    Some(child.child_session_id.clone())
+            .find(|block| block.id == id);
+        match block.map(|block| block.kind) {
+            Some(ConversationBlockKind::SubAgent { child, .. }) => {
+                let child_id = child.child_session_id.clone();
+                self.resume_session(child_id);
+            }
+            Some(ConversationBlockKind::AssistantMarkdown {
+                content,
+                streaming: false,
+            }) => {
+                let (seen_source, fences) = copyable_fences(content);
+                if !fences.is_empty() {
+                    let entries = fences
+                        .into_iter()
+                        .map(|fence| FenceCopyEntry {
+                            language: fence.language.map(str::to_owned),
+                            source: fence.source.to_owned(),
+                        })
+                        .collect();
+                    self.fence_copy_picker = Some(FenceCopyPicker::new(
+                        self.chat.context_id,
+                        id,
+                        content.len(),
+                        seen_source.to_owned(),
+                        entries,
+                    ));
                 }
-                _ => None,
-            });
-        if let Some(child_id) = child_id {
-            self.resume_session(child_id);
-        } else {
-            self.toggle_conversation_details();
+            }
+            _ => self.toggle_conversation_details(),
+        }
+    }
+
+    fn fence_copy_picker_matches_reply(&self) -> bool {
+        let Some(picker) = self.fence_copy_picker.as_ref() else {
+            return false;
+        };
+        if self.tab != Tab::Chat
+            || self.chat.context_id != picker.context_id
+            || self.chat.focused_block.as_ref() != Some(&picker.block_id)
+        {
+            return false;
+        }
+        self.conversation_blocks().into_iter().any(|block| {
+            block.id == picker.block_id
+                && matches!(
+                    block.kind,
+                    ConversationBlockKind::AssistantMarkdown { content, streaming: false }
+                        if content.len() == picker.original_len
+                            && content.starts_with(&picker.seen_source)
+                )
+        })
+    }
+
+    fn handle_fence_copy_picker_key(
+        &mut self,
+        key: KeyEvent,
+        copy: impl FnOnce(&str) -> std::io::Result<()>,
+    ) {
+        let action = self.resolve_context_action(ActionContext::FenceCopyPicker, key);
+        if !self.fence_copy_picker_matches_reply() {
+            self.fence_copy_picker = None;
+            return;
+        }
+        let Some(picker) = self.fence_copy_picker.as_mut() else {
+            return;
+        };
+        let page = picker.preview.as_ref().map_or_else(
+            || picker.rows_per_page.get(),
+            |preview| preview.rows_per_page.get(),
+        ) as isize;
+        match action {
+            Some(ActionId::Cancel) => {
+                if picker.preview.take().is_none() {
+                    self.fence_copy_picker = None;
+                }
+            }
+            Some(ActionId::Activate) if picker.preview.is_none() => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    picker.preview = Some(FenceSourcePreview::new(&entry.source));
+                }
+            }
+            Some(ActionId::NavigateUp) => picker.move_vertical(-1),
+            Some(ActionId::NavigateDown) => picker.move_vertical(1),
+            Some(ActionId::PageUp) => picker.move_vertical(-page),
+            Some(ActionId::PageDown) => picker.move_vertical(page),
+            Some(ActionId::PanLeft | ActionId::PanRight) => {
+                if let Some(preview) = &picker.preview {
+                    let columns = if action == Some(ActionId::PanLeft) {
+                        -4
+                    } else {
+                        4
+                    };
+                    preview.move_by(0, columns);
+                }
+            }
+            Some(ActionId::CopyValue) => {
+                if let Some(entry) = picker.entries.get(picker.selected) {
+                    match copy(&entry.source) {
+                        Ok(()) => self.status_message = "Copied code fence".to_string(),
+                        Err(error) => self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to copy code fence: {error}"),
+                        ),
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9191,8 +9757,7 @@ impl App {
     }
 
     /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
-    /// Ctrl+L are gated on this so they can't stack a second overlay on top
-    /// of one of these eight — see the precedence comment on `handle_key`.
+    /// Ctrl+L are gated on this so they can't stack a second overlay on top.
     fn any_modal_open(&self) -> bool {
         self.serve_offer.is_some()
             || self.pending_question.is_some()
@@ -9204,6 +9769,9 @@ impl App {
             || self.model_picker.is_some()
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_runs.is_some()
+            || self.schedule_sessions.is_some()
+            || self.fence_copy_picker.is_some()
             || self.config_editor.is_some()
             || self.terminal_settings.is_some()
     }
@@ -9274,6 +9842,12 @@ impl App {
             ActionContext::CommandPalette
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
+        } else if self.schedule_sessions.is_some() {
+            ActionContext::ScheduleSessions
+        } else if self.schedule_runs.is_some() {
+            ActionContext::ScheduleRuns
+        } else if self.fence_copy_picker.is_some() {
+            ActionContext::FenceCopyPicker
         } else if self.config_editor.is_some() {
             ActionContext::ConfigEditor
         } else if self.permission_editor.is_some() {
@@ -9636,6 +10210,11 @@ impl App {
             ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
+            ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
+            ActionContext::ScheduleSessions => self.handle_schedule_sessions_key(key),
+            ActionContext::FenceCopyPicker => {
+                self.handle_fence_copy_picker_key(key, copy_via_osc52)
+            }
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
             ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
             ActionContext::TerminalSettings => self.handle_terminal_settings_key(key),
@@ -11314,13 +11893,7 @@ impl App {
                     let _ = tx.send(AppEvent::McpServersLoaded(r));
                 });
             }
-            Tab::Schedules => {
-                self.schedules.loading = true;
-                tokio::spawn(async move {
-                    let r = client.list_schedules().await.map_err(|e| e.to_string());
-                    let _ = tx.send(AppEvent::SchedulesLoaded(r));
-                });
-            }
+            Tab::Schedules => self.load_schedule_catalog(client, tx),
             Tab::Skills => {
                 self.skills.loading = true;
                 tokio::spawn(async move {
@@ -11349,6 +11922,19 @@ impl App {
                 }
             }
         }
+    }
+
+    fn load_schedule_catalog(&mut self, client: BambooClient, tx: mpsc::UnboundedSender<AppEvent>) {
+        let generation = self.schedules.catalog_generation.wrapping_add(1);
+        self.schedules.catalog_generation = generation;
+        self.schedules.loading = true;
+        tokio::spawn(async move {
+            let result = client
+                .list_schedules()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SchedulesLoaded { generation, result });
+        });
     }
 
     fn start_clipboard_paste(&mut self) {
@@ -11952,8 +12538,30 @@ impl App {
     /// by `Enter` on the Sessions tab and by `--session-id` at startup so
     /// there's exactly one resume code path.
     fn resume_session(&mut self, session_id: String) {
+        self.resume_session_from(session_id, None);
+    }
+
+    fn resume_session_from(
+        &mut self,
+        session_id: String,
+        schedule_origin: Option<ScheduleSessionOpenOrigin>,
+    ) {
         self.cancel_opening_session();
-        if self.activate_cached_session(&session_id) {
+        let require_history_identity = matches!(
+            &schedule_origin,
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        );
+        let mismatch_error = match &schedule_origin {
+            Some(ScheduleSessionOpenOrigin::Run { .. }) => {
+                Some("session response did not match the selected run")
+            }
+            Some(ScheduleSessionOpenOrigin::SessionList { .. }) => {
+                Some("session response did not match the selected session")
+            }
+            None => None,
+        };
+        let from_schedule = mismatch_error.is_some();
+        if !from_schedule && self.activate_cached_session(&session_id) {
             return;
         }
         let Some(tx) = self.event_tx.clone() else {
@@ -11963,7 +12571,10 @@ impl App {
         self.opening_session_id = Some(session_id.clone());
         self.opening_session_epoch = summary_observation_epoch;
         let client = self.client.clone();
-        self.status_message = "Resuming session...".to_string();
+        if !from_schedule {
+            self.status_message = "Resuming session...".to_string();
+        }
+        self.opening_schedule_session = schedule_origin;
         self.opening_session_task = Some(tokio::spawn(async move {
             // Bracket history with two summary reads. If completion or a
             // permission transition lands between them, retry so a terminal
@@ -12006,6 +12617,19 @@ impl App {
                         return;
                     }
                 };
+                if let Some(error) = mismatch_error.filter(|_| {
+                    before.id != session_id
+                        || after.id != session_id
+                        || (history.session_id != session_id
+                            && (require_history_identity || !history.session_id.is_empty()))
+                }) {
+                    let _ = tx.send(AppEvent::SessionOpened {
+                        session_id,
+                        epoch: summary_observation_epoch,
+                        result: Err(error.to_string()),
+                    });
+                    return;
+                }
                 if same_history_snapshot(&before, &after) {
                     break (history, after);
                 }
@@ -14437,6 +15061,9 @@ impl App {
             Some(ActionId::NewSchedule) => {
                 self.schedule_form = Some(ScheduleForm::default());
             }
+            Some(ActionId::Activate) => self.open_schedule_runs(),
+            Some(ActionId::OpenScheduleSessions) => self.open_schedule_sessions(),
+            Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -14487,6 +15114,385 @@ impl App {
         Ok(())
     }
 
+    fn toggle_selected_schedule(&mut self) {
+        if self.schedules.has_pending_toggle() {
+            return;
+        }
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let Some(enabled) = schedule.enabled else {
+            return;
+        };
+        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str()) {
+            return;
+        }
+
+        let schedule_id = schedule.id.clone();
+        let enabled = !enabled;
+        let generation = self.schedules.toggle_generation.wrapping_add(1);
+        self.schedules.toggle_generation = generation;
+        if self.schedules.toggle_error_for(&schedule_id).is_some() {
+            self.schedules.toggle_error = None;
+        }
+        self.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation,
+            schedule_id: schedule_id.clone(),
+            enabled,
+        });
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .set_schedule_enabled(&schedule_id, enabled)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result,
+            });
+        });
+    }
+
+    fn finish_schedule_toggle(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<Schedule, String>,
+    ) {
+        let Some(pending) = self.schedules.pending_toggle.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        let result = result.and_then(|schedule| {
+            if schedule.id == schedule_id && schedule.enabled == Some(pending.enabled) {
+                Ok(schedule)
+            } else {
+                Err("Invalid schedule toggle response".into())
+            }
+        });
+        let row = self
+            .schedules
+            .schedules
+            .iter_mut()
+            .find(|row| row.id == schedule_id);
+        match result {
+            Ok(schedule) => {
+                if let Some(row) = row {
+                    *row = schedule;
+                }
+                // Any catalog request already in flight may have read the old
+                // enabled flag. Replace it with a read after the mutation.
+                if std::mem::take(&mut self.schedules.loading) {
+                    if let Some(tx) = self.event_tx.clone() {
+                        self.load_schedule_catalog(self.client.clone(), tx);
+                    }
+                }
+            }
+            Err(error) if row.is_some() => {
+                self.schedules.toggle_error = Some((schedule_id, error));
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn open_schedule_runs(&mut self) {
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let schedule_id = schedule.id.clone();
+        let name = schedule.name.as_deref().unwrap_or("(unnamed)").to_owned();
+        self.close_schedule_sessions();
+        self.schedule_runs_request_id = self.schedule_runs_request_id.wrapping_add(1);
+        let request_id = self.schedule_runs_request_id;
+        self.cancel_schedule_run_session_open();
+        self.schedule_runs = Some(ScheduleRunsPane::new(schedule_id.clone(), name, request_id));
+        Self::load_schedule_runs(self.client.clone(), tx, schedule_id, request_id);
+    }
+
+    fn load_schedule_runs(
+        client: BambooClient,
+        tx: mpsc::UnboundedSender<AppEvent>,
+        schedule_id: String,
+        request_id: u64,
+    ) {
+        tokio::spawn(async move {
+            let result = client
+                .list_schedule_runs(&schedule_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleRunsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            });
+        });
+    }
+
+    fn refresh_schedule_runs(&mut self) {
+        let (Some(pane), Some(tx)) = (self.schedule_runs.as_mut(), self.event_tx.clone()) else {
+            return;
+        };
+        // Initial load and refresh share one history request in this pane.
+        if pane.refreshing || matches!(pane.content, ScheduleRunsContent::Loading) {
+            return;
+        }
+        pane.refreshing = true;
+        pane.refresh_error = None;
+        Self::load_schedule_runs(
+            self.client.clone(),
+            tx,
+            pane.schedule_id.clone(),
+            pane.request_id,
+        );
+    }
+
+    fn request_schedule_run_cancel(&mut self) {
+        let (Some(pane), Some(tx)) = (self.schedule_runs.as_mut(), self.event_tx.clone()) else {
+            return;
+        };
+        let Some(run) = pane
+            .selected_run()
+            .filter(|_| pane.selected_run_can_request_cancel())
+        else {
+            return;
+        };
+        let run_id = run.run_id.clone();
+        let schedule_id = pane.schedule_id.clone();
+        let request_id = pane.request_id;
+        pane.cancellations
+            .insert(run_id.clone(), ScheduleRunCancelState::Sending);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .cancel_schedule_run(&schedule_id, &run_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id,
+                run_id,
+                result,
+            });
+        });
+    }
+
+    fn schedule_session_open_is_current(
+        &self,
+        origin: &ScheduleSessionOpenOrigin,
+        session_id: &str,
+    ) -> bool {
+        match origin {
+            ScheduleSessionOpenOrigin::Run { request_id, run_id } => {
+                self.schedule_runs.as_ref().is_some_and(|pane| {
+                    pane.request_id == *request_id
+                        && pane.selected_run().is_some_and(|run| run.run_id == *run_id)
+                        && pane.selected_session_id() == Some(session_id)
+                })
+            }
+            ScheduleSessionOpenOrigin::SessionList { request_id } => {
+                self.schedule_sessions.as_ref().is_some_and(|pane| {
+                    pane.request_id == *request_id
+                        && pane
+                            .selected_session()
+                            .is_some_and(|session| session.id == session_id)
+                })
+            }
+        }
+    }
+
+    fn active_schedule_session_open(&self) -> Option<&ScheduleSessionOpenOrigin> {
+        self.opening_schedule_session
+            .as_ref()
+            .zip(self.opening_session_id.as_deref())
+            .filter(|(origin, id)| self.schedule_session_open_is_current(origin, id))
+            .map(|(origin, _)| origin)
+    }
+
+    pub(crate) fn schedule_run_session_is_opening(&self) -> bool {
+        matches!(
+            self.active_schedule_session_open(),
+            Some(ScheduleSessionOpenOrigin::Run { .. })
+        )
+    }
+
+    fn cancel_schedule_run_session_open(&mut self) {
+        if matches!(
+            self.opening_schedule_session,
+            Some(ScheduleSessionOpenOrigin::Run { .. })
+        ) {
+            self.cancel_opening_session();
+        }
+    }
+
+    fn open_schedule_run_session(&mut self) {
+        if self.schedule_run_session_is_opening() {
+            return;
+        }
+        let Some(pane) = self.schedule_runs.as_mut() else {
+            return;
+        };
+        let Some((run, session_id)) = pane.selected_run().zip(pane.selected_session_id()) else {
+            return;
+        };
+        let origin = ScheduleSessionOpenOrigin::Run {
+            request_id: pane.request_id,
+            run_id: run.run_id.clone(),
+        };
+        let session_id = session_id.to_owned();
+        pane.session_open_error = None;
+        self.resume_session_from(session_id, Some(origin));
+    }
+
+    fn handle_schedule_runs_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleRuns, key);
+        let Some(pane) = self.schedule_runs.as_mut() else {
+            return;
+        };
+        let page = pane.rows_per_page.get() as isize;
+        let selected = pane.selected;
+        match action {
+            Some(ActionId::Cancel) => {
+                self.cancel_schedule_run_session_open();
+                self.schedule_runs = None;
+                return;
+            }
+            Some(ActionId::Activate) => {
+                self.open_schedule_run_session();
+                return;
+            }
+            Some(ActionId::CancelScheduledRun) => {
+                self.request_schedule_run_cancel();
+                return;
+            }
+            Some(ActionId::Refresh) => {
+                self.refresh_schedule_runs();
+                return;
+            }
+            Some(ActionId::NavigateUp) => pane.move_selection(-1),
+            Some(ActionId::NavigateDown) => pane.move_selection(1),
+            Some(ActionId::PageUp) => pane.move_selection(-page),
+            Some(ActionId::PageDown) => pane.move_selection(page),
+            _ => {}
+        }
+        if pane.selected != selected {
+            pane.session_open_error = None;
+            self.cancel_schedule_run_session_open();
+        }
+    }
+
+    fn open_schedule_sessions(&mut self) {
+        let (Some(schedule), Some(tx)) = (
+            self.schedules.schedules.get(self.schedules.selected),
+            self.event_tx.clone(),
+        ) else {
+            return;
+        };
+        let schedule_id = schedule.id.clone();
+        let name = schedule.name.as_deref().unwrap_or("(unnamed)").to_owned();
+        self.cancel_schedule_run_session_open();
+        self.schedule_runs = None;
+        self.close_schedule_sessions();
+        self.schedule_sessions_request_id = self.schedule_sessions_request_id.wrapping_add(1);
+        let request_id = self.schedule_sessions_request_id;
+        self.schedule_sessions = Some(ScheduleSessionsPane::new(
+            schedule_id.clone(),
+            name,
+            request_id,
+        ));
+
+        let client = self.client.clone();
+        self.schedule_sessions_task = Some(tokio::spawn(async move {
+            let result = client
+                .list_schedule_sessions(&schedule_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ScheduleSessionsLoaded {
+                request_id,
+                schedule_id,
+                result,
+            });
+        }));
+    }
+
+    pub(crate) fn schedule_session_is_opening(&self) -> bool {
+        matches!(
+            self.active_schedule_session_open(),
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        )
+    }
+
+    fn cancel_schedule_session_list_open(&mut self) {
+        if matches!(
+            self.opening_schedule_session,
+            Some(ScheduleSessionOpenOrigin::SessionList { .. })
+        ) {
+            self.cancel_opening_session();
+        }
+    }
+
+    fn close_schedule_sessions(&mut self) {
+        self.cancel_schedule_session_list_open();
+        if let Some(task) = self.schedule_sessions_task.take() {
+            task.abort();
+        }
+        self.schedule_sessions = None;
+    }
+
+    fn open_selected_schedule_session(&mut self) {
+        if self.schedule_session_is_opening() {
+            return;
+        }
+        let Some(pane) = self.schedule_sessions.as_mut() else {
+            return;
+        };
+        let Some(session) = pane.selected_session() else {
+            return;
+        };
+        let session_id = session.id.clone();
+        let origin = ScheduleSessionOpenOrigin::SessionList {
+            request_id: pane.request_id,
+        };
+        pane.session_open_error = None;
+        self.resume_session_from(session_id, Some(origin));
+    }
+
+    fn handle_schedule_sessions_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleSessions, key);
+        let Some(pane) = self.schedule_sessions.as_mut() else {
+            return;
+        };
+        let page = pane.rows_per_page.get() as isize;
+        let selected = pane.selected;
+        match action {
+            Some(ActionId::Cancel) => {
+                self.close_schedule_sessions();
+                return;
+            }
+            Some(ActionId::Activate) => {
+                self.open_selected_schedule_session();
+                return;
+            }
+            Some(ActionId::NavigateUp) => pane.move_selection(-1),
+            Some(ActionId::NavigateDown) => pane.move_selection(1),
+            Some(ActionId::PageUp) => pane.move_selection(-page),
+            Some(ActionId::PageDown) => pane.move_selection(page),
+            _ => {}
+        }
+        if pane.selected != selected {
+            pane.session_open_error = None;
+            self.cancel_schedule_session_list_open();
+        }
+    }
+
     /// Drive the new-schedule form modal. On Enter (all fields filled) it POSTs
     /// create_schedule off the event loop and reloads the tab.
     fn handle_schedule_form_key(&mut self, key: KeyEvent) {
@@ -14499,38 +15505,35 @@ impl App {
                 self.schedule_form = None;
             }
             Some(ActionId::NextField) => {
-                form.field = (form.field + 1) % 3;
+                form.move_focus(1);
             }
             Some(ActionId::PreviousField) => {
-                form.field = (form.field + 2) % 3;
+                form.move_focus(-1);
+            }
+            Some(ActionId::NextTrigger) => {
+                form.change_trigger(1);
+            }
+            Some(ActionId::PreviousTrigger) => {
+                form.change_trigger(-1);
             }
             Some(ActionId::Backspace) => {
-                form.error = None;
-                form.current_mut().pop();
+                if let Some(value) = form.current_mut() {
+                    value.pop();
+                    form.error = None;
+                }
             }
             Some(ActionId::Activate) => {
-                if form.name.trim().is_empty()
-                    || form.cron.trim().is_empty()
-                    || form.prompt.trim().is_empty()
-                {
-                    form.error = Some("Fill in name, cron, and prompt".to_string());
-                    return;
-                }
-                let req = CreateScheduleRequest {
-                    name: form.name.trim().to_string(),
-                    trigger: ScheduleTriggerReq::Cron {
-                        expr: form.cron.trim().to_string(),
-                    },
-                    enabled: true,
-                    run_config: ScheduleRunConfigReq {
-                        project_id: self
-                            .sessions
-                            .sessions
-                            .get(self.sessions.selected)
-                            .and_then(|session| session.project_id.clone()),
-                        task_message: Some(form.prompt.trim().to_string()),
-                        auto_execute: true,
-                    },
+                let project_id = self
+                    .sessions
+                    .sessions
+                    .get(self.sessions.selected)
+                    .and_then(|session| session.project_id.clone());
+                let req = match form.request(project_id, Utc::now()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        form.error = Some(error.to_string());
+                        return;
+                    }
                 };
                 self.schedule_form = None;
                 if let Some(tx) = self.event_tx.clone() {
@@ -14549,9 +15552,9 @@ impl App {
                 }
             }
             _ => {
-                if let Some(character) = text_character(key) {
+                if let (Some(character), Some(value)) = (text_character(key), form.current_mut()) {
+                    value.push(character);
                     form.error = None;
-                    form.current_mut().push(character);
                 }
             }
         }
@@ -21965,10 +22968,11 @@ mod question_tests {
         let mut schedule = App::new(BambooClient::new("http://127.0.0.1:0"));
         schedule.schedule_form = Some(ScheduleForm {
             name: "nightly-计划".to_string(),
-            cron: "0 0 * * *".to_string(),
+            timing: "0 0 * * *".to_string(),
             prompt: format!("{}TAIL_🧭e\u{301}", "x".repeat(80)),
-            field: 2,
+            field: 3,
             error: Some("Prompt cannot be empty".to_string()),
+            ..Default::default()
         });
         actual.push(minimum_modal_fingerprint(&schedule));
 
@@ -22040,14 +23044,14 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    12_360_418_717_810_675_712
+                    15_697_706_785_549_981_363
                 } else {
-                    1_603_011_432_197_960_348
+                    6_997_252_207_367_741_014
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
                 9_768_235_100_311_109_645,
-                13_337_898_881_162_529_494,
+                15_361_603_810_980_377_359,
                 14_839_815_545_818_862_244,
                 14_001_204_281_749_812_417,
                 3_082_197_214_727_898_618,
@@ -23338,6 +24342,7 @@ mod question_tests {
 
     #[test]
     fn schedule_form_cycles_and_validates() {
+        use crate::schedule_form::ScheduleTriggerKind;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         fn k(c: KeyCode) -> KeyEvent {
             KeyEvent::new(c, KeyModifiers::empty())
@@ -23346,12 +24351,29 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.schedule_form = Some(ScheduleForm::default());
 
-        // Type into the name field, then Tab to cron.
+        // Type into the name field, then Tab to the trigger selector.
         app.handle_schedule_form_key(k(KeyCode::Char('h')));
         app.handle_schedule_form_key(k(KeyCode::Char('i')));
         assert_eq!(app.schedule_form.as_ref().unwrap().name, "hi");
         app.handle_schedule_form_key(k(KeyCode::Tab));
         assert_eq!(app.schedule_form.as_ref().unwrap().field, 1);
+        for expected in [
+            ScheduleTriggerKind::Once,
+            ScheduleTriggerKind::Interval,
+            ScheduleTriggerKind::Daily,
+            ScheduleTriggerKind::Weekly,
+            ScheduleTriggerKind::Monthly,
+            ScheduleTriggerKind::Cron,
+        ] {
+            app.handle_schedule_form_key(k(KeyCode::Right));
+            assert_eq!(app.schedule_form.as_ref().unwrap().trigger, expected);
+        }
+        app.handle_schedule_form_key(k(KeyCode::Left));
+        assert_eq!(
+            app.schedule_form.as_ref().unwrap().trigger,
+            ScheduleTriggerKind::Monthly
+        );
+        assert_eq!(app.schedule_form.as_ref().unwrap().name, "hi");
 
         // Enter with empty cron/prompt does NOT submit (form stays open).
         app.handle_schedule_form_key(k(KeyCode::Enter));
@@ -23390,6 +24412,1398 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_form_posts_weekly_schedule_from_keyboard_input() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut socket).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("POST /api/v1/schedules HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({
+                    "name": "Study",
+                    "trigger": {
+                        "type": "weekly", "weekdays": ["mon", "fri"],
+                        "hour": 8, "minute": 30, "second": 0,
+                    },
+                    "timezone": "UTC",
+                    "enabled": true,
+                    "run_config": {"task_message": "Check the log", "auto_execute": true},
+                })
+            );
+            respond_test_http(&mut socket, "application/json", "{}").await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        for character in "Study".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Right)).await.unwrap();
+        }
+        for input in ["08:30", "Mon,Fri", "Check the log"] {
+            app.handle_key(key(KeyCode::Tab)).await.unwrap();
+            for character in input.chars() {
+                app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+            }
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::ActionDone {
+                outcome: Ok(_),
+                reload_tab: true,
+                ..
+            }
+        ));
+        assert!(app.schedule_form.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_toggle_key_updates_only_its_row_and_fences_an_older_catalog() {
+        use ratatui::backend::TestBackend;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        const ORIGINAL: &str = r#"{"schedules":[
+            {"id":"first","name":"First review","enabled":true,"trigger":{"type":"interval","every_seconds":90}},
+            {"id":"second","name":"Second review","enabled":true}
+        ]}"#;
+        const DISABLED: &str = r#"{"id":"first","name":"First review","enabled":false,
+            "trigger":{"type":"interval","every_seconds":90},
+            "state":{"next_fire_at":"2028-01-26T09:10:00Z"}}"#;
+        const REORDERED: &str = r#"{"schedules":[
+            {"id":"second","name":"Second review","enabled":true},
+            {"id":"first","name":"First review","enabled":false,"trigger":{"type":"interval","every_seconds":90},
+             "state":{"next_fire_at":"2028-01-26T09:10:00Z"}}
+        ]}"#;
+
+        async fn read_toggle(stream: &mut tokio::net::TcpStream, enabled: bool) {
+            let request = read_test_http_request(stream).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("PATCH /api/v1/schedules/first HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"enabled": enabled})
+            );
+        }
+
+        async fn reply_error(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+
+        let preview = |app: &App, phase: &str| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(60)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_TOGGLE").is_some() {
+                eprintln!(
+                    "SCHEDULE TOGGLE {phase} PREVIEW\n{text}\nEND SCHEDULE TOGGLE {phase} PREVIEW"
+                );
+            }
+            text
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_get_seen, old_get_started) = oneshot::channel();
+        let (patch_seen, patch_started) = oneshot::channel();
+        let (allow_patch, wait_patch) = oneshot::channel();
+        let (allow_refresh, wait_refresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut first).await, "/api/v1/schedules");
+            respond_test_http(&mut first, "application/json", ORIGINAL).await;
+
+            let (mut old, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut old).await, "/api/v1/schedules");
+            old_get_seen.send(()).unwrap();
+            let (mut patch, _) = listener.accept().await.unwrap();
+            read_toggle(&mut patch, false).await;
+            patch_seen.send(()).unwrap();
+            wait_patch.await.unwrap();
+            respond_test_http(&mut patch, "application/json", DISABLED).await;
+
+            let (mut current, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut current).await, "/api/v1/schedules");
+            respond_test_http(&mut old, "application/json", ORIGINAL).await;
+            wait_refresh.await.unwrap();
+            respond_test_http(&mut current, "application/json", REORDERED).await;
+
+            let (mut refused, _) = listener.accept().await.unwrap();
+            read_toggle(&mut refused, true).await;
+            reply_error(
+                &mut refused,
+                "409 Conflict",
+                r#"{"error":{"code":"schedule_no_future_occurrence","message":"RAW_SCHEDULE_ERROR"}}"#,
+            ).await;
+
+            let (mut failed_refresh, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut failed_refresh)
+                    .await
+                    .lines()
+                    .next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            reply_error(
+                &mut failed_refresh,
+                "503 Service Unavailable",
+                r#"{"error":{"message":"RAW_REFRESH_DIAGNOSTIC"}}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Mcp;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+            {"context":"schedules","action":"toggle-schedule-enabled","keys":["/"]}
+        ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let budget = Duration::from_secs(5);
+        async fn next_event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert_eq!(app.tab, Tab::Schedules);
+        app.handle_key(key(KeyCode::Char('t'))).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        tokio::time::timeout(budget, old_get_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        tokio::time::timeout(budget, patch_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(app.schedules.toggle_pending_for("first"));
+        assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        let pending = preview(&app, "PENDING");
+        assert!(pending.contains("Saving schedule…"), "{pending}");
+        assert!(
+            pending.contains("r run now") && pending.contains("Enter runs"),
+            "{pending}"
+        );
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(!app.schedules.toggle_pending_for("second"));
+        assert_eq!(app.schedules.selected, 1);
+        let busy = preview(&app, "OTHER ROW");
+        assert!(busy.contains("Saving another schedule…"), "{busy}");
+        allow_patch.send(()).unwrap();
+        let saved = next_event(&mut rx).await;
+        assert!(
+            matches!(&saved, AppEvent::ScheduleToggleFinished { schedule_id, .. } if schedule_id == "first")
+        );
+        app.handle_event(saved).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(app.schedules.loading);
+        assert_eq!(app.schedules.selected, 1);
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
+        assert_eq!(
+            app.schedules.schedules[0].next_run,
+            Some("2028-01-26T09:10:00Z".parse().unwrap())
+        );
+        assert_eq!(app.schedules.schedules[1].enabled, Some(true));
+
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.loading);
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
+        allow_refresh.send(()).unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.selected, 0);
+        assert_eq!(app.schedules.schedules[0].id, "second");
+        assert_eq!(app.schedules.schedules[1].id, "first");
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        let settled = preview(&app, "SETTLED");
+        assert!(
+            settled.contains("/ Enable") && settled.contains("Every 90 seconds"),
+            "{settled}"
+        );
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.schedules[1].enabled, Some(false));
+        assert_eq!(
+            app.schedules.toggle_error_for("first"),
+            Some("Schedule has no future occurrence")
+        );
+        assert_eq!(app.schedules.toggle_error_for("second"), None);
+        let refusal = preview(&app, "REFUSAL");
+        assert!(
+            refusal.contains("Schedule has no future occurrence"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("RAW_SCHEDULE_ERROR"), "{refusal}");
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        assert!(app.schedules.loading);
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(!app.schedules.loading);
+        let selected = &app.schedules.schedules[app.schedules.selected];
+        assert_eq!(selected.id, "first");
+        assert_eq!(selected.enabled, Some(false));
+        let cached = preview(&app, "REFRESH FAILED");
+        let row = cached
+            .lines()
+            .find(|row| row.contains("› First review"))
+            .unwrap();
+        assert!(row.contains("disabled"), "{cached}");
+        for expected in [
+            "Refresh failed",
+            "Every 90 seconds",
+            "/ Enable",
+            "Enter runs",
+            "r run now",
+        ] {
+            assert!(cached.contains(expected), "missing {expected:?}\n{cached}");
+        }
+        assert!(!cached.contains("RAW_REFRESH_DIAGNOSTIC"), "{cached}");
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_toggle_ignores_unmatched_events_and_does_not_reinsert_a_missing_row() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let id = app.schedules.schedules[0].id.clone();
+        let previous = app.schedules.schedules[0].clone();
+        let mut saved = previous.clone();
+        saved.enabled = Some(false);
+        app.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation: 2,
+            schedule_id: id.clone(),
+            enabled: false,
+        });
+        for (generation, schedule_id) in [(1, id.clone()), (2, "second".into())] {
+            app.handle_event(AppEvent::ScheduleToggleFinished {
+                generation,
+                schedule_id,
+                result: Ok(saved.clone()),
+            })
+            .await
+            .unwrap();
+            assert!(app.schedules.toggle_pending_for(&id));
+            assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        }
+        app.handle_event(AppEvent::ScheduleToggleFinished {
+            generation: 2,
+            schedule_id: id.clone(),
+            result: Ok(previous),
+        })
+        .await
+        .unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert_eq!(app.schedules.schedules[0].enabled, Some(true));
+        assert_eq!(
+            app.schedules.toggle_error_for(&id),
+            Some("Invalid schedule toggle response")
+        );
+
+        app.schedules.pending_toggle = Some(PendingScheduleToggle {
+            generation: 3,
+            schedule_id: id.clone(),
+            enabled: false,
+        });
+        app.schedules.install_catalog(Vec::new());
+        app.handle_event(AppEvent::ScheduleToggleFinished {
+            generation: 3,
+            schedule_id: id.clone(),
+            result: Ok(saved),
+        })
+        .await
+        .unwrap();
+        assert!(!app.schedules.has_pending_toggle());
+        assert!(app.schedules.schedules.is_empty());
+        assert_eq!(app.schedules.toggle_error_for(&id), None);
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_opens_a_retained_session_without_running_the_schedule_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let runs = r#"{"schedule_id":"schedule","runs":[
+                {"run_id":"unlinked","scheduled_for":"2026-10-20T10:15:00Z","status":"skipped"}
+            ]}"#;
+            let sessions = r#"{"schedule_id":"schedule","sessions":[
+                {"id":"newer-session","title":"Newer Session","created_by_schedule_id":"schedule"},
+                {"id":"retained-session","title":"Older Session","created_by_schedule_id":"schedule","is_running":true}
+            ]}"#;
+            let summary = r#"{"session":{"id":"retained-session","title":"Older Session","is_running":true,"message_count":1}}"#;
+            let history = r#"{"session_id":"retained-session","messages":[{"id":"a1","role":"assistant","content":"retained schedule history"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/runs", runs),
+                ("/api/v1/schedules/schedule/sessions", sessions),
+                ("/api/v1/sessions/retained-session", summary),
+                ("/api/v1/history/retained-session", history),
+                ("/api/v1/sessions/retained-session", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                assert_eq!(
+                    request.lines().next(),
+                    Some(format!("GET {path} HTTP/1.1").as_str())
+                );
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+
+            // A resumed active Session subscribes to its own events. The
+            // other requests are the standard read-only Chat refreshes.
+            let mut expected = HashMap::from([
+                (
+                    "/api/v1/events/retained-session",
+                    ("text/event-stream", "data: [DONE]\n\n"),
+                ),
+                (
+                    "/api/v1/sessions/retained-session",
+                    ("application/json", summary),
+                ),
+                (
+                    "/api/v1/sessions/retained-session/task",
+                    ("application/json", r#"{"tasks":[]}"#),
+                ),
+                (
+                    "/api/v1/sessions/retained-session/loop",
+                    ("application/json", "null"),
+                ),
+                (
+                    "/api/v1/subagents/snapshot",
+                    ("application/json", r#"{"sessions":[]}"#),
+                ),
+            ]);
+            while !expected.is_empty() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut socket).await;
+                let mut request_line = request.lines().next().unwrap().split_whitespace();
+                assert_eq!(request_line.next(), Some("GET"), "{request}");
+                let path = request_line.next().unwrap();
+                let (content_type, body) = expected
+                    .remove(path)
+                    .unwrap_or_else(|| panic!("unexpected read {path}"));
+                respond_test_http(&mut socket, content_type, body).await;
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let mut cached = SessionUiContext::blank(app.allocate_context_id());
+        cached.chat.session_id = Some("retained-session".into());
+        cached.chat.history_loaded = true;
+        cached.chat.messages = vec![asst_msg("stale cache")];
+        app.cache_context(cached);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let budget = Duration::from_secs(5);
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert_eq!(
+            app.schedule_runs.as_ref().unwrap().selected_session_id(),
+            None
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.opening_session_id.is_none());
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        assert!(matches!(
+            app.schedule_sessions.as_ref().unwrap().content,
+            ScheduleSessionsContent::Loading
+        ));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.opening_session_id.is_none());
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert_eq!(
+            app.schedule_sessions
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "newer-session"
+        );
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        assert_eq!(
+            app.schedule_sessions
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "retained-session"
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let opening_epoch = app.opening_session_epoch;
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(app.opening_session_epoch, opening_epoch);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        assert!(app.schedule_runs.is_none());
+        assert!(!app.schedule_session_is_opening());
+        assert_eq!(app.tab, Tab::Chat);
+        assert_eq!(app.chat.session_id.as_deref(), Some("retained-session"));
+        assert_eq!(app.chat.messages[0].content, "retained schedule history");
+        assert!(app.chat.streaming);
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_ignores_queued_replies_after_close_and_reselection() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let initial = r#"{"schedule_id":"schedule","sessions":[{"id":"obsolete","created_by_schedule_id":"schedule"}]}"#;
+            let replacement = r#"{"schedule_id":"second","sessions":[
+                {"id":"first-session","created_by_schedule_id":"second"},
+                {"id":"gone-session","created_by_schedule_id":"second"}
+            ]}"#;
+            let summary = r#"{"session":{"id":"first-session","message_count":1}}"#;
+            let history = r#"{"session_id":"first-session","messages":[{"id":"a1","role":"assistant","content":"stale history"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/sessions", initial),
+                ("/api/v1/schedules/second/sessions", replacement),
+                ("/api/v1/sessions/first-session", summary),
+                ("/api/v1/history/first-session", history),
+                ("/api/v1/sessions/first-session", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+            let (mut gone, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut gone).await,
+                "/api/v1/sessions/gone-session"
+            );
+            let body = "RAW_SESSION_ERROR";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            gone.write_all(response.as_bytes()).await.unwrap();
+            gone.shutdown().await.unwrap();
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let mut second = app.schedules.schedules[0].clone();
+        second.id = "second".into();
+        second.name = Some("Second schedule".into());
+        app.schedules.schedules.push(second);
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+            {"context":"schedules","action":"open-schedule-sessions","keys":["F8"]}
+        ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_sessions.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        app.handle_event(late).await.unwrap();
+        let pane = app.schedule_sessions.as_ref().unwrap();
+        assert_eq!(pane.name, "Second schedule");
+        assert!(matches!(pane.content, ScheduleSessionsContent::Loading));
+
+        let result = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(result).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_event(late).await.unwrap();
+        assert!(!app.schedule_session_is_opening());
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        assert!(app.chat.messages.is_empty());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let pane = app.schedule_sessions.as_ref().unwrap();
+        assert_eq!(pane.selected_session().unwrap().id, "gone-session");
+        assert_eq!(pane.session_open_error, Some("Could not open this session"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        assert_eq!(app.tab, Tab::Schedules);
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_sessions_rejects_history_without_a_session_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut list, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut list).await,
+                "/api/v1/schedules/schedule/sessions"
+            );
+            respond_test_http(
+                &mut list,
+                "application/json",
+                r#"{"schedule_id":"schedule","sessions":[{"id":"row","created_by_schedule_id":"schedule"}]}"#,
+            ).await;
+            let summary = r#"{"session":{"id":"row","message_count":0}}"#;
+            for history in [r#"{"messages":[]}"#, r#"{"session_id":"","messages":[]}"#] {
+                for (path, body) in [
+                    ("/api/v1/sessions/row", summary),
+                    ("/api/v1/history/row", history),
+                    ("/api/v1/sessions/row", summary),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_test_http_path(&mut socket).await, path);
+                    respond_test_http(&mut socket, "application/json", body).await;
+                }
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        let list = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(list).await.unwrap();
+        for _ in 0..2 {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let refusal = tokio::time::timeout(budget, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&refusal, AppEvent::SessionOpened { result: Err(error), .. }
+                if error == "session response did not match the selected session")
+            );
+            app.handle_event(refusal).await.unwrap();
+            let pane = app.schedule_sessions.as_ref().unwrap();
+            assert_eq!(pane.selected_session().unwrap().id, "row");
+            assert_eq!(pane.session_open_error, Some("Could not open this session"));
+            assert_eq!(app.tab, Tab::Schedules);
+            assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+            assert!(!app.schedule_session_is_opening());
+        }
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_active_chat_closes_schedule_sessions_and_discards_queued_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let list = r#"{"schedule_id":"schedule","sessions":[{"id":"row","created_by_schedule_id":"schedule"}]}"#;
+            let summary = r#"{"session":{"id":"row","message_count":1}}"#;
+            let history = r#"{"session_id":"row","messages":[{"id":"a1","role":"assistant","content":"must stay out of the new chat"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/sessions", list),
+                ("/api/v1/sessions/row", summary),
+                ("/api/v1/history/row", history),
+                ("/api/v1/sessions/row", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Char('s'))).await.unwrap();
+        let list = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(list).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.schedule_session_is_opening());
+        let late = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&late, AppEvent::SessionOpened { session_id, result: Ok(_), .. } if session_id == "row")
+        );
+
+        // An earlier Session delete completes while the scoped open is queued.
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "current-session".into(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_sessions.is_none());
+        assert!(app.opening_session_task.is_none());
+        assert!(app.opening_session_id.is_none());
+        app.handle_event(late).await.unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        tokio::time::timeout(budget, server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_opens_selected_history_and_ignores_late_previous_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_request_seen, first_arrived) = tokio::sync::oneshot::channel();
+        let (release_old_reply, wait_to_reply) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut first).await.lines().next(),
+                Some("GET /api/v1/schedules/first/runs HTTP/1.1")
+            );
+            old_request_seen.send(()).unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut second).await.lines().next(),
+                Some("GET /api/v1/schedules/second/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut second,
+                "application/json",
+                r#"{"schedule_id":"second","runs":[
+                    {"run_id":"newer","scheduled_for":"2026-10-20T10:15:00Z","status":"success"},
+                    {"run_id":"older","scheduled_for":"2026-10-20T08:15:00Z","status":"running"}
+                ]}"#,
+            )
+            .await;
+            wait_to_reply.await.unwrap();
+            respond_test_http(
+                &mut first,
+                "application/json",
+                r#"{"schedule_id":"first","runs":[]}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = ["first", "second"]
+            .into_iter()
+            .map(|id| Schedule {
+                id: id.to_owned(),
+                name: Some(format!("{id} schedule")),
+                cron: None,
+                cadence_detail: None,
+                enabled: Some(true),
+                prompt: None,
+                last_run: None,
+                next_run: None,
+            })
+            .collect();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Loading
+        ));
+        tokio::time::timeout(Duration::from_secs(5), first_arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+
+        let current = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(current).await.unwrap();
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        release_old_reply.send(()).unwrap();
+        let late = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(late).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.name, "second schedule");
+        assert_eq!(pane.selected, 1);
+        let ScheduleRunsContent::Loaded(runs) = &pane.content else {
+            panic!("the selected schedule's runs should remain loaded");
+        };
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+        assert_eq!(app.schedules.selected, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_ignores_a_prior_request_for_the_same_schedule() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.schedule_runs = Some(ScheduleRunsPane::new(
+            "schedule".into(),
+            "Schedule".into(),
+            2,
+        ));
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(Vec::new()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Loading
+        ));
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 2,
+            schedule_id: "schedule".into(),
+            result: Err("Could not fetch schedule runs".into()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            app.schedule_runs.as_ref().unwrap().content,
+            ScheduleRunsContent::Failed(_)
+        ));
+    }
+
+    fn schedule_run_session_test_app(client: BambooClient) -> App {
+        let mut app = App::new(client);
+        app.tab = Tab::Schedules;
+        app.chat.session_id = Some("current-session".to_owned());
+        app.schedules.schedules.push(Schedule {
+            id: "schedule".to_owned(),
+            name: Some("Schedule".to_owned()),
+            cron: None,
+            cadence_detail: None,
+            enabled: Some(true),
+            prompt: None,
+            last_run: None,
+            next_run: None,
+        });
+        app
+    }
+
+    fn linked_test_schedule_runs() -> ScheduleRunsPane {
+        let mut pane = ScheduleRunsPane::new("schedule".into(), "Schedule".into(), 1);
+        pane.content = ScheduleRunsContent::Loaded(
+            [("run-1", "linked-session"), ("run-2", "other-session")]
+                .into_iter()
+                .map(|(run, session)| ScheduleRunView {
+                    run_id: run.to_owned(),
+                    scheduled_for: Utc::now(),
+                    status: "success".to_owned(),
+                    session_id: Some(session.to_owned()),
+                    workflow_run_id: None,
+                })
+                .collect(),
+        );
+        pane
+    }
+
+    #[tokio::test]
+    async fn schedule_run_cancel_key_requests_exact_run_and_refreshes_in_place() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (post_seen, posted) = tokio::sync::oneshot::channel();
+        let (release_post, hold_post) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut initial).await.lines().next(),
+                Some("GET /api/v1/schedules/schedule/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut initial,
+                "application/json",
+                r#"{"schedule_id":"schedule","runs":[
+                    {"run_id":"ordinary","scheduled_for":"2026-10-20T08:15:00Z","status":"running","session_id":"linked-session"},
+                    {"run_id":"workflow","scheduled_for":"2026-10-20T10:15:00Z","status":"running","session_id":"workflow-session","workflow_run_id":"wf-1"}
+                ]}"#,
+            )
+            .await;
+
+            let (mut post, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut post).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("POST /api/v1/schedules/schedule/runs/ordinary/cancel HTTP/1.1")
+            );
+            assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+            post_seen.send(()).unwrap();
+            hold_post.await.unwrap();
+            let body =
+                r#"{"schedule_id":"schedule","run_id":"ordinary","status":"cancel_requested"}"#;
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            post.write_all(response.as_bytes()).await.unwrap();
+            post.shutdown().await.unwrap();
+
+            let (mut refreshed, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut refreshed).await.lines().next(),
+                Some("GET /api/v1/schedules/schedule/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut refreshed,
+                "application/json",
+                r#"{"schedule_id":"schedule","runs":[
+                    {"run_id":"workflow","scheduled_for":"2026-10-20T10:15:00Z","status":"running","session_id":"workflow-session","workflow_run_id":"wf-1"},
+                    {"run_id":"ordinary","scheduled_for":"2026-10-20T08:15:00Z","status":"cancelled","session_id":"linked-session"}
+                ]}"#,
+            )
+            .await;
+        });
+
+        let mut app = schedule_run_session_test_app(client);
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"schedule-runs","action":"cancel-scheduled-run","keys":["/"]}
+            ]}"#,
+        )
+        .unwrap();
+        app.set_keymap(keymap, None);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let initial = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(initial).await.unwrap();
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert!(pane.selected_run_can_request_cancel());
+        assert!(pane.selected_cancel_state().is_none());
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), posted)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Sending)
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().run_id, "workflow");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.selected_run_can_request_cancel());
+        release_post.send(()).unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(ack).await.unwrap();
+        assert!(app
+            .schedule_runs
+            .as_ref()
+            .unwrap()
+            .selected_cancel_state()
+            .is_none());
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Requested)
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        assert_eq!(pane.selected_session_id(), Some("linked-session"));
+        let request_id = pane.request_id;
+
+        app.handle_key(key(KeyCode::Char('r'))).await.unwrap();
+        assert!(app.schedule_runs.as_ref().unwrap().refreshing);
+        let refreshed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refreshed).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.request_id, request_id);
+        assert_eq!(pane.selected, 1);
+        assert_eq!(pane.selected_run().unwrap().run_id, "ordinary");
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.refreshing);
+        assert_eq!(app.tab, Tab::Schedules);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_schedule_cancel_receipt_survives_an_older_run_history_refresh() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let mut pane = linked_test_schedule_runs();
+        let mut running = pane.selected_run().unwrap().clone();
+        running.status = "running".into();
+        pane.content = ScheduleRunsContent::Loaded(vec![running.clone()]);
+        pane.refreshing = true;
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        let mut terminal = running.clone();
+        terminal.status = "cancelled".into();
+        app.handle_event(AppEvent::ScheduleRunCancellationFinished {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            run_id: "run-1".into(),
+            result: Ok(CancelScheduleRunOutcome::Terminal(terminal)),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![running]),
+        })
+        .await
+        .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert!(pane.selected_cancel_state().is_none());
+        assert!(!pane.selected_run_can_request_cancel());
+
+        let mut current = pane.selected_run().unwrap().clone();
+        current.session_id = Some("recorded-session".into());
+        app.schedule_runs.as_mut().unwrap().refreshing = true;
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 1,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![current]),
+        })
+        .await
+        .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(pane.selected_run().unwrap().status, "cancelled");
+        assert_eq!(pane.selected_session_id(), Some("recorded-session"));
+    }
+
+    #[tokio::test]
+    async fn schedule_cancel_replies_are_scoped_to_the_exact_open_pane_and_run() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let mut pane = linked_test_schedule_runs();
+        if let ScheduleRunsContent::Loaded(runs) = &mut pane.content {
+            runs[0].status = "running".into();
+        }
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        let result = |request_id, schedule_id: &str, run_id: &str| {
+            AppEvent::ScheduleRunCancellationFinished {
+                request_id,
+                schedule_id: schedule_id.to_owned(),
+                run_id: run_id.to_owned(),
+                result: Err("Schedule run not found".into()),
+            }
+        };
+        for wrong in [
+            result(2, "schedule", "run-1"),
+            result(1, "different-schedule", "run-1"),
+            result(1, "schedule", "run-2"),
+        ] {
+            app.handle_event(wrong).await.unwrap();
+            assert_eq!(
+                app.schedule_runs.as_ref().unwrap().selected_cancel_state(),
+                Some(&ScheduleRunCancelState::Sending)
+            );
+        }
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(
+            pane.selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Failed(
+                "Schedule run not found".into()
+            ))
+        );
+        assert_eq!(pane.selected_run().unwrap().status, "running");
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        assert!(app.schedule_runs.is_none());
+
+        let mut pane = linked_test_schedule_runs();
+        pane.request_id = 2;
+        pane.cancellations
+            .insert("run-1".into(), ScheduleRunCancelState::Sending);
+        app.schedule_runs = Some(pane);
+        app.handle_event(result(1, "schedule", "run-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.schedule_runs.as_ref().unwrap().selected_cancel_state(),
+            Some(&ScheduleRunCancelState::Sending)
+        );
+
+        app.schedule_runs.as_mut().unwrap().refreshing = true;
+        app.handle_event(AppEvent::ScheduleRunsLoaded {
+            request_id: 2,
+            schedule_id: "schedule".into(),
+            result: Ok(vec![]),
+        })
+        .await
+        .unwrap();
+        app.handle_event(result(2, "schedule", "run-1"))
+            .await
+            .unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert!(pane.selected_run().is_none());
+        assert!(pane.cancellations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_schedule_run_opens_authoritative_session_after_an_observation_retry() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let summary =
+                r#"{"session":{"id":"linked-session","model":"schedule-model","message_count":1}}"#;
+            let runs = r#"{"schedule_id":"schedule","runs":[
+                {"run_id":"run-unlinked","scheduled_for":"2026-10-20T10:15:00Z","status":"skipped"},
+                {"run_id":"run-linked","scheduled_for":"2026-10-20T08:15:00Z","status":"success","session_id":"linked-session"}
+            ]}"#;
+            let first_history = r#"{"session_id":"linked-session","messages":[{"id":"a1","role":"assistant","content":"first snapshot"}]}"#;
+            let final_history = r#"{"messages":[{"id":"a1","role":"assistant","content":"authoritative history"}]}"#;
+            for (path, body) in [
+                ("/api/v1/schedules/schedule/runs", runs),
+                ("/api/v1/sessions/linked-session", summary),
+                ("/api/v1/history/linked-session", first_history),
+                ("/api/v1/sessions/linked-session", summary),
+                ("/api/v1/sessions/linked-session", summary),
+                ("/api/v1/history/linked-session", final_history),
+                ("/api/v1/sessions/linked-session", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_test_http_request(&mut socket).await.lines().next(),
+                    Some(format!("GET {path} HTTP/1.1").as_str())
+                );
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+        let mut app = schedule_run_session_test_app(client);
+        let mut cached = SessionUiContext::blank(app.allocate_context_id());
+        cached.chat.session_id = Some("linked-session".to_owned());
+        cached.chat.history_loaded = true;
+        cached.chat.messages = vec![asst_msg("cached history")];
+        app.cache_context(cached);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let runs = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(runs).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(
+            app.opening_session_id.is_none(),
+            "the first run has no session"
+        );
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let first_epoch = app.opening_session_epoch;
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(app.opening_session_epoch, first_epoch);
+        assert!(app.schedule_run_session_is_opening());
+        assert_eq!(app.tab, Tab::Schedules);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let frame: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(frame.contains("Opening Session…"), "{frame}");
+        assert!(frame.contains("Esc close"), "{frame}");
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let newer_summary = app.next_summary_observation_epoch();
+        app.session_views
+            .get_mut("linked-session")
+            .unwrap()
+            .chat
+            .latest_summary_observation_epoch = newer_summary;
+        app.handle_event(first).await.unwrap();
+        assert!(app.schedule_run_session_is_opening());
+        assert!(app.opening_session_epoch > newer_summary);
+        assert_eq!(app.schedule_runs.as_ref().unwrap().selected, 1);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+
+        let retry = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(retry).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+        assert!(!app.schedule_run_session_is_opening());
+        assert_eq!(app.tab, Tab::Chat);
+        assert_eq!(app.chat.session_id.as_deref(), Some("linked-session"));
+        assert_eq!(app.chat.messages[0].content, "authoritative history");
+        assert_eq!(app.chat.model, "schedule-model");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_schedule_run_session_keeps_the_pane_and_current_chat() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut socket).await.lines().next(),
+                Some("GET /api/v1/sessions/linked-session HTTP/1.1")
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let mut app = schedule_run_session_test_app(client);
+        app.schedule_runs = Some(linked_test_schedule_runs());
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedule-runs","action":"activate","keys":["/"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let missing = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &missing,
+            AppEvent::SessionOpened { result: Err(error), .. } if error.contains("404")
+        ));
+        app.handle_event(missing).await.unwrap();
+        let pane = app.schedule_runs.as_ref().unwrap();
+        assert!(!app.schedule_run_session_is_opening());
+        assert_eq!(pane.selected, 0);
+        assert_eq!(pane.selected_session_id(), Some("linked-session"));
+        assert_eq!(pane.session_open_error, Some("Could not open this session"));
+        assert_eq!(app.tab, Tab::Schedules);
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_run_open_rejects_mismatched_summary_or_history_ids() {
+        for mismatched_read in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                for (index, path) in [
+                    "/api/v1/sessions/linked-session",
+                    "/api/v1/history/linked-session",
+                    "/api/v1/sessions/linked-session",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_test_http_path(&mut socket).await, path);
+                    let id = if index == mismatched_read {
+                        "other-session"
+                    } else {
+                        "linked-session"
+                    };
+                    let body = if index == 1 {
+                        serde_json::json!({"session_id": id, "messages": []})
+                    } else {
+                        serde_json::json!({"session": {"id": id}})
+                    };
+                    respond_test_http(&mut socket, "application/json", &body.to_string()).await;
+                }
+            });
+            let mut app = schedule_run_session_test_app(client);
+            app.schedule_runs = Some(linked_test_schedule_runs());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            app.event_tx = Some(tx);
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let mismatch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                &mismatch,
+                AppEvent::SessionOpened { result: Err(error), .. }
+                    if error == "session response did not match the selected run"
+            ));
+            app.handle_event(mismatch).await.unwrap();
+            let pane = app.schedule_runs.as_ref().unwrap();
+            assert_eq!(pane.selected_session_id(), Some("linked-session"));
+            assert!(pane.session_open_error.is_some());
+            assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_schedule_run_origin_ignores_a_queued_session_response() {
+        for action in [Some(KeyCode::Esc), Some(KeyCode::Down), None] {
+            let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+            app.schedule_runs = Some(linked_test_schedule_runs());
+            app.schedule_runs_request_id = 1;
+            let (tx, _rx) = mpsc::unbounded_channel();
+            app.event_tx = Some(tx);
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            assert!(app.schedule_run_session_is_opening());
+            let late = AppEvent::SessionOpened {
+                session_id: "linked-session".to_owned(),
+                epoch: app.opening_session_epoch,
+                result: Ok(opened(vec![asst_msg("late history")])),
+            };
+            match action {
+                Some(code) => app.handle_key(key(code)).await.unwrap(),
+                None => app.open_schedule_runs(),
+            }
+            app.handle_event(late).await.unwrap();
+            assert!(!app.schedule_run_session_is_opening());
+            assert!(app.opening_session_task.is_none());
+            assert_eq!(app.tab, Tab::Schedules);
+            assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+            assert!(app.chat.messages.is_empty());
+            match action {
+                Some(KeyCode::Esc) => assert!(app.schedule_runs.is_none()),
+                Some(KeyCode::Down) => assert_eq!(app.schedule_runs.as_ref().unwrap().selected, 1),
+                None => assert_eq!(app.schedule_runs.as_ref().unwrap().request_id, 2),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn schedule_delete_requires_confirmation_owns_mouse_and_guards_in_flight() {
         use crossterm::event::{MouseEvent, MouseEventKind};
 
@@ -23397,6 +25811,7 @@ mod question_tests {
             id: format!("schedule-{index}"),
             name: Some(format!("计划 {index} 🧭")),
             cron: Some("0 * * * *".to_string()),
+            cadence_detail: None,
             enabled: Some(true),
             prompt: None,
             last_run: None,
@@ -23476,10 +25891,11 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.schedule_form = Some(ScheduleForm {
             name: "name".to_string(),
-            cron: "* * * * *".to_string(),
+            timing: "* * * * *".to_string(),
             prompt: format!("{}PROMPT_TAIL_🧭e\u{301}", "x".repeat(120)),
-            field: 2,
+            field: 3,
             error: Some("Cron is required".to_string()),
+            ..Default::default()
         });
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal
@@ -25770,6 +28186,242 @@ mod question_tests {
             image_count: 0,
             terminal_status: None,
         }
+    }
+
+    #[tokio::test]
+    async fn focused_reply_opens_fence_picker_and_copies_the_selected_exact_body() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let code = "first line\r\n";
+        let diagram = "\tA[中文 🧭] --> B\r\n".repeat(70);
+        let reply = format!(
+            "Instructions\r\n```rust options\r\n{code}```\r\n~~~mermaid\r\n{diagram}~~~\r\n```\r\nunfinished",
+        );
+        app.chat.messages.push(ChatMessage {
+            id: "fenced-reply".into(),
+            ..asst_msg(&reply)
+        });
+        let focused = "fenced-reply:assistant".to_string();
+        app.chat.focused_block = Some(focused.clone());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(
+            app.active_action_contexts()[0],
+            ActionContext::FenceCopyPicker
+        );
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.entries.len(), 2);
+        assert_eq!(picker.entries[0].language.as_deref(), Some("rust"));
+        assert_eq!(picker.entries[0].source, code);
+        assert_eq!(picker.entries[1].language.as_deref(), Some("mermaid"));
+        assert_eq!(picker.selected, 0);
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.fence_copy_picker.as_ref().unwrap().selected, 1);
+
+        let mut copied = Vec::new();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |value| {
+            copied.extend_from_slice(value.as_bytes());
+            Ok(())
+        });
+        assert_eq!(copied, diagram.as_bytes());
+        assert_eq!(app.status_message, "Copied code fence");
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
+        assert_eq!(app.chat.focused_block.as_ref(), Some(&focused));
+        assert_eq!(app.conversation_blocks()[0].copy_text(), reply);
+    }
+
+    #[tokio::test]
+    async fn fence_source_view_routes_scrolling_and_returns_to_the_same_selection() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut source = format!("\t界e\u{301}👩‍💻{} far end\r\n", "x".repeat(96));
+        for line in 2..=90 {
+            source.push_str(&format!("source line {line}\r\n"));
+        }
+        let reply = format!("```rust\r\n{source}```\r\n~~~text\nsecond fence\n~~~");
+        app.chat.messages.push(ChatMessage {
+            id: "source-reply".into(),
+            ..asst_msg(&reply)
+        });
+        app.chat.focused_block = Some("source-reply:assistant".into());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let preview = app
+            .fence_copy_picker
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap();
+        assert_eq!(preview.line_count, 90);
+        preview.set_viewport(5, 24);
+
+        app.handle_key(key(KeyCode::PageDown)).await.unwrap();
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        for key_code in [KeyCode::Right, KeyCode::Right, KeyCode::Left] {
+            app.handle_key(key(key_code)).await.unwrap();
+        }
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0);
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!((preview.first_line(), preview.first_column()), (9, 4));
+
+        let mut copied = String::new();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |value| {
+            copied.push_str(value);
+            Ok(())
+        });
+        assert_eq!(copied, source);
+        let preview = app
+            .fence_copy_picker
+            .as_ref()
+            .unwrap()
+            .preview
+            .as_ref()
+            .unwrap();
+        preview.set_viewport(90, 200);
+        preview.set_viewport(5, 24);
+        assert_eq!((preview.first_line(), preview.first_column()), (0, 0));
+
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0);
+        assert!(picker.preview.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let picker = app.fence_copy_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 1);
+        let preview = picker.preview.as_ref().unwrap();
+        assert_eq!(preview.line_count, 1);
+        assert_eq!((preview.first_line(), preview.first_column()), (0, 0));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert_eq!(app.fence_copy_picker.as_ref().unwrap().selected, 1);
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
+        assert_eq!(
+            app.chat.focused_block.as_deref(),
+            Some("source-reply:assistant")
+        );
+    }
+
+    #[test]
+    fn fence_source_pan_reaches_the_suffix_of_contextually_measured_text() {
+        let source = format!("{}SUFFIX", "لا".repeat(56));
+        let preview = FenceSourcePreview::new(&source);
+        preview.set_viewport(10, 56);
+        preview.move_by(0, isize::MAX);
+
+        assert_eq!(preview.first_column(), 62);
+        let final_window = crate::text::slice_cells(&source, preview.first_column(), 56);
+        assert!(final_window.ends_with("SUFFIX"));
+    }
+
+    #[tokio::test]
+    async fn fence_picker_rejects_replaced_source_and_closes_on_session_switch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages.push(ChatMessage {
+            id: "reply".into(),
+            ..asst_msg("```rust\nfirst\n```")
+        });
+        app.chat.focused_block = Some("reply:assistant".into());
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app
+            .fence_copy_picker
+            .as_ref()
+            .is_some_and(|picker| picker.preview.is_some()));
+
+        app.chat.messages[0].content = "```rust\nother\n```".into();
+        app.handle_fence_copy_picker_key(key(KeyCode::Char('y')), |_| {
+            panic!("a replaced reply must never reach the clipboard")
+        });
+        assert!(app.fence_copy_picker.is_none());
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_some());
+        app.new_session();
+        assert!(app.fence_copy_picker.is_none());
+        assert!(app.chat.focused_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_history_for_another_context_preserves_the_fence_picker() {
+        let watch = || LoopWatch {
+            id: "loop".into(),
+            token: "watch-token".into(),
+            pending: true,
+            displayed_run: None,
+            attached_run: None,
+            draining: false,
+            question_recovery: LoopQuestionRecovery::None,
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("visible".into());
+        app.chat.loop_watch = Some(watch());
+        app.chat.messages.push(ChatMessage {
+            id: "reply".into(),
+            ..asst_msg("```rust\nlet value = 1;\n```")
+        });
+        app.chat.focused_block = Some("reply:assistant".into());
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_some());
+
+        let background_context = app.allocate_context_id();
+        let mut background = SessionUiContext::blank(background_context);
+        background.chat.session_id = Some("background".into());
+        background.chat.loop_watch = Some(watch());
+        app.cache_context(background);
+
+        for (context_id, session_id, keeps_picker) in [
+            (background_context, "background", true),
+            (app.chat.context_id, "visible", false),
+        ] {
+            app.handle_event(AppEvent::SessionLoopObserved {
+                context_id,
+                session_id: session_id.into(),
+                watch_token: "watch-token".into(),
+                stream_epoch: 0,
+                result: Ok(LoopObservation::History {
+                    run_id: "latest".into(),
+                    history: HistoryResponse::default(),
+                    last_run_status: Some("completed".into()),
+                    draining: false,
+                }),
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.chat.session_id.as_deref(), Some("visible"));
+            assert_eq!(app.fence_copy_picker.is_some(), keeps_picker);
+        }
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_reply_does_not_open_the_fence_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("active".into());
+        app.chat.current_response = "```rust\nlet value = 1;\n```".into();
+        app.chat.focused_block = Some("active:assistant".into());
+        assert!(app.conversation_blocks().iter().any(|block| {
+            block.id == "active:assistant"
+                && matches!(
+                    block.kind,
+                    ConversationBlockKind::AssistantMarkdown {
+                        streaming: true,
+                        ..
+                    }
+                )
+        }));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.fence_copy_picker.is_none());
     }
 
     #[test]
@@ -30387,6 +33039,324 @@ mod run_status_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn atx_closing_markers_follow_stream_boundaries_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use crate::theme::ColorRole;
+        use ratatui::style::Modifier;
+
+        let mut app = running_app("session-atx", "run-atx");
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let steps: [(&str, &[&str]); 5] = [
+            ("# Build *next* ###", &["Build next ###"]),
+            (
+                "\r\n## Release `trace` ##",
+                &["Build next", "Release trace ##"],
+            ),
+            ("\n### Review ###", &["Release trace", "Review ###"]),
+            (" is literal", &["Review ### is literal"]),
+            (
+                "\n# Final *plan* ##",
+                &["Review ### is literal", "Final plan ##"],
+            ),
+        ];
+        let mut source = String::new();
+        for (delta, expected) in steps {
+            source.push_str(delta);
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            let text = terminal_text(&terminal);
+            for expected in expected {
+                assert!(
+                    text.lines().any(|row| row.trim() == *expected),
+                    "missing {expected:?}\n{text}"
+                );
+            }
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                source.as_bytes()
+            );
+        }
+
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let completed = terminal_text(&terminal);
+        assert!(
+            completed.lines().any(|row| row.trim() == "Final plan"),
+            "{completed}"
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-atx".into(),
+            role: "assistant".into(),
+            content: source.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        let restored = terminal_text(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_CLOSE").is_some() {
+            eprintln!("ATX CLOSE PREVIEW\n{restored}\nEND ATX CLOSE PREVIEW");
+        }
+        let title_row = |title: &str| {
+            restored
+                .lines()
+                .position(|row| row.trim() == title)
+                .unwrap_or_else(|| panic!("missing {title:?}\n{restored}"))
+        };
+        let cells = terminal.backend().buffer().content();
+        let primary = cells.chunks(60).nth(title_row("Build next")).unwrap();
+        let secondary = cells.chunks(60).nth(title_row("Release trace")).unwrap();
+        let build = primary.iter().find(|cell| cell.symbol() == "B").unwrap();
+        let release = secondary.iter().find(|cell| cell.symbol() == "R").unwrap();
+        assert_eq!(build.fg, saved.theme.color(ColorRole::Brand));
+        assert!(build.modifier.contains(Modifier::BOLD));
+        assert!(release.modifier.contains(Modifier::BOLD));
+        assert!(primary
+            .iter()
+            .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+        assert!(secondary
+            .iter()
+            .any(|cell| cell.symbol() == "t" && cell.modifier.contains(Modifier::REVERSED)));
+        title_row("Review ### is literal");
+        title_row("Final plan");
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+    }
+
+    #[test]
+    fn atx_openers_follow_stream_boundaries_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use crate::theme::ColorRole;
+        use ratatui::style::Modifier;
+
+        let mut app = running_app("session-atx-openers", "run-atx-openers");
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let steps: [(&str, &[&str]); 4] = [
+            ("#\tBuild *next*", &["Build next"]),
+            ("\r\n##", &["Build next", "##"]),
+            (
+                "\r\nRelease details\n######",
+                &["Release details", "######"],
+            ),
+            (
+                "\n#hashtag\n#6 bolt\n####### Too many\n##\tReview `trace`\n###",
+                &[
+                    "#hashtag",
+                    "#6 bolt",
+                    "####### Too many",
+                    "Review trace",
+                    "###",
+                ],
+            ),
+        ];
+        let mut source = String::new();
+        for (delta, expected) in steps {
+            source.push_str(delta);
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            let text = terminal_text(&terminal);
+            for expected in expected {
+                assert!(
+                    text.lines().any(|row| row.trim() == *expected),
+                    "missing {expected:?}\n{text}"
+                );
+            }
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                source.as_bytes()
+            );
+        }
+
+        let assert_headings = |terminal: &Terminal<TestBackend>, app: &App| {
+            let text = terminal_text(terminal);
+            let rows: Vec<_> = text.lines().map(str::trim).collect();
+            let title_row = |title: &str| {
+                rows.iter()
+                    .position(|row| *row == title)
+                    .unwrap_or_else(|| panic!("missing {title:?}\n{text}"))
+            };
+            let primary = title_row("Build next");
+            let secondary = title_row("Review trace");
+            assert_eq!(
+                &rows[primary..primary + 5],
+                &["Build next", "", "Release details", "", "#hashtag"],
+                "bare markers become empty rows at CRLF and LF\n{text}"
+            );
+            let cells = terminal.backend().buffer().content();
+            let first = cells.chunks(60).nth(primary).unwrap();
+            let second = cells.chunks(60).nth(secondary).unwrap();
+            let build = first.iter().find(|cell| cell.symbol() == "B").unwrap();
+            assert_eq!(build.fg, app.theme.color(ColorRole::Brand));
+            assert!(build.modifier.contains(Modifier::BOLD));
+            assert!(first
+                .iter()
+                .any(|cell| cell.symbol() == "x" && cell.modifier.contains(Modifier::ITALIC)));
+            assert!(second
+                .iter()
+                .any(|cell| cell.symbol() == "R" && cell.modifier.contains(Modifier::BOLD)));
+            assert!(second
+                .iter()
+                .any(|cell| cell.symbol() == "t" && cell.modifier.contains(Modifier::REVERSED)));
+        };
+        assert_headings(&terminal, &app);
+
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let completed = terminal_text(&terminal);
+        assert!(
+            completed.lines().any(|row| row.trim() == "Review trace"),
+            "{completed}"
+        );
+        assert!(
+            !completed.lines().any(|row| row.trim() == "###"),
+            "{completed}"
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-atx-openers".into(),
+            role: "assistant".into(),
+            content: source.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        assert_headings(&terminal, &saved);
+        let restored = terminal_text(&terminal);
+        assert!(
+            !restored.lines().any(|row| row.trim() == "###"),
+            "{restored}"
+        );
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            source.as_bytes()
+        );
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_OPENER").is_some() {
+            eprintln!("ATX OPENER PREVIEW\n{restored}\nEND ATX OPENER PREVIEW");
+        }
+    }
+
+    #[test]
+    fn table_preview_clips_the_transcript_and_copies_the_complete_report() {
+        use crate::api::types::HistoryMessage;
+
+        const MARKER: &str = "… Table preview clipped";
+        const OMITTED_CELL: &str = "ZX";
+        const OMITTED_ROW: &str = "33";
+        const FOLLOWING: &str = "## Next steps\r\nArchive the report.\r\n";
+        let mut report = String::from(
+            "# Release verification\r\n\r\n| ID\t | OS | CI | UT | IT | QA | PR | Doc | API | Env | DB | UI | Ticket |\r\n",
+        );
+        report.push('|');
+        report.push_str(&" --- |".repeat(13));
+        report.push_str("\r\n");
+        for number in 1..=33 {
+            report.push_str(&format!(
+                "| {number:02} | Mac | OK | OK | OK | OK | OK | OK | OK | QA | OK | OK | {OMITTED_CELL} |\r\n"
+            ));
+        }
+        let full_report = format!("{report}{FOLLOWING}");
+
+        let assert_preview = |terminal: &Terminal<TestBackend>, has_following: bool| {
+            let text = terminal_text(terminal);
+            let row = |value: &str| {
+                text.lines()
+                    .position(|line| line.contains(value))
+                    .unwrap_or_else(|| panic!("missing {value:?}\n{text}"))
+            };
+            let first = row("01 ");
+            let last = row("32 ");
+            let clipped = row(MARKER);
+            assert!(last == first + 31 && clipped == last + 1, "{text}");
+            assert_eq!(text.matches(MARKER).count(), 1, "{text}");
+            assert!(!text.contains(OMITTED_CELL), "{text}");
+            assert!(!text.contains(OMITTED_ROW), "{text}");
+            if has_following {
+                let heading = row("Next steps");
+                assert!(
+                    clipped < heading && row("Archive the report.") == heading + 1,
+                    "{text}"
+                );
+            }
+        };
+
+        let mut app = running_app("session-table-preview", "run-table-preview");
+        let mut terminal = Terminal::new(TestBackend::new(60, 80)).unwrap();
+        for (delta, original, has_following) in [
+            (report.as_str(), report.as_str(), false),
+            (FOLLOWING, full_report.as_str(), true),
+        ] {
+            app.handle_sse_event(AgentEvent::Token {
+                content: delta.to_string(),
+            })
+            .unwrap();
+            terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+            assert!(app.chat.streaming);
+            assert_preview(&terminal, has_following);
+            assert_eq!(
+                app.conversation_blocks()[0].copy_text().as_bytes(),
+                original.as_bytes()
+            );
+        }
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.conversation_blocks()[0].copy_text().as_bytes(),
+            full_report.as_bytes()
+        );
+
+        let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+        saved.chat.history_loaded = true;
+        saved.connected = true;
+        saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+            id: "history-table-preview".into(),
+            role: "assistant".into(),
+            content: full_report.clone(),
+            ..Default::default()
+        }]);
+        terminal.draw(|f| crate::ui::render(f, &saved)).unwrap();
+        assert_preview(&terminal, true);
+        assert_eq!(
+            saved.conversation_blocks()[0].copy_text().as_bytes(),
+            full_report.as_bytes()
+        );
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_TABLE_PREVIEW").is_some() {
+            let mut compact = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            compact.draw(|f| crate::ui::render(f, &saved)).unwrap();
+            let text = terminal_text(&compact);
+            assert!(
+                text.contains(MARKER) && text.contains("Archive the report."),
+                "{text}"
+            );
+            eprintln!("TABLE PREVIEW CAPTURE\n{text}\nEND TABLE PREVIEW CAPTURE");
+        }
     }
 
     #[test]

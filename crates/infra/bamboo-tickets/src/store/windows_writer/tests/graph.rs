@@ -1,10 +1,12 @@
+mod process_exit;
+
 use std::{
     collections::BTreeMap,
     env,
     ffi::OsStr,
     fs,
     io::{Seek, SeekFrom, Write},
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
     process,
 };
 
@@ -100,6 +102,13 @@ struct Categories<'writer, 'scope> {
 }
 
 impl<'writer, 'scope> Categories<'writer, 'scope> {
+    fn create(fixture: &Path, writer: &'writer WriterGuard<'scope>) -> Self {
+        for category in CATEGORIES {
+            fs::create_dir(fixture.join(category)).expect("create plain scratch category");
+        }
+        Self::open(writer)
+    }
+
     fn open(writer: &'writer WriterGuard<'scope>) -> Self {
         Self {
             objects: writer.open_category("objects").expect("open objects"),
@@ -129,8 +138,7 @@ fn native_standard_user_ticket_graph_publication() {
 
     let token = token::attest(&expected_sid);
     let version = windows_version();
-    let initial_snapshot = sample(1, "First checkpoint");
-    let successor_snapshot = sample(2, "Final checkpoint");
+    let [initial_snapshot, successor_snapshot] = graph_samples();
     let initial_snapshot_bytes = canonical_bytes(&initial_snapshot).unwrap();
     let successor_snapshot_bytes = canonical_bytes(&successor_snapshot).unwrap();
 
@@ -143,10 +151,7 @@ fn native_standard_user_ticket_graph_publication() {
         assert_eq!(writer.identity().volume_serial, scope_id.volume_serial);
         assert_eq!(entries(&fixture), [WRITER]);
         let initial_lock = lock_observation(&scope, &writer);
-        for category in CATEGORIES {
-            fs::create_dir(fixture.join(category)).expect("create plain scratch category");
-        }
-        let categories = Categories::open(&writer);
+        let categories = Categories::create(&fixture, &writer);
         let head = writer
             .open_head_scope()
             .expect("retain writable HEAD scope");
@@ -321,6 +326,10 @@ fn native_standard_user_ticket_graph_publication() {
         }),
         GRAPH_REPLY_LIMIT,
     );
+}
+
+fn graph_samples() -> [Snapshot; 2] {
+    [sample(1, "First checkpoint"), sample(2, "Final checkpoint")]
 }
 
 fn sample(sequence: u64, title: &str) -> Snapshot {

@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+#[cfg(test)]
 use crate::v2::atomic_write;
 use crate::SessionStoreV2;
 
@@ -2232,11 +2233,9 @@ impl FileSessionInbox {
     async fn lock_file(dir: &Path) -> Result<FileOperationLock, SessionInboxError> {
         let path = dir.to_owned();
         tokio::task::spawn_blocking(move || {
-            // The legacy claim/ACK path takes the same advisory lock as the owned
-            // writer, so it must resolve it the same way: retain the canonical
-            // Inbox directory and open the lock name relative to that handle. A
-            // link at either name now fails closed instead of creating or locking
-            // an object outside the canonical Inbox.
+            // Legacy queue operations take the same advisory lock as retained
+            // Inbox writers. Open the lock name relative to the Inbox handle so
+            // a link at either name fails closed during acquisition.
             let anchor = anchor::InboxAnchor::acquire(&path).map_err(|error| {
                 SessionInboxError::Storage(format!(
                     "create session inbox directory {}: {error}",
@@ -3039,9 +3038,29 @@ impl FileSessionInbox {
         mode: ReceiptLookupMode<'_>,
         filesystem: Option<&OwnedFilesystem>,
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
+        let admitted_path = Self::admitted_path(dir, &requested.id);
+        let read = Self::read_receipt_bytes_retaining(&admitted_path, mode, filesystem).await;
+        Self::decode_admitted_receipt(&admitted_path, requested, mode, read)
+    }
+
+    async fn ack_admitted_receipt(
+        dir: &Path,
+        requested: &SessionMessageEnvelope,
+        authority: &AckAuthority<'_>,
+    ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
+        let admitted_path = Self::admitted_path(dir, &requested.id);
+        let read = authority.read(&admitted_path).await;
+        Self::decode_admitted_receipt(&admitted_path, requested, ReceiptLookupMode::Enqueue, read)
+    }
+
+    fn decode_admitted_receipt(
+        admitted_path: &Path,
+        requested: &SessionMessageEnvelope,
+        mode: ReceiptLookupMode<'_>,
+        read: std::io::Result<Vec<u8>>,
+    ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
         let id = &requested.id;
-        let admitted_path = Self::admitted_path(dir, id);
-        match Self::read_receipt_bytes_retaining(&admitted_path, mode, filesystem).await {
+        match read {
             Ok(bytes) => {
                 if matches!(mode, ReceiptLookupMode::ObserverProof { .. }) {
                     let receipt: RootOutcomeInputReceipt<'_> = serde_json::from_slice(&bytes)
@@ -3709,12 +3728,12 @@ impl FileSessionInbox {
     ) -> Result<(), SessionInboxError> {
         let expected_lease = authority.lease();
         let cur_path = dir.join("cur").join(&claim.claim_id);
-        let bytes = match tokio::fs::read(&cur_path).await {
+        let bytes = match authority.read(&cur_path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 // Idempotent retry only when the exact permanent receipt is
                 // already present. A missing claim without that proof is stale.
-                return match Self::admitted_receipt(dir, &claim.envelope).await? {
+                return match Self::ack_admitted_receipt(dir, &claim.envelope, &authority).await? {
                     Some(receipt)
                         if receipt.delivery.generation == claim.generation
                             && StoredLease::same_optional_identity(
@@ -3772,7 +3791,8 @@ impl FileSessionInbox {
         }
 
         let admitted_path = Self::admitted_path(dir, &claim.envelope.id);
-        if let Some(existing) = Self::admitted_receipt(dir, &claim.envelope).await? {
+        if let Some(existing) = Self::ack_admitted_receipt(dir, &claim.envelope, &authority).await?
+        {
             if existing.delivery.generation != claim.generation
                 || existing.intent != intent
                 || !StoredLease::same_optional_identity(existing.lease.as_ref(), expected_lease)
@@ -5517,16 +5537,25 @@ impl SessionInboxPort for FileSessionInbox {
                 "claim target mismatch".into(),
             ));
         }
-        let _lifecycle = self.lock_lifecycle().await?;
-        let dir = self.inbox_dir(target_session_id).await?;
-        let _guard = self.lock_operation(&dir).await?;
-        if Self::owned_enabled(&dir).await? {
+        let lifecycle = self.lock_lifecycle().await?;
+        let (dir, filesystem) = self
+            .filesystem_with_authority(
+                target_session_id,
+                InboxAuthority::Lifecycle { _guard: lifecycle },
+            )
+            .await?;
+        if Self::owned_enabled_retaining(&dir, Some(&filesystem)).await? {
             return Err(SessionInboxError::InvalidClaim(
                 "owned Inbox ACK API required".into(),
             ));
         }
-        self.ack_unlocked(&dir, target_session_id, claim, AckAuthority::Legacy)
-            .await
+        self.ack_unlocked(
+            &dir,
+            target_session_id,
+            claim,
+            AckAuthority::Legacy(&filesystem),
+        )
+        .await
     }
 
     async fn pending_guidance(
@@ -5850,9 +5879,8 @@ mod tests {
         assert!(violations.is_empty(), "{}", violations.join("; "));
     }
 
-    /// The legacy claim/ACK entrypoint reaches the operation lock through
-    /// `lock_operation`, not through the owned writer, so it needs its own guard
-    /// against a replaced Inbox name or lock name.
+    /// Public legacy ACK opens the Inbox and its advisory lock through the
+    /// retained filesystem. Both names must reject links during acquisition.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn legacy_ack_does_not_follow_inbox_or_lock_symlinks() {
