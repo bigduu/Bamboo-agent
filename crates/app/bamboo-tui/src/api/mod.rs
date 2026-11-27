@@ -333,19 +333,23 @@ async fn read_bounded_schedule_body(
     Ok(body)
 }
 
-async fn schedule_response_has_code(response: reqwest::Response, code: &str) -> bool {
+async fn schedule_response_code(response: reqwest::Response) -> Option<String> {
     const MAX_ERROR_BYTES: usize = 8 * 1024;
-    let Ok(body) = read_bounded_schedule_body(response, MAX_ERROR_BYTES).await else {
-        return false;
-    };
+    let body = read_bounded_schedule_body(response, MAX_ERROR_BYTES)
+        .await
+        .ok()?;
     serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .is_some_and(|error| {
+        .and_then(|error| {
             error
                 .pointer("/error/code")
                 .and_then(serde_json::Value::as_str)
-                == Some(code)
+                .map(str::to_owned)
         })
+}
+
+async fn schedule_response_has_code(response: reqwest::Response, code: &str) -> bool {
+    schedule_response_code(response).await.as_deref() == Some(code)
 }
 
 #[derive(Clone)]
@@ -1234,6 +1238,98 @@ impl BambooClient {
             "Schedule rename response does not match the request"
         );
         Ok(reply.name)
+    }
+
+    pub(crate) async fn update_schedule_interval(
+        &self,
+        schedule_id: &str,
+        every_seconds: u64,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        const INVALID_PERIOD: &str =
+            "Schedule interval must be a positive representable number of seconds";
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(
+            is_valid_schedule_interval(every_seconds),
+            "{INVALID_PERIOD}"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "interval"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| {
+                anyhow::anyhow!("Could not contact the Host to update the schedule interval")
+            })?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "every_seconds": every_seconds }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the schedule interval")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the schedule interval")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            let message = match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_interval")) => INVALID_PERIOD,
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    "Schedule is no longer an Interval schedule"
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    "Schedule has no future occurrence"
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => "Schedule no longer exists",
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    "Editing the interval requires a newer Host"
+                }
+                _ => anyhow::bail!(
+                    "Could not update schedule interval (HTTP {})",
+                    status.as_u16()
+                ),
+            };
+            anyhow::bail!("{message}");
+        }
+
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule interval response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the schedule interval response")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule interval response"),
+            })?;
+        let view: ScheduleView = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule interval response"))?;
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id && schedule.interval_seconds == Some(every_seconds),
+            "Schedule interval response does not match the request"
+        );
+        Ok(schedule)
     }
 
     pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
@@ -2167,6 +2263,175 @@ mod tests {
             .unwrap();
             assert_eq!(result.unwrap_err().to_string(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_sends_only_the_period_and_projects_confirmed_state() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Status review",
+            "enabled": true,
+            "trigger": {
+                "type": "interval",
+                "every_seconds": 120,
+                "anchor_at": "2030-02-13T13:30:00Z"
+            },
+            "state": {"next_fire_at": "2030-02-13T13:32:00Z"},
+            "run_config": {"task_message": "Review progress"}
+        });
+        let schedule = schedule_interval_reply("200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.interval_seconds, Some(120));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Every 120 seconds")
+        );
+        assert_eq!(schedule.name.as_deref(), Some("Status review"));
+        assert_eq!(schedule.enabled, Some(true));
+        assert_eq!(schedule.prompt.as_deref(), Some("Review progress"));
+        assert_eq!(
+            schedule.next_run,
+            Some("2030-02-13T13:32:00Z".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_rejects_mismatched_identity_kind_and_period() {
+        for (id, trigger) in [
+            (
+                "other",
+                serde_json::json!({"type":"interval","every_seconds":120}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"interval","every_seconds":60}),
+            ),
+            (TOGGLE_SCHEDULE_ID, serde_json::json!({"type":"interval"})),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","every_seconds":120}),
+            ),
+        ] {
+            let body = serde_json::json!({"id": id, "trigger": trigger});
+            assert_eq!(
+                schedule_interval_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Schedule interval response does not match the request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                Some("invalid_schedule_interval"),
+                "Schedule interval must be a positive representable number of seconds",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_trigger_changed"),
+                "Schedule is no longer an Interval schedule",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_no_future_occurrence"),
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                None,
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "404 Not Found",
+                Some("not_found"),
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                None,
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                Some("schedule_trigger_changed"),
+                "Could not update schedule interval (HTTP 503)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_interval_reply(status, "", &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            schedule_interval_reply(
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update schedule interval (HTTP 307)"
+        );
+    }
+
+    async fn schedule_interval_reply(status: &str, extra: &str, body: &str) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/interval HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"every_seconds":120})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_interval(TOGGLE_SCHEDULE_ID, 120),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
     }
 
     #[tokio::test]

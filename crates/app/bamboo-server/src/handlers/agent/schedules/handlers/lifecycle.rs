@@ -6,7 +6,7 @@ use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
 use super::super::types::{
     CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
-    ScheduleView,
+    ScheduleView, SetScheduleIntervalRequest,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -96,21 +96,23 @@ pub async fn patch_schedule(
             .get_ref()
             .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
         {
-            Some(SchedulePatchRejection::NoFutureOccurrence) => {
-                Ok(crate::error::json_error_with_code(
-                    StatusCode::CONFLICT,
-                    "Schedule has no future occurrence".into(),
-                    Some("schedule_no_future_occurrence"),
-                ))
-            }
+            Some(SchedulePatchRejection::NoFutureOccurrence) => Ok(schedule_no_future_occurrence()),
             Some(SchedulePatchRejection::InvalidWindow) => Ok(crate::error::json_error_with_code(
                 StatusCode::BAD_REQUEST,
                 "start_at must be earlier than end_at".into(),
                 Some("invalid_schedule_window"),
             )),
-            None => Err(internal_server_error("patch schedule", error)),
+            _ => Err(internal_server_error("patch schedule", error)),
         },
     }
+}
+
+fn schedule_no_future_occurrence() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::CONFLICT,
+        "Schedule has no future occurrence".into(),
+        Some("schedule_no_future_occurrence"),
+    )
 }
 
 /// `PATCH /api/v1/schedules/{schedule_id}/name`
@@ -148,6 +150,56 @@ pub async fn rename_schedule(
             "Schedule not found".into(),
             Some("schedule_not_found"),
         )),
+    }
+}
+
+fn invalid_schedule_interval() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::BAD_REQUEST,
+        "Interval must be a positive, representable number of seconds".into(),
+        Some("invalid_schedule_interval"),
+    )
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/interval`
+pub async fn set_schedule_interval(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<SetScheduleIntervalRequest>>,
+) -> Result<HttpResponse> {
+    let SetScheduleIntervalRequest::Period { every_seconds } = match req {
+        Ok(req) => req.into_inner(),
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => {
+            return Ok(invalid_schedule_interval());
+        }
+        Err(error) => return Err(error),
+    };
+    match state
+        .schedule_store
+        .patch_interval_period(&path, every_seconds)
+        .await
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::InvalidInterval) => Ok(invalid_schedule_interval()),
+            Some(SchedulePatchRejection::TriggerChanged) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "Schedule no longer uses an Interval trigger".into(),
+                Some("schedule_trigger_changed"),
+            )),
+            Some(
+                SchedulePatchRejection::NoFutureOccurrence | SchedulePatchRejection::InvalidWindow,
+            ) => Ok(schedule_no_future_occurrence()),
+            None => Err(internal_server_error("change schedule interval", error)),
+        },
     }
 }
 
@@ -303,8 +355,8 @@ mod tests {
         use crate::routes::configure_routes;
         use crate::schedule_app::store::ScheduleDefinitionChanges;
         use crate::schedule_app::{
-            default_trigger_engine, ScheduleRunConfig, ScheduleRunStatus, ScheduleStore,
-            ScheduleTrigger,
+            default_trigger_engine, MisFirePolicy, OverlapPolicy, ScheduleRunConfig,
+            ScheduleRunStatus, ScheduleStore, ScheduleTrigger,
         };
         use crate::AppState;
 
@@ -487,6 +539,219 @@ mod tests {
                 renamed
             );
             assert_eq!(reopened.get_schedule(&sibling.id).await, Some(sibling));
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_interval_preserves_saved_fields_and_queued_run() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let anchor = chrono::Utc::now() - chrono::Duration::hours(1);
+            let occurrence = anchor + chrono::Duration::hours(2);
+            let schedule = store
+                .create_schedule_with_definition(
+                    "Recurring report".into(),
+                    true,
+                    ScheduleRunConfig {
+                        task_message: Some("Keep the saved prompt".into()),
+                        ..Default::default()
+                    },
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::legacy_interval(7200, Some(anchor))),
+                        timezone: Some("Asia/Shanghai".into()),
+                        start_at: Some(anchor),
+                        end_at: Some(anchor + chrono::Duration::hours(8)),
+                        misfire_policy: Some(MisFirePolicy::CatchUpWindow {
+                            max_catch_up_runs: 3,
+                            max_lateness_seconds: 60,
+                        }),
+                        overlap_policy: Some(OverlapPolicy::Allow),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(schedule.state.next_fire_at, Some(occurrence));
+            // Claim through the real store at the saved instant without dispatching a job.
+            let claimed = store.claim_due_runs(occurrence).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].scheduled_for, occurrence);
+            let before = store
+                .patch_schedule(&schedule.id, None, Some(false), None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(before.state.queued_run_count, 1);
+            assert_eq!(before.state.last_scheduled_at, Some(occurrence));
+            let records = store.list_run_records_for_schedule(&schedule.id).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, ScheduleRunStatus::Queued);
+            assert_eq!(records[0].run_id, claimed[0].run_id);
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/schedules/{}/interval", schedule.id))
+                    .set_json(serde_json::json!({ "every_seconds": 1800 }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let edited: Value = test::read_body_json(response).await;
+            let mut expected = serde_json::to_value(ScheduleView::from(before)).unwrap();
+            expected["trigger"]["every_seconds"] = serde_json::json!(1800);
+            expected["state"]["next_fire_at"] =
+                serde_json::json!(occurrence + chrono::Duration::seconds(1800));
+            assert!(edited["updated_at"].is_string());
+            expected["updated_at"] = edited["updated_at"].clone();
+            assert_eq!(edited, expected);
+
+            let reopened = ScheduleStore::new(store.index_path().parent().unwrap().to_path_buf())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.list_run_records_for_schedule(&schedule.id).await,
+                records
+            );
+            assert_eq!(
+                reopened.list_run_records_for_schedule(&schedule.id).await,
+                records
+            );
+            let entry = reopened.get_schedule(&schedule.id).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(entry)).unwrap(),
+                edited
+            );
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_interval_keeps_exhausted_and_incompatible_rows_intact() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let occurrence = chrono::Utc::now() + chrono::Duration::hours(2);
+            let schedule = store
+                .create_schedule_with_definition(
+                    "Finite interval".into(),
+                    true,
+                    ScheduleRunConfig::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::legacy_interval(900, Some(occurrence))),
+                        end_at: Some(occurrence + chrono::Duration::seconds(30)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let claimed = store.claim_due_runs(occurrence).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            let exhausted = store.get_schedule(&schedule.id).await.unwrap();
+            assert!(!exhausted.enabled);
+            assert_eq!(exhausted.state.next_fire_at, None);
+            let once = store
+                .create_schedule(
+                    "One shot".into(),
+                    ScheduleTrigger::Once { at: occurrence },
+                    false,
+                    ScheduleRunConfig::default(),
+                )
+                .await
+                .unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let saved = tokio::fs::read(store.index_path()).await.unwrap();
+            let cases = [
+                (
+                    &schedule.id,
+                    serde_json::json!({}),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_schedule_interval",
+                ),
+                (
+                    &schedule.id,
+                    serde_json::json!({"every_seconds": 0}),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_schedule_interval",
+                ),
+                (
+                    &schedule.id,
+                    serde_json::json!({"every_seconds": u64::MAX}),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_schedule_interval",
+                ),
+                (
+                    &schedule.id,
+                    serde_json::json!({"every_seconds": 30, "enabled": true}),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_schedule_interval",
+                ),
+                (
+                    &schedule.id,
+                    serde_json::json!({"every_seconds": 1800}),
+                    StatusCode::CONFLICT,
+                    "schedule_no_future_occurrence",
+                ),
+                (
+                    &once.id,
+                    serde_json::json!({"every_seconds": 30}),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+            ];
+            for (id, payload, status, code) in cases {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&format!("/api/v1/schedules/{id}/interval"))
+                        .set_json(payload)
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), status);
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], code);
+            }
+            let missing = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri("/api/v1/schedules/missing/interval")
+                    .set_json(serde_json::json!({"every_seconds": 30}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            let body: Value = test::read_body_json(missing).await;
+            assert_eq!(body["error"]["code"], "schedule_not_found");
+
+            let repeated = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/schedules/{}/interval", schedule.id))
+                    .set_json(serde_json::json!({"every_seconds": 900}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(repeated.status(), StatusCode::OK);
+            let repeated: Value = test::read_body_json(repeated).await;
+            assert_eq!(
+                repeated,
+                serde_json::to_value(ScheduleView::from(exhausted.clone())).unwrap()
+            );
+            assert_eq!(store.get_schedule(&schedule.id).await, Some(exhausted));
+            assert_eq!(store.get_schedule(&once.id).await, Some(once));
+            assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
         }
 
         #[actix_web::test]

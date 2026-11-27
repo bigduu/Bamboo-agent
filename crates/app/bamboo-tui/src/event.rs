@@ -60,6 +60,11 @@ pub enum AppEvent {
         schedule_id: String,
         result: Loaded<String>,
     },
+    ScheduleIntervalFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<Schedule>,
+    },
     ScheduleRunsLoaded {
         request_id: u64,
         schedule_id: String,

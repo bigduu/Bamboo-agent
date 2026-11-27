@@ -7,7 +7,7 @@
 //! crate still warns, since the blanket crate-level allow was removed.
 #![allow(dead_code)]
 
-use chrono::{DateTime, NaiveTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 fn default_allow_custom() -> bool {
@@ -823,13 +823,14 @@ pub struct ToolInfo {
 /// Flat, display-oriented schedule used by the Schedules tab. Built from the
 /// server's richer `ScheduleView` via [`Schedule::from_view`] — the server has
 /// no flat `cron`/`prompt` fields, so we project its `trigger`/`state` into the
-/// handful of fields the list actually renders.
+/// fields the list renders and the period the Interval editor can edit.
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub id: String,
     pub name: Option<String>,
     pub cron: Option<String>,
     pub cadence_detail: Option<String>,
+    pub interval_seconds: Option<u64>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
@@ -838,9 +839,19 @@ pub struct Schedule {
 
 impl Schedule {
     pub fn from_view(v: ScheduleView) -> Self {
+        let interval_seconds =
+            if v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("interval") {
+                v.trigger
+                    .get("every_seconds")
+                    .and_then(|period| period.as_u64())
+                    .filter(|&period| is_valid_schedule_interval(period))
+            } else {
+                None
+            };
         Self {
             cron: Some(trigger_display(&v.trigger)),
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
+            interval_seconds,
             name: Some(v.name),
             enabled: Some(v.enabled),
             prompt: v.run_config.task_message,
@@ -849,6 +860,14 @@ impl Schedule {
             id: v.id,
         }
     }
+}
+
+pub(crate) fn is_valid_schedule_interval(every_seconds: u64) -> bool {
+    every_seconds > 0
+        && i64::try_from(every_seconds)
+            .ok()
+            .and_then(TimeDelta::try_seconds)
+            .is_some()
 }
 
 /// Human-readable one-liner for a schedule trigger. Cron triggers show their
@@ -1312,6 +1331,40 @@ pub struct SkillDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_projection_exposes_only_valid_typed_interval_periods() {
+        for (trigger, expected) in [
+            (None, None),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":1})),
+                Some(1),
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":0})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":"90"})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":i64::MAX})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"future","every_seconds":90})),
+                None,
+            ),
+        ] {
+            let mut body = serde_json::json!({ "id": "schedule-17" });
+            if let Some(trigger) = trigger {
+                body["trigger"] = trigger;
+            }
+            let view: ScheduleView = serde_json::from_value(body).unwrap();
+            assert_eq!(Schedule::from_view(view).interval_seconds, expected);
+        }
+    }
 
     #[test]
     fn cadence_projection_keeps_calendar_choices_readable_and_bounded() {

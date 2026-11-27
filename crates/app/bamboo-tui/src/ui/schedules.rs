@@ -115,15 +115,29 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let toggle_height = u16::from(toggle.is_some());
     let detail_limit = body.height.saturating_sub(2 + toggle_height).min(3);
     let detail = selected_schedule
-        .and_then(|schedule| schedule.cadence_detail.as_deref())
-        .filter(|text| !text.is_empty() && detail_width > 0 && detail_limit > 0)
-        .map(|text| {
+        .filter(|_| detail_width > 0 && detail_limit > 0)
+        .and_then(|schedule| {
+            let text = schedule
+                .cadence_detail
+                .as_deref()
+                .filter(|text| !text.is_empty())?;
             let width = usize::from(detail_width) * usize::from(detail_limit);
-            Paragraph::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled("Cadence  ", Style::default().fg(colors::brand())),
                 Span::raw(clip_schedule_text(text, width.saturating_sub(9))),
-            ]))
-            .wrap(Wrap { trim: true })
+            ];
+            if schedule.interval_seconds.is_some() {
+                let key = app
+                    .keymap
+                    .primary_hint(ActionContext::Schedules, ActionId::EditScheduleInterval);
+                let hint = format!(" · {key} edit interval");
+                let remaining = width.saturating_sub(9 + display_width(text));
+                spans.push(Span::styled(
+                    clip_schedule_text(&hint, remaining),
+                    Style::default().fg(colors::inactive()),
+                ));
+            }
+            Some(Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }))
         });
     let detail_height = detail.as_ref().map_or(0, |paragraph| {
         paragraph
@@ -503,6 +517,7 @@ mod tests {
             last_run: None,
             next_run: None,
             cadence_detail: None,
+            interval_seconds: None,
         }
     }
 
