@@ -1125,7 +1125,13 @@ mod execution_input_http {
                 .configure(crate::routes::configure_routes),
         )
         .await;
-        for case in ["completed", "waiting", "permission-handoff", "unresolved"] {
+        for case in [
+            "completed",
+            "waiting",
+            "permission-handoff",
+            "managed-work",
+            "unresolved",
+        ] {
             let id = format!("manual-interrupted-{case}");
             let mut session = owned_http_session(&state, &id);
             session.messages = vec![Message::user("user input")];
@@ -1148,6 +1154,32 @@ mod execution_input_http {
                 session.metadata.insert(
                     bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY.into(),
                     "owned-generation".into(),
+                );
+            }
+            if case == "managed-work" {
+                use bamboo_engine::ticket_runtime::{TicketDispatchBinding, TICKET_DISPATCH_KEY};
+                let dispatch = TicketDispatchBinding {
+                    dispatch_key: "dispatch-fixture".into(),
+                    spec_hash: "spec-fixture".into(),
+                    assignment_id: "assignment-fixture".into(),
+                    binding: bamboo_tickets::ScopeBinding {
+                        scope_id: "scope-fixture".into(),
+                        supervisor_session_id: "supervisor-fixture".into(),
+                        binding_revision: 1,
+                    },
+                    max_rounds: None,
+                    highest_reasoning: false,
+                    receipt: Some(bamboo_tickets::RuntimeReceipt {
+                        dispatch_key: "dispatch-fixture".into(),
+                        spec_hash: "spec-fixture".into(),
+                        run_id: "previous-work-run".into(),
+                        session_id: id.clone(),
+                    }),
+                    receipt_created_at: Some(chrono::Utc::now()),
+                };
+                session.metadata.insert(
+                    TICKET_DISPATCH_KEY.into(),
+                    serde_json::to_string(&dispatch).unwrap(),
                 );
             }
             if case == "unresolved" {

@@ -65,6 +65,9 @@ async fn eligible(state: &AppState, session: &Session) -> bool {
         || session
             .metadata
             .contains_key(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+        || session
+            .metadata
+            .contains_key(bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY)
         || !session
             .messages
             .iter()
