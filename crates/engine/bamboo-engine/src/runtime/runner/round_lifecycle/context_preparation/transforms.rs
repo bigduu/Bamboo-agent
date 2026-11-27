@@ -78,6 +78,11 @@ pub(super) async fn apply_message_transforms_with_vision_budget(
     model_name: &str,
     allow_paid_vision: bool,
 ) -> Result<(), AgentError> {
+    if config.interrupted_resume_context {
+        prepared_context.messages.retain(|message| {
+            !super::super::stream_execution::is_interrupted_assistant_output(message)
+        });
+    }
     normalize_tool_chains(&mut prepared_context.messages, session_id);
     match image_projection(config, llm.as_ref(), model_name).await {
         ImageProjection::Nonvision => {

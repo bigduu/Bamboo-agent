@@ -297,7 +297,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // stay with their existing default Tools, Infrastructure and Server owners.
 // #3169 keeps message-fork tests in default Storage/packages-0 and server-handlers.
 // The five additive contexts and 23 case selections retain their current owners.
-const FEATURE_SOURCE_SHA256 = "7427d8db7715a9f32c6287fbef9a33220ac73c8bd33d926567925c31ad535eb4";
+// #3189 adds default Server HTTP and Storage Root writer regression cases.
+const FEATURE_SOURCE_SHA256 = "3aeb7d252224343918e02d009a018facd9a2a3e7e7be200ed00424f6d7115d2a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

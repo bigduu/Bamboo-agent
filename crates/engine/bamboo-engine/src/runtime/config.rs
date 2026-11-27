@@ -978,6 +978,7 @@ pub struct AgentLoopConfig {
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn LiveBootstrapHost>>,
+    pub(crate) interrupted_resume_context: bool,
     pub(crate) gold_target_resolver: Option<GoldTargetResolver>,
     pub(crate) host_gold_run: Option<Arc<crate::runtime::host_gold::HostGoldRun>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
@@ -1226,6 +1227,7 @@ impl Default for AgentLoopConfig {
             guidance_active_run_id: None,
             session_inbox: None,
             live_bootstrap_host: None,
+            interrupted_resume_context: false,
             gold_target_resolver: None,
             host_gold_run: None,
             session_activation_notifications: None,

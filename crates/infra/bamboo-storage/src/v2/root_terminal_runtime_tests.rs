@@ -1017,6 +1017,63 @@ async fn root_terminal_main_corrects_same_fence_diagnostic_without_unretiring_or
     }
 }
 #[tokio::test]
+async fn interrupted_root_requires_expired_current_owner_without_final_checkpoint() {
+    let f = Fixture::new(false, 2).await;
+    let checkpoint = f.current().await;
+    assert!(!f
+        .store
+        .has_expired_interrupted_root(&checkpoint)
+        .await
+        .unwrap());
+    while Utc::now() <= f.expires {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(f
+        .store
+        .has_expired_interrupted_root(&checkpoint)
+        .await
+        .unwrap());
+
+    let owner = f.successor("manual-resume-successor").await;
+    assert!(!f
+        .store
+        .has_expired_interrupted_root(&checkpoint)
+        .await
+        .unwrap());
+
+    let mut candidate = checkpoint.clone();
+    candidate.add_message(Message::user("must reject invented resumed input"));
+    let original = serde_json::to_value(&f.current().await.messages).unwrap();
+    assert!(f
+        .store
+        .save_interrupted_root_startup(&owner, &mut candidate, &checkpoint, Arc::new(|_| {}))
+        .await
+        .is_err());
+    assert_eq!(
+        serde_json::to_value(&f.current().await.messages).unwrap(),
+        original
+    );
+
+    // Disk can still carry a legacy Root budget, which ordinary session reads
+    // already clear. It is not a conflicting change to the stopped run.
+    let runtime_path = f.path("runtime.json");
+    let mut legacy: Session =
+        serde_json::from_slice(&fs::read(&runtime_path).await.unwrap()).unwrap();
+    legacy.token_budget = Some(bamboo_domain::TokenBudget::for_model(1000));
+    fs::write(&runtime_path, serde_json::to_vec(&legacy).unwrap())
+        .await
+        .unwrap();
+
+    let observed = f.current().await;
+    let mut candidate = observed.clone();
+    f.store
+        .save_interrupted_root_startup(&owner, &mut candidate, &observed, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&candidate.messages).unwrap(), original);
+}
+
+#[tokio::test]
 async fn root_terminal_live_main_requires_expiry_and_fixed_restart_cutoff_renewal_wins() {
     for renewed in [false, true] {
         let f = Fixture::new(true, 10).await;

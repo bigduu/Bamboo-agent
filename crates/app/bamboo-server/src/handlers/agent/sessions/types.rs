@@ -146,6 +146,9 @@ pub struct SessionSummary {
     /// reason to disable a legacy session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_compatibility: Option<bamboo_domain::SessionCompatibilityReport>,
+    /// Detail-only observation for offering an explicit interrupted resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_interrupted: Option<bool>,
     #[serde(default)]
     pub project_id: Option<bamboo_domain::ProjectId>,
     pub kind: bamboo_agent_core::SessionKind,
@@ -317,6 +320,7 @@ impl SessionSummary {
         let mut summary = Self {
             id: entry.id,
             execution_compatibility: None,
+            resume_interrupted: None,
             project_id,
             kind: entry.kind,
             title: entry.title,
@@ -825,6 +829,7 @@ mod tests {
     fn test_create_session_response_serialization() {
         let summary = SessionSummary {
             execution_compatibility: None,
+            resume_interrupted: None,
             id: "test-id".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
@@ -888,6 +893,7 @@ mod tests {
     fn test_get_session_response_serialization() {
         let summary = SessionSummary {
             execution_compatibility: None,
+            resume_interrupted: None,
             id: "session-123".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
@@ -1038,6 +1044,7 @@ mod tests {
     fn test_session_summary_debug() {
         let summary = SessionSummary {
             execution_compatibility: None,
+            resume_interrupted: None,
             id: "test".to_string(),
             project_id: None,
             bypass_permissions: false,

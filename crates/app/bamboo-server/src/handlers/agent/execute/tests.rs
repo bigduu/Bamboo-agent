@@ -79,6 +79,7 @@ fn execute_request_empty_model_normalizes_to_compat_absent() {
         run_budget: None,
         upstream_retry: None,
         live_bootstrap_resume: false,
+        resume_interrupted: false,
     };
 
     let model = request.model.as_deref().unwrap_or("").trim();
@@ -1009,6 +1010,240 @@ mod execution_input_http {
             ),
             bamboo_agent_core::Message::tool_result("already-completed-call", "already completed"),
         ]
+    }
+
+    #[actix_web::test]
+    async fn manual_interrupted_resume_preserves_context_and_transcript() {
+        use bamboo_agent_core::{Message, MessagePhase, Role};
+
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        let id = "manual-interrupted-context";
+        let mut session = owned_http_session(&state, id);
+        session.messages = completed_synthetic_tool_exchange();
+        let mut partial = Message::assistant("interrupted display fragment", None);
+        partial.phase = Some(MessagePhase::Commentary);
+        partial.metadata = Some(serde_json::json!({
+            "runtime_kind": "interrupted_assistant_output",
+            "interrupted": true,
+        }));
+        session.messages.push(partial);
+        session.set_last_run_status("error");
+        let old_messages = serde_json::to_value(&session.messages).unwrap();
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .skill_manager
+            .store_for_workspace(
+                session
+                    .workspace_path_meta()
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .await
+            .unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+
+        let detail: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["resume_interrupted"], true);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"resume_interrupted":true}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let receipt: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{receipt}");
+        assert_eq!(receipt["status"], "started");
+        assert!(receipt["run_id"].is_string());
+        let mut saved = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let session = state.storage.load_session(id).await.unwrap().unwrap();
+                if session.last_run_status().as_deref() == Some("completed") {
+                    break session;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resume must complete on the provider");
+
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count(),
+            1
+        );
+        assert!(saved
+            .messages
+            .iter()
+            .any(|m| m.content == "owned Root finished"));
+        saved
+            .messages
+            .retain(|m| session.messages.iter().any(|old| old.id == m.id));
+        assert_eq!(serde_json::to_value(saved.messages).unwrap(), old_messages);
+        {
+            let calls = provider.messages.lock().unwrap();
+            let context = calls.first().expect("provider saw the resumed session");
+            assert!(context
+                .iter()
+                .any(|m| m.role == Role::User && m.content == "one original user message"));
+            assert!(context
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content == "already completed"));
+            assert!(!context
+                .iter()
+                .any(|m| m.content.contains("interrupted display fragment")));
+        }
+        state.shutdown().await;
+    }
+
+    #[actix_web::test]
+    async fn manual_interrupted_resume_refuses_completed_waiting_or_unresolved_sessions() {
+        use bamboo_agent_core::{Message, PendingQuestion};
+
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for case in [
+            "completed",
+            "waiting",
+            "permission-handoff",
+            "managed-work",
+            "counted-loop",
+            "unresolved",
+        ] {
+            let id = format!("manual-interrupted-{case}");
+            let mut session = owned_http_session(&state, &id);
+            session.messages = vec![Message::user("user input")];
+            session.set_last_run_status(if case == "completed" {
+                "completed"
+            } else {
+                "cancelled"
+            });
+            if case == "waiting" {
+                session.pending_question = Some(PendingQuestion {
+                    tool_call_id: "pending-tool".into(),
+                    tool_name: String::new(),
+                    question: "Choose an option".into(),
+                    options: vec!["Continue".into()],
+                    allow_custom: false,
+                    source: Default::default(),
+                });
+            }
+            if case == "permission-handoff" {
+                session.metadata.insert(
+                    bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_GENERATION_METADATA_KEY.into(),
+                    "owned-generation".into(),
+                );
+            }
+            if case == "managed-work" {
+                use bamboo_engine::ticket_runtime::{TicketDispatchBinding, TICKET_DISPATCH_KEY};
+                let dispatch = TicketDispatchBinding {
+                    dispatch_key: "dispatch-fixture".into(),
+                    spec_hash: "spec-fixture".into(),
+                    assignment_id: "assignment-fixture".into(),
+                    binding: bamboo_tickets::ScopeBinding {
+                        scope_id: "scope-fixture".into(),
+                        supervisor_session_id: "supervisor-fixture".into(),
+                        binding_revision: 1,
+                    },
+                    max_rounds: None,
+                    highest_reasoning: false,
+                    receipt: Some(bamboo_tickets::RuntimeReceipt {
+                        dispatch_key: "dispatch-fixture".into(),
+                        spec_hash: "spec-fixture".into(),
+                        run_id: "previous-work-run".into(),
+                        session_id: id.clone(),
+                    }),
+                    receipt_created_at: Some(chrono::Utc::now()),
+                };
+                session.metadata.insert(
+                    TICKET_DISPATCH_KEY.into(),
+                    serde_json::to_string(&dispatch).unwrap(),
+                );
+            }
+            if case == "counted-loop" {
+                use bamboo_engine::runtime::counted_loop::{
+                    LoopState, LoopStatus, LOOP_STATE_METADATA_KEY,
+                };
+                let generation = LoopState {
+                    schema_version: 1,
+                    generation: uuid::Uuid::from_u128(1).to_string(),
+                    revision: 1,
+                    objective_revision: 1,
+                    owner_execution_id: "previous-loop-run".into(),
+                    objective: "Repeated objective".into(),
+                    max_iterations: 3,
+                    max_total_rounds: 10,
+                    iterations_started: 1,
+                    iterations_completed: 0,
+                    rounds_started: 1,
+                    status: LoopStatus::Running,
+                    control: None,
+                };
+                session.metadata.insert(
+                    LOOP_STATE_METADATA_KEY.into(),
+                    serde_json::to_string(&generation).unwrap(),
+                );
+            }
+            if case == "unresolved" {
+                session.messages = completed_synthetic_tool_exchange();
+                session.messages.pop();
+            }
+            state.storage.save_session(&session).await.unwrap();
+            let detail: serde_json::Value = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                detail["session"]["resume_interrupted"], false,
+                "{id}: {detail}"
+            );
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/execute/{id}"))
+                    .set_json(serde_json::json!({"resume_interrupted":true}))
+                    .to_request(),
+            )
+            .await;
+            let status = response.status();
+            let rejection: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{rejection}");
+            assert_eq!(rejection["error"]["code"], "interrupted_resume_unavailable");
+            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(saved.last_run_status(), session.last_run_status());
+            assert_eq!(
+                serde_json::to_value(saved.messages).unwrap(),
+                serde_json::to_value(&session.messages).unwrap()
+            );
+        }
+        assert!(provider.messages.lock().unwrap().is_empty());
+        state.shutdown().await;
     }
 
     #[actix_web::test]

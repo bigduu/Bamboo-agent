@@ -677,6 +677,14 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Keep interrupted display records in history while continuing coherent model context.
+    #[doc(hidden)]
+    pub fn with_interrupted_resume_context(&self) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.interrupted_resume_context = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind a live-bootstrap Host to this execution only. The Host must retain
     /// its exact runner and writer; this method does not create authority.
     #[doc(hidden)]

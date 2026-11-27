@@ -153,6 +153,7 @@ pub struct AgentRuntime {
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub(crate) managed_work: Option<Arc<crate::ticket_runtime::managed::ManagedWorkRuntime>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
+    pub(crate) interrupted_resume_context: bool,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
     pub(crate) host_gold_origin_resolver: Option<crate::runtime::host_gold::HostGoldOriginResolver>,
     // Private to managed child resume; never inferred from a registry name.
@@ -363,6 +364,7 @@ impl AgentRuntimeBuilder {
             session_inbox: self.session_inbox,
             managed_work: None,
             live_bootstrap_host: None,
+            interrupted_resume_context: false,
             gold_target_resolver: None,
             host_gold_origin_resolver: None,
             child_resume_gold_selected: None,
@@ -1250,6 +1252,7 @@ impl AgentRuntime {
                 self.session_inbox.clone()
             },
             live_bootstrap_host: self.live_bootstrap_host.clone(),
+            interrupted_resume_context: self.interrupted_resume_context,
             gold_target_resolver: self.gold_target_resolver.clone(),
             session_activation_notifications,
             session_update_router: self.activation_router.clone(),

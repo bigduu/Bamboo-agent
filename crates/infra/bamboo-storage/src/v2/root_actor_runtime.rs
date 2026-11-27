@@ -156,6 +156,13 @@ impl RootActorWriteProof {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RootBoundStartup<'a> {
+    Execution,
+    Interrupted,
+    Approval(&'a SupervisorApprovalCommit),
+}
+
 impl SessionStoreV2 {
     pub(super) async fn claim_once_response_handoff_impl(
         &self,
@@ -400,16 +407,43 @@ impl SessionStoreV2 {
         .await
     }
 
+    /// Atomically check the canonical stopped run and its transcript before
+    /// committing the next startup. The Root writer is still the only owner.
+    pub async fn save_interrupted_root_startup(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        let (publish, committed) = crate::session_merge::capture_root_publication(publish);
+        self.save_root_actor_bound_startup_impl(
+            owner,
+            session,
+            expected,
+            None,
+            RootBoundStartup::Interrupted,
+            publish,
+        )
+        .await?;
+        crate::session_merge::adopt_root_publication(session, &committed)
+    }
+
     pub(super) async fn save_root_actor_bound_startup_impl(
         &self,
         owner: &RootActorRuntimeWrite,
         session: &mut Session,
         expected: &Session,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
-        approval: Option<&SupervisorApprovalCommit>,
+        mode: RootBoundStartup<'_>,
         publish: RootActorRuntimePublisher,
     ) -> io::Result<()> {
         let total_started = Instant::now();
+        let approval = match mode {
+            RootBoundStartup::Approval(approval) => Some(approval),
+            _ => None,
+        };
+        let interrupted = matches!(mode, RootBoundStartup::Interrupted);
         validate_session_id(&session.id)?;
         if let Some(wait) = inherited {
             wait.validate_session(session)?;
@@ -470,10 +504,21 @@ impl SessionStoreV2 {
             bamboo_domain::root_planned_update_predecessor_sha256(&owner.fence.lease_owner)
                 .is_some();
         Self::default_writer_job(&guards, move || {
-            let current = proof.validate()?;
+            let mut current = proof.validate()?;
             observed
                 .check_conversation_generation(&current)
                 .map_err(conflict)?;
+            if interrupted {
+                // Match the canonical session read, which discards the pre-#180
+                // Root budget cache before a new runtime resolves its limits.
+                current.clear_stale_root_token_budget();
+                if serde_json::to_value(&observed)? != serde_json::to_value(&current)?
+                    || serde_json::to_value(&observed.messages)?
+                        != serde_json::to_value(&proposed.messages)?
+                {
+                    return Err(conflict("interrupted conversation changed before startup"));
+                }
+            }
             if planned_update {
                 let history = serde_json::to_value(&observed.messages)?;
                 let same_park = observed.is_parked_for_planned_update()
