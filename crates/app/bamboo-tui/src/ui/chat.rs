@@ -1669,6 +1669,106 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_previews_rounded_mermaid_nodes_only_after_settling() {
+        let edges = "A(\"计划 🧭\") --> B[Review]\r\nB --> C(Done)\r\n";
+        for (direction, connector) in [("TD", '↓'), ("LR", '→')] {
+            let body = format!("flowchart {direction}\r\n{edges}");
+            let source = format!(
+                "Before the diagram.\r\n\r\n~~~mermaid\r\n{body}~~~\r\n\r\nAfter the diagram."
+            );
+            let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+            live.chat.streaming = true;
+            live.chat.current_turn_id = Some("run:mermaid-rounded".into());
+            live.chat.current_response = source.clone();
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let rows = transcript_rows(&mut terminal, &live, true);
+            let fence = fence_rows(&rows, "mermaid");
+            assert!(fence[1].contains(direction));
+            assert!(fence[2]
+                .replace(' ', "")
+                .contains("A(\"计划🧭\")-->B[Review]"));
+            assert!(!rows
+                .iter()
+                .any(|row| row.contains(connector) || row.contains('╭')));
+
+            let saved = assistant_transcript(&source);
+            if direction == "LR" {
+                terminal.backend_mut().resize(34, 24);
+                let narrow = transcript_rows(&mut terminal, &saved, false);
+                assert!(narrow
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+                assert!(fence_rows(&narrow, "mermaid")[1].contains("flowchart LR"));
+                assert!(!narrow
+                    .iter()
+                    .any(|row| row.contains(connector) || row.contains('╭')));
+            }
+
+            for width in [60, 120] {
+                terminal.backend_mut().resize(width, 24);
+                let mut rows = transcript_rows(&mut terminal, &saved, false);
+                let top = rows
+                    .iter()
+                    .position(|row| row.starts_with('╭'))
+                    .unwrap_or_else(|| {
+                        panic!("missing rounded diagram at {width}:\n{}", rows.join("\n"))
+                    });
+                // A wide glyph covers its continuation cell even when TestBackend
+                // retains a symbol there from the previous draw.
+                let width_in_cells = usize::from(width);
+                let first_cell = (top + 1) * width_in_cells;
+                let buffer = terminal.backend().buffer();
+                let cells = &buffer.content()[first_cell..first_cell + width_in_cells];
+                let mut label_row = String::new();
+                let mut column = 0;
+                while let Some(cell) = cells.get(column) {
+                    let symbol = cell.symbol();
+                    label_row.push_str(symbol);
+                    column += crate::text::grapheme_cell_width(symbol).max(1);
+                }
+                rows[top + 1] = label_row;
+                let rendered = rows.join("\n");
+                if direction == "TD" {
+                    assert_eq!(rows[top].trim_end(), "╭─────────╮");
+                    assert_eq!(rows[top + 1].replace(' ', ""), "│计划🧭│");
+                    assert_eq!(rows[top + 2].trim_end(), "╰────┬────╯");
+                    assert_eq!(rows[top + 3].trim_end(), "     ↓");
+                    assert_eq!(rows[top + 4].trim_end(), "┌────┴────┐");
+                    assert_eq!(rows[top + 8].trim_end(), "╭────┴────╮");
+                    assert_eq!(rows[top + 10].trim_end(), "╰─────────╯");
+                } else {
+                    assert_eq!(rows[top].trim_end(), "╭─────────╮   ┌────────┐   ╭──────╮");
+                    assert_eq!(
+                        rows[top + 1].replace(' ', ""),
+                        "│计划🧭├──→┤Review├──→┤Done│"
+                    );
+                    assert_eq!(
+                        rows[top + 2].trim_end(),
+                        "╰─────────╯   └────────┘   ╰──────╯"
+                    );
+                }
+                assert!(rendered.contains("After the diagram."));
+                assert!(!rendered.contains("Mermaid source") && !rendered.contains("-->"));
+                if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_ROUNDED").is_some() {
+                    eprintln!(
+                        "MERMAID ROUNDED {direction} PREVIEW\n{rendered}\nEND MERMAID ROUNDED PREVIEW"
+                    );
+                }
+            }
+
+            assert_eq!(saved.chat.messages[0].content, source);
+            let (_, fences) = markdown::copyable_fences(&saved.chat.messages[0].content);
+            assert_eq!(
+                fences,
+                [markdown::CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn testbackend_renders_assistant_checklist_and_neighboring_markdown_at_each_width() {
         let source = concat!(
             "# Launch checklist\n\n",
