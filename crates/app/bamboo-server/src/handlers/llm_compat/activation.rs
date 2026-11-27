@@ -82,6 +82,7 @@ pub(crate) async fn activate(state: web::Data<AppState>, http: HttpRequest) -> H
         run_budget: None,
         upstream_retry: None,
         live_bootstrap_resume: false,
+        resume_interrupted: false,
     };
     // Keep Native validation, the single execute idempotency namespace and
     // actual selected Root reservation/claim/Ready/spawn exactly authoritative.

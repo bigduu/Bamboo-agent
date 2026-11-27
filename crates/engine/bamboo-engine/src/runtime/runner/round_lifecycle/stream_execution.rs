@@ -77,6 +77,14 @@ pub(super) const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str =
     "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
+
+pub(super) fn is_interrupted_assistant_output(message: &Message) -> bool {
+    message.role == Role::Assistant
+        && message.metadata.as_ref().is_some_and(|metadata| {
+            metadata["runtime_kind"] == INTERRUPTED_ASSISTANT_OUTPUT_KIND
+                && metadata["interrupted"] == true
+        })
+}
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;

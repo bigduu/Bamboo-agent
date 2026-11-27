@@ -155,6 +155,9 @@ pub struct ExecuteRequest {
     /// Omission keeps the existing finite failure behavior.
     #[serde(default)]
     pub live_bootstrap_resume: bool,
+    /// Resume the previous interrupted run from its saved context.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_interrupted: bool,
 }
 
 #[cfg(test)]

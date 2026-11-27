@@ -119,6 +119,7 @@ fn continuation_selector(
         || req.no_human_approver
         || req.run_budget.is_some()
         || req.live_bootstrap_resume
+        || req.resume_interrupted
     {
         return Err("A continuation requires only upstream_retry.mode=until_cancelled");
     }
@@ -197,6 +198,12 @@ struct RestoredFreshAdmission {
     live_bootstrap_resume: bool,
 }
 
+enum ExecuteAdmissionSource {
+    Ordinary,
+    FreshSync(RestoredFreshAdmission),
+    Interrupted(Box<bamboo_domain::Session>),
+}
+
 async fn handle_execute_inner(
     state: web::Data<AppState>,
     session_id: String,
@@ -204,6 +211,15 @@ async fn handle_execute_inner(
     selected: Option<receipt::Selection>,
     origin: ExecuteOrigin,
 ) -> HttpResponse {
+    if req.resume_interrupted
+        && (!matches!(origin, ExecuteOrigin::Http)
+            || selected.is_some()
+            || req.upstream_retry.is_some()
+            || req.live_bootstrap_resume
+            || req.no_human_approver)
+    {
+        return bad_request_error_response("An interrupted resume requires an interactive execute without new input or a retry selector");
+    }
     match state.storage.load_session(&session_id).await {
         Ok(Some(session)) => {
             if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
@@ -236,11 +252,35 @@ async fn handle_execute_inner(
     let startup_lock = state.persistence.acquire_lock(&session_id).await;
     // Protect the preparation window before `reserve_runner` can publish a
     // Pending runner. Reference-counted RAII releases on every return/panic.
+    if req.resume_interrupted
+        && crate::handlers::agent::events::execute_startup_is_in_flight(&state, &session_id)
+    {
+        return super::interrupted::unavailable(&session_id);
+    }
     let mut startup_guard =
         crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
+    if req.resume_interrupted {
+        let (mut reservation, observed) =
+            match super::interrupted::reserve(&state, &session_id).await {
+                Ok((reservation, observed)) => (Some(reservation), observed),
+                Err(response) => return *response,
+            };
+        let response = handle_reserved_execute(
+            state,
+            session_id,
+            req,
+            &mut startup_guard,
+            &mut reservation,
+            ExecuteAdmissionSource::Interrupted(Box::new(observed)),
+            origin,
+        )
+        .await;
+        abandon_admission_reservation(&mut reservation).await;
+        return response;
+    }
     // A resync handoff contains the original non-clonable reservation and
     // freshly admitted input. Never recreate it from history or a receipt.
     let handoff = if selected.is_none() {
@@ -287,7 +327,10 @@ async fn handle_execute_inner(
         req,
         &mut startup_guard,
         &mut admission_reservation,
-        restored,
+        restored.map_or(
+            ExecuteAdmissionSource::Ordinary,
+            ExecuteAdmissionSource::FreshSync,
+        ),
         origin,
     )
     .await;
@@ -303,9 +346,14 @@ async fn handle_reserved_execute(
     req: web::Json<ExecuteRequest>,
     startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
     admission_reservation: &mut Option<SessionExecutionReservation>,
-    restored: Option<RestoredFreshAdmission>,
+    source: ExecuteAdmissionSource,
     origin: ExecuteOrigin,
 ) -> HttpResponse {
+    let (restored, interrupted_expected) = match source {
+        ExecuteAdmissionSource::Ordinary => (None, None),
+        ExecuteAdmissionSource::FreshSync(admission) => (Some(admission), None),
+        ExecuteAdmissionSource::Interrupted(observed) => (None, Some(observed)),
+    };
     let restored_owner = restored.is_some();
     // A sync correction reuses this owner; preserve the opt-in selected on
     // its first request so the later provider future can publish its offer.
@@ -313,7 +361,7 @@ async fn handle_reserved_execute(
         || restored
             .as_ref()
             .is_some_and(|handoff| handoff.live_bootstrap_resume);
-    let admission = if restored_owner {
+    let admission = if restored_owner || interrupted_expected.is_some() {
         None
     } else {
         Some(
@@ -398,6 +446,8 @@ async fn handle_reserved_execute(
                 restored.generate_title,
                 restored.native_main,
             )
+        } else if interrupted_expected.is_some() {
+            (None, None, false, true)
         } else {
             let admission = admission.expect("new admission exists");
             (
@@ -408,9 +458,13 @@ async fn handle_reserved_execute(
             )
         };
     let stored_session = state.storage.load_session(&session_id).await.ok().flatten();
-    let startup_turn_id = stored_session
-        .as_ref()
-        .and_then(crate::handlers::agent::events::startup_work_id);
+    let startup_turn_id = if interrupted_expected.is_some() {
+        None
+    } else {
+        stored_session
+            .as_ref()
+            .and_then(crate::handlers::agent::events::startup_work_id)
+    };
     // The prepared session remains authoritative and is revalidated later;
     // use its scheduled binding here so default-account settings cannot reject
     // or supply reasoning for an explicitly bound scheduled account.
@@ -470,12 +524,26 @@ async fn handle_reserved_execute(
         .collect();
     let disabled_skill_ids_vec: Vec<String> =
         config_snapshot.disabled_skill_ids().into_iter().collect();
-    let explicit_provider = scheduled_provider.as_deref().or_else(|| {
-        req.model_ref
-            .as_ref()
-            .map(|model_ref| model_ref.provider.as_str())
-            .or(req.provider.as_deref())
-    });
+    let saved_model = interrupted_expected
+        .as_deref()
+        .and_then(bamboo_engine::session_app::provider_model::session_effective_model_ref);
+    let saved_provider = saved_model
+        .as_ref()
+        .map(|model| model.provider.clone())
+        .or_else(|| {
+            interrupted_expected
+                .as_ref()
+                .and_then(|session| session.provider_name())
+        });
+    let explicit_provider = scheduled_provider
+        .as_deref()
+        .or(saved_provider.as_deref())
+        .or_else(|| {
+            req.model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.provider.as_str())
+                .or(req.provider.as_deref())
+        });
     let requested_provider_alias = resolve_requested_provider(&config_snapshot, explicit_provider);
     let requested_provider = match resolve_provider_routing_key(
         &config_snapshot,
@@ -538,7 +606,7 @@ async fn handle_reserved_execute(
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
 
-    let mut request_model_ref = req.model_ref.clone();
+    let mut request_model_ref = saved_model.or_else(|| req.model_ref.clone());
     if let Some(model_ref) = &mut request_model_ref {
         model_ref.provider = requested_provider.clone();
     }
@@ -562,13 +630,17 @@ async fn handle_reserved_execute(
         }),
     };
 
-    let outcome = match bamboo_engine::session_app::execute::prepare_execute(
-        state.as_ref(),
-        config.clone(),
-        input,
-    )
-    .await
-    {
+    let preparation = if let Some(observed) = interrupted_expected.as_deref() {
+        bamboo_engine::session_app::execute::prepare_interrupted_execute(
+            observed.clone(),
+            config.clone(),
+            input,
+        )
+    } else {
+        bamboo_engine::session_app::execute::prepare_execute(state.as_ref(), config.clone(), input)
+            .await
+    };
+    let outcome = match preparation {
         Ok(outcome) => outcome,
         Err(error) => {
             fail_reserved_pending_startup(
@@ -661,7 +733,8 @@ async fn handle_reserved_execute(
                     model_source,
                     reasoning_source,
                     is_child_session,
-                    scheduled_startup_expected,
+                    bound_startup_expected: interrupted_expected.or(scheduled_startup_expected),
+                    resume_interrupted: req.resume_interrupted,
                     no_human_approver: req.no_human_approver,
                     run_budget: req.run_budget,
                     upstream_retry: req.upstream_retry.unwrap_or_default(),

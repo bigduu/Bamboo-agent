@@ -6,6 +6,7 @@
 pub(crate) mod defaults;
 mod handler;
 pub(crate) mod image_fallback;
+pub(crate) mod interrupted;
 pub(crate) mod runtime;
 mod types;
 

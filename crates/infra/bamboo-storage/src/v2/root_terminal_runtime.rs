@@ -741,6 +741,52 @@ impl SessionStoreV2 {
         Ok(finished)
     }
 
+    /// A still-marked-running Root can be resumed only after its exact activation
+    /// expires and storage has no confirmed terminal checkpoint for that owner.
+    pub async fn has_expired_interrupted_root(&self, expected: &Session) -> io::Result<bool> {
+        let (rel, path, guards) = self
+            .lock_actor_runtime(&expected.id)
+            .await
+            .map_err(io::Error::other)?;
+        let Some(current) = self.projection_target(&expected.id, &rel).await? else {
+            return Ok(false);
+        };
+        if current.last_run_status().as_deref() != Some("running")
+            || current.has_runtime_wait()
+            || !Self::same_root_runtime_observation(expected, &current)
+        {
+            return Ok(false);
+        }
+        expected
+            .check_conversation_generation(&current)
+            .map_err(io::Error::other)?;
+        let Some(entry) = self
+            .observed_runtime_actor(&path, &current)
+            .await
+            .map_err(io::Error::other)?
+        else {
+            return Ok(false);
+        };
+        validate_projection_identity(&entry, &current).map_err(io::Error::other)?;
+        let Some(activation) = entry.activation.as_ref() else {
+            return Ok(false);
+        };
+        let fence = activation.fence();
+        if !activation.status.is_live()
+            || activation.lease_expires_at > Utc::now()
+            || is_root_compaction_lease_owner(&activation.lease_owner)
+            || root_planned_update_predecessor_sha256(&activation.lease_owner).is_some()
+            || !matches_observation(&current, &fence)?
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .confirmed_root_main_outcome(&entry, &rel, &fence, &guards)
+            .await
+            .map_err(io::Error::other)?
+            .is_none())
+    }
+
     pub(crate) async fn reconcile_root_runtime_impl(
         &self,
         expected: &Session,
