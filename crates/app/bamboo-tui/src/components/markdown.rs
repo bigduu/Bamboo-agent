@@ -5,6 +5,7 @@ use crate::text::{clip_cells, display_width, truncate_cells};
 use crate::theme::colors;
 
 mod fence;
+mod mermaid;
 mod table;
 
 use fence::FencedBlock;
@@ -27,7 +28,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
     let mut fences = Vec::new();
     while let Some(line) = input.next() {
         if let Some(block) =
-            fence::take_fence(source, line, &mut input).filter(|block| block.closed)
+            fence::take_fence(source, line, &mut input).filter(|block| block.closing_line.is_some())
         {
             fences.push(CopyableFence {
                 language: block.kind.language(),
@@ -42,6 +43,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// links, image descriptions, ATX and single-line Setext headings, nested
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
+/// Completed top-level Mermaid fences can preview a short vertical path.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     render_markdown_preview(text, width, false)
 }
@@ -72,8 +74,35 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         let indentation = column_after(0, raw_indent);
         let block_container = previous_container.after_indented_block(indentation);
         if let Some(block) = fence::take_fence(source, line, &mut input) {
-            render_code_block(&mut lines, block, width);
             container = block_container;
+            let diagram = match block.kind {
+                fence::FenceKind::Mermaid { has_options, .. }
+                    if !streaming
+                        && block_container == ParagraphContainer::None
+                        && is_top_level_fence(raw_line)
+                        && block.closing_line.is_some_and(is_top_level_closing_fence) =>
+                {
+                    Some(if has_options {
+                        Err(mermaid::Unavailable::Unsupported)
+                    } else {
+                        mermaid::render(block.source, width)
+                    })
+                }
+                _ => None,
+            };
+            if let Some(diagram) = diagram {
+                match diagram {
+                    Ok(rows) => {
+                        lines.extend(rows);
+                        continue;
+                    }
+                    Err(reason) => lines.push(Line::styled(
+                        clip_cells(reason.status(), width),
+                        Style::default().fg(colors::subtle()),
+                    )),
+                }
+            }
+            render_code_block(&mut lines, block, width);
             continue;
         }
 
@@ -273,6 +302,14 @@ impl ParagraphContainer {
 fn top_level_body(line: &str) -> Option<&str> {
     let body = line.trim_start_matches(' ');
     (line.len() - body.len() <= 3 && !body.starts_with('\t')).then_some(body)
+}
+
+fn is_top_level_fence(line: &str) -> bool {
+    top_level_body(line).is_some_and(|body| body.starts_with(['`', '~']))
+}
+
+fn is_top_level_closing_fence(line: &str) -> bool {
+    is_top_level_fence(line) && line.trim_end_matches([' ', '\t']).ends_with(['`', '~'])
 }
 
 fn setext_title(line: &str) -> Option<&str> {
@@ -1842,6 +1879,46 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(widths.iter().all(|width| *width == widths[0]), "{widths:?}");
         assert_eq!(widths[0], 18);
+    }
+
+    #[test]
+    fn settled_mermaid_preview_keeps_exact_copy_bytes_and_requires_top_level_closure() {
+        let body = "graph TD\r\n\tA[计划 🧭] --> B[完成]\r\n";
+        let source = format!("  ~~~ Mermaid\r\n{body}   ~~~");
+        let preview = render_markdown(&source, 80);
+        assert_eq!(preview.len(), 7);
+        assert!(text_of(&preview[3]).ends_with('↓'));
+        assert_eq!(
+            copyable_fences(&source).1,
+            [CopyableFence {
+                language: Some("Mermaid"),
+                source: body,
+            }]
+        );
+
+        for source in [
+            format!("~~~mermaid\r\n{body}"),
+            format!("~~~mermaid\r\n{body}    ~~~"),
+            format!("~~~mermaid\r\n{body}~~~\u{a0}"),
+            format!("  - Chart\n    ~~~mermaid\r\n{body}    ~~~"),
+        ] {
+            assert_eq!(
+                render_markdown(&source, 80),
+                render_streaming_markdown(&source, 80)
+            );
+        }
+    }
+
+    #[test]
+    fn settled_unsupported_mermaid_adds_status_and_keeps_the_code_preview() {
+        for source in [
+            "```mermaid\nflowchart LR\nA --> B\n```",
+            "~~~mermaid theme=neutral\nflowchart TD\nA --> B\n~~~",
+        ] {
+            let settled = render_markdown(source, 80);
+            assert_eq!(text_of(&settled[0]), "Mermaid source · unsupported diagram");
+            assert_eq!(settled[1..], render_streaming_markdown(source, 80));
+        }
     }
 
     #[test]
