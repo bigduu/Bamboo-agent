@@ -11,9 +11,7 @@
 //! `InProgress` on purpose. An authoritative forge provider may override that
 //! later; this layer must never guess a merge it cannot prove.
 //!
-//! Every Git invocation is bounded. `git.rs` uses `Command::output()`, which has
-//! no kill path (#2402); this path must not repeat that, so it polls
-//! `try_wait` against a deadline instead.
+//! Every Git invocation is bounded by the caller's deadline.
 use super::git::{git_command, Worktree};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -223,24 +221,6 @@ fn resolve_ref(repo: &Path, reference: &str, deadline: Instant) -> Option<String
     (!commit.is_empty()).then_some(commit)
 }
 
-/// The checkout's repository metadata directory, bounded.
-///
-/// `git::repository` uses `Command::output()`, which has no kill path (#2402);
-/// this endpoint runs on a sidebar poll, so every Git access it makes must be
-/// killable.
-pub fn repository_bounded(repo: &Path, deadline: Instant) -> Result<PathBuf, &'static str> {
-    let output = run_bounded(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        deadline,
-    )?;
-    if !output.success {
-        return Err("not_a_repository");
-    }
-    let text = String::from_utf8(output.stdout).map_err(|_| "git_error")?;
-    std::fs::canonicalize(PathBuf::from(text.trim())).map_err(|_| "not_a_repository")
-}
-
 /// Metadata-only worktree inventory, bounded.
 ///
 /// `git worktree list --porcelain` reads only `.git/worktrees/*` metadata and
@@ -248,14 +228,26 @@ pub fn repository_bounded(repo: &Path, deadline: Instant) -> Result<PathBuf, &'s
 /// files. It also costs nothing per checkout: the merge-state question needs
 /// path/branch/HEAD and nothing else, whereas `git::list` additionally runs
 /// `ls-files` and `status` per entry — the unbounded behaviour #2402 describes.
-pub fn list_metadata(repo: &Path, deadline: Instant) -> Result<Vec<Worktree>, &'static str> {
+pub fn list_metadata(
+    repo: &Path,
+    deadline: Instant,
+) -> Result<(Option<PathBuf>, Vec<Worktree>), &'static str> {
     let listing = run_bounded(repo, &["worktree", "list", "--porcelain", "-z"], deadline)?;
     if !listing.success {
         return Err("not_a_repository");
     }
+    let fields = listing.stdout.split(|byte| *byte == 0);
+    // Git lists the main worktree first. Read its identity even when the
+    // repository was discovered from a different, linked checkout.
+    let main_checkout = fields
+        .clone()
+        .find_map(|field| field.strip_prefix(b"worktree "))
+        .and_then(|path| std::str::from_utf8(path).ok())
+        .map(Path::new)
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
     let mut result = Vec::new();
     let mut entry: Option<Worktree> = None;
-    for field in listing.stdout.split(|byte| *byte == 0) {
+    for field in fields {
         if let Some(path) = field.strip_prefix(b"worktree ") {
             if let Some(previous) = entry.take() {
                 result.push(previous);
@@ -281,7 +273,7 @@ pub fn list_metadata(repo: &Path, deadline: Instant) -> Result<Vec<Worktree>, &'
     if let Some(previous) = entry {
         result.push(previous);
     }
-    Ok(result)
+    Ok((main_checkout, result))
 }
 
 /// The deadline for one checkout: never later than the whole-scan deadline.
@@ -291,61 +283,6 @@ pub fn list_metadata(repo: &Path, deadline: Instant) -> Result<Vec<Worktree>, &'
 /// outlast its own budget.
 pub fn entry_deadline(scan_deadline: Instant) -> Instant {
     (Instant::now() + PER_ENTRY_BUDGET).min(scan_deadline)
-}
-
-/// Repositories to inspect for one registered Project root, bounded.
-///
-/// A root may be a checkout itself, or a container directory holding several
-/// repositories — the layout the worktree inventory supports. Assuming every
-/// root is a repository would return no state at all for a container Project
-/// whose checkouts the inventory does list.
-///
-/// Bounded by depth, entry count and the caller's deadline, so a large tree
-/// cannot turn a sidebar poll into a directory walk.
-pub fn discover_bounded(root: &Path, deadline: Instant) -> Vec<PathBuf> {
-    const MAX_DEPTH: usize = 4;
-    const MAX_ENTRIES: usize = 2_000;
-
-    let mut found = Vec::new();
-    let mut pending = vec![(root.to_path_buf(), 0usize)];
-    let mut visited = 0usize;
-    while let Some((directory, depth)) = pending.pop() {
-        if Instant::now() >= deadline || visited >= MAX_ENTRIES {
-            break;
-        }
-        if repository_bounded(&directory, deadline).is_ok() {
-            // A checkout stops the descent: nested repositories are not this
-            // Project's checkouts, and the inventory does not own them either.
-            found.push(directory);
-            continue;
-        }
-        if depth >= MAX_DEPTH {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited >= MAX_ENTRIES || Instant::now() >= deadline {
-                break;
-            }
-            // Never follow symlinks: a link could escape the Project root or loop.
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
-                continue;
-            }
-            pending.push((entry.path(), depth + 1));
-        }
-    }
-    found
 }
 
 /// Resolve the integration base once per repository. `refs/remotes/origin/HEAD`
@@ -380,12 +317,11 @@ pub fn merge_base(repo: &Path, deadline: Instant) -> Result<MergeBase, &'static 
 
 /// Classify one checkout against `base`.
 ///
-/// `main_checkout` is the repository's primary worktree: it is the workspace
-/// itself and never reported as outstanding branch work.
+/// The repository's primary worktree never represents outstanding branch work.
 pub fn merge_verdict(
     repo: &Path,
     entry: &Worktree,
-    main_checkout: &Path,
+    main_checkout: Option<&Path>,
     base: &MergeBase,
     deadline: Instant,
 ) -> MergeVerdict {
@@ -400,7 +336,7 @@ pub fn merge_verdict(
     // base tip. Both are cheap, so resolve them before consulting the memo;
     // otherwise a worktree sharing the main checkout's head would inherit its
     // "main_checkout" reason.
-    if is_main_checkout(&entry.path, main_checkout) {
+    if main_checkout.is_some_and(|main_checkout| is_main_checkout(&entry.path, main_checkout)) {
         return MergeVerdict::new(MergeState::Primary, "main_checkout");
     }
     if entry.head == base.commit {
@@ -609,7 +545,7 @@ mod tests {
         let verdict = merge_verdict(
             &f.repo(),
             &entry,
-            &f.repo(),
+            Some(&f.repo()),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -622,7 +558,7 @@ mod tests {
         let verdict = merge_verdict(
             &f.repo(),
             &entry,
-            &f.repo(),
+            Some(&f.repo()),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -640,7 +576,7 @@ mod tests {
         let verdict = merge_verdict(
             &f.repo(),
             &entry,
-            &f.repo(),
+            Some(&f.repo()),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -668,7 +604,7 @@ mod tests {
         let verdict = merge_verdict(
             &repo,
             &entry,
-            &repo,
+            Some(&repo),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -694,7 +630,7 @@ mod tests {
         let verdict = merge_verdict(
             &repo,
             &entry,
-            &repo,
+            Some(&repo),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -722,7 +658,7 @@ mod tests {
         let verdict = merge_verdict(
             &repo,
             &entry,
-            &repo,
+            Some(&repo),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -740,7 +676,7 @@ mod tests {
         f.commit(&work, "b.txt", "two\n");
         let entry = f.entry(&work);
         // A deadline already in the past stands in for an exhausted scan budget.
-        let verdict = merge_verdict(&f.repo(), &entry, &f.repo(), &base, Instant::now());
+        let verdict = merge_verdict(&f.repo(), &entry, Some(&f.repo()), &base, Instant::now());
         assert_eq!(verdict.state, MergeState::Unknown);
         assert_eq!(verdict.reason, "budget_exhausted");
     }
@@ -754,7 +690,7 @@ mod tests {
         let verdict = merge_verdict(
             &f.repo(),
             &entry,
-            &f.repo(),
+            Some(&f.repo()),
             &base,
             Instant::now() + Duration::from_secs(5),
         );
@@ -771,11 +707,11 @@ mod tests {
         f.commit(&work, "b.txt", "two\n");
         let entry = f.entry(&work);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let first = merge_verdict(&f.repo(), &entry, &f.repo(), &base, deadline);
+        let first = merge_verdict(&f.repo(), &entry, Some(&f.repo()), &base, deadline);
         assert_eq!(first.state, MergeState::InProgress);
         // A stale deadline would fail if the second call actually ran Git: a
         // cached verdict proves the memo path is what answered.
-        let second = merge_verdict(&f.repo(), &entry, &f.repo(), &base, Instant::now());
+        let second = merge_verdict(&f.repo(), &entry, Some(&f.repo()), &base, Instant::now());
         assert_eq!(second, first);
 
         // New work changes the head, which must invalidate the memo.
@@ -784,7 +720,7 @@ mod tests {
         let third = merge_verdict(
             &f.repo(),
             &moved,
-            &f.repo(),
+            Some(&f.repo()),
             &base,
             Instant::now() + Duration::from_secs(5),
         );

@@ -5,6 +5,7 @@
 //! only proof ever produces `merged`.
 use super::forge::*;
 use super::merge_state::{MergeState, MergeVerdict};
+use std::time::{Duration, Instant};
 
 fn local(state: MergeState, reason: &'static str) -> MergeVerdict {
     MergeVerdict { state, reason }
@@ -232,8 +233,12 @@ fn a_non_github_remote_is_reported_before_any_credential_question() {
     git(&["init", "-b", "main"]);
     git(&["remote", "add", "origin", "git@gitlab.com:team/repo.git"]);
     assert_eq!(
-        github_remote(&dir).unwrap_err(),
+        github_remote(&dir, Instant::now() + Duration::from_secs(5)).unwrap_err(),
         ForgeReason::UnsupportedForge
+    );
+    assert_eq!(
+        remote_url(&dir, Instant::now()).unwrap_err(),
+        ForgeReason::NoRemote
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -342,6 +347,9 @@ fn a_remote_url_without_origin_is_no_remote_not_a_failure() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(remote_url(&dir).unwrap_err(), ForgeReason::NoRemote);
+    assert_eq!(
+        remote_url(&dir, Instant::now() + Duration::from_secs(5)).unwrap_err(),
+        ForgeReason::NoRemote
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
