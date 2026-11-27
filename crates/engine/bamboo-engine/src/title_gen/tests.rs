@@ -272,6 +272,14 @@ async fn routing_contract_title_config_managed_removed_instance_never_dispatches
             config.http_proxy = "https://127.0.0.1:9".into();
             config.https_proxy.clear();
             config.proxy_auth = None;
+            config
+                .defaults
+                .as_mut()
+                .unwrap()
+                .fast
+                .as_mut()
+                .unwrap()
+                .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Max);
             for (id, server) in [("chat-a", &chat), ("fast-b", &fast), ("memory-c", &memory)] {
                 let instance = config.provider_instances.get_mut(id).unwrap();
                 instance.api_key = "fixture-only-not-a-credential".into();
@@ -306,6 +314,8 @@ async fn routing_contract_title_config_managed_removed_instance_never_dispatches
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["model"], "cheap-b");
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["max_completion_tokens"], 4096);
         assert_eq!(managed_title_request_count(&chat).await, 0);
         assert_eq!(managed_title_request_count(&memory).await, 0);
 
